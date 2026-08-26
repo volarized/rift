@@ -208,6 +208,7 @@ fn dispatch(behavior: &str, message: &Value, input: &mut EngineInput, state: &mu
         },
         "workspace/willRenameFiles" => answer_will_rename(behavior, message, state),
         "textDocument/diagnostic" => answer_diagnostic(behavior, id, state),
+        "textDocument/references" => answer_references(behavior, message, state),
         _ => {}
     }
 }
@@ -314,6 +315,63 @@ fn answer_diagnostic(behavior: &str, id: &Value, state: &mut EngineState) {
     }
 }
 
+/// Answers one references request: every other word-boundary occurrence of the word at the
+/// requested position, across the root's `.rs` files, the declaration's own occurrence
+/// excluded.
+///
+/// The scan reuses [`word_edits`], the same word-boundary search the rename behaviors run,
+/// so a fixture's cross-file call sites are exactly its rename occurrences minus the
+/// requested position. `refuses-references` answers a JSON-RPC error instead;
+/// `mutates-then-answers-references` drifts the requested document on disk before answering
+/// normally, the same race `mutates-then-renames` proves for a rename proposal.
+fn answer_references(behavior: &str, message: &Value, state: &EngineState) {
+    record_lifecycle("references");
+    if behavior == "refuses-references" {
+        print_message(&json!({
+            "jsonrpc": "2.0",
+            "id": message["id"],
+            "error": {"code": -32602, "message": "cannot answer references here"},
+        }));
+        return;
+    }
+    if behavior == "mutates-then-answers-references" {
+        drift_target(message);
+    }
+    let uri = message["params"]["textDocument"]["uri"]
+        .as_str()
+        .unwrap_or_default();
+    let line = message["params"]["position"]["line"]
+        .as_u64()
+        .unwrap_or_default();
+    let character = message["params"]["position"]["character"]
+        .as_u64()
+        .unwrap_or_default();
+    let target_text = state.opened.get(uri).cloned().unwrap_or_default();
+    let offset = line_start(&target_text, usize::try_from(line).unwrap_or_default())
+        + usize::try_from(character).unwrap_or_default();
+    let word = word_at(&target_text, offset);
+    let declaration_range = json!({
+        "start": {"line": line, "character": character},
+        "end": {"line": line, "character": character + word.len() as u64},
+    });
+    let mut locations = Vec::new();
+    for path in rust_files(&state.root) {
+        let path_uri = format!("file://{}", path.display());
+        let text = if path_uri == uri {
+            target_text.clone()
+        } else {
+            std::fs::read_to_string(&path).unwrap_or_default()
+        };
+        for edit in word_edits(&text, &word, &word) {
+            if path_uri == uri && edit["range"] == declaration_range {
+                continue;
+            }
+            locations.push(json!({"uri": path_uri, "range": edit["range"]}));
+        }
+    }
+    respond(&message["id"], &json!(locations));
+}
+
 /// Refuses one diagnostic pull, naming the code and the pull's ordinal.
 fn refuse_pull(id: &Value, code: i64, pull: usize) {
     print_message(&json!({
@@ -411,6 +469,12 @@ fn initialize_answer(behavior: &str) -> Value {
                 },
             },
         }),
+        "references-only" => json!({
+            "capabilities": {
+                "positionEncoding": "utf-8",
+                "referencesProvider": true,
+            },
+        }),
         "python-filters" => json!({
             "capabilities": {
                 "positionEncoding": "utf-8",
@@ -427,6 +491,7 @@ fn initialize_answer(behavior: &str) -> Value {
             "capabilities": {
                 "positionEncoding": "utf-8",
                 "renameProvider": {"prepareProvider": true},
+                "referencesProvider": true,
                 "workspace": {
                     "fileOperations": {
                         "willRename": {

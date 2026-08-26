@@ -956,7 +956,7 @@ pub(crate) fn digest_wire_hex(digest: &sha2::digest::Output<Sha256>) -> String {
 /// declaration, including attached docs and attributes) for most nodes, but
 /// the item node itself only spans its own bytes, so it matches on
 /// `item_range` instead.
-fn symbol_for_range(file: &IndexedFile, range: ByteRange) -> Option<&SyntaxSymbol> {
+pub(crate) fn symbol_for_range(file: &IndexedFile, range: ByteRange) -> Option<&SyntaxSymbol> {
     file.syntax()
         .symbols()
         .iter()

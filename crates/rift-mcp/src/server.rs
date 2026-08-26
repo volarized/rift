@@ -9,7 +9,8 @@ use rift_core::{ProjectPath as CoreProjectPath, SourceVisibility};
 use rift_index::{LexicalIndexLimits, PathChanges, WorkspaceIndexLimits, capture_digests};
 use rift_protocol::change::{
     ChangeResult, ChangeSummary, GuaranteeEvidence, InsertSymbolParams, MoveFileParams,
-    PatchParams, RenameSymbolParams, ReplaceNodeParams, ReplaceSymbolParams,
+    PatchParams, RemoveNodeParams, RemoveSymbolParams, RenameSymbolParams, ReplaceNodeParams,
+    ReplaceSymbolParams,
 };
 use rift_protocol::configuration::{
     CommandHook, Duration as WireDuration, EngineConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX,
@@ -27,7 +28,8 @@ use rift_search::{
 };
 use rift_server::{
     ChangeService, EnginePool, HookStatus, MoveResolution, ReadError, ReadFault, ReadService,
-    RenameResolution, engine_change_diagnostics, plan_move, plan_rename, run_hooks,
+    RemoveResolution, RenameResolution, engine_change_diagnostics, plan_move, plan_remove_node,
+    plan_remove_symbol, plan_rename, run_hooks,
 };
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -1070,6 +1072,9 @@ impl RiftMcp {
     /// includes its attached outer attributes and doc comments. The parser
     /// derives the span, so the caller supplies no offsets; a refusal
     /// names the failed precondition and leaves the workspace untouched.
+    /// The body is spliced in verbatim at the declaration's own start byte:
+    /// its first line inherits the declaration's column, and every later
+    /// line carries whatever indentation it is written with.
     #[tool]
     async fn replace_symbol(
         &self,
@@ -1084,7 +1089,11 @@ impl RiftMcp {
     /// its attached outer attributes and doc comments included. A file target
     /// lands the body verbatim at the file's start or end, creating it first
     /// when `create_missing` is set and it is missing. A refusal names the
-    /// failed precondition and leaves the workspace untouched.
+    /// failed precondition and leaves the workspace untouched. A body
+    /// inserted `before` its anchor is spliced in at the anchor's start byte
+    /// and its first line inherits the anchor's column; a body inserted
+    /// `after` its anchor, or at a file target either side, always starts a
+    /// fresh line at column zero.
     #[tool]
     async fn insert_symbol(
         &self,
@@ -1153,6 +1162,62 @@ impl RiftMcp {
             MoveResolution::Refused(result) => Ok(Json(result)),
             MoveResolution::Planned(plan) => {
                 self.change(move |reads, changes| changes.apply_move(reads, &plan))
+                    .await
+            }
+        }
+    }
+
+    /// Removes one declaration addressed by symbol. The whole declaration,
+    /// its attached outer attributes and doc comments included, is removed
+    /// together with the separator that followed it, so no blank-line run
+    /// stands where it stood. When the configured language engine
+    /// advertises `textDocument/references`, a standing reference refuses
+    /// `unmet_precondition` naming `no_references`, unless `force` applies
+    /// the removal anyway and carries the references as a warning. Without
+    /// such an engine, the removal applies and carries a warning naming why
+    /// it was not checked.
+    #[tool]
+    async fn remove_symbol(
+        &self,
+        Parameters(params): Parameters<RemoveSymbolParams>,
+    ) -> Result<Json<ChangeResult>, ErrorData> {
+        let published = self.published_workspace(wire::ErrorPhase::Change).await?;
+        published.configuration.accepted(wire::ErrorPhase::Change)?;
+        let pool = self.engine_pool().await;
+        let resolution = plan_remove_symbol(&published.reads, &pool, &self.root, &params)
+            .await
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
+        match resolution {
+            RemoveResolution::Refused(result) => Ok(Json(result)),
+            RemoveResolution::Planned(plan) => {
+                self.change(move |reads, changes| changes.apply_remove(reads, &plan))
+                    .await
+            }
+        }
+    }
+
+    /// Removes one syntax node through a witnessed address from `nodes`.
+    /// The server recomputes the witness before writing and refuses when
+    /// the bytes drifted, so a stale address never removes moved code. When
+    /// the node names a declaration, the removal is checked against the
+    /// configured language engine's references the same way `remove_symbol`
+    /// checks them; a node naming no declaration applies unchecked, with a
+    /// warning saying so.
+    #[tool]
+    async fn remove_node(
+        &self,
+        Parameters(params): Parameters<RemoveNodeParams>,
+    ) -> Result<Json<ChangeResult>, ErrorData> {
+        let published = self.published_workspace(wire::ErrorPhase::Change).await?;
+        published.configuration.accepted(wire::ErrorPhase::Change)?;
+        let pool = self.engine_pool().await;
+        let resolution = plan_remove_node(&published.reads, &pool, &self.root, &params)
+            .await
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
+        match resolution {
+            RemoveResolution::Refused(result) => Ok(Json(result)),
+            RemoveResolution::Planned(plan) => {
+                self.change(move |reads, changes| changes.apply_remove(reads, &plan))
                     .await
             }
         }
@@ -2315,6 +2380,8 @@ mod tests {
                 "move_file",
                 "nodes",
                 "patch",
+                "remove_node",
+                "remove_symbol",
                 "rename_symbol",
                 "replace_node",
                 "replace_symbol",

@@ -78,6 +78,10 @@ name = "move_file"
 path = "tests/move_file.rs"
 
 [[test]]
+name = "remove_symbol"
+path = "tests/remove_symbol.rs"
+
+[[test]]
 name = "rename_symbol"
 path = "tests/rename_symbol.rs"
 

@@ -249,7 +249,7 @@ fn resolved_target(reads: &ReadService, address: &SymbolAddress) -> Result<Renam
 /// occurrence of the short name inside the item's bytes, or the item start
 /// when the provider's name is not spelled there - the engine's own
 /// verdict then decides whether the position renames.
-fn declaration_name_offset(source: &str, symbol: &SyntaxSymbol) -> usize {
+pub(crate) fn declaration_name_offset(source: &str, symbol: &SyntaxSymbol) -> usize {
     let start = bounded_offset(symbol.item_range.start, source.len());
     let end = bounded_offset(symbol.item_range.end, source.len());
     let item = source.get(start..end).unwrap_or_default();
@@ -299,14 +299,14 @@ async fn verified_disk_target(
 /// The declaration name's position in both offered encodings, decided by
 /// the negotiated encoding once the engine has spawned.
 #[derive(Clone, Copy, Debug)]
-struct NamePositions {
+pub(crate) struct NamePositions {
     utf8: Position,
     utf16: Position,
 }
 
 impl NamePositions {
     /// The position in the encoding one session negotiated.
-    fn negotiated(self, encoding: PositionEncoding) -> Position {
+    pub(crate) fn negotiated(self, encoding: PositionEncoding) -> Position {
         match encoding {
             PositionEncoding::Utf8 => self.utf8,
             PositionEncoding::Utf16 => self.utf16,
@@ -317,7 +317,7 @@ impl NamePositions {
 /// Converts the name offset into both offered encodings. The offset came
 /// from the same source bytes, so a conversion failure is an internal
 /// fault, never a caller mistake.
-fn name_positions(source: &str, name_offset: usize) -> Result<NamePositions, PlanEnd> {
+pub(crate) fn name_positions(source: &str, name_offset: usize) -> Result<NamePositions, PlanEnd> {
     let index = LineIndex::new(source);
     let converted = |encoding| {
         index.position(encoding, name_offset).map_err(|error| {

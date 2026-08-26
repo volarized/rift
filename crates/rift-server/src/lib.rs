@@ -9,6 +9,7 @@ mod hook;
 mod move_file;
 mod patch;
 mod read;
+mod remove;
 mod rename;
 mod rewrite;
 mod search;
@@ -22,6 +23,9 @@ pub use engine::{EnginePool, EngineSlot};
 pub use hook::{HookRun, HookStatus, run_hooks};
 pub use move_file::{MovePlan, MoveResolution, plan_move};
 pub use read::{ReadError, ReadFault, ReadService};
+pub use remove::{
+    REMOVE_REFERENCES_MAX, RemovePlan, RemoveResolution, plan_remove_node, plan_remove_symbol,
+};
 pub use rename::{
     RENAME_FILE_BYTES_MAX, RENAME_FILE_EDITS_MAX, RENAME_FILES_MAX, RENAME_SWEEP_BYTES_MAX,
     RENAME_SWEEP_FILES_MAX, RENAME_SWEEP_FINDINGS_MAX, RenamePlan, RenameResolution, plan_rename,
