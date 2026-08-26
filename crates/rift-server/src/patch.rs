@@ -2,7 +2,7 @@
 //! applies each one itself, following `git apply` semantics.
 //!
 //! A hunk header is a hint, not a requirement, on both of its halves.
-//! Context and deleted lines must match exactly, but the position they
+//! Context and deleted lines must match by content, but the position they
 //! match at may drift from the header: each hunk's search starts at its
 //! header position corrected by the drift already discovered from earlier
 //! hunks in the same file - the running delta `git apply` itself carries
@@ -12,6 +12,14 @@
 //! miscounted header applies and only a body that cannot be located
 //! refuses.
 //!
+//! Matching compares line content alone, the way `git apply` tolerates it: an LF hunk
+//! locates against CRLF source, and the reverse. A located hunk's context lines keep the
+//! exact bytes already standing in the source, and its inserted lines take the line
+//! ending already prevailing at that position, so bytes outside the hunk stay unchanged
+//! and no hunk introduces a foreign ending. A hunk whose content cannot be located
+//! anywhere in the file refuses, naming each side's content and line ending, so two
+//! genuinely different byte strings never render identically.
+//!
 //! Each located hunk records the previous image's bytes it replaced, so a
 //! result names the regions that changed instead of echoing whole files.
 //! `/dev/null` headers create or delete a file; renames and copies stay
@@ -20,7 +28,9 @@
 //! An existing target is any file the workspace's `[source]` policy makes visible,
 //! parsed or not: the syntax index's own copy, then the text index's, then a direct
 //! filesystem read guarded by the policy alone. The base image is always the file's
-//! bytes on disk; hunk context is the guard and needs no syntax tree.
+//! bytes on disk; hunk context is the guard and needs no syntax tree. A path that
+//! resolves to a directory refuses `target_is_file` instead of reaching a read or a
+//! write that would otherwise fail unclassified.
 
 use std::fs;
 use std::path::Path;
@@ -397,7 +407,8 @@ fn drift_checked_base(
 /// visible file no syntax provider parses and no text extension includes, such as
 /// `justfile` or `.gitignore`. A path the policy excludes refuses `unsupported`,
 /// naming the policy; a visible path absent from the filesystem refuses
-/// `target_exists` the way an unindexed path already does.
+/// `target_exists` the way an unindexed path already does; a directory refuses
+/// `target_is_file` instead of reaching the read that would otherwise fail unclassified.
 fn visible_source(
     reads: &ReadService,
     path: &CoreProjectPath,
@@ -409,11 +420,18 @@ fn visible_source(
     if !visible {
         return Ok(Err(crate::publish::not_visible_refusal(path)));
     }
+    let metadata = match fs::metadata(absolute) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Err(target_missing_refusal(path)));
+        }
+        Err(error) => return Err(ReadFault::storage(path.as_str(), "stat", &error)),
+    };
+    if metadata.is_dir() {
+        return Ok(Err(directory_target_refusal(path)));
+    }
     match fs::read_to_string(absolute) {
         Ok(disk) => Ok(Ok(disk)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(Err(target_missing_refusal(path)))
-        }
         Err(error) => Err(ReadFault::storage(path.as_str(), "read", &error)),
     }
 }
@@ -457,14 +475,27 @@ fn resolve_create(
     )? {
         return Ok(Err(refusal));
     }
-    match root.join(path.as_str()).try_exists() {
-        Ok(true) => return Ok(Err(already_exists_refusal(path))),
-        Ok(false) => {}
-        Err(error) => return Err(ReadFault::storage(path.as_str(), "stat", &error)),
+    if let Some(refusal) = creation_conflict(root, path)? {
+        return Ok(Err(refusal));
     }
     match apply_segment("", parsed) {
         Ok(applied) => Ok(Ok(FileRewrite::create(path.clone(), applied.next_source))),
         Err(detail) => Ok(Err(detail.into_refusal(path))),
+    }
+}
+
+/// The refusal for a create target something already occupies: `target_is_file` when a
+/// directory stands there, `target_exists` for anything else - a file or a symlink.
+/// `None` when nothing occupies the path.
+fn creation_conflict(
+    root: &Path,
+    path: &CoreProjectPath,
+) -> Result<Option<ChangeResult>, ReadError> {
+    match fs::metadata(root.join(path.as_str())) {
+        Ok(metadata) if metadata.is_dir() => Ok(Some(directory_target_refusal(path))),
+        Ok(_) => Ok(Some(already_exists_refusal(path))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ReadFault::storage(path.as_str(), "stat", &error)),
     }
 }
 
@@ -492,38 +523,39 @@ fn resolve_delete(
 
 /// One line of the file image a patch's hunks apply against: bytes still
 /// from the original file, carrying the offset they start at there, or
-/// bytes a previous hunk in this same run already wrote. A later hunk
-/// never matches into a `Patched` line - that would apply on top of text
-/// this same patch just introduced.
-#[derive(Clone, Copy)]
+/// bytes a previous hunk in this same run already wrote - context lines
+/// included, so a later hunk never matches into a `Patched` line even
+/// when its content is unchanged; that would apply on top of text this
+/// same patch just introduced.
 enum ImageLine<'a> {
     Original { text: &'a str, start: u64 },
-    Patched(&'a str),
+    Patched(String),
 }
 
-impl<'a> ImageLine<'a> {
-    fn text(self) -> &'a str {
+impl ImageLine<'_> {
+    fn text(&self) -> &str {
         match self {
-            Self::Original { text, .. } | Self::Patched(text) => text,
+            Self::Original { text, .. } => text,
+            Self::Patched(text) => text,
         }
     }
 
-    fn is_patched(self) -> bool {
+    fn is_patched(&self) -> bool {
         matches!(self, Self::Patched(_))
     }
 
     /// Where this line starts in the original file, or `None` for a line
     /// an earlier hunk wrote.
-    fn base_start(self) -> Option<u64> {
+    fn base_start(&self) -> Option<u64> {
         match self {
-            Self::Original { start, .. } => Some(start),
+            Self::Original { start, .. } => Some(*start),
             Self::Patched(_) => None,
         }
     }
 
     /// Where this line ends in the original file, or `None` for a line an
     /// earlier hunk wrote.
-    fn base_end(self) -> Option<u64> {
+    fn base_end(&self) -> Option<u64> {
         self.base_start()
             .map(|start| start + self.text().len() as u64)
     }
@@ -541,11 +573,11 @@ pub(crate) struct AppliedSegment {
 ///
 /// Each hunk's search anchors at its header position, corrected by the
 /// drift already found while applying earlier hunks in this same segment.
-/// The search itself never fuzzy-matches content: only exact line
-/// equality locates a hunk, at a position that may differ from the
-/// header. Bounded: one hunk visits at most `image.len() + 1` candidate
-/// positions, since the search distance never usefully exceeds the
-/// image's length.
+/// The search itself never fuzzy-matches content: only line-content
+/// equality locates a hunk, ignoring each side's line ending, at a
+/// position that may differ from the header. Bounded: one hunk visits at
+/// most `image.len() + 1` candidate positions, since the search distance
+/// never usefully exceeds the image's length.
 ///
 /// The recorded regions are ascending and never overlap: a located run is
 /// original lines alone, and applying a hunk marks its own run as written
@@ -561,8 +593,7 @@ fn apply_segment(
     let mut replaced = Vec::with_capacity(parsed.hunks().len());
     let mut delta: i64 = 0;
     for (index, hunk) in parsed.hunks().iter().enumerate() {
-        let pre_image = image_lines(hunk, HunkImage::Pre);
-        let post_image = image_lines(hunk, HunkImage::Post);
+        let pre_image = pre_image_lines(hunk);
         let expected = zero_based_start(hunk.new_range());
         let anchor = clamp_anchor(expected, delta, image.len());
         let Some(found) = find_hunk_position(&image, &pre_image, anchor) else {
@@ -575,19 +606,72 @@ fn apply_segment(
             ));
         };
         delta = i64::try_from(found).unwrap_or(0) - i64::try_from(expected).unwrap_or(0);
+        let post_lines = reconciled_post_lines(hunk, &image, found);
         replaced.push(ReplacedRegion {
             range: replaced_range(&image, found, pre_image.len(), base_len),
-            text: post_image.concat(),
+            text: post_lines.iter().map(ImageLine::text).collect(),
         });
-        let patched: Vec<ImageLine<'_>> =
-            post_image.iter().copied().map(ImageLine::Patched).collect();
-        image.splice(found..found + pre_image.len(), patched);
+        image.splice(found..found + pre_image.len(), post_lines);
     }
     replaced.sort_by_key(|region| (region.range.start, region.range.end));
     Ok(AppliedSegment {
-        next_source: image.iter().copied().map(ImageLine::text).collect(),
+        next_source: image.iter().map(ImageLine::text).collect(),
         replaced,
     })
+}
+
+/// The lines a hunk leaves behind at its located position: each context line keeps the
+/// exact source bytes it matched there, each inserted line takes the hunk's prevailing
+/// line ending - the ending the file already carries at that position, so content located
+/// by matching alone never introduces a foreign line ending - and each deleted line
+/// contributes nothing.
+fn reconciled_post_lines<'a>(
+    hunk: &Hunk<'_, str>,
+    image: &[ImageLine<'a>],
+    found: usize,
+) -> Vec<ImageLine<'a>> {
+    let ending = prevailing_ending(image, found);
+    let mut cursor = found;
+    let mut lines = Vec::with_capacity(hunk.lines().len());
+    for line in hunk.lines().iter().copied() {
+        match line {
+            Line::Context(_) => {
+                if let Some(source) = image.get(cursor) {
+                    lines.push(ImageLine::Patched(source.text().to_owned()));
+                }
+                cursor += 1;
+            }
+            Line::Delete(_) => cursor += 1,
+            Line::Insert(text) => {
+                lines.push(ImageLine::Patched(ending_reconciled(text, ending)));
+            }
+        }
+    }
+    lines
+}
+
+/// The line ending inserted content should adopt for a hunk located at `found`: the
+/// ending the source line standing at that position already carries, or the ending of the
+/// line immediately before it when the hunk lands at the file's end. `None` when neither
+/// exists - an empty file with nothing to match - so inserted content keeps whatever
+/// ending the diff itself carries.
+fn prevailing_ending(image: &[ImageLine<'_>], found: usize) -> Option<line::LineEnding> {
+    image
+        .get(found)
+        .or_else(|| found.checked_sub(1).and_then(|prior| image.get(prior)))
+        .and_then(|entry| line::LineEnding::of(entry.text()))
+}
+
+/// `text`'s content with its ending replaced by `ending`, when `text` carries an ending
+/// and it differs from `ending`; `text` unchanged otherwise, including when it carries no
+/// ending at all - a final line with no trailing newline stays that way.
+fn ending_reconciled(text: &str, ending: Option<line::LineEnding>) -> String {
+    match (ending, line::LineEnding::of(text)) {
+        (Some(ending), Some(current)) if current != ending => {
+            format!("{}{}", line::without_ending(text), ending.as_str())
+        }
+        _ => text.to_owned(),
+    }
 }
 
 /// The starting image: every line of `starting`, each carrying the offset
@@ -616,9 +700,8 @@ fn replaced_range(
     let run = image.get(found..found + run_len).unwrap_or_default();
     let bounds = run
         .first()
-        .copied()
         .and_then(ImageLine::base_start)
-        .zip(run.last().copied().and_then(ImageLine::base_end));
+        .zip(run.last().and_then(ImageLine::base_end));
     if let Some((start, end)) = bounds {
         return ByteRange { start, end };
     }
@@ -634,7 +717,6 @@ fn insertion_offset(image: &[ImageLine<'_>], found: usize, base_len: u64) -> u64
     image
         .iter()
         .skip(found)
-        .copied()
         .find_map(ImageLine::base_start)
         .unwrap_or(base_len)
 }
@@ -687,43 +769,31 @@ fn find_hunk_position(image: &[ImageLine<'_>], pre_image: &[&str], anchor: usize
     None
 }
 
-/// Tests whether `pre_image` matches the image exactly at `pos`: every
-/// line byte-equal, and none of them already written by an earlier hunk.
+/// Tests whether `pre_image` matches the image at `pos`: every line equal by content,
+/// ignoring each side's line ending, and none of them already written by an earlier hunk.
 fn matches_at(image: &[ImageLine<'_>], pre_image: &[&str], pos: usize) -> bool {
     let Some(window) = image.get(pos..pos + pre_image.len()) else {
         return false;
     };
-    if window.iter().copied().any(ImageLine::is_patched) {
+    if window.iter().any(ImageLine::is_patched) {
         return false;
     }
     window
         .iter()
-        .copied()
         .map(ImageLine::text)
-        .eq(pre_image.iter().copied())
+        .map(line::without_ending)
+        .eq(pre_image.iter().copied().map(line::without_ending))
 }
 
-/// Which half of a hunk's lines [`image_lines`] selects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HunkImage {
-    /// The lines a hunk expects to find at its position: context and
-    /// deleted lines.
-    Pre,
-    /// The lines a hunk leaves behind after applying: context and
-    /// inserted lines.
-    Post,
-}
-
-/// Selects one side of `hunk`'s lines: [`HunkImage::Pre`] keeps context
-/// and deleted lines (what the search must locate), [`HunkImage::Post`]
-/// keeps context and inserted lines (what replaces the located run).
-fn image_lines<'a>(hunk: &Hunk<'a, str>, image: HunkImage) -> Vec<&'a str> {
+/// The lines a hunk expects to find at its position, in body order: context and deleted
+/// lines - what the search in [`find_hunk_position`] must locate. Insert-only lines
+/// contribute nothing, since they name no position in the source at all.
+fn pre_image_lines<'a>(hunk: &Hunk<'a, str>) -> Vec<&'a str> {
     hunk.lines()
         .iter()
-        .filter_map(|line| match (image, line) {
-            (HunkImage::Pre, Line::Context(text) | Line::Delete(text))
-            | (HunkImage::Post, Line::Context(text) | Line::Insert(text)) => Some(*text),
-            _ => None,
+        .filter_map(|line| match line {
+            Line::Context(text) | Line::Delete(text) => Some(*text),
+            Line::Insert(_) => None,
         })
         .collect()
 }
@@ -760,16 +830,13 @@ impl MismatchDetail {
         image: &[ImageLine<'_>],
     ) -> Self {
         let expected = pre_image.first().copied().unwrap_or_default();
-        let observed = image.get(anchor).copied().map(ImageLine::text);
+        let observed = image.get(anchor).map(ImageLine::text);
         Self {
             ordinal,
             header: hunk_header_text(hunk),
             line: anchor + 1,
-            expected: line::without_ending(expected).to_owned(),
-            observed: observed.map_or_else(
-                || "end of file".to_owned(),
-                |text| line::without_ending(text).to_owned(),
-            ),
+            expected: escaped_line(expected),
+            observed: observed.map_or_else(|| "end of file".to_owned(), escaped_line),
         }
     }
 
@@ -792,6 +859,20 @@ impl MismatchDetail {
             self.ordinal, self.header, self.line
         )
     }
+}
+
+/// Renders one line for a mismatch message: its content, stripped of its ending, followed
+/// by that ending's own name. Two lines whose content agrees but whose bytes differ - a
+/// `\r` present on one side alone - render as different strings, which stripping the
+/// ending without naming it cannot do.
+fn escaped_line(line: &str) -> String {
+    let content = line::without_ending(line);
+    let ending = match line::LineEnding::of(line) {
+        Some(line::LineEnding::Lf) => "LF ending",
+        Some(line::LineEnding::CrLf) => "CRLF ending",
+        None => "no line ending",
+    };
+    format!("{content} ({ending})")
 }
 
 /// Truncates one detail string to the shared byte bound, never splitting
@@ -846,6 +927,15 @@ fn already_exists_refusal(path: &CoreProjectPath) -> ChangeResult {
     )
 }
 
+fn directory_target_refusal(path: &CoreProjectPath) -> ChangeResult {
+    precondition_refusal(
+        OperationPreconditionKind::TargetIsFile,
+        path,
+        PreconditionValue::Boolean { value: true },
+        PreconditionValue::Boolean { value: false },
+    )
+}
+
 fn source_drift_refusal(path: &CoreProjectPath, indexed: &str, disk: &str) -> ChangeResult {
     precondition_refusal(
         OperationPreconditionKind::SourceUnchanged,
@@ -889,8 +979,9 @@ mod tests {
     use rift_protocol::read::ProjectPath;
 
     use super::{
-        HunkCounts, PATCH_MISMATCH_DETAIL_BYTES_MAX, PatchTarget, apply_segment,
-        find_hunk_position, resolve_patch_target, rewritten_header, truncate_detail,
+        CoreProjectPath, HunkCounts, PATCH_MISMATCH_DETAIL_BYTES_MAX, PatchTarget, apply_segment,
+        creation_conflict, find_hunk_position, resolve_patch_target, rewritten_header,
+        truncate_detail,
     };
     use crate::change::ChangeService;
     use crate::read::ReadService;
@@ -994,8 +1085,45 @@ mod tests {
         assert_eq!(detail.ordinal, 1);
         assert_eq!(detail.line, 1);
         assert!(detail.header.contains("@@ -1 +1 @@"));
-        assert_eq!(detail.expected, "vanished");
-        assert_eq!(detail.observed, "one");
+        assert_eq!(detail.expected, "vanished (LF ending)");
+        assert_eq!(detail.observed, "one (LF ending)");
+        Ok(())
+    }
+
+    /// Reproduces the defect a `without_ending`-stripped display left behind: content that
+    /// matches at the reported line while a later line in the same hunk does not must still
+    /// render `expected` and `observed` as different strings, never the identical `one`.
+    #[test]
+    fn mismatch_detail_names_each_sides_line_ending_when_the_first_line_matches_by_content_alone()
+    -> TestResult {
+        let diff = "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n one\n-vanished\n+X\n";
+        let segments = hunks(diff)?;
+        let parsed = Patch::from_str(&segments[0])?;
+        let detail = apply_segment("one\r\ntwo\r\n", &parsed)
+            .err()
+            .ok_or("a hunk whose second line never matches must refuse")?;
+        assert_eq!(detail.expected, "one (LF ending)");
+        assert_eq!(detail.observed, "one (CRLF ending)");
+        assert_ne!(
+            detail.expected, detail.observed,
+            "identical content with a differing line ending must never render as the same \
+             string"
+        );
+        Ok(())
+    }
+
+    /// The file's last line carries no trailing newline at all; a mismatch reported there
+    /// must still name that absence, not fall back to reporting some other ending.
+    #[test]
+    fn mismatch_detail_names_a_final_line_with_no_trailing_newline() -> TestResult {
+        let diff = "--- a/f\n+++ b/f\n@@ -2 +2 @@\n-TWO\n+CHANGED\n";
+        let segments = hunks(diff)?;
+        let parsed = Patch::from_str(&segments[0])?;
+        let detail = apply_segment("one\ntwo", &parsed)
+            .err()
+            .ok_or("a final unterminated line that never matches must still refuse")?;
+        assert_eq!(detail.expected, "TWO (LF ending)");
+        assert_eq!(detail.observed, "two (no line ending)");
         Ok(())
     }
 
@@ -2256,8 +2384,10 @@ mod tests {
         Ok(())
     }
 
+    /// An LF diff locates against CRLF source by content alone, the way `git apply`
+    /// tolerates it, and the rewritten line adopts the source's own CRLF ending.
     #[test]
-    fn patch_with_lf_context_refuses_a_crlf_source() -> TestResult {
+    fn patch_with_lf_context_applies_against_crlf_source_and_adopts_its_ending() -> TestResult {
         let (directory, reads, changes) = fixture("pub fn beacon() {}\r\n")?;
         let patch = [
             "--- a/lib.rs",
@@ -2274,12 +2404,185 @@ mod tests {
                 patch: patch.into(),
             },
         )?;
-        let ChangeResult::Refused { reason, .. } = result else {
-            panic!("an ending mismatch must refuse as context drift, not rewrite endings");
+        let summary = applied_summary(result);
+        assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(written, "pub fn beacon() -> u8 { 7 }\r\n");
+        Ok(())
+    }
+
+    /// The reverse direction: a CRLF diff locates against LF source, and the rewritten
+    /// line adopts the source's own LF ending.
+    #[test]
+    fn patch_with_crlf_context_applies_against_lf_source_and_adopts_its_ending() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let patch = [
+            "--- a/lib.rs",
+            "+++ b/lib.rs",
+            "@@ -1 +1 @@",
+            "-pub fn beacon() {}",
+            "+pub fn beacon() -> u8 { 7 }",
+            "",
+        ]
+        .join("\r\n");
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?;
+        let summary = applied_summary(result);
+        assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(written, "pub fn beacon() -> u8 { 7 }\n");
+        Ok(())
+    }
+
+    /// A file whose lines carry different endings: the changed line adopts its own
+    /// position's prevailing ending, and every untouched line keeps its own, unaltered.
+    #[test]
+    fn patch_against_mixed_ending_source_keeps_each_untouched_lines_own_ending() -> TestResult {
+        let (directory, reads, changes) =
+            fixture("pub fn one() {}\r\npub fn two() {}\npub fn three() {}\r\n")?;
+        let patch = "--- a/lib.rs\n+++ b/lib.rs\n@@ -2 +2 @@\n-pub fn two() {}\n+pub fn TWO() {}\n";
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.to_owned().into(),
+            },
+        )?;
+        let summary = applied_summary(result);
+        assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(
+            written, "pub fn one() {}\r\npub fn TWO() {}\npub fn three() {}\r\n",
+            "the changed line takes line 2's own LF ending; lines 1 and 3 keep their CRLF \
+             untouched"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn patch_against_a_directory_target_refuses_target_is_file() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        fs::create_dir(directory.path().join("adir"))?;
+        let patch = "--- a/adir\n+++ b/adir\n@@ -1 +1 @@\n-x\n+y\n";
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.to_owned().into(),
+            },
+        )?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("patching a directory must refuse");
         };
         assert_eq!(reason, RefusalReason::UnmetPrecondition);
-        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
-        assert_eq!(untouched, "pub fn beacon() {}\r\n");
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::TargetIsFile
+        );
+        assert_eq!(
+            preconditions[0].expected,
+            PreconditionValue::Boolean { value: true }
+        );
+        assert_eq!(
+            preconditions[0].observed,
+            PreconditionValue::Boolean { value: false }
+        );
+        assert!(
+            directory.path().join("adir").is_dir(),
+            "the directory is untouched"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn patch_creation_into_a_directory_refuses_target_is_file() -> TestResult {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        fs::create_dir(directory.path().join("adir"))?;
+        let patch = "--- /dev/null\n+++ b/adir\n@@ -0,0 +1 @@\n+pub fn fresh() {}\n";
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.to_owned().into(),
+            },
+        )?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("creating over a directory must refuse");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::TargetIsFile
+        );
+        assert!(
+            directory.path().join("adir").is_dir(),
+            "the directory is untouched"
+        );
+        Ok(())
+    }
+
+    /// A file `resolve_base_image` finds unindexed - no syntax provider claims `.lock`,
+    /// and it carries no `[search.text]` extension - reads through the `[source]` policy
+    /// directly, and a stat failure on that read surfaces as `storage_failure` rather
+    /// than reaching the mismatch path.
+    #[cfg(unix)]
+    #[test]
+    fn patch_against_an_unreadable_source_directory_is_a_storage_failure() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir()?;
+        let sealed = directory.path().join("sealed");
+        fs::create_dir(&sealed)?;
+        fs::write(sealed.join("Cargo.lock"), "# generated\n")?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let changes = ChangeService::new(directory.path());
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000))?;
+        let patch = "--- a/sealed/Cargo.lock\n+++ b/sealed/Cargo.lock\n@@ -1 +1 @@\n-# generated\n+# regenerated\n";
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.to_owned().into(),
+            },
+        );
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o755))?;
+        let error = result.expect_err("an unreadable source directory is a storage failure");
+        assert_eq!(error.descriptor().code(), "storage_failure");
+        Ok(())
+    }
+
+    /// `resolve_create` asks [`crate::publish::resolve_write_target`] first, which stats
+    /// the same path and already turns a stat failure into `storage_failure` before
+    /// `creation_conflict` runs - so this drives `creation_conflict` directly, the only
+    /// way to prove its own stat-error arm rather than the one upstream of it.
+    #[cfg(unix)]
+    #[test]
+    fn creation_conflict_on_an_unreadable_directory_is_a_storage_failure() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir()?;
+        let sealed = directory.path().join("sealed");
+        fs::create_dir(&sealed)?;
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000))?;
+        let path = CoreProjectPath::new("sealed/fresh.rs").expect("fixture path validates");
+        let result = creation_conflict(directory.path(), &path);
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o755))?;
+        let error = result.expect_err("an unreadable directory is a storage failure");
+        assert_eq!(error.descriptor().code(), "storage_failure");
         Ok(())
     }
 
@@ -2527,7 +2830,7 @@ mod tests {
         assert_eq!(original.base_start(), Some(12));
         assert_eq!(original.base_end(), Some(19), "12 plus the line's 7 bytes");
 
-        let patched = super::ImageLine::Patched("beacon\n");
+        let patched = super::ImageLine::Patched("beacon\n".to_owned());
         assert_eq!(
             patched.base_start(),
             None,
@@ -2704,8 +3007,8 @@ mod tests {
             .err()
             .ok_or("wrong counts plus unmatchable content must still refuse")?;
         assert_eq!(detail.ordinal, 1);
-        assert_eq!(detail.expected, "vanished");
-        assert_eq!(detail.observed, "one");
+        assert_eq!(detail.expected, "vanished (LF ending)");
+        assert_eq!(detail.observed, "one (LF ending)");
         assert!(
             detail.header.contains("@@ -1 +1 @@"),
             "the refusal reports the recounted header (one line each side), not the original \

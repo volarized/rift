@@ -277,6 +277,15 @@ impl ErrorDescriptor {
     pub const fn action(self) -> &'static str {
         self.action
     }
+
+    /// Returns this descriptor with `action` replacing the registry's own: for a fault
+    /// whose specific cause the registry's shared action would misdirect, such as a
+    /// capability no configuration can ever provide.
+    #[must_use]
+    pub(crate) const fn with_action(mut self, action: &'static str) -> Self {
+        self.action = action;
+        self
+    }
 }
 
 /// Typed detail attached to one operating failure.
@@ -359,6 +368,15 @@ pub trait Fault: fmt::Debug {
     /// for a `limit_exceeded` fault that cannot state a required value. A kind that
     /// classifies as `limit_exceeded` and overrides this must keep both consistent.
     fn limit_evidence(&self) -> Option<LimitEvidence> {
+        None
+    }
+
+    /// Replaces the registry's shared action for this identity, for a fault whose
+    /// specific cause makes that action misleading - a capability no configuration can
+    /// ever provide, unlike another fault classifying under the same identity. `None`
+    /// renders the registry's own action, which is the answer for every fault kind that
+    /// does not override it.
+    fn action_override(&self) -> Option<&'static str> {
         None
     }
 }
@@ -444,7 +462,11 @@ impl<K: Fault> From<K> for Error<K> {
 
 impl<K: Fault> fmt::Display for Error<K> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&render_failure(self.descriptor(), &self.context()))
+        let descriptor = match self.kind.action_override() {
+            Some(action) => self.descriptor().with_action(action),
+            None => self.descriptor(),
+        };
+        formatter.write_str(&render_failure(descriptor, &self.context()))
     }
 }
 

@@ -39,10 +39,17 @@ pub enum ReadFault {
     History(HistoryError),
     /// A language engine failed while serving the request.
     Engine(rift_lsp::session::EngineError),
-    /// Request uses functionality this release does not serve.
+    /// Request uses functionality this release does not serve, where configuring the
+    /// workspace could serve it.
     Unsupported {
         /// The unserved capability the request named.
         capability: String,
+    },
+    /// A path's extension carries no shipped syntax provider, so no workspace
+    /// configuration can ever serve a syntax read at this path.
+    UnclaimedExtension {
+        /// The extension named, or a statement that the path carries none.
+        extension: String,
     },
     /// Request is invalid for direct workspace reads.
     Invalid {
@@ -100,7 +107,9 @@ impl Fault for ReadFault {
             Self::Index(source) => source.descriptor().name(),
             Self::History(source) => source.descriptor().name(),
             Self::Engine(source) => source.name(),
-            Self::Unsupported { .. } => ErrorName::Wire(ErrorCode::CapabilityUnavailable),
+            Self::Unsupported { .. } | Self::UnclaimedExtension { .. } => {
+                ErrorName::Wire(ErrorCode::CapabilityUnavailable)
+            }
             Self::Invalid { .. } => ErrorName::Wire(ErrorCode::InvalidRequest),
             Self::NotFound { .. } => ErrorName::Wire(ErrorCode::ResourceNotFound),
             Self::SourceUnavailable { .. } => ErrorName::Wire(ErrorCode::ContentUnavailable),
@@ -119,6 +128,9 @@ impl Fault for ReadFault {
             Self::Engine(source) => source.context(),
             Self::Unsupported { capability } => {
                 vec![ErrorContext::new("capability", capability.clone())]
+            }
+            Self::UnclaimedExtension { extension } => {
+                vec![ErrorContext::new("capability", extension.clone())]
             }
             Self::Invalid { field, violation } => vec![
                 ErrorContext::new("field", *field),
@@ -156,6 +168,7 @@ impl Fault for ReadFault {
             Self::History(source) => Some(source),
             Self::Engine(source) => Some(source),
             Self::Unsupported { .. }
+            | Self::UnclaimedExtension { .. }
             | Self::Invalid { .. }
             | Self::NotFound { .. }
             | Self::SourceUnavailable { .. }
@@ -165,12 +178,29 @@ impl Fault for ReadFault {
             | Self::CapacityTimeout { .. } => None,
         }
     }
+
+    /// A path whose extension no shipped provider parses can never be served: unlike
+    /// [`Self::Unsupported`], which also classifies a capability the operator could turn
+    /// on, no `rift.toml` table adds a syntax grammar this release does not ship.
+    fn action_override(&self) -> Option<&'static str> {
+        match self {
+            Self::UnclaimedExtension { .. } => Some("address a path a shipped provider parses"),
+            _ => None,
+        }
+    }
 }
 
 impl ReadFault {
     pub(crate) fn unsupported(capability: impl Into<String>) -> ReadError {
         Error::new(Self::Unsupported {
             capability: capability.into(),
+        })
+    }
+
+    /// Classifies a path whose extension no shipped provider parses.
+    pub(crate) fn unclaimed_extension(extension: impl Into<String>) -> ReadError {
+        Error::new(Self::UnclaimedExtension {
+            extension: extension.into(),
         })
     }
 
@@ -512,8 +542,8 @@ impl ReadService {
 
     /// The failure for a path the syntax index does not hold: `content_unavailable` when
     /// this snapshot's own warnings name `path` as holding invalid UTF-8 - the file exists
-    /// but could not be read - `Unsupported` naming the unparsed extension when no shipped
-    /// provider parses `path` and this snapshot can confirm the path is real, and
+    /// but could not be read - `UnclaimedExtension` naming the unparsed extension when no
+    /// shipped provider parses `path` and this snapshot can confirm the path is real, and
     /// `not_found` for everything else, including a claimed extension the index simply has
     /// not read.
     fn missing_file_fault(&self, path: &CoreProjectPath) -> ReadError {
@@ -521,7 +551,7 @@ impl ReadService {
             return ReadFault::source_unavailable(path.as_str());
         }
         match self.unclaimed_extension_capability(path) {
-            Ok(Some(capability)) => ReadFault::unsupported(capability),
+            Ok(Some(extension)) => ReadFault::unclaimed_extension(extension),
             Ok(None) => ReadFault::not_found(path.as_str()),
             Err(storage_fault) => storage_fault,
         }
@@ -1783,16 +1813,22 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn nodes_on_an_unparsed_path_names_its_extension() -> TestResult {
+    fn nodes_on_an_unparsed_path_names_its_extension_without_configuration_advice() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("Cargo.lock"), "# generated\n")?;
         let service = nodes_service(directory.path(), &SourceVisibility::default())?;
         let error = nodes_at_root(&service, "Cargo.lock")
             .expect_err("an unparsed extension must be rejected");
-        let ReadFault::Unsupported { capability } = error.fault() else {
-            panic!("expected Unsupported, got {:?}", error.fault());
+        let ReadFault::UnclaimedExtension { extension } = error.fault() else {
+            panic!("expected UnclaimedExtension, got {:?}", error.fault());
         };
-        assert_eq!(capability, "lock files", "the refusal names the extension");
+        assert_eq!(extension, "lock files", "the refusal names the extension");
+        assert_eq!(error.descriptor().code(), "capability_unavailable");
+        assert!(
+            !error.to_string().contains("configure a provider"),
+            "no configuration can ever add a shipped grammar, so the message must not \
+             suggest one: {error}"
+        );
         Ok(())
     }
 
@@ -1834,11 +1870,11 @@ pub fn compute() -> i32 {
         let service = nodes_service(directory.path(), &SourceVisibility::default())?;
         let error = nodes_at_root(&service, "justfile")
             .expect_err("an unparsed extension must be rejected");
-        let ReadFault::Unsupported { capability } = error.fault() else {
-            panic!("expected Unsupported, got {:?}", error.fault());
+        let ReadFault::UnclaimedExtension { extension } = error.fault() else {
+            panic!("expected UnclaimedExtension, got {:?}", error.fault());
         };
         assert_eq!(
-            capability, "files with no extension",
+            extension, "files with no extension",
             "justfile carries no extension at all"
         );
         Ok(())
@@ -2665,11 +2701,11 @@ pub fn compute() -> i32 {
                 rev: Some(RevisionId("main".to_owned())),
             })
             .expect_err("an unparsed extension must be rejected at a revision too");
-        let ReadFault::Unsupported { capability } = error.fault() else {
-            panic!("expected Unsupported, got {:?}", error.fault());
+        let ReadFault::UnclaimedExtension { extension } = error.fault() else {
+            panic!("expected UnclaimedExtension, got {:?}", error.fault());
         };
         assert_eq!(
-            capability, "lock files",
+            extension, "lock files",
             "a revision snapshot carries no filesystem policy, so the extension alone \
              decides: nodes can never serve an unclaimed one, whatever tree it reads"
         );
