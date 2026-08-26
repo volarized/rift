@@ -8,9 +8,9 @@ use rift_core::constants::{RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME};
 use rift_core::{ProjectPath as CoreProjectPath, SourceVisibility};
 use rift_index::{LexicalIndexLimits, PathChanges, WorkspaceIndexLimits, capture_digests};
 use rift_protocol::change::{
-    ChangeResult, ChangeSummary, GuaranteeEvidence, InsertSymbolParams, MoveFileParams,
-    PatchParams, RemoveNodeParams, RemoveSymbolParams, RenameSymbolParams, ReplaceNodeParams,
-    ReplaceSymbolParams,
+    ChangeResult, ChangeSummary, GuaranteeEvidence, InsertNodeParams, InsertSymbolParams,
+    MoveFileParams, PatchParams, RemoveNodeParams, RemoveSymbolParams, RenameSymbolParams,
+    ReplaceNodeParams, ReplaceSymbolParams,
 };
 use rift_protocol::configuration::{
     CommandHook, Duration as WireDuration, EngineConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX,
@@ -1095,6 +1095,22 @@ impl RiftMcp {
         Parameters(params): Parameters<ReplaceNodeParams>,
     ) -> Result<Json<ChangeResult>, ErrorData> {
         self.change(move |reads, changes| changes.replace_node(reads, &params))
+            .await
+    }
+
+    /// Inserts new content beside a syntax node addressed through a witnessed address
+    /// from `nodes`. The server recomputes the witness before writing and refuses when
+    /// the bytes drifted, the same check `replace_node` runs. Unlike `insert_symbol`,
+    /// which separates a new declaration from its anchor with a blank line and preserves
+    /// the anchor's indentation, `body` lands verbatim at the node's own boundary with no
+    /// separator of its own: a node is not a declaration, so the caller supplies whatever
+    /// spacing and indentation the inserted bytes need.
+    #[tool]
+    async fn insert_node(
+        &self,
+        Parameters(params): Parameters<InsertNodeParams>,
+    ) -> Result<Json<ChangeResult>, ErrorData> {
+        self.change(move |reads, changes| changes.insert_node(reads, &params))
             .await
     }
 
@@ -2408,6 +2424,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "get_symbol",
+                "insert_node",
                 "insert_symbol",
                 "move_file",
                 "nodes",
@@ -3907,6 +3924,49 @@ pub fn beacon() -> u64 {
             tokio::time::sleep(SEARCH_TIER_POLL).await;
         }
         Err("the pass after a landed change never ranked the inserted declaration".into())
+    }
+
+    /// `insert_symbol` `after`, then `remove_symbol` on exactly what landed, returns the
+    /// file's bytes to the original exactly - the same round trip
+    /// `insert_symbol_after_then_remove_symbol_round_trips_to_the_original_bytes` proves
+    /// against `ChangeService` directly, driven here through the tool methods the MCP
+    /// surface advertises.
+    #[tokio::test]
+    async fn insert_symbol_after_then_remove_symbol_round_trips_through_the_mcp_surface()
+    -> TestResult {
+        let (directory, server) = fixture().await?;
+        let original = fs::read_to_string(directory.path().join("lib.rs"))?;
+
+        let insert = serde_json::from_value(json!({
+            "anchor": "rift://symbol/rust/lib.rs/beacon",
+            "position": "after",
+            "body": "pub fn tail() {}"
+        }))?;
+        let inserted = server.insert_symbol(Parameters(insert)).await?.0;
+        assert!(
+            matches!(
+                inserted,
+                rift_protocol::change::ChangeResult::Applied { .. }
+            ),
+            "the insertion must land: {inserted:#?}"
+        );
+
+        let remove = serde_json::from_value(json!({
+            "symbol": "rift://symbol/rust/lib.rs/tail",
+            "force": false
+        }))?;
+        let removed = server.remove_symbol(Parameters(remove)).await?.0;
+        assert!(
+            matches!(removed, rift_protocol::change::ChangeResult::Applied { .. }),
+            "the removal must land: {removed:#?}"
+        );
+
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(
+            written, original,
+            "insert then remove through the MCP surface must return the original bytes"
+        );
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]

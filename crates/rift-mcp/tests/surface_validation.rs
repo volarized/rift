@@ -94,13 +94,6 @@ fn corpus() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
-            "replace_node",
-            json!({
-                "node": "rift://node/rust/lib.rs@0-22#00000000",
-                "body": "pub fn beacon_one() {}"
-            }),
-        ),
-        (
             "replace_symbol",
             json!({
                 "symbol": "rift://symbol/rust/lib.rs/beacon_three",
@@ -117,6 +110,7 @@ fn corpus() -> Vec<(&'static str, Value)> {
             }),
         ),
     ];
+    requests.extend(node_write_corpus());
     requests.extend(patch_corpus());
     requests.extend(move_file_corpus());
     requests.extend(revision_read_corpus());
@@ -159,6 +153,41 @@ fn remove_corpus() -> Vec<(&'static str, Value)> {
             json!({
                 "node": "rift://node/rust/remove_caller.rs@0-48#00000000",
                 "force": false
+            }),
+        ),
+    ]
+}
+
+/// The node writers, each addressing a witnessed range: `replace_node` over a stale
+/// witness, `insert_node` over a fresh one and over a stale one.
+///
+/// The applied insertion addresses `remove_watched.rs`, whose declaration only
+/// `remove_symbol` reaches later and only by symbol name, so the insertion cannot move a
+/// byte range a later entry depends on. The body carries its own trailing newline: the
+/// tool adds no separator of its own.
+fn node_write_corpus() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "replace_node",
+            json!({
+                "node": "rift://node/rust/lib.rs@0-22#00000000",
+                "body": "pub fn beacon_one() {}"
+            }),
+        ),
+        (
+            "insert_node",
+            json!({
+                "anchor": "rift://node/rust/remove_watched.rs@0-26#d662e01c",
+                "position": "before",
+                "body": "pub fn beacon_inserted() {}\n"
+            }),
+        ),
+        (
+            "insert_node",
+            json!({
+                "anchor": "rift://node/rust/lib.rs@0-22#00000000",
+                "position": "after",
+                "body": "pub fn never_lands() {}"
             }),
         ),
     ]

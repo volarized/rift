@@ -423,11 +423,13 @@ pub struct ReplaceSymbolParams {
 /// The request carries exactly one of `anchor` or `file`; an anchored insertion lands
 /// beside the whole declaration, attached outer attributes and doc comments included.
 ///
-/// `body` inserted `before` its anchor is spliced in verbatim at the anchor's start byte,
-/// so its first line inherits the anchor's column and every later line carries its own.
-/// `body` inserted `after` its anchor, or at a file target either side, always starts a
-/// fresh line at column zero: it lands past the blank line that separates it from what
-/// came before.
+/// `body` inserted `before` its anchor is spliced in verbatim at the anchor's start byte, so
+/// its first line inherits the anchor's column, and a blank line separates it from the
+/// anchor that follows. The anchor's own leading indentation - spaces or tabs alone - is
+/// copied back after that blank line, so the anchor keeps its column too; an anchor that
+/// shares its line with other source keeps none. `body` inserted `after` its anchor, or at a
+/// file target either side, always starts a fresh line at column zero, past the same
+/// blank-line separator. The separator uses the source file's own line ending.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(extend("rift:since" = "v0.0.6"))]
@@ -482,6 +484,34 @@ pub struct ReplaceNodeParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<RegionRole>,
     /// The replacement source, inline or read from a file.
+    pub body: BodySource,
+}
+
+/// Inserts new content beside a syntax node addressed through a witnessed address from
+/// `nodes`. The server recomputes the witness before writing and refuses when the bytes
+/// drifted, the same check `replace_node` runs.
+///
+/// `body` lands verbatim at the node's own boundary, with no separator of its own: a node is
+/// not a declaration, so `insert_symbol`'s blank-line spacing and column preservation do not
+/// apply here, and the caller supplies whatever spacing the inserted bytes need.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+#[schemars(extend("rift:since" = "v0.0.20"))]
+#[schemars(extend("examples" = [
+    {
+        "anchor": "rift://node/rust/src/config.rs@334-353#4df4426e",
+        "position": "after",
+        "body": "\nparse_config(text.trim());"
+    }
+]))]
+#[schemars(transform = schema::declare_insert_node_body_length)]
+pub struct InsertNodeParams {
+    /// The node the new content lands beside, witness included.
+    pub anchor: NodeId,
+    /// Which side of the node receives the new content.
+    pub position: InsertPosition,
+    /// The new content, spliced in verbatim with no added separator. Inline or read from a
+    /// file.
     pub body: BodySource,
 }
 
@@ -780,6 +810,28 @@ mod tests {
         let result = serde_json::from_value::<ReplaceSymbolParams>(json!({
             "symbol": "rift://symbol/rust/foo",
             "body": {"file": "/tmp/change.diff", "extra": 1}
+        }));
+        assert!(result.is_err());
+    }
+
+    /// `InsertNodeParams` decodes `anchor`, `position`, and `body`, and rejects a request
+    /// carrying an unknown field alongside them.
+    #[test]
+    fn insert_node_params_decodes_required_fields_and_rejects_unknown_fields() {
+        let params: InsertNodeParams = serde_json::from_value(json!({
+            "anchor": "rift://node/rust/foo.rs@0-1#00000000",
+            "position": "after",
+            "body": "fn b() {}"
+        }))
+        .expect("insert_node params deserialize");
+        assert_eq!(params.position, InsertPosition::After);
+        assert_eq!(params.body, BodySource::Inline("fn b() {}".to_owned()));
+
+        let result = serde_json::from_value::<InsertNodeParams>(json!({
+            "anchor": "rift://node/rust/foo.rs@0-1#00000000",
+            "position": "after",
+            "body": "fn b() {}",
+            "extra": 1
         }));
         assert!(result.is_err());
     }
