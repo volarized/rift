@@ -1413,6 +1413,77 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
+    /// One read service over `directory` under `visibility`, the shape every
+    /// `nodes` classification test builds.
+    fn nodes_service(
+        directory: &std::path::Path,
+        visibility: &SourceVisibility,
+    ) -> Result<ReadService, super::ReadError> {
+        let limits = WorkspaceIndexLimits::default();
+        let inclusion = rift_core::TextFileInclusion::default();
+        ReadService::build(
+            directory,
+            limits,
+            visibility,
+            &inclusion,
+            HistoryConfiguration::default(),
+        )
+    }
+
+    fn nodes_at_root(service: &ReadService, path: &str) -> Result<NodesResult, super::ReadError> {
+        service.nodes(NodesParams {
+            path: ProjectPath(path.to_owned()),
+            position: 0,
+            projection: None,
+            rev: None,
+        })
+    }
+
+    #[test]
+    fn nodes_on_an_unparsed_path_names_its_extension() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("Cargo.lock"), "# generated\n")?;
+        let service = nodes_service(directory.path(), &SourceVisibility::default())?;
+        let error = nodes_at_root(&service, "Cargo.lock")
+            .expect_err("an unparsed extension must be rejected");
+        let ReadFault::Unsupported { capability } = error.fault() else {
+            panic!("expected Unsupported, got {:?}", error.fault());
+        };
+        assert_eq!(capability, "lock files", "the refusal names the extension");
+        Ok(())
+    }
+
+    #[test]
+    fn nodes_on_a_source_excluded_unparsed_path_stays_not_found() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("Cargo.lock"), "# generated\n")?;
+        let visibility = SourceVisibility::new(Vec::new(), vec!["Cargo.lock".to_owned()], false);
+        let service = nodes_service(directory.path(), &visibility)?;
+        let error =
+            nodes_at_root(&service, "Cargo.lock").expect_err("an excluded path must be rejected");
+        assert!(
+            matches!(error.fault(), ReadFault::NotFound { .. }),
+            "the workspace asked for this path to be invisible, so nodes cannot name a \
+             capability for it: {:?}",
+            error.fault()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nodes_on_an_absent_unparsed_path_stays_not_found() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let service = nodes_service(directory.path(), &SourceVisibility::default())?;
+        let error =
+            nodes_at_root(&service, "absent.lock").expect_err("an absent path must be rejected");
+        assert!(
+            matches!(error.fault(), ReadFault::NotFound { .. }),
+            "no file stands at that path, so there is no capability to name: {:?}",
+            error.fault()
+        );
+        Ok(())
+    }
+
     #[test]
     fn nodes_on_a_visible_unparsed_path_names_the_extension() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -2180,6 +2251,29 @@ pub fn compute() -> i32 {
             &SourceVisibility::default(),
             HistoryConfiguration::default(),
         )
+    }
+
+    #[test]
+    fn revision_nodes_on_an_unparsed_path_names_the_extension_without_a_policy() -> TestResult {
+        let directory = committed_fixture()?;
+        let service = revision_service(directory.path(), "main")?;
+        let error = service
+            .nodes(NodesParams {
+                path: ProjectPath("Cargo.lock".to_owned()),
+                position: 0,
+                projection: None,
+                rev: Some(RevisionId("main".to_owned())),
+            })
+            .expect_err("an unparsed extension must be rejected at a revision too");
+        let ReadFault::Unsupported { capability } = error.fault() else {
+            panic!("expected Unsupported, got {:?}", error.fault());
+        };
+        assert_eq!(
+            capability, "lock files",
+            "a revision snapshot carries no filesystem policy, so the extension alone \
+             decides: nodes can never serve an unclaimed one, whatever tree it reads"
+        );
+        Ok(())
     }
 
     #[test]
