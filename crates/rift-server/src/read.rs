@@ -1488,20 +1488,9 @@ pub fn compute() -> i32 {
     fn nodes_on_a_visible_unparsed_path_names_the_extension() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("justfile"), "default:\n    echo hi\n")?;
-        let service = ReadService::build(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::default(),
-            HistoryConfiguration::default(),
-        )?;
-        let result = service.nodes(NodesParams {
-            path: ProjectPath("justfile".to_owned()),
-            position: 0,
-            projection: None,
-            rev: None,
-        });
-        let error = result.expect_err("an unparsed extension must be rejected");
+        let service = nodes_service(directory.path(), &SourceVisibility::default())?;
+        let error = nodes_at_root(&service, "justfile")
+            .expect_err("an unparsed extension must be rejected");
         let ReadFault::Unsupported { capability } = error.fault() else {
             panic!("expected Unsupported, got {:?}", error.fault());
         };
