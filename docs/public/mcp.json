@@ -3762,7 +3762,7 @@
       }
     },
     {
-      "description": "Lists the syntax nodes covering one UTF-8 byte position in one file,\noutermost first. Each identity carries a witness, so an address taken\nfrom this listing refuses cleanly once the file's bytes drift. `rev`\nlists the nodes as of a version-control revision instead of the\ncurrent tree.",
+      "description": "Lists the syntax nodes covering one UTF-8 byte position in one file,\noutermost first. Each identity carries a witness, so an address taken\nfrom this listing refuses cleanly once the file's bytes drift. `rev`\nlists the nodes as of a version-control revision instead of the\ncurrent tree. A visible path no syntax provider parses refuses\n`capability_unavailable`, naming the extension.",
       "input_schema": {
         "$defs": {
           "ProjectPath": {
@@ -4569,7 +4569,7 @@
       }
     },
     {
-      "description": "Applies unified-diff hunks to workspace files atomically. Hunk\ncontext guards the change: a header's line numbers are hints and\nits line counts are read from the hunk's own body, as with\n`git apply`. A `/dev/null` header creates or deletes the file. The\nresult carries one edit per hunk, spanning the bytes it replaced.",
+      "description": "Applies unified-diff hunks to workspace files atomically. The target is any\nfile the workspace's `[source]` policy makes visible, parsed or not. Hunk\ncontext guards the change: a header's line numbers are hints and\nits line counts are read from the hunk's own body, as with\n`git apply`. A `/dev/null` header creates or deletes the file. The\nresult carries one edit per hunk, spanning the bytes it replaced.",
       "input_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
@@ -4580,7 +4580,7 @@
         ],
         "properties": {
           "patch": {
-            "description": "A unified diff. Hunk context guards the change: a header's line numbers are\nhints and its line counts are read from the hunk's own body, as with\n`git apply`. `/dev/null` headers create or delete files.",
+            "description": "A unified diff. The addressed file is any workspace file the `[source]` policy\nmakes visible, whether or not a syntax provider parses it. Hunk context guards\nthe change: a header's line numbers are hints and its line counts are read\nfrom the hunk's own body, as with `git apply`. `/dev/null` headers create or\ndelete files.",
             "maxLength": 4194304,
             "minLength": 1,
             "type": "string"

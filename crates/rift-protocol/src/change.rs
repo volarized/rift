@@ -583,9 +583,11 @@ pub struct RemoveNodeParams {
     }
 ]))]
 pub struct PatchParams {
-    /// A unified diff. Hunk context guards the change: a header's line numbers are
-    /// hints and its line counts are read from the hunk's own body, as with
-    /// `git apply`. `/dev/null` headers create or delete files.
+    /// A unified diff. The addressed file is any workspace file the `[source]` policy
+    /// makes visible, whether or not a syntax provider parses it. Hunk context guards
+    /// the change: a header's line numbers are hints and its line counts are read
+    /// from the hunk's own body, as with `git apply`. `/dev/null` headers create or
+    /// delete files.
     #[schemars(length(min = 1, max = 4_194_304))]
     pub patch: String,
 }

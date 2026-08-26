@@ -469,9 +469,22 @@ impl WorkspaceSourcePolicy {
         })
     }
 
-    /// Returns whether one source or included-text path passes current workspace policy.
-    /// Source and text-file candidates share this one predicate: only the extension gate
-    /// that includes a path in either class differs between them.
+    /// Whether `path` is visible to the workspace: above the hard floor, kept by the
+    /// `[source]` policy, and not excluded by the workspace's `.gitignore` chain.
+    /// Visibility is what the change tools reach. The index narrows it further to the
+    /// extensions a syntax provider or the text policy claims - see [`Self::includes`].
+    #[must_use]
+    pub fn visible(&self, path: &Path) -> bool {
+        let Some(path) = self.normalized_path(path) else {
+            return false;
+        };
+        self.visible_normalized(path.as_ref())
+    }
+
+    /// Returns whether one source or included-text path passes current workspace policy:
+    /// visible, and carrying an extension a syntax provider serves or `[source.text]`
+    /// includes. Source and text-file candidates share this one predicate: only the
+    /// extension gate that includes a path in either class differs between them.
     #[must_use]
     pub fn includes(&self, path: &Path) -> bool {
         let Some(path) = self.normalized_path(path) else {
@@ -479,8 +492,16 @@ impl WorkspaceSourcePolicy {
         };
         let path = path.as_ref();
         let extension_included = has_source_extension(path) || self.text_inclusion.includes(path);
+        extension_included && self.visible_normalized(path)
+    }
+
+    /// Carries the checks [`Self::visible`] and [`Self::includes`] share, against a path
+    /// [`Self::normalized_path`] already resolved: above the hard floor, kept by the
+    /// `[source]` matcher, and not excluded by the workspace's `.gitignore` chain. Neither
+    /// caller normalizes twice.
+    fn visible_normalized(&self, path: &Path) -> bool {
         let above_hard_floor = hard_floor_includes_path(&self.root, path);
-        if !extension_included || !above_hard_floor {
+        if !above_hard_floor {
             return false;
         }
         let configuration_includes = self.matcher.includes(path);
@@ -2202,6 +2223,55 @@ mod tests {
         assert!(
             !policy.includes(&directory.path().join("logo.png")),
             "an extension outside both included sets must be refused"
+        );
+    }
+
+    #[test]
+    fn test_workspace_source_policy_visible_reaches_files_no_syntax_provider_parses() {
+        let directory = fixture();
+        fs::create_dir(directory.path().join("target")).expect("target directory");
+        fs::write(directory.path().join(".gitignore"), "hidden.mdx\n").expect("ignore policy");
+        fs::write(directory.path().join("justfile"), "default:\n    echo hi\n")
+            .expect("no extension at all");
+        fs::write(directory.path().join("guide.mdx"), "guide").expect("no syntax provider");
+        fs::write(directory.path().join("hidden.mdx"), "secret").expect("gitignored candidate");
+        fs::write(
+            directory.path().join("excluded.rs"),
+            "pub fn excluded() {}\n",
+        )
+        .expect("excluded candidate");
+        let visibility = SourceVisibility::new(Vec::new(), vec!["excluded.rs".to_owned()], true);
+        let policy = WorkspaceSourcePolicy::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &visibility,
+            &TextFileInclusion::default(),
+        )
+        .expect("source policy");
+
+        assert!(
+            policy.visible(&directory.path().join("justfile")),
+            "a tracked file no provider parses at all is still visible - patch reaches it"
+        );
+        assert!(
+            !policy.includes(&directory.path().join("justfile")),
+            "the extension gate still stands: the index never holds it"
+        );
+        assert!(
+            policy.visible(&directory.path().join("guide.mdx")),
+            "a tracked file no syntax provider parses is visible"
+        );
+        assert!(
+            !policy.visible(&directory.path().join("target/build.log")),
+            "the hard floor refuses visibility below it, the same as inclusion"
+        );
+        assert!(
+            !policy.visible(&directory.path().join("excluded.rs")),
+            "a [source].exclude match refuses visibility, not only inclusion"
+        );
+        assert!(
+            !policy.visible(&directory.path().join("hidden.mdx")),
+            "a gitignored path refuses visibility, not only inclusion"
         );
     }
 

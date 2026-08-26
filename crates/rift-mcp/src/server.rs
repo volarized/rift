@@ -1057,7 +1057,8 @@ impl RiftMcp {
     /// outermost first. Each identity carries a witness, so an address taken
     /// from this listing refuses cleanly once the file's bytes drift. `rev`
     /// lists the nodes as of a version-control revision instead of the
-    /// current tree.
+    /// current tree. A visible path no syntax provider parses refuses
+    /// `capability_unavailable`, naming the extension.
     #[tool]
     async fn nodes(
         &self,
@@ -1222,7 +1223,8 @@ impl RiftMcp {
         }
     }
 
-    /// Applies unified-diff hunks to workspace files atomically. Hunk
+    /// Applies unified-diff hunks to workspace files atomically. The target is any
+    /// file the workspace's `[source]` policy makes visible, parsed or not. Hunk
     /// context guards the change: a header's line numbers are hints and
     /// its line counts are read from the hunk's own body, as with
     /// `git apply`. A `/dev/null` header creates or deletes the file. The
@@ -1258,7 +1260,7 @@ impl RiftMcp {
         let configuration = published.configuration.accepted(wire::ErrorPhase::Read)?;
         if !configuration.providers.history.enabled {
             return Err(ReadError::from(ReadFault::Unsupported {
-                capability: "revision reads (providers.history disabled)",
+                capability: "revision reads (providers.history disabled)".to_owned(),
             })
             .tool_error(wire::ErrorPhase::Read));
         }
@@ -2265,7 +2267,7 @@ mod tests {
         let error = executor
             .run("refused operation", || -> Result<(), ReadError> {
                 Err(ReadError::from(ReadFault::Unsupported {
-                    capability: "probe",
+                    capability: "probe".to_owned(),
                 }))
             })
             .await
@@ -3063,11 +3065,11 @@ pub fn beacon() -> u64 {
         });
         let changes = ChangeService::new(directory.path());
         let root = directory.path().to_path_buf();
-        // `files_max=1` accepts the workspace's single Rust source file for `ReadService::build`,
-        // which never counts `.gitignore` files. `WorkspaceSourcePolicy::build` re-walks for
-        // `.gitignore` files specifically and counts each one against that same bound, so a
-        // second `.gitignore` written by the change trips `TooManyFiles` there even though the
-        // read-side rebuild already succeeded.
+        // `files_max=1` accepts the workspace's single Rust source file: the source scan
+        // never counts `.gitignore` files. `ReadService::build` also compiles the `[source]`
+        // policy right after that scan, and its `GitignoreChain` walk counts each `.gitignore`
+        // file against that same bound, so two `.gitignore` files written by the change trip
+        // `TooManyFiles` there even though the source scan alone already succeeded.
         let tight_limits = WorkspaceIndexLimits::new(1, 1_048_576, 10_485_760, 16, 5)
             .expect("tight limits accept exactly one file");
         let outcome = RiftMcp::change_serialized(

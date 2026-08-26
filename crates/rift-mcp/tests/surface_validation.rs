@@ -211,6 +211,15 @@ fn patch_corpus() -> Vec<(&'static str, Value)> {
                 "patch": "--- a/lib.rs\n+++ b/renamed.rs\n@@ -1 +1 @@\n-pub fn beacon_one() -> u8 { 1 }\n+pub fn beacon_one() -> u8 { 1 }\n"
             }),
         ),
+        // `justfile` carries no extension at all, so no syntax provider and no
+        // `[search.text]` extension admit it; `patch` still reaches it through the
+        // `[source]` policy alone.
+        (
+            "patch",
+            json!({
+                "patch": "--- a/justfile\n+++ b/justfile\n@@ -1,2 +1,2 @@\n default:\n-    echo hi\n+    echo hello\n"
+            }),
+        ),
     ]
 }
 
@@ -522,6 +531,11 @@ async fn served_fixture() -> TestResult<(
         directory.path().join("remove_caller.rs"),
         "pub fn calls_watched() {\n    beacon_watched();\n}\n",
     )?;
+    // No extension gate admits it: no syntax provider claims it and no `[search.text]`
+    // extension includes it. Visible to the `[source]` policy all the same, so `patch`
+    // reaches it and `nodes` refuses `capability_unavailable` naming its missing
+    // extension.
+    fs::write(directory.path().join("justfile"), "default:\n    echo hi\n")?;
     // A committed baseline, so the corpus can prove revision-addressed reads:
     // `hidden.rs` stays gitignored and uncommitted, everything else lands in
     // the fixture's one commit on `main`.
@@ -881,6 +895,35 @@ async fn miscounted_hunk_header_applies_and_reports_its_own_region() -> TestResu
         "the edit names the second declaration's own line: {applied:#}"
     );
     assert_eq!(edits[0]["text"], json!("pub fn beacon_two() -> u8 { 2 }\n"));
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A visible path no syntax provider parses refuses `capability_unavailable`, naming
+/// the extension - `nodes` can never serve it whatever tree it is pointed at.
+#[tokio::test]
+async fn nodes_on_an_unparsed_visible_path_names_the_extension() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+
+    let error = client
+        .call_tool(
+            CallToolRequestParams::new("nodes")
+                .with_arguments(arguments(&json!({ "path": "justfile", "position": 0 }))?),
+        )
+        .await
+        .expect_err("an unparsed extension must be rejected");
+    let rmcp::ServiceError::McpError(data) = error else {
+        panic!("expected protocol-level McpError, got {error:?}");
+    };
+    let wire = data.data.ok_or("wire error data must be present")?;
+    assert_eq!(wire["code"], json!("capability_unavailable"));
+    let message = wire["message"].as_str().ok_or("message must be a string")?;
+    assert!(
+        message.contains("files with no extension"),
+        "the refusal must name what governs the missing provider: {message}"
+    );
 
     client.cancel().await?;
     server_task.await?;
