@@ -2169,6 +2169,10 @@ mod tests {
         )
         .expect("source policy");
 
+        assert!(
+            !policy.visible(std::path::Path::new("/nowhere/outside/the/root.rs")),
+            "a path that does not normalize under the watched root is not visible"
+        );
         assert!(policy.includes(&directory.path().join("src/lib.rs")));
         assert!(!policy.includes(&directory.path().join("src/ignored.rs")));
         assert!(!policy.includes(&directory.path().join("src/generated/code.rs")));
