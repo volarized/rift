@@ -9,6 +9,11 @@
 //! precondition and an unsupported file-level change - plus a live witnessed
 //! `replace_node` that lands after the walk.
 
+// `fake_engine` is a shared helper file compiled separately into every test binary that
+// declares it; this binary calls only `engine_configuration`, so `counted` and `recorded`
+// read as dead code here even though `rename_symbol.rs` and `move_file.rs` call them.
+#[allow(dead_code)]
+mod fake_engine;
 mod hermetic_search;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -118,7 +123,47 @@ fn corpus() -> Vec<(&'static str, Value)> {
     requests.extend(revision_read_corpus());
     requests.extend(insert_symbol_file_target_corpus());
     requests.extend(lexical_search_corpus());
+    requests.extend(remove_corpus());
     requests
+}
+
+/// `remove_symbol` requests against the `[engines.fake]` references-only engine: a clean
+/// removal with no reference to find, a refusal when one stands, and the same target applied
+/// under `force` once the refusal has proven the tree stayed untouched.
+fn remove_corpus() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "remove_symbol",
+            json!({
+                "symbol": "rift://symbol/rust/remove_lonely.rs/beacon_lonely",
+                "force": false
+            }),
+        ),
+        (
+            "remove_symbol",
+            json!({
+                "symbol": "rift://symbol/rust/remove_watched.rs/beacon_watched",
+                "force": false
+            }),
+        ),
+        (
+            "remove_symbol",
+            json!({
+                "symbol": "rift://symbol/rust/remove_watched.rs/beacon_watched",
+                "force": true
+            }),
+        ),
+        // A stale witness, proving `remove_node` reaches the same witness verification
+        // `replace_node` shares through `resolve_node`; the live-fetched witness case runs in
+        // `live_witnessed_remove_node_checks_references_and_validates`.
+        (
+            "remove_node",
+            json!({
+                "node": "rift://node/rust/lib.rs@0-18#00000000",
+                "force": false
+            }),
+        ),
+    ]
 }
 
 /// `patch` requests: modifying, creating, and renaming a file, each proving one
@@ -154,7 +199,25 @@ fn patch_corpus() -> Vec<(&'static str, Value)> {
         (
             "patch",
             json!({
+                // The header counts 9 old and 4 new lines over a body
+                // carrying one of each, proving the counts are read from
+                // the body the way `git apply` reads them.
+                "patch": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1,9 +1,4 @@\n-pub fn beacon_two() {}\n+pub fn beacon_two() -> u8 { 2 }\n"
+            }),
+        ),
+        (
+            "patch",
+            json!({
                 "patch": "--- a/lib.rs\n+++ b/renamed.rs\n@@ -1 +1 @@\n-pub fn beacon_one() -> u8 { 1 }\n+pub fn beacon_one() -> u8 { 1 }\n"
+            }),
+        ),
+        // `justfile` carries no extension at all, so no syntax provider and no
+        // `[search.text]` extension admit it; `patch` still reaches it through the
+        // `[source]` policy alone.
+        (
+            "patch",
+            json!({
+                "patch": "--- a/justfile\n+++ b/justfile\n@@ -1,2 +1,2 @@\n default:\n-    echo hi\n+    echo hello\n"
             }),
         ),
     ]
@@ -454,13 +517,38 @@ async fn served_fixture() -> TestResult<(
         directory.path().join("notes.txt"),
         "Beacon telemetry guidance covers rotating every legacy sensor unit safely.\n",
     )?;
+    // Unreferenced anywhere, so removing it proves the checked-clean arm; `remove_watched.rs`
+    // and `remove_caller.rs` give the removal corpus a standing reference to find instead.
+    fs::write(
+        directory.path().join("remove_lonely.rs"),
+        "pub fn beacon_lonely() {}\n",
+    )?;
+    fs::write(
+        directory.path().join("remove_watched.rs"),
+        "pub fn beacon_watched() {}\n",
+    )?;
+    fs::write(
+        directory.path().join("remove_caller.rs"),
+        "pub fn calls_watched() {\n    beacon_watched();\n}\n",
+    )?;
+    // No extension gate admits it: no syntax provider claims it and no `[search.text]`
+    // extension includes it. Visible to the `[source]` policy all the same, so `patch`
+    // reaches it and `nodes` refuses `capability_unavailable` naming its missing
+    // extension.
+    fs::write(directory.path().join("justfile"), "default:\n    echo hi\n")?;
     // A committed baseline, so the corpus can prove revision-addressed reads:
     // `hidden.rs` stays gitignored and uncommitted, everything else lands in
     // the fixture's one commit on `main`.
-    fs::write(
-        directory.path().join("rift.toml"),
-        hermetic_search::SEMANTIC_DISABLED,
-    )?;
+    //
+    // The `[engines.fake]` table claims `rust` and advertises only
+    // `textDocument/references`, so `remove_symbol` and `remove_node` reach a real reference
+    // check without disturbing what every other tool sees: neither `rename_symbol` nor
+    // `move_file` finds a rename or will-rename capability on this engine, so both still
+    // refuse or fall back exactly as they do with no engine configured at all.
+    let mut configuration = hermetic_search::SEMANTIC_DISABLED.to_owned();
+    configuration.push('\n');
+    configuration.push_str(&fake_engine::engine_configuration("references-only", "10s"));
+    fs::write(directory.path().join("rift.toml"), configuration)?;
     rift_history::fixture::init(directory.path());
     rift_history::fixture::commit_all(directory.path(), "fixture baseline");
     let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
@@ -486,6 +574,7 @@ struct CorpusArms {
     applied_changes: usize,
     applied_with_findings: usize,
     refusal_reasons: BTreeSet<String>,
+    precondition_kinds: BTreeSet<String>,
 }
 
 impl CorpusArms {
@@ -504,6 +593,11 @@ impl CorpusArms {
             Some("refused") => {
                 if let Some(reason) = structured["reason"].as_str() {
                     self.refusal_reasons.insert(reason.to_owned());
+                }
+                for precondition in structured["preconditions"].as_array().into_iter().flatten() {
+                    if let Some(kind) = precondition["kind"].as_str() {
+                        self.precondition_kinds.insert(kind.to_owned());
+                    }
                 }
             }
             _ => {}
@@ -533,6 +627,11 @@ impl CorpusArms {
                 self.refusal_reasons
             );
         }
+        assert!(
+            self.precondition_kinds.contains("no_references"),
+            "the corpus must prove the no_references precondition; proven: {:?}",
+            self.precondition_kinds
+        );
     }
 }
 
@@ -762,6 +861,75 @@ async fn rename_symbol_schema_rejects_invalid_requests() -> TestResult {
     Ok(())
 }
 
+/// A hunk whose header counts disagree with its body applies, and the
+/// applied summary names the hunk's own region rather than the whole file.
+#[tokio::test]
+async fn miscounted_hunk_header_applies_and_reports_its_own_region() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+
+    // The body carries one old and one new line under a header claiming 9
+    // and 4. `git apply` reads the counts from the body; so does the server.
+    let miscounted = json!({
+        "patch": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1,9 +1,4 @@\n-pub fn beacon_two() {}\n+pub fn beacon_two() -> u8 { 2 }\n"
+    });
+    let arguments = arguments(&miscounted)?;
+    let request = CallToolRequestParams::new("patch").with_arguments(arguments);
+    let applied = client.call_tool(request).await?;
+    let applied = applied
+        .structured_content
+        .ok_or("patch must return structured content")?;
+    assert_eq!(
+        applied["status"],
+        json!("applied"),
+        "a miscounted header must apply on its context alone: {applied:#}"
+    );
+
+    let edits = applied["summary"]["edits"]
+        .as_array()
+        .ok_or("an applied patch must carry its edits")?;
+    assert_eq!(edits.len(), 1, "one hunk mints one edit: {applied:#}");
+    let span = &edits[0]["span"]["range"];
+    assert_eq!(
+        (span["start"].as_u64(), span["end"].as_u64()),
+        (Some(23), Some(46)),
+        "the edit names the second declaration's own line: {applied:#}"
+    );
+    assert_eq!(edits[0]["text"], json!("pub fn beacon_two() -> u8 { 2 }\n"));
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A visible path no syntax provider parses refuses `capability_unavailable`, naming
+/// the extension - `nodes` can never serve it whatever tree it is pointed at.
+#[tokio::test]
+async fn nodes_on_an_unparsed_visible_path_names_the_extension() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+
+    let error = client
+        .call_tool(
+            CallToolRequestParams::new("nodes")
+                .with_arguments(arguments(&json!({ "path": "justfile", "position": 0 }))?),
+        )
+        .await
+        .expect_err("an unparsed extension must be rejected");
+    let rmcp::ServiceError::McpError(data) = error else {
+        panic!("expected protocol-level McpError, got {error:?}");
+    };
+    let wire = data.data.ok_or("wire error data must be present")?;
+    assert_eq!(wire["code"], json!("capability_unavailable"));
+    let message = wire["message"].as_str().ok_or("message must be a string")?;
+    assert!(
+        message.contains("files with no extension"),
+        "the refusal must name what governs the missing provider: {message}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
 /// A file `insert_symbol` creates lands in the rebuilt snapshot, so a later
 /// read sees the symbol it declares.
 #[tokio::test]
@@ -848,6 +1016,62 @@ async fn live_witnessed_replace_node_lands_and_validates() -> TestResult {
         replaced["status"],
         json!("applied"),
         "a fresh witnessed address must land: {replaced:#}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A fresh witnessed node address round-trips through `remove_node` the way
+/// [`live_witnessed_replace_node_lands_and_validates`] proves it for `replace_node`: the
+/// listed node names `beacon_lonely` - unreferenced anywhere in the fixture - so the
+/// `[engines.fake]` references-only engine checks it clean and the removal applies with no
+/// warning.
+#[tokio::test]
+async fn live_witnessed_remove_node_checks_references_and_validates() -> TestResult {
+    let (directory, client, server_task) = served_fixture().await?;
+    let tools = client.list_all_tools().await?;
+    let validators = tool_validators(&tools)?;
+
+    let listing = client
+        .call_tool(
+            CallToolRequestParams::new("nodes").with_arguments(arguments(
+                &json!({ "path": "remove_lonely.rs", "position": 3 }),
+            )?),
+        )
+        .await?;
+    let listing = listing
+        .structured_content
+        .ok_or("nodes must return structured content")?;
+    let witnessed = listing["nodes"][0]["id"]
+        .as_str()
+        .ok_or("listing must carry a node id")?
+        .to_owned();
+    let removed = client
+        .call_tool(
+            CallToolRequestParams::new("remove_node")
+                .with_arguments(arguments(&json!({ "node": witnessed, "force": false }))?),
+        )
+        .await?;
+    let removed = removed
+        .structured_content
+        .ok_or("remove_node must return structured content")?;
+    let (_, output_validator) = &validators["remove_node"];
+    assert_validates(
+        output_validator,
+        &removed,
+        "live witnessed remove_node result",
+    );
+    assert_eq!(
+        removed["status"],
+        json!("applied"),
+        "an unreferenced declaration removes cleanly: {removed:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("remove_lonely.rs"))?,
+        "",
+        "the sole declaration leaves the file empty: {removed:#}"
     );
 
     client.cancel().await?;

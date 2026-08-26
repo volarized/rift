@@ -107,6 +107,11 @@ interleaved bytes:
   reference the configured [language engine](/docs/configuration#engines) resolves.
 - [`move_file`](/docs/protocol/mcp#tool-move_file) moves one file, and an engine that supports it
   updates the imports that pointed at the old path.
+- [`remove_symbol`](/docs/protocol/mcp#tool-remove_symbol) removes one declaration addressed by
+  symbol, checked against the configured language engine's references first; a standing
+  reference refuses unless `force` applies it anyway.
+- [`remove_node`](/docs/protocol/mcp#tool-remove_node) removes one syntax node through a
+  witnessed address from `nodes`, checked the same way when the node names a declaration.
 
 A change that cannot land returns a refusal naming the failed precondition, and the tree is
 untouched. After a change applies, the server re-parses what it touched and reports parser

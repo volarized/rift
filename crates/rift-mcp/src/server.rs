@@ -9,7 +9,8 @@ use rift_core::{ProjectPath as CoreProjectPath, SourceVisibility};
 use rift_index::{LexicalIndexLimits, PathChanges, WorkspaceIndexLimits, capture_digests};
 use rift_protocol::change::{
     ChangeResult, ChangeSummary, GuaranteeEvidence, InsertSymbolParams, MoveFileParams,
-    PatchParams, RenameSymbolParams, ReplaceNodeParams, ReplaceSymbolParams,
+    PatchParams, RemoveNodeParams, RemoveSymbolParams, RenameSymbolParams, ReplaceNodeParams,
+    ReplaceSymbolParams,
 };
 use rift_protocol::configuration::{
     CommandHook, Duration as WireDuration, EngineConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX,
@@ -27,7 +28,8 @@ use rift_search::{
 };
 use rift_server::{
     ChangeService, EnginePool, HookStatus, MoveResolution, ReadError, ReadFault, ReadService,
-    RenameResolution, engine_change_diagnostics, plan_move, plan_rename, run_hooks,
+    RemoveResolution, RenameResolution, engine_change_diagnostics, plan_move, plan_remove_node,
+    plan_remove_symbol, plan_rename, run_hooks,
 };
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -1055,7 +1057,8 @@ impl RiftMcp {
     /// outermost first. Each identity carries a witness, so an address taken
     /// from this listing refuses cleanly once the file's bytes drift. `rev`
     /// lists the nodes as of a version-control revision instead of the
-    /// current tree.
+    /// current tree. A visible path no syntax provider parses refuses
+    /// `capability_unavailable`, naming the extension.
     #[tool]
     async fn nodes(
         &self,
@@ -1069,6 +1072,9 @@ impl RiftMcp {
     /// includes its attached outer attributes and doc comments. The parser
     /// derives the span, so the caller supplies no offsets; a refusal
     /// names the failed precondition and leaves the workspace untouched.
+    /// The body is spliced in verbatim at the declaration's own start byte:
+    /// its first line inherits the declaration's column, and every later
+    /// line carries whatever indentation it is written with.
     #[tool]
     async fn replace_symbol(
         &self,
@@ -1083,7 +1089,11 @@ impl RiftMcp {
     /// its attached outer attributes and doc comments included. A file target
     /// lands the body verbatim at the file's start or end, creating it first
     /// when `create_missing` is set and it is missing. A refusal names the
-    /// failed precondition and leaves the workspace untouched.
+    /// failed precondition and leaves the workspace untouched. A body
+    /// inserted `before` its anchor is spliced in at the anchor's start byte
+    /// and its first line inherits the anchor's column; a body inserted
+    /// `after` its anchor, or at a file target either side, always starts a
+    /// fresh line at column zero.
     #[tool]
     async fn insert_symbol(
         &self,
@@ -1157,9 +1167,68 @@ impl RiftMcp {
         }
     }
 
-    /// Applies unified-diff hunks to workspace files atomically. Hunk
-    /// context guards the change; header line numbers are hints, as with
-    /// `git apply`. A `/dev/null` header creates or deletes the file.
+    /// Removes one declaration addressed by symbol. The whole declaration,
+    /// its attached outer attributes and doc comments included, is removed
+    /// together with the separator that followed it, so no blank-line run
+    /// stands where it stood. When the configured language engine
+    /// advertises `textDocument/references`, a standing reference refuses
+    /// `unmet_precondition` naming `no_references`, unless `force` applies
+    /// the removal anyway and carries the references as a warning. Without
+    /// such an engine, the removal applies and carries a warning naming why
+    /// it was not checked.
+    #[tool]
+    async fn remove_symbol(
+        &self,
+        Parameters(params): Parameters<RemoveSymbolParams>,
+    ) -> Result<Json<ChangeResult>, ErrorData> {
+        let published = self.published_workspace(wire::ErrorPhase::Change).await?;
+        published.configuration.accepted(wire::ErrorPhase::Change)?;
+        let pool = self.engine_pool().await;
+        let resolution = plan_remove_symbol(&published.reads, &pool, &self.root, &params)
+            .await
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
+        match resolution {
+            RemoveResolution::Refused(result) => Ok(Json(result)),
+            RemoveResolution::Planned(plan) => {
+                self.change(move |reads, changes| changes.apply_remove(reads, &plan))
+                    .await
+            }
+        }
+    }
+
+    /// Removes one syntax node through a witnessed address from `nodes`.
+    /// The server recomputes the witness before writing and refuses when
+    /// the bytes drifted, so a stale address never removes moved code. When
+    /// the node names a declaration, the removal is checked against the
+    /// configured language engine's references the same way `remove_symbol`
+    /// checks them; a node naming no declaration applies unchecked, with a
+    /// warning saying so.
+    #[tool]
+    async fn remove_node(
+        &self,
+        Parameters(params): Parameters<RemoveNodeParams>,
+    ) -> Result<Json<ChangeResult>, ErrorData> {
+        let published = self.published_workspace(wire::ErrorPhase::Change).await?;
+        published.configuration.accepted(wire::ErrorPhase::Change)?;
+        let pool = self.engine_pool().await;
+        let resolution = plan_remove_node(&published.reads, &pool, &self.root, &params)
+            .await
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
+        match resolution {
+            RemoveResolution::Refused(result) => Ok(Json(result)),
+            RemoveResolution::Planned(plan) => {
+                self.change(move |reads, changes| changes.apply_remove(reads, &plan))
+                    .await
+            }
+        }
+    }
+
+    /// Applies unified-diff hunks to workspace files atomically. The target is any
+    /// file the workspace's `[source]` policy makes visible, parsed or not. Hunk
+    /// context guards the change: a header's line numbers are hints and
+    /// its line counts are read from the hunk's own body, as with
+    /// `git apply`. A `/dev/null` header creates or deletes the file. The
+    /// result carries one edit per hunk, spanning the bytes it replaced.
     #[tool]
     async fn patch(
         &self,
@@ -1191,7 +1260,7 @@ impl RiftMcp {
         let configuration = published.configuration.accepted(wire::ErrorPhase::Read)?;
         if !configuration.providers.history.enabled {
             return Err(ReadError::from(ReadFault::Unsupported {
-                capability: "revision reads (providers.history disabled)",
+                capability: "revision reads (providers.history disabled)".to_owned(),
             })
             .tool_error(wire::ErrorPhase::Read));
         }
@@ -2198,7 +2267,7 @@ mod tests {
         let error = executor
             .run("refused operation", || -> Result<(), ReadError> {
                 Err(ReadError::from(ReadFault::Unsupported {
-                    capability: "probe",
+                    capability: "probe".to_owned(),
                 }))
             })
             .await
@@ -2311,6 +2380,8 @@ mod tests {
                 "move_file",
                 "nodes",
                 "patch",
+                "remove_node",
+                "remove_symbol",
                 "rename_symbol",
                 "replace_node",
                 "replace_symbol",
@@ -2994,11 +3065,11 @@ pub fn beacon() -> u64 {
         });
         let changes = ChangeService::new(directory.path());
         let root = directory.path().to_path_buf();
-        // `files_max=1` accepts the workspace's single Rust source file for `ReadService::build`,
-        // which never counts `.gitignore` files. `WorkspaceSourcePolicy::build` re-walks for
-        // `.gitignore` files specifically and counts each one against that same bound, so a
-        // second `.gitignore` written by the change trips `TooManyFiles` there even though the
-        // read-side rebuild already succeeded.
+        // `files_max=1` accepts the workspace's single Rust source file: the source scan
+        // never counts `.gitignore` files. `ReadService::build` also compiles the `[source]`
+        // policy right after that scan, and its `GitignoreChain` walk counts each `.gitignore`
+        // file against that same bound, so two `.gitignore` files written by the change trip
+        // `TooManyFiles` there even though the source scan alone already succeeded.
         let tight_limits = WorkspaceIndexLimits::new(1, 1_048_576, 10_485_760, 16, 5)
             .expect("tight limits accept exactly one file");
         let outcome = RiftMcp::change_serialized(

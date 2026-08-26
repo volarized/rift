@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::path::Path;
+use std::sync::Arc;
 
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::constants::DIGEST_WIRE_CHARS;
@@ -9,7 +11,7 @@ use rift_core::{
 use rift_history::{HistoryError, Repository};
 use rift_index::{
     FileDigest, IndexedFile, PathChanges, SymbolMatch, WorkspaceDigests, WorkspaceFingerprint,
-    WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits,
+    WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::HistoryConfiguration;
 use rift_protocol::read::{
@@ -39,7 +41,7 @@ pub enum ReadFault {
     /// Request uses functionality this release does not serve.
     Unsupported {
         /// The unserved capability the request named.
-        capability: &'static str,
+        capability: String,
     },
     /// Request is invalid for direct workspace reads.
     Invalid {
@@ -108,7 +110,7 @@ impl Fault for ReadFault {
             Self::History(source) => source.context(),
             Self::Engine(source) => source.context(),
             Self::Unsupported { capability } => {
-                vec![ErrorContext::new("capability", *capability)]
+                vec![ErrorContext::new("capability", capability.clone())]
             }
             Self::Invalid { field, violation } => vec![
                 ErrorContext::new("field", *field),
@@ -155,8 +157,10 @@ impl Fault for ReadFault {
 }
 
 impl ReadFault {
-    pub(crate) fn unsupported(capability: &'static str) -> ReadError {
-        Error::new(Self::Unsupported { capability })
+    pub(crate) fn unsupported(capability: impl Into<String>) -> ReadError {
+        Error::new(Self::Unsupported {
+            capability: capability.into(),
+        })
     }
 
     pub(crate) fn invalid(field: &'static str, violation: impl Into<String>) -> ReadError {
@@ -235,6 +239,10 @@ pub struct ReadService {
     /// The accepted `[providers.history]` table: whether symbol history is
     /// served from this snapshot, and how far its walks may reach.
     history: HistoryConfiguration,
+    /// The compiled `[source]` policy this snapshot resolved: `Some` for the current
+    /// tree, `None` for a revision snapshot, which has no filesystem tree to be
+    /// visible in.
+    source_policy: Option<Arc<WorkspaceSourcePolicy>>,
 }
 
 impl ReadService {
@@ -266,6 +274,11 @@ impl ReadService {
                 span.record("outcome", "error");
                 ReadFault::index(source)
             })?;
+        let source_policy = WorkspaceSourcePolicy::build(root, limits, visibility, text_inclusion)
+            .map_err(|source| {
+                span.record("outcome", "error");
+                ReadFault::index(source)
+            })?;
         let revisions = captured_revisions(&index);
         span.record("files_count", index.file_count());
         span.record("tree_revision", revisions.wire_tree_revision());
@@ -275,6 +288,7 @@ impl ReadService {
             revisions,
             revision: None,
             history,
+            source_policy: Some(Arc::new(source_policy)),
         })
     }
 
@@ -330,6 +344,7 @@ impl ReadService {
             revisions,
             revision: self.revision.clone(),
             history: self.history.clone(),
+            source_policy: self.source_policy.clone(),
         })
     }
 
@@ -365,12 +380,29 @@ impl ReadService {
             revisions,
             revision: Some(RevisionId(resolved.commit_id())),
             history,
+            source_policy: None,
         })
     }
 
     /// Returns the immutable workspace index this snapshot serves.
     pub(crate) const fn index(&self) -> &WorkspaceIndex {
         &self.index
+    }
+
+    /// Returns this snapshot's compiled `[source]` policy: the hard floor, the
+    /// `[source]` matcher, and the workspace's `.gitignore` chain. `None` for a
+    /// revision snapshot, which has no filesystem tree to be visible in.
+    #[must_use]
+    pub fn source_policy(&self) -> Option<&WorkspaceSourcePolicy> {
+        self.source_policy.as_deref()
+    }
+
+    /// Returns this snapshot's compiled `[source]` policy as a shared handle, so a
+    /// caller publishing this snapshot beside the workspace index carries the same
+    /// value rather than compiling a second one.
+    #[must_use]
+    pub fn source_policy_handle(&self) -> Option<Arc<WorkspaceSourcePolicy>> {
+        self.source_policy.clone()
     }
 
     /// Returns the warnings every answer from this service carries: one
@@ -436,11 +468,10 @@ impl ReadService {
         let file = self
             .index
             .file(&path)
-            .ok_or_else(|| ReadFault::not_found(path.as_str()))?;
-        let nodes = self
-            .index
-            .nodes(&path, params.position)
-            .ok_or_else(|| ReadFault::not_found(path.as_str()))?
+            .ok_or_else(|| self.missing_file_fault(&path))?;
+        let nodes = file
+            .syntax()
+            .nodes_at(params.position)
             .into_iter()
             .map(|node| wire_node(file, node))
             .collect();
@@ -456,6 +487,45 @@ impl ReadService {
             source,
             warnings: self.warnings(),
         })
+    }
+
+    /// The failure for a path the syntax index does not hold: `Unsupported` naming the
+    /// unparsed extension when no shipped provider parses `path` and this snapshot can
+    /// confirm the path is real; `not_found` for everything else, including a claimed
+    /// extension the index simply has not read.
+    fn missing_file_fault(&self, path: &CoreProjectPath) -> ReadError {
+        match self.unclaimed_extension_capability(path) {
+            Ok(Some(capability)) => ReadFault::unsupported(capability),
+            Ok(None) => ReadFault::not_found(path.as_str()),
+            Err(storage_fault) => storage_fault,
+        }
+    }
+
+    /// `Some` naming `path`'s extension, or stating that it carries none, when no
+    /// shipped syntax provider parses it and this snapshot can confirm the path is
+    /// real. On the current tree that means the `[source]` policy makes `path` visible
+    /// and the filesystem holds it; on a revision snapshot, which carries no filesystem
+    /// policy, the extension alone decides, because `nodes` can never serve an
+    /// unclaimed extension whatever tree it is pointed at.
+    fn unclaimed_extension_capability(
+        &self,
+        path: &CoreProjectPath,
+    ) -> Result<Option<String>, ReadError> {
+        if extension_claimed(path) {
+            return Ok(None);
+        }
+        let Some(policy) = self.source_policy.as_deref() else {
+            return Ok(Some(extension_capability(path)));
+        };
+        let absolute = self.index.root().join(path.as_str());
+        if !policy.visible(&absolute) {
+            return Ok(None);
+        }
+        match absolute.try_exists() {
+            Ok(true) => Ok(Some(extension_capability(path))),
+            Ok(false) => Ok(None),
+            Err(error) => Err(ReadFault::storage(path.as_str(), "stat", &error)),
+        }
     }
 
     /// Finds declarations by name, with each hit's version-control timeline
@@ -712,6 +782,23 @@ fn language_selects(filter: &Language, candidate: &Language) -> bool {
         && (filter.dialect.is_none() || filter.dialect == candidate.dialect)
 }
 
+/// Whether some shipped syntax provider parses `path`'s extension.
+fn extension_claimed(path: &CoreProjectPath) -> bool {
+    Path::new(path.as_str())
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| registry::provider_for_extension(extension).is_some())
+}
+
+/// The `Unsupported` capability text for a path no syntax provider parses: the
+/// extension itself, or a statement that the path carries none.
+fn extension_capability(path: &CoreProjectPath) -> String {
+    match Path::new(path.as_str()).extension().and_then(OsStr::to_str) {
+        Some(extension) => format!("{extension} files"),
+        None => "files with no extension".to_owned(),
+    }
+}
+
 pub(crate) fn file_id(path: &CoreProjectPath) -> FileId {
     FileId(format!(
         "rift://file/{}",
@@ -869,7 +956,7 @@ pub(crate) fn digest_wire_hex(digest: &sha2::digest::Output<Sha256>) -> String {
 /// declaration, including attached docs and attributes) for most nodes, but
 /// the item node itself only spans its own bytes, so it matches on
 /// `item_range` instead.
-fn symbol_for_range(file: &IndexedFile, range: ByteRange) -> Option<&SyntaxSymbol> {
+pub(crate) fn symbol_for_range(file: &IndexedFile, range: ByteRange) -> Option<&SyntaxSymbol> {
     file.syntax()
         .symbols()
         .iter()
@@ -1178,7 +1265,7 @@ pub fn compute() -> i32 {
         let ReadFault::Unsupported { capability } = error.fault() else {
             panic!("expected Unsupported, got {:?}", error.fault());
         };
-        assert_eq!(*capability, "symbol history (providers.history disabled)");
+        assert_eq!(capability, "symbol history (providers.history disabled)");
         Ok(())
     }
 
@@ -1323,6 +1410,34 @@ pub fn compute() -> i32 {
             missing.expect_err("missing source must fail").fault(),
             ReadFault::NotFound { .. }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn nodes_on_a_visible_unparsed_path_names_the_extension() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("justfile"), "default:\n    echo hi\n")?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let result = service.nodes(NodesParams {
+            path: ProjectPath("justfile".to_owned()),
+            position: 0,
+            projection: None,
+            rev: None,
+        });
+        let error = result.expect_err("an unparsed extension must be rejected");
+        let ReadFault::Unsupported { capability } = error.fault() else {
+            panic!("expected Unsupported, got {:?}", error.fault());
+        };
+        assert_eq!(
+            capability, "files with no extension",
+            "justfile carries no extension at all"
+        );
         Ok(())
     }
 

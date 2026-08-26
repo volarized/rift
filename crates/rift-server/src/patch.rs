@@ -1,14 +1,26 @@
 //! Unified-diff patch engine: parses hunks with `diffy`, then locates and
 //! applies each one itself, following `git apply` semantics.
 //!
-//! Header line numbers are a hint, not a requirement: context and deleted
-//! lines must match exactly, but the position they match at may drift from
-//! the header. Each hunk's search starts at its header position corrected
-//! by the drift already discovered from earlier hunks in the same file -
-//! the running delta `git apply` itself carries forward - then widens
-//! outward, nearer positions first and the earlier position on a tie.
+//! A hunk header is a hint, not a requirement, on both of its halves.
+//! Context and deleted lines must match exactly, but the position they
+//! match at may drift from the header: each hunk's search starts at its
+//! header position corrected by the drift already discovered from earlier
+//! hunks in the same file - the running delta `git apply` itself carries
+//! forward - then widens outward, nearer positions first and the earlier
+//! position on a tie. The header's line counts are derived from the hunk's
+//! own body before parsing, the way `git apply` derives them, so a
+//! miscounted header applies and only a body that cannot be located
+//! refuses.
+//!
+//! Each located hunk records the previous image's bytes it replaced, so a
+//! result names the regions that changed instead of echoing whole files.
 //! `/dev/null` headers create or delete a file; renames and copies stay
 //! unsupported.
+//!
+//! An existing target is any file the workspace's `[source]` policy makes visible,
+//! parsed or not: the syntax index's own copy, then the text index's, then a direct
+//! filesystem read guarded by the policy alone. The base image is always the file's
+//! bytes on disk; hunk context is the guard and needs no syntax tree.
 
 use std::fs;
 use std::path::Path;
@@ -16,12 +28,15 @@ use std::path::Path;
 use diffy::{Hunk, HunkRange, Line, ParsePatchError, Patch};
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::line;
+use rift_index::TextSourceFile;
 use rift_protocol::change::{
     ChangeResult, OperationPrecondition, OperationPreconditionKind, OperationPreconditionStatus,
     PreconditionValue, RefusalReason,
 };
+use rift_syntax::ByteRange;
 
 use crate::read::{ReadError, ReadFault, ReadService, digest_hex8};
+use crate::rewrite::{FileRewrite, ReplacedRegion};
 
 /// Most files one unified diff may address.
 pub(crate) const PATCH_FILES_MAX: usize = 64;
@@ -42,26 +57,6 @@ const HUNK_HEADER_PREFIX: &str = "@@";
 /// instead of editing an existing one.
 const NULL_TARGET: &str = "/dev/null";
 
-/// How one resolved file segment changes the tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RewriteKind {
-    /// An existing file's content changes in place.
-    Modify,
-    /// A new file is written; its parent directories are created first.
-    Create,
-    /// An existing file is removed.
-    Delete,
-}
-
-/// One file-level effect a patch resolved to, not yet written.
-#[derive(Debug)]
-pub(crate) struct FileRewrite {
-    pub(crate) path: CoreProjectPath,
-    pub(crate) kind: RewriteKind,
-    pub(crate) previous_len: u64,
-    pub(crate) next_source: String,
-}
-
 /// Splits one unified diff into its per-file segments. Only a header line
 /// opens a segment: hunk body lines never start with `---` at column zero,
 /// because context lines carry a leading space and removals a single `-`.
@@ -69,7 +64,9 @@ pub(crate) struct FileRewrite {
 /// Hunk body bytes pass through untouched - a CRLF patch keeps its `\r`
 /// so its context matches a CRLF source, and an ending mismatch surfaces
 /// as hunk-context drift, never a silent rewrite. Only structural lines
-/// shed a CRLF ending, because the diff parser rejects `\r` in headers.
+/// change: they shed a CRLF ending, because the diff parser rejects `\r`
+/// in headers, and a hunk header's counts are replaced by the counts its
+/// own body carries.
 pub(crate) fn split_file_segments(patch: &str) -> Result<Vec<String>, ReadError> {
     let (_, raw_segments) = split_at_marker(patch, |line| line.starts_with(ORIGINAL_HEADER_PREFIX));
     if raw_segments.len() > PATCH_FILES_MAX {
@@ -83,8 +80,104 @@ pub(crate) fn split_file_segments(patch: &str) -> Result<Vec<String>, ReadError>
     }
     Ok(raw_segments
         .iter()
-        .map(|raw| normalize_segment(raw))
+        .map(|raw| recounted_headers(&normalize_segment(raw)))
         .collect())
+}
+
+/// Rewrites every hunk header's line counts to the counts the hunk's own
+/// body carries, leaving its offsets alone.
+///
+/// `git apply` derives the counts this way, and an agent composing a diff
+/// by hand counts context, removals, and the blank line between two
+/// declarations. A header whose counts disagree with its body used to
+/// refuse the whole patch before a single line was compared; now only a
+/// body that cannot be located in the file refuses.
+fn recounted_headers(segment: &str) -> String {
+    let (prefix, hunks) = split_into_hunks(segment);
+    let mut recounted = prefix;
+    for hunk in &hunks {
+        push_recounted_hunk(&mut recounted, hunk);
+    }
+    recounted
+}
+
+/// Appends one hunk to `recounted`, its header carrying the counts its own
+/// body implies. A header that is not the `@@ -old +new @@` shape passes
+/// through untouched, leaving the parser to name what is wrong with it.
+fn push_recounted_hunk(recounted: &mut String, hunk: &str) {
+    let mut lines = line::lines_inclusive(hunk);
+    let Some(header) = lines.next() else {
+        return;
+    };
+    let body: Vec<&str> = lines.collect();
+    match rewritten_header(header, HunkCounts::of(&body)) {
+        Some(rewritten) => recounted.push_str(&rewritten),
+        None => recounted.push_str(header),
+    }
+    for text in body {
+        recounted.push_str(text);
+    }
+}
+
+/// The line counts one hunk's body implies for each side of its header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HunkCounts {
+    old: usize,
+    new: usize,
+}
+
+impl HunkCounts {
+    /// Counts `body` the way `git apply` does: a line opening with a space
+    /// stands on both sides, `-` on the old side alone, `+` on the new side
+    /// alone, and a bare empty line is context both sides carry. The
+    /// `\ No newline at end of file` marker describes the line above it and
+    /// stands on neither side.
+    fn of(body: &[&str]) -> Self {
+        let mut counts = Self { old: 0, new: 0 };
+        for text in body {
+            match line::without_ending(text).as_bytes().first() {
+                Some(b' ') | None => {
+                    counts.old += 1;
+                    counts.new += 1;
+                }
+                Some(b'-') => counts.old += 1,
+                Some(b'+') => counts.new += 1,
+                _ => {}
+            }
+        }
+        counts
+    }
+}
+
+/// Rewrites `header`'s counts to `counts`, keeping its offsets, its
+/// trailing section heading, and its own line ending. Returns `None` for
+/// anything that is not the `@@ -old +new @@` shape.
+fn rewritten_header(header: &str, counts: HunkCounts) -> Option<String> {
+    let text = line::without_ending(header);
+    let ending = &header[text.len()..];
+    let (ranges, trailing) = text
+        .strip_prefix(HUNK_HEADER_PREFIX)?
+        .split_once(HUNK_HEADER_PREFIX)?;
+    let mut sides = ranges.split_whitespace();
+    let old_start = declared_start(sides.next()?, '-')?;
+    let new_start = declared_start(sides.next()?, '+')?;
+    if sides.next().is_some() {
+        return None;
+    }
+    Some(format!(
+        "{HUNK_HEADER_PREFIX} -{old_start},{} +{new_start},{} {HUNK_HEADER_PREFIX}{trailing}{ending}",
+        counts.old, counts.new
+    ))
+}
+
+/// The start offset one `-old` or `+new` header side declares, dropping
+/// the count the body now decides.
+fn declared_start(side: &str, sign: char) -> Option<u64> {
+    side.strip_prefix(sign)?
+        .split(',')
+        .next()?
+        .parse::<u64>()
+        .ok()
 }
 
 /// Sheds each of `raw`'s structural line endings down to a bare `\n`,
@@ -250,30 +343,107 @@ fn project_path(value: &str) -> Result<CoreProjectPath, ReadError> {
     })
 }
 
-/// Resolves a segment that edits an existing file.
+/// Resolves a segment that edits an existing file: the syntax or text index's own
+/// copy when the path is indexed, the `[source]` policy against the filesystem
+/// otherwise.
 fn resolve_modify(
     root: &Path,
     reads: &ReadService,
     path: &CoreProjectPath,
     parsed: &Patch<'_, str>,
 ) -> Result<Result<FileRewrite, ChangeResult>, ReadError> {
-    let Some(file) = reads.index().file(path) else {
-        return Ok(Err(target_missing_refusal(path)));
+    let base = match resolve_base_image(root, reads, path)? {
+        Ok(base) => base,
+        Err(refusal) => return Ok(Err(refusal)),
     };
-    let disk = fs::read_to_string(root.join(path.as_str()))
-        .map_err(|error| ReadFault::storage(path.as_str(), "read", &error))?;
-    if disk != file.source() {
-        return Ok(Err(source_drift_refusal(path, file.source(), &disk)));
-    }
-    match apply_segment(file.source(), parsed) {
-        Ok(next_source) => Ok(Ok(FileRewrite {
-            path: path.clone(),
-            kind: RewriteKind::Modify,
-            previous_len: file.source().len() as u64,
-            next_source,
-        })),
+    match apply_segment(&base, parsed) {
+        Ok(applied) => Ok(Ok(FileRewrite::modify(
+            path.clone(),
+            &base,
+            applied.next_source,
+            applied.replaced,
+        ))),
         Err(detail) => Ok(Err(detail.into_refusal(path))),
     }
+}
+
+/// The bytes the index already holds for `path`: the syntax index's copy, then the
+/// text index's copy. `None` when neither indexes it.
+fn indexed_source<'a>(reads: &'a ReadService, path: &CoreProjectPath) -> Option<&'a str> {
+    if let Some(file) = reads.index().file(path) {
+        return Some(file.source());
+    }
+    reads.index().text_file(path).map(TextSourceFile::content)
+}
+
+/// Compares `indexed`'s stored copy against the disk read at `absolute`, taking the
+/// disk bytes as the base image on agreement and refusing `source_unchanged` on
+/// disagreement.
+fn drift_checked_base(
+    path: &CoreProjectPath,
+    indexed: &str,
+    absolute: &Path,
+) -> Result<Result<String, ChangeResult>, ReadError> {
+    let disk = fs::read_to_string(absolute)
+        .map_err(|error| ReadFault::storage(path.as_str(), "read", &error))?;
+    if disk == indexed {
+        Ok(Ok(disk))
+    } else {
+        Ok(Err(source_drift_refusal(path, indexed, &disk)))
+    }
+}
+
+/// Reads `path` fresh from disk through the `[source]` policy alone: the route for a
+/// visible file no syntax provider parses and no text extension includes, such as
+/// `justfile` or `.gitignore`. A path the policy excludes refuses `unsupported`,
+/// naming the policy; a visible path absent from the filesystem refuses
+/// `target_exists` the way an unindexed path already does.
+fn visible_source(
+    reads: &ReadService,
+    path: &CoreProjectPath,
+    absolute: &Path,
+) -> Result<Result<String, ChangeResult>, ReadError> {
+    let visible = reads
+        .source_policy()
+        .is_some_and(|policy| policy.visible(absolute));
+    if !visible {
+        return Ok(Err(not_visible_refusal(path)));
+    }
+    match fs::read_to_string(absolute) {
+        Ok(disk) => Ok(Ok(disk)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(Err(target_missing_refusal(path)))
+        }
+        Err(error) => Err(ReadFault::storage(path.as_str(), "read", &error)),
+    }
+}
+
+/// Resolves `path`'s current base image for a patch to apply against: the syntax
+/// index's copy, then the text index's copy, each checked for drift against the
+/// disk; the `[source]` policy against the filesystem last, for a visible file no
+/// provider parses. The base image is always the file's bytes on disk - hunk context
+/// is the guard and needs no syntax tree. `resolve_modify` and `resolve_delete` share
+/// this resolution; only what they do with the result differs.
+fn resolve_base_image(
+    root: &Path,
+    reads: &ReadService,
+    path: &CoreProjectPath,
+) -> Result<Result<String, ChangeResult>, ReadError> {
+    let absolute = root.join(path.as_str());
+    match indexed_source(reads, path) {
+        Some(indexed) => drift_checked_base(path, indexed, &absolute),
+        None => visible_source(reads, path, &absolute),
+    }
+}
+
+/// Refuses a target the `[source]` policy makes invisible: excluded by
+/// `[source].exclude`, `.gitignore`, or the hard floor. The file is there; the
+/// workspace asked for it not to be.
+fn not_visible_refusal(path: &CoreProjectPath) -> ChangeResult {
+    crate::rename::unsupported_refusal(format!(
+        "{} is outside the workspace's [source] visibility policy",
+        path.as_str()
+    ))
 }
 
 /// Resolves a segment that creates a new file. The starting image is
@@ -290,67 +460,83 @@ fn resolve_create(
         Err(error) => return Err(ReadFault::storage(path.as_str(), "stat", &error)),
     }
     match apply_segment("", parsed) {
-        Ok(next_source) => Ok(Ok(FileRewrite {
-            path: path.clone(),
-            kind: RewriteKind::Create,
-            previous_len: 0,
-            next_source,
-        })),
+        Ok(applied) => Ok(Ok(FileRewrite::create(path.clone(), applied.next_source))),
         Err(detail) => Ok(Err(detail.into_refusal(path))),
     }
 }
 
-/// Resolves a segment that deletes an existing file: the hunks must
-/// consume the entire file, leaving nothing behind.
+/// Resolves a segment that deletes an existing file: the hunks must consume the
+/// entire file, leaving nothing behind. Shares [`resolve_base_image`] with
+/// `resolve_modify`, so an unparsed visible file deletes the same way it modifies.
 fn resolve_delete(
     root: &Path,
     reads: &ReadService,
     path: &CoreProjectPath,
     parsed: &Patch<'_, str>,
 ) -> Result<Result<FileRewrite, ChangeResult>, ReadError> {
-    let Some(file) = reads.index().file(path) else {
-        return Ok(Err(target_missing_refusal(path)));
+    let base = match resolve_base_image(root, reads, path)? {
+        Ok(base) => base,
+        Err(refusal) => return Ok(Err(refusal)),
     };
-    let disk = fs::read_to_string(root.join(path.as_str()))
-        .map_err(|error| ReadFault::storage(path.as_str(), "read", &error))?;
-    if disk != file.source() {
-        return Ok(Err(source_drift_refusal(path, file.source(), &disk)));
-    }
-    match apply_segment(file.source(), parsed) {
-        Ok(next_source) if next_source.is_empty() => Ok(Ok(FileRewrite {
-            path: path.clone(),
-            kind: RewriteKind::Delete,
-            previous_len: file.source().len() as u64,
-            next_source: String::new(),
-        })),
-        Ok(next_source) => Ok(Err(deletion_incomplete_refusal(path, &next_source))),
+    match apply_segment(&base, parsed) {
+        Ok(applied) if applied.next_source.is_empty() => {
+            Ok(Ok(FileRewrite::delete(path.clone(), &base)))
+        }
+        Ok(applied) => Ok(Err(deletion_incomplete_refusal(path, &applied.next_source))),
         Err(detail) => Ok(Err(detail.into_refusal(path))),
     }
 }
 
 /// One line of the file image a patch's hunks apply against: bytes still
-/// from the original file, or bytes a previous hunk in this same run
-/// already wrote. A later hunk never matches into a `Patched` line - that
-/// would apply on top of text this same patch just introduced.
+/// from the original file, carrying the offset they start at there, or
+/// bytes a previous hunk in this same run already wrote. A later hunk
+/// never matches into a `Patched` line - that would apply on top of text
+/// this same patch just introduced.
 #[derive(Clone, Copy)]
 enum ImageLine<'a> {
-    Original(&'a str),
+    Original { text: &'a str, start: u64 },
     Patched(&'a str),
 }
 
 impl<'a> ImageLine<'a> {
     fn text(self) -> &'a str {
         match self {
-            Self::Original(text) | Self::Patched(text) => text,
+            Self::Original { text, .. } | Self::Patched(text) => text,
         }
     }
 
     fn is_patched(self) -> bool {
         matches!(self, Self::Patched(_))
     }
+
+    /// Where this line starts in the original file, or `None` for a line
+    /// an earlier hunk wrote.
+    fn base_start(self) -> Option<u64> {
+        match self {
+            Self::Original { start, .. } => Some(start),
+            Self::Patched(_) => None,
+        }
+    }
+
+    /// Where this line ends in the original file, or `None` for a line an
+    /// earlier hunk wrote.
+    fn base_end(self) -> Option<u64> {
+        match self {
+            Self::Original { text, start } => Some(start + text.len() as u64),
+            Self::Patched(_) => None,
+        }
+    }
 }
 
-/// Applies every hunk in `parsed` against `starting`, in order.
+/// One segment applied: the file's whole next content, and the original
+/// image's regions its hunks replaced.
+pub(crate) struct AppliedSegment {
+    pub(crate) next_source: String,
+    pub(crate) replaced: Vec<ReplacedRegion>,
+}
+
+/// Applies every hunk in `parsed` against `starting`, in order, recording
+/// the original image's bytes each one replaced.
 ///
 /// Each hunk's search anchors at its header position, corrected by the
 /// drift already found while applying earlier hunks in this same segment.
@@ -359,10 +545,19 @@ impl<'a> ImageLine<'a> {
 /// header. Bounded: one hunk visits at most `image.len() + 1` candidate
 /// positions, since the search distance never usefully exceeds the
 /// image's length.
-fn apply_segment(starting: &str, parsed: &Patch<'_, str>) -> Result<String, MismatchDetail> {
-    let mut image: Vec<ImageLine<'_>> = line::lines_inclusive(starting)
-        .map(ImageLine::Original)
-        .collect();
+///
+/// The recorded regions are ascending and never overlap: a located run is
+/// original lines alone, and applying a hunk marks its own run as written
+/// so no later hunk can match back into it. They come back in the order
+/// their hunks landed, which a backward search can leave out of file
+/// order, so the caller sorts them into the order a result carries.
+fn apply_segment(
+    starting: &str,
+    parsed: &Patch<'_, str>,
+) -> Result<AppliedSegment, MismatchDetail> {
+    let mut image: Vec<ImageLine<'_>> = base_image(starting);
+    let base_len = starting.len() as u64;
+    let mut replaced = Vec::with_capacity(parsed.hunks().len());
     let mut delta: i64 = 0;
     for (index, hunk) in parsed.hunks().iter().enumerate() {
         let pre_image = image_lines(hunk, HunkImage::Pre);
@@ -379,11 +574,68 @@ fn apply_segment(starting: &str, parsed: &Patch<'_, str>) -> Result<String, Mism
             ));
         };
         delta = i64::try_from(found).unwrap_or(0) - i64::try_from(expected).unwrap_or(0);
+        replaced.push(ReplacedRegion {
+            range: replaced_range(&image, found, pre_image.len(), base_len),
+            text: post_image.concat(),
+        });
         let patched: Vec<ImageLine<'_>> =
             post_image.iter().copied().map(ImageLine::Patched).collect();
         image.splice(found..found + pre_image.len(), patched);
     }
-    Ok(image.iter().copied().map(ImageLine::text).collect())
+    replaced.sort_by_key(|region| (region.range.start, region.range.end));
+    Ok(AppliedSegment {
+        next_source: image.iter().copied().map(ImageLine::text).collect(),
+        replaced,
+    })
+}
+
+/// The starting image: every line of `starting`, each carrying the offset
+/// it begins at.
+fn base_image(starting: &str) -> Vec<ImageLine<'_>> {
+    let mut start = 0u64;
+    line::lines_inclusive(starting)
+        .map(|text| {
+            let line = ImageLine::Original { text, start };
+            start += text.len() as u64;
+            line
+        })
+        .collect()
+}
+
+/// The original bytes one hunk replaces: the run it was located at,
+/// bounded by that run's own offsets. A hunk that deletes nothing has no
+/// run to bound, so its region is the empty range at the point
+/// [`insertion_offset`] resolves.
+fn replaced_range(
+    image: &[ImageLine<'_>],
+    found: usize,
+    run_len: usize,
+    base_len: u64,
+) -> ByteRange {
+    let run = image.get(found..found + run_len).unwrap_or_default();
+    let bounds = run
+        .first()
+        .copied()
+        .and_then(ImageLine::base_start)
+        .zip(run.last().copied().and_then(ImageLine::base_end));
+    if let Some((start, end)) = bounds {
+        return ByteRange { start, end };
+    }
+    let at = insertion_offset(image, found, base_len);
+    ByteRange { start: at, end: at }
+}
+
+/// Where a hunk that deletes nothing inserts, in original-file bytes: the
+/// start of the first original line still standing at or after `found`,
+/// and the end of the file when every line from there on was written by an
+/// earlier hunk.
+fn insertion_offset(image: &[ImageLine<'_>], found: usize, base_len: u64) -> u64 {
+    image
+        .iter()
+        .skip(found)
+        .copied()
+        .find_map(ImageLine::base_start)
+        .unwrap_or(base_len)
 }
 
 /// Converts a hunk's declared old-file range into a 0-based image
@@ -636,11 +888,12 @@ mod tests {
     use rift_protocol::read::ProjectPath;
 
     use super::{
-        FileRewrite, PATCH_MISMATCH_DETAIL_BYTES_MAX, PatchTarget, RewriteKind, apply_segment,
-        find_hunk_position, resolve_patch_target, truncate_detail,
+        HunkCounts, PATCH_MISMATCH_DETAIL_BYTES_MAX, PatchTarget, apply_segment,
+        find_hunk_position, resolve_patch_target, rewritten_header, truncate_detail,
     };
     use crate::change::ChangeService;
     use crate::read::ReadService;
+    use crate::rewrite::{FileRewrite, RewriteKind};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -678,7 +931,8 @@ mod tests {
         let segments = hunks(diff)?;
         let parsed = Patch::from_str(&segments[0])?;
         let result = apply_segment("one\ntwo\n", &parsed)
-            .map_err(|_| "must apply at the exact header position")?;
+            .map_err(|_| "must apply at the exact header position")?
+            .next_source;
         assert_eq!(result, "ONE\ntwo\n");
         Ok(())
     }
@@ -690,7 +944,8 @@ mod tests {
         let parsed = Patch::from_str(&segments[0])?;
         let source = "a\nb\nc\ntarget\n";
         let result = apply_segment(source, &parsed)
-            .map_err(|_| "context three lines below the header must still be found")?;
+            .map_err(|_| "context three lines below the header must still be found")?
+            .next_source;
         assert_eq!(result, "a\nb\nc\nTARGET\n");
         Ok(())
     }
@@ -702,7 +957,8 @@ mod tests {
         let parsed = Patch::from_str(&segments[0])?;
         let source = "target\na\nb\n";
         let result = apply_segment(source, &parsed)
-            .map_err(|_| "context three lines above the header must still be found")?;
+            .map_err(|_| "context three lines above the header must still be found")?
+            .next_source;
         assert_eq!(result, "TARGET\na\nb\n");
         Ok(())
     }
@@ -719,7 +975,8 @@ mod tests {
         let parsed = Patch::from_str(&segments[0])?;
         let source = "zero\none\ntwo\nthree\n";
         let result = apply_segment(source, &parsed)
-            .map_err(|_| "the second hunk must land after correcting for the first hunk's drift")?;
+            .map_err(|_| "the second hunk must land after correcting for the first hunk's drift")?
+            .next_source;
         assert_eq!(result, "zero\none\ninserted\ntwo\nTHREE\n");
         Ok(())
     }
@@ -745,7 +1002,7 @@ mod tests {
     fn find_hunk_position_breaks_an_equal_distance_tie_toward_the_earlier_position() {
         let image: Vec<super::ImageLine<'_>> = vec!["x", "match", "y", "match"]
             .into_iter()
-            .map(super::ImageLine::Original)
+            .map(|text| super::ImageLine::Original { text, start: 0 })
             .collect();
         let pre_image = ["match"];
         let found = find_hunk_position(&image, &pre_image, 2);
@@ -767,7 +1024,8 @@ mod tests {
         let segments = hunks(diff)?;
         let parsed = Patch::from_str(&segments[0])?;
         let result = apply_segment("a\nz\na\n", &parsed)
-            .map_err(|_| "the untouched occurrence must still be found")?;
+            .map_err(|_| "the untouched occurrence must still be found")?
+            .next_source;
         assert_eq!(result, "MARK\nz\nZULU\n");
         Ok(())
     }
@@ -841,7 +1099,9 @@ mod tests {
         let diff = "--- /dev/null\n+++ b/new.rs\n@@ -0,0 +1,2 @@\n+one\n+two\n";
         let segments = hunks(diff)?;
         let parsed = Patch::from_str(&segments[0])?;
-        let content = apply_segment("", &parsed).map_err(|_| "an all-addition hunk must apply")?;
+        let content = apply_segment("", &parsed)
+            .map_err(|_| "an all-addition hunk must apply")?
+            .next_source;
         assert_eq!(content, "one\ntwo\n");
         Ok(())
     }
@@ -862,7 +1122,9 @@ mod tests {
         let diff = "--- /dev/null\n+++ b/empty.rs\n";
         let segments = hunks(diff)?;
         let parsed = Patch::from_str(&segments[0])?;
-        let content = apply_segment("", &parsed).map_err(|_| "zero hunks must trivially apply")?;
+        let content = apply_segment("", &parsed)
+            .map_err(|_| "zero hunks must trivially apply")?
+            .next_source;
         assert_eq!(content, "");
         Ok(())
     }
@@ -911,8 +1173,14 @@ mod tests {
 
     #[test]
     fn file_rewrite_kind_distinguishes_modify_create_and_delete() -> TestResult {
-        assert_ne!(RewriteKind::Modify, RewriteKind::Create);
-        assert_ne!(RewriteKind::Create, RewriteKind::Delete);
+        assert!(!RewriteKind::Create.removes_file());
+        assert!(
+            !RewriteKind::Modify {
+                replaced: Vec::new()
+            }
+            .removes_file()
+        );
+        assert!(RewriteKind::Delete.removes_file());
         let _ = FileRewrite {
             path: rift_core::ProjectPath::new("f.rs")?,
             kind: RewriteKind::Delete,
@@ -1512,6 +1780,146 @@ mod tests {
         Ok(())
     }
 
+    /// Builds a workspace with `lib.rs`, a text-indexed `.mdx` file, and two files no
+    /// extension gate admits at all: `justfile` and `.gitignore` itself.
+    fn visible_file_fixture() -> TestResult<(tempfile::TempDir, ReadService, ChangeService)> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(directory.path().join("notes.mdx"), "# Notes\nFirst line.\n")?;
+        fs::write(
+            directory.path().join("justfile"),
+            "default:\n    echo hello\n",
+        )?;
+        fs::write(directory.path().join(".gitignore"), "target\n")?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let changes = ChangeService::new(directory.path());
+        Ok((directory, reads, changes))
+    }
+
+    #[test]
+    fn patch_applies_against_a_text_indexed_file_no_syntax_provider_parses() -> TestResult {
+        let (directory, reads, changes) = visible_file_fixture()?;
+        let patch = "--- a/notes.mdx\n+++ b/notes.mdx\n@@ -1,2 +1,2 @@\n # Notes\n-First line.\n+Updated line.\n".to_owned();
+        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let summary = applied_summary(result);
+        assert_eq!(summary.paths, vec![ProjectPath("notes.mdx".to_owned())]);
+        let written = fs::read_to_string(directory.path().join("notes.mdx"))?;
+        assert_eq!(written, "# Notes\nUpdated line.\n");
+        Ok(())
+    }
+
+    /// A visible file no extension gate admits at all - no syntax provider claims it
+    /// and no `[search.text]` extension includes it - still resolves as a patch
+    /// target through the `[source]` policy alone. `justfile` and `.gitignore` both
+    /// prove it, in one change.
+    #[test]
+    fn patch_applies_against_files_no_extension_gate_admits() -> TestResult {
+        let (directory, reads, changes) = visible_file_fixture()?;
+        let patch = [
+            "--- a/justfile",
+            "+++ b/justfile",
+            "@@ -1,2 +1,2 @@",
+            " default:",
+            "-    echo hello",
+            "+    echo goodbye",
+            "--- a/.gitignore",
+            "+++ b/.gitignore",
+            "@@ -1 +1,2 @@",
+            " target",
+            "+build",
+            "",
+        ]
+        .join("\n");
+        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let summary = applied_summary(result);
+        assert_eq!(summary.paths.len(), 2);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("justfile"))?,
+            "default:\n    echo goodbye\n"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join(".gitignore"))?,
+            "target\nbuild\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn patch_deletes_a_file_no_extension_gate_admits() -> TestResult {
+        let (directory, reads, changes) = visible_file_fixture()?;
+        let patch = [
+            "--- a/justfile",
+            "+++ /dev/null",
+            "@@ -1,2 +0,0 @@",
+            "-default:",
+            "-    echo hello",
+            "",
+        ]
+        .join("\n");
+        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let summary = applied_summary(result);
+        assert_eq!(summary.paths, vec![ProjectPath("justfile".to_owned())]);
+        assert!(!directory.path().join("justfile").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn patch_against_a_source_excluded_path_refuses_unsupported_not_target_exists() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            directory.path().join("justfile"),
+            "default:\n    echo hello\n",
+        )?;
+        let visibility = SourceVisibility::new(Vec::new(), vec!["justfile".to_owned()], true);
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &visibility,
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let changes = ChangeService::new(directory.path());
+        let patch = "--- a/justfile\n+++ b/justfile\n@@ -1,2 +1,2 @@\n default:\n-    echo hello\n+    echo goodbye\n".to_owned();
+        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            diagnostics,
+        } = result
+        else {
+            panic!("a [source]-excluded target must refuse");
+        };
+        assert_eq!(
+            reason,
+            RefusalReason::Unsupported,
+            "a policy-excluded target refuses as unsupported, not unmet_precondition"
+        );
+        assert!(
+            preconditions.is_empty(),
+            "an unsupported refusal carries no preconditions: {preconditions:?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("justfile")
+                    && diagnostic.message.contains("[source]")),
+            "the diagnostic must name the excluded path and the policy: {diagnostics:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("justfile"))?,
+            "default:\n    echo hello\n",
+            "an excluded target is untouched"
+        );
+        Ok(())
+    }
+
     #[test]
     fn patch_with_crlf_endings_applies_and_preserves_them() -> TestResult {
         let (directory, reads, changes) = fixture("pub fn beacon() {}\r\npub fn steady() {}\r\n")?;
@@ -1591,6 +1999,334 @@ mod tests {
         assert!(
             error.to_string().contains("forward-slash"),
             "message must name the expected form: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn apply_segment_records_the_located_runs_original_byte_range_and_post_image_text() -> TestResult
+    {
+        let diff = "--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n";
+        let segments = hunks(diff)?;
+        let parsed = Patch::from_str(&segments[0])?;
+        let applied = apply_segment("alpha\nbeta\ngamma\n", &parsed)
+            .map_err(|_| "the full context+delete run must be located")?;
+        assert_eq!(applied.replaced.len(), 1);
+        let region = &applied.replaced[0];
+        assert_eq!(
+            (region.range.start, region.range.end),
+            (0, 17),
+            "the region spans the hunk's whole located run - the leading and trailing context \
+             lines included, not just the changed line"
+        );
+        assert_eq!(region.text, "alpha\nBETA\ngamma\n");
+        assert_eq!(applied.next_source, "alpha\nBETA\ngamma\n");
+        Ok(())
+    }
+
+    #[test]
+    fn apply_segment_records_a_zero_width_region_for_an_insertion_only_hunk() -> TestResult {
+        let diff = "--- a/f\n+++ b/f\n@@ -1,0 +2,1 @@\n+NEW\n";
+        let segments = hunks(diff)?;
+        let parsed = Patch::from_str(&segments[0])?;
+        let applied =
+            apply_segment("one\ntwo\n", &parsed).map_err(|_| "a pure insertion hunk must apply")?;
+        assert_eq!(applied.replaced.len(), 1);
+        let region = &applied.replaced[0];
+        assert_eq!(
+            (region.range.start, region.range.end),
+            (4, 4),
+            "an insertion-only hunk records a zero-width region at the point it inserts, not a \
+             spanning range"
+        );
+        assert_eq!(region.text, "NEW\n");
+        assert_eq!(applied.next_source, "one\nNEW\ntwo\n");
+        Ok(())
+    }
+
+    #[test]
+    fn apply_segment_records_the_deleted_runs_range_with_empty_replacement_text() -> TestResult {
+        let diff = "--- a/f\n+++ b/f\n@@ -2 +1,0 @@\n-two\n";
+        let segments = hunks(diff)?;
+        let parsed = Patch::from_str(&segments[0])?;
+        let applied = apply_segment("one\ntwo\nthree\n", &parsed)
+            .map_err(|_| "a deletion-only hunk must apply")?;
+        assert_eq!(applied.replaced.len(), 1);
+        let region = &applied.replaced[0];
+        assert_eq!(
+            (region.range.start, region.range.end),
+            (4, 8),
+            "a deletion-only hunk records the deleted run's original range"
+        );
+        assert_eq!(region.text, "", "nothing replaces a purely deleted run");
+        assert_eq!(applied.next_source, "one\nthree\n");
+        Ok(())
+    }
+
+    #[test]
+    fn apply_segment_returns_regions_ascending_by_start_after_a_backward_drift() -> TestResult {
+        // "P" sits at line 2 and "Q" at line 9; the first hunk claims and finds
+        // "Q" directly, but the second hunk's header claims line 10 while "P"
+        // only exists at line 2 - the backward search that locates it lands
+        // before the first hunk's own region.
+        let diff = "--- a/f\n+++ b/f\n\
+             @@ -9,1 +9,1 @@\n-Q\n+QQ\n\
+             @@ -10,1 +10,1 @@\n-P\n+PP\n";
+        let segments = hunks(diff)?;
+        let parsed = Patch::from_str(&segments[0])?;
+        let source = "x\nP\nx\nx\nx\nx\nx\nx\nQ\nx\nx\n";
+        let applied = apply_segment(source, &parsed).map_err(
+            |_| "the second hunk must still be found after searching backward past the first",
+        )?;
+        assert_eq!(applied.replaced.len(), 2);
+        assert_eq!(
+            (
+                applied.replaced[0].range.start,
+                applied.replaced[0].range.end
+            ),
+            (2, 4),
+            "the second hunk (P, found earlier in the file) sorts first despite applying second"
+        );
+        assert_eq!(applied.replaced[0].text, "PP\n");
+        assert_eq!(
+            (
+                applied.replaced[1].range.start,
+                applied.replaced[1].range.end
+            ),
+            (16, 18),
+            "the first hunk (Q, found later in the file) sorts second"
+        );
+        assert_eq!(applied.replaced[1].text, "QQ\n");
+        Ok(())
+    }
+
+    #[test]
+    fn apply_segment_records_the_real_position_after_a_forward_drift_not_the_header_position()
+    -> TestResult {
+        let diff = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-target\n+TARGET\n";
+        let segments = hunks(diff)?;
+        let parsed = Patch::from_str(&segments[0])?;
+        let source = "a\nb\nc\ntarget\n";
+        let applied = apply_segment(source, &parsed)
+            .map_err(|_| "context three lines below the header must still be found")?;
+        assert_eq!(applied.replaced.len(), 1);
+        assert_eq!(
+            (
+                applied.replaced[0].range.start,
+                applied.replaced[0].range.end
+            ),
+            (6, 13),
+            "the region names the line's real position (line 4), not the header's claimed line 1"
+        );
+        assert_eq!(applied.replaced[0].text, "TARGET\n");
+        Ok(())
+    }
+
+    #[test]
+    fn apply_segment_insertion_offset_falls_back_to_the_original_images_end() -> TestResult {
+        // The first hunk replaces both remaining lines of a 3-line file; the
+        // second hunk then inserts after that point, where nothing original
+        // is left standing.
+        let diff = "--- a/f\n+++ b/f\n@@ -2,2 +2,1 @@\n-b\n-c\n+BC\n@@ -4,0 +3,1 @@\n+TAIL\n";
+        let segments = hunks(diff)?;
+        let parsed = Patch::from_str(&segments[0])?;
+        let applied = apply_segment("a\nb\nc\n", &parsed)
+            .map_err(|_| "a tail-replacing hunk followed by a trailing insertion must apply")?;
+        assert_eq!(applied.replaced.len(), 2);
+        assert_eq!(
+            (
+                applied.replaced[0].range.start,
+                applied.replaced[0].range.end
+            ),
+            (2, 6),
+            "the first hunk replaces the tail two lines of the 6-byte original image"
+        );
+        assert_eq!(applied.replaced[0].text, "BC\n");
+        assert_eq!(
+            (
+                applied.replaced[1].range.start,
+                applied.replaced[1].range.end
+            ),
+            (6, 6),
+            "every line from the insertion point on was already patched, so it resolves to the \
+             original image's own end, not a mid-file offset"
+        );
+        assert_eq!(applied.replaced[1].text, "TAIL\n");
+        assert_eq!(applied.next_source, "a\nBC\nTAIL\n");
+        Ok(())
+    }
+
+    #[test]
+    fn hunk_counts_of_counts_each_line_kind_correctly() {
+        assert_eq!(
+            HunkCounts::of(&[" ctx\n"]),
+            HunkCounts { old: 1, new: 1 },
+            "a space-prefixed line counts on both sides"
+        );
+        assert_eq!(
+            HunkCounts::of(&["-old\n"]),
+            HunkCounts { old: 1, new: 0 },
+            "a `-` line counts only the old side"
+        );
+        assert_eq!(
+            HunkCounts::of(&["+new\n"]),
+            HunkCounts { old: 0, new: 1 },
+            "a `+` line counts only the new side"
+        );
+        assert_eq!(
+            HunkCounts::of(&["\n"]),
+            HunkCounts { old: 1, new: 1 },
+            "a bare empty line counts on both sides"
+        );
+        assert_eq!(
+            HunkCounts::of(&["\\ No newline at end of file\n"]),
+            HunkCounts { old: 0, new: 0 },
+            "the no-newline marker counts on neither side"
+        );
+    }
+
+    #[test]
+    fn rewritten_header_refuses_a_malformed_header_shape() {
+        let counts = HunkCounts { old: 1, new: 1 };
+        assert!(
+            rewritten_header("not a header\n", counts).is_none(),
+            "a line that does not open with `@@` must not be rewritten"
+        );
+        assert!(
+            rewritten_header("@@ -1,2 @@\n", counts).is_none(),
+            "a header missing its `+new` side must not be rewritten"
+        );
+        assert!(
+            rewritten_header("@@ -x,2 +1,3 @@\n", counts).is_none(),
+            "a header whose offset is not numeric must not be rewritten"
+        );
+        assert!(
+            rewritten_header("@@ -1,2 +1,3 +9,9 @@\n", counts).is_none(),
+            "a header carrying a third range must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn rewritten_header_keeps_offsets_trailing_heading_and_line_ending() {
+        let header = "@@ -10,3 +12,5 @@ fn heading() {\n";
+        let counts = HunkCounts { old: 7, new: 2 };
+        let rewritten =
+            rewritten_header(header, counts).expect("a well-formed header must rewrite");
+        assert_eq!(rewritten, "@@ -10,7 +12,2 @@ fn heading() {\n");
+    }
+
+    #[test]
+    fn apply_segment_applies_a_miscounted_header_identically_to_a_correct_one() -> TestResult {
+        let source = "line1\nline2\nline3\nline4\nline5\n";
+        let body = " line1\n-line2\n-line3\n+NEW2\n+NEW3\n line4\n";
+        let wrong = format!("--- a/f\n+++ b/f\n@@ -1,11 +1,6 @@\n{body}");
+        let correct = format!("--- a/f\n+++ b/f\n@@ -1,4 +1,4 @@\n{body}");
+        let wrong_segments = hunks(&wrong)?;
+        let correct_segments = hunks(&correct)?;
+        assert_eq!(
+            wrong_segments[0], correct_segments[0],
+            "recounting from the body must erase the header's originally wrong counts entirely"
+        );
+        let wrong_parsed = Patch::from_str(&wrong_segments[0])?;
+        let correct_parsed = Patch::from_str(&correct_segments[0])?;
+        let wrong_applied = apply_segment(source, &wrong_parsed)
+            .map_err(|_| "a miscounted header must still apply once recounted")?;
+        let correct_applied = apply_segment(source, &correct_parsed)
+            .map_err(|_| "the correctly counted header must apply")?;
+        assert_eq!(wrong_applied.next_source, correct_applied.next_source);
+        assert_eq!(
+            wrong_applied.next_source,
+            "line1\nNEW2\nNEW3\nline4\nline5\n"
+        );
+        assert_eq!(wrong_applied.replaced.len(), 1);
+        assert_eq!(correct_applied.replaced.len(), 1);
+        assert_eq!(
+            (
+                wrong_applied.replaced[0].range.start,
+                wrong_applied.replaced[0].range.end
+            ),
+            (0, 24),
+            "the header claimed 11 old / 6 new lines; the body's real 4 and 4 still bound the \
+             replaced run"
+        );
+        assert_eq!(wrong_applied.replaced[0].text, "line1\nNEW2\nNEW3\nline4\n");
+        assert_eq!(
+            wrong_applied.replaced[0].range,
+            correct_applied.replaced[0].range
+        );
+        assert_eq!(
+            wrong_applied.replaced[0].text,
+            correct_applied.replaced[0].text
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn apply_segment_applies_a_hunk_whose_header_omits_the_count() -> TestResult {
+        let diff = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-one\n+ONE\n";
+        let segments = hunks(diff)?;
+        let parsed = Patch::from_str(&segments[0])?;
+        let applied = apply_segment("one\n", &parsed)
+            .map_err(|_| "a header with an omitted count must still parse and apply")?;
+        assert_eq!(applied.next_source, "ONE\n");
+        assert_eq!(
+            (
+                applied.replaced[0].range.start,
+                applied.replaced[0].range.end
+            ),
+            (0, 4),
+            "the omitted count implies exactly one line, spanning the whole 4-byte source"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn apply_segment_refuses_when_the_recounted_header_still_cannot_locate_its_context()
+    -> TestResult {
+        let diff = "--- a/f\n+++ b/f\n@@ -1,99 +1,99 @@\n-vanished\n+VANISHED\n";
+        let segments = hunks(diff)?;
+        let parsed = Patch::from_str(&segments[0])?;
+        let detail = apply_segment("one\ntwo\n", &parsed)
+            .err()
+            .ok_or("wrong counts plus unmatchable content must still refuse")?;
+        assert_eq!(detail.ordinal, 1);
+        assert_eq!(detail.expected, "vanished");
+        assert_eq!(detail.observed, "one");
+        assert!(
+            detail.header.contains("@@ -1 +1 @@"),
+            "the refusal reports the recounted header (one line each side), not the original \
+             wrong count of 99: {}",
+            detail.header
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn apply_segment_keeps_crlf_bytes_through_the_recounted_header_and_applies() -> TestResult {
+        let diff = "--- a/f\r\n+++ b/f\r\n@@ -1,2 +1,2 @@\r\n-one\r\n+ONE\r\n two\r\n";
+        let segments = hunks(diff)?;
+        assert!(
+            segments[0].contains("-one\r\n"),
+            "hunk body bytes, CRLF included, must survive normalization untouched: {:?}",
+            segments[0]
+        );
+        let parsed = Patch::from_str(&segments[0])?;
+        let applied = apply_segment("one\r\ntwo\r\n", &parsed)
+            .map_err(|_| "a CRLF hunk body must match a CRLF source")?;
+        assert_eq!(applied.next_source, "ONE\r\ntwo\r\n");
+        Ok(())
+    }
+
+    #[test]
+    fn named_parse_error_names_the_hunk_whose_header_is_malformed() -> TestResult {
+        let diff = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-one\n+ONE\n@@ nonsense @@\n-two\n+TWO\n";
+        let segments = hunks(diff)?;
+        let error = super::parse_segment(&segments[0], 5)
+            .err()
+            .ok_or("a malformed second hunk header must fail to parse")?;
+        assert!(
+            error.to_string().contains("file 5 hunk 2"),
+            "message must name the file and the malformed hunk: {error}"
         );
         Ok(())
     }
