@@ -40,9 +40,9 @@ use tracing::Instrument as _;
 
 use crate::failure::{WireFailure, hook_failure_diagnostic, stale_snapshot_diagnostic};
 use crate::validation::{
-    ConfigurationState, INDEX_CAPTURE_ATTEMPTS_MAX, INDEX_FRESHNESS_TIMEOUT, IndexState,
-    IndexSupervisor, IndexSupervisorContext, IndexValidation, LexicalLane, LexicalWrite,
-    PendingWork, PopulationLane, PublishedWorkspace, RebuildOutcome, WorkspaceCandidate,
+    ConfigurationState, INDEX_CAPTURE_ATTEMPTS_MAX, IndexState, IndexSupervisor,
+    IndexSupervisorContext, IndexValidation, LexicalLane, LexicalWrite, PendingWork,
+    PopulationLane, PublishedWorkspace, RebuildOutcome, WorkspaceCandidate,
     build_workspace_candidate, configuration_fingerprint, finish_rebuild, initial_workspace,
     lexical_write, run_index_supervisor, workspace_watcher,
 };
@@ -1283,18 +1283,42 @@ impl RiftMcp {
     }
 
     /// Returns one atomically published index and configuration policy.
+    ///
+    /// The wait is bounded by `[server] readiness_timeout` from the last
+    /// accepted `rift.toml` - the default table's value while the file is
+    /// invalid, since the acceptance failure itself is what a request
+    /// meets once the wait ends. The deadline starts here, covering index
+    /// validation; a caller that goes on to wait for a specific engine's
+    /// readiness spends what remains of the same budget, not a fresh one.
     async fn published_workspace(
         &self,
         phase: wire::ErrorPhase,
     ) -> Result<Arc<PublishedWorkspace>, ErrorData> {
-        match tokio::time::timeout(INDEX_FRESHNESS_TIMEOUT, self.reconcile_workspace(phase)).await {
+        let deadline = tokio::time::Instant::now() + self.readiness_timeout().await;
+        match tokio::time::timeout_at(deadline, self.reconcile_workspace(phase)).await {
             Ok(result) => result,
             Err(_) => Err(ReadFault::unavailable(
                 "current workspace read",
-                "index freshness deadline elapsed",
+                "readiness deadline elapsed",
             )
             .tool_error(phase)),
         }
+    }
+
+    /// The `[server] readiness_timeout` this request's wait is bounded by,
+    /// read from whatever configuration is currently published - stale or
+    /// not, since a deadline this call needs before validation can even
+    /// begin cannot itself wait on that validation.
+    async fn readiness_timeout(&self) -> Duration {
+        let state = self.published.read().await;
+        let (current, _failure) = state.snapshot();
+        Duration::from_millis(
+            current
+                .configuration
+                .server_configuration()
+                .readiness_timeout
+                .milliseconds(),
+        )
     }
 
     /// Reconciles native observations with an exact request-time capture of the tree.
@@ -3187,7 +3211,7 @@ pub fn beacon() -> u64 {
             .await
             .expect_err("a stalled publication must miss the freshness deadline");
         assert!(
-            error.message.contains("index freshness deadline elapsed"),
+            error.message.contains("readiness deadline elapsed"),
             "unexpected refusal: {error:?}"
         );
         Ok(())
@@ -3902,7 +3926,7 @@ pub fn beacon() -> u64 {
             .await
             .expect_err("a stalled publication must miss the freshness deadline");
         assert!(
-            error.message.contains("index freshness deadline elapsed"),
+            error.message.contains("readiness deadline elapsed"),
             "unexpected refusal: {error:?}"
         );
         Ok(())

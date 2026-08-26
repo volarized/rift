@@ -1,8 +1,9 @@
 //! Engine diagnostics pulled over the paths one applied change touched.
 //!
 //! After a change lands, each changed path whose language has an engine
-//! advertising diagnostic pulls is opened with its published bytes, pulled,
-//! and closed; the engine's findings ride the change summary, mapped and
+//! advertising diagnostic pulls is notified through the engine's own
+//! watched-file registration, opened with its published bytes, pulled, and
+//! closed; the engine's findings ride the change summary, mapped and
 //! bounded. The change already applied, so nothing here refuses or fails
 //! the call: an engine failure degrades to one warning naming the engine,
 //! and an engine without the capability stays silent.
@@ -13,8 +14,11 @@
 //! own - under that engine's `[engines.<name>.retry]` and
 //! `[engines.<name>.restart]` tables. What reaches this module is either
 //! the engine's settled findings or the condition that outlasted the whole
-//! budget, and an engine that never stopped analyzing degrades to its own
-//! warning: an empty list would read as clean bytes.
+//! budget. An engine still analyzing on every attempt, and one whose pull
+//! answered empty while its own readiness stayed unconfirmed, both
+//! degrade to `rift.engine.unready`: an empty list would otherwise read as
+//! clean bytes, and a settled-looking answer from an engine that has never
+//! proven it is settled is not evidence of anything.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -23,7 +27,7 @@ use lsp_types::{Diagnostic as LspDiagnostic, DiagnosticSeverity, NumberOrString}
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::position::LineIndex;
-use rift_lsp::session::{EngineError, EngineFault, EngineSession};
+use rift_lsp::session::{EngineError, EngineFault, EngineReadiness, EngineSession};
 use rift_protocol::read::{
     Diagnostic, DiagnosticCode, DiagnosticContinuation, DiagnosticReliability, Extensions, FileId,
     Language, ProjectPath, Severity, SourceSpan, TextRange,
@@ -34,6 +38,9 @@ use crate::read::{ReadService, file_id};
 
 /// Most mapped engine findings one applied change carries.
 pub const ENGINE_DIAGNOSTICS_PER_CHANGE_MAX: usize = 16;
+
+/// Most paths one `rift.engine.unready` warning names.
+const ENGINE_UNREADY_PATHS_MAX: usize = 16;
 
 /// Pulls engine diagnostics for every changed path an engine serves.
 ///
@@ -46,6 +53,12 @@ pub const ENGINE_DIAGNOSTICS_PER_CHANGE_MAX: usize = 16;
 /// contributes nothing. The slot has already spent that engine's whole
 /// retry budget on the path before any warning is raised.
 ///
+/// A path whose pull could not be proven settled - the engine exhausted
+/// every attempt still analyzing, or answered empty while it had never
+/// confirmed its own readiness - is held out of the mapped findings and
+/// named instead in one `rift.engine.unready` warning per engine and
+/// language, grouping every such path from this walk.
+///
 /// # Cancel safety
 ///
 /// Dropping the future leaves at most one engine request pending; the
@@ -57,14 +70,15 @@ pub async fn engine_change_diagnostics(
 ) -> Vec<Diagnostic> {
     let mut findings = Vec::new();
     let mut ended_engines: BTreeSet<String> = BTreeSet::new();
+    let mut unready: BTreeMap<(String, String), (Language, Vec<ProjectPath>)> = BTreeMap::new();
     for path in paths {
         if findings.len() >= ENGINE_DIAGNOSTICS_PER_CHANGE_MAX {
             break;
         }
-        let Ok(path) = CoreProjectPath::new(path.0.as_str()) else {
+        let Ok(core_path) = CoreProjectPath::new(path.0.as_str()) else {
             continue;
         };
-        let Some(file) = reads.index().file(&path) else {
+        let Some(file) = reads.index().file(&core_path) else {
             continue;
         };
         let language = file.syntax().language().clone();
@@ -74,9 +88,14 @@ pub async fn engine_change_diagnostics(
         if ended_engines.contains(slot.name()) {
             continue;
         }
-        match pulled_diagnostics(slot, &path, &language, file.source()).await {
-            Ok((items, encoding)) => {
-                let unit = file_id(&path);
+        match pulled_diagnostics(slot, &core_path, &language, file.source()).await {
+            Ok((items, _encoding, readiness))
+                if items.is_empty() && readiness == EngineReadiness::Unconfirmed =>
+            {
+                unready_paths(&mut unready, slot.name(), &language).push(path.clone());
+            }
+            Ok((items, encoding, _readiness)) => {
+                let unit = file_id(&core_path);
                 let index = LineIndex::new(file.source());
                 let remaining = ENGINE_DIAGNOSTICS_PER_CHANGE_MAX - findings.len();
                 findings.extend(
@@ -85,6 +104,9 @@ pub async fn engine_change_diagnostics(
                         .take(remaining)
                         .map(|item| mapped_diagnostic(item, &unit, &index, encoding, &language)),
                 );
+            }
+            Err(error) if matches!(error.fault(), EngineFault::Analyzing { .. }) => {
+                unready_paths(&mut unready, slot.name(), &language).push(path.clone());
             }
             Err(error) => {
                 if !matches!(error.fault(), EngineFault::CapabilityAbsent { .. }) {
@@ -96,7 +118,26 @@ pub async fn engine_change_diagnostics(
             }
         }
     }
+    for ((engine, _identity_segment), (language, unready_for)) in unready {
+        if findings.len() >= ENGINE_DIAGNOSTICS_PER_CHANGE_MAX {
+            break;
+        }
+        findings.push(unready_warning(&engine, &language, &unready_for));
+    }
     findings
+}
+
+/// The paths already recorded as unready for one engine and language,
+/// inserting an empty record on first use.
+fn unready_paths<'record>(
+    record: &'record mut BTreeMap<(String, String), (Language, Vec<ProjectPath>)>,
+    engine: &str,
+    language: &Language,
+) -> &'record mut Vec<ProjectPath> {
+    &mut record
+        .entry((engine.to_owned(), language.identity_segment()))
+        .or_insert_with(|| (language.clone(), Vec::new()))
+        .1
 }
 
 /// One open-pull-close conversation on the claimed engine's slot.
@@ -105,7 +146,7 @@ async fn pulled_diagnostics(
     path: &CoreProjectPath,
     language: &Language,
     source: &str,
-) -> Result<(Vec<LspDiagnostic>, PositionEncoding), EngineError> {
+) -> Result<(Vec<LspDiagnostic>, PositionEncoding, EngineReadiness), EngineError> {
     // The boxed future may only borrow the session, so each attempt gets
     // its own owned copy of the request data.
     let request_path = path.clone();
@@ -120,29 +161,38 @@ async fn pulled_diagnostics(
     .await
 }
 
-/// Opens, pulls, and closes one document on a running session.
+/// Notifies, opens, pulls, and closes one document on a running session.
 ///
-/// The capability gate runs before the open, so an engine without pulls is
-/// never handed a document. A failed pull still attempts the close; a
-/// session the fault already ended refuses it, which changes nothing.
+/// The capability gate runs before the notification and the open, so an
+/// engine without pulls is never handed one. The notification records
+/// that this path changed on disk before the pull is sent, so the pull
+/// starts only once the announced work that notification triggers has
+/// been read - the outer slot resends the whole attempt while the session
+/// still reads as analyzing, so a progress cycle interleaved before the
+/// pull's own answer is not missed. A failed pull still attempts the
+/// close; a session the fault already ended refuses it, which changes
+/// nothing.
 async fn pull_on_session(
     session: &mut EngineSession,
     path: &CoreProjectPath,
     language_id: &str,
     text: String,
-) -> Result<(Vec<LspDiagnostic>, PositionEncoding), EngineError> {
+) -> Result<(Vec<LspDiagnostic>, PositionEncoding, EngineReadiness), EngineError> {
     if !session.capabilities().pull_diagnostics {
         return Err(rift_core::Error::new(EngineFault::CapabilityAbsent {
             capability: DocumentDiagnosticRequest::METHOD.to_owned(),
         }));
     }
     let encoding = session.capabilities().position_encoding;
+    let notified_paths = std::slice::from_ref(path);
+    session.notify_changed_paths(notified_paths).await?;
     session.open(path, language_id, text).await?;
     let pulled = session.pull_diagnostics(path).await;
+    let readiness = session.readiness();
     // The close is best-effort: a session the pull's fault ended refuses
     // it, and the pull's own outcome is what the caller acts on.
     let _ = session.close(path).await;
-    Ok((pulled?, encoding))
+    Ok((pulled?, encoding, readiness))
 }
 
 /// One LSP diagnostic mapped into the change summary's carrier.
@@ -204,32 +254,20 @@ fn mapped_severity(severity: Option<DiagnosticSeverity>) -> Severity {
     }
 }
 
-/// The one warning an engine that did not serve settled diagnostics
-/// contributes.
+/// The one warning an engine that failed to serve diagnostics contributes.
 ///
-/// An engine that was still analyzing on every attempt gets its own code
-/// and its own words: the pull answered, and what it answered is simply
-/// not final. Reporting that as no findings would tell the caller the
-/// changed bytes are clean. Every other failure keeps the engine-failed
-/// code.
+/// Every failure that reaches here is one the retry budget could not
+/// absorb: a broken exchange, a dead engine the restart budget refused to
+/// replace, a timeout. An engine still analyzing on every attempt, or one
+/// whose empty answer never confirmed its own readiness, is not reported
+/// through this warning at all - see [`unready_warning`].
 fn engine_warning(engine: &str, error: &EngineError) -> Diagnostic {
-    let (code, message) = match error.fault() {
-        EngineFault::Analyzing { attempts } => (
-            DiagnosticCode::EngineAnalyzing,
-            format!(
-                "engine {engine} was still analyzing on all {attempts} attempts, so its \
-                 findings over the applied change may be incomplete"
-            ),
-        ),
-        _ => (
-            DiagnosticCode::EngineFailed,
-            format!("engine {engine} could not serve diagnostics over the applied change: {error}"),
-        ),
-    };
     Diagnostic {
         severity: Severity::Warning,
-        code: Some(code.code()),
-        message,
+        code: Some(DiagnosticCode::EngineFailed.code()),
+        message: format!(
+            "engine {engine} could not serve diagnostics over the applied change: {error}"
+        ),
         span: None,
         related: Vec::new(),
         tags: Vec::new(),
@@ -237,6 +275,37 @@ fn engine_warning(engine: &str, error: &EngineError) -> Diagnostic {
         continuation: DiagnosticContinuation::Unknown,
         extensions: Extensions(BTreeMap::new()),
         language: None,
+    }
+}
+
+/// The one warning naming every changed path whose post-apply diagnostics
+/// from `engine`, for `language`, could not be proven settled.
+///
+/// Grouped one warning per engine and language rather than one per path:
+/// the reason is the same for every path in the group, and the group is
+/// bounded by [`ENGINE_UNREADY_PATHS_MAX`].
+fn unready_warning(engine: &str, language: &Language, paths: &[ProjectPath]) -> Diagnostic {
+    let named = paths
+        .iter()
+        .take(ENGINE_UNREADY_PATHS_MAX)
+        .map(|path| path.0.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Diagnostic {
+        severity: Severity::Warning,
+        code: Some(DiagnosticCode::EngineUnready.code()),
+        message: format!(
+            "engine {engine} for language {} never confirmed its own readiness, so its \
+             diagnostics for {named} are not proven settled",
+            language.identity_segment()
+        ),
+        span: None,
+        related: Vec::new(),
+        tags: Vec::new(),
+        reliability: DiagnosticReliability::Reliable,
+        continuation: DiagnosticContinuation::Unknown,
+        extensions: Extensions(BTreeMap::new()),
+        language: Some(language.clone()),
     }
 }
 
@@ -354,24 +423,26 @@ mod tests {
         assert_eq!(failed.severity, Severity::Warning);
         assert_eq!(failed.code.as_deref(), Some("rift.engine.failed"));
         assert!(failed.message.contains("fake"), "{}", failed.message);
-        let analyzing = engine_warning(
-            "fake",
-            &rift_core::Error::new(EngineFault::Analyzing { attempts: 8 }),
-        );
-        assert_eq!(analyzing.severity, Severity::Warning);
-        assert_eq!(analyzing.code.as_deref(), Some("rift.engine.analyzing"));
-        assert!(
-            analyzing
-                .message
-                .contains("still analyzing on all 8 attempts"),
-            "{}",
-            analyzing.message
-        );
-        assert!(
-            analyzing.message.contains("may be incomplete"),
-            "{}",
-            analyzing.message
-        );
+    }
+
+    #[test]
+    fn unready_warnings_carry_their_own_code_and_name_every_path() {
+        let language = Language {
+            name: "rust".to_owned(),
+            dialect: None,
+        };
+        let paths = [
+            ProjectPath("lib.rs".to_owned()),
+            ProjectPath("caller.rs".to_owned()),
+        ];
+        let warning = unready_warning("fake", &language, &paths);
+        assert_eq!(warning.severity, Severity::Warning);
+        assert_eq!(warning.code.as_deref(), Some("rift.engine.unready"));
+        assert_eq!(warning.language, Some(language));
+        assert!(warning.message.contains("fake"), "{}", warning.message);
+        assert!(warning.message.contains("rust"), "{}", warning.message);
+        assert!(warning.message.contains("lib.rs"), "{}", warning.message);
+        assert!(warning.message.contains("caller.rs"), "{}", warning.message);
     }
 
     #[tokio::test]
@@ -395,5 +466,275 @@ mod tests {
         ];
         let findings = engine_change_diagnostics(&engines, &reads, &paths).await;
         assert!(findings.is_empty());
+    }
+
+    /// One framed JSON-RPC message.
+    fn framed(body: &str) -> String {
+        format!("Content-Length: {}\r\n\r\n{body}", body.len())
+    }
+
+    /// A workspace served by a canned `sh` engine that advertises pull
+    /// diagnostics and never announces any work of its own: every
+    /// `textDocument/diagnostic` pull it answers - the first, and the one
+    /// resend an unconfirmed engine earns - carries no item. The script
+    /// never reads its stdin; it writes both answers regardless of what
+    /// the session sends.
+    fn workspace_with_unconfirmed_engine(
+        files: &[(&str, &str)],
+    ) -> (tempfile::TempDir, ReadService, EnginePool) {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        for (name, source) in files {
+            std::fs::write(directory.path().join(name), source).expect("fixture file writes");
+        }
+        let reads = ReadService::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )
+        .expect("fixture workspace indexes");
+        let capabilities = framed(
+            r#"{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"diagnosticProvider":{"identifier":"fake","interFileDependencies":false,"workspaceDiagnostics":false}}}}"#,
+        );
+        let empty_pull = |id: u64| {
+            framed(&format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"kind":"full","items":[]}}}}"#
+            ))
+        };
+        let script = format!(
+            "printf '%s' '{capabilities}{}{}'; sleep 0.2",
+            empty_pull(1),
+            empty_pull(2),
+        );
+        let engine = rift_protocol::configuration::EngineConfiguration {
+            program: "sh".to_owned(),
+            arguments: vec!["-c".to_owned(), script],
+            environment: BTreeMap::new(),
+            languages: vec!["rust".to_owned()],
+            initialization_options: None,
+            startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            output_limit: rift_protocol::configuration::ByteSize::from_bytes(4_096),
+            retry: rift_protocol::retry::RetryPolicy {
+                attempts: 2,
+                delay: rift_protocol::configuration::Duration::from_millis(1),
+                delay_limit: rift_protocol::configuration::Duration::from_millis(1),
+            },
+            restart: rift_protocol::retry::RestartPolicy::default(),
+        };
+        let engines = EnginePool::new(
+            directory.path(),
+            BTreeMap::from([("fake".to_owned(), engine)]),
+        );
+        (directory, reads, engines)
+    }
+
+    /// Reproduces the defect an unread readiness left behind: an
+    /// unconfirmed engine's settled-looking empty pull - the one this
+    /// session already spent its one resend on - used to read as clean
+    /// bytes. It must instead surface as `rift.engine.unready`, naming
+    /// the engine and the path, rather than silently reporting nothing.
+    #[tokio::test]
+    async fn an_unconfirmed_engines_settled_looking_empty_pull_is_reported_unready() {
+        let (directory, reads, engines) =
+            workspace_with_unconfirmed_engine(&[("lib.rs", "pub fn beacon() {}\n")]);
+        let paths = vec![ProjectPath("lib.rs".to_owned())];
+        let findings = engine_change_diagnostics(&engines, &reads, &paths).await;
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert_eq!(findings[0].code.as_deref(), Some("rift.engine.unready"));
+        assert!(
+            findings[0].message.contains("fake"),
+            "{}",
+            findings[0].message
+        );
+        assert!(
+            findings[0].message.contains("lib.rs"),
+            "{}",
+            findings[0].message
+        );
+        engines.shutdown().await;
+        drop(directory);
+    }
+
+    /// A workspace served by a canned `sh` engine that announces one
+    /// work-done progress token and never ends it, and answers exactly one
+    /// `textDocument/diagnostic` pull with no item while it is outstanding.
+    /// With `retry.attempts` at 1 the slot exhausts its budget on that
+    /// single attempt, so `pulled_diagnostics` surfaces
+    /// `EngineFault::Analyzing` rather than a settled answer. The script
+    /// never reads its stdin; it writes the fixed sequence regardless of
+    /// what the session sends.
+    fn workspace_with_an_engine_still_analyzing(
+        files: &[(&str, &str)],
+    ) -> (tempfile::TempDir, ReadService, EnginePool) {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        for (name, source) in files {
+            std::fs::write(directory.path().join(name), source).expect("fixture file writes");
+        }
+        let reads = ReadService::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )
+        .expect("fixture workspace indexes");
+        let capabilities = framed(
+            r#"{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"diagnosticProvider":{"identifier":"fake","interFileDependencies":false,"workspaceDiagnostics":false}}}}"#,
+        );
+        let progress_begin = framed(
+            r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"warm","value":{"kind":"begin","title":"loading"}}}"#,
+        );
+        let empty_pull = framed(r#"{"jsonrpc":"2.0","id":1,"result":{"kind":"full","items":[]}}"#);
+        let script = format!("printf '%s' '{capabilities}{progress_begin}{empty_pull}'; sleep 0.2");
+        let engine = rift_protocol::configuration::EngineConfiguration {
+            program: "sh".to_owned(),
+            arguments: vec!["-c".to_owned(), script],
+            environment: BTreeMap::new(),
+            languages: vec!["rust".to_owned()],
+            initialization_options: None,
+            startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            output_limit: rift_protocol::configuration::ByteSize::from_bytes(4_096),
+            retry: rift_protocol::retry::RetryPolicy {
+                attempts: 1,
+                delay: rift_protocol::configuration::Duration::from_millis(1),
+                delay_limit: rift_protocol::configuration::Duration::from_millis(1),
+            },
+            restart: rift_protocol::retry::RestartPolicy::default(),
+        };
+        let engines = EnginePool::new(
+            directory.path(),
+            BTreeMap::from([("fake".to_owned(), engine)]),
+        );
+        (directory, reads, engines)
+    }
+
+    /// An engine still analyzing on every attempt reports the same
+    /// `rift.engine.unready` warning an unconfirmed engine's settled-
+    /// looking empty answer does: both are answers the retry budget could
+    /// not turn into a settled verdict, and neither is evidence the
+    /// changed bytes are clean.
+    #[tokio::test]
+    async fn an_engine_still_analyzing_on_every_attempt_is_reported_unready() {
+        let (directory, reads, engines) =
+            workspace_with_an_engine_still_analyzing(&[("lib.rs", "pub fn beacon() {}\n")]);
+        let paths = vec![ProjectPath("lib.rs".to_owned())];
+        let findings = engine_change_diagnostics(&engines, &reads, &paths).await;
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert_eq!(findings[0].code.as_deref(), Some("rift.engine.unready"));
+        assert!(
+            findings[0].message.contains("fake"),
+            "{}",
+            findings[0].message
+        );
+        assert!(
+            findings[0].message.contains("lib.rs"),
+            "{}",
+            findings[0].message
+        );
+        engines.shutdown().await;
+        drop(directory);
+    }
+
+    /// A workspace served by a canned `sh` engine whose first path never
+    /// confirms readiness - two empty pulls, exactly
+    /// [`workspace_with_unconfirmed_engine`]'s script - and whose second
+    /// path answers with [`ENGINE_DIAGNOSTICS_PER_CHANGE_MAX`] mapped
+    /// diagnostics, filling the finding cap before the walk ever appends
+    /// the first path's queued unready warning.
+    fn workspace_with_an_unconfirmed_path_and_a_flooding_path(
+        files: &[(&str, &str)],
+    ) -> (tempfile::TempDir, ReadService, EnginePool) {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        for (name, source) in files {
+            std::fs::write(directory.path().join(name), source).expect("fixture file writes");
+        }
+        let reads = ReadService::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )
+        .expect("fixture workspace indexes");
+        let capabilities = framed(
+            r#"{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"diagnosticProvider":{"identifier":"fake","interFileDependencies":false,"workspaceDiagnostics":false}}}}"#,
+        );
+        let empty_pull = |id: u64| {
+            framed(&format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"kind":"full","items":[]}}}}"#
+            ))
+        };
+        let items = (0..ENGINE_DIAGNOSTICS_PER_CHANGE_MAX)
+            .map(|index| {
+                format!(
+                    r#"{{"range":{{"start":{{"line":0,"character":0}},"end":{{"line":0,"character":1}}}},"message":"flood-{index}"}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let flooding_pull = framed(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"result":{{"kind":"full","items":[{items}]}}}}"#
+        ));
+        let script = format!(
+            "printf '%s' '{capabilities}{}{}{flooding_pull}'; sleep 0.2",
+            empty_pull(1),
+            empty_pull(2),
+        );
+        let engine = rift_protocol::configuration::EngineConfiguration {
+            program: "sh".to_owned(),
+            arguments: vec!["-c".to_owned(), script],
+            environment: BTreeMap::new(),
+            languages: vec!["rust".to_owned()],
+            initialization_options: None,
+            startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            output_limit: rift_protocol::configuration::ByteSize::from_bytes(8_192),
+            retry: rift_protocol::retry::RetryPolicy {
+                attempts: 2,
+                delay: rift_protocol::configuration::Duration::from_millis(1),
+                delay_limit: rift_protocol::configuration::Duration::from_millis(1),
+            },
+            restart: rift_protocol::retry::RestartPolicy::default(),
+        };
+        let engines = EnginePool::new(
+            directory.path(),
+            BTreeMap::from([("fake".to_owned(), engine)]),
+        );
+        (directory, reads, engines)
+    }
+
+    /// Once one path's mapped findings fill the cap, a still-queued
+    /// unready warning from an earlier path in the same walk is never
+    /// appended: the cap applies to the unready warnings the same way it
+    /// applies to mapped findings, so the walk's total never exceeds it.
+    #[tokio::test]
+    async fn a_finding_cap_reached_before_the_unready_group_drops_the_queued_warning() {
+        let (directory, reads, engines) =
+            workspace_with_an_unconfirmed_path_and_a_flooding_path(&[
+                ("a.rs", "pub fn a() {}\n"),
+                ("b.rs", "pub fn b() {}\n"),
+            ]);
+        let paths = vec![
+            ProjectPath("a.rs".to_owned()),
+            ProjectPath("b.rs".to_owned()),
+        ];
+        let findings = engine_change_diagnostics(&engines, &reads, &paths).await;
+        assert_eq!(
+            findings.len(),
+            ENGINE_DIAGNOSTICS_PER_CHANGE_MAX,
+            "{findings:#?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.code.as_deref() != Some("rift.engine.unready")),
+            "the cap is reached before path a's queued unready warning is appended: \
+             {findings:#?}"
+        );
+        engines.shutdown().await;
+        drop(directory);
     }
 }

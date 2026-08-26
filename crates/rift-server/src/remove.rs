@@ -5,14 +5,17 @@
 //! writes, the server asks the language engine configured for the declaration what still
 //! references it: a standing reference refuses unless `force` overrides the refusal, and an
 //! engine that cannot answer the question at all is not the same as one that answered it
-//! clean, so the two stay distinguishable on the result.
+//! clean, so the two stay distinguishable on the result. An empty answer from an engine that
+//! has never confirmed its own readiness is a third case, distinct from both: it refuses
+//! unless `force` overrides it too, because nothing tells that answer apart from the answer
+//! of an engine that has not read the file yet.
 
 use std::path::Path;
 
 use lsp_types::Location;
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::line::{lines_inclusive, without_ending};
-use rift_lsp::session::{EngineError, EngineFault, EngineSession};
+use rift_lsp::session::{EngineError, EngineFault, EngineReadiness, EngineSession};
 use rift_lsp::uri::TreeRoot;
 use rift_protocol::change::{
     ChangeResult, OperationPrecondition, OperationPreconditionKind, OperationPreconditionStatus,
@@ -270,6 +273,16 @@ async fn concluded_plan(
         ReferenceCheck::Found { count, paths } => {
             Err(PlanEnd::Refused(reference_refusal(addresses, count, paths)))
         }
+        ReferenceCheck::Unconfirmed { engine } if force => Ok(built_plan(
+            target,
+            widened,
+            addresses,
+            Some(unchecked_diagnostic(&NotChecked::Unconfirmed { engine })),
+        )),
+        ReferenceCheck::Unconfirmed { .. } => Err(PlanEnd::Failed(ReadFault::unavailable(
+            "remove reference check",
+            "the engine has not confirmed it is ready",
+        ))),
         ReferenceCheck::NotChecked(reason) => Ok(built_plan(
             target,
             widened,
@@ -328,6 +341,10 @@ enum ReferenceCheck {
     /// The engine named at least one reference: `count` is the number the engine answered,
     /// `paths` the deduplicated, bounded project paths it named.
     Found { count: u64, paths: Vec<String> },
+    /// The engine answered with no references while it had never confirmed its own
+    /// readiness: nothing distinguishes that answer from the answer of an engine that has
+    /// not read the file yet, so it is not proof the declaration is unreferenced.
+    Unconfirmed { engine: String },
     /// No check ran, or the one that did could not be read as an answer.
     NotChecked(NotChecked),
 }
@@ -342,6 +359,9 @@ enum NotChecked {
     CapabilityAbsent { engine: String },
     /// The engine failed to answer the request.
     RequestFailed { engine: String },
+    /// The engine answered with no references while it had never confirmed its own
+    /// readiness; `force` let the removal proceed anyway.
+    Unconfirmed { engine: String },
 }
 
 impl NotChecked {
@@ -360,6 +380,10 @@ impl NotChecked {
             Self::RequestFailed { engine } => {
                 format!("engine {engine} did not answer the reference check")
             }
+            Self::Unconfirmed { engine } => format!(
+                "engine {engine} answered with no references and has announced no work of \
+                 its own, so it may not have read the file yet"
+            ),
         }
     }
 }
@@ -393,7 +417,12 @@ async fn checked_references(
     )
     .await;
     match exchanged {
-        Ok(locations) => Ok(reference_check_from_locations(&tree_root, &locations)),
+        Ok((locations, readiness)) => Ok(reference_check_from_locations(
+            &tree_root,
+            &locations,
+            readiness,
+            slot.name(),
+        )),
         Err(error) => {
             let engine = slot.name().to_owned();
             if matches!(error.fault(), EngineFault::CapabilityAbsent { .. }) {
@@ -416,7 +445,7 @@ async fn engine_exchange(
     language: &Language,
     indexed_source: &str,
     positions: &NamePositions,
-) -> Result<Vec<Location>, EngineError> {
+) -> Result<(Vec<Location>, EngineReadiness), EngineError> {
     // The boxed future may only borrow the session, so each attempt gets its own owned copy
     // of the request data.
     let request_path = path.clone();
@@ -435,26 +464,44 @@ async fn engine_exchange(
 }
 
 /// One open-references-close conversation on a running session.
+///
+/// The engine's readiness is read right after `references` answers: whatever the answer
+/// says, this is what the engine had proven about itself when it said it.
 async fn exchange_on_session(
     session: &mut EngineSession,
     path: &CoreProjectPath,
     language: &Language,
     indexed_source: &str,
     positions: &NamePositions,
-) -> Result<Vec<Location>, EngineError> {
+) -> Result<(Vec<Location>, EngineReadiness), EngineError> {
     session
         .open(path, &language.name, indexed_source.to_owned())
         .await?;
     let position = positions.negotiated(session.capabilities().position_encoding);
     let locations = session.references(path, position).await?;
+    let readiness = session.readiness();
     session.close(path).await?;
-    Ok(locations)
+    Ok((locations, readiness))
 }
 
-/// The engine's answered locations, resolved to a checked-clean or checked-found verdict.
-fn reference_check_from_locations(tree_root: &TreeRoot, locations: &[Location]) -> ReferenceCheck {
+/// The engine's answered locations, resolved to a checked-clean, checked-found, or
+/// unconfirmed verdict. An empty answer only reads as clean when `readiness` proves the
+/// engine has confirmed it is ready or is still analyzing; an engine that has never
+/// announced any work at all gets [`ReferenceCheck::Unconfirmed`] instead.
+fn reference_check_from_locations(
+    tree_root: &TreeRoot,
+    locations: &[Location],
+    readiness: EngineReadiness,
+    engine: &str,
+) -> ReferenceCheck {
     if locations.is_empty() {
-        return ReferenceCheck::Clean;
+        return if readiness == EngineReadiness::Unconfirmed {
+            ReferenceCheck::Unconfirmed {
+                engine: engine.to_owned(),
+            }
+        } else {
+            ReferenceCheck::Clean
+        };
     }
     let mut paths = std::collections::BTreeSet::new();
     for location in locations {
@@ -759,6 +806,12 @@ mod tests {
                 },
                 "did not answer the reference check",
             ),
+            (
+                NotChecked::Unconfirmed {
+                    engine: "fake".to_owned(),
+                },
+                "has announced no work of its own",
+            ),
         ];
         for (reason, expected) in cases {
             assert!(reason.detail().contains(expected), "{}", reason.detail());
@@ -1027,6 +1080,195 @@ mod tests {
         );
     }
 
+    /// One framed JSON-RPC message.
+    fn framed(body: &str) -> String {
+        format!("Content-Length: {}\r\n\r\n{body}", body.len())
+    }
+
+    /// A canned `sh` engine configuration claiming `rust`, answering exactly the bytes
+    /// `script` writes and nothing else. The script never reads its stdin.
+    fn references_engine(
+        script: String,
+        retry: rift_protocol::retry::RetryPolicy,
+    ) -> rift_protocol::configuration::EngineConfiguration {
+        rift_protocol::configuration::EngineConfiguration {
+            program: "sh".to_owned(),
+            arguments: vec!["-c".to_owned(), script],
+            environment: std::collections::BTreeMap::new(),
+            languages: vec!["rust".to_owned()],
+            initialization_options: None,
+            startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            output_limit: rift_protocol::configuration::ByteSize::from_bytes(4_096),
+            retry,
+            restart: rift_protocol::retry::RestartPolicy::default(),
+        }
+    }
+
+    /// A workspace served by a canned `sh` engine that advertises
+    /// `textDocument/references` and never announces work through `$/progress`: its
+    /// readiness stays [`rift_lsp::session::EngineReadiness::Unconfirmed`] throughout. Two
+    /// references answers ride the script, both empty - the first, and the one resend an
+    /// unconfirmed engine earns (`EngineSlot::request`'s `claim_empty_answer_resend`) -
+    /// because an empty answer from an engine that has never announced work claims one
+    /// resend before the outer exchange settles on it. The retry wait is trimmed to 1ms so
+    /// the resend lands well inside the script's own `sleep` window. The script never
+    /// reads its stdin; it writes both answers regardless of what the session sends.
+    fn workspace_with_unconfirmed_references_engine(
+        files: &[(&str, &str)],
+    ) -> (tempfile::TempDir, ReadService, EnginePool) {
+        let (directory, reads, _unused_engines) = workspace(files);
+        let capabilities = framed(
+            r#"{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"referencesProvider":true}}}"#,
+        );
+        let no_references =
+            |id: u64| framed(&format!(r#"{{"jsonrpc":"2.0","id":{id},"result":null}}"#));
+        let script = format!(
+            "printf '%s' '{capabilities}{}{}'; sleep 0.2",
+            no_references(1),
+            no_references(2),
+        );
+        let retry = rift_protocol::retry::RetryPolicy {
+            attempts: 2,
+            delay: rift_protocol::configuration::Duration::from_millis(1),
+            delay_limit: rift_protocol::configuration::Duration::from_millis(1),
+        };
+        let engines = EnginePool::new(
+            directory.path(),
+            std::collections::BTreeMap::from([(
+                "fake".to_owned(),
+                references_engine(script, retry),
+            )]),
+        );
+        (directory, reads, engines)
+    }
+
+    /// The same fixture, except the engine announces and ends one work-done progress token
+    /// before it answers the references request: its readiness has settled to
+    /// [`rift_lsp::session::EngineReadiness::Ready`] by the time that answer lands, so no
+    /// resend is claimed and the default retry policy is unused.
+    fn workspace_with_confirmed_ready_references_engine(
+        files: &[(&str, &str)],
+    ) -> (tempfile::TempDir, ReadService, EnginePool) {
+        let (directory, reads, _unused_engines) = workspace(files);
+        let capabilities = framed(
+            r#"{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"referencesProvider":true}}}"#,
+        );
+        let progress_begin = framed(
+            r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"warm","value":{"kind":"begin","title":"loading"}}}"#,
+        );
+        let progress_end = framed(
+            r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"warm","value":{"kind":"end"}}}"#,
+        );
+        let no_references = framed(r#"{"jsonrpc":"2.0","id":1,"result":null}"#);
+        let script = format!(
+            "printf '%s' '{capabilities}{progress_begin}{progress_end}{no_references}'; sleep 0.2"
+        );
+        let engines = EnginePool::new(
+            directory.path(),
+            std::collections::BTreeMap::from([(
+                "fake".to_owned(),
+                references_engine(script, rift_protocol::retry::RetryPolicy::default()),
+            )]),
+        );
+        (directory, reads, engines)
+    }
+
+    /// Reproduces the defect an unread readiness would leave behind: an unconfirmed
+    /// engine's empty references answer used to read as `Clean`. It must instead refuse -
+    /// as `temporarily_unavailable`, distinct from the `unmet_precondition` refusal a
+    /// standing reference gets - and leave the tree untouched.
+    #[tokio::test]
+    async fn plan_remove_symbol_against_an_unconfirmed_engines_empty_answer_refuses() {
+        let source = "pub fn beacon() {}\n";
+        let (directory, reads, engines) =
+            workspace_with_unconfirmed_references_engine(&[("lib.rs", source)]);
+        let error = plan_remove_symbol(
+            &reads,
+            &engines,
+            directory.path(),
+            &RemoveSymbolParams {
+                symbol: symbol("beacon"),
+                force: false,
+            },
+        )
+        .await
+        .expect_err("an unconfirmed engine's empty answer must refuse, not apply");
+        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+        let untouched =
+            std::fs::read_to_string(directory.path().join("lib.rs")).expect("fixture file reads");
+        assert_eq!(
+            untouched, source,
+            "a refusal over an unconfirmed check leaves the tree untouched"
+        );
+        engines.shutdown().await;
+    }
+
+    /// `force` overrides the unconfirmed-check refusal the same way it overrides a
+    /// standing-reference refusal: the removal applies, and the result carries a warning
+    /// naming why the check did not run to a verdict.
+    #[tokio::test]
+    async fn plan_remove_symbol_against_an_unconfirmed_engine_with_force_applies_with_a_warning() {
+        let source = "pub fn beacon() {}\n";
+        let (directory, reads, engines) =
+            workspace_with_unconfirmed_references_engine(&[("lib.rs", source)]);
+        let resolution = plan_remove_symbol(
+            &reads,
+            &engines,
+            directory.path(),
+            &RemoveSymbolParams {
+                symbol: symbol("beacon"),
+                force: true,
+            },
+        )
+        .await
+        .expect("force lets an unconfirmed engine's empty answer proceed");
+        let RemoveResolution::Planned(plan) = resolution else {
+            panic!("force must plan the removal: {resolution:?}");
+        };
+        let diagnostic = plan
+            .diagnostic
+            .expect("an applied removal over an unconfirmed check carries a warning");
+        assert_eq!(diagnostic.severity, Severity::Warning);
+        assert_eq!(diagnostic.code.as_deref(), Some("rift.remove.unchecked"));
+        assert!(
+            diagnostic.message.contains("fake"),
+            "{}",
+            diagnostic.message
+        );
+        engines.shutdown().await;
+    }
+
+    /// The new `Unconfirmed` arm must not swallow the settled case: an engine that has
+    /// confirmed its own readiness and then answers empty still applies clean, with no
+    /// warning at all.
+    #[tokio::test]
+    async fn plan_remove_symbol_against_a_confirmed_ready_engines_empty_answer_applies_clean() {
+        let source = "pub fn beacon() {}\n";
+        let (directory, reads, engines) =
+            workspace_with_confirmed_ready_references_engine(&[("lib.rs", source)]);
+        let resolution = plan_remove_symbol(
+            &reads,
+            &engines,
+            directory.path(),
+            &RemoveSymbolParams {
+                symbol: symbol("beacon"),
+                force: false,
+            },
+        )
+        .await
+        .expect("a settled engine's empty answer must apply clean");
+        let RemoveResolution::Planned(plan) = resolution else {
+            panic!("a clean check must plan the removal: {resolution:?}");
+        };
+        assert!(
+            plan.diagnostic.is_none(),
+            "a settled clean check carries no warning: {:?}",
+            plan.diagnostic
+        );
+        engines.shutdown().await;
+    }
+
     #[test]
     fn reference_check_from_locations_falls_back_to_the_raw_uri_outside_the_tree_root() {
         let tree_root = TreeRoot::new(Path::new("/workspace")).expect("root parses");
@@ -1036,12 +1278,40 @@ mod tests {
             uri: outside,
             range: lsp_types::Range::default(),
         };
-        let check = reference_check_from_locations(&tree_root, std::slice::from_ref(&location));
+        let check = reference_check_from_locations(
+            &tree_root,
+            std::slice::from_ref(&location),
+            EngineReadiness::Ready,
+            "fake",
+        );
         let ReferenceCheck::Found { count, paths } = check else {
             panic!("a located reference must be found");
         };
         assert_eq!(count, 1);
         assert_eq!(paths, vec![expected]);
+    }
+
+    #[test]
+    fn an_empty_answer_from_an_unconfirmed_engine_is_not_read_as_clean() {
+        let tree_root = TreeRoot::new(Path::new("/workspace")).expect("root parses");
+        let check =
+            reference_check_from_locations(&tree_root, &[], EngineReadiness::Unconfirmed, "fake");
+        assert!(
+            matches!(check, ReferenceCheck::Unconfirmed { ref engine } if engine == "fake"),
+            "an unconfirmed engine's empty answer must not read as clean"
+        );
+    }
+
+    #[test]
+    fn an_empty_answer_from_a_settled_engine_still_reads_as_clean() {
+        let tree_root = TreeRoot::new(Path::new("/workspace")).expect("root parses");
+        for readiness in [EngineReadiness::Ready, EngineReadiness::Analyzing] {
+            let check = reference_check_from_locations(&tree_root, &[], readiness, "fake");
+            assert!(
+                matches!(check, ReferenceCheck::Clean),
+                "readiness {readiness:?} must still read an empty answer as clean"
+            );
+        }
     }
 
     #[test]

@@ -229,7 +229,8 @@ pub fn declare_execution_ranges(schema: &mut Schema) {
 pub fn declare_server_ranges(schema: &mut Schema) {
     use crate::configuration::{
         Duration, SERVER_IDLE_TIMEOUT_MS_MAX, SERVER_IDLE_TIMEOUT_MS_MIN,
-        SERVER_QUEUE_TIMEOUT_MS_MAX, ServerConfiguration,
+        SERVER_QUEUE_TIMEOUT_MS_MAX, SERVER_READINESS_TIMEOUT_MS_MAX,
+        SERVER_READINESS_TIMEOUT_MS_MIN, ServerConfiguration,
     };
     annotate_property(
         schema,
@@ -247,6 +248,15 @@ pub fn declare_server_ranges(schema: &mut Schema) {
         range(
             &Duration::from_millis(SERVER_IDLE_TIMEOUT_MS_MIN),
             &Duration::from_millis(SERVER_IDLE_TIMEOUT_MS_MAX),
+        ),
+    );
+    annotate_property(
+        schema,
+        property!(ServerConfiguration, readiness_timeout),
+        RIFT_RANGE,
+        range(
+            &Duration::from_millis(SERVER_READINESS_TIMEOUT_MS_MIN),
+            &Duration::from_millis(SERVER_READINESS_TIMEOUT_MS_MAX),
         ),
     );
     append(
@@ -665,6 +675,17 @@ mod tests {
             schema["properties"]["worker_queue_timeout"][RIFT_RANGE],
             json!({ "min": "1ms", "max": "1h" }),
             "worker_queue_timeout must state its accepted range"
+        );
+    }
+
+    #[test]
+    fn server_configuration_schema_states_range_on_the_readiness_timeout() {
+        let schema = serde_json::to_value(schema_for!(crate::configuration::ServerConfiguration))
+            .expect("schema");
+        assert_eq!(
+            schema["properties"]["readiness_timeout"][RIFT_RANGE],
+            json!({ "min": "1s", "max": "1h" }),
+            "readiness_timeout must state its accepted range"
         );
     }
 

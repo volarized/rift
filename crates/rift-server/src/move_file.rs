@@ -6,10 +6,10 @@
 //! atomic publish. Without an engine, without the will-rename capability,
 //! or with filters that do not cover the file, the move still lands and
 //! the result carries a warning that references were not updated. So does
-//! a move an engine answered with no edit at all while it has announced
-//! no work of its own: the slot has already asked it twice by then, and a
-//! silence from an engine that never says what it is doing is not proof
-//! that nothing needed updating.
+//! a move whose engine answers with no edit at all, whatever its readiness
+//! said before that answer: the contract already permits a move that needs
+//! no reference rewritten, and the warning tells the caller which case
+//! this was rather than staying silent about it.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -17,7 +17,9 @@ use std::path::Path;
 use lsp_types::{TextEdit, WorkspaceEdit};
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_lsp::capabilities::PositionEncoding;
-use rift_lsp::session::{EngineError, EngineFault, EngineSession, proposes_no_edit};
+use rift_lsp::session::{
+    EngineError, EngineFault, EngineReadiness, EngineSession, proposes_no_edit,
+};
 use rift_protocol::change::{
     ChangeResult, MoveFileParams, OperationPreconditionKind, PreconditionValue, RefusalReason,
 };
@@ -64,10 +66,12 @@ pub enum MoveResolution {
 
 /// Why the moved file's references were not updated.
 ///
-/// The first three name an engine that was never asked. The fourth names
-/// one that was: it answered nothing, and it has never announced any work
-/// of its own, so nothing distinguishes that answer from the answer of an
-/// engine with nothing to update.
+/// The first three name an engine that was never asked. The last two name
+/// one that was, and proposed no edit: [`Self::AnsweredNothing`] when the
+/// engine had never confirmed its own readiness at the time it answered,
+/// so nothing distinguishes that answer from the answer of an engine with
+/// nothing to update; [`Self::NoReferenceEdits`] once it had, which is the
+/// engine's own settled verdict that the move needs no reference rewrite.
 #[derive(Debug)]
 pub(crate) enum ReferencesNotUpdated {
     /// No engine claims the moved file's language.
@@ -85,14 +89,31 @@ pub(crate) enum ReferencesNotUpdated {
         /// The engine's configured name.
         engine: String,
     },
-    /// The engine proposed no edit and has never announced any work.
+    /// The engine proposed no edit while its own readiness stayed
+    /// unconfirmed.
     AnsweredNothing {
+        /// The engine's configured name.
+        engine: String,
+    },
+    /// The engine proposed no edit after confirming its own readiness.
+    NoReferenceEdits {
         /// The engine's configured name.
         engine: String,
     },
 }
 
 impl ReferencesNotUpdated {
+    /// The reason one will-rename answer that proposed no edit is
+    /// reported under, decided by the engine's readiness as of that
+    /// answer.
+    fn no_edit(engine: String, readiness: EngineReadiness) -> Self {
+        if readiness == EngineReadiness::Unconfirmed {
+            Self::AnsweredNothing { engine }
+        } else {
+            Self::NoReferenceEdits { engine }
+        }
+    }
+
     /// The warning an applied move carries, naming why its references
     /// were not updated.
     pub(crate) fn diagnostic(&self) -> Diagnostic {
@@ -110,6 +131,9 @@ impl ReferencesNotUpdated {
                 "engine {engine} proposed none and has announced no work of its own, \
                  so it may not have read the file yet"
             ),
+            Self::NoReferenceEdits { engine } => {
+                format!("engine {engine} proposed no reference edits for the move")
+            }
         };
         let mut diagnostic = plan_diagnostic(format!(
             "the file moved and its references were not updated: {reason}"
@@ -165,13 +189,9 @@ async fn planned_move(
     let proposal = engine_proposal(engines, &from, &to, &source.language_segment).await?;
     match proposal {
         EngineProposal::Nothing(reason) => Ok(unedited_plan(from, to, source.text, Some(reason))),
-        EngineProposal::Answered { edit: None, .. } => {
-            Ok(unedited_plan(from, to, source.text, None))
+        EngineProposal::Answered { edit, encoding } => {
+            compiled_move(workspace_root, &edit, encoding, from, to, source.text).await
         }
-        EngineProposal::Answered {
-            edit: Some(edit),
-            encoding,
-        } => compiled_move(workspace_root, &edit, encoding, from, to, source.text).await,
     }
 }
 
@@ -316,9 +336,9 @@ enum EngineProposal {
     /// The engine contributed no reference updates; the reason rides the
     /// applied move as its warning.
     Nothing(ReferencesNotUpdated),
-    /// The engine answered the will-rename request.
+    /// The engine proposed at least one reference edit.
     Answered {
-        edit: Option<WorkspaceEdit>,
+        edit: WorkspaceEdit,
         encoding: PositionEncoding,
     },
 }
@@ -331,11 +351,10 @@ enum MoveExchange {
     Answered {
         edit: Option<WorkspaceEdit>,
         encoding: PositionEncoding,
-        /// Whether the engine has yet to announce any work of its own.
-        /// The slot has already sent the request again once by the time
-        /// this is read, so a `true` here means the engine answered
-        /// nothing twice without ever saying what it was doing.
-        never_announced: bool,
+        /// The engine's own readiness as of this answer, read right after
+        /// it: whatever the answer says, this is what the engine had
+        /// proven about itself when it said it.
+        readiness: EngineReadiness,
     },
 }
 
@@ -359,14 +378,21 @@ async fn engine_proposal(
             ReferencesNotUpdated::FilterMismatch { engine: engine() },
         )),
         Ok(MoveExchange::Answered {
-            ref edit,
-            never_announced,
-            ..
-        }) if never_announced && proposes_no_edit(edit.as_ref()) => Ok(EngineProposal::Nothing(
-            ReferencesNotUpdated::AnsweredNothing { engine: engine() },
-        )),
-        Ok(MoveExchange::Answered { edit, encoding, .. }) => {
-            Ok(EngineProposal::Answered { edit, encoding })
+            edit,
+            encoding,
+            readiness,
+        }) => {
+            if proposes_no_edit(edit.as_ref()) {
+                Ok(EngineProposal::Nothing(ReferencesNotUpdated::no_edit(
+                    engine(),
+                    readiness,
+                )))
+            } else {
+                Ok(EngineProposal::Answered {
+                    edit: edit.unwrap_or_default(),
+                    encoding,
+                })
+            }
         }
         Err(error) => {
             if matches!(error.fault(), EngineFault::CapabilityAbsent { .. }) {
@@ -415,7 +441,7 @@ async fn will_rename_on_session(
     Ok(MoveExchange::Answered {
         edit,
         encoding,
-        never_announced: session.has_never_announced_work(),
+        readiness: session.readiness(),
     })
 }
 
@@ -520,6 +546,55 @@ mod tests {
         }
     }
 
+    /// One framed JSON-RPC message.
+    fn framed(body: &str) -> String {
+        format!("Content-Length: {}\r\n\r\n{body}", body.len())
+    }
+
+    /// A workspace served by a canned `sh` engine that answers `initialize`
+    /// advertising will-rename over every path, announces and ends one
+    /// work-done progress token before the move ever asks it anything, then
+    /// answers the one `workspace/willRenameFiles` request the move sends
+    /// with `null` - the engine's own settled verdict that the move needs
+    /// no reference rewrite, given only after it has already proven it
+    /// reports its own work. The script never reads its stdin; it writes
+    /// this fixed sequence regardless of what the session sends.
+    fn workspace_with_confirmed_ready_engine(
+        files: &[(&str, &str)],
+    ) -> (tempfile::TempDir, ReadService, EnginePool) {
+        let (directory, reads, _unused_engines) = workspace(files);
+        let capabilities = framed(
+            r#"{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"workspace":{"fileOperations":{"willRename":{"filters":[{"pattern":{"glob":"**/*"}}]}}}}}}"#,
+        );
+        let progress_begin = framed(
+            r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"warm","value":{"kind":"begin","title":"loading"}}}"#,
+        );
+        let progress_end = framed(
+            r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"warm","value":{"kind":"end"}}}"#,
+        );
+        let no_edit = framed(r#"{"jsonrpc":"2.0","id":1,"result":null}"#);
+        let script = format!(
+            "printf '%s' '{capabilities}{progress_begin}{progress_end}{no_edit}'; sleep 0.2"
+        );
+        let engine = rift_protocol::configuration::EngineConfiguration {
+            program: "sh".to_owned(),
+            arguments: vec!["-c".to_owned(), script],
+            environment: BTreeMap::new(),
+            languages: vec!["rust".to_owned()],
+            initialization_options: None,
+            startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            output_limit: rift_protocol::configuration::ByteSize::from_bytes(4_096),
+            retry: rift_protocol::retry::RetryPolicy::default(),
+            restart: rift_protocol::retry::RestartPolicy::default(),
+        };
+        let engines = EnginePool::new(
+            directory.path(),
+            BTreeMap::from([("fake".to_owned(), engine)]),
+        );
+        (directory, reads, engines)
+    }
+
     fn precondition(result: &ChangeResult) -> &rift_protocol::change::OperationPrecondition {
         match result {
             ChangeResult::Refused { preconditions, .. } => {
@@ -527,6 +602,111 @@ mod tests {
             }
             ChangeResult::Applied { .. } => panic!("expected a refusal, got an applied change"),
         }
+    }
+
+    /// Reproduces the defect a `never_announced`-gated warning left behind:
+    /// an engine that has already proven it reports its own work, then
+    /// answers `null` to `workspace/willRenameFiles`, must still carry
+    /// `references_not_updated` - the move's contract permits landing
+    /// without a reference rewrite, but never silently.
+    #[tokio::test]
+    async fn a_move_a_confirmed_ready_engine_answers_nothing_for_still_carries_the_warning() {
+        let (directory, reads, engines) =
+            workspace_with_confirmed_ready_engine(&[("lib.rs", "pub fn beacon() {}\n")]);
+        let resolution = plan_move(
+            &reads,
+            &engines,
+            directory.path(),
+            &params("lib.rs", "moved.rs"),
+        )
+        .await
+        .expect("the move plans");
+        let MoveResolution::Planned(plan) = resolution else {
+            panic!("a move an engine answers null for still plans: {resolution:?}");
+        };
+        assert!(
+            matches!(
+                plan.references_not_updated,
+                Some(ReferencesNotUpdated::NoReferenceEdits { ref engine }) if engine == "fake"
+            ),
+            "an engine that confirmed its own readiness and still proposed nothing must carry \
+             the warning under its own settled reason, not silence: {:?}",
+            plan.references_not_updated
+        );
+        engines.shutdown().await;
+    }
+
+    /// A workspace served by a canned `sh` engine that answers `initialize`
+    /// advertising will-rename over every path, never announces any
+    /// `$/progress` work of its own, and answers the one
+    /// `workspace/willRenameFiles` request the move sends with `null`. With
+    /// `retry.attempts` at 1 the slot's one empty-answer resend is never
+    /// claimed past the first attempt, so the answer reaches `plan_move`
+    /// exactly as the engine gave it: nothing, from an engine that has
+    /// proven nothing about its own readiness. The script never reads its
+    /// stdin; it writes this fixed sequence regardless of what the session
+    /// sends.
+    fn workspace_with_an_unconfirmed_engine(
+        files: &[(&str, &str)],
+    ) -> (tempfile::TempDir, ReadService, EnginePool) {
+        let (directory, reads, _unused_engines) = workspace(files);
+        let capabilities = framed(
+            r#"{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"workspace":{"fileOperations":{"willRename":{"filters":[{"pattern":{"glob":"**/*"}}]}}}}}}"#,
+        );
+        let no_edit = framed(r#"{"jsonrpc":"2.0","id":1,"result":null}"#);
+        let script = format!("printf '%s' '{capabilities}{no_edit}'; sleep 0.2");
+        let engine = rift_protocol::configuration::EngineConfiguration {
+            program: "sh".to_owned(),
+            arguments: vec!["-c".to_owned(), script],
+            environment: BTreeMap::new(),
+            languages: vec!["rust".to_owned()],
+            initialization_options: None,
+            startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            output_limit: rift_protocol::configuration::ByteSize::from_bytes(4_096),
+            retry: rift_protocol::retry::RetryPolicy {
+                attempts: 1,
+                delay: rift_protocol::configuration::Duration::from_millis(1),
+                delay_limit: rift_protocol::configuration::Duration::from_millis(1),
+            },
+            restart: rift_protocol::retry::RestartPolicy::default(),
+        };
+        let engines = EnginePool::new(
+            directory.path(),
+            BTreeMap::from([("fake".to_owned(), engine)]),
+        );
+        (directory, reads, engines)
+    }
+
+    /// The other half of [`no_edit`](ReferencesNotUpdated::no_edit): an
+    /// engine that proposed nothing while its own readiness stayed
+    /// unconfirmed carries `AnsweredNothing`, not the settled
+    /// `NoReferenceEdits` reason the confirmed-ready engine above earns.
+    #[tokio::test]
+    async fn a_move_an_unconfirmed_engine_answers_nothing_for_carries_answered_nothing() {
+        let (directory, reads, engines) =
+            workspace_with_an_unconfirmed_engine(&[("lib.rs", "pub fn beacon() {}\n")]);
+        let resolution = plan_move(
+            &reads,
+            &engines,
+            directory.path(),
+            &params("lib.rs", "moved.rs"),
+        )
+        .await
+        .expect("the move plans");
+        let MoveResolution::Planned(plan) = resolution else {
+            panic!("a move an engine answers null for still plans: {resolution:?}");
+        };
+        assert!(
+            matches!(
+                plan.references_not_updated,
+                Some(ReferencesNotUpdated::AnsweredNothing { ref engine }) if engine == "fake"
+            ),
+            "an engine that never confirmed its own readiness and proposed nothing must carry \
+             the answered-nothing reason, not the settled one: {:?}",
+            plan.references_not_updated
+        );
+        engines.shutdown().await;
     }
 
     #[tokio::test]
@@ -808,6 +988,12 @@ mod tests {
                     engine: "fake".to_owned(),
                 },
                 "has announced no work of its own",
+            ),
+            (
+                ReferencesNotUpdated::NoReferenceEdits {
+                    engine: "fake".to_owned(),
+                },
+                "proposed no reference edits for the move",
             ),
         ];
         for (reason, expected) in reasons {

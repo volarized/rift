@@ -33,7 +33,7 @@ use lsp_types::Position;
 use rift_core::{ErrorCode, ErrorName, ProjectPath};
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::framing::FramingFault;
-use rift_lsp::session::{EngineError, EngineFault, EngineLaunch, EngineSession};
+use rift_lsp::session::{EngineError, EngineFault, EngineLaunch, EngineReadiness, EngineSession};
 use rift_lsp::uri::TreeRoot;
 use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, DuplexStream};
@@ -982,8 +982,9 @@ async fn an_empty_proposal_from_an_unannounced_engine_claims_one_resend() {
     })
     .await;
     let document = path("src/lib.rs");
-    assert!(
-        session.has_never_announced_work(),
+    assert_eq!(
+        session.readiness(),
+        EngineReadiness::Unconfirmed,
         "this engine announces no work at all"
     );
 
@@ -1049,14 +1050,472 @@ async fn an_announced_engine_keeps_its_empty_answer() {
         .await
         .expect("the loading engine answers its pull");
     assert!(pulled.is_empty(), "a loading engine reports nothing yet");
-    assert!(
-        !session.has_never_announced_work(),
-        "the begin the pull consumed is the engine announcing its work"
+    assert_eq!(
+        session.readiness(),
+        EngineReadiness::Analyzing,
+        "the begin the pull consumed announces work still outstanding"
     );
     assert!(
         !session.claim_empty_answer_resend(),
         "an announced engine's empty answer is its own"
     );
+    session.shutdown().await;
+    join(engine_task).await;
+}
+
+/// An engine that has announced no work of its own answers `references`
+/// with an empty list - the answer of an engine with nothing pointing at
+/// the declaration, and of one that has not indexed the file yet.
+///
+/// The session claims one resend for it, and exactly one: the second empty
+/// answer is the engine's own, however empty. `references` records its own
+/// empty answer under the same policy `willRenameFiles` and diagnostic
+/// pulls already followed.
+#[tokio::test]
+async fn an_empty_references_answer_from_an_unannounced_engine_claims_one_resend() {
+    let (_workspace, mut session, engine_task) = started(|mut engine| async move {
+        engine.handshake(full_capabilities()).await;
+        for _attempt in 0..2 {
+            let (id, _params) = engine.expect_request("textDocument/references").await;
+            engine.respond(&id, json!([])).await;
+        }
+        let (id, _params) = engine.expect_request("shutdown").await;
+        engine.respond(&id, Value::Null).await;
+        engine.next_message().await;
+    })
+    .await;
+    let document = path("src/lib.rs");
+    let position = Position {
+        line: 0,
+        character: 3,
+    };
+    assert_eq!(session.readiness(), EngineReadiness::Unconfirmed);
+
+    let first = session
+        .references(&document, position)
+        .await
+        .expect("references answers");
+    assert!(first.is_empty(), "the engine names nothing");
+    assert!(
+        session.claim_empty_answer_resend(),
+        "an empty answer from an unconfirmed engine is worth asking again once"
+    );
+
+    let second = session
+        .references(&document, position)
+        .await
+        .expect("references answers again");
+    assert!(second.is_empty());
+    assert!(
+        !session.claim_empty_answer_resend(),
+        "the operation's one resend per session is spent"
+    );
+    session.shutdown().await;
+    join(engine_task).await;
+}
+
+/// Readiness moves through its three states in the order the protocol
+/// traffic proves them: unconfirmed before any progress, analyzing while a
+/// token is outstanding, ready once every announced token has ended.
+#[tokio::test]
+async fn readiness_moves_from_unconfirmed_through_analyzing_to_ready() {
+    let (_workspace, mut session, engine_task) = started(|mut engine| async move {
+        engine.handshake(full_capabilities()).await;
+        let (id, _params) = engine.expect_request("textDocument/references").await;
+        engine.begin_progress().await;
+        engine.respond(&id, json!([])).await;
+        let (id, _params) = engine.expect_request("textDocument/references").await;
+        engine.end_progress().await;
+        engine.respond(&id, json!([])).await;
+        let (id, _params) = engine.expect_request("shutdown").await;
+        engine.respond(&id, Value::Null).await;
+        engine.next_message().await;
+    })
+    .await;
+    let document = path("src/lib.rs");
+    let position = Position {
+        line: 0,
+        character: 3,
+    };
+    assert_eq!(
+        session.readiness(),
+        EngineReadiness::Unconfirmed,
+        "no progress has been read yet"
+    );
+
+    session
+        .references(&document, position)
+        .await
+        .expect("references answers");
+    assert_eq!(
+        session.readiness(),
+        EngineReadiness::Analyzing,
+        "the begin this exchange read leaves work outstanding"
+    );
+
+    session
+        .references(&document, position)
+        .await
+        .expect("references answers again");
+    assert_eq!(
+        session.readiness(),
+        EngineReadiness::Ready,
+        "the end this exchange read retires the only outstanding token"
+    );
+
+    session.shutdown().await;
+    join(engine_task).await;
+}
+
+/// A provisional answer - given while work is still outstanding - is
+/// retried until the engine settles: a caller that discards every answer
+/// read while `is_analyzing()` holds and keeps asking converges on the
+/// engine's real verdict, not the provisional one.
+///
+/// `EngineSession` records only whether the engine was analyzing; the
+/// resend loop is the caller's, exactly as `EngineSlot::request` runs it.
+/// This proves the primitive that loop retries on.
+#[tokio::test]
+async fn a_provisional_answer_is_retried_until_the_engine_settles() {
+    let (_workspace, mut session, engine_task) = started(|mut engine| async move {
+        engine.handshake(full_capabilities()).await;
+        engine.begin_progress().await;
+        for _provisional in 0..2 {
+            let (id, _params) = engine.expect_request("textDocument/references").await;
+            engine
+                .respond(
+                    &id,
+                    json!([{"uri": "file:///workspace/lib.rs", "range": zero_range()}]),
+                )
+                .await;
+        }
+        let (id, _params) = engine.expect_request("textDocument/references").await;
+        engine.end_progress().await;
+        engine.respond(&id, json!([])).await;
+        let (id, _params) = engine.expect_request("shutdown").await;
+        engine.respond(&id, Value::Null).await;
+        engine.next_message().await;
+    })
+    .await;
+    let document = path("src/lib.rs");
+    let position = Position {
+        line: 0,
+        character: 3,
+    };
+    let mut settled = None;
+    for _attempt in 0..3 {
+        let answer = session
+            .references(&document, position)
+            .await
+            .expect("references answers");
+        if !session.is_analyzing() {
+            settled = Some(answer);
+            break;
+        }
+    }
+    let settled = settled.expect("the engine settles inside the attempt bound");
+    assert!(
+        settled.is_empty(),
+        "the settled answer must be the engine's real verdict, not one of the provisional \
+         locations it answered while analyzing: {settled:#?}"
+    );
+    session.shutdown().await;
+    join(engine_task).await;
+}
+
+/// An engine whose progress never ends stays analyzing forever. A caller
+/// that gives up after its own attempt bound reports the budget it spent -
+/// the shape `EngineSlot::request` reports through
+/// `EngineFault::Analyzing` once its own retry table is exhausted.
+#[tokio::test]
+async fn an_engine_that_never_settles_lets_a_caller_report_its_spent_budget() {
+    const ATTEMPTS_MAX: u64 = 3;
+    let (_workspace, mut session, engine_task) = started(|mut engine| async move {
+        engine.handshake(full_capabilities()).await;
+        engine.begin_progress().await;
+        for _attempt in 0..ATTEMPTS_MAX {
+            let (id, _params) = engine.expect_request("textDocument/references").await;
+            engine.respond(&id, json!([])).await;
+        }
+        let (id, _params) = engine.expect_request("shutdown").await;
+        engine.respond(&id, Value::Null).await;
+        engine.next_message().await;
+    })
+    .await;
+    let document = path("src/lib.rs");
+    let position = Position {
+        line: 0,
+        character: 3,
+    };
+    for _attempt in 1..=ATTEMPTS_MAX {
+        session
+            .references(&document, position)
+            .await
+            .expect("references answers");
+        assert!(
+            session.is_analyzing(),
+            "the engine never ends the progress it began"
+        );
+    }
+    let exhausted = EngineError::new(EngineFault::Analyzing {
+        attempts: ATTEMPTS_MAX,
+    });
+    assert_eq!(
+        exhausted.name(),
+        ErrorName::Wire(ErrorCode::TemporarilyUnavailable)
+    );
+    assert!(
+        exhausted
+            .to_string()
+            .contains(&format!("attempts {ATTEMPTS_MAX}")),
+        "{exhausted}"
+    );
+    session.shutdown().await;
+    join(engine_task).await;
+}
+
+/// The engine's own `client/registerCapability` call for
+/// `workspace/didChangeWatchedFiles` is what `notify_changed_paths` matches
+/// against: a path a registered glob covers is named in the notification
+/// the engine reads, and a path outside every registered glob is left out
+/// of both the return value and the wire.
+#[tokio::test]
+async fn notify_changed_paths_matches_only_the_engines_registered_watchers() {
+    let (_workspace, mut session, engine_task) = started(|mut engine| async move {
+        engine.handshake(full_capabilities()).await;
+        engine
+            .send(&json!({
+                "jsonrpc": "2.0",
+                "id": "register-watched-files",
+                "method": "client/registerCapability",
+                "params": {
+                    "registrations": [{
+                        "id": "watch-rust",
+                        "method": "workspace/didChangeWatchedFiles",
+                        "registerOptions": {
+                            "watchers": [{"globPattern": "**/*.rs"}],
+                        },
+                    }],
+                },
+            }))
+            .await;
+        let (id, _params) = engine.expect_request("textDocument/references").await;
+        engine.respond(&id, json!([])).await;
+        let notified = engine.next_message().await;
+        assert_eq!(
+            notified["method"],
+            json!("workspace/didChangeWatchedFiles"),
+            "{notified:#}"
+        );
+        let changes = notified["params"]["changes"]
+            .as_array()
+            .expect("changes is an array");
+        assert_eq!(changes.len(), 1, "{notified:#}");
+        assert!(
+            changes[0]["uri"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with("lib.rs"),
+            "{notified:#}"
+        );
+        assert_eq!(
+            changes[0]["type"],
+            json!(2),
+            "type 2 is Changed: {notified:#}"
+        );
+        let (id, _params) = engine.expect_request("shutdown").await;
+        engine.respond(&id, Value::Null).await;
+        engine.next_message().await;
+    })
+    .await;
+    let document = path("src/lib.rs");
+    let position = Position {
+        line: 0,
+        character: 3,
+    };
+    // Any request pumps the exchange loop that reads the engine's
+    // unprompted registration; references answering is enough to prove it
+    // landed before the notification below is sent.
+    session
+        .references(&document, position)
+        .await
+        .expect("references answers");
+
+    let matched = session
+        .notify_changed_paths(&[document.clone(), path("README.md")])
+        .await
+        .expect("the notification sends");
+    assert_eq!(
+        matched,
+        vec![document],
+        "only the path the registered glob covers is matched"
+    );
+
+    session.shutdown().await;
+    join(engine_task).await;
+}
+
+/// A `client/registerCapability` call the session cannot read as a
+/// registration - malformed top-level params, a registration for a
+/// different method, one missing `registerOptions`, or one whose
+/// `registerOptions` will not parse as
+/// `DidChangeWatchedFilesRegistrationOptions` - contributes no watcher, and
+/// the session still answers every one of them: a malformed registration
+/// costs the engine no capability it would otherwise have. A later valid
+/// registration in the same batch is unaffected, proving each bad entry is
+/// skipped rather than aborting the whole registration.
+#[tokio::test]
+async fn malformed_watched_file_registrations_are_skipped_without_losing_the_valid_one() {
+    let (_workspace, mut session, engine_task) = started(|mut engine| async move {
+        engine.handshake(full_capabilities()).await;
+        // Top-level params that will not parse as `RegistrationParams` at
+        // all: `registrations` must be an array.
+        engine
+            .send(&json!({
+                "jsonrpc": "2.0",
+                "id": "unparsable-params",
+                "method": "client/registerCapability",
+                "params": {"registrations": "not-an-array"},
+            }))
+            .await;
+        // One well-formed batch mixing three bad entries with one valid
+        // one, in order: wrong method, missing `registerOptions`,
+        // unparsable `registerOptions`, then a real watcher.
+        engine
+            .send(&json!({
+                "jsonrpc": "2.0",
+                "id": "mixed-batch",
+                "method": "client/registerCapability",
+                "params": {
+                    "registrations": [
+                        {
+                            "id": "wrong-method",
+                            "method": "workspace/didChangeConfiguration",
+                        },
+                        {
+                            "id": "missing-options",
+                            "method": "workspace/didChangeWatchedFiles",
+                        },
+                        {
+                            "id": "bad-options",
+                            "method": "workspace/didChangeWatchedFiles",
+                            "registerOptions": {"watchers": "not-an-array"},
+                        },
+                        {
+                            "id": "good",
+                            "method": "workspace/didChangeWatchedFiles",
+                            "registerOptions": {
+                                "watchers": [{"globPattern": "**/*.rs"}],
+                            },
+                        },
+                    ],
+                },
+            }))
+            .await;
+        let (id, _params) = engine.expect_request("textDocument/references").await;
+        engine.respond(&id, json!([])).await;
+        let notified = engine.next_message().await;
+        assert_eq!(
+            notified["method"],
+            json!("workspace/didChangeWatchedFiles"),
+            "{notified:#}"
+        );
+        let (id, _params) = engine.expect_request("shutdown").await;
+        engine.respond(&id, Value::Null).await;
+        engine.next_message().await;
+    })
+    .await;
+    let document = path("src/lib.rs");
+    let position = Position {
+        line: 0,
+        character: 3,
+    };
+    // Pumps the exchange loop that reads both registration calls before
+    // the notification is sent below.
+    session
+        .references(&document, position)
+        .await
+        .expect("references answers");
+
+    let matched = session
+        .notify_changed_paths(&[document.clone(), path("src/notes.md")])
+        .await
+        .expect("the notification sends");
+    assert_eq!(
+        matched,
+        vec![document],
+        "only the path the surviving valid watcher covers is matched"
+    );
+
+    session.shutdown().await;
+    join(engine_task).await;
+}
+
+/// A watched-file registration past the session's retained-watcher bound
+/// (64) is dropped: the record already holds enough patterns to match
+/// against, so a batch registering 65 watchers keeps only the first 64 and
+/// drops the rest, whatever glob they name.
+#[tokio::test]
+async fn watched_file_watchers_past_the_bound_are_dropped() {
+    let watchers_max = 64_usize;
+    let (_workspace, mut session, engine_task) = started(move |mut engine| async move {
+        engine.handshake(full_capabilities()).await;
+        let mut watchers: Vec<Value> = (0..watchers_max)
+            .map(|_| json!({"globPattern": "**/*.rs"}))
+            .collect();
+        watchers.push(json!({"globPattern": "**/*.md"}));
+        watchers.push(json!({"globPattern": "**/*.txt"}));
+        engine
+            .send(&json!({
+                "jsonrpc": "2.0",
+                "id": "oversized-batch",
+                "method": "client/registerCapability",
+                "params": {
+                    "registrations": [{
+                        "id": "watch-many",
+                        "method": "workspace/didChangeWatchedFiles",
+                        "registerOptions": {"watchers": watchers},
+                    }],
+                },
+            }))
+            .await;
+        let (id, _params) = engine.expect_request("textDocument/references").await;
+        engine.respond(&id, json!([])).await;
+        let notified = engine.next_message().await;
+        assert_eq!(
+            notified["method"],
+            json!("workspace/didChangeWatchedFiles"),
+            "{notified:#}"
+        );
+        let (id, _params) = engine.expect_request("shutdown").await;
+        engine.respond(&id, Value::Null).await;
+        engine.next_message().await;
+    })
+    .await;
+    let document = path("src/lib.rs");
+    let position = Position {
+        line: 0,
+        character: 3,
+    };
+    session
+        .references(&document, position)
+        .await
+        .expect("references answers");
+
+    let matched = session
+        .notify_changed_paths(&[
+            document.clone(),
+            path("src/notes.md"),
+            path("src/readme.txt"),
+        ])
+        .await
+        .expect("the notification sends");
+    assert_eq!(
+        matched,
+        vec![document],
+        "the 65th and 66th watchers never landed once the bound was reached"
+    );
+
     session.shutdown().await;
     join(engine_task).await;
 }

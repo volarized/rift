@@ -16,21 +16,24 @@ use std::time::Duration;
 
 use lsp_types::error_codes::{CONTENT_MODIFIED, SERVER_CANCELLED};
 use lsp_types::notification::{
-    DidCloseTextDocument, DidOpenTextDocument, Exit, Initialized, Notification, Progress,
-    PublishDiagnostics,
+    DidChangeWatchedFiles, DidCloseTextDocument, DidOpenTextDocument, Exit, Initialized,
+    Notification, Progress, PublishDiagnostics,
 };
 use lsp_types::request::{
     DocumentDiagnosticRequest, Initialize, PrepareRenameRequest, References, RegisterCapability,
     Rename, Request, Shutdown, WillRenameFiles, WorkDoneProgressCreate, WorkspaceConfiguration,
 };
 use lsp_types::{
-    ConfigurationParams, Diagnostic, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DocumentChangeOperation, DocumentChanges, DocumentDiagnosticParams, DocumentDiagnosticReport,
-    DocumentDiagnosticReportResult, FileRename, InitializeParams, InitializedParams, Location,
+    ConfigurationParams, Diagnostic, DidChangeWatchedFilesParams,
+    DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DocumentChangeOperation, DocumentChanges, DocumentDiagnosticParams,
+    DocumentDiagnosticReport, DocumentDiagnosticReportResult, FileChangeType, FileEvent,
+    FileRename, FileSystemWatcher, GlobPattern, InitializeParams, InitializedParams, Location,
     PartialResultParams, Position, PrepareRenameResponse, ProgressParams, ProgressParamsValue,
-    ProgressToken, PublishDiagnosticsParams, ReferenceContext, ReferenceParams, RenameFilesParams,
-    RenameParams, TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
-    WorkDoneProgress, WorkDoneProgressParams, WorkspaceEdit, WorkspaceFolder,
+    ProgressToken, PublishDiagnosticsParams, ReferenceContext, ReferenceParams, RegistrationParams,
+    RenameFilesParams, RenameParams, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, WatchKind, WorkDoneProgress, WorkDoneProgressParams, WorkspaceEdit,
+    WorkspaceFolder,
 };
 use rift_core::{
     CapturedStream, Error, ErrorCode, ErrorContext, ErrorName, Fault, ProjectPath,
@@ -41,7 +44,7 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command};
 
-use crate::capabilities::{Capabilities, CapabilitiesError, offered};
+use crate::capabilities::{Capabilities, CapabilitiesError, glob_matches, offered};
 use crate::correlation::{self, Correlation, CorrelationError, METHOD_NOT_FOUND_CODE, RequestId};
 use crate::framing::{Framing, FramingError};
 use crate::uri::{TreeRoot, UriError};
@@ -74,6 +77,17 @@ const PROGRESS_TOKENS_MAX: usize = 64;
 /// work. One resend closes it; a second would wait on an engine that may
 /// simply have nothing to say.
 const EMPTY_ANSWER_RESENDS_MAX: u32 = 1;
+
+/// Maximum watched-file glob patterns retained across every
+/// `client/registerCapability` call for `workspace/didChangeWatchedFiles`.
+///
+/// A pattern past the bound is dropped: the record already has enough
+/// patterns to match against, and one more registration changes nothing a
+/// caller can observe beyond which paths a notification names.
+const WATCHED_FILE_WATCHERS_MAX: usize = 64;
+
+/// Maximum registrations one `client/registerCapability` call contributes.
+const WATCHED_FILE_REGISTRATIONS_MAX: usize = 16;
 
 /// The refusal codes that name a transient condition, not a bad request.
 ///
@@ -325,6 +339,30 @@ pub type EngineError = Error<EngineFault>;
 /// are outstanding right now, and whether the engine has ever announced
 /// any work at all. An engine that began one token and ended it has
 /// announced work with nothing outstanding.
+/// What one engine has proven about its own settlement, read from its
+/// `$/progress` traffic alone and independent of what language it serves.
+///
+/// Initialization completing is not enough on its own: every work-done
+/// progress token the engine announced must also have ended before an
+/// answer is trusted as settled. Announcing work alone never confirms
+/// readiness - it names [`EngineReadiness::Analyzing`], not
+/// [`EngineReadiness::Ready`] - and an engine that never announces any
+/// progress at all never reaches either: it stays
+/// [`EngineReadiness::Unconfirmed`], a state rather than a failure, because
+/// nothing distinguishes it from one still loading.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EngineReadiness {
+    /// The engine has never announced any work of its own. Its answers may
+    /// be the answers of a settled engine, or of one that has not started
+    /// analyzing yet; nothing here tells the two apart.
+    Unconfirmed,
+    /// The engine announced work it has not yet ended. Its most recent
+    /// answer is provisional.
+    Analyzing,
+    /// The engine announced work and every token it began has since ended.
+    Ready,
+}
+
 #[derive(Debug, Default)]
 struct WorkProgress {
     announced: bool,
@@ -361,6 +399,18 @@ impl WorkProgress {
     fn is_announced(&self) -> bool {
         self.announced
     }
+
+    /// The readiness this record proves, from the announcement and
+    /// outstanding-token facts alone.
+    fn readiness(&self) -> EngineReadiness {
+        if !self.is_announced() {
+            EngineReadiness::Unconfirmed
+        } else if self.is_outstanding() {
+            EngineReadiness::Analyzing
+        } else {
+            EngineReadiness::Ready
+        }
+    }
 }
 
 /// One request whose empty answer says nothing a real answer would not.
@@ -375,6 +425,8 @@ enum EmptyAnswer {
     WillRenameFiles,
     /// `textDocument/diagnostic` reported no item.
     Diagnostics,
+    /// `textDocument/references` reported no location.
+    References,
 }
 
 /// What the session's most recent answer said, and the resends already
@@ -446,6 +498,7 @@ pub struct EngineSession {
     published: BTreeMap<ProjectPath, Vec<Diagnostic>>,
     progress: WorkProgress,
     empty_answers: EmptyAnswers,
+    watched_file_watchers: Vec<FileSystemWatcher>,
     document_version: i32,
     ended: bool,
 }
@@ -587,6 +640,7 @@ impl EngineSession {
             published: BTreeMap::new(),
             progress: WorkProgress::default(),
             empty_answers: EmptyAnswers::default(),
+            watched_file_watchers: Vec::new(),
             document_version: 0,
             ended: false,
         };
@@ -641,22 +695,21 @@ impl EngineSession {
     /// reads only while a call runs, so the query answers the state as of
     /// the most recent answer. An engine that reports no progress at all
     /// never reads as analyzing, and its answers are final at once.
+    /// Equivalent to `readiness() == EngineReadiness::Analyzing`.
     #[must_use]
     pub fn is_analyzing(&self) -> bool {
         self.progress.is_outstanding()
     }
 
-    /// Whether the engine has never announced any work of its own.
+    /// What this session has proven about the engine's own settlement.
     ///
-    /// [`EngineSession::is_analyzing`] answers what the engine is doing
-    /// now; this answers whether it has ever said what it is doing. Until
-    /// one `$/progress` begin has arrived, nothing distinguishes an engine
-    /// that has finished its work from one that has not started
-    /// announcing it, so an empty answer given in that window is not
-    /// evidence that there was nothing to answer.
+    /// Reads only what the session has read so far, so the answer is as of
+    /// the most recent exchange; see [`EngineReadiness`] for what each
+    /// state means and [`EngineSession::is_analyzing`] for the outstanding
+    /// half of it alone.
     #[must_use]
-    pub fn has_never_announced_work(&self) -> bool {
-        !self.progress.is_announced()
+    pub fn readiness(&self) -> EngineReadiness {
+        self.progress.readiness()
     }
 
     /// Claims one resend for an answer that said nothing where something
@@ -846,7 +899,10 @@ impl EngineSession {
             },
         };
         let locations = self.request::<References>(params).await?;
-        Ok(locations.unwrap_or_default())
+        let locations = locations.unwrap_or_default();
+        self.empty_answers
+            .record(EmptyAnswer::References, locations.is_empty());
+        Ok(locations)
     }
 
     /// Pulls the engine's current diagnostics for one document.
@@ -898,6 +954,65 @@ impl EngineSession {
     #[must_use]
     pub fn published_diagnostics(&self, path: &ProjectPath) -> Option<&[Diagnostic]> {
         self.published.get(path).map(Vec::as_slice)
+    }
+
+    /// Sends `workspace/didChangeWatchedFiles` naming every path in
+    /// `paths` that matches a glob the engine registered through
+    /// `client/registerCapability`, and returns the matched paths in the
+    /// order given.
+    ///
+    /// A path outside every watcher the engine registered - or one this
+    /// session read no registration for at all - is left out: the
+    /// notification only ever names what the engine itself asked to hear
+    /// about, so a caller reads an empty return as "nothing to wait on"
+    /// rather than as a failure. Every matched path is reported as
+    /// [`FileChangeType::CHANGED`]: the caller already knows the path
+    /// changed on disk, and LSP does not require the finer create or
+    /// delete distinction for an engine to reload it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] when the session ended or the engine's side
+    /// of the connection broke.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future may leave the notification unsent; the engine's
+    /// view of the changed paths is then unknown and the next operation
+    /// still runs.
+    pub async fn notify_changed_paths(
+        &mut self,
+        paths: &[ProjectPath],
+    ) -> Result<Vec<ProjectPath>, EngineError> {
+        let matched: Vec<ProjectPath> = paths
+            .iter()
+            .filter(|path| self.matches_watched_file(path))
+            .cloned()
+            .collect();
+        if matched.is_empty() {
+            return Ok(matched);
+        }
+        let mut changes = Vec::with_capacity(matched.len());
+        for path in &matched {
+            changes.push(FileEvent {
+                uri: self.document_uri(path)?,
+                typ: FileChangeType::CHANGED,
+            });
+        }
+        self.notify::<DidChangeWatchedFiles>(&DidChangeWatchedFilesParams { changes })
+            .await?;
+        Ok(matched)
+    }
+
+    /// Whether one path matches a watcher the engine registered, and that
+    /// watcher's interest covers a change event.
+    fn matches_watched_file(&self, path: &ProjectPath) -> bool {
+        self.watched_file_watchers.iter().any(|watcher| {
+            watcher
+                .kind
+                .is_none_or(|kind| kind.contains(WatchKind::Change))
+                && glob_pattern_matches(&watcher.glob_pattern, path.as_str())
+        })
     }
 
     /// Ends the engine: shutdown and exit under their timeout, then a kill.
@@ -1034,6 +1149,7 @@ impl EngineSession {
             if let Some(method) = incoming.method {
                 match incoming.id {
                     Some(request_id) => {
+                        self.record_server_request(&method, incoming.params.clone());
                         let answer = answer_server_request(&method, &request_id, incoming.params);
                         self.write_payload(answer, R::METHOD).await?;
                     }
@@ -1178,6 +1294,56 @@ impl EngineSession {
         }
     }
 
+    /// Records what one server-initiated request reveals about the
+    /// engine's own subscriptions.
+    ///
+    /// Only `client/registerCapability` carries anything this session
+    /// keeps beyond its answer; every other server-initiated request is
+    /// answered without further record.
+    fn record_server_request(&mut self, method: &str, params: Option<Value>) {
+        if method == RegisterCapability::METHOD {
+            self.record_watched_file_registration(params);
+        }
+    }
+
+    /// Retains the glob patterns one `client/registerCapability` call
+    /// registered for `workspace/didChangeWatchedFiles`, bounded.
+    ///
+    /// A registration this session cannot parse, or one naming a
+    /// different method, contributes nothing: the session always answers
+    /// the registration with success regardless, so a malformed one costs
+    /// the engine no capability it would otherwise have.
+    fn record_watched_file_registration(&mut self, params: Option<Value>) {
+        let Ok(registration) =
+            serde_json::from_value::<RegistrationParams>(params.unwrap_or(Value::Null))
+        else {
+            return;
+        };
+        for entry in registration
+            .registrations
+            .into_iter()
+            .take(WATCHED_FILE_REGISTRATIONS_MAX)
+        {
+            if entry.method != DidChangeWatchedFiles::METHOD {
+                continue;
+            }
+            let Some(options) = entry.register_options else {
+                continue;
+            };
+            let Ok(options) =
+                serde_json::from_value::<DidChangeWatchedFilesRegistrationOptions>(options)
+            else {
+                continue;
+            };
+            for watcher in options.watchers {
+                if self.watched_file_watchers.len() >= WATCHED_FILE_WATCHERS_MAX {
+                    return;
+                }
+                self.watched_file_watchers.push(watcher);
+            }
+        }
+    }
+
     /// The file URI for one project path, as an engine fault on refusal.
     fn document_uri(&self, path: &ProjectPath) -> Result<lsp_types::Uri, EngineError> {
         self.root
@@ -1274,6 +1440,21 @@ fn operation_edits_nothing(operation: &DocumentChangeOperation) -> bool {
         DocumentChangeOperation::Op(_) => false,
         DocumentChangeOperation::Edit(document) => document.edits.is_empty(),
     }
+}
+
+/// Whether one registered glob pattern matches a slash-separated relative
+/// path.
+///
+/// A [`GlobPattern::Relative`] pattern is matched by its own glob alone:
+/// every session anchors one workspace root, so the base URI a real engine
+/// names is always that same root, and folding it into the match would
+/// only restate the scope this session already has.
+fn glob_pattern_matches(pattern: &GlobPattern, path: &str) -> bool {
+    let glob = match pattern {
+        GlobPattern::String(glob) => glob,
+        GlobPattern::Relative(relative) => &relative.pattern,
+    };
+    glob_matches(glob, false, path)
 }
 
 /// Refuses the operation when the engine was advertised without it.

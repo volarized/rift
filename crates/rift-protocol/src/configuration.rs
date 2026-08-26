@@ -30,6 +30,14 @@ pub const SERVER_IDLE_TIMEOUT_MS_MIN: u64 = 1_000;
 /// Milliseconds the server serves with no request before it stops, at
 /// most: one day.
 pub const SERVER_IDLE_TIMEOUT_MS_MAX: u64 = 86_400_000;
+/// Milliseconds a request waits for the workspace and its engines to
+/// prove they are ready to answer, at least: one second.
+pub const SERVER_READINESS_TIMEOUT_MS_MIN: u64 = 1_000;
+/// Milliseconds a request waits for the workspace and its engines to
+/// prove they are ready to answer, at most: one hour.
+pub const SERVER_READINESS_TIMEOUT_MS_MAX: u64 = 3_600_000;
+/// Milliseconds [`ServerConfiguration::readiness_timeout`] defaults to.
+const SERVER_READINESS_TIMEOUT_MS_DEFAULT: u64 = 30_000;
 /// Bytes one submitted execution block may hold, at most.
 pub const EXECUTION_CODE_BYTES_MAX: u64 = 32 << 10;
 /// Milliseconds one evaluation may run, at most: one day.
@@ -401,6 +409,12 @@ pub struct ServerConfiguration {
     pub worker_queue_timeout: Duration,
     /// Wall-clock span with no served request that stops the server, 1s to 1d.
     pub idle_timeout: Duration,
+    /// Wall-clock bound one request waits for the workspace's index and
+    /// its language engines to prove they are ready to answer, 1s to 1h.
+    /// One deadline: index validation starts it, and once a request
+    /// resolves the languages it needs, waiting on those engines spends
+    /// what remains of it.
+    pub readiness_timeout: Duration,
     /// The exact loopback port the server binds, 1024 or above. Excludes
     /// `port_range`; omitted, the server picks from `port_range` or the
     /// default serving range.
@@ -417,6 +431,7 @@ impl Default for ServerConfiguration {
             num_workers: 4,
             worker_queue_timeout: Duration::from_millis(30_000),
             idle_timeout: Duration::from_millis(1_800_000),
+            readiness_timeout: Duration::from_millis(SERVER_READINESS_TIMEOUT_MS_DEFAULT),
             port: None,
             port_range: None,
         }
@@ -457,6 +472,12 @@ impl ServerConfiguration {
                 self.idle_timeout.milliseconds(),
                 SERVER_IDLE_TIMEOUT_MS_MIN,
                 SERVER_IDLE_TIMEOUT_MS_MAX,
+            ),
+            (
+                "server.readiness_timeout",
+                self.readiness_timeout.milliseconds(),
+                SERVER_READINESS_TIMEOUT_MS_MIN,
+                SERVER_READINESS_TIMEOUT_MS_MAX,
             ),
         ])
         .or_else(|| self.port_violation())
@@ -2415,6 +2436,7 @@ mod tests {
         assert_eq!(table.num_workers, 4);
         assert_eq!(table.worker_queue_timeout, Duration::from_millis(30_000));
         assert_eq!(table.idle_timeout, Duration::from_millis(1_800_000));
+        assert_eq!(table.readiness_timeout, Duration::from_millis(30_000));
         assert_eq!(WorkspaceConfiguration::default().validate(), Ok(()));
     }
 
@@ -2472,6 +2494,34 @@ mod tests {
                 configuration.validate(),
                 Ok(()),
                 "idle_timeout {timeout_ms}ms must be accepted"
+            );
+        }
+        configuration.server.idle_timeout = Duration::from_millis(SERVER_IDLE_TIMEOUT_MS_MAX);
+        for timeout_ms in [
+            SERVER_READINESS_TIMEOUT_MS_MIN - 1,
+            SERVER_READINESS_TIMEOUT_MS_MAX + 1,
+        ] {
+            configuration.server.readiness_timeout = Duration::from_millis(timeout_ms);
+            assert!(
+                matches!(
+                    configuration.validate(),
+                    Err(ConfigurationViolation::LimitOutOfRange {
+                        field: "server.readiness_timeout",
+                        ..
+                    })
+                ),
+                "readiness_timeout {timeout_ms}ms must be refused"
+            );
+        }
+        for timeout_ms in [
+            SERVER_READINESS_TIMEOUT_MS_MIN,
+            SERVER_READINESS_TIMEOUT_MS_MAX,
+        ] {
+            configuration.server.readiness_timeout = Duration::from_millis(timeout_ms);
+            assert_eq!(
+                configuration.validate(),
+                Ok(()),
+                "readiness_timeout {timeout_ms}ms must be accepted"
             );
         }
     }

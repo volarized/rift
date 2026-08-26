@@ -811,6 +811,15 @@
           "default": null,
           "description": "The loopback range the server picks its port from. Excludes `port`;\nomitted, the default serving range applies."
         },
+        "readiness_timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "30s",
+          "description": "Wall-clock bound one request waits for the workspace's index and\nits language engines to prove they are ready to answer, 1s to 1h.\nOne deadline: index validation starts it, and once a request\nresolves the languages it needs, waiting on those engines spends\nwhat remains of it.",
+          "rift:range": {
+            "max": "1h",
+            "min": "1s"
+          }
+        },
         "worker_queue_timeout": {
           "$ref": "#/$defs/Duration",
           "default": "30s",
@@ -965,6 +974,7 @@
         "num_workers": 4,
         "port": null,
         "port_range": null,
+        "readiness_timeout": "30s",
         "worker_queue_timeout": "30s"
       },
       "description": "The server's own blocking-work bounds: worker count and queue wait."
