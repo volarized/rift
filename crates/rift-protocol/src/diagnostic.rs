@@ -72,6 +72,15 @@ pub enum DiagnosticCode {
     /// findings over an applied change may be incomplete; the change itself landed.
     #[serde(rename = "rift.engine.analyzing")]
     EngineAnalyzing,
+    /// A removal applied under `force` while a reference to the removed declaration still
+    /// stood.
+    #[serde(rename = "rift.remove.reference")]
+    RemoveReference,
+    /// A removal applied without a reference check: no engine served the language, the
+    /// engine advertised no `textDocument/references`, the request failed, or the removed
+    /// node named no declaration.
+    #[serde(rename = "rift.remove.unchecked")]
+    RemoveUnchecked,
 }
 
 impl DiagnosticCode {
@@ -199,6 +208,14 @@ mod tests {
         assert_eq!(
             DiagnosticCode::EngineAnalyzing.code(),
             "rift.engine.analyzing"
+        );
+        assert_eq!(
+            DiagnosticCode::RemoveReference.code(),
+            "rift.remove.reference"
+        );
+        assert_eq!(
+            DiagnosticCode::RemoveUnchecked.code(),
+            "rift.remove.unchecked"
         );
     }
 }

@@ -60,6 +60,7 @@ async fn happy_engine_negotiates_renames_and_serves_diagnostics() {
     let record = session.capabilities();
     assert_eq!(record.position_encoding, PositionEncoding::Utf8);
     assert!(record.rename && record.prepare_rename);
+    assert!(record.references);
     assert!(record.will_rename_files() && record.pull_diagnostics);
     assert_eq!(record.diagnostic_identifier.as_deref(), Some("fake"));
     assert_eq!(
@@ -112,6 +113,21 @@ async fn happy_engine_negotiates_renames_and_serves_diagnostics() {
         .await
         .expect("willRenameFiles answers");
     assert!(moved.is_some());
+
+    let references = session
+        .references(
+            &document,
+            Position {
+                line: 0,
+                character: 3,
+            },
+        )
+        .await
+        .expect("references answers");
+    assert!(
+        references.is_empty(),
+        "the declaration's own occurrence is excluded by include_declaration: false"
+    );
 
     let pulled = session
         .pull_diagnostics(&document)
@@ -168,6 +184,16 @@ async fn engine_without_capabilities_gets_typed_refusals_before_any_request() {
             .await
             .err(),
         session.pull_diagnostics(&document).await.err(),
+        session
+            .references(
+                &document,
+                Position {
+                    line: 0,
+                    character: 0,
+                },
+            )
+            .await
+            .err(),
     ] {
         let error = absent.expect("the capability gate refuses");
         assert!(matches!(
