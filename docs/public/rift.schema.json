@@ -74,7 +74,7 @@
           }
         },
         "program": {
-          "description": "The executable Rift starts. An absolute path is refused; a bare name\nresolves through `PATH`, a relative one below `working_directory`.",
+          "description": "The executable Rift starts. A bare name resolves through `PATH`; a\npath resolves below `working_directory`. An absolute path or a `.`\nor `..` segment is refused.",
           "minLength": 1,
           "type": "string"
         },
@@ -92,7 +92,7 @@
         },
         "working_directory": {
           "$ref": "#/$defs/ProjectPath",
-          "description": "Directory the process starts in, relative to the changed tree's\nroot. Empty selects the root."
+          "description": "Directory the process starts in, relative to the changed tree's\nroot. Empty selects the root. An absolute path or a `.` or `..`\nsegment is refused."
         }
       },
       "required": [

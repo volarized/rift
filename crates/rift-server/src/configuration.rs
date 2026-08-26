@@ -26,6 +26,13 @@ pub enum ConfigurationFault {
         /// The rendered I/O failure.
         io: String,
     },
+    /// A directory stands where the configuration file belongs. Reading it
+    /// can never succeed by retrying: the operator must remove or replace
+    /// it with the file.
+    IsDirectory {
+        /// The directory's path.
+        path: String,
+    },
     /// The file is larger than configuration can be.
     Oversized {
         /// The file's size in bytes.
@@ -47,9 +54,10 @@ impl Fault for ConfigurationFault {
     fn name(&self) -> ErrorName {
         match self {
             Self::Unreadable { .. } => ErrorName::Wire(ErrorCode::StorageFailure),
-            Self::Oversized { .. } | Self::Malformed { .. } | Self::Invalid(_) => {
-                ErrorName::Wire(ErrorCode::ConfigurationInvalid)
-            }
+            Self::IsDirectory { .. }
+            | Self::Oversized { .. }
+            | Self::Malformed { .. }
+            | Self::Invalid(_) => ErrorName::Wire(ErrorCode::ConfigurationInvalid),
         }
     }
 
@@ -59,6 +67,10 @@ impl Fault for ConfigurationFault {
             Self::Unreadable { path, io } => {
                 context.push(ErrorContext::new("path", path.clone()));
                 context.push(ErrorContext::new("io", io.clone()));
+            }
+            Self::IsDirectory { path } => {
+                context.push(ErrorContext::new("path", path.clone()));
+                context.push(ErrorContext::new("detail", "the path is a directory"));
             }
             Self::Oversized { bytes, bytes_max } => {
                 context.push(ErrorContext::new("bytes", bytes.to_string()));
@@ -90,6 +102,11 @@ pub fn load_configuration(root: &Path) -> Result<WorkspaceConfiguration, Configu
         Ok(raw) => raw,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(WorkspaceConfiguration::default());
+        }
+        Err(_) if path.is_dir() => {
+            return Err(Error::new(ConfigurationFault::IsDirectory {
+                path: path.display().to_string(),
+            }));
         }
         Err(error) => {
             return Err(Error::new(ConfigurationFault::Unreadable {
@@ -328,18 +345,53 @@ download_timeout = "5m"
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_unreadable_file_is_a_storage_failure() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir(directory.path().join(WORKSPACE_CONFIGURATION_FILE))
-            .expect("a directory can shadow the configuration file");
-        let error = load_configuration(directory.path())
-            .expect_err("a directory in the file's place must fail to read");
+        let path = directory.path().join(WORKSPACE_CONFIGURATION_FILE);
+        fs::write(&path, "[server]\n").expect("test configuration must be writable");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000))
+            .expect("fixture permissions set");
+        let error = load_configuration(directory.path());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .expect("fixture permissions restore");
+        let error = error.expect_err("a file this process cannot read must fail to read");
         assert_eq!(error.name(), ErrorName::Wire(ErrorCode::StorageFailure));
         let message = error.to_string();
         assert!(
             message.contains("path ") && message.contains("io "),
             "the refusal must carry the path and the I/O account: {message}"
+        );
+    }
+
+    #[test]
+    fn test_directory_in_place_of_the_file_is_configuration_invalid() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(directory.path().join(WORKSPACE_CONFIGURATION_FILE))
+            .expect("a directory can shadow the configuration file");
+        let error = load_configuration(directory.path())
+            .expect_err("a directory in the file's place must be refused, not retried");
+        assert_eq!(
+            error.name(),
+            ErrorName::Wire(ErrorCode::ConfigurationInvalid),
+            "a directory can never become readable by retrying"
+        );
+        let message = error.to_string();
+        let expected_path = directory
+            .path()
+            .join(WORKSPACE_CONFIGURATION_FILE)
+            .display()
+            .to_string();
+        assert!(
+            message.contains(&expected_path),
+            "the refusal must name the offending path: {message}"
+        );
+        assert!(
+            message.contains("directory"),
+            "the refusal must say the path is a directory: {message}"
         );
     }
 }
