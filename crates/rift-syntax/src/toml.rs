@@ -456,6 +456,39 @@ mod tests {
             .expect("TOML fixture must parse")
     }
 
+    #[test]
+    fn key_segment_spelling_answers_for_a_key_and_refuses_for_anything_else() {
+        let text = "bare = 1\n\"quoted\" = 2\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_toml_ng::LANGUAGE.into())
+            .expect("the pinned grammar must load");
+        let tree = parser.parse(text, None).expect("the fixture must parse");
+        let rules = TomlRules {
+            kinds: toml_kinds(),
+        };
+        let mut spellings = Vec::new();
+        let mut values = Vec::new();
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        for pair in root.named_children(&mut cursor) {
+            let mut inner = pair.walk();
+            let children: Vec<_> = pair.named_children(&mut inner).collect();
+            spellings.push(rules.key_segment_spelling(children[0], text));
+            values.push(rules.key_segment_spelling(children[1], text));
+        }
+        assert_eq!(
+            spellings,
+            vec![Some("bare".to_owned()), Some("quoted".to_owned())],
+            "a bare key is its bytes; a quoted key is the bytes between its quotes"
+        );
+        assert_eq!(
+            values,
+            vec![None, None],
+            "a value node is neither a bare key nor a quoted key, so it spells no segment"
+        );
+    }
+
     fn qualified_names(document: &SyntaxDocument) -> Vec<&str> {
         document
             .symbols()
