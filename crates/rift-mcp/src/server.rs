@@ -1889,12 +1889,37 @@ mod tests {
     #[tokio::test]
     async fn build_propagates_workspace_index_failure() {
         let directory = tempfile::tempdir().expect("fixture must exist");
-        fs::write(directory.path().join("invalid.rs"), [0xff])
-            .expect("invalid source fixture must write");
-        let error = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())
+        fs::write(directory.path().join("wide.rs"), "pub fn wide() {}\n")
+            .expect("source fixture must write");
+        let limits =
+            WorkspaceIndexLimits::new(8, 1, 4096, 8, 32).expect("test bounds must be positive");
+        let error = RiftMcp::build(directory.path(), limits)
             .await
-            .expect_err("invalid source must fail");
+            .expect_err("a file past the per-file byte bound must fail the build");
         assert!(matches!(error.fault(), ReadFault::Index(_)));
+    }
+
+    #[tokio::test]
+    async fn build_serves_a_workspace_holding_a_file_that_is_not_utf8() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("invalid.rs"), [0xff])?;
+        let valid_declaration = "pub fn valid_declaration() {}\n";
+        fs::write(directory.path().join("valid.rs"), valid_declaration)?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        let result = get_symbol(&server, "valid_declaration")
+            .await
+            .map_err(|error| format!("the valid file must still serve: {error:?}"))?;
+        assert_eq!(result.hits.len(), 1);
+        assert!(
+            result.warnings.iter().any(|warning| matches!(
+                warning,
+                ReadWarning::SourceUnavailable { unit, .. } if unit.0.contains("invalid.rs")
+            )),
+            "the answer must name the file the index omitted: {:?}",
+            result.warnings
+        );
+        drop(directory);
+        Ok(())
     }
 
     #[tokio::test]

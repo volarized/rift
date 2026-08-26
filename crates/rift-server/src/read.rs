@@ -11,7 +11,8 @@ use rift_core::{
 use rift_history::{HistoryError, Repository};
 use rift_index::{
     FileDigest, IndexedFile, PathChanges, SymbolMatch, WorkspaceDigests, WorkspaceFingerprint,
-    WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits, WorkspaceSourcePolicy,
+    WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits, WorkspaceIndexWarning,
+    WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::HistoryConfiguration;
 use rift_protocol::read::{
@@ -52,6 +53,12 @@ pub enum ReadFault {
     },
     /// Requested source does not exist.
     NotFound {
+        /// The path the request addressed.
+        path: String,
+    },
+    /// A claimed path's bytes are not valid UTF-8: the path is real, but the index could
+    /// not read it and holds no file there.
+    SourceUnavailable {
         /// The path the request addressed.
         path: String,
     },
@@ -96,6 +103,7 @@ impl Fault for ReadFault {
             Self::Unsupported { .. } => ErrorName::Wire(ErrorCode::CapabilityUnavailable),
             Self::Invalid { .. } => ErrorName::Wire(ErrorCode::InvalidRequest),
             Self::NotFound { .. } => ErrorName::Wire(ErrorCode::ResourceNotFound),
+            Self::SourceUnavailable { .. } => ErrorName::Wire(ErrorCode::ContentUnavailable),
             Self::Storage { .. } => ErrorName::Wire(ErrorCode::StorageFailure),
             Self::Task { .. } => ErrorName::Wire(ErrorCode::InternalError),
             Self::Unavailable { .. } | Self::CapacityTimeout { .. } => {
@@ -116,7 +124,9 @@ impl Fault for ReadFault {
                 ErrorContext::new("field", *field),
                 ErrorContext::new("violation", violation.clone()),
             ],
-            Self::NotFound { path } => vec![ErrorContext::new("path", path.clone())],
+            Self::NotFound { path } | Self::SourceUnavailable { path } => {
+                vec![ErrorContext::new("path", path.clone())]
+            }
             Self::Storage {
                 path,
                 operation,
@@ -148,6 +158,7 @@ impl Fault for ReadFault {
             Self::Unsupported { .. }
             | Self::Invalid { .. }
             | Self::NotFound { .. }
+            | Self::SourceUnavailable { .. }
             | Self::Storage { .. }
             | Self::Task { .. }
             | Self::Unavailable { .. }
@@ -172,6 +183,13 @@ impl ReadFault {
 
     pub(crate) fn not_found(path: impl Into<String>) -> ReadError {
         Error::new(Self::NotFound { path: path.into() })
+    }
+
+    /// Classifies a claimed path whose bytes are not valid UTF-8: the index confirmed the
+    /// path is real by naming it in its own warnings, so this is `content_unavailable`
+    /// rather than `not_found`.
+    pub(crate) fn source_unavailable(path: impl Into<String>) -> ReadError {
+        Error::new(Self::SourceUnavailable { path: path.into() })
     }
 
     pub(crate) fn storage(
@@ -406,10 +424,13 @@ impl ReadService {
     }
 
     /// Returns the warnings every answer from this service carries: one
-    /// `stale_index` when the published index lags the captured tree, none
-    /// when the two match.
+    /// `stale_index` when the published index lags the captured tree, one
+    /// `source_unavailable` for each file the index omitted because its
+    /// bytes are not UTF-8, and none of either when nothing applies.
     pub(crate) fn warnings(&self) -> Vec<ReadWarning> {
-        self.revisions.warnings()
+        let mut warnings = self.revisions.warnings();
+        warnings.extend(self.index.warnings().iter().map(wire_index_warning));
+        warnings
     }
 
     /// Returns the resolved commit this service serves, or none for the
@@ -489,16 +510,30 @@ impl ReadService {
         })
     }
 
-    /// The failure for a path the syntax index does not hold: `Unsupported` naming the
-    /// unparsed extension when no shipped provider parses `path` and this snapshot can
-    /// confirm the path is real; `not_found` for everything else, including a claimed
-    /// extension the index simply has not read.
+    /// The failure for a path the syntax index does not hold: `content_unavailable` when
+    /// this snapshot's own warnings name `path` as holding invalid UTF-8 - the file exists
+    /// but could not be read - `Unsupported` naming the unparsed extension when no shipped
+    /// provider parses `path` and this snapshot can confirm the path is real, and
+    /// `not_found` for everything else, including a claimed extension the index simply has
+    /// not read.
     fn missing_file_fault(&self, path: &CoreProjectPath) -> ReadError {
+        if self.index_names_invalid_utf8(path) {
+            return ReadFault::source_unavailable(path.as_str());
+        }
         match self.unclaimed_extension_capability(path) {
             Ok(Some(capability)) => ReadFault::unsupported(capability),
             Ok(None) => ReadFault::not_found(path.as_str()),
             Err(storage_fault) => storage_fault,
         }
+    }
+
+    /// Whether this snapshot's own warnings name `path` as holding bytes that are not
+    /// UTF-8: the one condition the index confirms without the path being indexed.
+    fn index_names_invalid_utf8(&self, path: &CoreProjectPath) -> bool {
+        self.index
+            .warnings()
+            .iter()
+            .any(|warning| warning.path() == path)
     }
 
     /// `Some` naming `path`'s extension, or stating that it carries none, when no
@@ -806,6 +841,21 @@ pub(crate) fn file_id(path: &CoreProjectPath) -> FileId {
     ))
 }
 
+/// Projects one index-build warning onto its wire form. Invalid UTF-8 is the only source
+/// today: the message states that the file's bytes are not UTF-8 and that it is therefore
+/// absent from the index.
+fn wire_index_warning(warning: &WorkspaceIndexWarning) -> ReadWarning {
+    match warning {
+        WorkspaceIndexWarning::InvalidUtf8Source(path) => ReadWarning::SourceUnavailable {
+            unit: file_id(path),
+            detail: format!(
+                "{path}'s bytes are not valid UTF-8, so the file is absent from the index",
+                path = path.as_str(),
+            ),
+        },
+    }
+}
+
 /// Mints the project resolver's source-unit identity: the resolver name, then the
 /// project-relative path as the resolver's own canonical unit key.
 pub(crate) fn source_unit_id(path: &CoreProjectPath) -> SourceUnitId {
@@ -971,12 +1021,12 @@ mod tests {
     use rift_core::SourceVisibility;
     use rift_protocol::read::{
         GetSymbolParams, Language, NodeFacet, NodesParams, NodesResult, ProjectPath, ProjectionId,
-        RevisionId,
+        ReadWarning, RevisionId,
     };
     use serde_json::json;
     use tempfile::TempDir;
 
-    use super::{HistoryConfiguration, ReadFault, ReadService, WorkspaceIndexLimits};
+    use super::{HistoryConfiguration, ReadFault, ReadService, WorkspaceIndexLimits, file_id};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -1497,6 +1547,89 @@ pub fn compute() -> i32 {
         assert_eq!(
             capability, "files with no extension",
             "justfile carries no extension at all"
+        );
+        Ok(())
+    }
+
+    /// A workspace holding one UTF-8-invalid source file beside a valid one: addressing
+    /// the invalid file directly answers `content_unavailable`, a genuinely absent sibling
+    /// path still answers `not_found`, and reading the valid file still serves normally
+    /// while carrying a warning naming the invalid one.
+    #[test]
+    fn nodes_distinguishes_invalid_utf8_from_absent_and_still_serves_and_warns() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn kept() {}\n")?;
+        fs::write(directory.path().join("src/invalid.rs"), [0xff])?;
+        let service = nodes_service(directory.path(), &SourceVisibility::default())?;
+
+        let invalid = nodes_at_root(&service, "src/invalid.rs")
+            .expect_err("the addressed file exists but cannot be read");
+        let invalid_fault = invalid.fault();
+        assert!(
+            matches!(invalid_fault, ReadFault::SourceUnavailable { .. }),
+            "an invalid-UTF-8 path answers content_unavailable, not not_found: {invalid_fault:?}"
+        );
+        assert_eq!(
+            invalid.descriptor().code(),
+            "content_unavailable",
+            "the wire code names the omitted content, not a missing path"
+        );
+
+        let absent = nodes_at_root(&service, "src/missing.rs")
+            .expect_err("a path nothing claims must still fail");
+        let absent_fault = absent.fault();
+        assert!(
+            matches!(absent_fault, ReadFault::NotFound { .. }),
+            "a genuinely absent sibling path is unaffected: {absent_fault:?}"
+        );
+        assert_eq!(
+            absent.descriptor().code(),
+            "resource_not_found",
+            "a genuinely absent path keeps its own wire code"
+        );
+
+        let kept = nodes_at_root(&service, "src/lib.rs")?;
+        let invalid_path = rift_core::ProjectPath::new("src/invalid.rs")?;
+        assert!(
+            kept.warnings.contains(&ReadWarning::SourceUnavailable {
+                unit: file_id(&invalid_path),
+                detail: "src/invalid.rs's bytes are not valid UTF-8, so the file is absent \
+                         from the index"
+                    .to_owned(),
+            }),
+            "the valid file still serves and its result names the skipped one: {:?}",
+            kept.warnings
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn get_symbol_over_a_workspace_with_an_invalid_utf8_file_still_warns_and_serves_others()
+    -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub struct Beacon;\n")?;
+        fs::write(directory.path().join("src/invalid.rs"), [0xff])?;
+        let service = nodes_service(directory.path(), &SourceVisibility::default())?;
+
+        let params: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
+        let result = service.get_symbol(&params)?;
+        assert_eq!(
+            result.hits.len(),
+            1,
+            "the valid file's declaration is still found"
+        );
+        let invalid_path = rift_core::ProjectPath::new("src/invalid.rs")?;
+        assert!(
+            result.warnings.contains(&ReadWarning::SourceUnavailable {
+                unit: file_id(&invalid_path),
+                detail: "src/invalid.rs's bytes are not valid UTF-8, so the file is absent \
+                         from the index"
+                    .to_owned(),
+            }),
+            "get_symbol's answer names the skipped file too: {:?}",
+            result.warnings
         );
         Ok(())
     }

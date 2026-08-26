@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -394,12 +394,12 @@ const FINGERPRINT_FILE_SEPARATOR: u8 = 0xff;
 impl WorkspaceFingerprint {
     /// Captures visible source and included text paths and bytes without parsing syntax.
     ///
-    /// Work is bounded by [`WorkspaceIndexLimits`].
+    /// Work is bounded by [`WorkspaceIndexLimits`]. A claimed file whose bytes are not
+    /// UTF-8 is omitted from the capture rather than failing it.
     ///
     /// # Errors
     ///
-    /// Returns [`WorkspaceIndexError`] for discovery, read, encoding, or
-    /// configured-bound failures.
+    /// Returns [`WorkspaceIndexError`] for discovery, read, or configured-bound failures.
     pub fn capture(
         root: &Path,
         limits: WorkspaceIndexLimits,
@@ -578,6 +578,27 @@ impl WorkspaceSourcePolicy {
     }
 }
 
+/// One condition a build or rebuild encountered while assembling an index but did not
+/// treat as fatal: the index still publishes, and a caller sees why a file is missing
+/// rather than only its absence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceIndexWarning {
+    /// A claimed file's bytes are not valid UTF-8. The file is omitted from the index and
+    /// from a digest capture over the same tree; addressing it directly still refuses
+    /// `content_unavailable`.
+    InvalidUtf8Source(ProjectPath),
+}
+
+impl WorkspaceIndexWarning {
+    /// The file this warning names.
+    #[must_use]
+    pub fn path(&self) -> &ProjectPath {
+        match self {
+            Self::InvalidUtf8Source(path) => path,
+        }
+    }
+}
+
 /// Immutable current-workspace Rust read index.
 ///
 /// Files are keyed by project path and held behind `Arc`, so the next publication can
@@ -592,6 +613,7 @@ pub struct WorkspaceIndex {
     limits: WorkspaceIndexLimits,
     text_inclusion: TextFileInclusion,
     fingerprint: WorkspaceFingerprint,
+    warnings: Vec<WorkspaceIndexWarning>,
 }
 
 impl WorkspaceIndex {
@@ -601,6 +623,10 @@ impl WorkspaceIndex {
     ///
     /// Symlinks, `.git`, `.rift`, and `target` are never followed or
     /// indexed, whatever `visibility` says.
+    ///
+    /// A claimed file whose bytes are not UTF-8 does not fail the build: it is omitted
+    /// from the index and recorded in [`Self::warnings`] instead, so one bad file cannot
+    /// take the rest of the workspace down.
     ///
     /// # Errors
     ///
@@ -616,17 +642,33 @@ impl WorkspaceIndex {
         let composition = composition()?;
         let classified = discover(&root, limits, visibility, text_inclusion)?;
         let mut workspace_bytes = 0_usize;
+        let mut warnings = Vec::new();
         let mut files = BTreeMap::new();
         for path in classified.source {
             let provider = syntax_provider_for(&path);
-            let file = read_file(&root, &path, provider, limits, &mut workspace_bytes)?;
-            files.insert(file.path().clone(), Arc::new(file));
+            let file = read_file(&root, &path, provider, limits, &mut workspace_bytes);
+            include_or_warn(
+                file,
+                || project_path_below(&root, &path),
+                &mut warnings,
+                |file| {
+                    files.insert(file.path().clone(), Arc::new(file));
+                },
+            )?;
         }
         let mut text_files = BTreeMap::new();
         for path in classified.text {
-            let file = read_text_file(&root, &path, limits, &mut workspace_bytes)?;
-            text_files.insert(file.path().clone(), Arc::new(file));
+            let file = read_text_file(&root, &path, limits, &mut workspace_bytes);
+            include_or_warn(
+                file,
+                || project_path_below(&root, &path),
+                &mut warnings,
+                |file| {
+                    text_files.insert(file.path().clone(), Arc::new(file));
+                },
+            )?;
         }
+        warnings.sort_by(|left, right| left.path().cmp(right.path()));
         let fingerprint = WorkspaceFingerprint::from_files(&files, &text_files);
         Ok(Self {
             root,
@@ -636,6 +678,7 @@ impl WorkspaceIndex {
             limits,
             text_inclusion: text_inclusion.clone(),
             fingerprint,
+            warnings,
         })
     }
 
@@ -650,10 +693,12 @@ impl WorkspaceIndex {
     ///
     /// # Errors
     ///
-    /// Returns [`WorkspaceIndexError`] for I/O, invalid UTF-8, syntax, or an exceeded
-    /// bound, exactly as a whole scan does. A named path the filesystem no longer holds is
-    /// dropped rather than refused: the observation that named it has already been
-    /// superseded by the deletion.
+    /// Returns [`WorkspaceIndexError`] for I/O, syntax, or an exceeded bound, exactly as a
+    /// whole scan does. A named path the filesystem no longer holds is dropped rather than
+    /// refused: the observation that named it has already been superseded by the deletion.
+    /// A named path whose bytes are not UTF-8 is dropped the same way a whole scan drops
+    /// one, and a warning naming it replaces any warning the previous index carried for
+    /// that path.
     pub fn rebuilt(&self, changes: &PathChanges) -> Result<Self, WorkspaceIndexError> {
         let mut files = self.files.clone();
         let mut text_files = self.text_files.clone();
@@ -662,9 +707,23 @@ impl WorkspaceIndex {
             text_files.remove(path);
         }
         let mut workspace_bytes = Self::indexed_bytes(&files, &text_files);
+        let touched: BTreeSet<&ProjectPath> = changes.paths().collect();
+        let mut warnings: Vec<WorkspaceIndexWarning> = self
+            .warnings
+            .iter()
+            .filter(|warning| !touched.contains(warning.path()))
+            .cloned()
+            .collect();
         for path in changes.indexed() {
-            self.read_indexed_path(path, &mut files, &mut text_files, &mut workspace_bytes)?;
+            self.read_indexed_path(
+                path,
+                &mut files,
+                &mut text_files,
+                &mut workspace_bytes,
+                &mut warnings,
+            )?;
         }
+        warnings.sort_by(|left, right| left.path().cmp(right.path()));
         let fingerprint = WorkspaceFingerprint::from_files(&files, &text_files);
         Ok(Self {
             root: self.root.clone(),
@@ -674,18 +733,21 @@ impl WorkspaceIndex {
             limits: self.limits,
             text_inclusion: self.text_inclusion.clone(),
             fingerprint,
+            warnings,
         })
     }
 
     /// Reads one changed path into the index being built, classified the way a whole scan
     /// classifies it: source when a syntax provider serves the extension, included text
-    /// otherwise. A path the filesystem no longer holds is skipped.
+    /// otherwise. A path the filesystem no longer holds is skipped. A path whose bytes are
+    /// not UTF-8 is omitted and recorded in `warnings` instead of failing the rebuild.
     fn read_indexed_path(
         &self,
         path: &ProjectPath,
         files: &mut BTreeMap<ProjectPath, Arc<IndexedFile>>,
         text_files: &mut BTreeMap<ProjectPath, Arc<TextSourceFile>>,
         workspace_bytes: &mut usize,
+        warnings: &mut Vec<WorkspaceIndexWarning>,
     ) -> Result<(), WorkspaceIndexError> {
         let absolute = self.root.join(path.as_str());
         let Some(class) = classify_path(&absolute, &self.text_inclusion) else {
@@ -703,12 +765,26 @@ impl WorkspaceIndex {
                     provider,
                     self.limits,
                     workspace_bytes,
+                );
+                include_or_warn(
+                    file,
+                    || Ok(path.clone()),
+                    warnings,
+                    |file| {
+                        files.insert(file.path().clone(), Arc::new(file));
+                    },
                 )?;
-                files.insert(file.path().clone(), Arc::new(file));
             }
             PathClass::Text => {
-                let file = read_text_file(&self.root, &absolute, self.limits, workspace_bytes)?;
-                text_files.insert(file.path().clone(), Arc::new(file));
+                let file = read_text_file(&self.root, &absolute, self.limits, workspace_bytes);
+                include_or_warn(
+                    file,
+                    || Ok(path.clone()),
+                    warnings,
+                    |file| {
+                        text_files.insert(file.path().clone(), Arc::new(file));
+                    },
+                )?;
             }
         }
         Ok(())
@@ -748,6 +824,7 @@ impl WorkspaceIndex {
             limits,
             text_inclusion,
             fingerprint,
+            warnings: Vec::new(),
         }
     }
 
@@ -872,6 +949,15 @@ impl WorkspaceIndex {
     #[must_use]
     pub const fn fingerprint(&self) -> &WorkspaceFingerprint {
         &self.fingerprint
+    }
+
+    /// Conditions this build or rebuild encountered but did not treat as fatal, in
+    /// project-path order. A claimed file whose bytes are not UTF-8 is the only source
+    /// today; the build still succeeds, and a caller weighs the warning against the answer
+    /// it names.
+    #[must_use]
+    pub fn warnings(&self) -> &[WorkspaceIndexWarning] {
+        &self.warnings
     }
 
     /// Returns the maximum result count accepted per query against this index.
@@ -1309,12 +1395,14 @@ fn capture_paths(
 
 /// Reads every visible file's digest below `root`, without parsing syntax.
 ///
-/// Work is bounded by [`WorkspaceIndexLimits`], the same bounds the index applies.
+/// Work is bounded by [`WorkspaceIndexLimits`], the same bounds the index applies. A
+/// claimed file whose bytes are not UTF-8 is omitted from the returned digests rather than
+/// failing the capture, matching what [`WorkspaceIndex::build`] omits from the index over
+/// the same tree.
 ///
 /// # Errors
 ///
-/// Returns [`WorkspaceIndexError`] for discovery, read, encoding, or configured-bound
-/// failures.
+/// Returns [`WorkspaceIndexError`] for discovery, read, or configured-bound failures.
 pub fn capture_digests(
     root: &Path,
     limits: WorkspaceIndexLimits,
@@ -1327,7 +1415,9 @@ pub fn capture_digests(
 }
 
 /// Reads one class's path list into the digest set a capture returns, applying the
-/// per-file byte bound only to [`PathClass::Source`] paths.
+/// per-file byte bound only to [`PathClass::Source`] paths. A path whose bytes are not
+/// UTF-8 is omitted from `digests` rather than failing the capture, matching what a build
+/// omits from the index over the same tree.
 fn capture_path_class(
     digests: &mut BTreeMap<ProjectPath, FileDigest>,
     workspace_bytes: &mut usize,
@@ -1352,14 +1442,10 @@ fn capture_path_class(
                 path,
             ));
         }
-        let relative = path.strip_prefix(root).map_err(|error| {
-            index_error_caused_by(WorkspaceIndexViolation::InvalidPath, Some(path), error)
-        })?;
-        let project_path = relative_path(relative)?;
-        let content = String::from_utf8(bytes).map_err(|error| {
-            index_error_caused_by(WorkspaceIndexViolation::InvalidSource, Some(path), error)
-        })?;
-        digests.insert(project_path, FileDigest::of(content.as_bytes()));
+        let project_path = project_path_below(root, path)?;
+        if let Ok(content) = source_utf8(bytes, path) {
+            digests.insert(project_path, FileDigest::of(content.as_bytes()));
+        }
     }
     Ok(())
 }
@@ -1536,17 +1622,16 @@ fn read_file(
     let bytes = fs::read(path).map_err(|error| {
         index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
     })?;
-    let relative = path.strip_prefix(root).map_err(|error| {
-        index_error_caused_by(WorkspaceIndexViolation::InvalidPath, Some(path), error)
-    })?;
-    let project_path = relative_path(relative)?;
+    let project_path = project_path_below(root, path)?;
     included_file(project_path, bytes, path, provider, limits, workspace_bytes)
 }
 
 /// Includes one source file's bytes in an index, whatever supplied them: the
 /// per-file and aggregate byte bounds, UTF-8, and the syntax parse are the
 /// same for a directory walk and a committed revision tree. `context_path`
-/// names the file in refusals.
+/// names the file in refusals. Bytes that are not UTF-8 refuse rather than
+/// indexing an empty or lossily-decoded source; a caller that means to omit
+/// the file rather than fail outright catches that refusal itself.
 pub(crate) fn included_file(
     project_path: ProjectPath,
     bytes: Vec<u8>,
@@ -1570,13 +1655,7 @@ pub(crate) fn included_file(
             context_path,
         ));
     }
-    let source = String::from_utf8(bytes).map_err(|error| {
-        index_error_caused_by(
-            WorkspaceIndexViolation::InvalidSource,
-            Some(context_path),
-            error,
-        )
-    })?;
+    let source = source_utf8(bytes, context_path)?;
     let syntax = provider
         .analyze(SyntaxSource {
             path: &project_path,
@@ -1602,10 +1681,7 @@ fn read_text_file(
     let bytes = fs::read(path).map_err(|error| {
         index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
     })?;
-    let relative = path.strip_prefix(root).map_err(|error| {
-        index_error_caused_by(WorkspaceIndexViolation::InvalidPath, Some(path), error)
-    })?;
-    let project_path = relative_path(relative)?;
+    let project_path = project_path_below(root, path)?;
     included_text_file(project_path, bytes, path, limits, workspace_bytes)
 }
 
@@ -1631,18 +1707,67 @@ pub(crate) fn included_text_file(
             context_path,
         ));
     }
-    let content = String::from_utf8(bytes).map_err(|error| {
-        index_error_caused_by(
-            WorkspaceIndexViolation::InvalidSource,
-            Some(context_path),
-            error,
-        )
-    })?;
+    let content = source_utf8(bytes, context_path)?;
     Ok(TextSourceFile {
         path: project_path,
         digest: FileDigest::of(content.as_bytes()),
         content,
     })
+}
+
+/// Decides whether bytes read for one claimed file are valid UTF-8 source: the single
+/// classification source discovery's request-time capture, index construction, and every
+/// direct file read share. Invalid bytes refuse; the caller decides whether that refusal
+/// fails its own operation outright (a single-file read) or is instead treated as an
+/// omission (a whole-workspace build or capture).
+fn source_utf8(bytes: Vec<u8>, context_path: &Path) -> Result<String, WorkspaceIndexError> {
+    String::from_utf8(bytes).map_err(|error| {
+        index_error_caused_by(
+            WorkspaceIndexViolation::InvalidSource,
+            Some(context_path),
+            error,
+        )
+    })
+}
+
+/// Whether a read failure is exactly [`source_utf8`]'s refusal - the one failure a build or
+/// rebuild omits and warns about instead of propagating.
+fn is_invalid_utf8_source(error: &WorkspaceIndexError) -> bool {
+    error.fault().violation() == WorkspaceIndexViolation::InvalidSource
+}
+
+/// Applies one included-file read's outcome: on success, hands the value to `insert`; on
+/// the shared invalid-UTF-8 failure, records a warning naming the path `warned_path`
+/// resolves instead; any other failure propagates. `warned_path` is evaluated only when the
+/// read failed, so the common successful path pays nothing for it.
+fn include_or_warn<Included>(
+    read: Result<Included, WorkspaceIndexError>,
+    warned_path: impl FnOnce() -> Result<ProjectPath, WorkspaceIndexError>,
+    warnings: &mut Vec<WorkspaceIndexWarning>,
+    insert: impl FnOnce(Included),
+) -> Result<(), WorkspaceIndexError> {
+    match read {
+        Ok(included) => {
+            insert(included);
+            Ok(())
+        }
+        Err(error) if is_invalid_utf8_source(&error) => {
+            warnings.push(WorkspaceIndexWarning::InvalidUtf8Source(warned_path()?));
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The project-relative address of `absolute`, which the caller has already proven lies
+/// below `root`. Every direct filesystem read into the index shares this conversion, so a
+/// discovered path and a path recovered after a skipped read resolve to the same
+/// [`ProjectPath`].
+fn project_path_below(root: &Path, absolute: &Path) -> Result<ProjectPath, WorkspaceIndexError> {
+    let relative = absolute.strip_prefix(root).map_err(|error| {
+        index_error_caused_by(WorkspaceIndexViolation::InvalidPath, Some(absolute), error)
+    })?;
+    relative_path(relative)
 }
 
 fn relative_path(path: &Path) -> Result<ProjectPath, WorkspaceIndexError> {
@@ -1957,6 +2082,36 @@ mod tests {
     }
 
     #[test]
+    fn test_rebuilt_reindexes_an_edited_text_file() {
+        let directory = fixture();
+        let root = directory.path();
+        let text_inclusion = TextFileInclusion::new(vec!["txt".to_owned()], 1_024);
+        let index = indexed(root, &text_inclusion);
+        assert_eq!(
+            index.text_file_count(),
+            1,
+            "the fixture's README.txt is included"
+        );
+        fs::write(root.join("README.txt"), "edited prose").expect("edited text file");
+
+        let changes = resolved(&index, root, &["README.txt"]);
+        let next = index.rebuilt(&changes).expect("the rebuild must land");
+
+        let text_path = ProjectPath::new("README.txt").expect("fixture path");
+        assert_eq!(
+            next.text_file(&text_path)
+                .expect("the edited text file stays indexed")
+                .content(),
+            "edited prose"
+        );
+        assert_ne!(
+            index.fingerprint(),
+            next.fingerprint(),
+            "replacing a text file's bytes changes workspace identity"
+        );
+    }
+
+    #[test]
     fn test_rebuilt_adds_removes_and_reclassifies_named_paths() {
         let directory = fixture();
         let root = directory.path();
@@ -2054,6 +2209,72 @@ mod tests {
             .rebuilt(&changes)
             .expect("a vanished path is not a refusal");
         assert_eq!(next.file_count(), index.file_count());
+    }
+
+    #[test]
+    fn test_rebuilt_omits_a_newly_invalid_file_and_recovers_a_fixed_one() {
+        let directory = fixture();
+        let root = directory.path();
+        let index = indexed(root, &TextFileInclusion::default());
+        assert!(index.warnings().is_empty());
+        let lib_path = ProjectPath::new("src/lib.rs").expect("fixture path");
+
+        // src/lib.rs turns invalid; the rebuild still lands, omitting it and warning.
+        fs::write(root.join("src/lib.rs"), [0xff]).expect("corrupted source");
+        let changes = resolved(&index, root, &["src/lib.rs"]);
+        let corrupted = index
+            .rebuilt(&changes)
+            .expect("one invalid file must not fail the rebuild");
+        assert!(
+            corrupted.file(&lib_path).is_none(),
+            "the corrupted file is dropped"
+        );
+        assert_eq!(
+            corrupted.warnings(),
+            [WorkspaceIndexWarning::InvalidUtf8Source(lib_path.clone())],
+            "the rebuild carries a warning naming the corrupted file"
+        );
+
+        // Repairing the bytes and rebuilding again clears the warning and restores the file.
+        fs::write(root.join("src/lib.rs"), "pub struct Rift;\n").expect("repaired source");
+        let changes = resolved(&corrupted, root, &["src/lib.rs"]);
+        let repaired = corrupted
+            .rebuilt(&changes)
+            .expect("the repaired file must rebuild");
+        assert!(
+            repaired.file(&lib_path).is_some(),
+            "the repaired file is indexed again"
+        );
+        assert!(
+            repaired.warnings().is_empty(),
+            "the warning clears once the file is fixed"
+        );
+    }
+
+    #[test]
+    fn test_rebuilt_omits_a_newly_invalid_text_file_and_warns() {
+        let directory = fixture();
+        let root = directory.path();
+        let index = indexed(root, &TextFileInclusion::default());
+        assert!(index.warnings().is_empty());
+        let readme_path = ProjectPath::new("README.txt").expect("fixture path");
+        assert!(index.text_file(&readme_path).is_some());
+
+        // README.txt turns invalid; the rebuild still lands, omitting it and warning.
+        fs::write(root.join("README.txt"), [0xff]).expect("corrupted text file");
+        let changes = resolved(&index, root, &["README.txt"]);
+        let corrupted = index
+            .rebuilt(&changes)
+            .expect("one invalid text file must not fail the rebuild");
+        assert!(
+            corrupted.text_file(&readme_path).is_none(),
+            "the corrupted text file is dropped"
+        );
+        assert_eq!(
+            corrupted.warnings(),
+            [WorkspaceIndexWarning::InvalidUtf8Source(readme_path)],
+            "the rebuild carries a warning naming the corrupted text file"
+        );
     }
 
     #[test]
@@ -3017,17 +3238,13 @@ mod tests {
             WorkspaceIndexViolation::InvalidPath,
         );
 
-        fs::write(directory.path().join("src/invalid.rs"), [0xff]).expect("invalid UTF-8");
+        let invalid = directory.path().join("src/invalid.rs");
+        fs::write(&invalid, [0xff]).expect("invalid UTF-8");
         assert_eq!(
-            WorkspaceIndex::build(
-                directory.path(),
-                limits,
-                &SourceVisibility::default(),
-                &rift_core::TextFileInclusion::default()
-            )
-            .expect_err("invalid source")
-            .fault()
-            .violation(),
+            read_file(directory.path(), &invalid, &parser, limits, &mut bytes)
+                .expect_err("the file's own read refuses rather than returning empty content")
+                .fault()
+                .violation(),
             WorkspaceIndexViolation::InvalidSource,
         );
 
@@ -3103,14 +3320,14 @@ mod tests {
             WorkspaceIndexViolation::InvalidPath
         );
 
+        // Unlike every other case above, invalid UTF-8 does not fail the capture: the file
+        // is omitted from the digest set instead, matching what a build omits from the
+        // index over the same tree.
         let invalid = root.join("invalid.rs");
         fs::write(&invalid, [0xff]).expect("invalid source");
-        let error =
-            capture_paths(&root, &source_only(vec![invalid]), limits).expect_err("invalid UTF-8");
-        assert_eq!(
-            error.fault().violation(),
-            WorkspaceIndexViolation::InvalidSource
-        );
+        let digests = capture_paths(&root, &source_only(vec![invalid]), limits)
+            .expect("invalid UTF-8 is omitted rather than failing the capture");
+        assert!(digests.is_empty(), "the invalid file contributes no digest");
     }
 
     #[test]
@@ -3145,7 +3362,7 @@ mod tests {
     }
 
     #[test]
-    fn test_capture_paths_text_class_still_refuses_invalid_utf8() {
+    fn test_capture_paths_text_class_omits_invalid_utf8_rather_than_refusing() {
         let directory = tempfile::tempdir().expect("workspace");
         let root = fs::canonicalize(directory.path()).expect("canonical root");
         let limits = WorkspaceIndexLimits::default();
@@ -3155,11 +3372,11 @@ mod tests {
             source: Vec::new(),
             text: vec![invalid],
         };
-        let error =
-            capture_paths(&root, &paths, limits).expect_err("invalid UTF-8 text must refuse");
-        assert_eq!(
-            error.fault().violation(),
-            WorkspaceIndexViolation::InvalidSource
+        let digests = capture_paths(&root, &paths, limits)
+            .expect("invalid UTF-8 text is omitted rather than failing the capture");
+        assert!(
+            digests.is_empty(),
+            "the invalid text file contributes no digest"
         );
     }
 
@@ -3402,19 +3619,142 @@ mod tests {
     }
 
     #[test]
-    fn test_build_refuses_invalid_utf8_text_file() {
+    fn test_build_omits_invalid_utf8_source_file_and_warns() {
         let directory = tempfile::tempdir().expect("temporary workspace");
-        fs::write(directory.path().join("invalid.txt"), [0xff, 0xfe]).expect("invalid text bytes");
-        let error = WorkspaceIndex::build(
+        fs::create_dir_all(directory.path().join("src")).expect("fixture directory");
+        fs::write(directory.path().join("src/invalid.rs"), [0xff]).expect("invalid UTF-8 source");
+        fs::write(directory.path().join("src/valid.rs"), "pub fn kept() {}\n")
+            .expect("valid source");
+        let index = WorkspaceIndex::build(
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
             &TextFileInclusion::default(),
         )
-        .expect_err("invalid UTF-8 text must refuse");
+        .expect("one invalid source file must not fail the build");
+
+        let invalid_path = ProjectPath::new("src/invalid.rs").expect("fixture path");
+        let valid_path = ProjectPath::new("src/valid.rs").expect("fixture path");
+        assert!(
+            index.file(&invalid_path).is_none(),
+            "the invalid source file is omitted from the index"
+        );
+        assert!(
+            index.file(&valid_path).is_some(),
+            "the valid source file remains available"
+        );
         assert_eq!(
-            error.fault().violation(),
-            WorkspaceIndexViolation::InvalidSource
+            index.warnings(),
+            [WorkspaceIndexWarning::InvalidUtf8Source(invalid_path)],
+            "the build carries a warning naming the skipped file"
+        );
+    }
+
+    #[test]
+    fn test_build_indexes_a_valid_utf8_file_containing_a_nul_byte() {
+        // A NUL byte is valid UTF-8 - it is the codepoint U+0000 - so `String::from_utf8`
+        // accepts it exactly as it accepts any other byte the source language never emits.
+        // This step does not change that.
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        fs::create_dir_all(directory.path().join("src")).expect("fixture directory");
+        let mut source = b"// note: \0\n".to_vec();
+        source.extend_from_slice(b"pub fn ok() {}\n");
+        fs::write(directory.path().join("src/lib.rs"), &source).expect("source with a NUL byte");
+        let index = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("a NUL byte does not fail UTF-8 validation");
+        assert!(index.warnings().is_empty(), "a NUL byte raises no warning");
+        assert!(
+            index
+                .file(&ProjectPath::new("src/lib.rs").expect("fixture path"))
+                .is_some(),
+            "the file indexes normally"
+        );
+    }
+
+    #[test]
+    fn test_build_indexes_empty_file_and_lone_byte_order_mark() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        fs::create_dir_all(directory.path().join("src")).expect("fixture directory");
+        fs::write(directory.path().join("src/empty.rs"), []).expect("empty source");
+        fs::write(directory.path().join("src/bom.rs"), [0xef, 0xbb, 0xbf])
+            .expect("byte-order-mark-only source");
+        let index = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("an empty file and a lone byte-order mark are both valid UTF-8");
+        assert!(index.warnings().is_empty());
+        assert!(
+            index
+                .file(&ProjectPath::new("src/empty.rs").expect("fixture path"))
+                .is_some(),
+            "an empty file still indexes"
+        );
+        assert!(
+            index
+                .file(&ProjectPath::new("src/bom.rs").expect("fixture path"))
+                .is_some(),
+            "a lone byte-order mark still indexes"
+        );
+    }
+
+    #[test]
+    fn test_capture_and_index_fingerprint_agree_when_a_file_is_invalid_utf8() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let root = directory.path();
+        fs::create_dir_all(root.join("src")).expect("fixture directory");
+        fs::write(root.join("src/lib.rs"), "pub fn kept() {}\n").expect("valid source");
+        fs::write(root.join("src/invalid.rs"), [0xff]).expect("invalid UTF-8 source");
+
+        let index = indexed(root, &TextFileInclusion::default());
+        let captured = WorkspaceFingerprint::capture(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("a request-time capture must not fail over the same invalid file");
+        assert_eq!(
+            index.fingerprint(),
+            &captured,
+            "the index and a request-time capture omit the same invalid file and still agree"
+        );
+    }
+
+    #[test]
+    fn test_build_omits_invalid_utf8_text_file_and_warns() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        fs::write(directory.path().join("invalid.txt"), [0xff, 0xfe]).expect("invalid text bytes");
+        fs::write(directory.path().join("valid.txt"), "kept").expect("valid text bytes");
+        let index = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("one invalid text file must not fail the build");
+
+        let invalid_path = ProjectPath::new("invalid.txt").expect("fixture path");
+        let valid_path = ProjectPath::new("valid.txt").expect("fixture path");
+        assert!(
+            index.text_file(&invalid_path).is_none(),
+            "the invalid text file is omitted from the index"
+        );
+        assert!(
+            index.text_file(&valid_path).is_some(),
+            "the valid text file remains available"
+        );
+        assert_eq!(
+            index.warnings(),
+            [WorkspaceIndexWarning::InvalidUtf8Source(invalid_path)],
+            "the build carries a warning naming the skipped file"
         );
     }
 
@@ -3645,6 +3985,25 @@ mod tests {
         assert_eq!(
             error.fault().violation(),
             WorkspaceIndexViolation::WorkspaceTooLarge
+        );
+    }
+
+    #[test]
+    fn test_included_text_file_refuses_invalid_utf8_rather_than_empty_content() {
+        let limits = WorkspaceIndexLimits::default();
+        let mut workspace_bytes = 0_usize;
+        let project_path = ProjectPath::new("invalid.txt").expect("fixture path");
+        let error = included_text_file(
+            project_path,
+            vec![0xff, 0xfe],
+            Path::new("invalid.txt"),
+            limits,
+            &mut workspace_bytes,
+        )
+        .expect_err("invalid UTF-8 bytes refuse rather than indexing empty content");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::InvalidSource
         );
     }
 
