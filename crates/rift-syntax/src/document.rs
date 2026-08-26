@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use rift_core::ProjectPath;
-use rift_protocol::read::{Language, SymbolFacet};
+use rift_protocol::read::{Documentation, Language, Signature, SymbolFacet};
 
 /// The character a qualified name carries its disambiguating number after,
 /// the `~N` suffix `SymbolId` advertises.
@@ -40,7 +40,11 @@ pub struct SyntaxNode {
 }
 
 /// One named declaration extracted from a source file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is not derived: `signatures` and `documentation` carry
+/// [`rift_protocol::read::Extensions`], whose `serde_json::Value` payload
+/// implements only `PartialEq`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SyntaxSymbol {
     /// Declared short name.
     pub name: String,
@@ -67,10 +71,19 @@ pub struct SyntaxSymbol {
     /// The implementation part: the grammar's body or value field; `None`
     /// for a declaration without one.
     pub body_range: Option<ByteRange>,
+    /// Callable forms this declaration renders as. Empty for a declaration
+    /// the grammar does not mark callable, or one with no attached
+    /// implementation.
+    pub signatures: Vec<Signature>,
+    /// Doc comments the grammar attaches to this declaration, stripped of
+    /// comment syntax. Empty when nothing attaches.
+    pub documentation: Vec<Documentation>,
 }
 
 /// Immutable syntax facts for one source file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is not derived: [`SyntaxSymbol`] is not `Eq`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SyntaxDocument {
     language: Language,
     path: ProjectPath,
@@ -248,6 +261,8 @@ mod tests {
             range,
             item_range: range,
             body_range: None,
+            signatures: Vec::new(),
+            documentation: Vec::new(),
         }
     }
 

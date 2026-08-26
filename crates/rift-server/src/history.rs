@@ -355,6 +355,8 @@ mod tests {
             range,
             item_range: item,
             body_range: body,
+            signatures: Vec::new(),
+            documentation: Vec::new(),
         };
         SymbolShape::from_source(source, &symbol)
     }

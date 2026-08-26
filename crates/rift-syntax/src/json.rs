@@ -26,6 +26,9 @@
 //!   missing the value.
 //! - Members carry no visibility and no portable symbol facet:
 //!   `visibility` stays `None` and `facets` stays empty.
+//! - `signatures` and `documentation` stay empty for every member: JSON has
+//!   no callable form and, with nothing attached in front of a pair, no
+//!   comment for a member to carry either.
 
 use std::num::NonZeroU16;
 use std::sync::OnceLock;
@@ -147,6 +150,7 @@ impl GrammarRules for JsonRules {
             facets: Vec::new(),
             visibility: None,
             body_range,
+            documentation: Vec::new(),
         }))
     }
 
@@ -242,7 +246,13 @@ impl SyntaxProvider for JsonSyntaxProvider {
         let rules = JsonRules {
             kinds: json_kinds(),
         };
-        let (nodes, symbols) = extract::extract(tree.root_node(), source, self.limits, &rules)?;
+        let (nodes, symbols) = extract::extract(
+            tree.root_node(),
+            source,
+            self.limits,
+            &self.language,
+            &rules,
+        )?;
         Ok(SyntaxDocument::new(
             self.language.clone(),
             source.path.clone(),

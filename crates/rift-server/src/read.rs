@@ -739,8 +739,8 @@ pub(crate) fn wire_symbol(matched: SymbolMatch<'_>) -> Symbol {
         modifiers: Vec::new(),
         visibility: symbol.visibility.clone(),
         types: Vec::new(),
-        signatures: Vec::new(),
-        documentation: Vec::new(),
+        signatures: symbol.signatures.clone(),
+        documentation: symbol.documentation.clone(),
         extensions: Extensions(BTreeMap::new()),
         document_local: false,
     }

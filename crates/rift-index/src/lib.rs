@@ -19,7 +19,7 @@ pub use workspace::{
     IndexedFile, SymbolMatch, SymbolMatchRank, TextSourceFile, WorkspaceFingerprint,
     WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexFault, WorkspaceIndexLimits,
     WorkspaceIndexViolation, WorkspaceIndexWarning, WorkspaceSourcePolicy, capture_digests,
-    source_line_matches, symbol_matches,
+    source_line_matches, symbol_matches, text_line_matches,
 };
 
 /// Compile-time marker for index-layer ownership.

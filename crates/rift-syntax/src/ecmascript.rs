@@ -21,6 +21,11 @@
 //! - A declaration's span is its own node: the grammars attach decorators
 //!   as children of the declared node, so nothing outside it belongs to the
 //!   declaration and `range` equals `item_range`.
+//! - `documentation` is always empty: with `range` equal to `item_range`, no
+//!   leading `JSDoc` comment is ever part of a declaration's span here, so
+//!   there is nothing to attach. A `Signature` still renders for a callable
+//!   declaration - `signatures` derives from `body_range` and the
+//!   `Callable` facet alone, in the shared walk.
 
 use std::num::NonZeroU16;
 
@@ -368,6 +373,7 @@ impl GrammarRules for EcmaScriptRules {
             facets,
             visibility: self.accessibility(node, text),
             body_range: self.body_range(node, kind)?,
+            documentation: Vec::new(),
         }))
     }
 
@@ -423,7 +429,7 @@ pub(crate) fn analyze(
         })
     })?;
     let rules = EcmaScriptRules { kinds };
-    let (nodes, symbols) = extract::extract(tree.root_node(), source, limits, &rules)?;
+    let (nodes, symbols) = extract::extract(tree.root_node(), source, limits, language, &rules)?;
     Ok(SyntaxDocument::new(
         language.clone(),
         source.path.clone(),

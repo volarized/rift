@@ -388,8 +388,13 @@ impl SyntaxProvider for RustSyntaxProvider {
                 path: Some(source.path.clone()),
             })
         })?;
-        let (nodes, symbols) =
-            extract::extract(tree.root_node(), source, self.limits, &RustGrammarRules)?;
+        let (nodes, symbols) = extract::extract(
+            tree.root_node(),
+            source,
+            self.limits,
+            &self.language,
+            &RustGrammarRules,
+        )?;
         Ok(SyntaxDocument::new(
             self.language.clone(),
             source.path.clone(),
@@ -438,6 +443,7 @@ impl GrammarRules for RustGrammarRules {
             facets: declaration_facets(kind, &visibility),
             visibility: Some(visibility.authored()),
             body_range: body_range(node, kind)?,
+            documentation: attachment::attached_documentation(node, text),
         }))
     }
 
@@ -599,6 +605,41 @@ mod tests {
                 "macro",
             ]
         );
+    }
+
+    /// A callable declaration with a body renders one signature whose `display` is the
+    /// header text - the source from the item's own start to where the body begins, trimmed
+    /// of trailing whitespace - and carries the document's language.
+    #[test]
+    fn test_a_function_with_a_body_renders_one_signature_from_its_header() {
+        let document = analyze("pub fn compute(x: i32) -> i32 {\n    x\n}\n");
+        let function = &document.symbols()[0];
+        assert_eq!(function.signatures.len(), 1);
+        assert_eq!(
+            function.signatures[0].display,
+            "pub fn compute(x: i32) -> i32"
+        );
+        assert_eq!(function.signatures[0].language.name, "rust");
+    }
+
+    /// A kind the grammar declares no `Callable` facet for never renders a signature, even
+    /// when it carries a `body_range` - a struct's braces are not a callable implementation.
+    #[test]
+    fn test_a_non_callable_declaration_with_a_body_range_renders_no_signature() {
+        let document = analyze("pub struct Beacon { field: u8 }\n");
+        assert!(document.symbols()[0].signatures.is_empty());
+    }
+
+    /// Every function in a file renders its own signature; nothing bleeds between them.
+    #[test]
+    fn test_every_function_in_a_document_renders_its_own_signature() {
+        let document = analyze("pub fn one() {}\npub fn two(x: u8) -> u8 { x }\n");
+        let signatures: Vec<&str> = document
+            .symbols()
+            .iter()
+            .map(|symbol| symbol.signatures[0].display.as_str())
+            .collect();
+        assert_eq!(signatures, ["pub fn one()", "pub fn two(x: u8) -> u8"]);
     }
 
     #[test]

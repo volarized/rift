@@ -104,22 +104,32 @@ impl TextFileInclusion {
         self.chunk_bytes_max
     }
 
-    /// Whether `path`'s extension is one this policy includes. The comparison is
-    /// case-insensitive against the configured lowercase spellings - `README.MD` is included
-    /// by `extensions = ["md"]`, matching how case-insensitive filesystems already present
-    /// extensions to callers - while configuration acceptance still refuses any entry that is
-    /// not itself lowercase.
+    /// Whether `path` joins the text lane on its name alone: a configured `[search.text]`
+    /// extension, matched case-insensitively against the configured lowercase spellings -
+    /// `README.MD` is included by `extensions = ["md"]`, matching how case-insensitive
+    /// filesystems already present extensions to callers, while configuration acceptance
+    /// still refuses any entry that is not itself lowercase - or no extension at all.
+    /// `justfile`, `Dockerfile`, and `.gitignore` carry no extension a configured list could
+    /// ever name, so an extensionless path is eligible by default; the caller that reads the
+    /// candidate's bytes still sniffs it for [`EXTENSIONLESS_SNIFF_BYTES_MAX`] before treating
+    /// it as text, which this method - path-only, no I/O - cannot do.
     #[must_use]
     pub fn includes(&self, path: &std::path::Path) -> bool {
-        path.extension()
-            .and_then(std::ffi::OsStr::to_str)
-            .is_some_and(|extension| {
-                self.extensions
-                    .iter()
-                    .any(|included| included.eq_ignore_ascii_case(extension))
-            })
+        match path.extension().and_then(std::ffi::OsStr::to_str) {
+            Some(extension) => self
+                .extensions
+                .iter()
+                .any(|included| included.eq_ignore_ascii_case(extension)),
+            None => true,
+        }
     }
 }
+
+/// Bytes sniffed from the front of an extensionless text-lane candidate before it may join
+/// the index: a NUL byte within this many bytes is a compiled artifact, not text, and the
+/// candidate stays out. A path carrying an extension is never sniffed - its extension already
+/// settled inclusion.
+pub const EXTENSIONLESS_SNIFF_BYTES_MAX: u64 = 8 * 1024;
 
 impl Default for TextFileInclusion {
     /// Every default `[search.text]` extension included, at the default chunk bound.
@@ -216,7 +226,20 @@ mod tests {
             "a mixed-case filesystem extension must still be included"
         );
         assert!(!inclusion.includes(std::path::Path::new("docs/readme.txt")));
-        assert!(!inclusion.includes(std::path::Path::new("docs/no-extension")));
+    }
+
+    /// `justfile`, `Dockerfile`, and `.gitignore` carry no extension a configured list could
+    /// ever spell, so every extensionless path is eligible on its name alone, whatever the
+    /// configured extension list holds.
+    #[test]
+    fn test_text_file_inclusion_includes_every_extensionless_path_by_default() {
+        let inclusion = TextFileInclusion::new(vec!["md".to_owned()], 1_024);
+        for path in ["justfile", "Dockerfile", ".gitignore", "scripts/build"] {
+            assert!(
+                inclusion.includes(std::path::Path::new(path)),
+                "an extensionless path must be eligible on its name alone: {path}"
+            );
+        }
     }
 
     #[test]

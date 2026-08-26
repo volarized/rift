@@ -30,6 +30,9 @@
 //!   span, absent for a bare `---`.
 //! - Entries carry no visibility and no portable symbol facet:
 //!   `visibility` stays `None` and `facets` stays empty.
+//! - `signatures` and `documentation` stay empty for every entry and every
+//!   document: YAML has no callable form and, with nothing attached in
+//!   front of a declaration, no comment for one to carry either.
 
 use std::num::NonZeroU16;
 use std::sync::OnceLock;
@@ -230,6 +233,7 @@ impl YamlRules {
             facets: Vec::new(),
             visibility: None,
             body_range,
+            documentation: Vec::new(),
         }))
     }
 
@@ -254,6 +258,7 @@ impl YamlRules {
             facets: Vec::new(),
             visibility: None,
             body_range: self.document_body_range(document)?,
+            documentation: Vec::new(),
         }))
     }
 
@@ -379,7 +384,13 @@ impl SyntaxProvider for YamlSyntaxProvider {
             })
         })?;
         let rules = YamlRules::new(yaml_kinds(), tree.root_node());
-        let (nodes, symbols) = extract::extract(tree.root_node(), source, self.limits, &rules)?;
+        let (nodes, symbols) = extract::extract(
+            tree.root_node(),
+            source,
+            self.limits,
+            &self.language,
+            &rules,
+        )?;
         Ok(SyntaxDocument::new(
             self.language.clone(),
             source.path.clone(),
