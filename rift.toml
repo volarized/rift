@@ -3,8 +3,10 @@
 [source]
 include = []
 # Agent worktrees and local tooling state hold full copies of the source tree; keep them out of
-# the index even if gitignore inheritance is ever disabled.
-exclude = [".claude/**", ".agents/**"]
+# the index even if gitignore inheritance is ever disabled. `docs/public` holds the artifacts
+# `just generate` exports from the Rust models and from `rift --help`, so every hit in them
+# restates something the same answer already carries.
+exclude = [".claude/**", ".agents/**", "docs/public/**"]
 respect_gitignore = true
 
 [engines.rust]
