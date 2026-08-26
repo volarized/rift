@@ -13,9 +13,10 @@ use std::sync::Mutex;
 
 use percent_encoding::percent_decode_str;
 use rift_core::ProjectPath as CoreProjectPath;
+use rift_core::line::{self, LineEnding};
 use rift_protocol::change::{
-    BODY_BYTES_MAX, BodySource, ChangeId, ChangeResult, ChangeSummary, Edit, InsertPosition,
-    InsertSymbolParams, OperationPrecondition, OperationPreconditionKind,
+    BODY_BYTES_MAX, BodySource, ChangeId, ChangeResult, ChangeSummary, Edit, InsertNodeParams,
+    InsertPosition, InsertSymbolParams, OperationPrecondition, OperationPreconditionKind,
     OperationPreconditionStatus, PATCH_BYTES_MAX, PatchParams, PreconditionAddress,
     PreconditionValue, RefusalReason, ReplaceNodeParams, ReplaceSymbolParams,
 };
@@ -32,7 +33,7 @@ use crate::read::{
     NodeRangeResolution, ReadError, ReadFault, ReadService, digest_hex8, file_id,
     resolve_node_range,
 };
-use crate::remove::RemovePlan;
+use crate::remove::{RemovePlan, is_blank_content};
 use crate::rename::{PlannedRewrite, RenamePlan, survivor_findings};
 use crate::rewrite::{FileRewrite, ReplacedRegion, RewriteKind};
 
@@ -239,11 +240,12 @@ impl ChangeService {
             Err(refusal) => return Ok(refusal),
         };
         let address = parse_symbol_address(&params.symbol.0)?;
-        let resolution = self.resolve_symbol_spans(reads, &address, |range| ChangePlan {
-            path: address.path.clone(),
-            range,
-            text: body.clone(),
-        })?;
+        let resolution =
+            self.resolve_symbol_spans(reads, &address, |range, _source| ChangePlan {
+                path: address.path.clone(),
+                range,
+                text: body.clone(),
+            })?;
         self.conclude(reads, resolution)
     }
 
@@ -290,11 +292,8 @@ impl ChangeService {
     ) -> Result<ChangeResult, ReadError> {
         let address = parse_symbol_address(anchor)?;
         let body = body.to_owned();
-        let resolution = self.resolve_symbol_spans(reads, &address, |range| {
-            let (at, text) = match position {
-                InsertPosition::Before => (range.start, format!("{body}\n\n")),
-                InsertPosition::After => (range.end, format!("\n\n{body}")),
-            };
+        let resolution = self.resolve_symbol_spans(reads, &address, |range, source| {
+            let (at, text) = spliced_beside_anchor(source, range, position, &body);
             ChangePlan {
                 path: address.path.clone(),
                 range: ByteRange { start: at, end: at },
@@ -392,6 +391,51 @@ impl ChangeService {
                     ChangePlan {
                         path: address.path.clone(),
                         range: address.range,
+                        text: body,
+                    },
+                )?;
+                self.conclude(reads, resolution)
+            }
+        }
+    }
+
+    /// Inserts new content beside a syntax node through a witnessed address. `body` lands
+    /// verbatim at the node's own boundary - no separator, no indentation carried across -
+    /// since a node is not a declaration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] for a malformed address or a filesystem failure; a stale
+    /// witness, or a range naming no syntax node, returns a refused [`ChangeResult`] instead.
+    pub fn insert_node(
+        &self,
+        reads: &ReadService,
+        params: &InsertNodeParams,
+    ) -> Result<ChangeResult, ReadError> {
+        let _application = self
+            .application
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let body = match resolve_body_source(&params.body, BODY_BYTES_MAX) {
+            Ok(body) => body,
+            Err(refusal) => return Ok(refusal),
+        };
+        match resolve_node(reads, &params.anchor)? {
+            NodeResolution::Refused {
+                reason,
+                preconditions,
+            } => Ok(ChangeResult::refused(reason, preconditions)),
+            NodeResolution::Verified { address, .. } => {
+                let at = match params.position {
+                    InsertPosition::Before => address.range.start,
+                    InsertPosition::After => address.range.end,
+                };
+                let resolution = self.verified_against_disk(
+                    reads,
+                    &address.path,
+                    ChangePlan {
+                        path: address.path.clone(),
+                        range: ByteRange { start: at, end: at },
                         text: body,
                     },
                 )?;
@@ -672,12 +716,14 @@ impl ChangeService {
     }
 
     /// Resolves one symbol address to its declaration span and builds the
-    /// plan through `plan`, refusing when the target is missing.
+    /// plan through `plan`, refusing when the target is missing. `plan`
+    /// also receives the indexed file's own source, for a caller that
+    /// derives its inserted bytes from the text around the declaration.
     fn resolve_symbol_spans(
         &self,
         reads: &ReadService,
         address: &SymbolAddress,
-        plan: impl Fn(ByteRange) -> ChangePlan,
+        plan: impl Fn(ByteRange, &str) -> ChangePlan,
     ) -> Result<Resolution, ReadError> {
         match resolve_symbol(reads, address)? {
             SymbolResolution::Refused {
@@ -687,8 +733,8 @@ impl ChangeService {
                 reason,
                 preconditions,
             }),
-            SymbolResolution::Declared { symbol, .. } => {
-                self.verified_against_disk(reads, &address.path, plan(symbol.range))
+            SymbolResolution::Declared { file, symbol } => {
+                self.verified_against_disk(reads, &address.path, plan(symbol.range, file.source()))
             }
         }
     }
@@ -855,13 +901,19 @@ fn spliced_at_file_edge(
     position: InsertPosition,
     body: &str,
 ) -> (String, ReplacedRegion) {
-    let (at, text) = match position {
-        InsertPosition::Before => (0, format!("{body}\n\n")),
-        InsertPosition::After => (existing.len(), format!("\n\n{body}")),
+    let boundary = match position {
+        InsertPosition::Before => ByteRange { start: 0, end: 0 },
+        InsertPosition::After => {
+            let end = existing.len() as u64;
+            ByteRange { start: end, end }
+        }
     };
+    let (at, text) = spliced_beside_anchor(existing, boundary, position, body);
     let mut next_source = existing.to_owned();
-    next_source.insert_str(at, &text);
-    let at = at as u64;
+    next_source.insert_str(
+        usize::try_from(at).expect("file boundary offset fits this platform's usize"),
+        &text,
+    );
     (
         next_source,
         ReplacedRegion {
@@ -869,6 +921,54 @@ fn spliced_at_file_edge(
             text,
         },
     )
+}
+
+/// Splices `body` beside `anchor` at `position`. The caller writes a zero-width edit at the
+/// returned byte offset with the returned text; the separator between `body` and what already
+/// stood there is one blank line using `source`'s own line ending.
+///
+/// `Before` reads the bytes between the anchor's line start and `anchor.start`: when they
+/// hold only spaces or tabs, that prefix stays attached to `body`'s first line - the
+/// splice point is unchanged, so the existing prefix is never touched - and a second copy
+/// follows the separator, so the anchor keeps its original column. A prefix holding source
+/// text is never copied. `After` always starts `body` on a fresh line at column zero, past
+/// the same separator.
+///
+/// Holds no language, extension, or grammar case: every line-ending and blank-content
+/// decision routes through `rift_core::line`.
+fn spliced_beside_anchor(
+    source: &str,
+    anchor: ByteRange,
+    position: InsertPosition,
+    body: &str,
+) -> (u64, String) {
+    let ending = source_line_ending(source).as_str();
+    let separator = format!("{ending}{ending}");
+    match position {
+        InsertPosition::Before => {
+            let start =
+                usize::try_from(anchor.start).expect("anchor start fits this platform's usize");
+            let line_start = source[..start]
+                .rfind(char::from(line::LINE_FEED))
+                .map_or(0, |index| index + 1);
+            let prefix = &source[line_start..start];
+            let text = if is_blank_content(prefix) {
+                format!("{body}{separator}{prefix}")
+            } else {
+                format!("{body}{separator}")
+            };
+            (anchor.start, text)
+        }
+        InsertPosition::After => (anchor.end, format!("{separator}{body}")),
+    }
+}
+
+/// The line ending `source` already uses, read from its first terminated line; `Lf` when no
+/// line in `source` carries an ending at all.
+fn source_line_ending(source: &str) -> LineEnding {
+    line::lines_inclusive(source)
+        .find_map(LineEnding::of)
+        .unwrap_or(LineEnding::Lf)
 }
 
 /// A parsed witnessed node address.
@@ -1240,8 +1340,17 @@ mod tests {
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
     fn fixture(source: &str) -> TestResult<(tempfile::TempDir, ReadService, ChangeService)> {
+        fixture_with_name("lib.rs", source)
+    }
+
+    /// A one-file workspace named `name` rather than the default `lib.rs`, for a fixture
+    /// whose language the extension selects.
+    fn fixture_with_name(
+        name: &str,
+        source: &str,
+    ) -> TestResult<(tempfile::TempDir, ReadService, ChangeService)> {
         let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), source)?;
+        fs::write(directory.path().join(name), source)?;
         let reads = ReadService::build(
             directory.path(),
             WorkspaceIndexLimits::default(),
@@ -1254,7 +1363,133 @@ mod tests {
     }
 
     fn symbol(qualified_name: &str) -> SymbolId {
-        SymbolId(format!("rift://symbol/rust/lib.rs/{qualified_name}"))
+        language_symbol("rust", "lib.rs", qualified_name)
+    }
+
+    /// A symbol address minted the way the server itself mints one, so a test fixture never
+    /// hand-guesses the wire escaping a language segment or qualified name needs.
+    fn language_symbol(language_segment: &str, path: &str, qualified_name: &str) -> SymbolId {
+        SymbolId(rift_core::symbol_identity(
+            language_segment,
+            path,
+            qualified_name,
+        ))
+    }
+
+    /// One language whose grammar expresses every `insert_symbol` spacing case this suite
+    /// proves: two top-level declarations packed with no blank line between them, a
+    /// declaration indented inside a wrapper, the same packed pair over CRLF, and two
+    /// declarations sharing one physical line. Markdown, JSON, YAML, and TOML are excluded
+    /// from this table: JSON's members are comma-delimited rather than blank-line separated
+    /// at all, and none of the four grammars expresses a nested, indented declaration the way
+    /// this suite's indentation case needs.
+    struct LanguageCase {
+        language_segment: &'static str,
+        file_name: &'static str,
+        /// Declarations `a` and `b`, packed with no blank line between them.
+        packed: &'static str,
+        /// `indented`'s wrapper open line, e.g. `"impl Wrapper {\n"`.
+        indented_open: &'static str,
+        /// `indented`'s wrapper close line, e.g. `"}\n"`.
+        indented_close: &'static str,
+        /// `indented`'s own indentation, repeated before every member and before an
+        /// inserted declaration's first line.
+        indented_column: &'static str,
+        /// `packed`, with CRLF line endings.
+        crlf: &'static str,
+        /// Declaration `a` on its own line; `b` and `c` sharing the next line, so `c`'s
+        /// prefix on that line holds `b`'s own source text rather than blank indentation.
+        two_on_one_line: &'static str,
+    }
+
+    impl LanguageCase {
+        /// A one-line declaration named `name`, in this case's own language.
+        fn declaration(&self, name: &str) -> String {
+            if self.language_segment == "rust" {
+                format!("fn {name}() {{}}")
+            } else {
+                format!("function {name}() {{}}")
+            }
+        }
+
+        /// The member declaration `Wrapper` carries for `name`, without its leading
+        /// indentation or trailing line ending, e.g. `"fn a(&self) {}"` or `"a() {}"`.
+        fn indented_member_declaration(&self, name: &str) -> String {
+            if self.language_segment == "rust" {
+                format!("fn {name}(&self) {{}}")
+            } else {
+                format!("{name}() {{}}")
+            }
+        }
+
+        /// A wrapper containing indented declarations `a` and `b`, e.g.
+        /// `"impl Wrapper {\n    fn a(&self) {}\n    fn b(&self) {}\n}\n"`.
+        fn indented(&self) -> String {
+            format!(
+                "{open}{col}{a}\n{col}{b}\n{close}",
+                open = self.indented_open,
+                col = self.indented_column,
+                a = self.indented_member_declaration("a"),
+                b = self.indented_member_declaration("b"),
+                close = self.indented_close,
+            )
+        }
+
+        /// The qualification separator `Wrapper`'s member `name` uses: `::` for Rust, `.`
+        /// for the ECMAScript family.
+        fn indented_member(&self, name: &str) -> String {
+            let separator = if self.language_segment == "rust" {
+                "::"
+            } else {
+                "."
+            };
+            format!("Wrapper{separator}{name}")
+        }
+    }
+
+    fn language_cases() -> Vec<LanguageCase> {
+        vec![
+            LanguageCase {
+                language_segment: "rust",
+                file_name: "lib.rs",
+                packed: "fn a() {}\nfn b() {}\n",
+                indented_open: "impl Wrapper {\n",
+                indented_close: "}\n",
+                indented_column: "    ",
+                crlf: "fn a() {}\r\nfn b() {}\r\n",
+                two_on_one_line: "fn a() {}\nfn b() {} fn c() {}\n",
+            },
+            LanguageCase {
+                language_segment: "javascript",
+                file_name: "index.js",
+                packed: "function a() {}\nfunction b() {}\n",
+                indented_open: "class Wrapper {\n",
+                indented_close: "}\n",
+                indented_column: "  ",
+                crlf: "function a() {}\r\nfunction b() {}\r\n",
+                two_on_one_line: "function a() {}\nfunction b() {} function c() {}\n",
+            },
+            LanguageCase {
+                language_segment: "typescript",
+                file_name: "index.ts",
+                packed: "function a() {}\nfunction b() {}\n",
+                indented_open: "class Wrapper {\n",
+                indented_close: "}\n",
+                indented_column: "  ",
+                crlf: "function a() {}\r\nfunction b() {}\r\n",
+                two_on_one_line: "function a() {}\nfunction b() {} function c() {}\n",
+            },
+            LanguageCase {
+                language_segment: "typescript:tsx",
+                file_name: "index.tsx",
+                packed: "function a() {}\nfunction b() {}\n",
+                indented_open: "class Wrapper {\n",
+                indented_close: "}\n",
+                indented_column: "  ",
+                crlf: "function a() {}\r\nfunction b() {}\r\n",
+                two_on_one_line: "function a() {}\nfunction b() {} function c() {}\n",
+            },
+        ]
     }
 
     fn applied_summary(result: ChangeResult) -> rift_protocol::change::ChangeSummary {
@@ -1959,6 +2194,211 @@ mod tests {
         Ok(())
     }
 
+    /// Insert `after` `anchor` into `source`, remove exactly the declaration that landed,
+    /// and assert the file holds `source`'s own bytes again.
+    async fn assert_insert_then_remove_round_trips(
+        case: &LanguageCase,
+        source: &'static str,
+        anchor: &str,
+    ) -> TestResult {
+        {
+            let (directory, reads, changes) = fixture_with_name(case.file_name, source)?;
+            let inserted_name = "z";
+            let inserted = changes.insert_symbol(
+                &reads,
+                &InsertSymbolParams {
+                    anchor: Some(language_symbol(
+                        case.language_segment,
+                        case.file_name,
+                        anchor,
+                    )),
+                    file: None,
+                    position: InsertPosition::After,
+                    body: case.declaration(inserted_name).into(),
+                    create_missing: false,
+                },
+            )?;
+            applied_summary(inserted);
+
+            let reads_after_insert = ReadService::build(
+                directory.path(),
+                WorkspaceIndexLimits::default(),
+                &SourceVisibility::default(),
+                &rift_core::TextFileInclusion::default(),
+                HistoryConfiguration::default(),
+            )?;
+            let engines =
+                crate::engine::EnginePool::new(directory.path(), std::collections::BTreeMap::new());
+            let resolution = crate::remove::plan_remove_symbol(
+                &reads_after_insert,
+                &engines,
+                directory.path(),
+                &rift_protocol::change::RemoveSymbolParams {
+                    symbol: language_symbol(case.language_segment, case.file_name, inserted_name),
+                    force: false,
+                },
+            )
+            .await?;
+            let crate::remove::RemoveResolution::Planned(plan) = resolution else {
+                panic!(
+                    "{}: the inserted declaration must resolve for removal",
+                    case.language_segment
+                );
+            };
+            applied_summary(changes.apply_remove(&reads_after_insert, &plan)?);
+
+            let written = fs::read_to_string(directory.path().join(case.file_name))?;
+            assert_eq!(
+                written, source,
+                "{}: insert then remove must return the original bytes",
+                case.language_segment
+            );
+        }
+        Ok(())
+    }
+
+    /// Insert `after` a declaration, then remove exactly the declaration that landed: the
+    /// file's bytes must equal the original exactly, in every language whose grammar
+    /// expresses the shape. Two fixtures, because the two defects are different: a packed
+    /// pair, where `widened_removal_span` used never to take back the blank line the
+    /// insertion added, and a pair sharing one line, where the insertion splits that line
+    /// and only the rejoin rule puts the two halves back together.
+    #[tokio::test]
+    async fn insert_symbol_after_then_remove_symbol_round_trips_to_the_original_bytes() -> TestResult
+    {
+        for case in language_cases() {
+            assert_insert_then_remove_round_trips(&case, case.packed, "a").await?;
+            assert_insert_then_remove_round_trips(&case, case.two_on_one_line, "b").await?;
+        }
+        Ok(())
+    }
+
+    /// Insert `before` a declaration indented inside a wrapper: the anchor keeps its
+    /// original column, the inserted body's first line inherits that same column, and the
+    /// body's own later lines land exactly as authored - never reindented to the anchor's
+    /// column or to anything else.
+    #[test]
+    fn insert_symbol_before_an_indented_anchor_keeps_both_columns_and_leaves_later_body_lines_unchanged()
+    -> TestResult {
+        for case in language_cases() {
+            let indented = case.indented();
+            let (directory, reads, changes) = fixture_with_name(case.file_name, &indented)?;
+            let body = format!(
+                "// c\n{over_indent}// deliberately over-indented",
+                over_indent = case.indented_column.repeat(3)
+            );
+            let result = changes.insert_symbol(
+                &reads,
+                &InsertSymbolParams {
+                    anchor: Some(language_symbol(
+                        case.language_segment,
+                        case.file_name,
+                        &case.indented_member("b"),
+                    )),
+                    file: None,
+                    position: InsertPosition::Before,
+                    body: body.clone().into(),
+                    create_missing: false,
+                },
+            )?;
+            applied_summary(result);
+            let written = fs::read_to_string(directory.path().join(case.file_name))?;
+            let expected = format!(
+                "{open}{col}{a}\n{col}{body}\n\n{col}{b}\n{close}",
+                open = case.indented_open,
+                col = case.indented_column,
+                a = case.indented_member_declaration("a"),
+                b = case.indented_member_declaration("b"),
+                close = case.indented_close,
+            );
+            assert_eq!(
+                written, expected,
+                "{}: the anchor and the inserted declaration must both keep the anchor's \
+                 column, and the body's later line must land exactly as authored",
+                case.language_segment
+            );
+        }
+        Ok(())
+    }
+
+    /// Insert `after` a declaration in a CRLF file: the blank-line separator uses CRLF
+    /// throughout, and no bare LF is introduced.
+    #[test]
+    fn insert_symbol_into_a_crlf_file_uses_crlf_for_the_separator() -> TestResult {
+        for case in language_cases() {
+            let (directory, reads, changes) = fixture_with_name(case.file_name, case.crlf)?;
+            let inserted = case.declaration("z");
+            let result = changes.insert_symbol(
+                &reads,
+                &InsertSymbolParams {
+                    anchor: Some(language_symbol(case.language_segment, case.file_name, "a")),
+                    file: None,
+                    position: InsertPosition::After,
+                    body: inserted.clone().into(),
+                    create_missing: false,
+                },
+            )?;
+            applied_summary(result);
+            let written = fs::read_to_string(directory.path().join(case.file_name))?;
+            // `crlf` is exactly `declaration("a") + "\r\n" + declaration("b") + "\r\n"`; the
+            // insertion adds one CRLF-separated declaration between them.
+            let expected = format!(
+                "{a}\r\n\r\n{inserted}\r\n{b}\r\n",
+                a = case.declaration("a"),
+                b = case.declaration("b"),
+            );
+            assert_eq!(
+                written, expected,
+                "{}: the separator around the inserted declaration must use CRLF",
+                case.language_segment
+            );
+            for line in written.split("\r\n") {
+                assert!(
+                    !line.contains('\n'),
+                    "{}: a bare LF must never appear outside a CRLF pair: {written}",
+                    case.language_segment
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Insert `before` a declaration that shares its line with another: the shared line's
+    /// text is not blank indentation, so it is never copied after the separator, and the
+    /// following declaration lands at column zero rather than inheriting a false column.
+    #[test]
+    fn insert_symbol_before_an_anchor_sharing_its_line_never_copies_the_source_prefix() -> TestResult
+    {
+        for case in language_cases() {
+            let (directory, reads, changes) =
+                fixture_with_name(case.file_name, case.two_on_one_line)?;
+            let inserted = case.declaration("x");
+            let result = changes.insert_symbol(
+                &reads,
+                &InsertSymbolParams {
+                    anchor: Some(language_symbol(case.language_segment, case.file_name, "c")),
+                    file: None,
+                    position: InsertPosition::Before,
+                    body: inserted.clone().into(),
+                    create_missing: false,
+                },
+            )?;
+            applied_summary(result);
+            let written = fs::read_to_string(directory.path().join(case.file_name))?;
+            let expected = case.two_on_one_line.replacen(
+                &case.declaration("c"),
+                &format!("{inserted}\n\n{}", case.declaration("c")),
+                1,
+            );
+            assert_eq!(
+                written, expected,
+                "{}: the shared line's own source must not be duplicated after the separator",
+                case.language_segment
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn replace_symbol_on_a_documented_declaration_leaves_no_orphaned_doc_or_attribute() -> TestResult
     {
@@ -2330,6 +2770,173 @@ mod tests {
         applied_summary(applied);
         let written = fs::read_to_string(directory.path().join("lib.rs"))?;
         assert!(written.contains("-> u8"));
+        Ok(())
+    }
+
+    /// `insert_node` splices `body` verbatim at the node's own boundary, on either side,
+    /// with no separator of its own - unlike `insert_symbol`, which always adds one.
+    #[test]
+    fn insert_node_lands_the_body_unchanged_with_no_separator_on_either_side() -> TestResult {
+        let source = "pub fn beacon() {}\n";
+
+        let (directory, reads, changes) = fixture(source)?;
+        let node = declaration_node_id(&reads, "pub fn beacon() {}")?;
+        let result = changes.insert_node(
+            &reads,
+            &rift_protocol::change::InsertNodeParams {
+                anchor: node,
+                position: InsertPosition::Before,
+                body: "// note\n".to_owned().into(),
+            },
+        )?;
+        applied_summary(result);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("lib.rs"))?,
+            "// note\npub fn beacon() {}\n",
+            "a `before` insertion must land verbatim at the node's start byte, with no \
+             separator"
+        );
+
+        let (directory, reads, changes) = fixture(source)?;
+        let node = declaration_node_id(&reads, "pub fn beacon() {}")?;
+        let result = changes.insert_node(
+            &reads,
+            &rift_protocol::change::InsertNodeParams {
+                anchor: node,
+                position: InsertPosition::After,
+                body: "// tail".to_owned().into(),
+            },
+        )?;
+        applied_summary(result);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("lib.rs"))?,
+            "pub fn beacon() {}// tail\n",
+            "an `after` insertion must land verbatim at the node's end byte, with no separator"
+        );
+        Ok(())
+    }
+
+    /// A body one byte over `BODY_BYTES_MAX` refuses `unsupported` naming the byte count,
+    /// before `insert_node` ever resolves the anchor - the same bound every other change
+    /// method enforces on its own body.
+    #[test]
+    fn insert_node_with_an_oversized_body_refuses_unsupported() -> TestResult {
+        let source = "pub fn beacon() {}\n";
+        let (_directory, reads, changes) = fixture(source)?;
+        let node = declaration_node_id(&reads, "pub fn beacon() {}")?;
+        let over_bound = "x".repeat(BODY_BYTES_MAX + 1);
+        let result = changes.insert_node(
+            &reads,
+            &rift_protocol::change::InsertNodeParams {
+                anchor: node,
+                position: InsertPosition::After,
+                body: over_bound.into(),
+            },
+        )?;
+        let ChangeResult::Refused {
+            reason,
+            diagnostics,
+            ..
+        } = result
+        else {
+            panic!("a body one byte over the bound must refuse");
+        };
+        assert_eq!(reason, RefusalReason::Unsupported);
+        assert!(
+            diagnostics[0]
+                .message
+                .contains(&(BODY_BYTES_MAX + 1).to_string())
+        );
+        Ok(())
+    }
+
+    /// The witnessed address of the syntax node at byte 3 of `lib.rs` whose own source
+    /// excerpt equals `declaration` exactly - the function item, not the enclosing
+    /// `source_file` root `nodes_at` also lists at that position.
+    fn declaration_node_id(reads: &ReadService, declaration: &str) -> TestResult<NodeId> {
+        let listing = reads.nodes(NodesParams {
+            path: ProjectPath("lib.rs".to_owned()),
+            position: 3,
+            rev: None,
+        })?;
+        let index = listing
+            .source
+            .iter()
+            .position(|excerpt| excerpt.text == declaration)
+            .ok_or("no listed node's excerpt matches the expected declaration")?;
+        Ok(listing.nodes[index].id.clone())
+    }
+
+    /// `insert_node` proves its witness the same way `replace_node` does: a stale address
+    /// refuses `unmet_precondition` naming `source_unchanged` rather than splicing into
+    /// bytes the address no longer describes.
+    #[test]
+    fn insert_node_with_a_stale_witness_refuses_source_unchanged() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let address = reads
+            .nodes(NodesParams {
+                path: ProjectPath("lib.rs".to_owned()),
+                position: 3,
+                rev: None,
+            })?
+            .nodes[0]
+            .id
+            .0
+            .clone();
+        let mut stale = address.clone();
+        stale.replace_range(stale.len() - 8.., "00000000");
+        let refused = changes.insert_node(
+            &reads,
+            &rift_protocol::change::InsertNodeParams {
+                anchor: NodeId(stale),
+                position: InsertPosition::After,
+                body: "pub fn late() {}".to_owned().into(),
+            },
+        )?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = refused
+        else {
+            panic!("stale witness must refuse");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::SourceUnchanged
+        );
+        Ok(())
+    }
+
+    /// `insert_node` addressing a range that lands inside the file but names no real syntax
+    /// node refuses the way `replace_node` does: an invalid request naming the range, not a
+    /// witness mismatch.
+    #[test]
+    fn insert_node_addressing_a_range_that_is_not_a_node_refuses_the_way_replace_node_does()
+    -> TestResult {
+        let source = "pub fn beacon() {}\n";
+        let (directory, reads, changes) = fixture(source)?;
+        let start = source.find("beacon").expect("fixture names beacon");
+        let end = start + "bea".len();
+        let witness = digest_hex8(&source[start..end]);
+        let error = changes
+            .insert_node(
+                &reads,
+                &rift_protocol::change::InsertNodeParams {
+                    anchor: NodeId(format!("rift://node/rust/lib.rs@{start}-{end}#{witness}")),
+                    position: InsertPosition::After,
+                    body: "x".to_owned().into(),
+                },
+            )
+            .expect_err("a range naming no syntax node must error");
+        assert_eq!(error.descriptor().code(), "invalid_request");
+        assert!(
+            error.to_string().contains("outside the addressed file"),
+            "message must name the range, not a witness mismatch: {error}"
+        );
+        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(untouched, source);
         Ok(())
     }
 

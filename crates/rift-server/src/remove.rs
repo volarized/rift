@@ -607,8 +607,33 @@ fn line_ending_at(spans: &[LineSpan], offset: usize) -> Option<LineSpan> {
 
 /// Whether a line's content - its bytes with the ending stripped - holds nothing but spaces
 /// and tabs.
-fn is_blank_content(content: &str) -> bool {
+pub(crate) fn is_blank_content(content: &str) -> bool {
     content.bytes().all(|byte| byte == b' ' || byte == b'\t')
+}
+
+/// The start a removal takes when real source follows it on its own line and a blank run
+/// stands before that line: the end of the last non-blank line's content, so the source left
+/// behind rejoins the line it sat on before whatever put it here separated the two.
+///
+/// A removal whose line is preceded directly by real source retreats nowhere: those two
+/// lines were separate before the removal and stay separate after it. Only the blank run an
+/// insertion leaves behind is taken back, which is what makes insert-then-remove return the
+/// original bytes when the anchor shared its line with another declaration.
+fn rejoined_start(source: &str, spans: &[LineSpan], start: usize) -> usize {
+    let mut retreated = start;
+    while let Some(previous) = line_ending_at(spans, retreated) {
+        let content = source
+            .get(previous.start..previous.content_end)
+            .unwrap_or_default();
+        if !is_blank_content(content) {
+            break;
+        }
+        retreated = previous.start;
+    }
+    if retreated == start {
+        return start;
+    }
+    line_ending_at(spans, retreated).map_or(retreated, |previous| previous.content_end)
 }
 
 /// Widens `span` over the whitespace-only bytes and separator that isolate a removed
@@ -619,14 +644,21 @@ fn is_blank_content(content: &str) -> bool {
 /// 1. If every byte between the line start and `span.start` is blank, the widened span
 ///    starts at the line start: the removal takes its own leading indentation with it.
 /// 2. If every byte between `span.end` and the end of its line is blank, the widened span
-///    extends past that line's ending, then past every further wholly blank line: the
-///    removal takes the separator that followed it, and the blank run beyond, with it.
-/// 3. When step 2 widened the span all the way to the end of `source`, the widened span
-///    also retreats past every wholly blank line immediately before its start, so a removed
-///    trailing declaration leaves no blank run before the file's new end either.
+///    extends past that line's ending: the removal takes the separator that followed it.
+/// 3. Past that ending, the widened span takes one further adjacent blank-line run: from the
+///    trailing side (every further wholly blank line, in source order) when one stands there,
+///    otherwise from the leading side (every wholly blank line immediately before `start`, in
+///    reverse), otherwise neither. A removal between two declarations therefore collapses to
+///    the one separator that already stood on either side of it, never both, and a removal
+///    whose own insertion left a blank run behind it - nothing trailing, everything leading -
+///    takes that run back.
 ///
-/// A span that sits mid-line - its start preceded by more than indentation, or its end
-/// followed by more than blanks - is returned unchanged.
+/// 4. A span that began its own line but is followed on that line by real source takes the
+///    blank run before it and the line ending that separated it from the last non-blank
+///    line, so what follows rejoins the line it sat on before the insertion split them. A
+///    line preceded directly by real source retreats nowhere.
+///
+/// A span whose start is preceded by more than indentation is returned unchanged.
 ///
 /// `span` must already land inside `source`: both removal callers resolve it first. Widening
 /// only moves `start` and `end` along `source`'s own line boundaries, so it cannot push
@@ -647,38 +679,44 @@ pub(crate) fn widened_removal_span(source: &str, span: ByteRange) -> ByteRange {
     );
     let spans = line_spans(source);
 
+    let mut began_its_line = false;
     if let Some(line) = line_at(&spans, start) {
         let prefix = source.get(line.start..start).unwrap_or_default();
         if is_blank_content(prefix) {
             start = line.start;
+            began_its_line = true;
         }
     }
 
-    let mut widened_over_separator = false;
     if let Some(line) = line_at(&spans, end) {
         let suffix = source.get(end..line.content_end).unwrap_or_default();
+        if !is_blank_content(suffix) && began_its_line {
+            start = rejoined_start(source, &spans, start);
+        }
         if is_blank_content(suffix) {
-            end = line.end;
-            widened_over_separator = true;
-            while let Some(next) = line_at(&spans, end) {
+            let own_ending_end = line.end;
+            let mut trailing_end = own_ending_end;
+            while let Some(next) = line_at(&spans, trailing_end) {
                 let content = source.get(next.start..next.content_end).unwrap_or_default();
                 if !is_blank_content(content) {
                     break;
                 }
-                end = next.end;
+                trailing_end = next.end;
             }
-        }
-    }
-
-    if widened_over_separator && end == source_len {
-        while let Some(previous) = line_ending_at(&spans, start) {
-            let content = source
-                .get(previous.start..previous.content_end)
-                .unwrap_or_default();
-            if !is_blank_content(content) {
-                break;
+            if trailing_end > own_ending_end {
+                end = trailing_end;
+            } else {
+                end = own_ending_end;
+                while let Some(previous) = line_ending_at(&spans, start) {
+                    let content = source
+                        .get(previous.start..previous.content_end)
+                        .unwrap_or_default();
+                    if !is_blank_content(content) {
+                        break;
+                    }
+                    start = previous.start;
+                }
             }
-            start = previous.start;
         }
     }
 
@@ -782,6 +820,27 @@ mod tests {
         let source = "fn a() {}\r\n\r\nfn b() {}\r\n\r\nfn c() {}\r\n";
         let widened = widened_removal_span(source, range(source, "fn b() {}"));
         assert_eq!(removed(source, widened), "fn a() {}\r\n\r\nfn c() {}\r\n");
+    }
+
+    /// A declaration with a blank-line run only on its leading side - the shape an
+    /// `insert_symbol` `after` insertion into a packed file produces - takes that run back
+    /// instead of leaving it standing, so insert then remove returns the original bytes.
+    #[test]
+    fn widens_a_declaration_over_its_leading_blank_line_when_the_trailing_side_has_none() {
+        let source = "fn a() {}\n\nfn x() {}\nfn b() {}\n";
+        let widened = widened_removal_span(source, range(source, "fn x() {}"));
+        assert_eq!(removed(source, widened), "fn a() {}\nfn b() {}\n");
+    }
+
+    /// A declaration that begins its own line but is followed there by real source, with
+    /// the line directly before it also real source rather than blank, retreats nowhere:
+    /// `rejoined_start` finds no blank run to reclaim, so the removal takes only its own
+    /// span and the split line stays exactly as the removal left it.
+    #[test]
+    fn widens_a_declaration_sharing_its_trailing_line_with_no_leading_blank_line_to_reclaim() {
+        let source = "fn a() {}\nfn x() {} fn c() {}\n";
+        let widened = widened_removal_span(source, range(source, "fn x() {}"));
+        assert_eq!(removed(source, widened), "fn a() {}\n fn c() {}\n");
     }
 
     #[test]

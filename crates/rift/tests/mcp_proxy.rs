@@ -57,8 +57,9 @@ const GONE_POLL_ATTEMPT_COUNT: u32 = 100;
 const PROXIED_CALL_MAX: Duration = Duration::from_mins(1);
 
 /// The tools the workspace server advertises, in served order.
-const SERVED_TOOL_NAMES: [&str; 11] = [
+const SERVED_TOOL_NAMES: [&str; 12] = [
     "get_symbol",
+    "insert_node",
     "insert_symbol",
     "move_file",
     "nodes",

@@ -586,6 +586,19 @@ pub fn declare_replace_node_body_length(schema: &mut Schema) {
     );
 }
 
+/// An [`InsertNodeParams`](crate::change::InsertNodeParams) states
+/// [`BODY_BYTES_MAX`](crate::change::BODY_BYTES_MAX) as `body`'s inline-string
+/// `maxLength`, the same rule [`declare_patch_body_length`] states for `patch`.
+pub fn declare_insert_node_body_length(schema: &mut Schema) {
+    use crate::change::{BODY_BYTES_MAX, InsertNodeParams};
+    annotate_property(
+        schema,
+        property!(InsertNodeParams, body),
+        keyword::MAX_LENGTH,
+        json!(BODY_BYTES_MAX),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -899,12 +912,14 @@ mod tests {
         );
     }
 
-    /// `ReplaceSymbolParams.body`, `InsertSymbolParams.body`, and
-    /// `ReplaceNodeParams.body` each state the `BodySource` `$ref`'s inline-string
+    /// `ReplaceSymbolParams.body`, `InsertSymbolParams.body`, `ReplaceNodeParams.body`, and
+    /// `InsertNodeParams.body` each state the `BodySource` `$ref`'s inline-string
     /// `maxLength` as a sibling of `$ref`, pinned to [`crate::change::BODY_BYTES_MAX`].
     #[test]
     fn body_carrying_params_schemas_state_body_length() {
-        use crate::change::{BODY_BYTES_MAX, InsertSymbolParams, ReplaceNodeParams};
+        use crate::change::{
+            BODY_BYTES_MAX, InsertNodeParams, InsertSymbolParams, ReplaceNodeParams,
+        };
         let cases = [
             (
                 "ReplaceSymbolParams",
@@ -918,6 +933,10 @@ mod tests {
             (
                 "ReplaceNodeParams",
                 serde_json::to_value(schema_for!(ReplaceNodeParams)).expect("schema"),
+            ),
+            (
+                "InsertNodeParams",
+                serde_json::to_value(schema_for!(InsertNodeParams)).expect("schema"),
             ),
         ];
         for (model, schema) in cases {
