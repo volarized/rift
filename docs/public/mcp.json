@@ -778,6 +778,31 @@
                   "detail"
                 ],
                 "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A claimed file's bytes are not valid UTF-8, so the index omits it: it answers no\nsearch or lookup, and addressing it directly still refuses `content_unavailable`.\nEvery other file in the workspace stays available.",
+                "properties": {
+                  "code": {
+                    "const": "source_unavailable",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/FileId",
+                    "description": "The file whose bytes could not be read."
+                  }
+                },
+                "required": [
+                  "code",
+                  "unit",
+                  "detail"
+                ],
+                "type": "object"
               }
             ]
           },
@@ -4249,6 +4274,31 @@
                 },
                 "required": [
                   "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A claimed file's bytes are not valid UTF-8, so the index omits it: it answers no\nsearch or lookup, and addressing it directly still refuses `content_unavailable`.\nEvery other file in the workspace stays available.",
+                "properties": {
+                  "code": {
+                    "const": "source_unavailable",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/FileId",
+                    "description": "The file whose bytes could not be read."
+                  }
+                },
+                "required": [
+                  "code",
+                  "unit",
                   "detail"
                 ],
                 "type": "object"
@@ -12137,6 +12187,31 @@
                 },
                 "required": [
                   "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A claimed file's bytes are not valid UTF-8, so the index omits it: it answers no\nsearch or lookup, and addressing it directly still refuses `content_unavailable`.\nEvery other file in the workspace stays available.",
+                "properties": {
+                  "code": {
+                    "const": "source_unavailable",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/FileId",
+                    "description": "The file whose bytes could not be read."
+                  }
+                },
+                "required": [
+                  "code",
+                  "unit",
                   "detail"
                 ],
                 "type": "object"

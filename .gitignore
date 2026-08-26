@@ -8,6 +8,7 @@ lcov.info
 # Agents, skills, and editor state: local tooling, not project contract.
 .claude/
 .agents/
+.doppel/
 skills-lock.json
 .DS_Store
 .idea/

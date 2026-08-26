@@ -9,8 +9,14 @@ from __future__ import annotations
 
 import difflib
 import json
+import pathlib
+import re
 import subprocess
 from typing import Any
+
+# Cargo runs a test function only from a target it compiles, so a file holding one
+# of these attributes is a suite rather than a helper another suite includes.
+TEST_ATTRIBUTE = re.compile(r"#\[(?:tokio::)?test\b")
 
 EXPECTED_EDGES = {
     "rift -> rift-core",
@@ -92,6 +98,48 @@ def fail_edges(actual: set[str]) -> None:
     raise RuntimeError(f"Rift dependency edges differ:\n{difference}")
 
 
+def unlisted_test_suites(package: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Return test files a package leaves unlisted, and listed files holding no test.
+
+    A package that turns off Cargo's own test discovery lists every suite as a
+    `[[test]]` target. A suite added to `tests/` without an entry compiles into
+    nothing and stops running, so the two sets have to match exactly: every file
+    under `tests/` that declares a test is a listed target, and every listed target
+    declares one. A file declaring none is a helper another suite reaches with
+    `mod <name>;`, and listing it would compile it as a suite of its own.
+    """
+    manifest = pathlib.Path(package["manifest_path"])
+    if "autotests = false" not in manifest.read_text(encoding="utf-8"):
+        return ([], [])
+    listed = {
+        pathlib.Path(target["src_path"]).resolve()
+        for target in package["targets"]
+        if "test" in target["kind"]
+    }
+    directory = manifest.parent / "tests"
+    declares_a_test = {
+        entry.resolve()
+        for entry in sorted(directory.glob("*.rs"))
+        if TEST_ATTRIBUTE.search(entry.read_text(encoding="utf-8"))
+    }
+    unlisted = sorted(str(path) for path in declares_a_test - listed)
+    testless = sorted(str(path) for path in listed - declares_a_test)
+    return (unlisted, testless)
+
+
+def fail_test_targets(packages: list[dict[str, Any]]) -> None:
+    """Report every suite left out of a manifest, and every listed file holding no test."""
+    complaints: list[str] = []
+    for package in packages:
+        unlisted, testless = unlisted_test_suites(package)
+        for path in unlisted:
+            complaints.append(f"{package['name']}: {path} declares a test and has no [[test]] entry")
+        for path in testless:
+            complaints.append(f"{package['name']}: {path} has a [[test]] entry and declares no test")
+    if complaints:
+        raise RuntimeError("Rift test targets differ:\n" + "\n".join(complaints))
+
+
 def main() -> int:
     """Check exact internal edges and binary targets."""
     packages = rift_packages(cargo_metadata())
@@ -117,6 +165,8 @@ def main() -> int:
         raise RuntimeError(
             f"expected exactly {expected_binaries} binary targets, got {binaries}"
         )
+
+    fail_test_targets(packages)
     return 0
 
 

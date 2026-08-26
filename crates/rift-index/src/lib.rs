@@ -18,8 +18,8 @@ pub use vector::{SemanticVectorStore, StoredVector};
 pub use workspace::{
     IndexedFile, SymbolMatch, SymbolMatchRank, TextSourceFile, WorkspaceFingerprint,
     WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexFault, WorkspaceIndexLimits,
-    WorkspaceIndexViolation, WorkspaceSourcePolicy, capture_digests, source_line_matches,
-    symbol_matches,
+    WorkspaceIndexViolation, WorkspaceIndexWarning, WorkspaceSourcePolicy, capture_digests,
+    source_line_matches, symbol_matches,
 };
 
 /// Compile-time marker for index-layer ownership.

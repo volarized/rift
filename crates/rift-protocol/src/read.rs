@@ -995,6 +995,16 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
+    /// A claimed file's bytes are not valid UTF-8, so the index omits it: it answers no
+    /// search or lookup, and addressing it directly still refuses `content_unavailable`.
+    /// Every other file in the workspace stays available.
+    SourceUnavailable {
+        /// The file whose bytes could not be read.
+        unit: FileId,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
 }
 
 /// One named part of a node. A language marks these out inside a declaration, so an
@@ -1664,8 +1674,8 @@ pub struct TypeExpression {
 #[cfg(test)]
 mod tests {
     use super::{
-        Digest, Duration, GetSymbolParams, Language, PAGE_INDEX_DEFAULT, REVISION_ID_BYTES_MAX,
-        ReadWarning, RevisionId, RevisionIdViolation, SourceUnitId,
+        Digest, Duration, FileId, GetSymbolParams, Language, PAGE_INDEX_DEFAULT,
+        REVISION_ID_BYTES_MAX, ReadWarning, RevisionId, RevisionIdViolation, SourceUnitId,
     };
     use schemars::schema_for;
     use serde_json::json;
@@ -1815,6 +1825,17 @@ mod tests {
                     "detail": "the full-text index did not open",
                 }),
             ),
+            (
+                ReadWarning::SourceUnavailable {
+                    unit: FileId("rift://file/src%2Finvalid.rs".to_owned()),
+                    detail: "src/invalid.rs is not UTF-8 and is absent from the index".to_owned(),
+                },
+                json!({
+                    "code": "source_unavailable",
+                    "unit": "rift://file/src%2Finvalid.rs",
+                    "detail": "src/invalid.rs is not UTF-8 and is absent from the index",
+                }),
+            ),
         ];
         for (warning, wire) in cases {
             assert_eq!(serde_json::to_value(&warning).expect("serialize"), wire);
@@ -1836,6 +1857,7 @@ mod tests {
             "semantic_index_preparing",
             "semantic_ranking_unavailable",
             "lexical_ranking_unavailable",
+            "source_unavailable",
         ] {
             assert!(
                 codes.contains(&json!({ "const": code, "type": "string" })),
