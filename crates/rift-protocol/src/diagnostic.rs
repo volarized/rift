@@ -72,6 +72,11 @@ pub enum DiagnosticCode {
     /// findings over an applied change may be incomplete; the change itself landed.
     #[serde(rename = "rift.engine.analyzing")]
     EngineAnalyzing,
+    /// The language engine's post-apply diagnostics for one or more changed paths could
+    /// not be proven settled: the engine has never confirmed its own readiness, so an
+    /// empty answer is not evidence the paths are clean. The change itself landed.
+    #[serde(rename = "rift.engine.unready")]
+    EngineUnready,
     /// A removal applied under `force` while a reference to the removed declaration still
     /// stood.
     #[serde(rename = "rift.remove.reference")]
@@ -209,6 +214,7 @@ mod tests {
             DiagnosticCode::EngineAnalyzing.code(),
             "rift.engine.analyzing"
         );
+        assert_eq!(DiagnosticCode::EngineUnready.code(), "rift.engine.unready");
         assert_eq!(
             DiagnosticCode::RemoveReference.code(),
             "rift.remove.reference"

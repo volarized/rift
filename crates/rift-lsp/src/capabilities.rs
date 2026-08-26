@@ -6,9 +6,10 @@
 
 use lsp_types::{
     ClientCapabilities, DiagnosticClientCapabilities, DiagnosticServerCapabilities,
-    FileOperationFilter, GeneralClientCapabilities, InitializeResult, OneOf, PositionEncodingKind,
-    ReferenceClientCapabilities, RenameClientCapabilities, TextDocumentClientCapabilities,
-    WindowClientCapabilities, WorkspaceClientCapabilities, WorkspaceEditClientCapabilities,
+    DidChangeWatchedFilesClientCapabilities, FileOperationFilter, GeneralClientCapabilities,
+    InitializeResult, OneOf, PositionEncodingKind, ReferenceClientCapabilities,
+    RenameClientCapabilities, TextDocumentClientCapabilities, WindowClientCapabilities,
+    WorkspaceClientCapabilities, WorkspaceEditClientCapabilities,
     WorkspaceFileOperationsClientCapabilities,
 };
 use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, fault_label};
@@ -201,7 +202,9 @@ fn filter_matches(filter: &FileOperationFilter, path: &str) -> bool {
 ///
 /// `*` and `?` stay inside one path segment and `**` crosses segments, the
 /// LSP pattern grammar. A glob that does not compile matches nothing.
-fn glob_matches(glob: &str, ignore_case: bool, path: &str) -> bool {
+/// Shared with `session`'s watched-file matching, so the pattern grammar
+/// has one compiled representation.
+pub(crate) fn glob_matches(glob: &str, ignore_case: bool, path: &str) -> bool {
     globset::GlobBuilder::new(glob)
         .literal_separator(true)
         .case_insensitive(ignore_case)
@@ -226,6 +229,13 @@ fn glob_matches(glob: &str, ignore_case: bool, path: &str) -> bool {
 /// `diagnostic_provider` only when the client declares dynamic
 /// registration, so without this entry its pull-diagnostics chain never
 /// closes.
+///
+/// `workspace.didChangeWatchedFiles.dynamicRegistration` is what lets an
+/// engine ask, through `client/registerCapability`, which paths it wants
+/// told about after a change lands outside any document it has open;
+/// without this entry an engine has no channel to register that interest
+/// on, and `EngineSession::notify_changed_paths` has nothing to match
+/// against.
 #[must_use]
 pub fn offered() -> ClientCapabilities {
     ClientCapabilities {
@@ -244,6 +254,10 @@ pub fn offered() -> ClientCapabilities {
             file_operations: Some(WorkspaceFileOperationsClientCapabilities {
                 will_rename: Some(true),
                 ..WorkspaceFileOperationsClientCapabilities::default()
+            }),
+            did_change_watched_files: Some(DidChangeWatchedFilesClientCapabilities {
+                dynamic_registration: Some(true),
+                relative_pattern_support: Some(true),
             }),
             ..WorkspaceClientCapabilities::default()
         }),

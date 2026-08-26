@@ -43,8 +43,6 @@ use crate::server::{BlockingExecutor, ChangeLane};
 pub(crate) const INDEX_INVALIDATIONS_MAX: usize = 1;
 /// Delay collecting one bounded filesystem-event batch.
 pub(crate) const INDEX_DEBOUNCE: Duration = Duration::from_millis(50);
-/// Deadline for one request to obtain a validated current snapshot.
-pub(crate) const INDEX_FRESHNESS_TIMEOUT: Duration = Duration::from_secs(30);
 /// Deadline for joining the index supervisor during shutdown.
 pub(crate) const INDEX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Complete capture retries while the tree keeps moving.
@@ -1087,9 +1085,11 @@ pub(crate) async fn populate_search(
 
 /// Deadline for one rebuild to reach the lexical owner and hear its transaction end.
 ///
-/// A rebuild waits inside the same freshness window a request waits in, so a stuck owner
-/// cannot hold publication past the deadline the caller is already bounded by.
-pub(crate) const LEXICAL_COMMIT_TIMEOUT: Duration = INDEX_FRESHNESS_TIMEOUT;
+/// Fixed, not `[server] readiness_timeout`: a stuck lexical owner is an internal write-side
+/// condition independent of how long an operator lets a read wait for the workspace to
+/// settle, and coupling the two would let a short readiness budget starve every rebuild's
+/// own commit before it has a chance to finish.
+pub(crate) const LEXICAL_COMMIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Commits the lexical owner accepts before a rebuild waits for capacity.
 pub(crate) const LEXICAL_COMMITS_MAX: usize = 4;
 
