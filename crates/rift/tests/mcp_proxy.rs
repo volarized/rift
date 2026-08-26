@@ -1,12 +1,32 @@
-//! Real-binary contract of the `rift mcp` stdio proxy.
+//! Real-binary contract of the `rift mcp` stdio proxy, and the end-to-end
+//! lane: a real MCP client, the real `rift` binary run as an agent runs
+//! it, a real elected server, and - gated behind `RIFT_ENGINE_LIVE` - a
+//! real language engine, over a real temp-directory workspace.
 //!
 //! Every test drives the compiled `rift` binary as an MCP stdio child
-//! against a throwaway workspace fixture, proving the proxy elects,
-//! adopts, shares, and re-elects the workspace's server. The tests
-//! serialize on one async mutex: the servers share the loopback election
-//! port range. Each fixture's `rift.toml` accepts a 60-second idle timeout
-//! as an orphan-safety net, and a drop guard stops any server a failed
-//! test leaves behind.
+//! against a throwaway workspace fixture. The proxy tests prove election,
+//! adoption, sharing, and re-election; the engine tests prove one applied
+//! change's observable outcome - the bytes a real engine rewrote on disk,
+//! or the finding it attached - through the whole chain: proxy, server,
+//! and engine all real processes, no scripted engine and no in-process
+//! shortcut. The tests serialize on one async mutex: the servers share the
+//! loopback election port range. Each fixture's `rift.toml` accepts a
+//! 60-second idle timeout as an orphan-safety net, and a drop guard stops
+//! any server a failed test leaves behind.
+//!
+//! **Adding a case to the end-to-end lane.** Lay out a workspace with
+//! [`laid_out_workspace`] (files, plus an engine table when the case needs
+//! one - build it from a fixture in `engine_fixture.rs`/`rust_engine.rs`,
+//! following the pattern those two modules already set for rust), connect
+//! to it with [`proxy_client`], drive it with [`proxied_call`], and gate
+//! the test behind `live_engine_gate::engine_live` when it needs a real
+//! engine. `proxy_client` is the one entry point that spawns the real
+//! `rift mcp` binary; every case shares it, and no case may spawn a
+//! process of its own to stand in for the server or the engine.
+
+mod engine_fixture;
+mod live_engine_gate;
+mod rust_engine;
 
 use std::error::Error;
 use std::fs;
@@ -54,16 +74,9 @@ const SERVED_TOOL_NAMES: [&str; 11] = [
 /// Serializes the tests: the served port range is machine-global.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// The declaration every fixture serves, and the file referencing it.
+/// The declaration every non-engine fixture serves, and the file
+/// referencing it.
 const LIBRARY: &str = "pub fn beacon() {}\n";
-const CALLER: &str = "pub fn caller() { beacon(); }\n";
-
-/// The symbol address of that declaration.
-const BEACON_SYMBOL: &str = "rift://symbol/rust/lib.rs/beacon";
-
-/// The moved module and the file naming it.
-const HUB: &str = "pub fn hub() {}\n// hub module\n";
-const HUB_CALLER: &str = "mod hub;\n";
 
 /// A workspace fixture: one Rust source and a `rift.toml` whose
 /// `[server]` idle timeout reaps any orphaned server within a minute.
@@ -71,10 +84,36 @@ fn workspace() -> TestResult<tempfile::TempDir> {
     laid_out_workspace(&[("lib.rs", LIBRARY)], "")
 }
 
-/// The same fixture with an `[engines.fake]` table appended, serving
-/// `rust` through the scripted engine under `behavior`.
-fn engine_workspace(behavior: &str, files: &[(&str, &str)]) -> TestResult<tempfile::TempDir> {
-    laid_out_workspace(files, &engine_table(behavior)?)
+/// The cargo project the real rust-analyzer end-to-end cases serve:
+/// rust-analyzer resolves nothing outside a cargo project, so the fixture
+/// is one, with the same shape `rift-mcp`'s own `live_rust_analyzer.rs`
+/// uses - a manifest whose `[lib]` path keeps every module file at the
+/// tree root, and whose empty `[workspace]` table stops cargo climbing
+/// out of the tempdir. `hub.rs` holds the declaration and `caller.rs`
+/// imports and calls it under a different name, so a rename of the
+/// declaration leaves no occurrence of the old name behind.
+const RUST_PROJECT_MANIFEST: &str = "[package]\nname = \"rift_live_fixture\"\nversion = \"0.0.0\"\n\
+                                     edition = \"2021\"\npublish = false\n\n[lib]\npath = \"lib.rs\"\n\n\
+                                     [workspace]\n";
+const RUST_PROJECT_ROOT: &str = "pub mod caller;\npub mod hub;\n";
+const RUST_PROJECT_HUB: &str = "pub fn beacon(value: i32) -> i32 {\n    value\n}\n";
+const RUST_PROJECT_CALLER: &str =
+    "use crate::hub::beacon;\n\npub fn total() -> i32 {\n    beacon(2)\n}\n";
+const RUST_PROJECT_BEACON_SYMBOL: &str = "rift://symbol/rust/hub.rs/beacon";
+
+fn rust_project() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("Cargo.toml", RUST_PROJECT_MANIFEST),
+        ("lib.rs", RUST_PROJECT_ROOT),
+        ("hub.rs", RUST_PROJECT_HUB),
+        ("caller.rs", RUST_PROJECT_CALLER),
+    ]
+}
+
+/// The cargo project fixture with a real `[engines.rust]` table appended,
+/// serving `rust` through rust-analyzer.
+fn rust_engine_workspace() -> TestResult<tempfile::TempDir> {
+    laid_out_workspace(&rust_project(), &rust_engine::rust_engine_configuration())
 }
 
 /// The `[search.semantic]` table every fixture here declares.
@@ -99,34 +138,6 @@ fn laid_out_workspace(files: &[(&str, &str)], engine: &str) -> TestResult<tempfi
         format!("{SEMANTIC_DISABLED}[server]\nidle_timeout = \"60s\"\n{engine}"),
     )?;
     Ok(directory)
-}
-
-/// One `[engines.fake]` table resolving the scripted engine Cargo builds
-/// beside the `rift` binary under test.
-///
-/// `program` refuses an absolute path, so the table resolves the binary
-/// the way an operator's does: by name, through a `PATH` it overlays on
-/// the environment the server hands the engine.
-fn engine_table(behavior: &str) -> TestResult<String> {
-    let program = format!("fake_engine{}", std::env::consts::EXE_SUFFIX);
-    let directory = Path::new(env!("CARGO_BIN_EXE_rift"))
-        .parent()
-        .ok_or("the rift binary under test has a directory")?;
-    if !directory.join(&program).exists() {
-        return Err(format!(
-            "{program} is missing from {}: build it with `cargo test --workspace --all-targets`",
-            directory.display()
-        )
-        .into());
-    }
-    let separator = if cfg!(windows) { ';' } else { ':' };
-    let inherited = std::env::var("PATH").unwrap_or_default();
-    let overlay = format!("{}{separator}{inherited}", directory.display()).replace('\\', "\\\\");
-    Ok(format!(
-        "\n[engines.fake]\nprogram = \"fake_engine\"\narguments = [\"{behavior}\"]\n\
-         languages = [\"rust\"]\nrequest_timeout = \"20s\"\n\n\
-         [engines.fake.environment]\nPATH = \"{overlay}\"\n"
-    ))
 }
 
 /// Stops the fixture's server when a test unwinds, best effort.
@@ -624,38 +635,89 @@ async fn proxy_stderr_carries_lifecycle_lines_and_never_the_token() -> TestResul
     Ok(())
 }
 
-/// The engine tier answers through the proxy, against the root the CLI
-/// serves.
+// The engine tier answers through the proxy, against the root the CLI
+// serves.
+//
+// `rift mcp` and `rift server start` serve the process working directory,
+// which they name `.`. Reads and writes below the root resolve against
+// that directory, so they cannot tell one spelling from another; the
+// engine is addressed in `file://` URIs, which carry no working
+// directory, so it is the one caller that can. Every test below drives
+// the real binary against a real elected server, and - gated behind
+// `RIFT_ENGINE_LIVE` - a real language engine, the way an agent reaches
+// Rift.
+
+/// Most attempts the warm-up loop below spends waiting for rust-analyzer
+/// to finish loading the cargo project, and the pause between them: at
+/// most a minute of waiting, on top of the per-call [`PROXIED_CALL_MAX`]
+/// bound, then the test fails instead of hanging.
+const WARMUP_ATTEMPTS_MAX: usize = 240;
+const WARMUP_PAUSE: Duration = Duration::from_millis(250);
+
+/// Drives the rename tool, through the real proxy, until rust-analyzer has
+/// loaded the cargo project.
 ///
-/// `rift mcp` and `rift server start` serve the process working directory,
-/// which they name `.`. Reads and writes below the root resolve against
-/// that directory, so they cannot tell one spelling from another; the
-/// engine is addressed in `file://` URIs, which carry no working
-/// directory, so it is the one caller that can. Every test below drives
-/// the real binary against a real detached server, the way an agent
-/// reaches Rift.
+/// The probe renames the declaration to the name it already has. Once
+/// rust-analyzer resolves it, the proposal edits every occurrence to the
+/// bytes already there, so the compiled plan holds no rewrite and the tool
+/// refuses with `proposed no edits` - the readiness signal, with the tree
+/// untouched either way. `rift-mcp`'s own `live_rust_analyzer.rs` states
+/// the full reasoning for this probe; the proxy adds only its own latency
+/// on top.
+async fn warmed_rust_engine(client: &RunningService<RoleClient, ()>) -> TestResult {
+    for _attempt in 0..WARMUP_ATTEMPTS_MAX {
+        let structured = proxied_call(
+            client,
+            "rename_symbol",
+            &json!({ "symbol": RUST_PROJECT_BEACON_SYMBOL, "new_name": "beacon" }),
+        )
+        .await?;
+        let refused = structured["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap_or_default();
+        if refused.contains("proposed no edits") {
+            return Ok(());
+        }
+        tokio::time::sleep(WARMUP_PAUSE).await;
+    }
+    Err("rust-analyzer never resolved the declaration through the proxy".into())
+}
+
+/// The engine tier answers through the whole real chain: the `rift`
+/// binary as `rift mcp`, its elected `rift server`, and rust-analyzer, all
+/// real processes over a real cargo project on disk.
 #[tokio::test]
 async fn proxied_rename_symbol_rewrites_every_referencing_file() -> TestResult {
     let _serial = SERIAL.lock().await;
-    let directory = engine_workspace("renames-word", &[("lib.rs", LIBRARY), ("main.rs", CALLER)])?;
+    if !live_engine_gate::engine_live() {
+        return Ok(());
+    }
+    let directory = rust_engine_workspace()?;
     let root = directory.path();
+    rust_engine::require_rust_analyzer(root);
     let _cleanup = StopOnDrop::new(root);
 
     let client = proxy_client(root).await?;
     let structured = proxied_call(
         &client,
         "rename_symbol",
-        &json!({ "symbol": BEACON_SYMBOL, "new_name": "flare" }),
+        &json!({ "symbol": RUST_PROJECT_BEACON_SYMBOL, "new_name": "flare" }),
     )
     .await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
     assert_eq!(
-        fs::read_to_string(root.join("lib.rs"))?,
-        "pub fn flare() {}\n"
+        structured["summary"]["paths"],
+        json!(["caller.rs", "hub.rs"]),
+        "the declaration and its cross-file reference both carry the rename: {structured:#}"
     );
     assert_eq!(
-        fs::read_to_string(root.join("main.rs"))?,
-        "pub fn caller() { flare(); }\n"
+        fs::read_to_string(root.join("hub.rs"))?,
+        "pub fn flare(value: i32) -> i32 {\n    value\n}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("caller.rs"))?,
+        "use crate::hub::flare;\n\npub fn total() -> i32 {\n    flare(2)\n}\n",
+        "rust-analyzer rewrote the import and the call it resolved from its own index"
     );
 
     client.cancel().await?;
@@ -669,11 +731,16 @@ async fn proxied_rename_symbol_rewrites_every_referencing_file() -> TestResult {
 #[tokio::test]
 async fn proxied_move_file_rewrites_the_referencing_file() -> TestResult {
     let _serial = SERIAL.lock().await;
-    let directory = engine_workspace("moves-imports", &[("hub.rs", HUB), ("main.rs", HUB_CALLER)])?;
+    if !live_engine_gate::engine_live() {
+        return Ok(());
+    }
+    let directory = rust_engine_workspace()?;
     let root = directory.path();
+    rust_engine::require_rust_analyzer(root);
     let _cleanup = StopOnDrop::new(root);
 
     let client = proxy_client(root).await?;
+    warmed_rust_engine(&client).await?;
     let structured = proxied_call(
         &client,
         "move_file",
@@ -693,7 +760,16 @@ async fn proxied_move_file_rewrites_the_referencing_file() -> TestResult {
         "an engine-covered move carries no warning: {structured:#}"
     );
     assert!(!root.join("hub.rs").exists());
-    assert_eq!(fs::read_to_string(root.join("main.rs"))?, "mod spoke;\n");
+    assert_eq!(
+        fs::read_to_string(root.join("lib.rs"))?,
+        "pub mod caller;\npub mod spoke;\n",
+        "the module declaration follows the new file stem"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("caller.rs"))?,
+        "use crate::spoke::beacon;\n\npub fn total() -> i32 {\n    beacon(2)\n}\n",
+        "the sibling's import path follows the renamed module"
+    );
 
     client.cancel().await?;
     let stopped = run_rift(root, &["server", "stop"]).await?;
@@ -701,22 +777,70 @@ async fn proxied_move_file_rewrites_the_referencing_file() -> TestResult {
     Ok(())
 }
 
-/// A change applied through the proxy carries the engine's findings, and
-/// never the warning an unreachable engine degrades to.
+/// A patch handing the function one argument too many.
+const RUST_PROJECT_ARGUMENT_PATCH: &str =
+    "--- a/caller.rs\n+++ b/caller.rs\n@@ -4 +4 @@\n-    beacon(2)\n+    beacon(2, 3)\n";
+
+/// The inverse of [`RUST_PROJECT_ARGUMENT_PATCH`], restoring the single
+/// argument.
+const RUST_PROJECT_ARGUMENT_REVERT_PATCH: &str =
+    "--- a/caller.rs\n+++ b/caller.rs\n@@ -4 +4 @@\n-    beacon(2, 3)\n+    beacon(2)\n";
+
+/// A change applied through the whole real chain carries the engine's own
+/// finding for the file it changed, and never the warning an unreachable
+/// engine degrades to.
+///
+/// Each attempt lands the arity error and reverts it, so the file is
+/// exactly as the attempt found it and the next attempt runs against the
+/// same starting bytes; the loop ends on the first attempt whose summary
+/// carries rust-analyzer's own finding. `rift-mcp`'s own
+/// `live_rust_analyzer.rs` proves this same shape without the proxy in the
+/// path; this proves it with the proxy, the election, and the daemon all
+/// real too.
 #[tokio::test]
 async fn proxied_change_carries_the_engine_findings() -> TestResult {
     let _serial = SERIAL.lock().await;
-    let directory = engine_workspace("diagnostic-severities", &[("lib.rs", LIBRARY)])?;
+    if !live_engine_gate::engine_live() {
+        return Ok(());
+    }
+    let directory = rust_engine_workspace()?;
     let root = directory.path();
+    rust_engine::require_rust_analyzer(root);
     let _cleanup = StopOnDrop::new(root);
 
     let client = proxy_client(root).await?;
-    let structured = proxied_call(
-        &client,
-        "replace_symbol",
-        &json!({ "symbol": BEACON_SYMBOL, "body": "pub fn beacon() -> u8 {\n    7\n}" }),
-    )
-    .await?;
+    warmed_rust_engine(&client).await?;
+
+    let mut structured = None;
+    for _attempt in 0..WARMUP_ATTEMPTS_MAX {
+        let landed = proxied_call(
+            &client,
+            "patch",
+            &json!({ "patch": RUST_PROJECT_ARGUMENT_PATCH }),
+        )
+        .await?;
+        let carries_arity_error =
+            landed["summary"]["diagnostics"]
+                .as_array()
+                .is_some_and(|findings| {
+                    findings
+                        .iter()
+                        .any(|finding| finding["code"] == json!("E0107"))
+                });
+        if carries_arity_error {
+            structured = Some(landed);
+            break;
+        }
+        proxied_call(
+            &client,
+            "patch",
+            &json!({ "patch": RUST_PROJECT_ARGUMENT_REVERT_PATCH }),
+        )
+        .await?;
+        tokio::time::sleep(WARMUP_PAUSE).await;
+    }
+    let structured =
+        structured.ok_or("rust-analyzer reported no arity error within the warm-up bound")?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
     let findings = structured["summary"]["diagnostics"]
         .as_array()
@@ -725,13 +849,27 @@ async fn proxied_change_carries_the_engine_findings() -> TestResult {
         .iter()
         .filter(|finding| finding["language"]["name"] == json!("rust"))
         .count();
-    assert_eq!(engine_findings, 4, "{structured:#}");
+    assert_eq!(
+        engine_findings, 1,
+        "the arity error rides the applied change: {structured:#}"
+    );
+    let finding = findings
+        .iter()
+        .find(|finding| finding["code"] == json!("E0107"))
+        .ok_or("the arity error must be among the findings")?;
+    assert_eq!(finding["severity"], json!("error"));
+    assert_eq!(finding["message"], json!("expected 1 argument, found 2"));
     let degraded = findings
         .iter()
         .any(|finding| finding["code"] == json!("rift.engine.failed"));
     assert!(
         !degraded,
         "an addressed engine never degrades to a warning: {structured:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("caller.rs"))?,
+        "use crate::hub::beacon;\n\npub fn total() -> i32 {\n    beacon(2, 3)\n}\n",
+        "the change stays applied with its finding attached"
     );
 
     client.cancel().await?;

@@ -11,6 +11,8 @@
 use std::path::Path;
 use std::time::Instant;
 
+use crate::engine_fixture::EngineFixture;
+
 /// The package manager that installs the fixture's pinned `typescript`.
 pub(crate) const BUN_PROGRAM: &str = "bun";
 
@@ -73,8 +75,18 @@ pub(crate) fn install_typescript_engine(fixture_root: &Path) {
     }
 }
 
-/// The real `[engines.typescript]` table: typescript-language-server over
-/// the fixture's bun project, serving both TypeScript dialects.
+/// The real `[engines.typescript]` table, built from [`fixture`], beside
+/// the `[source]` policy the fixture always needs.
+pub(crate) fn typescript_engine_configuration() -> String {
+    format!(
+        "{SOURCE_EXCLUDES_NODE_MODULES}\n{}",
+        fixture().configuration_toml()
+    )
+}
+
+/// The fixture data the shared harness turns into the `[engines.typescript]`
+/// table: typescript-language-server over the fixture's bun project,
+/// serving both TypeScript dialects.
 ///
 /// `tsserver.useSyntaxServer = "never"` keeps the engine to one semantic
 /// server. Under the default `auto` the language server also runs a
@@ -88,14 +100,20 @@ pub(crate) fn install_typescript_engine(fixture_root: &Path) {
 /// sources and the first change refuses with `violation file_too_large,
 /// path .../node_modules/typescript/lib/_tsc.js`. Any workspace serving a
 /// bun project needs the same entry.
-pub(crate) fn typescript_engine_configuration() -> String {
-    format!(
-        "[source]\nexclude = [\"node_modules/**\"]\n\n\
-         [engines.typescript]\nprogram = \"{BUNX_PROGRAM}\"\n\
-         arguments = [\"{LANGUAGE_SERVER_PACKAGE}\", \"--stdio\"]\n\
-         languages = [\"typescript\", \"typescript:tsx\"]\n\
-         startup_timeout = \"2m\"\nrequest_timeout = \"2m\"\n\n\
-         [engines.typescript.initialization_options.tsserver]\n\
-         useSyntaxServer = \"never\"\n"
-    )
+pub(crate) fn fixture() -> EngineFixture {
+    EngineFixture {
+        name: "typescript",
+        program: BUNX_PROGRAM,
+        arguments: vec![LANGUAGE_SERVER_PACKAGE, "--stdio"],
+        languages: vec!["typescript", "typescript:tsx"],
+        extra_toml: "\n[engines.typescript.initialization_options.tsserver]\n\
+                     useSyntaxServer = \"never\"\n"
+            .to_owned(),
+    }
 }
+
+/// The `[source]` policy this engine's fixture always needs beside its
+/// `[engines.typescript]` table: without it the walk reaches
+/// `typescript`'s own 23mb of installed sources and the first change
+/// refuses with `violation file_too_large`.
+pub(crate) const SOURCE_EXCLUDES_NODE_MODULES: &str = "[source]\nexclude = [\"node_modules/**\"]\n";

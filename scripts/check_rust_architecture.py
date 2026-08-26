@@ -153,11 +153,11 @@ def main() -> int:
         for target in package["targets"]
         if "bin" in target["kind"]
     )
-    # rift is the only released binary; rift-schema-export is the repo-internal
-    # generator that writes the served tool surface into docs/protocol, and
-    # fake_engine is rift-lsp's scripted LSP engine for integration tests.
+    # rift is the only released binary, and rift-schema-export is the
+    # repo-internal generator that writes the served tool surface into
+    # docs/public. Engine behavior is proven against real language servers, so
+    # the workspace ships no test engine of its own.
     expected_binaries = [
-        "rift-lsp:fake_engine",
         "rift-mcp:rift-schema-export",
         "rift:rift",
     ]

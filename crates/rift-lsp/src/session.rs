@@ -38,8 +38,8 @@ use rift_core::{
 };
 use serde::Serialize;
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::process::{Child, Command};
 
 use crate::capabilities::{Capabilities, CapabilitiesError, offered};
 use crate::correlation::{self, Correlation, CorrelationError, METHOD_NOT_FOUND_CODE, RequestId};
@@ -419,12 +419,23 @@ impl EmptyAnswers {
     }
 }
 
-/// One running engine child and the conversation state around it.
-#[derive(Debug)]
+/// The engine's writable half: a real child's stdin, or a test transport's
+/// own write half.
+type EngineWriter = Box<dyn AsyncWrite + Send + Unpin>;
+
+/// The engine's readable half: a real child's stdout, or a test transport's
+/// own read half.
+type EngineReader = Box<dyn AsyncRead + Send + Unpin>;
+
+/// One running engine and the conversation state around it.
+///
+/// `child` is `Some` for a spawned process and `None` for a session started
+/// over an already-connected transport; `EngineSession::end` and
+/// [`EngineSession::shutdown`] only wait on and kill a process that exists.
 pub struct EngineSession {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: ChildStdout,
+    child: Option<Child>,
+    stdin: EngineWriter,
+    stdout: EngineReader,
     stderr_drain: tokio::task::JoinHandle<CapturedStream>,
     framing: Framing,
     correlation: Correlation,
@@ -437,6 +448,21 @@ pub struct EngineSession {
     empty_answers: EmptyAnswers,
     document_version: i32,
     ended: bool,
+}
+
+impl std::fmt::Debug for EngineSession {
+    /// Prints the session's observable state; the boxed byte streams carry
+    /// no `Debug` impl of their own and are omitted.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EngineSession")
+            .field("child_pid", &self.child.as_ref().and_then(Child::id))
+            .field("capabilities", &self.capabilities)
+            .field("root", &self.root)
+            .field("document_version", &self.document_version)
+            .field("ended", &self.ended)
+            .finish_non_exhaustive()
+    }
 }
 
 impl EngineSession {
@@ -457,8 +483,6 @@ impl EngineSession {
     /// armed: the runtime kills and reaps it in the background.
     pub async fn start(launch: EngineLaunch, workspace_root: &Path) -> Result<Self, EngineError> {
         refuse_program(&launch.program)?;
-        let root = TreeRoot::new(workspace_root)
-            .map_err(|source| Error::new(EngineFault::Document { source }))?;
         let mut command = Command::new(&launch.program);
         command
             .args(&launch.arguments)
@@ -480,6 +504,75 @@ impl EngineSession {
             }));
         };
         let stderr_drain = tokio::spawn(drain(stderr, launch.stderr_capture_bytes));
+        Self::assembled(
+            Some(child),
+            Box::new(stdin),
+            Box::new(stdout),
+            stderr_drain,
+            workspace_root,
+            launch.startup_timeout,
+            launch.request_timeout,
+            launch.initialization_options,
+        )
+        .await
+    }
+
+    /// Completes the handshake over an already-connected transport, with a
+    /// synthetic standard-error stream and no process to spawn, wait, or
+    /// kill.
+    ///
+    /// Exercises framing, correlation, capability negotiation, and the
+    /// standard-error drain from an exchange-level test that owns both ends
+    /// of the byte stream. `launch.program`, `launch.arguments`, and
+    /// `launch.environment` are never read; only the handshake and capture
+    /// bounds apply. Production sessions always start through
+    /// [`EngineSession::start`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] under the same conditions as
+    /// [`EngineSession::start`], minus a failed spawn.
+    pub async fn start_over_transport(
+        launch: EngineLaunch,
+        workspace_root: &Path,
+        transport: impl AsyncRead + AsyncWrite + Send + 'static,
+        stderr: impl AsyncRead + Send + Unpin + 'static,
+    ) -> Result<Self, EngineError> {
+        let (read_half, write_half) = tokio::io::split(transport);
+        let stderr_drain = tokio::spawn(drain(stderr, launch.stderr_capture_bytes));
+        Self::assembled(
+            None,
+            Box::new(write_half),
+            Box::new(read_half),
+            stderr_drain,
+            workspace_root,
+            launch.startup_timeout,
+            launch.request_timeout,
+            launch.initialization_options,
+        )
+        .await
+    }
+
+    /// Builds the session over an acquired transport and runs the
+    /// handshake, ending the session and propagating the failure if it
+    /// fails. Shared by [`EngineSession::start`] and
+    /// [`EngineSession::start_over_transport`], the only two constructors.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one field per assembled struct member"
+    )]
+    async fn assembled(
+        child: Option<Child>,
+        stdin: EngineWriter,
+        stdout: EngineReader,
+        stderr_drain: tokio::task::JoinHandle<CapturedStream>,
+        workspace_root: &Path,
+        startup_timeout: Duration,
+        request_timeout: Duration,
+        initialization_options: Option<Value>,
+    ) -> Result<Self, EngineError> {
+        let root = TreeRoot::new(workspace_root)
+            .map_err(|source| Error::new(EngineFault::Document { source }))?;
         let mut session = Self {
             child,
             stdin,
@@ -490,7 +583,7 @@ impl EngineSession {
             queue: VecDeque::new(),
             capabilities: Capabilities::default(),
             root,
-            request_timeout: launch.request_timeout,
+            request_timeout,
             published: BTreeMap::new(),
             progress: WorkProgress::default(),
             empty_answers: EmptyAnswers::default(),
@@ -498,11 +591,7 @@ impl EngineSession {
             ended: false,
         };
         if let Err(error) = session
-            .handshake(
-                workspace_root,
-                launch.startup_timeout,
-                launch.initialization_options,
-            )
+            .handshake(workspace_root, startup_timeout, initialization_options)
             .await
         {
             session.end().await;
@@ -826,11 +915,13 @@ impl EngineSession {
         }
         if !self.ended {
             let _exit = self.notify::<Exit>(&()).await;
-            let waited = tokio::time::timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await;
-            if !matches!(waited, Ok(Ok(_))) {
-                // The child overstayed shutdown or cannot be observed: kill
-                // and reap it rather than leave it running.
-                let _ = self.child.kill().await;
+            if let Some(child) = self.child.as_mut() {
+                let waited = tokio::time::timeout(SHUTDOWN_TIMEOUT, child.wait()).await;
+                if !matches!(waited, Ok(Ok(_))) {
+                    // The child overstayed shutdown or cannot be observed:
+                    // kill and reap it rather than leave it running.
+                    let _ = child.kill().await;
+                }
             }
             self.ended = true;
         }
@@ -1117,15 +1208,20 @@ impl EngineSession {
         }
     }
 
-    /// Kills and reaps the engine; later operations are refused.
+    /// Kills and reaps a spawned engine; later operations are refused.
+    ///
+    /// A session with no process (started over a transport) has nothing to
+    /// kill; dropping its boxed streams closes its side of the connection.
     async fn end(&mut self) {
         if self.ended {
             return;
         }
         self.ended = true;
-        // A kill on an already-exited child only re-observes it; the
-        // result carries nothing actionable beyond the fault in flight.
-        let _ = self.child.kill().await;
+        if let Some(child) = self.child.as_mut() {
+            // A kill on an already-exited child only re-observes it; the
+            // result carries nothing actionable beyond the fault in flight.
+            let _ = child.kill().await;
+        }
     }
 }
 

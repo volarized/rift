@@ -1,7 +1,10 @@
 //! The rust-analyzer probe and the real `[engines.rust]` table.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::Path;
+
+use crate::engine_fixture::EngineFixture;
 
 /// The engine program the live rust fixtures name in `program`.
 ///
@@ -61,8 +64,15 @@ pub(crate) fn require_rust_analyzer(fixture_root: &Path) {
     }
 }
 
-/// The real `[engines.rust]` table: rust-analyzer over the fixture's cargo
-/// project.
+/// The real `[engines.rust]` table, built from [`fixture`].
+pub(crate) fn rust_engine_configuration() -> String {
+    fixture().configuration_toml()
+}
+
+/// The fixture data the shared harness turns into the `[engines.rust]`
+/// table: rust-analyzer over the fixture's cargo project, with the
+/// toolchain override that lets it start outside this repository's own
+/// pinned channel.
 ///
 /// rust-analyzer answers initialize before it has loaded the project and
 /// keeps indexing afterwards, so the bounds are generous - and still
@@ -73,15 +83,16 @@ pub(crate) fn require_rust_analyzer(fixture_root: &Path) {
 /// project load over `$/progress` and ends that announcement about 830ms
 /// in on this fixture, then cancels requests until it settles around
 /// 2.3s; the eight default attempts reach past 9.75s.
-pub(crate) fn rust_engine_configuration() -> String {
-    let environment = rust_analyzer_environment()
-        .into_iter()
-        .map(|(key, value)| format!("{key} = \"{value}\""))
-        .collect::<Vec<String>>()
-        .join("\n");
-    format!(
-        "[engines.rust]\nprogram = \"{RUST_ANALYZER_PROGRAM}\"\nlanguages = [\"rust\"]\n\
-         startup_timeout = \"2m\"\nrequest_timeout = \"2m\"\n\n\
-         [engines.rust.environment]\n{environment}\n"
-    )
+pub(crate) fn fixture() -> EngineFixture {
+    let mut environment = String::new();
+    for (key, value) in rust_analyzer_environment() {
+        writeln!(environment, "{key} = \"{value}\"").expect("a string write cannot fail");
+    }
+    EngineFixture {
+        name: "rust",
+        program: RUST_ANALYZER_PROGRAM,
+        arguments: Vec::new(),
+        languages: vec!["rust"],
+        extra_toml: format!("\n[engines.rust.environment]\n{environment}"),
+    }
 }

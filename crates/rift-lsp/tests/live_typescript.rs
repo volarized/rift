@@ -16,38 +16,24 @@
 
 #![cfg(unix)]
 
+mod engine_fixture;
 mod live_engine_gate;
 mod typescript_engine;
 
-use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use live_engine_gate::engine_live;
 use lsp_types::FileOperationPatternKind;
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::session::{EngineLaunch, EngineSession};
-use typescript_engine::{
-    BUNX_PROGRAM, LANGUAGE_SERVER_PACKAGE, install_typescript_engine, typescript_package_files,
-};
+use typescript_engine::{install_typescript_engine, typescript_package_files};
 
-/// The live launch. The engine answers initialize in tens of milliseconds
-/// once `bunx` has resolved the package, so the bounds carry a cold
-/// resolution - and are still bounds.
-///
-/// `tsserver.useSyntaxServer = "never"` keeps the engine to one semantic
-/// server, the launch rift-mcp's tool suite pins its answers against.
+/// The live launch, built from the shared fixture's typescript-language-server
+/// data - `tsserver.useSyntaxServer = "never"` keeps the engine to one
+/// semantic server, the launch rift-mcp's tool suite pins its answers
+/// against.
 fn launch() -> EngineLaunch {
-    EngineLaunch {
-        program: BUNX_PROGRAM.to_owned(),
-        arguments: vec![LANGUAGE_SERVER_PACKAGE.to_owned(), "--stdio".to_owned()],
-        environment: BTreeMap::new(),
-        initialization_options: Some(serde_json::json!({
-            "tsserver": { "useSyntaxServer": "never" }
-        })),
-        startup_timeout: Duration::from_mins(2),
-        request_timeout: Duration::from_mins(2),
-        stderr_capture_bytes: 65_536,
-    }
+    typescript_engine::fixture().launch()
 }
 
 /// One bun project on disk with the pinned `typescript` installed.

@@ -9,11 +9,6 @@
 //! precondition and an unsupported file-level change - plus a live witnessed
 //! `replace_node` that lands after the walk.
 
-// `fake_engine` is a shared helper file compiled separately into every test binary that
-// declares it; this binary calls only `engine_configuration`, so `counted` and `recorded`
-// read as dead code here even though `rename_symbol.rs` and `move_file.rs` call them.
-#[allow(dead_code)]
-mod fake_engine;
 mod hermetic_search;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -131,9 +126,11 @@ fn corpus() -> Vec<(&'static str, Value)> {
     requests
 }
 
-/// `remove_symbol` requests against the `[engines.fake]` references-only engine: a clean
-/// removal with no reference to find, a refusal when one stands, and the same target applied
-/// under `force` once the refusal has proven the tree stayed untouched.
+/// `remove_symbol` requests with no `[engines]` table configured: this fixture proves the
+/// schema and pagination arms the corpus walk needs, not the engine-checked reference arm -
+/// `live_rust_analyzer.rs`'s `remove_symbol_with_a_standing_reference_refuses_and_names_the_caller`
+/// is what proves a real engine's `no_references` precondition, gated behind
+/// `RIFT_ENGINE_LIVE` since this hermetic corpus runs in plain `cargo test`.
 fn remove_corpus() -> Vec<(&'static str, Value)> {
     vec![
         (
@@ -148,13 +145,6 @@ fn remove_corpus() -> Vec<(&'static str, Value)> {
             json!({
                 "symbol": "rift://symbol/rust/remove_watched.rs/beacon_watched",
                 "force": false
-            }),
-        ),
-        (
-            "remove_symbol",
-            json!({
-                "symbol": "rift://symbol/rust/remove_watched.rs/beacon_watched",
-                "force": true
             }),
         ),
         // A stale witness, proving `remove_node` reaches the same witness verification
@@ -536,8 +526,10 @@ async fn served_fixture() -> TestResult<(
         directory.path().join("notes.txt"),
         "Beacon telemetry guidance covers rotating every legacy sensor unit safely.\n",
     )?;
-    // Unreferenced anywhere, so removing it proves the checked-clean arm; `remove_watched.rs`
-    // and `remove_caller.rs` give the removal corpus a standing reference to find instead.
+    // No `[engines]` table stands over this fixture, so both files remove unchecked; a real
+    // engine's own standing-reference refusal is proven in `live_rust_analyzer.rs` instead.
+    // `remove_caller.rs` still calls `beacon_watched`, so a future engine-backed suite that
+    // reuses this shape finds the reference this fixture cannot check.
     fs::write(
         directory.path().join("remove_lonely.rs"),
         "pub fn beacon_lonely() {}\n",
@@ -559,14 +551,11 @@ async fn served_fixture() -> TestResult<(
     // `hidden.rs` stays gitignored and uncommitted, everything else lands in
     // the fixture's one commit on `main`.
     //
-    // The `[engines.fake]` table claims `rust` and advertises only
-    // `textDocument/references`, so `remove_symbol` and `remove_node` reach a real reference
-    // check without disturbing what every other tool sees: neither `rename_symbol` nor
-    // `move_file` finds a rename or will-rename capability on this engine, so both still
-    // refuse or fall back exactly as they do with no engine configured at all.
-    let mut configuration = hermetic_search::SEMANTIC_DISABLED.to_owned();
-    configuration.push('\n');
-    configuration.push_str(&fake_engine::engine_configuration("references-only", "10s"));
+    // No `[engines]` table: this fixture proves schema and pagination, not engine-checked
+    // behavior, so `rename_symbol`, `move_file`, and `remove_symbol` all take their
+    // no-engine-configured arm. `live_rust_analyzer.rs` and `live_typescript.rs` prove the
+    // engine-covered arms of every one of those tools against a real engine.
+    let configuration = hermetic_search::SEMANTIC_DISABLED.to_owned();
     fs::write(directory.path().join("rift.toml"), configuration)?;
     rift_history::fixture::init(directory.path());
     rift_history::fixture::commit_all(directory.path(), "fixture baseline");
@@ -647,8 +636,8 @@ impl CorpusArms {
             );
         }
         assert!(
-            self.precondition_kinds.contains("no_references"),
-            "the corpus must prove the no_references precondition; proven: {:?}",
+            self.precondition_kinds.contains("target_exists"),
+            "the corpus must prove the target_exists precondition; proven: {:?}",
             self.precondition_kinds
         );
     }
@@ -1043,12 +1032,11 @@ async fn live_witnessed_replace_node_lands_and_validates() -> TestResult {
 }
 
 /// A fresh witnessed node address round-trips through `remove_node` the way
-/// [`live_witnessed_replace_node_lands_and_validates`] proves it for `replace_node`: the
-/// listed node names `beacon_lonely` - unreferenced anywhere in the fixture - so the
-/// `[engines.fake]` references-only engine checks it clean and the removal applies with no
-/// warning.
+/// [`live_witnessed_replace_node_lands_and_validates`] proves it for `replace_node`: no
+/// `[engines]` table stands over this fixture, so the removal applies unchecked and the
+/// listed node's own declaration is what disappears.
 #[tokio::test]
-async fn live_witnessed_remove_node_checks_references_and_validates() -> TestResult {
+async fn live_witnessed_remove_node_round_trips_and_validates() -> TestResult {
     let (directory, client, server_task) = served_fixture().await?;
     let tools = client.list_all_tools().await?;
     let validators = tool_validators(&tools)?;

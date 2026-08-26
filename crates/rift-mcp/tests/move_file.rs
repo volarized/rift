@@ -1,23 +1,29 @@
-//! Integration tests: `move_file` against the scripted fake engine.
+//! Integration tests: `move_file` without an engine, and its typed
+//! refusals.
 //!
-//! The engine arms cover the capability grid the live pair exhibits:
-//! will-rename present and absent, filters covering and missing the file,
-//! and a proposal, a `null` answer, and an out-of-tree escape.
+//! The engine-covered arms - a proposal, a `null` answer, an out-of-tree
+//! escape, absorption across an empty or provisional answer, and every
+//! capability-grid shape - are proven against real engines instead of a
+//! scripted one: `live_rust_analyzer.rs` and `live_typescript.rs` prove
+//! the applied move and its reference rewrite, and the absorption and
+//! empty-answer scenarios that stood here belong to the engine readiness
+//! rework that follows this step, which lands its own coverage through
+//! this crate's live suites once it reworks that policy.
 
 #![cfg(unix)]
 
-mod fake_engine;
 mod hermetic_search;
+// `served_relative_workspace` is part of `workspace_client`'s shared surface; this binary
+// never needs a relative-root fixture, since the tests here carry no engine for the root
+// spelling to matter to.
+#[allow(dead_code)]
 mod workspace_client;
 
 use std::fs;
 
-use fake_engine::{counted, engine_configuration, recorded};
 use rmcp::model::CallToolRequestParams;
 use serde_json::{Value, json};
-use workspace_client::{
-    TestResult, call_retrying_acceptance, served_relative_workspace, served_workspace, tool_request,
-};
+use workspace_client::{TestResult, call_retrying_acceptance, served_workspace, tool_request};
 
 fn move_request(from: &str, to: &str) -> CallToolRequestParams {
     tool_request("move_file", &json!({ "from": from, "to": to }))
@@ -26,15 +32,6 @@ fn move_request(from: &str, to: &str) -> CallToolRequestParams {
 /// The moved module and the file referencing it by stem.
 const HUB: &str = "pub fn hub() {}\n// hub module\n";
 const CALLER: &str = "mod hub;\n";
-
-/// One tool call expected to fail, returning its wire error payload.
-fn wire_error(error: rmcp::ServiceError) -> TestResult<Value> {
-    let rmcp::ServiceError::McpError(data) = error else {
-        return Err(format!("expected a tool error, got {error:?}").into());
-    };
-    data.data
-        .ok_or_else(|| "wire error data must be present".into())
-}
 
 fn move_warnings(structured: &Value) -> Vec<&Value> {
     structured["summary"]["diagnostics"]
@@ -46,13 +43,6 @@ fn move_warnings(structured: &Value) -> Vec<&Value> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn refusal_detail(structured: &Value) -> String {
-    structured["diagnostics"][0]["message"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned()
 }
 
 #[tokio::test]
@@ -84,278 +74,6 @@ async fn applied_move_without_an_engine_carries_the_warning() -> TestResult {
         CALLER,
         "references stay as they were"
     );
-
-    client.cancel().await?;
-    server_task.await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn applied_move_with_an_engine_rewrites_the_referencing_file() -> TestResult {
-    let (directory, client, server_task) = served_workspace(
-        &[("hub.rs", HUB), ("main.rs", CALLER)],
-        Some(engine_configuration("moves-imports", "20s")),
-    )
-    .await?;
-
-    let structured = call_retrying_acceptance(&client, move_request("hub.rs", "spoke.rs")).await?;
-    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
-    assert!(
-        move_warnings(&structured).is_empty(),
-        "an engine-covered move carries no warning: {structured:#}"
-    );
-    assert_eq!(
-        structured["summary"]["paths"],
-        json!(["hub.rs", "main.rs", "spoke.rs"]),
-        "the summary carries the old path, the rewrite, and the new path"
-    );
-    assert!(!directory.path().join("hub.rs").exists());
-    assert_eq!(
-        fs::read_to_string(directory.path().join("spoke.rs"))?,
-        "pub fn spoke() {}\n// spoke module\n",
-        "edits addressed to the moved file land on the moved bytes"
-    );
-    assert_eq!(
-        fs::read_to_string(directory.path().join("main.rs"))?,
-        "mod spoke;\n"
-    );
-
-    client.cancel().await?;
-    server_task.await?;
-    Ok(())
-}
-
-/// A workspace served under the CLI's own root spelling moves the same way
-/// one served under an absolute path does.
-///
-/// The engine proposes the reference rewrite in `file://` URIs, which carry
-/// no working directory, so the root's spelling reaches the proposal
-/// conversion even though every filesystem operation below the root is
-/// blind to it.
-#[tokio::test]
-async fn applied_move_under_a_relative_root_rewrites_the_referencing_file() -> TestResult {
-    let (directory, client, server_task) = served_relative_workspace(
-        &[("hub.rs", HUB), ("main.rs", CALLER)],
-        Some(engine_configuration("moves-imports", "20s")),
-    )
-    .await?;
-
-    let structured = call_retrying_acceptance(&client, move_request("hub.rs", "spoke.rs")).await?;
-    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
-    assert!(
-        move_warnings(&structured).is_empty(),
-        "an engine-covered move carries no warning: {structured:#}"
-    );
-    assert!(!directory.path().join("hub.rs").exists());
-    assert_eq!(
-        fs::read_to_string(directory.path().join("main.rs"))?,
-        "mod spoke;\n"
-    );
-
-    client.cancel().await?;
-    server_task.await?;
-    Ok(())
-}
-
-/// An engine that has announced its work and then proposes nothing is
-/// taken at its word: the move lands, the engine was asked once, and
-/// nothing warns.
-#[tokio::test]
-async fn null_proposal_from_an_announced_engine_moves_without_a_warning() -> TestResult {
-    let logs = tempfile::tempdir()?;
-    let log = logs.path().join("lifecycle.log");
-    let (directory, client, server_task) = served_workspace(
-        &[("hub.rs", HUB)],
-        Some(counted(
-            &engine_configuration("announces-then-answers-nothing", "20s"),
-            &log,
-            ABSORPTION_ATTEMPTS,
-        )),
-    )
-    .await?;
-
-    let structured = call_retrying_acceptance(&client, move_request("hub.rs", "spoke.rs")).await?;
-    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
-    assert!(
-        move_warnings(&structured).is_empty(),
-        "an engine that announced its work is believed when it proposes nothing: {structured:#}"
-    );
-    assert_eq!(
-        recorded(&log, "will-rename"),
-        1,
-        "an announced engine's answer is settled, so it is asked once"
-    );
-    assert_eq!(fs::read_to_string(directory.path().join("spoke.rs"))?, HUB);
-
-    client.cancel().await?;
-    server_task.await?;
-    Ok(())
-}
-
-/// The first request of a session races the engine's first announcement:
-/// an engine that has not read the file yet answers the will-rename with
-/// no edit, which is what an engine with nothing to update answers too.
-/// The server asks once more, and the imports the second answer carries
-/// land with the move.
-#[tokio::test]
-async fn a_first_empty_proposal_is_asked_again_and_the_imports_land() -> TestResult {
-    let logs = tempfile::tempdir()?;
-    let log = logs.path().join("lifecycle.log");
-    let (directory, client, server_task) = served_workspace(
-        &[("hub.rs", HUB), ("main.rs", CALLER)],
-        Some(counted(
-            &engine_configuration("moves-null-then-imports", "20s"),
-            &log,
-            ABSORPTION_ATTEMPTS,
-        )),
-    )
-    .await?;
-
-    let structured = call_retrying_acceptance(&client, move_request("hub.rs", "spoke.rs")).await?;
-    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
-    assert!(
-        move_warnings(&structured).is_empty(),
-        "the resent request carried the updates: {structured:#}"
-    );
-    assert_eq!(
-        recorded(&log, "will-rename"),
-        2,
-        "the empty answer was discarded and the engine asked again"
-    );
-    assert_eq!(
-        fs::read_to_string(directory.path().join("main.rs"))?,
-        "mod spoke;\n",
-        "the reference the second answer proposed was rewritten"
-    );
-    assert_eq!(
-        fs::read_to_string(directory.path().join("spoke.rs"))?,
-        "pub fn spoke() {}\n// spoke module\n"
-    );
-
-    client.cancel().await?;
-    server_task.await?;
-    Ok(())
-}
-
-/// An engine that answers nothing twice has said what it has to say. The
-/// move lands, the engine was asked exactly twice, and the summary carries
-/// the references-not-updated warning: this engine has never announced any
-/// work, so its silence is not proof that nothing needed updating.
-#[tokio::test]
-async fn a_second_empty_proposal_moves_the_file_with_the_warning() -> TestResult {
-    let logs = tempfile::tempdir()?;
-    let log = logs.path().join("lifecycle.log");
-    let (directory, client, server_task) = served_workspace(
-        &[("hub.rs", HUB), ("main.rs", CALLER)],
-        Some(counted(
-            &engine_configuration("moves-null", "20s"),
-            &log,
-            ABSORPTION_ATTEMPTS,
-        )),
-    )
-    .await?;
-
-    let structured = call_retrying_acceptance(&client, move_request("hub.rs", "spoke.rs")).await?;
-    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
-    let warnings = move_warnings(&structured);
-    assert_eq!(warnings.len(), 1, "{structured:#}");
-    assert!(
-        warnings[0]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("has announced no work of its own"),
-        "the warning names what the engine never did: {structured:#}"
-    );
-    assert_eq!(
-        recorded(&log, "will-rename"),
-        2,
-        "one resend, and only one, however many attempts the table allows"
-    );
-    assert_eq!(fs::read_to_string(directory.path().join("spoke.rs"))?, HUB);
-    assert_eq!(
-        fs::read_to_string(directory.path().join("main.rs"))?,
-        CALLER,
-        "the references stay as they were, which is what the warning says"
-    );
-
-    client.cancel().await?;
-    server_task.await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn engine_without_will_rename_moves_with_the_capability_warning() -> TestResult {
-    let (directory, client, server_task) = served_workspace(
-        &[("hub.rs", HUB)],
-        Some(engine_configuration("no-file-operations", "20s")),
-    )
-    .await?;
-
-    let structured = call_retrying_acceptance(&client, move_request("hub.rs", "spoke.rs")).await?;
-    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
-    let warnings = move_warnings(&structured);
-    assert_eq!(warnings.len(), 1, "{structured:#}");
-    assert!(
-        warnings[0]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("does not advertise workspace/willRenameFiles"),
-        "the warning names the absent capability: {structured:#}"
-    );
-    assert_eq!(fs::read_to_string(directory.path().join("spoke.rs"))?, HUB);
-
-    client.cancel().await?;
-    server_task.await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn filters_missing_the_file_move_with_the_filter_warning() -> TestResult {
-    let (directory, client, server_task) = served_workspace(
-        &[("hub.rs", HUB)],
-        Some(engine_configuration("python-filters", "20s")),
-    )
-    .await?;
-
-    let structured = call_retrying_acceptance(&client, move_request("hub.rs", "spoke.rs")).await?;
-    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
-    let warnings = move_warnings(&structured);
-    assert_eq!(warnings.len(), 1, "{structured:#}");
-    assert!(
-        warnings[0]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("filters do not cover the moved file"),
-        "the warning names the filter mismatch: {structured:#}"
-    );
-    assert_eq!(fs::read_to_string(directory.path().join("spoke.rs"))?, HUB);
-
-    client.cancel().await?;
-    server_task.await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn out_of_tree_proposal_refuses_and_nothing_moves() -> TestResult {
-    let (directory, client, server_task) = served_workspace(
-        &[("hub.rs", HUB)],
-        Some(engine_configuration("moves-outside-root", "20s")),
-    )
-    .await?;
-
-    let structured = call_retrying_acceptance(&client, move_request("hub.rs", "spoke.rs")).await?;
-    assert_eq!(structured["status"], json!("refused"), "{structured:#}");
-    assert_eq!(structured["reason"], json!("unsupported"));
-    assert!(
-        refusal_detail(&structured).contains("outside the workspace tree"),
-        "the refusal names the escape: {structured:#}"
-    );
-    assert_eq!(
-        fs::read_to_string(directory.path().join("hub.rs"))?,
-        HUB,
-        "the refusal leaves the tree untouched, the move included"
-    );
-    assert!(!directory.path().join("spoke.rs").exists());
 
     client.cancel().await?;
     server_task.await?;
@@ -395,28 +113,6 @@ async fn missing_source_and_occupied_destination_refuse() -> TestResult {
 }
 
 #[tokio::test]
-async fn engine_timeout_is_a_typed_error_and_nothing_moves() -> TestResult {
-    let (directory, client, server_task) = served_workspace(
-        &[("hub.rs", HUB)],
-        Some(engine_configuration("parks-on-move", "1s")),
-    )
-    .await?;
-
-    let error = client
-        .call_tool(move_request("hub.rs", "spoke.rs"))
-        .await
-        .expect_err("a parked will-rename request must time out as a typed error");
-    let wire = wire_error(error)?;
-    assert_eq!(wire["code"], json!("temporarily_unavailable"), "{wire:#}");
-    assert_eq!(fs::read_to_string(directory.path().join("hub.rs"))?, HUB);
-    assert!(!directory.path().join("spoke.rs").exists());
-
-    client.cancel().await?;
-    server_task.await?;
-    Ok(())
-}
-
-#[tokio::test]
 async fn illegal_paths_fail_as_typed_invalid_requests() -> TestResult {
     let (_directory, client, server_task) = served_workspace(&[("hub.rs", HUB)], None).await?;
 
@@ -429,54 +125,16 @@ async fn illegal_paths_fail_as_typed_invalid_requests() -> TestResult {
             .call_tool(move_request(from, to))
             .await
             .expect_err("an illegal move request fails before resolution");
-        let wire = wire_error(error)?;
+        let rmcp::ServiceError::McpError(data) = error else {
+            return Err(format!("expected a tool error, got {error:?}").into());
+        };
+        let wire = data.data.ok_or("wire error data must be present")?;
         assert_eq!(
             wire["code"],
             json!("invalid_request"),
             "{from} -> {to}: {wire:#}"
         );
     }
-
-    client.cancel().await?;
-    server_task.await?;
-    Ok(())
-}
-
-/// The attempt bound the absorption test states for itself, small enough
-/// to count off the lifecycle log.
-const ABSORPTION_ATTEMPTS: u64 = 3;
-
-/// A move is a plan phase, so an engine that never stops analyzing spends
-/// the whole attempt bound and then surfaces the failure the caller can
-/// resend. Nothing moved: the plan never reached the apply.
-#[tokio::test]
-async fn a_move_that_never_settles_surfaces_after_the_whole_budget() -> TestResult {
-    let logs = tempfile::tempdir()?;
-    let log = logs.path().join("lifecycle.log");
-    let (directory, client, server_task) = served_workspace(
-        &[("hub.rs", HUB), ("lib.rs", CALLER)],
-        Some(counted(
-            &engine_configuration("never-ends-progress", "20s"),
-            &log,
-            ABSORPTION_ATTEMPTS,
-        )),
-    )
-    .await?;
-
-    let error = client
-        .call_tool(move_request("hub.rs", "spoke.rs"))
-        .await
-        .expect_err("an engine that never settles must surface a typed error");
-    let wire = wire_error(error)?;
-    assert_eq!(wire["code"], json!("temporarily_unavailable"), "{wire:#}");
-    assert_eq!(wire["retry"], json!("same_request"), "{wire:#}");
-    assert_eq!(
-        recorded(&log, "initialize"),
-        1,
-        "an engine that keeps answering is never restarted"
-    );
-    assert_eq!(fs::read_to_string(directory.path().join("hub.rs"))?, HUB);
-    assert!(!directory.path().join("spoke.rs").exists());
 
     client.cancel().await?;
     server_task.await?;
