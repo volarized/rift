@@ -257,6 +257,9 @@ one of those files returns as a `file` hit, tagged the same way:
 Each identity carries the witness a later
 [`replace_node`](#tool-replace_node) verifies.
 
+A visible path no syntax provider parses - `justfile`, `.gitignore` - refuses
+`capability_unavailable`, naming the extension, or stating that the path carries none.
+
 ## Resources
 
 <VersionBadge version="planned" />
@@ -316,6 +319,11 @@ semantics: a hunk's context and deleted lines locate it, and its `@@` header's l
 only a hint. Resolution starts each hunk's search at its header position, corrected by the drift
 already found from earlier hunks in the same file, then widens outward - nearer positions first,
 the earlier position breaking a tie.
+
+The target is any file the workspace's [`[source]`](/docs/configuration#source) policy makes
+visible, parsed or not: `justfile` and `docs/content/docs/configuration.mdx` both resolve, the
+second through the same text index [`search`](#tool-search) reads. A path the policy excludes
+refuses `unsupported`, naming the policy.
 
 A header's line counts are a hint on the same footing. The server derives each hunk's counts
 from the hunk's own body before parsing it, the way `git apply` derives them, so a miscounted

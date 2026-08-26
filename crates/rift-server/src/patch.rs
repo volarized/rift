@@ -16,6 +16,11 @@
 //! result names the regions that changed instead of echoing whole files.
 //! `/dev/null` headers create or delete a file; renames and copies stay
 //! unsupported.
+//!
+//! An existing target is any file the workspace's `[source]` policy makes visible,
+//! parsed or not: the syntax index's own copy, then the text index's, then a direct
+//! filesystem read guarded by the policy alone. The base image is always the file's
+//! bytes on disk; hunk context is the guard and needs no syntax tree.
 
 use std::fs;
 use std::path::Path;
@@ -23,6 +28,7 @@ use std::path::Path;
 use diffy::{Hunk, HunkRange, Line, ParsePatchError, Patch};
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::line;
+use rift_index::TextSourceFile;
 use rift_protocol::change::{
     ChangeResult, OperationPrecondition, OperationPreconditionKind, OperationPreconditionStatus,
     PreconditionValue, RefusalReason,
@@ -337,30 +343,107 @@ fn project_path(value: &str) -> Result<CoreProjectPath, ReadError> {
     })
 }
 
-/// Resolves a segment that edits an existing file.
+/// Resolves a segment that edits an existing file: the syntax or text index's own
+/// copy when the path is indexed, the `[source]` policy against the filesystem
+/// otherwise.
 fn resolve_modify(
     root: &Path,
     reads: &ReadService,
     path: &CoreProjectPath,
     parsed: &Patch<'_, str>,
 ) -> Result<Result<FileRewrite, ChangeResult>, ReadError> {
-    let Some(file) = reads.index().file(path) else {
-        return Ok(Err(target_missing_refusal(path)));
+    let base = match resolve_base_image(root, reads, path)? {
+        Ok(base) => base,
+        Err(refusal) => return Ok(Err(refusal)),
     };
-    let disk = fs::read_to_string(root.join(path.as_str()))
-        .map_err(|error| ReadFault::storage(path.as_str(), "read", &error))?;
-    if disk != file.source() {
-        return Ok(Err(source_drift_refusal(path, file.source(), &disk)));
-    }
-    match apply_segment(file.source(), parsed) {
+    match apply_segment(&base, parsed) {
         Ok(applied) => Ok(Ok(FileRewrite::modify(
             path.clone(),
-            file.source(),
+            &base,
             applied.next_source,
             applied.replaced,
         ))),
         Err(detail) => Ok(Err(detail.into_refusal(path))),
     }
+}
+
+/// The bytes the index already holds for `path`: the syntax index's copy, then the
+/// text index's copy. `None` when neither indexes it.
+fn indexed_source<'a>(reads: &'a ReadService, path: &CoreProjectPath) -> Option<&'a str> {
+    if let Some(file) = reads.index().file(path) {
+        return Some(file.source());
+    }
+    reads.index().text_file(path).map(TextSourceFile::content)
+}
+
+/// Compares `indexed`'s stored copy against the disk read at `absolute`, taking the
+/// disk bytes as the base image on agreement and refusing `source_unchanged` on
+/// disagreement.
+fn drift_checked_base(
+    path: &CoreProjectPath,
+    indexed: &str,
+    absolute: &Path,
+) -> Result<Result<String, ChangeResult>, ReadError> {
+    let disk = fs::read_to_string(absolute)
+        .map_err(|error| ReadFault::storage(path.as_str(), "read", &error))?;
+    if disk == indexed {
+        Ok(Ok(disk))
+    } else {
+        Ok(Err(source_drift_refusal(path, indexed, &disk)))
+    }
+}
+
+/// Reads `path` fresh from disk through the `[source]` policy alone: the route for a
+/// visible file no syntax provider parses and no text extension includes, such as
+/// `justfile` or `.gitignore`. A path the policy excludes refuses `unsupported`,
+/// naming the policy; a visible path absent from the filesystem refuses
+/// `target_exists` the way an unindexed path already does.
+fn visible_source(
+    reads: &ReadService,
+    path: &CoreProjectPath,
+    absolute: &Path,
+) -> Result<Result<String, ChangeResult>, ReadError> {
+    let visible = reads
+        .source_policy()
+        .is_some_and(|policy| policy.visible(absolute));
+    if !visible {
+        return Ok(Err(not_visible_refusal(path)));
+    }
+    match fs::read_to_string(absolute) {
+        Ok(disk) => Ok(Ok(disk)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(Err(target_missing_refusal(path)))
+        }
+        Err(error) => Err(ReadFault::storage(path.as_str(), "read", &error)),
+    }
+}
+
+/// Resolves `path`'s current base image for a patch to apply against: the syntax
+/// index's copy, then the text index's copy, each checked for drift against the
+/// disk; the `[source]` policy against the filesystem last, for a visible file no
+/// provider parses. The base image is always the file's bytes on disk - hunk context
+/// is the guard and needs no syntax tree. `resolve_modify` and `resolve_delete` share
+/// this resolution; only what they do with the result differs.
+fn resolve_base_image(
+    root: &Path,
+    reads: &ReadService,
+    path: &CoreProjectPath,
+) -> Result<Result<String, ChangeResult>, ReadError> {
+    let absolute = root.join(path.as_str());
+    match indexed_source(reads, path) {
+        Some(indexed) => drift_checked_base(path, indexed, &absolute),
+        None => visible_source(reads, path, &absolute),
+    }
+}
+
+/// Refuses a target the `[source]` policy makes invisible: excluded by
+/// `[source].exclude`, `.gitignore`, or the hard floor. The file is there; the
+/// workspace asked for it not to be.
+fn not_visible_refusal(path: &CoreProjectPath) -> ChangeResult {
+    crate::rename::unsupported_refusal(format!(
+        "{} is outside the workspace's [source] visibility policy",
+        path.as_str()
+    ))
 }
 
 /// Resolves a segment that creates a new file. The starting image is
@@ -382,25 +465,22 @@ fn resolve_create(
     }
 }
 
-/// Resolves a segment that deletes an existing file: the hunks must
-/// consume the entire file, leaving nothing behind.
+/// Resolves a segment that deletes an existing file: the hunks must consume the
+/// entire file, leaving nothing behind. Shares [`resolve_base_image`] with
+/// `resolve_modify`, so an unparsed visible file deletes the same way it modifies.
 fn resolve_delete(
     root: &Path,
     reads: &ReadService,
     path: &CoreProjectPath,
     parsed: &Patch<'_, str>,
 ) -> Result<Result<FileRewrite, ChangeResult>, ReadError> {
-    let Some(file) = reads.index().file(path) else {
-        return Ok(Err(target_missing_refusal(path)));
+    let base = match resolve_base_image(root, reads, path)? {
+        Ok(base) => base,
+        Err(refusal) => return Ok(Err(refusal)),
     };
-    let disk = fs::read_to_string(root.join(path.as_str()))
-        .map_err(|error| ReadFault::storage(path.as_str(), "read", &error))?;
-    if disk != file.source() {
-        return Ok(Err(source_drift_refusal(path, file.source(), &disk)));
-    }
-    match apply_segment(file.source(), parsed) {
+    match apply_segment(&base, parsed) {
         Ok(applied) if applied.next_source.is_empty() => {
-            Ok(Ok(FileRewrite::delete(path.clone(), file.source())))
+            Ok(Ok(FileRewrite::delete(path.clone(), &base)))
         }
         Ok(applied) => Ok(Err(deletion_incomplete_refusal(path, &applied.next_source))),
         Err(detail) => Ok(Err(detail.into_refusal(path))),
@@ -1695,6 +1775,146 @@ mod tests {
         assert_ne!(preconditions[0].expected, preconditions[0].observed);
         let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
         assert_eq!(untouched, "pub fn beacon() { }\n");
+        Ok(())
+    }
+
+    /// Builds a workspace with `lib.rs`, a text-indexed `.mdx` file, and two files no
+    /// extension gate admits at all: `justfile` and `.gitignore` itself.
+    fn visible_file_fixture() -> TestResult<(tempfile::TempDir, ReadService, ChangeService)> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(directory.path().join("notes.mdx"), "# Notes\nFirst line.\n")?;
+        fs::write(
+            directory.path().join("justfile"),
+            "default:\n    echo hello\n",
+        )?;
+        fs::write(directory.path().join(".gitignore"), "target\n")?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let changes = ChangeService::new(directory.path());
+        Ok((directory, reads, changes))
+    }
+
+    #[test]
+    fn patch_applies_against_a_text_indexed_file_no_syntax_provider_parses() -> TestResult {
+        let (directory, reads, changes) = visible_file_fixture()?;
+        let patch = "--- a/notes.mdx\n+++ b/notes.mdx\n@@ -1,2 +1,2 @@\n # Notes\n-First line.\n+Updated line.\n".to_owned();
+        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let summary = applied_summary(result);
+        assert_eq!(summary.paths, vec![ProjectPath("notes.mdx".to_owned())]);
+        let written = fs::read_to_string(directory.path().join("notes.mdx"))?;
+        assert_eq!(written, "# Notes\nUpdated line.\n");
+        Ok(())
+    }
+
+    /// A visible file no extension gate admits at all - no syntax provider claims it
+    /// and no `[search.text]` extension includes it - still resolves as a patch
+    /// target through the `[source]` policy alone. `justfile` and `.gitignore` both
+    /// prove it, in one change.
+    #[test]
+    fn patch_applies_against_files_no_extension_gate_admits() -> TestResult {
+        let (directory, reads, changes) = visible_file_fixture()?;
+        let patch = [
+            "--- a/justfile",
+            "+++ b/justfile",
+            "@@ -1,2 +1,2 @@",
+            " default:",
+            "-    echo hello",
+            "+    echo goodbye",
+            "--- a/.gitignore",
+            "+++ b/.gitignore",
+            "@@ -1 +1,2 @@",
+            " target",
+            "+build",
+            "",
+        ]
+        .join("\n");
+        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let summary = applied_summary(result);
+        assert_eq!(summary.paths.len(), 2);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("justfile"))?,
+            "default:\n    echo goodbye\n"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join(".gitignore"))?,
+            "target\nbuild\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn patch_deletes_a_file_no_extension_gate_admits() -> TestResult {
+        let (directory, reads, changes) = visible_file_fixture()?;
+        let patch = [
+            "--- a/justfile",
+            "+++ /dev/null",
+            "@@ -1,2 +0,0 @@",
+            "-default:",
+            "-    echo hello",
+            "",
+        ]
+        .join("\n");
+        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let summary = applied_summary(result);
+        assert_eq!(summary.paths, vec![ProjectPath("justfile".to_owned())]);
+        assert!(!directory.path().join("justfile").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn patch_against_a_source_excluded_path_refuses_unsupported_not_target_exists() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            directory.path().join("justfile"),
+            "default:\n    echo hello\n",
+        )?;
+        let visibility = SourceVisibility::new(Vec::new(), vec!["justfile".to_owned()], true);
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &visibility,
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let changes = ChangeService::new(directory.path());
+        let patch = "--- a/justfile\n+++ b/justfile\n@@ -1,2 +1,2 @@\n default:\n-    echo hello\n+    echo goodbye\n".to_owned();
+        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            diagnostics,
+        } = result
+        else {
+            panic!("a [source]-excluded target must refuse");
+        };
+        assert_eq!(
+            reason,
+            RefusalReason::Unsupported,
+            "a policy-excluded target refuses as unsupported, not unmet_precondition"
+        );
+        assert!(
+            preconditions.is_empty(),
+            "an unsupported refusal carries no preconditions: {preconditions:?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("justfile")
+                    && diagnostic.message.contains("[source]")),
+            "the diagnostic must name the excluded path and the policy: {diagnostics:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("justfile"))?,
+            "default:\n    echo hello\n",
+            "an excluded target is untouched"
+        );
         Ok(())
     }
 
