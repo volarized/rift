@@ -33,14 +33,6 @@
             ],
             "type": "object"
           },
-          "ProjectionId": {
-            "description": "Identity of one projection, and the URI that resolves it. The caller names the\nprojection at `projection_create` - a directory-valid name of 1 to 64 lowercase\nletters, digits, and interior dashes, such as `my-feature-one` - and the URI carries\nthat name. The name addresses the projection while it lives; `projection_remove`\nfrees it, and a later projection reusing the name is a distinct projection. A change\nrequest that omits its `projection` field applies to the workspace tree itself.",
-            "examples": [
-              "rift://projection/my-feature-one"
-            ],
-            "pattern": "^rift://projection/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$",
-            "type": "string"
-          },
           "RevisionId": {
             "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it. Rift carries it opaquely and never orders two revisions\nby comparing their identifiers.",
             "examples": [
@@ -48,40 +40,10 @@
             ],
             "pattern": "^[A-Za-z0-9._/-]{1,128}$",
             "type": "string"
-          },
-          "SearchScope": {
-            "description": "Which source locations a symbol lookup or search may return.",
-            "oneOf": [
-              {
-                "const": "project",
-                "description": "Only source the workspace owns.",
-                "type": "string"
-              },
-              {
-                "const": "dependencies",
-                "description": "Only source of resolved dependencies.",
-                "type": "string"
-              },
-              {
-                "const": "all",
-                "description": "Project, dependency, and standard-library source alike.",
-                "type": "string"
-              }
-            ]
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
-        "allOf": [
-          {
-            "not": {
-              "required": [
-                "rev",
-                "projection"
-              ]
-            }
-          }
-        ],
         "examples": [
           {
             "include_body": true,
@@ -91,14 +53,12 @@
             },
             "limit": 5,
             "name": "ReadService",
-            "page_index": 0,
-            "scope": "all"
+            "page_index": 0
           },
           {
             "limit": 10,
             "name": "Deserialize",
-            "page_index": 1,
-            "scope": "dependencies"
+            "page_index": 1
           }
         ],
         "properties": {
@@ -144,17 +104,6 @@
             "minimum": 0,
             "type": "integer"
           },
-          "projection": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/ProjectionId"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "The projection to read. Omitted reads the workspace tree."
-          },
           "rev": {
             "anyOf": [
               {
@@ -164,12 +113,7 @@
                 "type": "null"
               }
             ],
-            "description": "The version-control revision to read - a branch, tag, or commit id as the\nworkspace's version control spells it. Omitted reads the current tree, and `rev`\nnever combines with `projection`. The server refuses a revision read when the\nworkspace has no version-control repository."
-          },
-          "scope": {
-            "$ref": "#/$defs/SearchScope",
-            "default": "all",
-            "description": "Source locations eligible for matches. All is the default because a known name may\nidentify a dependency or standard-library declaration."
+            "description": "The version-control revision to read - a branch, tag, or commit id as the\nworkspace's version control spells it. Omitted reads the current tree. The server\nrefuses a revision read when the workspace has no version-control repository."
           }
         },
         "required": [
@@ -1876,6 +1820,29 @@
       "description": "Inserts a new declaration beside an anchor symbol, or content at a file\ntarget. Anchored insertions land beside the anchor's whole declaration,\nits attached outer attributes and doc comments included. A file target\nlands the body verbatim at the file's start or end, creating it first\nwhen `create_missing` is set and it is missing. A refusal names the\nfailed precondition and leaves the workspace untouched. A body\ninserted `before` its anchor is spliced in at the anchor's start byte\nand its first line inherits the anchor's column; a body inserted\n`after` its anchor, or at a file target either side, always starts a\nfresh line at column zero.",
       "input_schema": {
         "$defs": {
+          "BodySource": {
+            "anyOf": [
+              {
+                "description": "The content itself.",
+                "type": "string"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A file the server reads for the content.",
+                "properties": {
+                  "file": {
+                    "description": "Absolute path to the file the server reads. Distinct from a destination\npath such as `insert_symbol`'s own `file`, which names where content\nlands, not where it comes from. The server reads this path itself, so a\ncaller not co-located with the server cannot use this form.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "file"
+                ],
+                "type": "object"
+              }
+            ],
+            "description": "Where a write tool's body bytes come from: written inline in the request, or read\nfrom a file. `patch`, and every write tool's `body`, accepts either form; the object\nform is refused when it carries an unknown or additional field.\n\nBoth forms are bounded by the field that embeds this type; the schema states the\nbound as the inline string's `maxLength`, and the server enforces the same bound\nagainst the resolved content of either form."
+          },
           "InsertPosition": {
             "description": "Which side of the anchor or file target receives the new content.",
             "oneOf": [
@@ -1963,9 +1930,9 @@
             "description": "The existing declaration the new one lands beside."
           },
           "body": {
-            "description": "The new content: a declaration beside `anchor`, or a file target's whole body.",
-            "maxLength": 1048576,
-            "type": "string"
+            "$ref": "#/$defs/BodySource",
+            "description": "The new content: a declaration beside `anchor`, or a file target's whole body.\nInline or read from a file.",
+            "maxLength": 1048576
           },
           "create_missing": {
             "default": false,
@@ -1981,7 +1948,7 @@
                 "type": "null"
               }
             ],
-            "description": "The file the content lands in, created first when `create_missing` is set and\nit does not exist."
+            "description": "The destination file the content lands in, created first when `create_missing`\nis set and it does not exist. Distinct from `body`'s own `file` form, which\nnames a source the server reads the content from, not a destination."
           },
           "position": {
             "$ref": "#/$defs/InsertPosition",
@@ -2503,6 +2470,11 @@
               {
                 "const": "no_references",
                 "description": "Wire value `no_references`.",
+                "type": "string"
+              },
+              {
+                "const": "body_readable",
+                "description": "Wire value `body_readable`. The failed entry names the [`BodySource`] `file`\nform: absent, not a plain file, unreadable, or holding bytes that are not\nvalid UTF-8 text.",
                 "type": "string"
               }
             ]
@@ -3419,6 +3391,11 @@
                 "const": "no_references",
                 "description": "Wire value `no_references`.",
                 "type": "string"
+              },
+              {
+                "const": "body_readable",
+                "description": "Wire value `body_readable`. The failed entry names the [`BodySource`] `file`\nform: absent, not a plain file, unreadable, or holding bytes that are not\nvalid UTF-8 text.",
+                "type": "string"
               }
             ]
           },
@@ -3799,14 +3776,6 @@
             "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
             "type": "string"
           },
-          "ProjectionId": {
-            "description": "Identity of one projection, and the URI that resolves it. The caller names the\nprojection at `projection_create` - a directory-valid name of 1 to 64 lowercase\nletters, digits, and interior dashes, such as `my-feature-one` - and the URI carries\nthat name. The name addresses the projection while it lives; `projection_remove`\nfrees it, and a later projection reusing the name is a distinct projection. A change\nrequest that omits its `projection` field applies to the workspace tree itself.",
-            "examples": [
-              "rift://projection/my-feature-one"
-            ],
-            "pattern": "^rift://projection/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$",
-            "type": "string"
-          },
           "RevisionId": {
             "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it. Rift carries it opaquely and never orders two revisions\nby comparing their identifiers.",
             "examples": [
@@ -3818,16 +3787,6 @@
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
-        "allOf": [
-          {
-            "not": {
-              "required": [
-                "rev",
-                "projection"
-              ]
-            }
-          }
-        ],
         "examples": [
           {
             "path": "src/config.rs",
@@ -3846,17 +3805,6 @@
             "minimum": 0,
             "type": "integer"
           },
-          "projection": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/ProjectionId"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "The projection to read. Omitted reads the workspace tree."
-          },
           "rev": {
             "anyOf": [
               {
@@ -3866,7 +3814,7 @@
                 "type": "null"
               }
             ],
-            "description": "The version-control revision to read - a branch, tag, or commit id as the\nworkspace's version control spells it. Omitted reads the current tree, and `rev`\nnever combines with `projection`. The server refuses a revision read when the\nworkspace has no version-control repository."
+            "description": "The version-control revision to read - a branch, tag, or commit id as the\nworkspace's version control spells it. Omitted reads the current tree. The server\nrefuses a revision read when the workspace has no version-control repository."
           }
         },
         "required": [
@@ -4621,6 +4569,31 @@
     {
       "description": "Applies unified-diff hunks to workspace files atomically. The target is any\nfile the workspace's `[source]` policy makes visible, parsed or not. Hunk\ncontext guards the change: a header's line numbers are hints and\nits line counts are read from the hunk's own body, as with\n`git apply`. A `/dev/null` header creates or deletes the file. The\nresult carries one edit per hunk, spanning the bytes it replaced.",
       "input_schema": {
+        "$defs": {
+          "BodySource": {
+            "anyOf": [
+              {
+                "description": "The content itself.",
+                "type": "string"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A file the server reads for the content.",
+                "properties": {
+                  "file": {
+                    "description": "Absolute path to the file the server reads. Distinct from a destination\npath such as `insert_symbol`'s own `file`, which names where content\nlands, not where it comes from. The server reads this path itself, so a\ncaller not co-located with the server cannot use this form.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "file"
+                ],
+                "type": "object"
+              }
+            ],
+            "description": "Where a write tool's body bytes come from: written inline in the request, or read\nfrom a file. `patch`, and every write tool's `body`, accepts either form; the object\nform is refused when it carries an unknown or additional field.\n\nBoth forms are bounded by the field that embeds this type; the schema states the\nbound as the inline string's `maxLength`, and the server enforces the same bound\nagainst the resolved content of either form."
+          }
+        },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
         "examples": [
@@ -4630,10 +4603,10 @@
         ],
         "properties": {
           "patch": {
-            "description": "A unified diff. The addressed file is any workspace file the `[source]` policy\nmakes visible, whether or not a syntax provider parses it. Hunk context guards\nthe change: a header's line numbers are hints and its line counts are read\nfrom the hunk's own body, as with `git apply`. `/dev/null` headers create or\ndelete files.",
+            "$ref": "#/$defs/BodySource",
+            "description": "A unified diff, inline or read from a file. The addressed file is any workspace\nfile the `[source]` policy makes visible, whether or not a syntax provider\nparses it. Hunk context guards the change: a header's line numbers are hints\nand its line counts are read from the hunk's own body, as with `git apply`.\n`/dev/null` headers create or delete files.",
             "maxLength": 4194304,
-            "minLength": 1,
-            "type": "string"
+            "minLength": 1
           }
         },
         "required": [
@@ -5150,6 +5123,11 @@
               {
                 "const": "no_references",
                 "description": "Wire value `no_references`.",
+                "type": "string"
+              },
+              {
+                "const": "body_readable",
+                "description": "Wire value `body_readable`. The failed entry names the [`BodySource`] `file`\nform: absent, not a plain file, unreadable, or holding bytes that are not\nvalid UTF-8 text.",
                 "type": "string"
               }
             ]
@@ -6067,6 +6045,11 @@
                 "const": "no_references",
                 "description": "Wire value `no_references`.",
                 "type": "string"
+              },
+              {
+                "const": "body_readable",
+                "description": "Wire value `body_readable`. The failed entry names the [`BodySource`] `file`\nform: absent, not a plain file, unreadable, or holding bytes that are not\nvalid UTF-8 text.",
+                "type": "string"
               }
             ]
           },
@@ -6982,6 +6965,11 @@
               {
                 "const": "no_references",
                 "description": "Wire value `no_references`.",
+                "type": "string"
+              },
+              {
+                "const": "body_readable",
+                "description": "Wire value `body_readable`. The failed entry names the [`BodySource`] `file`\nform: absent, not a plain file, unreadable, or holding bytes that are not\nvalid UTF-8 text.",
                 "type": "string"
               }
             ]
@@ -7901,6 +7889,11 @@
                 "const": "no_references",
                 "description": "Wire value `no_references`.",
                 "type": "string"
+              },
+              {
+                "const": "body_readable",
+                "description": "Wire value `body_readable`. The failed entry names the [`BodySource`] `file`\nform: absent, not a plain file, unreadable, or holding bytes that are not\nvalid UTF-8 text.",
+                "type": "string"
               }
             ]
           },
@@ -8272,6 +8265,29 @@
       "description": "Replaces one syntax node through a witnessed address from `nodes`.\nThe server recomputes the witness before writing and refuses when the\nbytes drifted, so a stale address never splices into moved code.",
       "input_schema": {
         "$defs": {
+          "BodySource": {
+            "anyOf": [
+              {
+                "description": "The content itself.",
+                "type": "string"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A file the server reads for the content.",
+                "properties": {
+                  "file": {
+                    "description": "Absolute path to the file the server reads. Distinct from a destination\npath such as `insert_symbol`'s own `file`, which names where content\nlands, not where it comes from. The server reads this path itself, so a\ncaller not co-located with the server cannot use this form.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "file"
+                ],
+                "type": "object"
+              }
+            ],
+            "description": "Where a write tool's body bytes come from: written inline in the request, or read\nfrom a file. `patch`, and every write tool's `body`, accepts either form; the object\nform is refused when it carries an unknown or additional field.\n\nBoth forms are bounded by the field that embeds this type; the schema states the\nbound as the inline string's `maxLength`, and the server enforces the same bound\nagainst the resolved content of either form."
+          },
           "NodeId": {
             "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. Resolution recomputes the witness before\nacting on the address and refuses with a failed `source_unchanged` precondition when the\nbytes have drifted, so an address read from a stale listing cannot splice into the wrong\ncode.",
             "examples": [
@@ -8333,9 +8349,9 @@
         ],
         "properties": {
           "body": {
-            "description": "The replacement source.",
-            "maxLength": 1048576,
-            "type": "string"
+            "$ref": "#/$defs/BodySource",
+            "description": "The replacement source, inline or read from a file.",
+            "maxLength": 1048576
           },
           "node": {
             "$ref": "#/$defs/NodeId",
@@ -8869,6 +8885,11 @@
                 "const": "no_references",
                 "description": "Wire value `no_references`.",
                 "type": "string"
+              },
+              {
+                "const": "body_readable",
+                "description": "Wire value `body_readable`. The failed entry names the [`BodySource`] `file`\nform: absent, not a plain file, unreadable, or holding bytes that are not\nvalid UTF-8 text.",
+                "type": "string"
               }
             ]
           },
@@ -9240,6 +9261,29 @@
       "description": "Replaces one declaration addressed by symbol. The whole declaration\nincludes its attached outer attributes and doc comments. The parser\nderives the span, so the caller supplies no offsets; a refusal\nnames the failed precondition and leaves the workspace untouched.\nThe body is spliced in verbatim at the declaration's own start byte:\nits first line inherits the declaration's column, and every later\nline carries whatever indentation it is written with.",
       "input_schema": {
         "$defs": {
+          "BodySource": {
+            "anyOf": [
+              {
+                "description": "The content itself.",
+                "type": "string"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A file the server reads for the content.",
+                "properties": {
+                  "file": {
+                    "description": "Absolute path to the file the server reads. Distinct from a destination\npath such as `insert_symbol`'s own `file`, which names where content\nlands, not where it comes from. The server reads this path itself, so a\ncaller not co-located with the server cannot use this form.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "file"
+                ],
+                "type": "object"
+              }
+            ],
+            "description": "Where a write tool's body bytes come from: written inline in the request, or read\nfrom a file. `patch`, and every write tool's `body`, accepts either form; the object\nform is refused when it carries an unknown or additional field.\n\nBoth forms are bounded by the field that embeds this type; the schema states the\nbound as the inline string's `maxLength`, and the server enforces the same bound\nagainst the resolved content of either form."
+          },
           "RegionRole": {
             "description": "One named part of a node. A language marks these out inside a declaration, so an\noperation can address the body of a function without addressing its documentation.",
             "oneOf": [
@@ -9301,9 +9345,9 @@
         ],
         "properties": {
           "body": {
-            "description": "The replacement source.",
-            "maxLength": 1048576,
-            "type": "string"
+            "$ref": "#/$defs/BodySource",
+            "description": "The replacement source, inline or read from a file.",
+            "maxLength": 1048576
           },
           "region": {
             "anyOf": [
@@ -9837,6 +9881,11 @@
                 "const": "no_references",
                 "description": "Wire value `no_references`.",
                 "type": "string"
+              },
+              {
+                "const": "body_readable",
+                "description": "Wire value `body_readable`. The failed entry names the [`BodySource`] `file`\nform: absent, not a plain file, unreadable, or holding bytes that are not\nvalid UTF-8 text.",
+                "type": "string"
               }
             ]
           },
@@ -10208,240 +10257,6 @@
       "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies. `rev`\nsearches a version-control revision instead of the current tree. Use `get_symbol`\nwhen the declaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the search index's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate ranked units against one snapshot and merge them into\nresults computed from another.",
       "input_schema": {
         "$defs": {
-          "ElementFilter": {
-            "additionalProperties": false,
-            "description": "A predicate over one entry of a list-valued field. `Symbol.types` holds several entries,\nand a filter that tests `role` and the resolved symbol separately would accept a symbol\nwhose return type and whose `Config` came from two different entries. Everything under\n`where` addresses one entry, so both have to hold of the same one.",
-            "properties": {
-              "field": {
-                "description": "The list-valued field to walk, by its name in this model: `types`, `signatures`.",
-                "type": "string"
-              },
-              "where": {
-                "$ref": "#/$defs/Filter",
-                "description": "What one entry has to satisfy. Field names inside address the entry, not the entity\nthat holds it."
-              }
-            },
-            "required": [
-              "field",
-              "where"
-            ],
-            "type": "object"
-          },
-          "FieldFilter": {
-            "additionalProperties": false,
-            "description": "A predicate over a standard, namespaced substrate, or diagnostic field. Rift evaluates\nthe regex operation under `rift-regex`. Path selectors carry their own glob grammar.",
-            "properties": {
-              "field": {
-                "description": "Which field to test, by its name in this model: `facets`, `origin.location.kind`,\n`origin.source_kind`, `severity`. Extension keys and diagnostic fields are addressed\nthe same way.",
-                "type": "string"
-              },
-              "op": {
-                "$ref": "#/$defs/FieldFilterOp",
-                "description": "How the operand is compared against the field. What a comparison means follows the\nfield's type, so ordering ops apply only where the values are ordered. An array field\nsuch as `facets` takes `contains`, `in` and `exists`; the rest have no meaning\nagainst a list and Rift rejects them."
-              },
-              "value": {
-                "description": "The operand, for every op except `in` and `exists`."
-              },
-              "values": {
-                "description": "The operands for `in`.",
-                "items": true,
-                "type": [
-                  "array",
-                  "null"
-                ]
-              }
-            },
-            "required": [
-              "field",
-              "op"
-            ],
-            "type": "object"
-          },
-          "FieldFilterOp": {
-            "description": "How the operand is compared against the field. What a comparison means follows the\nfield's type, so ordering ops apply only where the values are ordered.",
-            "oneOf": [
-              {
-                "const": "eq",
-                "description": "The field equals the value.",
-                "type": "string"
-              },
-              {
-                "const": "ne",
-                "description": "The field differs from the value.",
-                "type": "string"
-              },
-              {
-                "const": "in",
-                "description": "The field equals one of the listed values.",
-                "type": "string"
-              },
-              {
-                "const": "contains",
-                "description": "The array field holds the value as an entry.",
-                "type": "string"
-              },
-              {
-                "const": "prefix",
-                "description": "The field starts with the value.",
-                "type": "string"
-              },
-              {
-                "const": "regex",
-                "description": "The field matches the value as a regular expression.",
-                "type": "string"
-              },
-              {
-                "const": "gt",
-                "description": "The field is greater than the value.",
-                "type": "string"
-              },
-              {
-                "const": "gte",
-                "description": "The field is greater than or equal to the value.",
-                "type": "string"
-              },
-              {
-                "const": "lt",
-                "description": "The field is less than the value.",
-                "type": "string"
-              },
-              {
-                "const": "lte",
-                "description": "The field is less than or equal to the value.",
-                "type": "string"
-              },
-              {
-                "const": "exists",
-                "description": "The field is present, whatever its value.",
-                "type": "string"
-              }
-            ]
-          },
-          "Filter": {
-            "description": "A recursive typed predicate. Every branch is tagged, so a filter tree parses in one pass.",
-            "oneOf": [
-              {
-                "additionalProperties": false,
-                "description": "A test on one field of the entity.",
-                "properties": {
-                  "field": {
-                    "$ref": "#/$defs/FieldFilter",
-                    "description": "The field and the comparison."
-                  },
-                  "kind": {
-                    "const": "field",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "kind",
-                  "field"
-                ],
-                "type": "object"
-              },
-              {
-                "additionalProperties": false,
-                "description": "A test on the edges the entity has.",
-                "properties": {
-                  "kind": {
-                    "const": "relation",
-                    "type": "string"
-                  },
-                  "relation": {
-                    "$ref": "#/$defs/RelationFilter",
-                    "description": "The edges to look for, and what they must reach."
-                  }
-                },
-                "required": [
-                  "kind",
-                  "relation"
-                ],
-                "type": "object"
-              },
-              {
-                "additionalProperties": false,
-                "description": "Conjunction: every member has to hold.",
-                "properties": {
-                  "all": {
-                    "description": "The filters that must all hold.",
-                    "items": {
-                      "$ref": "#/$defs/Filter"
-                    },
-                    "type": "array"
-                  },
-                  "kind": {
-                    "const": "all",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "kind",
-                  "all"
-                ],
-                "type": "object"
-              },
-              {
-                "additionalProperties": false,
-                "description": "Disjunction: at least one member has to hold.",
-                "properties": {
-                  "any": {
-                    "description": "The filters, of which one is enough.",
-                    "items": {
-                      "$ref": "#/$defs/Filter"
-                    },
-                    "type": "array"
-                  },
-                  "kind": {
-                    "const": "any",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "kind",
-                  "any"
-                ],
-                "type": "object"
-              },
-              {
-                "additionalProperties": false,
-                "description": "Negation of what it holds.",
-                "properties": {
-                  "kind": {
-                    "const": "not",
-                    "type": "string"
-                  },
-                  "not": {
-                    "$ref": "#/$defs/Filter",
-                    "description": "The filter being negated."
-                  }
-                },
-                "required": [
-                  "kind",
-                  "not"
-                ],
-                "type": "object"
-              },
-              {
-                "additionalProperties": false,
-                "description": "A test on one entry of a list the entity holds.",
-                "properties": {
-                  "element": {
-                    "$ref": "#/$defs/ElementFilter",
-                    "description": "The list to walk, and what one of its entries has to satisfy."
-                  },
-                  "kind": {
-                    "const": "element",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "kind",
-                  "element"
-                ],
-                "type": "object"
-              }
-            ]
-          },
           "PathPattern": {
             "description": "Project-relative glob using *, ?, **, and character classes. Forward-slash separated on\nevery platform, whatever separator the host OS uses natively.",
             "examples": [
@@ -10481,288 +10296,6 @@
             },
             "type": "object"
           },
-          "ProjectionId": {
-            "description": "Identity of one projection, and the URI that resolves it. The caller names the\nprojection at `projection_create` - a directory-valid name of 1 to 64 lowercase\nletters, digits, and interior dashes, such as `my-feature-one` - and the URI carries\nthat name. The name addresses the projection while it lives; `projection_remove`\nfrees it, and a later projection reusing the name is a distinct projection. A change\nrequest that omits its `projection` field applies to the workspace tree itself.",
-            "examples": [
-              "rift://projection/my-feature-one"
-            ],
-            "pattern": "^rift://projection/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$",
-            "type": "string"
-          },
-          "RelationFilter": {
-            "additionalProperties": false,
-            "anyOf": [
-              {
-                "description": "Matching by exact kind, in one language's vocabulary.",
-                "required": [
-                  "kind"
-                ]
-              },
-              {
-                "description": "Matching by portable facet, which reaches every served language.",
-                "required": [
-                  "facet"
-                ]
-              }
-            ],
-            "description": "A predicate over an exact advertised relationship kind or portable facet.",
-            "properties": {
-              "direction": {
-                "$ref": "#/$defs/RelationFilterDirection",
-                "description": "Which way the edge runs, seen from the entity being filtered."
-              },
-              "facet": {
-                "description": "Portable relationship facets. Any listed facet matches.",
-                "items": {
-                  "$ref": "#/$defs/RelationshipFacet"
-                },
-                "type": [
-                  "array",
-                  "null"
-                ]
-              },
-              "kind": {
-                "description": "Exact relationship kinds a provider emits. Any listed kind matches.",
-                "items": {
-                  "type": "string"
-                },
-                "type": [
-                  "array",
-                  "null"
-                ]
-              },
-              "max_depth": {
-                "description": "How many edges a traversal may cross. Only edges that compose carry a depth -\n`contains`, `declares`, `augments`, `calls`, `imports`, `extends`, `implements`,\n`mixes_in`, `embeds`, `depends_on`. A bound above 1 on any other facet has nothing\nto walk, and Rift rejects it.",
-                "format": "uint64",
-                "maximum": 100,
-                "minimum": 1,
-                "type": [
-                  "integer",
-                  "null"
-                ]
-              },
-              "min_depth": {
-                "description": "How many edges to walk before a hit counts. Above 1 this asks about indirect\nneighbours and skips the direct ones.",
-                "format": "uint64",
-                "minimum": 1,
-                "type": [
-                  "integer",
-                  "null"
-                ]
-              },
-              "quantifier": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/RelationFilterQuantifier"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "description": "Whether a match needs such an edge, or needs there to be none."
-              },
-              "target": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/Filter"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "description": "What has to be true of the entity at the other end. Nesting a filter here is how\n\"callers that are tests\" becomes one query."
-              }
-            },
-            "required": [
-              "direction"
-            ],
-            "type": "object"
-          },
-          "RelationFilterDirection": {
-            "description": "Which way the edge runs, seen from the entity being filtered.",
-            "oneOf": [
-              {
-                "const": "outgoing",
-                "description": "The edge starts at the entity being filtered.",
-                "type": "string"
-              },
-              {
-                "const": "incoming",
-                "description": "The edge points at the entity being filtered.",
-                "type": "string"
-              },
-              {
-                "const": "either",
-                "description": "The edge runs either way.",
-                "type": "string"
-              }
-            ]
-          },
-          "RelationFilterQuantifier": {
-            "description": "Whether a match needs such an edge, or needs there to be none.",
-            "oneOf": [
-              {
-                "const": "exists",
-                "description": "At least one such edge must exist.",
-                "type": "string"
-              },
-              {
-                "const": "not_exists",
-                "description": "No such edge may exist.",
-                "type": "string"
-              }
-            ]
-          },
-          "RelationshipFacet": {
-            "description": "One portable category an edge falls into. The local kinds `import` and `use` can share\nthe `imports` facet, which lets one query cross languages.",
-            "oneOf": [
-              {
-                "const": "contains",
-                "description": "The source contains the target within its scope.",
-                "type": "string"
-              },
-              {
-                "const": "declares",
-                "description": "The source declares the target.",
-                "type": "string"
-              },
-              {
-                "const": "augments",
-                "description": "The source adds to a declaration made elsewhere.",
-                "type": "string"
-              },
-              {
-                "const": "references",
-                "description": "The source mentions the target.",
-                "type": "string"
-              },
-              {
-                "const": "calls",
-                "description": "The source invokes the target.",
-                "type": "string"
-              },
-              {
-                "const": "constructs",
-                "description": "The source creates an instance of the target.",
-                "type": "string"
-              },
-              {
-                "const": "reads",
-                "description": "The source reads the target's value.",
-                "type": "string"
-              },
-              {
-                "const": "writes",
-                "description": "The source assigns to the target.",
-                "type": "string"
-              },
-              {
-                "const": "imports",
-                "description": "The source brings the target into scope.",
-                "type": "string"
-              },
-              {
-                "const": "exports",
-                "description": "The source exposes the target outside its unit.",
-                "type": "string"
-              },
-              {
-                "const": "extends",
-                "description": "The source inherits from the target.",
-                "type": "string"
-              },
-              {
-                "const": "implements",
-                "description": "The source fulfils the target's interface.",
-                "type": "string"
-              },
-              {
-                "const": "has_type",
-                "description": "The source is typed by the target.",
-                "type": "string"
-              },
-              {
-                "const": "overrides",
-                "description": "The source replaces the target inherited from a supertype.",
-                "type": "string"
-              },
-              {
-                "const": "aliases",
-                "description": "The source is another name for the target.",
-                "type": "string"
-              },
-              {
-                "const": "generates",
-                "description": "The source produces the target as generated code.",
-                "type": "string"
-              },
-              {
-                "const": "depends_on",
-                "description": "The source requires the target to build or run.",
-                "type": "string"
-              },
-              {
-                "const": "annotated_by",
-                "description": "The source carries the target as an annotation.",
-                "type": "string"
-              },
-              {
-                "const": "throws",
-                "description": "The source can raise the target.",
-                "type": "string"
-              },
-              {
-                "const": "catches",
-                "description": "The source handles the target when raised.",
-                "type": "string"
-              },
-              {
-                "const": "bounded_by",
-                "description": "The source's type parameter is constrained by the target.",
-                "type": "string"
-              },
-              {
-                "const": "instantiates",
-                "description": "The source applies concrete arguments to the generic target.",
-                "type": "string"
-              },
-              {
-                "const": "specializes",
-                "description": "The source is a specialization of the generic target.",
-                "type": "string"
-              },
-              {
-                "const": "overloads",
-                "description": "The source and target are separately dispatched forms of one name.",
-                "type": "string"
-              },
-              {
-                "const": "mixes_in",
-                "description": "The source incorporates the target as a mixin.",
-                "type": "string"
-              },
-              {
-                "const": "embeds",
-                "description": "The source embeds the target within its own definition.",
-                "type": "string"
-              },
-              {
-                "const": "tests",
-                "description": "The source exercises the target as a test.",
-                "type": "string"
-              },
-              {
-                "const": "configures",
-                "description": "The source supplies configuration for the target.",
-                "type": "string"
-              },
-              {
-                "const": "binds",
-                "description": "The source binds a name or value to the target.",
-                "type": "string"
-              }
-            ]
-          },
           "ResultOrder": {
             "description": "The total order a paginated answer comes back in. Every order ends in the result's own\nidentity, so two results that tie never swap places between pages.",
             "oneOf": [
@@ -10798,60 +10331,15 @@
                 "const": "source",
                 "description": "The source text around each hit.",
                 "type": "string"
-              },
-              {
-                "const": "signature",
-                "description": "Rendered signatures for symbol hits.",
-                "type": "string"
-              },
-              {
-                "const": "relationships",
-                "description": "Edges from each hit.",
-                "type": "string"
-              },
-              {
-                "const": "diagnostics",
-                "description": "Provider findings at each hit.",
-                "type": "string"
-              }
-            ]
-          },
-          "SearchIntent": {
-            "description": "The task that selects graph defaults and ranking. The server still returns each traversed\nedge, so the caller can audit the ranking.",
-            "oneOf": [
-              {
-                "const": "trace",
-                "description": "Follows execution outward from the seed.",
-                "type": "string"
-              },
-              {
-                "const": "find_tests",
-                "description": "Finds the tests that exercise the seed.",
-                "type": "string"
-              },
-              {
-                "const": "edit_ripple",
-                "description": "Estimates what an edit to the seed would disturb.",
-                "type": "string"
-              },
-              {
-                "const": "review_context",
-                "description": "Gathers what a reviewer of the seed should see.",
-                "type": "string"
               }
             ]
           },
           "SearchParamsTarget": {
-            "description": "Which entity kinds may be returned. Type data is attached to the Symbol and Node records\nthat bind it, and filters can search those attachments.",
+            "description": "Which entity kinds may be returned.",
             "oneOf": [
               {
                 "const": "symbol",
                 "description": "Only declarations may match.",
-                "type": "string"
-              },
-              {
-                "const": "node",
-                "description": "Only syntax-tree nodes may match.",
                 "type": "string"
               },
               {
@@ -10865,183 +10353,14 @@
                 "type": "string"
               }
             ]
-          },
-          "SearchScope": {
-            "description": "Which source locations a symbol lookup or search may return.",
-            "oneOf": [
-              {
-                "const": "project",
-                "description": "Only source the workspace owns.",
-                "type": "string"
-              },
-              {
-                "const": "dependencies",
-                "description": "Only source of resolved dependencies.",
-                "type": "string"
-              },
-              {
-                "const": "all",
-                "description": "Project, dependency, and standard-library source alike.",
-                "type": "string"
-              }
-            ]
-          },
-          "SearchTraversal": {
-            "additionalProperties": false,
-            "description": "A bounded relationship walk starting at one symbol. The server visits at most\n`max_nodes` symbols outside `seed` and expands no path beyond `max_hops`.",
-            "properties": {
-              "direction": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/TraversalDirection"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "description": "Direction to walk. Omitted selects incoming for `find_tests` and `edit_ripple`,\noutgoing for `trace`, and both for `review_context`."
-              },
-              "facets": {
-                "description": "Portable relationship facets eligible for expansion. Omitted selects `tests` for\n`find_tests` and `calls` for every other intent; an empty list is `invalid_request`.",
-                "items": {
-                  "$ref": "#/$defs/RelationshipFacet"
-                },
-                "minItems": 1,
-                "type": [
-                  "array",
-                  "null"
-                ]
-              },
-              "intent": {
-                "$ref": "#/$defs/SearchIntent",
-                "description": "The task whose defaults rank and narrow the walk. `find_tests` returns test symbols;\nother intents return every eligible symbol."
-              },
-              "max_hops": {
-                "default": 1,
-                "description": "Maximum path length from `seed`. The server accepts 1 or 2; one hop is the default\nbecause a second hop can multiply weak edges.",
-                "format": "uint64",
-                "maximum": 2,
-                "minimum": 1,
-                "type": "integer"
-              },
-              "max_nodes": {
-                "default": 25,
-                "description": "Most distinct graph symbols the server may visit, excluding `seed`. Filtering can\nmake the answer shorter than this bound.",
-                "format": "uint64",
-                "maximum": 100,
-                "minimum": 1,
-                "type": "integer"
-              },
-              "seed": {
-                "$ref": "#/$defs/SymbolId",
-                "description": "The symbol where the walk starts. The seed is not returned as a hit."
-              }
-            },
-            "required": [
-              "seed",
-              "intent"
-            ],
-            "type": "object"
-          },
-          "SymbolId": {
-            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name.",
-            "examples": [
-              "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
-            ],
-            "maxLength": 8192,
-            "minLength": 17,
-            "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
-            "type": "string"
-          },
-          "TraversalDirection": {
-            "description": "Which edge direction the server walks from each visited symbol.",
-            "oneOf": [
-              {
-                "const": "outgoing",
-                "description": "Walks edges leaving each visited symbol.",
-                "type": "string"
-              },
-              {
-                "const": "incoming",
-                "description": "Walks edges arriving at each visited symbol.",
-                "type": "string"
-              },
-              {
-                "const": "both",
-                "description": "Walks edges in both directions.",
-                "type": "string"
-              }
-            ]
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
-        "allOf": [
-          {
-            "if": {
-              "required": [
-                "traversal"
-              ]
-            },
-            "then": {
-              "properties": {
-                "target": {
-                  "enum": [
-                    "symbol",
-                    "all"
-                  ]
-                }
-              }
-            }
-          },
-          {
-            "if": {
-              "required": [
-                "paths"
-              ]
-            },
-            "then": {
-              "properties": {
-                "scope": {
-                  "const": "project"
-                }
-              }
-            }
-          },
-          {
-            "not": {
-              "required": [
-                "rev",
-                "projection"
-              ]
-            }
-          }
-        ],
-        "anyOf": [
-          {
-            "description": "Satisfied by a text query, with or without a filter alongside it.",
-            "required": [
-              "query"
-            ]
-          },
-          {
-            "description": "Satisfied by a filter alone, for a search with no text to match.",
-            "required": [
-              "filter"
-            ]
-          },
-          {
-            "description": "Satisfied by a bounded relationship traversal.",
-            "required": [
-              "traversal"
-            ]
-          }
-        ],
         "examples": [
           {
             "include": [
-              "source",
-              "signature"
+              "source"
             ],
             "limit": 20,
             "order": "relevance",
@@ -11054,65 +10373,16 @@
               ]
             },
             "query": "load_config",
-            "scope": "project",
             "target": "all"
           },
           {
-            "filter": {
-              "all": [
-                {
-                  "field": {
-                    "field": "facets",
-                    "op": "contains",
-                    "value": "callable"
-                  },
-                  "kind": "field"
-                },
-                {
-                  "kind": "relation",
-                  "relation": {
-                    "direction": "incoming",
-                    "facet": [
-                      "calls"
-                    ],
-                    "target": {
-                      "field": {
-                        "field": "facets",
-                        "op": "contains",
-                        "value": "test"
-                      },
-                      "kind": "field"
-                    }
-                  }
-                }
-              ],
-              "kind": "all"
-            },
             "limit": 10,
+            "order": "path",
+            "query": "load_config",
             "target": "symbol"
-          },
-          {
-            "limit": 25,
-            "target": "symbol",
-            "traversal": {
-              "intent": "find_tests",
-              "max_nodes": 50,
-              "seed": "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
-            }
           }
         ],
         "properties": {
-          "filter": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/Filter"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "A predicate over resolved fields and relationships. This is where provider knowledge\nenters a search - implements this trait, called by that function, declared under\n`src/api`."
-          },
           "include": {
             "description": "Extra payload to attach to every hit. Each entry costs a lookup per hit, so the\ncaller requests only what it will read.",
             "items": {
@@ -11156,17 +10426,6 @@
             ],
             "description": "Files eligible for the search, selected by project-relative globs. Omitted selects\nevery visible file."
           },
-          "projection": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/ProjectionId"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "The projection to search. Omitted searches the workspace tree."
-          },
           "query": {
             "description": "Text to match against file contents, symbol names, and rendered signatures. Matching\nis case-insensitive and identifier-aware - the query and the fields split on case\nand underscore boundaries, so `loadConfig` finds `load_config`. Scoring is\nserver-defined and comparable within one answer.",
             "type": [
@@ -11183,28 +10442,12 @@
                 "type": "null"
               }
             ],
-            "description": "The version-control revision to search - a branch, tag, or commit id as the\nworkspace's version control spells it. Omitted searches the current tree, and\n`rev` never combines with `projection`. The server refuses a revision search when\nthe workspace has no version-control repository."
-          },
-          "scope": {
-            "$ref": "#/$defs/SearchScope",
-            "default": "project",
-            "description": "Source locations eligible for results. Project is the default; select dependencies\nor all when the answer may live outside the workspace."
+            "description": "The version-control revision to search - a branch, tag, or commit id as the\nworkspace's version control spells it. Omitted searches the current tree. The server\nrefuses a revision search when the workspace has no version-control repository."
           },
           "target": {
             "$ref": "#/$defs/SearchParamsTarget",
             "default": "all",
-            "description": "Which entity kinds may be returned - a kind selector, never the text to search for;\nthat is `query`. Omitted, every kind may match. Type data is attached to the Symbol\nand Node records that bind it, and filters can search those attachments."
-          },
-          "traversal": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/SearchTraversal"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "A bounded relationship walk. It may stand alone or add graph hits to a lexical or\nfiltered search; duplicate symbols keep their shortest path."
+            "description": "Which entity kinds may be returned - a kind selector, never the text to search for;\nthat is `query`. Omitted, every kind may match."
           }
         },
         "rift:since": "v0.0.6",
@@ -11213,224 +10456,6 @@
       "name": "search",
       "output_schema": {
         "$defs": {
-          "Diagnostic": {
-            "additionalProperties": false,
-            "description": "One finding a provider produced from source. Its code and message retain the provider's\nvocabulary.",
-            "properties": {
-              "code": {
-                "description": "The provider's own identifier for this finding - `TS2345`, `E0308`. Absent where\nthe provider issues none.",
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
-              "continuation": {
-                "$ref": "#/$defs/DiagnosticContinuation",
-                "description": "Whether the finding is an artefact of source that stops mid-way, which is the normal\nstate of a file the caller is halfway through writing."
-              },
-              "extensions": {
-                "$ref": "#/$defs/Extensions",
-                "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them."
-              },
-              "language": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/Language"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "description": "The language whose provider produced this. Absent for a finding Rift itself\nraised."
-              },
-              "message": {
-                "description": "What the provider said, in its own words.",
-                "maxLength": 4096,
-                "type": "string"
-              },
-              "related": {
-                "description": "Other places the provider pointed at while explaining this one.",
-                "items": {
-                  "$ref": "#/$defs/DiagnosticRelated"
-                },
-                "type": "array"
-              },
-              "reliability": {
-                "$ref": "#/$defs/DiagnosticReliability",
-                "description": "Whether the facts around this finding came off a clean parse."
-              },
-              "severity": {
-                "$ref": "#/$defs/Severity",
-                "description": "How much it matters."
-              },
-              "span": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/SourceSpan"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "description": "Where it applies. Absent for a finding about the file as a whole, or about the\nbuild."
-              },
-              "tags": {
-                "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text.",
-                "items": {
-                  "$ref": "#/$defs/DiagnosticTag"
-                },
-                "type": "array"
-              }
-            },
-            "required": [
-              "severity",
-              "message",
-              "related",
-              "tags",
-              "reliability",
-              "continuation",
-              "extensions"
-            ],
-            "type": "object"
-          },
-          "DiagnosticContext": {
-            "additionalProperties": false,
-            "description": "One `Diagnostic` as an MCP answer carries it: the fact its emitter minted, plus what Rift\ncan add on top - where it lands in a line and column, and the source around it.",
-            "properties": {
-              "column": {
-                "description": "One-based column within that line, counted in UTF-8 bytes. Absent for the same\nreason as `line`.",
-                "format": "uint64",
-                "minimum": 0,
-                "type": [
-                  "integer",
-                  "null"
-                ]
-              },
-              "diagnostic": {
-                "$ref": "#/$defs/Diagnostic",
-                "description": "The finding itself, exactly as its emitter minted it."
-              },
-              "excerpt": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/SourceExcerpt"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "description": "The source the finding points at. Absent where there is no span to copy from."
-              },
-              "line": {
-                "description": "One-based line the finding starts on. Absent where the diagnostic has no span - a\nwhole-project error has nowhere to point.",
-                "format": "uint64",
-                "minimum": 0,
-                "type": [
-                  "integer",
-                  "null"
-                ]
-              },
-              "source": {
-                "$ref": "#/$defs/DiagnosticContextSource",
-                "description": "Component that produced the diagnostic."
-              }
-            },
-            "required": [
-              "source",
-              "diagnostic"
-            ],
-            "type": "object"
-          },
-          "DiagnosticContextSource": {
-            "description": "Component that produced the diagnostic. Rift sets this after collecting provider, hook,\nor apply output.",
-            "oneOf": [
-              {
-                "const": "provider",
-                "description": "A language provider emitted the finding.",
-                "type": "string"
-              },
-              {
-                "const": "hook",
-                "description": "A configured hook emitted the finding.",
-                "type": "string"
-              },
-              {
-                "const": "apply",
-                "description": "Applying a change request emitted the finding.",
-                "type": "string"
-              }
-            ]
-          },
-          "DiagnosticContinuation": {
-            "description": "Whether the finding is an artefact of source that stops mid-way, which is the normal\nstate of a file the caller is halfway through writing.",
-            "oneOf": [
-              {
-                "const": "repairable",
-                "description": "The producer recovered and later facts remain reliable.",
-                "type": "string"
-              },
-              {
-                "const": "unrepairable",
-                "description": "The producer could not recover, so later facts are suspect.",
-                "type": "string"
-              },
-              {
-                "const": "unknown",
-                "description": "The producer does not say whether it recovered.",
-                "type": "string"
-              }
-            ]
-          },
-          "DiagnosticRelated": {
-            "additionalProperties": false,
-            "description": "A second place the provider points at - the earlier declaration a redefinition conflicts\nwith, the bound that failed. It carries a message and a location, and never a severity of\nits own, because it is part of one finding.",
-            "properties": {
-              "message": {
-                "description": "What to notice there - \"first defined here\", \"required by this bound\".",
-                "maxLength": 4096,
-                "type": "string"
-              },
-              "span": {
-                "$ref": "#/$defs/SourceSpan",
-                "description": "Where to look."
-              }
-            },
-            "required": [
-              "message",
-              "span"
-            ],
-            "type": "object"
-          },
-          "DiagnosticReliability": {
-            "description": "Whether the facts around this finding came off a clean parse.",
-            "oneOf": [
-              {
-                "const": "reliable",
-                "description": "The surrounding facts came off a clean parse.",
-                "type": "string"
-              },
-              {
-                "const": "recovered",
-                "description": "The parser recovered nearby, so surrounding facts may be off.",
-                "type": "string"
-              }
-            ]
-          },
-          "DiagnosticTag": {
-            "description": "Presentation tags for the finding. A consumer can render them as strikethrough or grey\ntext.",
-            "oneOf": [
-              {
-                "const": "deprecated",
-                "description": "The code the finding points at is deprecated.",
-                "type": "string"
-              },
-              {
-                "const": "unnecessary",
-                "description": "The code the finding points at is unused or has no effect.",
-                "type": "string"
-              }
-            ]
-          },
           "Digest": {
             "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
             "examples": [
@@ -11746,6 +10771,11 @@
               {
                 "const": "content",
                 "description": "The file's contents matched.",
+                "type": "string"
+              },
+              {
+                "const": "ranked",
+                "description": "The ranked lane placed the hit; no field match proves the query's literal bytes\nappear. The lane ranks whether or not `[search.semantic]` is enabled, so this member\nnames the lane rather than the tier that may or may not have contributed to it.",
                 "type": "string"
               },
               {
@@ -12543,16 +11573,6 @@
             ],
             "description": "One search hit. Its file, node, or symbol payload carries the canonical identity.\nDependency and synthetic symbols can have no readable source; node and file hits cannot.",
             "properties": {
-              "diagnostics": {
-                "description": "What providers reported here, requested with `include: [\"diagnostics\"]`.",
-                "items": {
-                  "$ref": "#/$defs/DiagnosticContext"
-                },
-                "type": [
-                  "array",
-                  "null"
-                ]
-              },
               "distance": {
                 "description": "Number of edges in `traversal_path`. It is present exactly when `traversal_path` is\npresent and equals its length.",
                 "format": "uint64",
@@ -12593,16 +11613,6 @@
                   }
                 ],
                 "description": "Project-relative path of the hit, where the location is a project path. Absent for\na hit whose only location is a dependency or standard-library source unit."
-              },
-              "relationships": {
-                "description": "Edges from this hit, requested with `include: [\"relationships\"]`.",
-                "items": {
-                  "$ref": "#/$defs/Relationship"
-                },
-                "type": [
-                  "array",
-                  "null"
-                ]
               },
               "score": {
                 "description": "How well this hit matched. Scores are comparable within one answer and nowhere\nelse.",
@@ -12709,31 +11719,6 @@
               }
             ]
           },
-          "Severity": {
-            "description": "How much a `Diagnostic` matters, in the provider's own judgement. Providers map their\ntoolchain's own levels onto these four, so a caller can drop everything below `warning`\nwithout knowing which language produced it.",
-            "oneOf": [
-              {
-                "const": "error",
-                "description": "The provider judges the code wrong.",
-                "type": "string"
-              },
-              {
-                "const": "warning",
-                "description": "Suspect but not necessarily wrong.",
-                "type": "string"
-              },
-              {
-                "const": "info",
-                "description": "Informational, with nothing to fix.",
-                "type": "string"
-              },
-              {
-                "const": "hint",
-                "description": "A gentle suggestion a consumer may hide.",
-                "type": "string"
-              }
-            ]
-          },
           "Signature": {
             "additionalProperties": false,
             "description": "One callable form of a symbol: the text it renders as, the symbols that text points at,\nand its structure. Overloads are separate entries.",
@@ -12836,25 +11821,6 @@
             ],
             "type": "object"
           },
-          "SourceExcerpt": {
-            "additionalProperties": false,
-            "description": "A copy of source from the catalog. The unit may belong to the project, a dependency, or\nthe standard library; the excerpt preserves bytes as they were when the answer was\nproduced.",
-            "properties": {
-              "span": {
-                "$ref": "#/$defs/SourceUnitSpan",
-                "description": "The source unit and byte range the text was taken from."
-              },
-              "text": {
-                "description": "The source bytes returned by the request.",
-                "type": "string"
-              }
-            },
-            "required": [
-              "span",
-              "text"
-            ],
-            "type": "object"
-          },
           "SourceKind": {
             "description": "How source or a declaration came to exist.",
             "oneOf": [
@@ -12951,25 +11917,6 @@
                 "type": "object"
               }
             ]
-          },
-          "SourceSpan": {
-            "additionalProperties": false,
-            "description": "A byte range of one file.",
-            "properties": {
-              "range": {
-                "$ref": "#/$defs/TextRange",
-                "description": "The bytes, as offsets into that file."
-              },
-              "unit": {
-                "$ref": "#/$defs/FileId",
-                "description": "Which file the offsets are into."
-              }
-            },
-            "required": [
-              "unit",
-              "range"
-            ],
-            "type": "object"
           },
           "SourceUnitId": {
             "description": "Stable identity of one source unit in the source catalog: a resolver identity, then that\nresolver's canonical unit key in canonical percent-encoding - for the project resolver, the\nproject-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its\nresolver's canonical human-readable key; digests appear on the wire only as short witnesses\nwhere byte-identity is required.",

@@ -1,119 +1,14 @@
-//! Wire models for the `search` MCP tool: request criteria, the filter tree, traversal, and
-//! result hits. Extracted from [`crate::read`] so that module stays below its size bound; every
-//! type here is re-exported from `read` so existing `rift_protocol::read::SearchParams`-style
-//! paths keep resolving.
+//! Wire models for the `search` MCP tool: request criteria and result hits. Extracted from
+//! [`crate::read`] so that module stays below its size bound; every type here is re-exported
+//! from `read` so existing `rift_protocol::read::SearchParams`-style paths keep resolving.
 
 use crate::read::{
-    DiagnosticContext, File, Node, PAGE_INDEX_DEFAULT, Pagination, ProjectPath, ProjectionId,
-    ReadWarning, Relationship, RelationshipFacet, RevisionId, SearchScope, SourceUnitSpan, Symbol,
-    SymbolId,
+    File, Node, PAGE_INDEX_DEFAULT, Pagination, ProjectPath, ReadWarning, Relationship, RevisionId,
+    SourceUnitSpan, Symbol,
 };
 use crate::schema;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-
-/// A predicate over one entry of a list-valued field. `Symbol.types` holds several entries,
-/// and a filter that tests `role` and the resolved symbol separately would accept a symbol
-/// whose return type and whose `Config` came from two different entries. Everything under
-/// `where` addresses one entry, so both have to hold of the same one.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ElementFilter {
-    /// The list-valued field to walk, by its name in this model: `types`, `signatures`.
-    pub field: String,
-    /// What one entry has to satisfy. Field names inside address the entry, not the entity
-    /// that holds it.
-    pub r#where: Box<Filter>,
-}
-
-/// A predicate over a standard, namespaced substrate, or diagnostic field. Rift evaluates
-/// the regex operation under `rift-regex`. Path selectors carry their own glob grammar.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct FieldFilter {
-    /// Which field to test, by its name in this model: `facets`, `origin.location.kind`,
-    /// `origin.source_kind`, `severity`. Extension keys and diagnostic fields are addressed
-    /// the same way.
-    pub field: String,
-    /// How the operand is compared against the field. What a comparison means follows the
-    /// field's type, so ordering ops apply only where the values are ordered. An array field
-    /// such as `facets` takes `contains`, `in` and `exists`; the rest have no meaning
-    /// against a list and Rift rejects them.
-    pub op: FieldFilterOp,
-    /// The operand, for every op except `in` and `exists`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value: Option<serde_json::Value>,
-    /// The operands for `in`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub values: Option<Vec<serde_json::Value>>,
-}
-
-/// How the operand is compared against the field. What a comparison means follows the
-/// field's type, so ordering ops apply only where the values are ordered.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum FieldFilterOp {
-    /// The field equals the value.
-    Eq,
-    /// The field differs from the value.
-    Ne,
-    /// The field equals one of the listed values.
-    In,
-    /// The array field holds the value as an entry.
-    Contains,
-    /// The field starts with the value.
-    Prefix,
-    /// The field matches the value as a regular expression.
-    Regex,
-    /// The field is greater than the value.
-    Gt,
-    /// The field is greater than or equal to the value.
-    Gte,
-    /// The field is less than the value.
-    Lt,
-    /// The field is less than or equal to the value.
-    Lte,
-    /// The field is present, whatever its value.
-    Exists,
-}
-
-/// A recursive typed predicate. Every branch is tagged, so a filter tree parses in one pass.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "kind", deny_unknown_fields, rename_all = "snake_case")]
-pub enum Filter {
-    /// A test on one field of the entity.
-    Field {
-        /// The field and the comparison.
-        field: FieldFilter,
-    },
-    /// A test on the edges the entity has.
-    Relation {
-        /// The edges to look for, and what they must reach.
-        relation: Box<RelationFilter>,
-    },
-    /// Conjunction: every member has to hold.
-    All {
-        /// The filters that must all hold.
-        all: Vec<Filter>,
-    },
-    /// Disjunction: at least one member has to hold.
-    Any {
-        /// The filters, of which one is enough.
-        any: Vec<Filter>,
-    },
-    /// Negation of what it holds.
-    Not {
-        /// The filter being negated.
-        not: Box<Filter>,
-    },
-    /// A test on one entry of a list the entity holds.
-    Element {
-        /// The list to walk, and what one of its entries has to satisfy.
-        element: Box<ElementFilter>,
-    },
-}
 
 /// One auditable step in a search traversal. `relationship` retains source-node evidence and
 /// derivation; `direction` records how the walk followed it.
@@ -152,6 +47,10 @@ pub enum MatchedField {
     Documentation,
     /// The file's contents matched.
     Content,
+    /// The ranked lane placed the hit; no field match proves the query's literal bytes
+    /// appear. The lane ranks whether or not `[search.semantic]` is enabled, so this member
+    /// names the lane rather than the tier that may or may not have contributed to it.
+    Ranked,
     /// The project-relative path matched.
     Path,
     /// A relationship traversal reached the hit.
@@ -248,66 +147,6 @@ pub struct PathSelector {
     pub force_include: Vec<PathPattern>,
 }
 
-/// A predicate over an exact advertised relationship kind or portable facet.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-#[schemars(transform = schema::require_kind_or_facet)]
-pub struct RelationFilter {
-    /// Exact relationship kinds a provider emits. Any listed kind matches.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<Vec<String>>,
-    /// Portable relationship facets. Any listed facet matches.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub facet: Option<Vec<RelationshipFacet>>,
-    /// Which way the edge runs, seen from the entity being filtered.
-    pub direction: RelationFilterDirection,
-    /// What has to be true of the entity at the other end. Nesting a filter here is how
-    /// "callers that are tests" becomes one query.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target: Option<Box<Filter>>,
-    /// How many edges to walk before a hit counts. Above 1 this asks about indirect
-    /// neighbours and skips the direct ones.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1_u64))]
-    pub min_depth: Option<u64>,
-    /// How many edges a traversal may cross. Only edges that compose carry a depth -
-    /// `contains`, `declares`, `augments`, `calls`, `imports`, `extends`, `implements`,
-    /// `mixes_in`, `embeds`, `depends_on`. A bound above 1 on any other facet has nothing
-    /// to walk, and Rift rejects it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1_u64, max = 100_u64))]
-    pub max_depth: Option<u64>,
-    /// Whether a match needs such an edge, or needs there to be none.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quantifier: Option<RelationFilterQuantifier>,
-}
-
-/// Which way the edge runs, seen from the entity being filtered.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum RelationFilterDirection {
-    /// The edge starts at the entity being filtered.
-    Outgoing,
-    /// The edge points at the entity being filtered.
-    Incoming,
-    /// The edge runs either way.
-    Either,
-}
-
-/// Whether a match needs such an edge, or needs there to be none.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum RelationFilterQuantifier {
-    /// At least one such edge must exist.
-    Exists,
-    /// No such edge may exist.
-    NotExists,
-}
-
 /// The total order a paginated answer comes back in. Every order ends in the result's own
 /// identity, so two results that tie never swap places between pages.
 #[derive(
@@ -336,16 +175,10 @@ pub struct SearchHit {
     pub score: f64,
     /// Which indexed fields produced the match.
     pub matched_by: Vec<MatchedField>,
-    /// Edges from this hit, requested with `include: ["relationships"]`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub relationships: Option<Vec<Relationship>>,
     /// The source text around the hit, requested with `include: ["source"]`. Covers the
     /// hit's `span`; a caller that needs the range already has it there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// What providers reported here, requested with `include: ["diagnostics"]`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub diagnostics: Option<Vec<DiagnosticContext>>,
     /// Where the hit is written in the source catalog. Absent for a symbol whose source
     /// is unavailable or synthetic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -401,34 +234,10 @@ pub enum SearchHitTarget {
 pub enum SearchInclude {
     /// The source text around each hit.
     Source,
-    /// Rendered signatures for symbol hits.
-    Signature,
-    /// Edges from each hit.
-    Relationships,
-    /// Provider findings at each hit.
-    Diagnostics,
 }
 
-/// The task that selects graph defaults and ranking. The server still returns each traversed
-/// edge, so the caller can audit the ranking.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum SearchIntent {
-    /// Follows execution outward from the seed.
-    Trace,
-    /// Finds the tests that exercise the seed.
-    FindTests,
-    /// Estimates what an edit to the seed would disturb.
-    EditRipple,
-    /// Gathers what a reviewer of the seed should see.
-    ReviewContext,
-}
-
-/// Criteria for one search. The caller supplies at least one of lexical `query`, provider
-/// `filter`, or relationship `traversal`; `scope` selects source locations, and `paths`
-/// narrows project-only searches.
+/// Criteria for one search. The caller supplies lexical `query`, and `paths` narrows the
+/// files eligible for it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(extend("rift:since" = "v0.0.6"))]
@@ -445,64 +254,21 @@ pub enum SearchIntent {
             "force_include": []
         },
         "include": [
-            "source",
-            "signature"
+            "source"
         ],
         "limit": 20,
-        "page_index": 0,
-        "scope": "project"
+        "page_index": 0
     },
     {
         "target": "symbol",
-        "filter": {
-            "kind": "all",
-            "all": [
-                {
-                    "kind": "field",
-                    "field": {
-                        "field": "facets",
-                        "op": "contains",
-                        "value": "callable"
-                    }
-                },
-                {
-                    "kind": "relation",
-                    "relation": {
-                        "direction": "incoming",
-                        "facet": [
-                            "calls"
-                        ],
-                        "target": {
-                            "kind": "field",
-                            "field": {
-                                "field": "facets",
-                                "op": "contains",
-                                "value": "test"
-                            }
-                        }
-                    }
-                }
-            ]
-        },
+        "query": "load_config",
+        "order": "path",
         "limit": 10
-    },
-    {
-        "target": "symbol",
-        "traversal": {
-            "seed": "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService",
-            "intent": "find_tests",
-            "max_nodes": 50
-        },
-        "limit": 25
     }
 ]))]
-#[schemars(transform = schema::restrict_traversal_and_paths)]
-#[schemars(transform = schema::require_query_filter_or_traversal)]
-#[schemars(transform = schema::forbid_search_rev_with_projection)]
 pub struct SearchParams {
     /// Which entity kinds may be returned - a kind selector, never the text to search for;
-    /// that is `query`. Omitted, every kind may match. Type data is attached to the Symbol
-    /// and Node records that bind it, and filters can search those attachments.
+    /// that is `query`. Omitted, every kind may match.
     #[serde(default = "default_search_params_target")]
     pub target: SearchParamsTarget,
     /// Which total order the page comes back in. Omitted, relevance.
@@ -514,11 +280,6 @@ pub struct SearchParams {
     /// server-defined and comparable within one answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
-    /// A predicate over resolved fields and relationships. This is where provider knowledge
-    /// enters a search - implements this trait, called by that function, declared under
-    /// `src/api`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub filter: Option<Filter>,
     /// Files eligible for the search, selected by project-relative globs. Omitted selects
     /// every visible file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -537,23 +298,11 @@ pub struct SearchParams {
     /// `page_index` and the true `total_pages`.
     #[serde(default = "default_search_params_page_index")]
     pub page_index: u64,
-    /// The projection to search. Omitted searches the workspace tree.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub projection: Option<ProjectionId>,
     /// The version-control revision to search - a branch, tag, or commit id as the
-    /// workspace's version control spells it. Omitted searches the current tree, and
-    /// `rev` never combines with `projection`. The server refuses a revision search when
-    /// the workspace has no version-control repository.
+    /// workspace's version control spells it. Omitted searches the current tree. The server
+    /// refuses a revision search when the workspace has no version-control repository.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rev: Option<RevisionId>,
-    /// A bounded relationship walk. It may stand alone or add graph hits to a lexical or
-    /// filtered search; duplicate symbols keep their shortest path.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub traversal: Option<SearchTraversal>,
-    /// Source locations eligible for results. Project is the default; select dependencies
-    /// or all when the answer may live outside the workspace.
-    #[serde(default = "default_search_params_scope")]
-    pub scope: SearchScope,
 }
 
 fn default_search_params_target() -> SearchParamsTarget {
@@ -568,12 +317,7 @@ fn default_search_params_page_index() -> u64 {
     PAGE_INDEX_DEFAULT
 }
 
-fn default_search_params_scope() -> SearchScope {
-    SearchScope::Project
-}
-
-/// Which entity kinds may be returned. Type data is attached to the Symbol and Node records
-/// that bind it, and filters can search those attachments.
+/// Which entity kinds may be returned.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
@@ -581,8 +325,6 @@ fn default_search_params_scope() -> SearchScope {
 pub enum SearchParamsTarget {
     /// Only declarations may match.
     Symbol,
-    /// Only syntax-tree nodes may match.
-    Node,
     /// Only tree entries may match.
     File,
     /// Any entity kind may match.
@@ -763,71 +505,9 @@ pub struct SearchResult {
     pub warnings: Vec<ReadWarning>,
 }
 
-/// Default `max_hops` for a search traversal: one hop, because a second hop can multiply weak
-/// edges.
-pub const SEARCH_TRAVERSAL_HOPS_DEFAULT: u64 = 1;
-/// Default `max_nodes` for a search traversal.
-pub const SEARCH_TRAVERSAL_NODES_DEFAULT: u64 = 25;
-
-/// A bounded relationship walk starting at one symbol. The server visits at most
-/// `max_nodes` symbols outside `seed` and expands no path beyond `max_hops`.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SearchTraversal {
-    /// The symbol where the walk starts. The seed is not returned as a hit.
-    pub seed: SymbolId,
-    /// The task whose defaults rank and narrow the walk. `find_tests` returns test symbols;
-    /// other intents return every eligible symbol.
-    pub intent: SearchIntent,
-    /// Direction to walk. Omitted selects incoming for `find_tests` and `edit_ripple`,
-    /// outgoing for `trace`, and both for `review_context`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub direction: Option<TraversalDirection>,
-    /// Portable relationship facets eligible for expansion. Omitted selects `tests` for
-    /// `find_tests` and `calls` for every other intent; an empty list is `invalid_request`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(min = 1))]
-    pub facets: Option<Vec<RelationshipFacet>>,
-    /// Maximum path length from `seed`. The server accepts 1 or 2; one hop is the default
-    /// because a second hop can multiply weak edges.
-    #[serde(default = "default_search_traversal_max_hops")]
-    #[schemars(range(min = 1_u64, max = 2_u64))]
-    pub max_hops: u64,
-    /// Most distinct graph symbols the server may visit, excluding `seed`. Filtering can
-    /// make the answer shorter than this bound.
-    #[serde(default = "default_search_traversal_max_nodes")]
-    #[schemars(range(min = 1_u64, max = 100_u64))]
-    pub max_nodes: u64,
-}
-
-fn default_search_traversal_max_hops() -> u64 {
-    SEARCH_TRAVERSAL_HOPS_DEFAULT
-}
-
-fn default_search_traversal_max_nodes() -> u64 {
-    SEARCH_TRAVERSAL_NODES_DEFAULT
-}
-
-/// Which edge direction the server walks from each visited symbol.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum TraversalDirection {
-    /// Walks edges leaving each visited symbol.
-    Outgoing,
-    /// Walks edges arriving at each visited symbol.
-    Incoming,
-    /// Walks edges in both directions.
-    Both,
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        PAGE_INDEX_DEFAULT, PathPattern, PathPatternViolation, SEARCH_TRAVERSAL_HOPS_DEFAULT,
-        SEARCH_TRAVERSAL_NODES_DEFAULT, SearchParams, SearchTraversal,
-    };
+    use super::{PAGE_INDEX_DEFAULT, PathPattern, PathPatternViolation, SearchParams};
     use serde_json::json;
 
     /// Attribute arguments and `#[serde(default = ...)]` functions are both compiled apart
@@ -883,22 +563,5 @@ mod tests {
                 "violation={violation:?}"
             );
         }
-    }
-
-    /// Attribute arguments and `#[serde(default = ...)]` functions are both compiled apart
-    /// from the schema; this pins the advertised default to the constant the field's default
-    /// function returns.
-    #[test]
-    fn search_traversal_schema_defaults_equal_the_enforced_constants() {
-        let schema = serde_json::to_value(schemars::schema_for!(SearchTraversal)).expect("schema");
-        let properties = &schema["properties"];
-        assert_eq!(
-            properties["max_hops"]["default"],
-            json!(SEARCH_TRAVERSAL_HOPS_DEFAULT)
-        );
-        assert_eq!(
-            properties["max_nodes"]["default"],
-            json!(SEARCH_TRAVERSAL_NODES_DEFAULT)
-        );
     }
 }

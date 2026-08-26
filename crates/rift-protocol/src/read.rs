@@ -10,14 +10,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-// Search-specific models (`SearchParams`, `PathSelector`, the filter tree, and their
-// neighbors) live in `search` so this module stays below its size bound; re-exporting them
-// here keeps every existing `rift_protocol::read::SearchParams`-style path resolving.
+// Search-specific models (`SearchParams`, `PathSelector`, and their neighbors) live in
+// `search` so this module stays below its size bound; re-exporting them here keeps every
+// existing `rift_protocol::read::SearchParams`-style path resolving.
 pub use crate::search::{
-    ElementFilter, FieldFilter, FieldFilterOp, Filter, GraphHop, HopDirection, MatchedField,
-    PathPattern, PathPatternViolation, PathSelector, RelationFilter, RelationFilterDirection,
-    RelationFilterQuantifier, ResultOrder, SearchHit, SearchHitTarget, SearchInclude, SearchIntent,
-    SearchParams, SearchParamsTarget, SearchResult, SearchTraversal, TraversalDirection,
+    GraphHop, HopDirection, MatchedField, PathPattern, PathPatternViolation, PathSelector,
+    ResultOrder, SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget,
+    SearchResult,
 };
 // Diagnostic-family models (`Diagnostic`, its context, and their neighbors) live in
 // `diagnostic` so this module stays below its size bound; re-exporting them here keeps every
@@ -229,17 +228,14 @@ pub struct GetSymbolHit {
         "include_body": true,
         "include_history": true,
         "limit": 5,
-        "page_index": 0,
-        "scope": "all"
+        "page_index": 0
     },
     {
         "name": "Deserialize",
-        "scope": "dependencies",
         "limit": 10,
         "page_index": 1
     }
 ]))]
-#[schemars(transform = schema::forbid_get_symbol_rev_with_projection)]
 pub struct GetSymbolParams {
     /// The declaration name to look up - a name, not a free-text query; `search` takes
     /// those. An exact symbol name ranks first, then prefix matches, then qualified-name
@@ -265,19 +261,11 @@ pub struct GetSymbolParams {
     /// `page_index` and the true `total_pages`.
     #[serde(default = "default_get_symbol_params_page_index")]
     pub page_index: u64,
-    /// The projection to read. Omitted reads the workspace tree.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub projection: Option<ProjectionId>,
     /// The version-control revision to read - a branch, tag, or commit id as the
-    /// workspace's version control spells it. Omitted reads the current tree, and `rev`
-    /// never combines with `projection`. The server refuses a revision read when the
-    /// workspace has no version-control repository.
+    /// workspace's version control spells it. Omitted reads the current tree. The server
+    /// refuses a revision read when the workspace has no version-control repository.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rev: Option<RevisionId>,
-    /// Source locations eligible for matches. All is the default because a known name may
-    /// identify a dependency or standard-library declaration.
-    #[serde(default = "default_get_symbol_params_scope")]
-    pub scope: SearchScope,
 }
 
 fn default_get_symbol_params_include_body() -> bool {
@@ -294,10 +282,6 @@ fn default_get_symbol_params_limit() -> u64 {
 
 fn default_get_symbol_params_page_index() -> u64 {
     PAGE_INDEX_DEFAULT
-}
-
-fn default_get_symbol_params_scope() -> SearchScope {
-    SearchScope::All
 }
 
 /// One page of declarations matching a name.
@@ -653,7 +637,6 @@ pub struct NodeRegion {
         "position": 338
     }
 ]))]
-#[schemars(transform = schema::forbid_nodes_rev_with_projection)]
 pub struct NodesParams {
     /// Project-relative file to inspect.
     #[schemars(length(min = 1))]
@@ -662,13 +645,9 @@ pub struct NodesParams {
     /// themselves carry the spans.
     #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
     pub position: u64,
-    /// The projection to read. Omitted reads the workspace tree.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub projection: Option<ProjectionId>,
     /// The version-control revision to read - a branch, tag, or commit id as the
-    /// workspace's version control spells it. Omitted reads the current tree, and `rev`
-    /// never combines with `projection`. The server refuses a revision read when the
-    /// workspace has no version-control repository.
+    /// workspace's version control spells it. Omitted reads the current tree. The server
+    /// refuses a revision read when the workspace has no version-control repository.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rev: Option<RevisionId>,
 }
@@ -919,21 +898,6 @@ pub struct ProjectPath(
     #[schemars(regex(
         pattern = r"^(?:$|(?!\.rift(?:/|$))(?!/)(?!.*(?:^|/)\.{1,2}(?:/|$))(?!.*//)[^\\\u0000-\u001F\u007F/]+(?:/[^\\\u0000-\u001F\u007F/]+)*)$"
     ))]
-    pub String,
-);
-
-/// Identity of one projection, and the URI that resolves it. The caller names the
-/// projection at `projection_create` - a directory-valid name of 1 to 64 lowercase
-/// letters, digits, and interior dashes, such as `my-feature-one` - and the URI carries
-/// that name. The name addresses the projection while it lives; `projection_remove`
-/// frees it, and a later projection reusing the name is a distinct projection. A change
-/// request that omits its `projection` field applies to the workspace tree itself.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-#[schemars(transparent)]
-pub struct ProjectionId(
-    #[schemars(example = &"rift://projection/my-feature-one")]
-    #[schemars(regex(pattern = r"^rift://projection/[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$"))]
     pub String,
 );
 
@@ -1205,20 +1169,6 @@ fn revision_id_violation(value: &str) -> Option<RevisionIdViolation> {
         bytes if !bytes.iter().all(accepted) => Some(RevisionIdViolation::CharsetForbidden),
         _ => None,
     }
-}
-
-/// Which source locations a symbol lookup or search may return.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum SearchScope {
-    /// Only source the workspace owns.
-    Project,
-    /// Only source of resolved dependencies.
-    Dependencies,
-    /// Project, dependency, and standard-library source alike.
-    All,
 }
 
 /// How much a `Diagnostic` matters, in the provider's own judgement. Providers map their

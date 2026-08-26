@@ -126,6 +126,11 @@ pub enum OperationPreconditionKind {
     /// Wire value `no_references`.
     #[serde(rename = "no_references")]
     NoReferences,
+    /// Wire value `body_readable`. The failed entry names the [`BodySource`] `file`
+    /// form: absent, not a plain file, unreadable, or holding bytes that are not
+    /// valid UTF-8 text.
+    #[serde(rename = "body_readable")]
+    BodyReadable,
 }
 
 /// Result of this check.
@@ -342,6 +347,49 @@ impl ChangeResult {
     }
 }
 
+/// Longest inline body a `replace_symbol`, `insert_symbol`, or `replace_node` request
+/// may carry, in UTF-8 bytes, and the longest a `file`-form body may resolve to. Equal
+/// in value to the server's enforced rewrite-result bound, pinned by a conformance test
+/// in `rift-server` - this crate cannot depend on the server crate to share the constant
+/// directly.
+pub const BODY_BYTES_MAX: usize = 1_048_576;
+
+/// Where a write tool's body bytes come from: written inline in the request, or read
+/// from a file. `patch`, and every write tool's `body`, accepts either form; the object
+/// form is refused when it carries an unknown or additional field.
+///
+/// Both forms are bounded by the field that embeds this type; the schema states the
+/// bound as the inline string's `maxLength`, and the server enforces the same bound
+/// against the resolved content of either form.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum BodySource {
+    /// The content itself.
+    Inline(String),
+    /// A file the server reads for the content.
+    File {
+        /// Absolute path to the file the server reads. Distinct from a destination
+        /// path such as `insert_symbol`'s own `file`, which names where content
+        /// lands, not where it comes from. The server reads this path itself, so a
+        /// caller not co-located with the server cannot use this form.
+        file: String,
+    },
+}
+
+impl From<String> for BodySource {
+    /// Wraps `value` as this source's inline content.
+    fn from(value: String) -> Self {
+        Self::Inline(value)
+    }
+}
+
+impl From<&str> for BodySource {
+    /// Wraps `value` as this source's inline content.
+    fn from(value: &str) -> Self {
+        Self::Inline(value.to_owned())
+    }
+}
+
 /// Replaces one declaration addressed by symbol. The parser derives the span, so the
 /// caller supplies no offsets. The whole declaration includes attached outer attributes
 /// and doc comments.
@@ -358,6 +406,7 @@ impl ChangeResult {
         "body": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)\n        .map_err(|error| ConfigError::read(path, error))?;\n    parse_config(&text)\n}"
     }
 ]))]
+#[schemars(transform = schema::declare_replace_symbol_body_length)]
 pub struct ReplaceSymbolParams {
     /// The declaration to replace.
     pub symbol: SymbolId,
@@ -366,9 +415,8 @@ pub struct ReplaceSymbolParams {
     /// `capability_unavailable`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<RegionRole>,
-    /// The replacement source.
-    #[schemars(length(max = 1_048_576))]
-    pub body: String,
+    /// The replacement source, inline or read from a file.
+    pub body: BodySource,
 }
 
 /// Inserts a new declaration beside an anchor symbol, or content at a file target.
@@ -392,19 +440,21 @@ pub struct ReplaceSymbolParams {
     }
 ]))]
 #[schemars(transform = schema::insert_symbol_addresses_one_target)]
+#[schemars(transform = schema::declare_insert_symbol_body_length)]
 pub struct InsertSymbolParams {
     /// The existing declaration the new one lands beside.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<SymbolId>,
-    /// The file the content lands in, created first when `create_missing` is set and
-    /// it does not exist.
+    /// The destination file the content lands in, created first when `create_missing`
+    /// is set and it does not exist. Distinct from `body`'s own `file` form, which
+    /// names a source the server reads the content from, not a destination.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<ProjectPath>,
     /// Which side of the anchor or file target receives the new content.
     pub position: InsertPosition,
     /// The new content: a declaration beside `anchor`, or a file target's whole body.
-    #[schemars(length(max = 1_048_576))]
-    pub body: String,
+    /// Inline or read from a file.
+    pub body: BodySource,
     /// Creates a missing `file` target instead of refusing. Invalid together with
     /// `anchor`.
     #[serde(default)]
@@ -422,6 +472,7 @@ pub struct InsertSymbolParams {
         "body": "parse_config(text.trim())"
     }
 ]))]
+#[schemars(transform = schema::declare_replace_node_body_length)]
 pub struct ReplaceNodeParams {
     /// The node to replace, witness included.
     pub node: NodeId,
@@ -430,9 +481,8 @@ pub struct ReplaceNodeParams {
     /// `capability_unavailable`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<RegionRole>,
-    /// The replacement source.
-    #[schemars(length(max = 1_048_576))]
-    pub body: String,
+    /// The replacement source, inline or read from a file.
+    pub body: BodySource,
 }
 
 /// Longest `new_name` a rename request may carry, in UTF-8 bytes.
@@ -573,6 +623,10 @@ pub struct RemoveNodeParams {
     pub force: bool,
 }
 
+/// Longest inline `patch` a request may carry, in UTF-8 bytes, and the longest a
+/// `file`-form patch may resolve to.
+pub const PATCH_BYTES_MAX: usize = 4_194_304;
+
 /// Applies unified-diff hunks to workspace files atomically.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -582,14 +636,14 @@ pub struct RemoveNodeParams {
         "patch": "--- a/src/config.rs\n+++ b/src/config.rs\n@@ -11,4 +11,4 @@\n pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n     let text = std::fs::read_to_string(path)?;\n-    parse_config(&text)\n+    parse_config(text.trim())\n }\n"
     }
 ]))]
+#[schemars(transform = schema::declare_patch_body_length)]
 pub struct PatchParams {
-    /// A unified diff. The addressed file is any workspace file the `[source]` policy
-    /// makes visible, whether or not a syntax provider parses it. Hunk context guards
-    /// the change: a header's line numbers are hints and its line counts are read
-    /// from the hunk's own body, as with `git apply`. `/dev/null` headers create or
-    /// delete files.
-    #[schemars(length(min = 1, max = 4_194_304))]
-    pub patch: String,
+    /// A unified diff, inline or read from a file. The addressed file is any workspace
+    /// file the `[source]` policy makes visible, whether or not a syntax provider
+    /// parses it. Hunk context guards the change: a header's line numbers are hints
+    /// and its line counts are read from the hunk's own body, as with `git apply`.
+    /// `/dev/null` headers create or delete files.
+    pub patch: BodySource,
 }
 
 #[cfg(test)]
@@ -688,6 +742,54 @@ mod tests {
             "symbol": "rift://symbol/rust/foo",
             "body": "fn foo() {}",
             "projection": "rift://projection/my-feature-one"
+        }));
+        assert!(result.is_err());
+    }
+
+    /// `body` accepts an inline string, decoding to [`BodySource::Inline`].
+    #[test]
+    fn replace_symbol_params_body_accepts_the_inline_form() {
+        let params: ReplaceSymbolParams = serde_json::from_value(json!({
+            "symbol": "rift://symbol/rust/foo",
+            "body": "fn foo() {}"
+        }))
+        .expect("inline body deserializes");
+        assert_eq!(params.body, BodySource::Inline("fn foo() {}".to_owned()));
+    }
+
+    /// `body` accepts an object naming a `file`, decoding to [`BodySource::File`].
+    #[test]
+    fn replace_symbol_params_body_accepts_the_file_form() {
+        let params: ReplaceSymbolParams = serde_json::from_value(json!({
+            "symbol": "rift://symbol/rust/foo",
+            "body": {"file": "/tmp/change.diff"}
+        }))
+        .expect("file body deserializes");
+        assert_eq!(
+            params.body,
+            BodySource::File {
+                file: "/tmp/change.diff".to_owned()
+            }
+        );
+    }
+
+    /// A `body` object carrying an unknown field alongside `file` matches neither
+    /// `BodySource` variant, so the request refuses before disk or engine is touched.
+    #[test]
+    fn body_source_file_form_rejects_an_unknown_field() {
+        let result = serde_json::from_value::<ReplaceSymbolParams>(json!({
+            "symbol": "rift://symbol/rust/foo",
+            "body": {"file": "/tmp/change.diff", "extra": 1}
+        }));
+        assert!(result.is_err());
+    }
+
+    /// A `body` object naming no `file` at all matches neither variant either.
+    #[test]
+    fn body_source_rejects_an_empty_object() {
+        let result = serde_json::from_value::<ReplaceSymbolParams>(json!({
+            "symbol": "rift://symbol/rust/foo",
+            "body": {}
         }));
         assert!(result.is_err());
     }

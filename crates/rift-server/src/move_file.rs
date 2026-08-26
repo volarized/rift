@@ -729,7 +729,10 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_moved_file_refuses_unsupported() {
-        let oversized = format!("// {}\n", "x".repeat(crate::rename::RENAME_FILE_BYTES_MAX));
+        let oversized = format!(
+            "// {}\n",
+            "x".repeat(crate::rewrite::REWRITE_FILE_BYTES_MAX)
+        );
         let (directory, reads, engines) = workspace(&[("lib.rs", oversized.as_str())]);
         let result = refused(
             plan_move(

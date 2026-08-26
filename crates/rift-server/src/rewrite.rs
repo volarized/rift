@@ -8,6 +8,16 @@
 use rift_core::ProjectPath;
 use rift_syntax::ByteRange;
 
+/// Longest a rewrite's resulting file may hold, in UTF-8 bytes.
+/// [`crate::publish::publish_rewrites`] checks every rewrite's `next_source` against
+/// this bound before staging, so a create edit, a whole-file report past
+/// `CHANGE_EDITS_MAX`, and a small patch against an already oversized file all refuse
+/// the same way. Equal in value to [`rift_protocol::change::BODY_BYTES_MAX`], pinned by
+/// a conformance test in this module - the two are enforced at different points (a
+/// request's advertised body length, and a write's resulting file length) and so are
+/// declared separately, never aliased.
+pub(crate) const REWRITE_FILE_BYTES_MAX: usize = 1_048_576;
+
 /// One region of a file's previous image a rewrite replaces, and the text
 /// standing in it once the rewrite lands.
 #[derive(Debug, Clone)]
@@ -100,8 +110,10 @@ impl FileRewrite {
 #[cfg(test)]
 mod tests {
     use rift_syntax::ByteRange;
+    use schemars::schema_for;
+    use serde_json::json;
 
-    use super::{FileRewrite, ReplacedRegion, RewriteKind};
+    use super::{FileRewrite, REWRITE_FILE_BYTES_MAX, ReplacedRegion, RewriteKind};
 
     fn path(value: &str) -> rift_core::ProjectPath {
         rift_core::ProjectPath::new(value).expect("test path must be legal")
@@ -139,5 +151,35 @@ mod tests {
         assert_eq!(rewrite.previous_len, 8);
         assert!(rewrite.next_source.is_empty());
         assert!(rewrite.kind.removes_file());
+    }
+
+    /// `rift-protocol` cannot depend on `rift-server`, so
+    /// [`rift_protocol::change::BODY_BYTES_MAX`] and `REWRITE_FILE_BYTES_MAX` are
+    /// declared separately; this test keeps their values equal.
+    #[test]
+    fn test_rewrite_file_bytes_max_equals_the_advertised_body_bound() {
+        assert_eq!(
+            REWRITE_FILE_BYTES_MAX,
+            rift_protocol::change::BODY_BYTES_MAX
+        );
+    }
+
+    /// `Edit::Replace.text`'s schema literal restates `REWRITE_FILE_BYTES_MAX`,
+    /// because attribute arguments take only literals; this pins the two together.
+    #[test]
+    fn test_edit_replace_text_schema_length_pins_the_enforced_bound() {
+        let schema =
+            serde_json::to_value(schema_for!(rift_protocol::change::Edit)).expect("schema");
+        let replace = schema["oneOf"]
+            .as_array()
+            .expect("Edit is a tagged union")
+            .iter()
+            .find(|variant| variant["properties"]["kind"]["const"] == json!("replace"))
+            .expect("Edit carries a replace variant");
+        assert_eq!(
+            replace["properties"]["text"]["maxLength"],
+            json!(REWRITE_FILE_BYTES_MAX),
+            "the advertised length must equal the enforced constant"
+        );
     }
 }

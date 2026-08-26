@@ -366,8 +366,8 @@ pub enum SymbolMatchRank {
     QualifiedExact,
     /// Query equals short declaration name.
     NameExact,
-    /// Complete qualified name ends with query.
-    QualifiedSuffix,
+    /// Short declaration name starts with query.
+    NamePrefix,
     /// Complete qualified name contains query elsewhere.
     Substring,
 }
@@ -966,7 +966,7 @@ impl WorkspaceIndex {
         self.limits.results_max()
     }
 
-    /// Finds declarations by exact, suffix, or substring name.
+    /// Finds declarations by exact, prefix, or substring name.
     ///
     /// # Errors
     ///
@@ -1103,8 +1103,8 @@ impl WorkspaceIndex {
 }
 
 /// Declaration matches for `query` across `files`, ranked qualified-exact first, then
-/// name-exact, qualified-suffix, and substring. Shared so an on-demand file set (search's
-/// `force_include`) scores identically to the index.
+/// name-exact, name-prefix, and qualified-name substring. Shared so an on-demand file set
+/// (search's `force_include`) scores identically to the index.
 pub fn symbol_matches<'a>(
     files: impl IntoIterator<Item = &'a IndexedFile>,
     query: &str,
@@ -1784,12 +1784,13 @@ fn relative_path(path: &Path) -> Result<ProjectPath, WorkspaceIndexError> {
 
 fn symbol_rank(symbol: &SyntaxSymbol, query: &str) -> SymbolMatchRank {
     let qualified = symbol.qualified_name.to_lowercase();
+    let name = symbol.name.to_lowercase();
     if qualified == query {
         SymbolMatchRank::QualifiedExact
-    } else if symbol.name.to_lowercase() == query {
+    } else if name == query {
         SymbolMatchRank::NameExact
-    } else if qualified.ends_with(query) {
-        SymbolMatchRank::QualifiedSuffix
+    } else if name.starts_with(query) {
+        SymbolMatchRank::NamePrefix
     } else {
         SymbolMatchRank::Substring
     }
@@ -2969,8 +2970,8 @@ mod tests {
             SymbolMatchRank::NameExact
         );
         assert_eq!(
-            index.symbols("::update", 5).expect("suffix match")[0].rank,
-            SymbolMatchRank::QualifiedSuffix
+            index.symbols("upd", 5).expect("prefix match")[0].rank,
+            SymbolMatchRank::NamePrefix
         );
         assert_eq!(
             index.symbols("pda", 5).expect("substring match")[0].rank,

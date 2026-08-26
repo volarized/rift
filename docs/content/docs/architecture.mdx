@@ -359,17 +359,6 @@ The server indexes names both as spelled and split into words on case and separa
 so `get user name` reaches a declaration spelled `getUserName`, and a concept-level search does
 not depend on guessing the identifier first.
 
-The same tool walks relationships when the starting symbol is known. A
-[`SearchTraversal`](/docs/protocol/reference#SearchTraversal) names that symbol and the
-task: trace dependencies, find tests, estimate an edit's ripple, or collect review context. The
-task selects an edge direction and relationship facets unless the caller supplies them.
-
-The walk stops after one edge by default and accepts at most two. It also stops after
-`max_nodes`, so a common utility cannot pull its whole transitive caller graph into one answer.
-
-Each graph hit carries the shortest path from the seed, including every relationship's
-source-node evidence, derivation, and the direction Rift followed it.
-
 #### Semantic ranking
 
 <VersionBadge

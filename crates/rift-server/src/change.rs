@@ -7,15 +7,17 @@
 //! changes collide as one clean refusal rather than as interleaved bytes.
 
 use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use percent_encoding::percent_decode_str;
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_protocol::change::{
-    ChangeId, ChangeResult, ChangeSummary, Edit, InsertPosition, InsertSymbolParams,
-    OperationPrecondition, OperationPreconditionKind, OperationPreconditionStatus, PatchParams,
-    PreconditionAddress, PreconditionValue, RefusalReason, ReplaceNodeParams, ReplaceSymbolParams,
+    BODY_BYTES_MAX, BodySource, ChangeId, ChangeResult, ChangeSummary, Edit, InsertPosition,
+    InsertSymbolParams, OperationPrecondition, OperationPreconditionKind,
+    OperationPreconditionStatus, PATCH_BYTES_MAX, PatchParams, PreconditionAddress,
+    PreconditionValue, RefusalReason, ReplaceNodeParams, ReplaceSymbolParams,
 };
 use rift_protocol::read::{
     Diagnostic, DiagnosticContinuation, DiagnosticReliability, Extensions, FileId, Language,
@@ -115,6 +117,91 @@ fn insert_target(params: &InsertSymbolParams) -> Result<InsertTarget<'_>, ReadEr
     }
 }
 
+/// What reading a [`BodySource::File`]'s file produced.
+enum BodyFileRead {
+    /// The file's content, within `bytes_max`.
+    Fits(String),
+    /// The file holds more than `bytes_max` bytes. The bounded reader stops at
+    /// `bytes_max + 1`, so this counts up to that ceiling rather than the file's
+    /// true length.
+    Oversized(usize),
+    /// The file could not be read as UTF-8 text: absent, not a plain file, denied by
+    /// permissions, or holding bytes that are not valid UTF-8. `detail` is the
+    /// underlying failure's own text.
+    Unreadable(String),
+}
+
+/// Reads `file`'s content, stopping after `bytes_max + 1` bytes so an oversized file
+/// is refused without loading the rest into memory.
+fn bounded_body_file_read(file: &str, bytes_max: usize) -> BodyFileRead {
+    let opened = match fs::File::open(file) {
+        Ok(opened) => opened,
+        Err(error) => return BodyFileRead::Unreadable(error.to_string()),
+    };
+    let mut buffer = Vec::new();
+    let ceiling = match u64::try_from(bytes_max) {
+        Ok(bytes_max) => bytes_max.saturating_add(1),
+        Err(_) => u64::MAX,
+    };
+    if let Err(error) = opened.take(ceiling).read_to_end(&mut buffer) {
+        return BodyFileRead::Unreadable(error.to_string());
+    }
+    if buffer.len() > bytes_max {
+        return BodyFileRead::Oversized(buffer.len());
+    }
+    match String::from_utf8(buffer) {
+        Ok(text) => BodyFileRead::Fits(text),
+        Err(error) => BodyFileRead::Unreadable(error.to_string()),
+    }
+}
+
+/// Refuses a [`BodySource`] whose resolved content, inline or from a file, holds more
+/// than `bytes_max` bytes.
+fn oversized_body_refusal(byte_count: usize, bytes_max: usize) -> ChangeResult {
+    crate::rename::unsupported_refusal(format!(
+        "the body holds {byte_count} bytes; at most {bytes_max} are accepted"
+    ))
+}
+
+/// Refuses a [`BodySource::File`] whose file could not be read as UTF-8 text, naming
+/// the file and the underlying failure.
+fn body_unreadable_refusal(file: &str, detail: &str) -> ChangeResult {
+    ChangeResult::Refused {
+        reason: RefusalReason::UnmetPrecondition,
+        preconditions: vec![OperationPrecondition::new(
+            OperationPreconditionKind::BodyReadable,
+            OperationPreconditionStatus::Failed,
+            Vec::new(),
+            Vec::new(),
+            PreconditionValue::Boolean { value: true },
+            PreconditionValue::Boolean { value: false },
+        )],
+        diagnostics: vec![crate::rename::plan_diagnostic(format!(
+            "{file} could not be read for the body: {detail}"
+        ))],
+    }
+}
+
+/// Resolves `source` to its content: the inline text itself, or a bounded read of its
+/// file. A body over `bytes_max`, inline or from a file, refuses naming the byte
+/// count; a file that cannot be read as UTF-8 text refuses `unmet_precondition`
+/// naming `body_readable`.
+fn resolve_body_source(source: &BodySource, bytes_max: usize) -> Result<String, ChangeResult> {
+    match source {
+        BodySource::Inline(text) => {
+            if text.len() > bytes_max {
+                return Err(oversized_body_refusal(text.len(), bytes_max));
+            }
+            Ok(text.clone())
+        }
+        BodySource::File { file } => match bounded_body_file_read(file, bytes_max) {
+            BodyFileRead::Fits(text) => Ok(text),
+            BodyFileRead::Oversized(counted) => Err(oversized_body_refusal(counted, bytes_max)),
+            BodyFileRead::Unreadable(detail) => Err(body_unreadable_refusal(file, &detail)),
+        },
+    }
+}
+
 impl ChangeService {
     /// Builds a change service writing the given workspace root.
     #[must_use]
@@ -144,11 +231,15 @@ impl ChangeService {
             .application
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let body = match resolve_body_source(&params.body, BODY_BYTES_MAX) {
+            Ok(body) => body,
+            Err(refusal) => return Ok(refusal),
+        };
         let address = parse_symbol_address(&params.symbol.0)?;
         let resolution = self.resolve_symbol_spans(reads, &address, |range| ChangePlan {
             path: address.path.clone(),
             range,
-            text: params.body.clone(),
+            text: body.clone(),
         })?;
         self.conclude(reads, resolution)
     }
@@ -171,14 +262,18 @@ impl ChangeService {
             .application
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let body = match resolve_body_source(&params.body, BODY_BYTES_MAX) {
+            Ok(body) => body,
+            Err(refusal) => return Ok(refusal),
+        };
         match insert_target(params)? {
             InsertTarget::BesideAnchor(anchor) => {
-                self.insert_beside_anchor(reads, anchor, params.position, &params.body)
+                self.insert_beside_anchor(reads, anchor, params.position, &body)
             }
             InsertTarget::AtFile {
                 file,
                 create_missing,
-            } => self.insert_at_file(reads, file, params.position, &params.body, create_missing),
+            } => self.insert_at_file(reads, file, params.position, &body, create_missing),
         }
     }
 
@@ -278,6 +373,10 @@ impl ChangeService {
             .application
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let body = match resolve_body_source(&params.body, BODY_BYTES_MAX) {
+            Ok(body) => body,
+            Err(refusal) => return Ok(refusal),
+        };
         match resolve_node(reads, &params.node)? {
             NodeResolution::Refused {
                 reason,
@@ -290,7 +389,7 @@ impl ChangeService {
                     ChangePlan {
                         path: address.path.clone(),
                         range: address.range,
-                        text: params.body.clone(),
+                        text: body,
                     },
                 )?;
                 self.conclude(reads, resolution)
@@ -503,7 +602,11 @@ impl ChangeService {
             .application
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let segments = patch::split_file_segments(&params.patch)?;
+        let patch = match resolve_body_source(&params.patch, PATCH_BYTES_MAX) {
+            Ok(patch) => patch,
+            Err(refusal) => return Ok(refusal),
+        };
+        let segments = patch::split_file_segments(&patch)?;
         let mut rewrites: Vec<FileRewrite> = Vec::with_capacity(segments.len());
         for (index, segment) in segments.iter().enumerate() {
             match patch::resolve_segment(&self.root, reads, segment, index + 1)? {
@@ -1119,9 +1222,9 @@ mod tests {
     use rift_core::SourceVisibility;
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::change::{
-        ChangeResult, Edit, InsertPosition, InsertSymbolParams, OperationPreconditionKind,
-        PatchParams, PreconditionAddress, PreconditionValue, RefusalReason, ReplaceNodeParams,
-        ReplaceSymbolParams,
+        BODY_BYTES_MAX, BodySource, ChangeResult, Edit, InsertPosition, InsertSymbolParams,
+        OperationPreconditionKind, PatchParams, PreconditionAddress, PreconditionValue,
+        RefusalReason, ReplaceNodeParams, ReplaceSymbolParams,
     };
     use rift_protocol::configuration::HistoryConfiguration;
     use rift_protocol::read::{
@@ -1132,7 +1235,7 @@ mod tests {
 
     use super::ChangeService;
     use crate::read::{ReadService, node_witness};
-    use crate::rewrite::{FileRewrite, ReplacedRegion};
+    use crate::rewrite::{FileRewrite, REWRITE_FILE_BYTES_MAX, ReplacedRegion};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -1171,7 +1274,7 @@ mod tests {
             &ReplaceSymbolParams {
                 symbol: symbol("beacon"),
                 region: None,
-                body: "pub fn beacon() -> u8 {\n    7\n}".to_owned(),
+                body: "pub fn beacon() -> u8 {\n    7\n}".to_owned().into(),
             },
         )?;
         let summary = applied_summary(result);
@@ -1190,6 +1293,318 @@ mod tests {
         );
         let written = fs::read_to_string(directory.path().join("lib.rs"))?;
         assert_eq!(written, "pub fn beacon() -> u8 {\n    7\n}\n");
+        Ok(())
+    }
+
+    /// `replace_symbol`, `insert_symbol`, and `replace_node` each accept `body` as an
+    /// inline string or as an object naming a file the server reads, and both forms
+    /// produce the same written bytes.
+    #[test]
+    fn body_carrying_tools_accept_both_inline_and_file_body_forms() -> TestResult {
+        let scratch = tempfile::tempdir()?;
+        let scratch_file = scratch.path().join("body.txt");
+
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        fs::write(&scratch_file, "pub fn beacon() -> u8 { 1 }")?;
+        applied_summary(changes.replace_symbol(
+            &reads,
+            &ReplaceSymbolParams {
+                symbol: symbol("beacon"),
+                region: None,
+                body: BodySource::File {
+                    file: scratch_file.to_string_lossy().into_owned(),
+                },
+            },
+        )?);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("lib.rs"))?,
+            "pub fn beacon() -> u8 { 1 }\n"
+        );
+
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        fs::write(&scratch_file, "/// Docs.\npub fn early() {}")?;
+        applied_summary(changes.insert_symbol(
+            &reads,
+            &InsertSymbolParams {
+                anchor: Some(symbol("beacon")),
+                file: None,
+                position: InsertPosition::Before,
+                body: BodySource::File {
+                    file: scratch_file.to_string_lossy().into_owned(),
+                },
+                create_missing: false,
+            },
+        )?);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("lib.rs"))?,
+            "/// Docs.\npub fn early() {}\n\npub fn beacon() {}\n"
+        );
+
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let listing = reads.nodes(NodesParams {
+            path: ProjectPath("lib.rs".to_owned()),
+            position: 3,
+            rev: None,
+        })?;
+        let node = listing.nodes[0].id.clone();
+        fs::write(&scratch_file, "pub fn beacon() -> u8 { 2 }")?;
+        applied_summary(changes.replace_node(
+            &reads,
+            &ReplaceNodeParams {
+                node,
+                region: None,
+                body: BodySource::File {
+                    file: scratch_file.to_string_lossy().into_owned(),
+                },
+            },
+        )?);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("lib.rs"))?,
+            "pub fn beacon() -> u8 { 2 }"
+        );
+        Ok(())
+    }
+
+    /// A `file`-form body applies identically to the same content sent inline.
+    #[test]
+    fn replace_symbol_file_form_body_matches_the_inline_form_byte_identically() -> TestResult {
+        let scratch = tempfile::tempdir()?;
+        let scratch_file = scratch.path().join("body.rs");
+        let body = "pub fn beacon() -> u8 {\n    9\n}";
+        fs::write(&scratch_file, body)?;
+
+        let (inline_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        applied_summary(changes.replace_symbol(
+            &reads,
+            &ReplaceSymbolParams {
+                symbol: symbol("beacon"),
+                region: None,
+                body: body.into(),
+            },
+        )?);
+
+        let (file_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        applied_summary(changes.replace_symbol(
+            &reads,
+            &ReplaceSymbolParams {
+                symbol: symbol("beacon"),
+                region: None,
+                body: BodySource::File {
+                    file: scratch_file.to_string_lossy().into_owned(),
+                },
+            },
+        )?);
+
+        assert_eq!(
+            fs::read(inline_directory.path().join("lib.rs"))?,
+            fs::read(file_directory.path().join("lib.rs"))?,
+            "the inline and file forms must write byte-identical trees"
+        );
+        Ok(())
+    }
+
+    /// An absent file, a directory in place of the file, a file with no read
+    /// permission, and a file holding bytes that are not valid UTF-8 each refuse
+    /// `unmet_precondition` naming `body_readable`, and the targeted tree stays
+    /// untouched.
+    #[cfg(unix)]
+    #[test]
+    fn body_source_file_form_refuses_unreadable_files() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = tempfile::tempdir()?;
+        let denied = scratch.path().join("denied.rs");
+        fs::write(&denied, "pub fn beacon() {}\n")?;
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0o000))?;
+        let invalid_utf8 = scratch.path().join("invalid_utf8.rs");
+        fs::write(&invalid_utf8, [0xFF, 0xFE, 0xFD])?;
+        let cases = [
+            ("absent.rs", scratch.path().join("absent.rs")),
+            ("a directory", scratch.path().to_path_buf()),
+            ("no read permission", denied.clone()),
+            ("bytes that are not valid UTF-8", invalid_utf8),
+        ];
+        for (case, file) in cases {
+            let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+            let result = changes.replace_symbol(
+                &reads,
+                &ReplaceSymbolParams {
+                    symbol: symbol("beacon"),
+                    region: None,
+                    body: BodySource::File {
+                        file: file.to_string_lossy().into_owned(),
+                    },
+                },
+            )?;
+            let ChangeResult::Refused {
+                reason,
+                preconditions,
+                ..
+            } = result
+            else {
+                panic!("{case} must refuse");
+            };
+            assert_eq!(reason, RefusalReason::UnmetPrecondition, "{case}");
+            assert_eq!(
+                preconditions[0].kind,
+                OperationPreconditionKind::BodyReadable,
+                "{case}"
+            );
+            assert_eq!(
+                fs::read_to_string(directory.path().join("lib.rs"))?,
+                "pub fn beacon() {}\n",
+                "{case} must leave the tree untouched"
+            );
+        }
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0o644))?;
+        Ok(())
+    }
+
+    /// A body at `BODY_BYTES_MAX` applies; one byte over refuses `unsupported` naming
+    /// the byte count, inline and from a file alike. `insert_symbol`'s file-target
+    /// create writes the body as the whole file, so the resulting file's length is the
+    /// body's own length exactly - no leftover bytes from a replaced span mask the
+    /// bound this test proves.
+    #[test]
+    fn body_source_bound_accepts_the_limit_and_refuses_one_byte_over() -> TestResult {
+        let scratch = tempfile::tempdir()?;
+        let at_bound = "x".repeat(BODY_BYTES_MAX);
+        let over_bound = "x".repeat(BODY_BYTES_MAX + 1);
+
+        let insert = |body: BodySource, name: &str| InsertSymbolParams {
+            anchor: None,
+            file: Some(ProjectPath(name.to_owned())),
+            position: InsertPosition::After,
+            body,
+            create_missing: true,
+        };
+
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        applied_summary(
+            changes.insert_symbol(&reads, &insert(at_bound.clone().into(), "at_bound.rs"))?,
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("at_bound.rs"))?.len(),
+            BODY_BYTES_MAX
+        );
+
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let result =
+            changes.insert_symbol(&reads, &insert(over_bound.clone().into(), "over_bound.rs"))?;
+        let ChangeResult::Refused {
+            reason,
+            diagnostics,
+            ..
+        } = result
+        else {
+            panic!("a body one byte over the bound must refuse");
+        };
+        assert_eq!(reason, RefusalReason::Unsupported);
+        assert!(
+            diagnostics[0]
+                .message
+                .contains(&(BODY_BYTES_MAX + 1).to_string())
+        );
+
+        let at_bound_file = scratch.path().join("at_bound_source.rs");
+        fs::write(&at_bound_file, &at_bound)?;
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        applied_summary(changes.insert_symbol(
+            &reads,
+            &insert(
+                BodySource::File {
+                    file: at_bound_file.to_string_lossy().into_owned(),
+                },
+                "at_bound_from_file.rs",
+            ),
+        )?);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("at_bound_from_file.rs"))?.len(),
+            BODY_BYTES_MAX
+        );
+
+        let over_bound_file = scratch.path().join("over_bound_source.rs");
+        fs::write(&over_bound_file, &over_bound)?;
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let result = changes.insert_symbol(
+            &reads,
+            &insert(
+                BodySource::File {
+                    file: over_bound_file.to_string_lossy().into_owned(),
+                },
+                "over_bound_from_file.rs",
+            ),
+        )?;
+        let ChangeResult::Refused { reason, .. } = result else {
+            panic!("a file one byte over the bound must refuse");
+        };
+        assert_eq!(reason, RefusalReason::Unsupported);
+        Ok(())
+    }
+
+    /// `replace_node` resolves its body before it resolves the addressed node, so a
+    /// body one byte over `BODY_BYTES_MAX` refuses `unsupported` naming the byte
+    /// count without ever reaching node resolution; the node id below is invalid on
+    /// purpose to prove the refusal fires first.
+    #[test]
+    fn replace_node_refuses_a_body_one_byte_over_the_bound() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let over_bound = "x".repeat(BODY_BYTES_MAX + 1);
+        let result = changes.replace_node(
+            &reads,
+            &ReplaceNodeParams {
+                node: NodeId("rift://node/rust/lib.rs@0-18#aaaaaaaa".to_owned()),
+                region: None,
+                body: over_bound.into(),
+            },
+        )?;
+        let ChangeResult::Refused {
+            reason,
+            diagnostics,
+            ..
+        } = result
+        else {
+            panic!("a body one byte over the bound must refuse");
+        };
+        assert_eq!(reason, RefusalReason::Unsupported);
+        assert!(
+            diagnostics[0]
+                .message
+                .contains(&(BODY_BYTES_MAX + 1).to_string())
+        );
+        Ok(())
+    }
+
+    /// A body within its own bound can still combine with a modified file's existing
+    /// content to exceed `REWRITE_FILE_BYTES_MAX`: `resolve_body_source` bounds only
+    /// the body itself, so the shared rewrite-result check in `publish_rewrites` is
+    /// what catches this.
+    #[test]
+    fn replace_symbol_refuses_when_body_and_existing_content_together_exceed_the_rewrite_bound()
+    -> TestResult {
+        let existing = format!(
+            "pub fn beacon() {{}}\n// {}\n",
+            "x".repeat(REWRITE_FILE_BYTES_MAX)
+        );
+        let (directory, reads, changes) = fixture(&existing)?;
+        let body = "pub fn beacon() -> u8 { 1 }";
+        let result = changes.replace_symbol(
+            &reads,
+            &ReplaceSymbolParams {
+                symbol: symbol("beacon"),
+                region: None,
+                body: body.into(),
+            },
+        )?;
+        let ChangeResult::Refused { reason, .. } = result else {
+            panic!("a result past the rewrite bound must refuse even with a small body");
+        };
+        assert_eq!(reason, RefusalReason::Unsupported);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("lib.rs"))?,
+            existing,
+            "a refused rewrite leaves the tree untouched"
+        );
         Ok(())
     }
 
@@ -1220,7 +1635,9 @@ mod tests {
             &ReplaceSymbolParams {
                 symbol: minted,
                 region: None,
-                body: "function App() {\n  return <main>rift</main>;\n}".to_owned(),
+                body: "function App() {\n  return <main>rift</main>;\n}"
+                    .to_owned()
+                    .into(),
             },
         )?;
         let summary = applied_summary(result);
@@ -1262,7 +1679,7 @@ mod tests {
         let replacement = ReplaceSymbolParams {
             symbol: minted,
             region: None,
-            body: "## Requirements\n\n- a newer toolchain\n".to_owned(),
+            body: "## Requirements\n\n- a newer toolchain\n".to_owned().into(),
         };
         let result = changes.replace_symbol(&reads, &replacement)?;
         let summary = applied_summary(result);
@@ -1304,7 +1721,7 @@ mod tests {
         let replacement = ReplaceSymbolParams {
             symbol: minted,
             region: None,
-            body: "\"port\": 9090".to_owned(),
+            body: "\"port\": 9090".to_owned().into(),
         };
         let result = changes.replace_symbol(&reads, &replacement)?;
         let summary = applied_summary(result);
@@ -1326,7 +1743,7 @@ mod tests {
             &ReplaceSymbolParams {
                 symbol: symbol("beacon"),
                 region: None,
-                body: "pub fn beacon() -> u8 { 7 }".to_owned(),
+                body: "pub fn beacon() -> u8 { 7 }".to_owned().into(),
             },
         )?;
         let ChangeResult::Refused {
@@ -1366,7 +1783,7 @@ mod tests {
                     &ReplaceSymbolParams {
                         symbol: symbol("beacon"),
                         region: None,
-                        body: "pub fn beacon() -> u8 { 1 }".to_owned(),
+                        body: "pub fn beacon() -> u8 { 1 }".to_owned().into(),
                     },
                 )
             });
@@ -1377,7 +1794,7 @@ mod tests {
                     &ReplaceSymbolParams {
                         symbol: symbol("beacon"),
                         region: None,
-                        body: "pub fn beacon() -> u8 { 2 }".to_owned(),
+                        body: "pub fn beacon() -> u8 { 2 }".to_owned().into(),
                     },
                 )
             });
@@ -1421,7 +1838,7 @@ mod tests {
                 &ReplaceSymbolParams {
                     symbol: symbol(absent),
                     region: None,
-                    body: "pub fn replaced() {}".to_owned(),
+                    body: "pub fn replaced() {}".to_owned().into(),
                 },
             )?;
             let ChangeResult::Refused {
@@ -1450,7 +1867,7 @@ mod tests {
             let params = ReplaceSymbolParams {
                 symbol: symbol(suffixed),
                 region: None,
-                body: "pub fn beacon() -> u8 { 7 }".to_owned(),
+                body: "pub fn beacon() -> u8 { 7 }".to_owned().into(),
             };
             let summary = applied_summary(changes.replace_symbol(&reads, &params)?);
             assert_eq!(
@@ -1481,7 +1898,7 @@ mod tests {
                 anchor: Some(symbol("beacon")),
                 file: None,
                 position: InsertPosition::Before,
-                body: "/// Docs.\npub fn early() {}".to_owned(),
+                body: "/// Docs.\npub fn early() {}".to_owned().into(),
                 create_missing: false,
             },
         )?;
@@ -1505,7 +1922,7 @@ mod tests {
                 anchor: Some(symbol("beacon")),
                 file: None,
                 position: InsertPosition::After,
-                body: "pub fn late() {}".to_owned(),
+                body: "pub fn late() {}".to_owned().into(),
                 create_missing: false,
             },
         )?;
@@ -1528,7 +1945,7 @@ mod tests {
                 anchor: Some(symbol("Beacon")),
                 file: None,
                 position: InsertPosition::Before,
-                body: "pub struct Early;".to_owned(),
+                body: "pub struct Early;".to_owned().into(),
                 create_missing: false,
             },
         )?;
@@ -1552,7 +1969,9 @@ mod tests {
             &ReplaceSymbolParams {
                 symbol: symbol("Beacon"),
                 region: None,
-                body: "/// New docs.\npub struct Beacon {\n    pub signal: u8,\n}".to_owned(),
+                body: "/// New docs.\npub struct Beacon {\n    pub signal: u8,\n}"
+                    .to_owned()
+                    .into(),
             },
         )?;
         applied_summary(result);
@@ -1577,7 +1996,7 @@ mod tests {
                 anchor: None,
                 file: Some(ProjectPath("lib.rs".to_owned())),
                 position: InsertPosition::Before,
-                body: "//! Module docs.".to_owned(),
+                body: "//! Module docs.".to_owned().into(),
                 create_missing: false,
             },
         )?;
@@ -1598,7 +2017,7 @@ mod tests {
                 anchor: None,
                 file: Some(ProjectPath("lib.rs".to_owned())),
                 position: InsertPosition::After,
-                body: "pub fn tail() {}".to_owned(),
+                body: "pub fn tail() {}".to_owned().into(),
                 create_missing: false,
             },
         )?;
@@ -1620,7 +2039,7 @@ mod tests {
                 anchor: None,
                 file: Some(ProjectPath("notes/todo/plan.rs".to_owned())),
                 position: InsertPosition::After,
-                body: "// plan".to_owned(),
+                body: "// plan".to_owned().into(),
                 create_missing: true,
             },
         )?;
@@ -1642,7 +2061,7 @@ mod tests {
                 anchor: None,
                 file: Some(ProjectPath("missing.rs".to_owned())),
                 position: InsertPosition::After,
-                body: "pub fn late() {}".to_owned(),
+                body: "pub fn late() {}".to_owned().into(),
                 create_missing: false,
             },
         )?;
@@ -1679,7 +2098,7 @@ mod tests {
                 anchor: None,
                 file: Some(ProjectPath("lib.rs".to_owned())),
                 position: InsertPosition::After,
-                body: "pub fn late() {}".to_owned(),
+                body: "pub fn late() {}".to_owned().into(),
                 create_missing: false,
             },
         );
@@ -1702,7 +2121,7 @@ mod tests {
                 anchor: None,
                 file: Some(ProjectPath("lib.rs".to_owned())),
                 position: InsertPosition::After,
-                body: "pub fn late() {}".to_owned(),
+                body: "pub fn late() {}".to_owned().into(),
                 create_missing: true,
             },
         )?;
@@ -1721,7 +2140,7 @@ mod tests {
                 anchor: None,
                 file: Some(ProjectPath("notes/TODO.txt".to_owned())),
                 position: InsertPosition::Before,
-                body: "- write docs".to_owned(),
+                body: "- write docs".to_owned().into(),
                 create_missing: true,
             },
         )?;
@@ -1745,7 +2164,7 @@ mod tests {
                     anchor: Some(symbol("beacon")),
                     file: Some(ProjectPath("lib.rs".to_owned())),
                     position: InsertPosition::After,
-                    body: "pub fn late() {}".to_owned(),
+                    body: "pub fn late() {}".to_owned().into(),
                     create_missing: false,
                 },
             )
@@ -1759,7 +2178,7 @@ mod tests {
                     anchor: None,
                     file: None,
                     position: InsertPosition::After,
-                    body: "pub fn late() {}".to_owned(),
+                    body: "pub fn late() {}".to_owned().into(),
                     create_missing: false,
                 },
             )
@@ -1773,7 +2192,7 @@ mod tests {
                     anchor: Some(symbol("beacon")),
                     file: None,
                     position: InsertPosition::After,
-                    body: "pub fn late() {}".to_owned(),
+                    body: "pub fn late() {}".to_owned().into(),
                     create_missing: true,
                 },
             )
@@ -1795,7 +2214,7 @@ mod tests {
                     anchor: None,
                     file: Some(ProjectPath(".rift/x.rs".to_owned())),
                     position: InsertPosition::After,
-                    body: "x".to_owned(),
+                    body: "x".to_owned().into(),
                     create_missing: true,
                 },
             )
@@ -1826,7 +2245,7 @@ mod tests {
                     anchor: None,
                     file: Some(ProjectPath("excluded/notes.rs".to_owned())),
                     position: InsertPosition::After,
-                    body: "pub fn late() {}".to_owned(),
+                    body: "pub fn late() {}".to_owned().into(),
                     create_missing,
                 },
             )?;
@@ -1866,7 +2285,6 @@ mod tests {
         let listing = reads.nodes(NodesParams {
             path: ProjectPath("lib.rs".to_owned()),
             position: 3,
-            projection: None,
             rev: None,
         })?;
         let address = listing.nodes[0].id.0.clone();
@@ -1878,7 +2296,7 @@ mod tests {
             &ReplaceNodeParams {
                 node: NodeId(stale),
                 region: None,
-                body: "pub fn beacon() -> u8 { 7 }".to_owned(),
+                body: "pub fn beacon() -> u8 { 7 }".to_owned().into(),
             },
         )?;
         let ChangeResult::Refused {
@@ -1906,7 +2324,7 @@ mod tests {
             &ReplaceNodeParams {
                 node: NodeId(address),
                 region: None,
-                body: "pub fn beacon() -> u8 {\n    7\n}".to_owned(),
+                body: "pub fn beacon() -> u8 {\n    7\n}".to_owned().into(),
             },
         )?;
         applied_summary(applied);
@@ -1923,7 +2341,7 @@ mod tests {
             &ReplaceSymbolParams {
                 symbol: symbol("beacon"),
                 region: None,
-                body: "pub fn beacon( {".to_owned(),
+                body: "pub fn beacon( {".to_owned().into(),
             },
         )?;
         let summary = applied_summary(result);
@@ -1946,7 +2364,7 @@ mod tests {
                 &ReplaceSymbolParams {
                     symbol: symbol("beacon"),
                     region: Some(rift_protocol::read::RegionRole::Body),
-                    body: "7".to_owned(),
+                    body: "7".to_owned().into(),
                 },
             )
             .expect_err("region replacement must be refused as unserved");
@@ -1963,7 +2381,7 @@ mod tests {
                 &ReplaceSymbolParams {
                     symbol: SymbolId("not-an-address".to_owned()),
                     region: None,
-                    body: "x".to_owned(),
+                    body: "x".to_owned().into(),
                 },
             )
             .expect_err("malformed symbol address must error");
@@ -1974,7 +2392,7 @@ mod tests {
                 &ReplaceNodeParams {
                     node: NodeId("rift://node/rust/lib.rs@9-3#zzzzzzzz".to_owned()),
                     region: None,
-                    body: "x".to_owned(),
+                    body: "x".to_owned().into(),
                 },
             )
             .expect_err("inverted span must error");
@@ -1990,7 +2408,7 @@ mod tests {
             &ReplaceSymbolParams {
                 symbol: SymbolId("rift://symbol/rust/ghost.rs/beacon".to_owned()),
                 region: None,
-                body: "pub fn beacon() {}".to_owned(),
+                body: "pub fn beacon() {}".to_owned().into(),
             },
         )?;
         let ChangeResult::Refused {
@@ -2022,7 +2440,7 @@ mod tests {
                 anchor: Some(symbol("vanished")),
                 file: None,
                 position: InsertPosition::After,
-                body: "pub fn late() {}".to_owned(),
+                body: "pub fn late() {}".to_owned().into(),
                 create_missing: false,
             },
         )?;
@@ -2057,7 +2475,7 @@ mod tests {
                 &ReplaceSymbolParams {
                     symbol: SymbolId("rift://symbol/rust/%2Fetc%2Fpasswd/beacon".to_owned()),
                     region: None,
-                    body: "x".to_owned(),
+                    body: "x".to_owned().into(),
                 },
             )
             .expect_err("absolute path inside a symbol address must error");
@@ -2080,7 +2498,7 @@ mod tests {
             &ReplaceSymbolParams {
                 symbol: symbol("beacon"),
                 region: None,
-                body: "pub fn beacon() -> u8 { 7 }".to_owned(),
+                body: "pub fn beacon() -> u8 { 7 }".to_owned().into(),
             },
         );
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755))?;
@@ -2095,33 +2513,29 @@ mod tests {
         Ok(())
     }
 
+    /// A change whose resulting file crosses the parser's own bound still lands - the
+    /// tree is the caller's - but the result reports the crossed bound instead of
+    /// leaving discovery to the next read. `BODY_BYTES_MAX` (1mb) sits well under the
+    /// Rust provider's own bound (4mb), so a body this large can no longer reach
+    /// `replace_symbol`'s wire surface at all; this proves `reparse_diagnostics`
+    /// directly instead of steering an unreachable integration path.
     #[test]
-    fn oversized_replacement_lands_but_reports_reparse_bound() -> TestResult {
-        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
-        let body = format!(
+    fn reparse_diagnostics_reports_a_source_past_the_parser_bound() {
+        let source = format!(
             "pub fn beacon() {{}}\n// {}",
             "x".repeat(rift_syntax::RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT)
         );
-        let result = changes.replace_symbol(
-            &reads,
-            &ReplaceSymbolParams {
-                symbol: symbol("beacon"),
-                region: None,
-                body,
-            },
-        )?;
-        let summary = applied_summary(result);
-        assert_eq!(summary.diagnostics.len(), 1);
+        let path = CoreProjectPath::new("lib.rs").expect("fixture path is valid");
+        let unit = FileId("rift://file/lib.rs".to_owned());
+        let diagnostics = super::reparse_diagnostics(unit, &path, &source);
+        assert_eq!(diagnostics.len(), 1);
         assert!(
-            summary.diagnostics[0]
+            diagnostics[0]
                 .message
                 .contains("no longer parses within bounds"),
             "diagnostic must name the crossed bound: {}",
-            summary.diagnostics[0].message
+            diagnostics[0].message
         );
-        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
-        assert!(written.len() > rift_syntax::RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT);
-        Ok(())
     }
 
     #[test]
@@ -2133,7 +2547,7 @@ mod tests {
                 &ReplaceNodeParams {
                     node: NodeId("rift://node/rust/lib.rs@0-18#aaaaaaaa".to_owned()),
                     region: Some(rift_protocol::read::RegionRole::Body),
-                    body: "7".to_owned(),
+                    body: "7".to_owned().into(),
                 },
             )
             .expect_err("region replacement must be refused as unserved");
@@ -2150,7 +2564,7 @@ mod tests {
             &ReplaceNodeParams {
                 node: node.clone(),
                 region: None,
-                body: "pub fn beacon() {}".to_owned(),
+                body: "pub fn beacon() {}".to_owned().into(),
             },
         )?;
         let ChangeResult::Refused {
@@ -2186,7 +2600,7 @@ mod tests {
                 &ReplaceNodeParams {
                     node: NodeId("rift://node/rust/%2Fetc%2Fpasswd@0-5#aaaaaaaa".to_owned()),
                     region: None,
-                    body: "x".to_owned(),
+                    body: "x".to_owned().into(),
                 },
             )
             .expect_err("absolute path inside a node address must error");
@@ -2251,7 +2665,7 @@ mod tests {
                 &ReplaceSymbolParams {
                     symbol: SymbolId("rift://symbol/typescript/lib.rs/beacon".to_owned()),
                     region: None,
-                    body: "pub fn beacon() {}".to_owned(),
+                    body: "pub fn beacon() {}".to_owned().into(),
                 },
             )
             .expect_err("a mismatched address language must be refused as invalid");
@@ -2274,7 +2688,7 @@ mod tests {
                 &ReplaceNodeParams {
                     node: NodeId("rift://node/typescript/lib.rs@0-5#aaaaaaaa".to_owned()),
                     region: None,
-                    body: "x".to_owned(),
+                    body: "x".to_owned().into(),
                 },
             )
             .expect_err("a mismatched address language must be refused as invalid");
@@ -2329,7 +2743,7 @@ mod tests {
                 &ReplaceNodeParams {
                     node: NodeId(format!("rift://node/rust/lib.rs@0-{end}#{witness}")),
                     region: None,
-                    body: "pub fn beacon() -> u8 { 7 }".to_owned(),
+                    body: "pub fn beacon() -> u8 { 7 }".to_owned().into(),
                 },
             )
             .expect_err("a span past the file end must error");
@@ -2742,7 +3156,12 @@ mod tests {
         let patch =
             "--- a/lib.rs\n+++ b/lib.rs\n@@ -2 +2 @@\n-two();\n+TWO();\n@@ -4 +4 @@\n-four();\n+FOUR();\n"
                 .to_owned();
-        let summary = applied_summary(changes.patch(&reads, &PatchParams { patch })?);
+        let summary = applied_summary(changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?);
         assert_eq!(
             summary.edits.len(),
             2,
@@ -2785,7 +3204,12 @@ mod tests {
     fn patch_creates_a_file_and_reports_one_edit_at_the_empty_range() -> TestResult {
         let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
         let patch = "--- /dev/null\n+++ b/new.rs\n@@ -0,0 +1 @@\n+pub fn fresh() {}\n".to_owned();
-        let summary = applied_summary(changes.patch(&reads, &PatchParams { patch })?);
+        let summary = applied_summary(changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?);
         assert_eq!(summary.edits.len(), 1);
         let Edit::Replace { span, text } = &summary.edits[0];
         assert_eq!(
@@ -2810,7 +3234,12 @@ mod tests {
             "",
         ]
         .join("\n");
-        let summary = applied_summary(changes.patch(&reads, &PatchParams { patch })?);
+        let summary = applied_summary(changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?);
         assert_eq!(summary.edits.len(), 1);
         let Edit::Replace { span, text } = &summary.edits[0];
         assert_eq!(
@@ -2843,7 +3272,12 @@ mod tests {
         let changes = ChangeService::new(directory.path());
         let patch = "--- a/notes.rs\n+++ b/notes.rs\n@@ -1 +1 @@\n-pub fn beacon() {}\n+pub fn renamed() {}\n"
             .to_owned();
-        applied_summary(changes.patch(&reads, &PatchParams { patch })?);
+        applied_summary(changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?);
         assert_eq!(
             fs::read_to_string(directory.path().join("notes.rs"))?,
             "pub fn renamed() {}\n"
@@ -2863,7 +3297,7 @@ mod tests {
             anchor: None,
             file: Some(ProjectPath("lib.rs".to_owned())),
             position: InsertPosition::Before,
-            body: "//! Module docs.".to_owned(),
+            body: "//! Module docs.".to_owned().into(),
             create_missing: false,
         };
         let summary = applied_summary(changes.insert_symbol(&reads, &params)?);
@@ -2890,7 +3324,7 @@ mod tests {
             anchor: None,
             file: Some(ProjectPath("lib.rs".to_owned())),
             position: InsertPosition::After,
-            body: "pub fn late() {}".to_owned(),
+            body: "pub fn late() {}".to_owned().into(),
             create_missing: false,
         };
         let summary = applied_summary(changes.insert_symbol(&reads, &params)?);

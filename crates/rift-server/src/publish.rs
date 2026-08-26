@@ -19,7 +19,7 @@ use rift_protocol::read::{
 };
 
 use crate::read::{ReadError, ReadFault, ReadService};
-use crate::rewrite::{FileRewrite, RewriteKind};
+use crate::rewrite::{FileRewrite, REWRITE_FILE_BYTES_MAX, RewriteKind};
 
 /// Whether a write should publish through a symlink's resolved target, or
 /// act on the addressed entry itself.
@@ -462,6 +462,24 @@ fn duplicate_target_refusal(
         })
 }
 
+/// Refuses a batch containing one rewrite whose resulting file exceeds
+/// [`REWRITE_FILE_BYTES_MAX`], naming the file and its byte count. Checked before any
+/// member stages, so this bounds every write path that produces a [`FileRewrite`]: a
+/// create edit, the whole-file fallback a batch reports past the change result's own
+/// edit bound, and a small patch against a file already over the bound.
+fn oversized_rewrite_refusal(rewrites: &[FileRewrite]) -> Option<ChangeResult> {
+    rewrites
+        .iter()
+        .find(|rewrite| rewrite.next_source.len() > REWRITE_FILE_BYTES_MAX)
+        .map(|rewrite| {
+            crate::rename::unsupported_refusal(format!(
+                "{} would hold {} bytes; at most {REWRITE_FILE_BYTES_MAX} are rewritten",
+                rewrite.path.as_str(),
+                rewrite.next_source.len()
+            ))
+        })
+}
+
 /// Stages and publishes whole-file rewrites, all or none.
 ///
 /// Every rewrite resolves through [`resolve_write_target`] before
@@ -469,7 +487,8 @@ fn duplicate_target_refusal(
 /// other kind resolved through a symlink it names; one invisible or
 /// symlink-refused member refuses the whole batch and stages nothing, as
 /// does a batch whose members resolve to the same absolute target - a
-/// symlink and its resolved target named separately included. Staging
+/// symlink and its resolved target named separately included - or one
+/// holding a resulting file past [`REWRITE_FILE_BYTES_MAX`]. Staging
 /// uses an exclusive temporary file per target, so no workspace filename
 /// can collide with it, and every target's previous state is captured
 /// before the first publish. A failed publish restores every member
@@ -481,13 +500,17 @@ fn duplicate_target_refusal(
 ///
 /// # Errors
 ///
-/// Returns [`ReadError`] for a filesystem failure; an invisible target or
-/// a duplicated batch member returns a refused [`ChangeResult`] instead.
+/// Returns [`ReadError`] for a filesystem failure; an invisible target, a
+/// duplicated batch member, or an oversized resulting file returns a
+/// refused [`ChangeResult`] instead.
 pub(crate) fn publish_rewrites(
     reads: &ReadService,
     root: &Path,
     rewrites: &[FileRewrite],
 ) -> Result<Result<Vec<Diagnostic>, ChangeResult>, ReadError> {
+    if let Some(refusal) = oversized_rewrite_refusal(rewrites) {
+        return Ok(Err(refusal));
+    }
     let mut targets: Vec<WriteTarget> = Vec::with_capacity(rewrites.len());
     for rewrite in rewrites {
         let resolution = if rewrite.kind.removes_file() {
@@ -540,7 +563,7 @@ mod tests {
         publish_rewrites, resolve_write_target, resolved_symlink_target,
     };
     use crate::read::ReadService;
-    use crate::rewrite::{FileRewrite, ReplacedRegion};
+    use crate::rewrite::{FileRewrite, REWRITE_FILE_BYTES_MAX, ReplacedRegion};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -732,6 +755,74 @@ mod tests {
             fs::read_to_string(directory.path().join("lib.rs"))?,
             "pub fn beacon() {}\n",
             "a refused batch writes nothing"
+        );
+        Ok(())
+    }
+
+    /// One member past [`REWRITE_FILE_BYTES_MAX`] refuses the whole batch atomically,
+    /// including a sibling member that is well within the bound: a create edit, the
+    /// whole-file fallback a change result reports past its own edit bound, and a
+    /// small patch against an already oversized file all share this check.
+    #[test]
+    fn test_publish_rewrites_refuses_a_batch_with_one_oversized_result() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("small.rs"), "pub fn beacon() {}\n")?;
+        let reads = reads_over(directory.path(), &SourceVisibility::default())?;
+        let oversized_source = "x".repeat(REWRITE_FILE_BYTES_MAX + 1);
+        let rewrites = vec![
+            FileRewrite::modify(
+                path("small.rs"),
+                "pub fn beacon() {}\n",
+                "pub fn beacon() -> u8 { 1 }\n".to_owned(),
+                vec![ReplacedRegion {
+                    range: ByteRange { start: 0, end: 20 },
+                    text: "pub fn beacon() -> u8 { 1 }\n".to_owned(),
+                }],
+            ),
+            FileRewrite::create(path("huge.rs"), oversized_source),
+        ];
+        let refusal = publish_rewrites(&reads, directory.path(), &rewrites)?
+            .expect_err("an oversized member must refuse the whole batch");
+        let ChangeResult::Refused {
+            reason,
+            diagnostics,
+            ..
+        } = refusal
+        else {
+            panic!("an oversized result must refuse");
+        };
+        assert_eq!(reason, RefusalReason::Unsupported);
+        assert!(
+            diagnostics[0].message.contains("huge.rs")
+                && diagnostics[0]
+                    .message
+                    .contains(&(REWRITE_FILE_BYTES_MAX + 1).to_string()),
+            "{diagnostics:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("small.rs"))?,
+            "pub fn beacon() {}\n",
+            "a refused batch writes nothing, including its well-bounded member"
+        );
+        assert!(
+            !directory.path().join("huge.rs").exists(),
+            "the oversized member's file must not be created"
+        );
+        Ok(())
+    }
+
+    /// A resulting file exactly at [`REWRITE_FILE_BYTES_MAX`] publishes.
+    #[test]
+    fn test_publish_rewrites_accepts_a_result_exactly_at_the_bound() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let reads = reads_over(directory.path(), &SourceVisibility::default())?;
+        let at_bound = "x".repeat(REWRITE_FILE_BYTES_MAX);
+        let rewrites = vec![FileRewrite::create(path("at_bound.rs"), at_bound.clone())];
+        publish_rewrites(&reads, directory.path(), &rewrites)?
+            .expect("a result exactly at the bound must publish");
+        assert_eq!(
+            fs::read_to_string(directory.path().join("at_bound.rs"))?,
+            at_bound
         );
         Ok(())
     }
