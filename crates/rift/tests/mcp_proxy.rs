@@ -23,38 +23,35 @@
 //! engine. `proxy_client` is the one entry point that spawns the real
 //! `rift mcp` binary; every case shares it, and no case may spawn a
 //! process of its own to stand in for the server or the engine.
+//!
+//! Every entry point named above lives in `harness.rs`, shared with
+//! `end_to_end.rs`; this file's own tests prove election, adoption,
+//! sharing, and re-election, and add the few helpers only they use.
 
 mod engine_fixture;
+mod harness;
 mod live_engine_gate;
 mod rust_engine;
 
-use std::error::Error;
 use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use harness::{
+    LIBRARY, RUST_PROJECT_BEACON_SYMBOL, SERIAL, StopOnDrop, TestResult, WARMUP_ATTEMPTS_MAX,
+    WARMUP_PAUSE, arguments, laid_out_workspace, proxied_call, proxy_client, proxy_command,
+    require_success, run_rift, rust_engine_workspace, warmed_rust_engine, within, workspace,
+};
 use rift_mcp::{PRESENCE_POLL_INTERVAL, ServerPresence, claim, probe};
 use rift_protocol::lock::{
     SERVER_LOCK_FILE_NAME, SERVER_PORT_MAX, SERVER_PORT_MIN, SERVER_TOKEN_LENGTH, ServerLock,
 };
+use rmcp::ServiceExt as _;
 use rmcp::model::CallToolRequestParams;
-use rmcp::service::{RoleClient, RunningService};
-use rmcp::transport::{ConfigureCommandExt as _, TokioChildProcess};
-use rmcp::{ServiceExt as _, transport::child_process::TokioChildProcessBuilder};
 use serde_json::json;
 use tokio::io::AsyncReadExt as _;
-
-type TestResult<T = ()> = Result<T, Box<dyn Error>>;
-
-/// Poll attempts while waiting on a server to disappear: 10 seconds at
-/// [`PRESENCE_POLL_INTERVAL`].
-const GONE_POLL_ATTEMPT_COUNT: u32 = 100;
-/// Bound on one proxied round trip that may include a server election. A
-/// refusal can wait out two start windows - the warmup's and the request's
-/// own - before it surfaces.
-const PROXIED_CALL_MAX: Duration = Duration::from_mins(1);
 
 /// The tools the workspace server advertises, in served order.
 const SERVED_TOOL_NAMES: [&str; 12] = [
@@ -72,128 +69,9 @@ const SERVED_TOOL_NAMES: [&str; 12] = [
     "search",
 ];
 
-/// Serializes the tests: the served port range is machine-global.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// The declaration every non-engine fixture serves, and the file
-/// referencing it.
-const LIBRARY: &str = "pub fn beacon() {}\n";
-
-/// A workspace fixture: one Rust source and a `rift.toml` whose
-/// `[server]` idle timeout reaps any orphaned server within a minute.
-fn workspace() -> TestResult<tempfile::TempDir> {
-    laid_out_workspace(&[("lib.rs", LIBRARY)], "")
-}
-
-/// The cargo project the real rust-analyzer end-to-end cases serve:
-/// rust-analyzer resolves nothing outside a cargo project, so the fixture
-/// is one, with the same shape `rift-mcp`'s own `live_rust_analyzer.rs`
-/// uses - a manifest whose `[lib]` path keeps every module file at the
-/// tree root, and whose empty `[workspace]` table stops cargo climbing
-/// out of the tempdir. `hub.rs` holds the declaration and `caller.rs`
-/// imports and calls it under a different name, so a rename of the
-/// declaration leaves no occurrence of the old name behind.
-const RUST_PROJECT_MANIFEST: &str = "[package]\nname = \"rift_live_fixture\"\nversion = \"0.0.0\"\n\
-                                     edition = \"2021\"\npublish = false\n\n[lib]\npath = \"lib.rs\"\n\n\
-                                     [workspace]\n";
-const RUST_PROJECT_ROOT: &str = "pub mod caller;\npub mod hub;\n";
-const RUST_PROJECT_HUB: &str = "pub fn beacon(value: i32) -> i32 {\n    value\n}\n";
-const RUST_PROJECT_CALLER: &str =
-    "use crate::hub::beacon;\n\npub fn total() -> i32 {\n    beacon(2)\n}\n";
-const RUST_PROJECT_BEACON_SYMBOL: &str = "rift://symbol/rust/hub.rs/beacon";
-
-fn rust_project() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("Cargo.toml", RUST_PROJECT_MANIFEST),
-        ("lib.rs", RUST_PROJECT_ROOT),
-        ("hub.rs", RUST_PROJECT_HUB),
-        ("caller.rs", RUST_PROJECT_CALLER),
-    ]
-}
-
-/// The cargo project fixture with a real `[engines.rust]` table appended,
-/// serving `rust` through rust-analyzer.
-fn rust_engine_workspace() -> TestResult<tempfile::TempDir> {
-    laid_out_workspace(&rust_project(), &rust_engine::rust_engine_configuration())
-}
-
-/// The `[search.semantic]` table every fixture here declares.
-///
-/// Rift ships the semantic tier on, so a fixture carrying no such table would acquire
-/// the default model from the hub. A hermetic suite must not write into the developer's
-/// own Hugging Face cache, and on a runner with no network a default-on tier would spend
-/// its whole retry budget inside a detached task nobody waits on. `rift-mcp`'s
-/// `tests/hermetic_search.rs` states the same policy for that crate's suites, and its
-/// `live_semantic_search` suite is the one place the shipped default is exercised.
-const SEMANTIC_DISABLED: &str = "[search.semantic]\ndisabled = true\n";
-
-/// One fixture workspace holding `files` and a `rift.toml` carrying the disabled
-/// semantic tier, the orphan-safety idle timeout, and `engine`.
-fn laid_out_workspace(files: &[(&str, &str)], engine: &str) -> TestResult<tempfile::TempDir> {
-    let directory = tempfile::tempdir()?;
-    for (name, source) in files {
-        fs::write(directory.path().join(name), source)?;
-    }
-    fs::write(
-        directory.path().join("rift.toml"),
-        format!("{SEMANTIC_DISABLED}[server]\nidle_timeout = \"60s\"\n{engine}"),
-    )?;
-    Ok(directory)
-}
-
-/// Stops the fixture's server when a test unwinds, best effort.
-struct StopOnDrop {
-    root: PathBuf,
-}
-
-impl StopOnDrop {
-    fn new(root: &Path) -> Self {
-        Self {
-            root: root.to_owned(),
-        }
-    }
-}
-
-impl Drop for StopOnDrop {
-    fn drop(&mut self) {
-        let _ = std::process::Command::new(env!("CARGO_BIN_EXE_rift"))
-            .args(["server", "stop"])
-            .current_dir(&self.root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-}
-
-/// Runs the real binary with `arguments` inside the fixture workspace,
-/// off the async runtime.
-async fn run_rift(root: &Path, arguments: &[&str]) -> TestResult<std::process::Output> {
-    let root = root.to_owned();
-    let arguments: Vec<String> = arguments.iter().map(|&argument| argument.into()).collect();
-    let output = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(env!("CARGO_BIN_EXE_rift"))
-            .args(&arguments)
-            .current_dir(&root)
-            .stdin(Stdio::null())
-            .output()
-    })
-    .await??;
-    Ok(output)
-}
-
-fn require_success(output: &std::process::Output, what: &str) -> TestResult {
-    if output.status.success() {
-        return Ok(());
-    }
-    Err(format!(
-        "{what} must succeed: status {:?}, stdout {:?}, stderr {:?}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    )
-    .into())
-}
+/// Poll attempts while waiting on a server to disappear: 10 seconds at
+/// [`PRESENCE_POLL_INTERVAL`].
+const GONE_POLL_ATTEMPT_COUNT: u32 = 100;
 
 fn document_path(root: &Path) -> PathBuf {
     root.join(".rift").join(SERVER_LOCK_FILE_NAME)
@@ -222,71 +100,10 @@ async fn wait_for<T>(
     Err(format!("timed out waiting for {what}").into())
 }
 
-/// Bounds one proxied operation by [`PROXIED_CALL_MAX`].
-async fn within<Value>(what: &str, operation: impl Future<Output = Value>) -> TestResult<Value> {
-    tokio::time::timeout(PROXIED_CALL_MAX, operation)
-        .await
-        .map_err(|_elapsed| format!("timed out waiting for {what}").into())
-}
-
-/// The `rift mcp` child command for one fixture workspace.
-fn proxy_command(root: &Path) -> TokioChildProcessBuilder {
-    TokioChildProcess::builder(
-        tokio::process::Command::new(env!("CARGO_BIN_EXE_rift")).configure(|command| {
-            command
-                .arg("mcp")
-                .current_dir(root)
-                .env("RUST_LOG", "rift=info,rift_mcp=info,rift_server=info");
-        }),
-    )
-}
-
-/// One connected `rift mcp` child with its stderr discarded.
-async fn proxy_client(root: &Path) -> TestResult<RunningService<RoleClient, ()>> {
-    let (transport, _stderr) = proxy_command(root).stderr(Stdio::null()).spawn()?;
-    Ok(().serve(transport).await?)
-}
-
-fn arguments(value: &serde_json::Value) -> TestResult<serde_json::Map<String, serde_json::Value>> {
-    value
-        .as_object()
-        .cloned()
-        .ok_or_else(|| "tool arguments must be an object".into())
-}
-
-/// Most attempts one proxied call spends on a retryable refusal.
-const ACCEPTANCE_ATTEMPTS_MAX: usize = 8;
-
-/// One proxied tool call returning its structured result, retrying the
-/// refusal the server advertises as `retry: same_request`: an applied
-/// change moves the index, and a request whose snapshot predates the move
-/// is refused rather than served stale.
-async fn proxied_call(
-    client: &RunningService<RoleClient, ()>,
-    name: &'static str,
-    call_arguments: &serde_json::Value,
-) -> TestResult<serde_json::Value> {
-    for _attempt in 0..ACCEPTANCE_ATTEMPTS_MAX {
-        let params = CallToolRequestParams::new(name).with_arguments(arguments(call_arguments)?);
-        match within(name, client.call_tool(params)).await? {
-            Ok(called) => {
-                return called
-                    .structured_content
-                    .ok_or_else(|| format!("{name} must return structured content").into());
-            }
-            Err(rmcp::ServiceError::McpError(error))
-                if error
-                    .data
-                    .as_ref()
-                    .is_some_and(|data| data.get("retry") == Some(&json!("same_request"))) => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Err(format!("the server kept refusing {name}").into())
-}
-
 /// One proxied `get_symbol` round trip for the fixture's `beacon` symbol.
-async fn beacon_lookup(client: &RunningService<RoleClient, ()>) -> TestResult<serde_json::Value> {
+async fn beacon_lookup(
+    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+) -> TestResult<serde_json::Value> {
     proxied_call(client, "get_symbol", &json!({"name": "beacon"})).await
 }
 
@@ -552,15 +369,10 @@ async fn held_election_without_a_server_refuses_with_operator_guidance() -> Test
 async fn a_spawned_server_that_cannot_bind_its_port_refuses_with_its_captured_stderr() -> TestResult
 {
     let _serial = SERIAL.lock().await;
-    let directory = tempfile::tempdir()?;
-    let root = directory.path();
-    fs::write(root.join("lib.rs"), LIBRARY)?;
     let held = held_port_in_range()?;
     let port = held.local_addr()?.port();
-    fs::write(
-        root.join("rift.toml"),
-        format!("{SEMANTIC_DISABLED}[server]\nport = {port}\nidle_timeout = \"60s\"\n"),
-    )?;
+    let directory = laid_out_workspace(&[("lib.rs", LIBRARY)], &format!("port = {port}\n"))?;
+    let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
 
     let client = proxy_client(root).await?;
@@ -647,42 +459,6 @@ async fn proxy_stderr_carries_lifecycle_lines_and_never_the_token() -> TestResul
 // the real binary against a real elected server, and - gated behind
 // `RIFT_ENGINE_LIVE` - a real language engine, the way an agent reaches
 // Rift.
-
-/// Most attempts the warm-up loop below spends waiting for rust-analyzer
-/// to finish loading the cargo project, and the pause between them: at
-/// most a minute of waiting, on top of the per-call [`PROXIED_CALL_MAX`]
-/// bound, then the test fails instead of hanging.
-const WARMUP_ATTEMPTS_MAX: usize = 240;
-const WARMUP_PAUSE: Duration = Duration::from_millis(250);
-
-/// Drives the rename tool, through the real proxy, until rust-analyzer has
-/// loaded the cargo project.
-///
-/// The probe renames the declaration to the name it already has. Once
-/// rust-analyzer resolves it, the proposal edits every occurrence to the
-/// bytes already there, so the compiled plan holds no rewrite and the tool
-/// refuses with `proposed no edits` - the readiness signal, with the tree
-/// untouched either way. `rift-mcp`'s own `live_rust_analyzer.rs` states
-/// the full reasoning for this probe; the proxy adds only its own latency
-/// on top.
-async fn warmed_rust_engine(client: &RunningService<RoleClient, ()>) -> TestResult {
-    for _attempt in 0..WARMUP_ATTEMPTS_MAX {
-        let structured = proxied_call(
-            client,
-            "rename_symbol",
-            &json!({ "symbol": RUST_PROJECT_BEACON_SYMBOL, "new_name": "beacon" }),
-        )
-        .await?;
-        let refused = structured["diagnostics"][0]["message"]
-            .as_str()
-            .unwrap_or_default();
-        if refused.contains("proposed no edits") {
-            return Ok(());
-        }
-        tokio::time::sleep(WARMUP_PAUSE).await;
-    }
-    Err("rust-analyzer never resolved the declaration through the proxy".into())
-}
 
 /// The engine tier answers through the whole real chain: the `rift`
 /// binary as `rift mcp`, its elected `rift server`, and rust-analyzer, all
