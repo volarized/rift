@@ -106,9 +106,9 @@ fn recounted_headers(segment: &str) -> String {
 /// through untouched, leaving the parser to name what is wrong with it.
 fn push_recounted_hunk(recounted: &mut String, hunk: &str) {
     let mut lines = line::lines_inclusive(hunk);
-    let Some(header) = lines.next() else {
-        return;
-    };
+    // A chunk always opens with its own `@@` line; an empty chunk carries no
+    // header to rewrite and no body to count, and falls through as itself.
+    let header = lines.next().unwrap_or_default();
     let body: Vec<&str> = lines.collect();
     match rewritten_header(header, HunkCounts::of(&body)) {
         Some(rewritten) => recounted.push_str(&rewritten),
@@ -521,10 +521,8 @@ impl<'a> ImageLine<'a> {
     /// Where this line ends in the original file, or `None` for a line an
     /// earlier hunk wrote.
     fn base_end(self) -> Option<u64> {
-        match self {
-            Self::Original { text, start } => Some(start + text.len() as u64),
-            Self::Patched(_) => None,
-        }
+        self.base_start()
+            .map(|start| start + self.text().len() as u64)
     }
 }
 
@@ -2120,6 +2118,24 @@ mod tests {
         );
         assert_eq!(applied.replaced[0].text, "TARGET\n");
         Ok(())
+    }
+
+    #[test]
+    fn image_line_offsets_answer_for_an_original_line_and_refuse_for_a_patched_one() {
+        let original = super::ImageLine::Original {
+            text: "beacon\n",
+            start: 12,
+        };
+        assert_eq!(original.base_start(), Some(12));
+        assert_eq!(original.base_end(), Some(19), "12 plus the line's 7 bytes");
+
+        let patched = super::ImageLine::Patched("beacon\n");
+        assert_eq!(
+            patched.base_start(),
+            None,
+            "a line an earlier hunk wrote stands at no offset in the original image"
+        );
+        assert_eq!(patched.base_end(), None);
     }
 
     #[test]
