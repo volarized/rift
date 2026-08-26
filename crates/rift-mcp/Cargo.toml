@@ -94,5 +94,9 @@ name = "schema_export"
 path = "tests/schema_export.rs"
 
 [[test]]
+name = "source_exclusion"
+path = "tests/source_exclusion.rs"
+
+[[test]]
 name = "surface_validation"
 path = "tests/surface_validation.rs"

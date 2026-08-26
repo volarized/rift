@@ -252,6 +252,10 @@ one of those files returns as a `file` hit, tagged the same way:
 }
 ```
 
+Neither hit above carries `source`: a request pays that lookup only when `include` names it.
+`include: ["source"]` attaches the excerpt as `source` on every hit; an omitted `include` returns
+the hit's symbol or file, `path`, `span`, and `line` alone, as both hits above do.
+
 <McpTool name="nodes" />
 
 Each identity carries the witness a later
