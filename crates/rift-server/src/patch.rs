@@ -882,8 +882,8 @@ mod tests {
     use rift_core::SourceVisibility;
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::change::{
-        ChangeResult, ChangeSummary, OperationPreconditionKind, PatchParams, PreconditionValue,
-        RefusalReason,
+        BodySource, ChangeResult, ChangeSummary, OperationPreconditionKind, PATCH_BYTES_MAX,
+        PatchParams, PreconditionValue, RefusalReason,
     };
     use rift_protocol::configuration::HistoryConfiguration;
     use rift_protocol::read::ProjectPath;
@@ -894,7 +894,7 @@ mod tests {
     };
     use crate::change::ChangeService;
     use crate::read::ReadService;
-    use crate::rewrite::{FileRewrite, RewriteKind};
+    use crate::rewrite::{FileRewrite, REWRITE_FILE_BYTES_MAX, RewriteKind};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -1202,7 +1202,12 @@ mod tests {
             "",
         ]
         .join("\n");
-        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?;
         let summary = applied_summary(result);
         assert_eq!(summary.paths, vec![ProjectPath("new.rs".to_owned())]);
         let written = fs::read_to_string(directory.path().join("new.rs"))?;
@@ -1221,7 +1226,12 @@ mod tests {
             "",
         ]
         .join("\n");
-        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?;
         applied_summary(result);
         let written = fs::read_to_string(directory.path().join("a/b/c/new.rs"))?;
         assert_eq!(written, "pub fn nested() {}\n");
@@ -1232,7 +1242,12 @@ mod tests {
     fn patch_creates_an_empty_file() -> TestResult {
         let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
         let patch = "--- /dev/null\n+++ b/empty.rs\n".to_owned();
-        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?;
         applied_summary(result);
         let written = fs::read_to_string(directory.path().join("empty.rs"))?;
         assert_eq!(written, "");
@@ -1246,7 +1261,9 @@ mod tests {
             .patch(
                 &reads,
                 &PatchParams {
-                    patch: "--- /dev/null\n+++ b//etc/passwd\n@@ -0,0 +1 @@\n+x\n".to_owned(),
+                    patch: "--- /dev/null\n+++ b//etc/passwd\n@@ -0,0 +1 @@\n+x\n"
+                        .to_owned()
+                        .into(),
                 },
             )
             .expect_err("an absolute creation path must error");
@@ -1255,7 +1272,9 @@ mod tests {
             .patch(
                 &reads,
                 &PatchParams {
-                    patch: "--- /dev/null\n+++ b/../escape.rs\n@@ -0,0 +1 @@\n+x\n".to_owned(),
+                    patch: "--- /dev/null\n+++ b/../escape.rs\n@@ -0,0 +1 @@\n+x\n"
+                        .to_owned()
+                        .into(),
                 },
             )
             .expect_err("a dot-segment creation path must error");
@@ -1274,7 +1293,12 @@ mod tests {
             "",
         ]
         .join("\n");
-        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?;
         let ChangeResult::Refused {
             reason,
             preconditions,
@@ -1308,7 +1332,12 @@ mod tests {
         ]
         .join("\n");
         let error = changes
-            .patch(&reads, &PatchParams { patch })
+            .patch(
+                &reads,
+                &PatchParams {
+                    patch: patch.into(),
+                },
+            )
             .expect_err("a non-directory parent segment must surface a stat failure");
         assert_eq!(error.descriptor().code(), "storage_failure");
         assert!(
@@ -1330,7 +1359,12 @@ mod tests {
             "",
         ]
         .join("\n");
-        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?;
         let ChangeResult::Refused { reason, .. } = result else {
             panic!("a context line cannot exist in an empty starting file");
         };
@@ -1351,7 +1385,12 @@ mod tests {
             "",
         ]
         .join("\n");
-        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?;
         let summary = applied_summary(result);
         assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
         assert!(!directory.path().join("lib.rs").exists());
@@ -1369,7 +1408,12 @@ mod tests {
             "",
         ]
         .join("\n");
-        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?;
         let ChangeResult::Refused {
             reason,
             preconditions,
@@ -1399,7 +1443,12 @@ mod tests {
             "",
         ]
         .join("\n");
-        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?;
         let ChangeResult::Refused {
             reason,
             preconditions,
@@ -1431,7 +1480,12 @@ mod tests {
             "",
         ]
         .join("\n");
-        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?;
         let ChangeResult::Refused {
             reason,
             preconditions,
@@ -1461,7 +1515,12 @@ mod tests {
             "",
         ]
         .join("\n");
-        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?;
         let ChangeResult::Refused {
             reason,
             preconditions,
@@ -1496,7 +1555,12 @@ mod tests {
             "",
         ]
         .join("\n");
-        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?;
         let summary = applied_summary(result);
         assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
         let written = fs::read_to_string(directory.path().join("lib.rs"))?;
@@ -1534,7 +1598,12 @@ mod tests {
             "",
         ]
         .join("\n");
-        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?;
         let ChangeResult::Refused { .. } = result else {
             panic!("a mismatched second file must refuse the whole patch");
         };
@@ -1562,7 +1631,7 @@ mod tests {
         let result = changes.patch(
             &reads,
             &PatchParams {
-                patch: patch.clone(),
+                patch: patch.clone().into(),
             },
         )?;
         let summary = applied_summary(result);
@@ -1587,7 +1656,7 @@ mod tests {
         let result = changes.patch(
             &reads,
             &PatchParams {
-                patch: patch.clone(),
+                patch: patch.clone().into(),
             },
         )?;
         let ChangeResult::Refused {
@@ -1638,7 +1707,7 @@ mod tests {
         let result = changes.patch(
             &reads,
             &PatchParams {
-                patch: patch.clone(),
+                patch: patch.clone().into(),
             },
         )?;
         let summary = applied_summary(result);
@@ -1656,7 +1725,7 @@ mod tests {
             .patch(
                 &reads,
                 &PatchParams {
-                    patch: "not a diff".to_owned(),
+                    patch: "not a diff".to_owned().into(),
                 },
             )
             .expect_err("headerless input must error");
@@ -1666,7 +1735,8 @@ mod tests {
                 &reads,
                 &PatchParams {
                     patch: "--- a/../escape.rs\n+++ b/../escape.rs\n@@ -1 +1 @@\n-x\n+y\n"
-                        .to_owned(),
+                        .to_owned()
+                        .into(),
                 },
             )
             .expect_err("dot segments must error");
@@ -1687,7 +1757,12 @@ mod tests {
             );
         }
         let error = changes
-            .patch(&reads, &PatchParams { patch })
+            .patch(
+                &reads,
+                &PatchParams {
+                    patch: patch.into(),
+                },
+            )
             .expect_err("a diff past the file bound must error");
         assert_eq!(error.descriptor().code(), "invalid_request");
         assert!(
@@ -1711,7 +1786,12 @@ mod tests {
             "",
         ]
         .join("\n");
-        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?;
         let ChangeResult::Refused { reason, .. } = result else {
             panic!("file rename must refuse this release");
         };
@@ -1728,7 +1808,7 @@ mod tests {
         let result = changes.patch(
             &reads,
             &PatchParams {
-                patch: patch.to_owned(),
+                patch: patch.into(),
             },
         )?;
         let ChangeResult::Refused {
@@ -1759,7 +1839,7 @@ mod tests {
         let result = changes.patch(
             &reads,
             &PatchParams {
-                patch: patch.to_owned(),
+                patch: patch.into(),
             },
         )?;
         let ChangeResult::Refused {
@@ -1807,7 +1887,12 @@ mod tests {
     fn patch_applies_against_a_text_indexed_file_no_syntax_provider_parses() -> TestResult {
         let (directory, reads, changes) = visible_file_fixture()?;
         let patch = "--- a/notes.mdx\n+++ b/notes.mdx\n@@ -1,2 +1,2 @@\n # Notes\n-First line.\n+Updated line.\n".to_owned();
-        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?;
         let summary = applied_summary(result);
         assert_eq!(summary.paths, vec![ProjectPath("notes.mdx".to_owned())]);
         let written = fs::read_to_string(directory.path().join("notes.mdx"))?;
@@ -1837,7 +1922,12 @@ mod tests {
             "",
         ]
         .join("\n");
-        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?;
         let summary = applied_summary(result);
         assert_eq!(summary.paths.len(), 2);
         assert_eq!(
@@ -1863,7 +1953,12 @@ mod tests {
             "",
         ]
         .join("\n");
-        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?;
         let summary = applied_summary(result);
         assert_eq!(summary.paths, vec![ProjectPath("justfile".to_owned())]);
         assert!(!directory.path().join("justfile").exists());
@@ -1888,7 +1983,12 @@ mod tests {
         )?;
         let changes = ChangeService::new(directory.path());
         let patch = "--- a/justfile\n+++ b/justfile\n@@ -1,2 +1,2 @@\n default:\n-    echo hello\n+    echo goodbye\n".to_owned();
-        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?;
         let ChangeResult::Refused {
             reason,
             preconditions,
@@ -1937,7 +2037,12 @@ mod tests {
         let changes = ChangeService::new(directory.path());
         let patch =
             "--- /dev/null\n+++ b/excluded/new.rs\n@@ -0,0 +1 @@\n+pub fn fresh() {}\n".to_owned();
-        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?;
         let ChangeResult::Refused {
             reason,
             diagnostics,
@@ -1992,7 +2097,12 @@ mod tests {
             "",
         ]
         .join("\n");
-        let summary = applied_summary(changes.patch(&reads, &PatchParams { patch })?);
+        let summary = applied_summary(changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?);
         assert_eq!(summary.paths.len(), 2);
         assert_eq!(
             fs::read_to_string(directory.path().join("report.rs"))?,
@@ -2027,7 +2137,12 @@ mod tests {
         let patch =
             "--- a/link.rs\n+++ b/link.rs\n@@ -1 +1 @@\n-pub fn beacon() {}\n+pub fn renamed() {}\n"
                 .to_owned();
-        let summary = applied_summary(changes.patch(&reads, &PatchParams { patch })?);
+        let summary = applied_summary(changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?);
         assert_eq!(summary.paths, vec![ProjectPath("link.rs".to_owned())]);
         assert!(
             fs::symlink_metadata(directory.path().join("link.rs"))?
@@ -2077,7 +2192,12 @@ mod tests {
         let patch =
             "--- a/link.rs\n+++ b/link.rs\n@@ -1 +1 @@\n-pub fn secret() {}\n+pub fn exposed() {}\n"
                 .to_owned();
-        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?;
         let ChangeResult::Refused {
             reason,
             diagnostics,
@@ -2120,7 +2240,12 @@ mod tests {
             "",
         ]
         .join("\r\n");
-        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?;
         let summary = applied_summary(result);
         assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
         let written = fs::read_to_string(directory.path().join("lib.rs"))?;
@@ -2143,7 +2268,12 @@ mod tests {
             "",
         ]
         .join("\n");
-        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?;
         let ChangeResult::Refused { reason, .. } = result else {
             panic!("an ending mismatch must refuse as context drift, not rewrite endings");
         };
@@ -2160,7 +2290,7 @@ mod tests {
         let result = changes.patch(
             &reads,
             &PatchParams {
-                patch: patch.to_owned(),
+                patch: patch.into(),
             },
         )?;
         let summary = applied_summary(result);
@@ -2178,7 +2308,7 @@ mod tests {
             .patch(
                 &reads,
                 &PatchParams {
-                    patch: patch.to_owned(),
+                    patch: patch.into(),
                 },
             )
             .expect_err("backslash separators must fail as an invalid path");
@@ -2186,6 +2316,85 @@ mod tests {
         assert!(
             error.to_string().contains("forward-slash"),
             "message must name the expected form: {error}"
+        );
+        Ok(())
+    }
+
+    /// `patch` with `{"file": ...}` applies identically to the same diff sent inline.
+    #[test]
+    fn patch_file_form_matches_the_inline_form_byte_identically() -> TestResult {
+        let diff = "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-pub fn beacon() {}\n+pub fn beacon() -> u8 { 3 }\n";
+        let scratch = tempfile::tempdir()?;
+        let scratch_file = scratch.path().join("change.diff");
+        fs::write(&scratch_file, diff)?;
+
+        let (inline_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        applied_summary(changes.patch(&reads, &PatchParams { patch: diff.into() })?);
+
+        let (file_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        applied_summary(changes.patch(
+            &reads,
+            &PatchParams {
+                patch: BodySource::File {
+                    file: scratch_file.to_string_lossy().into_owned(),
+                },
+            },
+        )?);
+
+        assert_eq!(
+            fs::read(inline_directory.path().join("lib.rs"))?,
+            fs::read(file_directory.path().join("lib.rs"))?,
+            "the inline and file forms must write byte-identical trees"
+        );
+        Ok(())
+    }
+
+    /// A `patch` at [`PATCH_BYTES_MAX`] applies; one byte over refuses `unsupported`
+    /// naming the byte count.
+    #[test]
+    fn patch_bound_accepts_the_limit_and_refuses_one_byte_over() -> TestResult {
+        // The bound is enforced before the patch is parsed, so this need not be a
+        // legal diff: it only needs to be one byte longer than PATCH_BYTES_MAX.
+        let over = "x".repeat(PATCH_BYTES_MAX + 1);
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let result = changes.patch(&reads, &PatchParams { patch: over.into() })?;
+        let ChangeResult::Refused {
+            reason,
+            diagnostics,
+            ..
+        } = result
+        else {
+            panic!("a patch one byte over the bound must refuse");
+        };
+        assert_eq!(reason, RefusalReason::Unsupported);
+        assert!(
+            diagnostics[0]
+                .message
+                .contains(&(PATCH_BYTES_MAX + 1).to_string())
+        );
+        Ok(())
+    }
+
+    /// A one-line patch against a file already over [`REWRITE_FILE_BYTES_MAX`]
+    /// refuses: nothing bounds the patch text itself here, since the change is tiny,
+    /// so the shared rewrite-result check in `publish_rewrites` is what catches it.
+    #[test]
+    fn patch_against_an_already_oversized_file_refuses() -> TestResult {
+        let existing = format!(
+            "pub fn beacon() {{}}\n// {}\n",
+            "x".repeat(REWRITE_FILE_BYTES_MAX)
+        );
+        let (directory, reads, changes) = fixture(&existing)?;
+        let diff = "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-pub fn beacon() {}\n+pub fn beacon() -> u8 { 1 }\n";
+        let result = changes.patch(&reads, &PatchParams { patch: diff.into() })?;
+        let ChangeResult::Refused { reason, .. } = result else {
+            panic!("a patch against an already oversized file must refuse");
+        };
+        assert_eq!(reason, RefusalReason::Unsupported);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("lib.rs"))?,
+            existing,
+            "a refused patch leaves the tree untouched"
         );
         Ok(())
     }

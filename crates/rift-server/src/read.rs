@@ -18,7 +18,7 @@ use rift_protocol::configuration::HistoryConfiguration;
 use rift_protocol::read::{
     Digest, ExactKind, Extensions, FileId, GetSymbolHit, GetSymbolParams, GetSymbolResult,
     Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, Pagination, ProjectPath,
-    ReadWarning, RevisionId, SearchScope, SourceExcerpt, SourceKind, SourceLocation, SourceUnitId,
+    ReadWarning, RevisionId, SourceExcerpt, SourceKind, SourceLocation, SourceUnitId,
     SourceUnitSpan, Symbol, SymbolId, SymbolOrigin, TextRange,
 };
 use rift_syntax::{ByteRange, SyntaxNode, SyntaxProvider, SyntaxSymbol, registry};
@@ -476,13 +476,9 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] for projections, invalid paths, or missing files.
+    /// Returns [`ReadError`] for invalid paths or missing files.
     pub fn nodes(&self, params: NodesParams) -> Result<NodesResult, ReadError> {
-        validate_common(
-            params.projection.is_some(),
-            params.rev.is_some(),
-            SearchScope::Project,
-        )?;
+        validate_common(params.rev.is_some())?;
         let path = CoreProjectPath::new(params.path.0).map_err(|error| {
             ReadFault::invalid("path", rift_core::fault_label(&error.fault().violation()))
         })?;
@@ -568,14 +564,10 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] for an unsupported projection or scope, and
-    /// for symbol history the workspace's version control cannot serve.
+    /// Returns [`ReadError`] for symbol history the workspace's version control cannot
+    /// serve.
     pub fn get_symbol(&self, params: &GetSymbolParams) -> Result<GetSymbolResult, ReadError> {
-        validate_common(
-            params.projection.is_some(),
-            params.rev.is_some(),
-            params.scope,
-        )?;
+        validate_common(params.rev.is_some())?;
         let limit = accepted_limit(params.limit)?;
         // The whole ranked match set is collected up to the index's own `results_max`
         // bound, so `pagination.total_pages` counts the full result set the pages divide.
@@ -639,23 +631,16 @@ pub(crate) fn accepted_limit(requested: u64) -> Result<usize, ReadError> {
         .map_err(|_| ReadFault::invalid("limit", format!("{requested} exceeds this platform")))
 }
 
-pub(crate) fn validate_common(
-    projection: bool,
-    rev: bool,
-    scope: SearchScope,
-) -> Result<(), ReadError> {
-    if rev && projection {
-        return Err(ReadFault::invalid(
-            "rev",
-            "combines with projection; a read serves one tree",
-        ));
-    }
-    if projection {
-        return Err(ReadFault::unsupported("projection reads"));
-    }
-    if scope == SearchScope::Dependencies {
-        return Err(ReadFault::unsupported("dependency reads"));
-    }
+/// The one checkpoint every read call passes before its own validation. `projection` and
+/// every `scope` but `project` left the wire, so `rev` is the only field this still takes;
+/// a caller-supplied `rev` needs no rule beyond what [`ReadService::at_revision`] already
+/// enforces when it resolves that revision.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "kept as Result for symmetry with every other read validation, which every call \
+              site propagates with `?`"
+)]
+pub(crate) fn validate_common(_rev: bool) -> Result<(), ReadError> {
     Ok(())
 }
 
@@ -1020,8 +1005,8 @@ mod tests {
 
     use rift_core::SourceVisibility;
     use rift_protocol::read::{
-        GetSymbolParams, Language, NodeFacet, NodesParams, NodesResult, ProjectPath, ProjectionId,
-        ReadWarning, RevisionId,
+        GetSymbolParams, Language, NodeFacet, NodesParams, NodesResult, ProjectPath, ReadWarning,
+        RevisionId,
     };
     use serde_json::json;
     use tempfile::TempDir;
@@ -1128,7 +1113,6 @@ pub fn compute() -> i32 {
         let result = service.nodes(NodesParams {
             path: ProjectPath("src/lib.rs".to_owned()),
             position: 5,
-            projection: None,
             rev: None,
         })?;
         let value = serde_json::to_value(result)?;
@@ -1227,6 +1211,36 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
+    /// `helper` is exact, `helper_alpha` is a name prefix, and `cafe_helper` is a qualified-
+    /// name substring - the order `GetSymbolParams.name`'s own doc states: "An exact symbol
+    /// name ranks first, then prefix matches, then qualified-name substrings."
+    #[test]
+    fn get_symbol_ranks_exact_then_prefix_then_substring() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("src"))?;
+        fs::write(
+            directory.path().join("src/lib.rs"),
+            "pub fn helper() {}\npub fn helper_alpha() {}\npub fn cafe_helper() {}\n",
+        )?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let params: GetSymbolParams =
+            serde_json::from_value(json!({"name": "helper", "limit": 10}))?;
+        let result = service.get_symbol(&params)?;
+        let names: Vec<&str> = result
+            .hits
+            .iter()
+            .map(|hit| hit.symbol.name.as_str())
+            .collect();
+        assert_eq!(names, ["helper", "helper_alpha", "cafe_helper"]);
+        Ok(())
+    }
+
     /// Pins the serialized symbol and node shape: the document's generic
     /// kind, facet, visibility, and container fields must serve the exact
     /// bytes the per-kind helpers served before them.
@@ -1264,21 +1278,19 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
+    /// `projection` left `NodesParams`'s served fields; a request naming it is refused as an
+    /// unknown field, not accepted and silently ignored.
     #[test]
-    fn unsupported_projection_is_rejected() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let projection = ProjectionId("rift://projection/my-feature-one".to_owned());
-        let nodes = service.nodes(NodesParams {
-            path: ProjectPath("src/lib.rs".to_owned()),
-            position: 0,
-            projection: Some(projection),
-            rev: None,
-        });
-        assert!(matches!(
-            nodes.expect_err("projection must fail").fault(),
-            ReadFault::Unsupported { .. }
-        ));
-        Ok(())
+    fn nodes_rejects_projection_as_an_unknown_field() {
+        let result: Result<NodesParams, _> = serde_json::from_value(json!({
+            "path": "src/lib.rs",
+            "position": 0,
+            "projection": "rift://projection/my-feature-one"
+        }));
+        assert!(
+            result.is_err(),
+            "a withdrawn projection field must fail deserialization"
+        );
     }
 
     #[test]
@@ -1453,7 +1465,6 @@ pub fn compute() -> i32 {
         let missing = service.nodes(NodesParams {
             path: ProjectPath("src/missing.rs".to_owned()),
             position: 0,
-            projection: None,
             rev: None,
         });
         assert!(matches!(
@@ -1484,7 +1495,6 @@ pub fn compute() -> i32 {
         service.nodes(NodesParams {
             path: ProjectPath(path.to_owned()),
             position: 0,
-            projection: None,
             rev: None,
         })
     }
@@ -1655,7 +1665,6 @@ pub fn compute() -> i32 {
         let result = service.nodes(NodesParams {
             path: ProjectPath("/etc/passwd".to_owned()),
             position: 0,
-            projection: None,
             rev: None,
         });
         assert!(matches!(
@@ -1665,19 +1674,16 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
+    /// `scope` left `GetSymbolParams`'s served fields once `project` became its only value; a
+    /// request naming it is refused as an unknown field, not accepted and silently ignored.
     #[test]
-    fn get_symbol_rejects_dependency_scope() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let params: GetSymbolParams =
-            serde_json::from_value(json!({"name": "Beacon", "scope": "dependencies"}))?;
-        assert!(matches!(
-            service
-                .get_symbol(&params)
-                .expect_err("dependency scope must fail")
-                .fault(),
-            ReadFault::Unsupported { .. }
-        ));
-        Ok(())
+    fn get_symbol_rejects_scope_as_an_unknown_field() {
+        let result: Result<GetSymbolParams, _> =
+            serde_json::from_value(json!({"name": "Beacon", "scope": "dependencies"}));
+        assert!(
+            result.is_err(),
+            "a withdrawn scope field must fail deserialization"
+        );
     }
 
     #[test]
@@ -1691,7 +1697,6 @@ pub fn compute() -> i32 {
         let expression = service.nodes(NodesParams {
             path: ProjectPath("src/lib.rs".to_owned()),
             position: expression_position,
-            projection: None,
             rev: None,
         })?;
         assert!(any_node_has_facet(&expression, "expression")?);
@@ -1702,7 +1707,6 @@ pub fn compute() -> i32 {
         let statement = service.nodes(NodesParams {
             path: ProjectPath("src/lib.rs".to_owned()),
             position: statement_position,
-            projection: None,
             rev: None,
         })?;
         assert!(any_node_has_facet(&statement, "statement")?);
@@ -1713,7 +1717,6 @@ pub fn compute() -> i32 {
         let comment = service.nodes(NodesParams {
             path: ProjectPath("src/lib.rs".to_owned()),
             position: comment_position,
-            projection: None,
             rev: None,
         })?;
         assert!(any_node_has_facet(&comment, "comment")?);
@@ -1753,7 +1756,6 @@ pub fn compute() -> i32 {
         let result = service.nodes(NodesParams {
             path: ProjectPath("src/lib.rs".to_owned()),
             position,
-            projection: None,
             rev: None,
         })?;
         let value = serde_json::to_value(result)?;
@@ -1779,7 +1781,6 @@ pub fn compute() -> i32 {
         let result = service.nodes(NodesParams {
             path: ProjectPath("src/lib.rs".to_owned()),
             position,
-            projection: None,
             rev: None,
         })?;
         let value = serde_json::to_value(result)?;
@@ -1804,7 +1805,6 @@ pub fn compute() -> i32 {
         let result = service.nodes(NodesParams {
             path: ProjectPath("src/lib.rs".to_owned()),
             position,
-            projection: None,
             rev: None,
         })?;
         let value = serde_json::to_value(result)?;
@@ -1941,7 +1941,6 @@ pub fn compute() -> i32 {
         let result = service.nodes(NodesParams {
             path: ProjectPath("src/App.tsx".to_owned()),
             position,
-            projection: None,
             rev: None,
         })?;
         let value = serde_json::to_value(result)?;
@@ -2061,7 +2060,6 @@ pub fn compute() -> i32 {
         let params = NodesParams {
             path: ProjectPath("src/guide.md".to_owned()),
             position,
-            projection: None,
             rev: None,
         };
         let value = serde_json::to_value(service.nodes(params)?)?;
@@ -2202,7 +2200,6 @@ pub fn compute() -> i32 {
         let params = NodesParams {
             path: ProjectPath("settings.json".to_owned()),
             position,
-            projection: None,
             rev: None,
         };
         let value = serde_json::to_value(service.nodes(params)?)?;
@@ -2244,7 +2241,6 @@ pub fn compute() -> i32 {
         let params = NodesParams {
             path: ProjectPath("pipeline.yaml".to_owned()),
             position,
-            projection: None,
             rev: None,
         };
         let value = serde_json::to_value(service.nodes(params)?)?;
@@ -2383,7 +2379,6 @@ pub fn compute() -> i32 {
             .nodes(NodesParams {
                 path: ProjectPath("Cargo.lock".to_owned()),
                 position: 0,
-                projection: None,
                 rev: Some(RevisionId("main".to_owned())),
             })
             .expect_err("an unparsed extension must be rejected at a revision too");
@@ -2443,7 +2438,6 @@ pub fn compute() -> i32 {
         let result = service.nodes(NodesParams {
             path: ProjectPath("src/lib.rs".to_owned()),
             position: 8,
-            projection: None,
             rev: Some(RevisionId("main".to_owned())),
         })?;
         let value = serde_json::to_value(result)?;
@@ -2628,31 +2622,25 @@ pub fn compute() -> i32 {
         let _ = super::language_provider(&stub);
     }
 
+    /// `projection` left `GetSymbolParams`'s served fields; a request naming it is refused as
+    /// an unknown field, not accepted and silently ignored - whether or not `rev` rides
+    /// alongside it.
     #[test]
-    fn rev_with_projection_is_refused_as_invalid() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let params: GetSymbolParams = serde_json::from_value(json!({
-            "name": "Beacon",
-            "rev": "main",
-            "projection": "rift://projection/my-feature-one"
-        }))?;
-        let error = service
-            .get_symbol(&params)
-            .expect_err("rev with projection must refuse before either is served");
-        assert!(matches!(
-            error.fault(),
-            ReadFault::Invalid { field: "rev", .. }
-        ));
-        let nodes = service.nodes(NodesParams {
-            path: ProjectPath("src/lib.rs".to_owned()),
-            position: 0,
-            projection: Some(ProjectionId("rift://projection/my-feature-one".to_owned())),
-            rev: Some(RevisionId("main".to_owned())),
-        });
-        assert!(matches!(
-            nodes.expect_err("rev with projection must refuse").fault(),
-            ReadFault::Invalid { field: "rev", .. }
-        ));
-        Ok(())
+    fn get_symbol_rejects_projection_as_an_unknown_field() {
+        let cases = [
+            json!({"name": "Beacon", "projection": "rift://projection/my-feature-one"}),
+            json!({
+                "name": "Beacon",
+                "rev": "main",
+                "projection": "rift://projection/my-feature-one"
+            }),
+        ];
+        for case in cases {
+            let result: Result<GetSymbolParams, _> = serde_json::from_value(case.clone());
+            assert!(
+                result.is_err(),
+                "a withdrawn projection field must fail deserialization: {case}"
+            );
+        }
     }
 }

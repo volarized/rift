@@ -37,17 +37,13 @@ use rift_syntax::{ByteRange, SyntaxSymbol};
 use crate::change::{SymbolAddress, SymbolResolution, parse_symbol_address, resolve_symbol};
 use crate::engine::{EnginePool, EngineSlot};
 use crate::read::{ReadError, ReadFault, ReadService, digest_hex8, file_id};
-use crate::rewrite::ReplacedRegion;
+use crate::rewrite::{REWRITE_FILE_BYTES_MAX, ReplacedRegion};
 
 /// Most files one engine rename proposal may rewrite.
 pub const RENAME_FILES_MAX: usize = 64;
 
 /// Most text edits one rename proposal may carry for one file.
 pub const RENAME_FILE_EDITS_MAX: usize = 4_096;
-
-/// Largest source, in bytes, a rename may read or produce for one file:
-/// the bound the wire `Edit` text advertises.
-pub const RENAME_FILE_BYTES_MAX: usize = 1_048_576;
 
 /// Most files the post-apply sweep scans.
 pub const RENAME_SWEEP_FILES_MAX: usize = 2_048;
@@ -751,12 +747,12 @@ pub(crate) fn refused_oversized(
     source_len: usize,
     operation: &'static str,
 ) -> Result<(), PlanEnd> {
-    if source_len <= RENAME_FILE_BYTES_MAX {
+    if source_len <= REWRITE_FILE_BYTES_MAX {
         return Ok(());
     }
     Err(PlanEnd::Refused(unsupported_refusal(format!(
         "{operation} (file {} holds {source_len} bytes; at most \
-         {RENAME_FILE_BYTES_MAX} are rewritten)",
+         {REWRITE_FILE_BYTES_MAX} are rewritten)",
         path.as_str()
     ))))
 }
@@ -1600,9 +1596,9 @@ mod tests {
     #[test]
     fn refused_oversized_accepts_the_bound_and_refuses_past_it() {
         let path = project_path("lib.rs");
-        assert!(refused_oversized(&path, RENAME_FILE_BYTES_MAX, RENAME_OPERATION).is_ok());
+        assert!(refused_oversized(&path, REWRITE_FILE_BYTES_MAX, RENAME_OPERATION).is_ok());
         let result = refusal(
-            refused_oversized(&path, RENAME_FILE_BYTES_MAX + 1, RENAME_OPERATION)
+            refused_oversized(&path, REWRITE_FILE_BYTES_MAX + 1, RENAME_OPERATION)
                 .expect_err("a file past the byte bound refuses"),
         );
         assert_eq!(refusal_reason(&result), RefusalReason::Unsupported);

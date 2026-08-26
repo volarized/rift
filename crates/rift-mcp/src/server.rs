@@ -47,12 +47,6 @@ use crate::validation::{
     lexical_write, run_index_supervisor, workspace_watcher,
 };
 
-/// Overfetches ranked units beyond the caller's requested `limit` before the identifier and
-/// ranked hit lists merge: the merge can collapse a ranked hit into an identifier-matched
-/// one it duplicates, so asking for exactly `limit` ranked units would under-fill the final
-/// page whenever duplicates exist.
-const SEARCH_OVERFETCH_FACTOR: u32 = 4;
-
 /// Semantic candidates one file may contribute to a fused ranking.
 ///
 /// Provisional: the `[search.semantic] per_file_max` key replaces it once that key lands,
@@ -1024,11 +1018,7 @@ impl RiftMcp {
             return Ok(Some(SearchRanking::default()));
         };
         let searched = index
-            .search(
-                published.reads.tree_revision(),
-                query,
-                self.fetch_limit(params),
-            )
+            .search(published.reads.tree_revision(), query, self.fetch_limit())
             .await
             .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
         Ok(ranking_of(
@@ -1038,19 +1028,12 @@ impl RiftMcp {
         ))
     }
 
-    /// How deep the search index is read for one request.
-    ///
-    /// The enforced ceiling identifier search itself would refuse past (`results_max`), so
-    /// the index never overfetches beyond what a merge could ever keep; this also keeps the
-    /// `u32` conversion within range without needing its saturating fallback in practice.
-    fn fetch_limit(&self, params: &SearchParams) -> u32 {
-        let results_max = u64::try_from(self.limits.results_max()).unwrap_or(u64::MAX);
-        let requested_limit = params
-            .limit
-            .unwrap_or(rift_core::constants::SEARCH_RESULTS_DEFAULT as u64)
-            .min(results_max);
-        u32::try_from(requested_limit.saturating_mul(u64::from(SEARCH_OVERFETCH_FACTOR)))
-            .unwrap_or(u32::MAX)
+    /// How deep the search index is read for one request: the same `results_max` bound
+    /// `ReadService::search`'s indexed lane already uses, so every lane merges into one
+    /// candidate pool bounded once, whatever the requested page size. A request's own
+    /// `limit` changes only how that one pool is paged, never how deep it is read.
+    fn fetch_limit(&self) -> u32 {
+        u32::try_from(self.limits.results_max()).unwrap_or(u32::MAX)
     }
 
     /// Lists the syntax nodes covering one UTF-8 byte position in one file,
@@ -2596,11 +2579,15 @@ mod tests {
             .as_array()
             .ok_or("results must be an array")?;
 
+        // Neither hit is found through the identifier or line matcher - `guide.txt` never
+        // joins `index.files()`, and no source line spells the query's exact phrase - so
+        // both reach the answer through the ranked lane alone, tagged `ranked`, never the
+        // literal-content claim `content` makes.
         let file_hit = results
             .iter()
             .find(|hit| hit["hit"]["target"] == "file" && hit["path"] == json!("guide.txt"))
             .ok_or_else(|| format!("guide.txt text-file hit missing: {structured:#}"))?;
-        assert_eq!(file_hit["matched_by"], json!(["content"]));
+        assert_eq!(file_hit["matched_by"], json!(["ranked"]));
 
         let symbol_hit = results
             .iter()
@@ -2611,8 +2598,8 @@ mod tests {
         assert!(
             symbol_hit["matched_by"]
                 .as_array()
-                .is_some_and(|fields| fields.contains(&json!("content"))),
-            "the symbol hit must name content as a matched field: {symbol_hit:#}"
+                .is_some_and(|fields| fields.contains(&json!("ranked"))),
+            "the symbol hit must name ranked as a matched field: {symbol_hit:#}"
         );
 
         client.cancel().await?;
@@ -3740,6 +3727,63 @@ pub fn beacon() -> u64 {
             answer.warnings
         )
         .into())
+    }
+
+    /// Polls `search` at `limit` until the population lane's pass has landed, the same
+    /// condition [`search_after_population`] polls for a default-limit request.
+    async fn search_at_limit_after_population(
+        server: &RiftMcp,
+        query: &str,
+        limit: u64,
+    ) -> TestResult<SearchResult> {
+        let params: SearchParams = serde_json::from_value(json!({"query": query, "limit": limit}))
+            .expect("test search parameters must deserialize");
+        let mut answer = server.search(Parameters(params.clone())).await?.0;
+        for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
+            if store_ranked(&answer) {
+                return Ok(answer);
+            }
+            tokio::time::sleep(SEARCH_TIER_POLL).await;
+            answer = server.search(Parameters(params.clone())).await?.0;
+        }
+        Err(format!(
+            "the population lane never stamped the served tree for query {query} at limit \
+             {limit}; the last answer still carried {:?}",
+            answer.warnings
+        )
+        .into())
+    }
+
+    /// `fetch_limit` no longer scales with the requested `limit`, so `total_pages` reflects
+    /// the same candidate pool whatever page size the caller asks for: a `limit: 1` request
+    /// reports as many pages as the pool a `limit` wide enough to fit it all serves on one
+    /// page.
+    #[tokio::test]
+    async fn search_total_pages_reflects_the_pool_whatever_the_requested_limit() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn helper_one() {}\npub fn helper_two() {}\npub fn helper_three() {}\n\
+             pub fn helper_four() {}\npub fn helper_five() {}\n",
+        )?;
+        super::hermetic_workspace(directory.path(), "")?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+
+        let wide = search_at_limit_after_population(&server, "helper", 50).await?;
+        let pool_size = wide.results.len();
+        assert!(
+            pool_size >= 5,
+            "the fixture must rank every declared helper: {wide:#?}"
+        );
+
+        let narrow = search_at_limit_after_population(&server, "helper", 1).await?;
+        assert_eq!(
+            usize::try_from(narrow.pagination.total_pages).unwrap_or(usize::MAX),
+            pool_size,
+            "a limit of 1 must report as many pages as the pool a limit of 50 served on one \
+             page: narrow={narrow:#?} wide={wide:#?}"
+        );
+        Ok(())
     }
 
     /// Calls `search` through the wire until one hit carries `path`.

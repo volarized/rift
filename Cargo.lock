@@ -3530,6 +3530,7 @@ dependencies = [
  "rift-provider",
  "rift-search",
  "rift-syntax",
+ "schemars",
  "serde_json",
  "sha2",
  "tempfile",

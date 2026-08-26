@@ -12,8 +12,8 @@ use rift_index::{
     SymbolMatch, SymbolMatchRank, TextSourceFile, WorkspaceIndex,
 };
 use rift_protocol::read::{
-    File, FileContent, MatchedField, PathPattern, PathSelector, SearchHit, SearchHitTarget,
-    SearchInclude, SearchParams, SearchParamsTarget, SearchResult, SymbolId,
+    File, FileContent, MatchedField, PathPattern, PathSelector, ResultOrder, SearchHit,
+    SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget, SearchResult, SymbolId,
 };
 use rift_search::{Declaration, DescribedUnit, RankedUnit};
 use rift_syntax::{ByteRange, SyntaxSymbol};
@@ -32,8 +32,7 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] for deferred filters, traversal, projections, scopes, an
-    /// invalid `paths` glob, or a `force_include` bound crossed.
+    /// Returns [`ReadError`] for an invalid `paths` glob or a `force_include` bound crossed.
     pub fn search(
         &self,
         params: &SearchParams,
@@ -60,9 +59,9 @@ impl ReadService {
             payloads: HitPayloads::requested(params),
         };
         // The whole candidate pool is collected up to the index's own `results_max` bound -
-        // bounded work whatever the page size - then ordered by relevance, so
-        // `pagination.total_pages` counts the full result set and every page is one window
-        // of the same ordering.
+        // bounded work whatever the page size - then ordered and truncated to that same
+        // bound, so `pagination.total_pages` counts the full result set and every page is
+        // one window of the same ordering.
         let fetch_limit = self.index().results_max();
 
         let mut results = Vec::new();
@@ -85,8 +84,16 @@ impl ReadService {
                 &mut results,
             )?;
         }
-        collect_ranked_hits(self.index(), criteria, ranked, &mut results);
-        order_by_relevance(&mut results);
+        collect_ranked_hits(
+            self.index(),
+            matcher.as_ref(),
+            root,
+            criteria,
+            ranked,
+            &mut results,
+        );
+        order_hits(&mut results, params.order);
+        results.truncate(fetch_limit);
         let (results, pagination) = page(results, params.page_index, limit);
         Ok(SearchResult {
             results,
@@ -164,8 +171,7 @@ fn force_include_requested(params: &SearchParams) -> bool {
 }
 
 /// Which extra payload `params.include` asked to attach to every hit, derived once per
-/// request. `SearchInclude::Signature`, `Relationships`, and `Diagnostics` name payloads no
-/// code path produces yet, so `source` is the only field this carries.
+/// request. `source` is the only member `SearchInclude` serves.
 #[derive(Clone, Copy, Debug, Default)]
 struct HitPayloads {
     source: bool,
@@ -193,17 +199,7 @@ struct SearchCriteria<'a> {
 }
 
 fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
-    validate_common(
-        params.projection.is_some(),
-        params.rev.is_some(),
-        params.scope,
-    )?;
-    if params.filter.is_some() || params.traversal.is_some() {
-        return Err(ReadFault::unsupported("filtered and traversal search"));
-    }
-    if params.target == SearchParamsTarget::Node {
-        return Err(ReadFault::unsupported("node search"));
-    }
+    validate_common(params.rev.is_some())?;
     if let Some(selector) = params.paths.as_ref() {
         validate_path_selector(selector)?;
     }
@@ -261,7 +257,7 @@ fn includes(matcher: Option<&PathMatcher>, root: &Path, path: &ProjectPath) -> b
 
 /// Symbol and source-line hits from the index, filtered by `matcher` and collected up to
 /// `fetch_limit` - the index's `results_max` bound, never the smaller page size - because
-/// [`order_by_relevance`] sorts this whole pool before one page is cut out of it: stopping
+/// [`order_hits`] orders this whole pool before one page is cut out of it: stopping
 /// collection at the page size could drop a later, higher-scoring candidate, and the page
 /// count states the full result set.
 fn collect_indexed_hits(
@@ -374,11 +370,9 @@ fn build_symbol_hit(
         },
         score,
         matched_by,
-        relationships: None,
         source: payloads
             .source
             .then(|| excerpt(matched.file, matched.symbol.range).text),
-        diagnostics: None,
         span: Some(source_span(matched.file.path(), matched.symbol.range)),
         line: Some(line::line_number_at(
             matched.file.source(),
@@ -417,9 +411,7 @@ fn file_search_hit(
         },
         score: 1.0,
         matched_by: vec![MatchedField::Content],
-        relationships: None,
         source: payloads.source.then_some(text),
-        diagnostics: None,
         span: Some(source_span(file.path(), range)),
         line: Some(u64::try_from(line_index).unwrap_or(u64::MAX)),
         path: Some(project_path(file.path())),
@@ -432,7 +424,7 @@ const fn symbol_match_score(rank: SymbolMatchRank) -> f64 {
     match rank {
         SymbolMatchRank::QualifiedExact => 1.0,
         SymbolMatchRank::NameExact => 0.9,
-        SymbolMatchRank::QualifiedSuffix => 0.8,
+        SymbolMatchRank::NamePrefix => 0.8,
         SymbolMatchRank::Substring => 0.7,
     }
 }
@@ -440,12 +432,15 @@ const fn symbol_match_score(rank: SymbolMatchRank) -> f64 {
 /// Merges the search index's ranked units into `results`: a resolved symbol becomes a hit
 /// at its fused score, and a text file's best-scoring chunk becomes a file hit whose line is
 /// the first line containing a query term. Each merges against an identifier-matched hit
-/// already in `results` by identity, rather than duplicating it.
+/// already in `results` by identity, rather than duplicating it. `matcher` and `root` drop
+/// a ranked hit at an excluded path exactly as the indexed lanes already do.
 ///
 /// The score arrives already fused into 0 to 1, so nothing here converts a rank: two
 /// requests' scores mean the same thing because one fusion produced both.
 fn collect_ranked_hits(
     index: &WorkspaceIndex,
+    matcher: Option<&PathMatcher>,
+    root: &Path,
     criteria: SearchCriteria<'_>,
     ranked: &[RankedUnit],
     results: &mut Vec<SearchHit>,
@@ -468,6 +463,9 @@ fn collect_ranked_hits(
                 // zero); skipping it silently is correct, not a defect to surface.
                 continue;
             };
+            if !includes(matcher, root, file.path()) {
+                continue;
+            }
             merge_symbol_hit(results, file, symbol, matched.score(), payloads);
         }
     }
@@ -476,6 +474,9 @@ fn collect_ranked_hits(
             let Some(file) = index.text_file(&path) else {
                 continue;
             };
+            if !includes(matcher, root, file.path()) {
+                continue;
+            }
             let (line_number, range, text) = locate_query_line(file.content(), query);
             merge_file_hit(results, file, line_number, range, text, score, payloads);
         }
@@ -560,7 +561,7 @@ fn merge_symbol_hit(
         |hit| matches!(&hit.hit, SearchHitTarget::Symbol { symbol } if symbol.id == identity),
     );
     if let Some(existing) = existing {
-        absorb_content_match(existing, score);
+        absorb_ranked_match(existing, score);
         return;
     }
     let matched = SymbolMatch {
@@ -573,7 +574,7 @@ fn merge_symbol_hit(
     results.push(build_symbol_hit(
         matched,
         score,
-        vec![MatchedField::Content],
+        vec![MatchedField::Ranked],
         payloads,
     ));
 }
@@ -596,7 +597,7 @@ fn merge_file_hit(
             && hit.line == Some(line_number)
     });
     if let Some(existing) = existing {
-        absorb_content_match(existing, score);
+        absorb_ranked_match(existing, score);
         return;
     }
     results.push(ranked_file_hit(
@@ -609,11 +610,14 @@ fn merge_file_hit(
     ));
 }
 
-/// Records that `existing` also matched by content: adds [`MatchedField::Content`] when
-/// absent, and raises its score to the better of the two.
-fn absorb_content_match(existing: &mut SearchHit, score: f64) {
-    if !existing.matched_by.contains(&MatchedField::Content) {
-        existing.matched_by.push(MatchedField::Content);
+/// Records that `existing` also matched through the ranked lane: adds
+/// [`MatchedField::Ranked`] when absent, and raises its score to the better of the two. The
+/// ranked lane fuses a lexical and a semantic tier into one score with no per-hit record of
+/// which tier placed it, so it can never claim [`MatchedField::Content`] - that member stays
+/// a claim the identifier or line matcher proved against literal bytes.
+fn absorb_ranked_match(existing: &mut SearchHit, score: f64) {
+    if !existing.matched_by.contains(&MatchedField::Ranked) {
+        existing.matched_by.push(MatchedField::Ranked);
     }
     existing.score = existing.score.max(score);
 }
@@ -640,10 +644,8 @@ fn ranked_file_hit(
             },
         },
         score,
-        matched_by: vec![MatchedField::Content],
-        relationships: None,
+        matched_by: vec![MatchedField::Ranked],
         source: payloads.source.then_some(text),
-        diagnostics: None,
         span: Some(source_span(file.path(), range)),
         line: Some(line_number),
         path: Some(project_path(file.path())),
@@ -652,20 +654,30 @@ fn ranked_file_hit(
     }
 }
 
-/// Sorts merged hits by descending score, breaking ties on a hit's own stable wire identity
-/// so the order does not depend on the arrival order of lexical matches, which carries no
-/// guaranteed order of its own.
-fn order_by_relevance(results: &mut [SearchHit]) {
-    results.sort_by(|left, right| {
-        right
+/// Sorts merged hits by the request's `order`, every order ending in a hit's own stable wire
+/// identity so the result does not depend on the arrival order of lexical matches, which
+/// carries no guaranteed order of its own, and so two results that tie never swap places
+/// between pages.
+fn order_hits(results: &mut [SearchHit], order: ResultOrder) {
+    results.sort_by(|left, right| hit_ordering(left, right, order));
+}
+
+fn hit_ordering(left: &SearchHit, right: &SearchHit, order: ResultOrder) -> Ordering {
+    match order {
+        ResultOrder::Relevance => right
             .score
             .partial_cmp(&left.score)
             .unwrap_or(Ordering::Equal)
-            .then_with(|| hit_identity(left).cmp(hit_identity(right)))
-    });
+            .then_with(|| hit_identity(left).cmp(hit_identity(right))),
+        ResultOrder::Path => left
+            .path
+            .cmp(&right.path)
+            .then_with(|| hit_identity(left).cmp(hit_identity(right))),
+        ResultOrder::Identity => hit_identity(left).cmp(hit_identity(right)),
+    }
 }
 
-/// The wire id `order_by_relevance` breaks score ties on.
+/// The wire id `order_hits` breaks a `relevance` or `path` tie on.
 fn hit_identity(hit: &SearchHit) -> &str {
     match &hit.hit {
         SearchHitTarget::Symbol { symbol } => symbol.id.0.as_str(),
@@ -684,8 +696,8 @@ mod tests {
     use rift_index::{LexicalIndexLimits, LexicalUnitKind, WorkspaceIndexLimits};
     use rift_protocol::configuration::HistoryConfiguration;
     use rift_protocol::read::{
-        ExactKind, Extensions, FileContent, FileId, MatchedField, Node, NodeId, SearchParams,
-        SearchParamsTarget, TextRange,
+        ExactKind, Extensions, FileContent, FileId, MatchedField, Node, NodeId, ResultOrder,
+        SearchParams, SearchParamsTarget, TextRange,
     };
     use rift_search::{RankedUnit, SearchIndex, SearchIndexLimits};
     use serde_json::json;
@@ -1054,25 +1066,22 @@ pub fn compute() -> i32 {
         let scores = [
             symbol_match_score(SymbolMatchRank::QualifiedExact),
             symbol_match_score(SymbolMatchRank::NameExact),
-            symbol_match_score(SymbolMatchRank::QualifiedSuffix),
+            symbol_match_score(SymbolMatchRank::NamePrefix),
             symbol_match_score(SymbolMatchRank::Substring),
         ];
         assert!(scores.windows(2).all(|pair| pair[0] > pair[1]));
     }
 
+    /// `target: "node"` left `SearchParamsTarget`'s served variants; a request naming it is
+    /// refused at deserialization, not accepted and silently ignored.
     #[test]
-    fn search_rejects_node_target() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let node_target: SearchParams =
-            serde_json::from_value(json!({"query": "Beacon", "target": "node"}))?;
-        assert!(matches!(
-            service
-                .search(&node_target, &[])
-                .expect_err("node target must fail")
-                .fault(),
-            ReadFault::Unsupported { .. }
-        ));
-        Ok(())
+    fn search_target_node_is_refused_as_an_unknown_enum_value() {
+        let result: Result<SearchParams, _> =
+            serde_json::from_value(json!({"query": "Beacon", "target": "node"}));
+        assert!(
+            result.is_err(),
+            "a withdrawn target value must fail deserialization"
+        );
     }
 
     #[test]
@@ -1199,9 +1208,10 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
+    /// `filter` and `traversal` left the served schema; a request naming either is refused as
+    /// an unknown field, alone or alongside `paths`, rather than accepted and ignored.
     #[test]
-    fn search_filter_and_traversal_stay_refused_alone_and_with_paths() -> TestResult {
-        let (_directory, service) = fixture()?;
+    fn search_filter_and_traversal_are_refused_as_unknown_fields_alone_and_with_paths() {
         let filter = json!({
             "kind": "field",
             "field": {"field": "name", "op": "eq", "value": "Beacon"}
@@ -1218,19 +1228,12 @@ pub fn compute() -> i32 {
             json!({"query": "Beacon", "traversal": traversal, "paths": paths}),
         ];
         for case in cases {
-            let params: SearchParams = serde_json::from_value(case.clone())?;
+            let result: Result<SearchParams, _> = serde_json::from_value(case.clone());
             assert!(
-                matches!(
-                    service
-                        .search(&params, &[])
-                        .expect_err("filter and traversal must stay refused")
-                        .fault(),
-                    ReadFault::Unsupported { .. }
-                ),
-                "case must refuse as unsupported: {case}"
+                result.is_err(),
+                "a withdrawn field must fail deserialization: {case}"
             );
         }
-        Ok(())
     }
 
     #[test]
@@ -1457,6 +1460,124 @@ pub fn compute() -> i32 {
         assert_eq!(
             value["pagination"],
             json!({ "page_index": 30, "total_pages": 3 })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn search_order_path_sorts_by_project_path() -> TestResult {
+        let (_directory, service) = multi_file_fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "beacon",
+            "target": "symbol",
+            "order": "path",
+            "limit": 10
+        }))?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let paths: Vec<String> = value["results"]
+            .as_array()
+            .ok_or("results must be array")?
+            .iter()
+            .map(|hit| hit["path"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(paths, ["other.rs", "src/lib.rs", "src/nested/deep.rs"]);
+        Ok(())
+    }
+
+    #[test]
+    fn search_order_identity_sorts_by_the_hits_own_identity() -> TestResult {
+        let (_directory, service) = multi_file_fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "beacon",
+            "target": "symbol",
+            "order": "identity",
+            "limit": 10
+        }))?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let ids: Vec<String> = value["results"]
+            .as_array()
+            .ok_or("results must be array")?
+            .iter()
+            .map(|hit| {
+                hit["hit"]["symbol"]["id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(
+            ids, sorted,
+            "identity order sorts purely by each hit's own id, independent of score"
+        );
+        Ok(())
+    }
+
+    /// Two symbols in one file tie on `order: "path"`; the tie breaks on identity, and that
+    /// relative order survives whether the page is cut at `limit: 1` or `limit: 2`.
+    #[test]
+    fn search_order_path_keeps_tied_hits_in_the_same_relative_order_across_page_sizes() -> TestResult
+    {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("src"))?;
+        fs::write(
+            directory.path().join("src/lib.rs"),
+            "pub fn beacon_alpha() {}\npub fn beacon_beta() {}\n",
+        )?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let mut narrow_ids = Vec::new();
+        for page_index in 0..2_u64 {
+            let request = json!({
+                "query": "beacon",
+                "target": "symbol",
+                "order": "path",
+                "limit": 1,
+                "page_index": page_index
+            });
+            let params: SearchParams = serde_json::from_value(request)?;
+            let value = serde_json::to_value(service.search(&params, &[])?)?;
+            narrow_ids.push(
+                value["results"][0]["hit"]["symbol"]["id"]
+                    .as_str()
+                    .ok_or("each narrow page must carry one hit")?
+                    .to_owned(),
+            );
+        }
+        let wide: SearchParams = serde_json::from_value(json!({
+            "query": "beacon",
+            "target": "symbol",
+            "order": "path",
+            "limit": 2
+        }))?;
+        let wide_value = serde_json::to_value(service.search(&wide, &[])?)?;
+        let wide_ids: Vec<String> = wide_value["results"]
+            .as_array()
+            .ok_or("results must be array")?
+            .iter()
+            .map(|hit| {
+                hit["hit"]["symbol"]["id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            narrow_ids, wide_ids,
+            "tied hits must keep their relative order across page sizes"
+        );
+        assert_eq!(
+            wide_ids,
+            [
+                "rift://symbol/rust/src/lib.rs/beacon_alpha",
+                "rift://symbol/rust/src/lib.rs/beacon_beta"
+            ]
         );
         Ok(())
     }
@@ -1705,11 +1826,11 @@ pub fn compute() -> i32 {
         assert_eq!(results[0].score, 0.9, "the higher score must win");
         assert_eq!(
             results[0].matched_by,
-            vec![MatchedField::Name, MatchedField::Content]
+            vec![MatchedField::Name, MatchedField::Ranked]
         );
 
         // A second merge at a lower score keeps the existing higher score and does not
-        // duplicate the already-present Content field.
+        // duplicate the already-present Semantic field.
         super::merge_symbol_hit(
             &mut results,
             file,
@@ -1721,7 +1842,7 @@ pub fn compute() -> i32 {
         assert_eq!(results[0].score, 0.9);
         assert_eq!(
             results[0].matched_by,
-            vec![MatchedField::Name, MatchedField::Content]
+            vec![MatchedField::Name, MatchedField::Ranked]
         );
         Ok(())
     }
@@ -1819,6 +1940,8 @@ pub fn compute() -> i32 {
         let mut results = Vec::new();
         super::collect_ranked_hits(
             unrelated.index(),
+            None,
+            unrelated.index().root(),
             super::SearchCriteria {
                 query: "Beacon",
                 target: SearchParamsTarget::Symbol,
@@ -1850,6 +1973,8 @@ pub fn compute() -> i32 {
         let mut results = Vec::new();
         super::collect_ranked_hits(
             unrelated.index(),
+            None,
+            unrelated.index().root(),
             super::SearchCriteria {
                 query: "Beacon",
                 target: SearchParamsTarget::File,
@@ -1902,6 +2027,8 @@ pub fn compute() -> i32 {
         let mut results = Vec::new();
         super::collect_ranked_hits(
             service.index(),
+            None,
+            service.index().root(),
             super::SearchCriteria {
                 query: "word",
                 target: SearchParamsTarget::File,
@@ -1947,8 +2074,80 @@ pub fn compute() -> i32 {
             answer
                 .results
                 .iter()
-                .any(|hit| hit.matched_by.contains(&MatchedField::Content)),
-            "a ranked unit merges as a content match: {answer:#?}"
+                .any(|hit| hit.matched_by.contains(&MatchedField::Ranked)),
+            "a ranked unit merges as a ranked match: {answer:#?}"
+        );
+        Ok(())
+    }
+
+    /// `README.txt` reaches the answer only through the ranked lane - `collect_indexed_hits`
+    /// never reads a text file - so its hit proves a ranked-only match never claims
+    /// [`MatchedField::Content`]. The exact `Beacon` struct match reaches the answer through
+    /// both the identifier matcher and the ranked lane, and its hit carries both members.
+    #[tokio::test]
+    async fn search_matched_by_distinguishes_a_ranked_only_hit_from_one_both_lanes_found()
+    -> TestResult {
+        let (directory, service) = fixture()?;
+        let database = directory.path().join("search.db");
+        let ranked = ranked_units(&database, &service, "Beacon").await?;
+        let params: SearchParams = serde_json::from_value(json!({"query": "Beacon", "limit": 50}))?;
+        let answer = service.search(&params, &ranked)?;
+
+        let beacon = answer
+            .results
+            .iter()
+            .find(|hit| {
+                matches!(&hit.hit, SearchHitTarget::Symbol { symbol } if symbol.name == "Beacon")
+            })
+            .ok_or("the exact struct match must reach the answer")?;
+        assert!(
+            beacon.matched_by.contains(&MatchedField::Name)
+                && beacon.matched_by.contains(&MatchedField::Ranked),
+            "a hit both lanes found carries both members: {beacon:#?}"
+        );
+
+        let readme = answer
+            .results
+            .iter()
+            .find(|hit| {
+                matches!(&hit.hit, SearchHitTarget::File { file } if file.id.0.contains("README"))
+            })
+            .ok_or("the text-only file must reach the answer through the ranked lane alone")?;
+        assert!(
+            !readme.matched_by.contains(&MatchedField::Content),
+            "a ranked-only hit never claims literal content: {readme:#?}"
+        );
+        assert!(
+            readme.matched_by.contains(&MatchedField::Ranked),
+            "a ranked-only hit carries the ranked member: {readme:#?}"
+        );
+        Ok(())
+    }
+
+    /// The only file holding the query's content sits at an excluded path; `paths.exclude`
+    /// narrows the ranked lane exactly as it already narrows the indexed lanes, so the
+    /// answer is empty rather than leaking the excluded text file's hit.
+    #[tokio::test]
+    async fn search_paths_exclude_narrows_the_ranked_lane_to_nothing() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("secret.txt"), "lighthouse guidance")?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let database = directory.path().join("search.db");
+        let ranked = ranked_units(&database, &service, "lighthouse").await?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "lighthouse",
+            "paths": {"exclude": ["secret.txt"]}
+        }))?;
+        let answer = service.search(&params, &ranked)?;
+        assert!(
+            answer.results.is_empty(),
+            "an excluded path's only ranked match must not reach the answer: {answer:#?}"
         );
         Ok(())
     }
@@ -1991,7 +2190,7 @@ pub fn compute() -> i32 {
         );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].score, 0.4);
-        assert_eq!(results[0].matched_by, vec![MatchedField::Content]);
+        assert_eq!(results[0].matched_by, vec![MatchedField::Ranked]);
 
         super::merge_file_hit(
             &mut results,
@@ -2010,7 +2209,7 @@ pub fn compute() -> i32 {
         assert_eq!(results[0].score, 0.9, "the higher score must win");
         assert_eq!(
             results[0].matched_by,
-            vec![MatchedField::Content],
+            vec![MatchedField::Ranked],
             "matched_by must union without duplicating an already-present field"
         );
 
@@ -2070,6 +2269,10 @@ pub fn compute() -> i32 {
     }
 
     fn file_hit_stub(id: &str, score: f64) -> SearchHit {
+        file_hit_stub_with_path(id, None, score)
+    }
+
+    fn file_hit_stub_with_path(id: &str, path: Option<&str>, score: f64) -> SearchHit {
         SearchHit {
             hit: SearchHitTarget::File {
                 file: File {
@@ -2085,25 +2288,23 @@ pub fn compute() -> i32 {
             },
             score,
             matched_by: vec![MatchedField::Content],
-            relationships: None,
             source: None,
-            diagnostics: None,
             span: None,
             line: None,
-            path: None,
+            path: path.map(|path| rift_protocol::read::ProjectPath(path.to_owned())),
             traversal_path: None,
             distance: None,
         }
     }
 
     #[test]
-    fn order_by_relevance_sorts_by_score_then_a_deterministic_identity_tie_break() {
+    fn order_hits_relevance_sorts_by_score_then_a_deterministic_identity_tie_break() {
         let mut first_arrival = vec![
             file_hit_stub("rift://file/z.rs", 0.5),
             file_hit_stub("rift://file/b.rs", 0.9),
             file_hit_stub("rift://file/a.rs", 0.9),
         ];
-        super::order_by_relevance(&mut first_arrival);
+        super::order_hits(&mut first_arrival, ResultOrder::Relevance);
         let ordered_ids: Vec<&str> = first_arrival.iter().map(super::hit_identity).collect();
         assert_eq!(
             ordered_ids,
@@ -2118,9 +2319,43 @@ pub fn compute() -> i32 {
             file_hit_stub("rift://file/z.rs", 0.5),
             file_hit_stub("rift://file/a.rs", 0.9),
         ];
-        super::order_by_relevance(&mut second_arrival);
+        super::order_hits(&mut second_arrival, ResultOrder::Relevance);
         let reordered_ids: Vec<&str> = second_arrival.iter().map(super::hit_identity).collect();
         assert_eq!(reordered_ids, ordered_ids);
+    }
+
+    /// `order: "path"` groups by project path, breaking a tie - two hits at the same path -
+    /// on the hit's own wire identity, the same tie-break `relevance` uses.
+    #[test]
+    fn order_hits_path_sorts_by_path_then_breaks_ties_on_identity() {
+        let mut hits = vec![
+            file_hit_stub_with_path("rift://file/z.rs", Some("z.rs"), 0.9),
+            file_hit_stub_with_path("rift://file/a.rs-two", Some("a.rs"), 0.1),
+            file_hit_stub_with_path("rift://file/a.rs-one", Some("a.rs"), 0.5),
+        ];
+        super::order_hits(&mut hits, ResultOrder::Path);
+        let ids: Vec<&str> = hits.iter().map(super::hit_identity).collect();
+        assert_eq!(
+            ids,
+            [
+                "rift://file/a.rs-one",
+                "rift://file/a.rs-two",
+                "rift://file/z.rs"
+            ],
+            "path order groups by path; two hits at the same path break the tie on identity"
+        );
+    }
+
+    /// `order: "identity"` sorts by each hit's own wire id alone, ignoring score.
+    #[test]
+    fn order_hits_identity_sorts_by_the_hits_own_identity_alone() {
+        let mut hits = vec![
+            file_hit_stub("rift://file/z.rs", 0.9),
+            file_hit_stub("rift://file/a.rs", 0.1),
+        ];
+        super::order_hits(&mut hits, ResultOrder::Identity);
+        let ids: Vec<&str> = hits.iter().map(super::hit_identity).collect();
+        assert_eq!(ids, ["rift://file/a.rs", "rift://file/z.rs"]);
     }
 
     fn node_hit_stub(id: &str, score: f64) -> SearchHit {
@@ -2144,9 +2379,7 @@ pub fn compute() -> i32 {
             },
             score,
             matched_by: vec![MatchedField::Content],
-            relationships: None,
             source: None,
-            diagnostics: None,
             span: None,
             line: None,
             path: None,
@@ -2165,7 +2398,7 @@ pub fn compute() -> i32 {
             file_hit_stub("rift://file/z.rs", 0.5),
             node_hit_stub("rift://node/rust/lib.rs@0-1#00000000", 0.5),
         ];
-        super::order_by_relevance(&mut results);
+        super::order_hits(&mut results, ResultOrder::Relevance);
         let ids: Vec<&str> = results.iter().map(super::hit_identity).collect();
         // "rift://file/..." sorts before "rift://node/..." lexicographically ('f' < 'n').
         assert_eq!(

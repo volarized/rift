@@ -6,7 +6,7 @@
 //! names are proven against the model structs by the `property!` macro, and
 //! wire values come from serializing the model enums themselves.
 
-use crate::read::{SearchHit, SearchParams, SearchParamsTarget, SearchScope};
+use crate::read::SearchHit;
 use schemars::Schema;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -27,6 +27,8 @@ mod keyword {
     pub(super) const ENUM: &str = "enum";
     pub(super) const DESCRIPTION: &str = "description";
     pub(super) const MAX_ITEMS: &str = "maxItems";
+    pub(super) const MIN_LENGTH: &str = "minLength";
+    pub(super) const MAX_LENGTH: &str = "maxLength";
 }
 
 /// The serde property name of one model field, proven against the model:
@@ -58,30 +60,12 @@ const SEARCH_HIT_TARGET_TAG: &str = "target";
 const SEARCH_HIT_NODE: &str = "node";
 const SEARCH_HIT_FILE: &str = "file";
 
-/// A JSON Schema composition keyword a rule may extend.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Composition {
-    /// `allOf`: every clause must hold.
-    All,
-    /// `anyOf`: at least one clause must hold.
-    Any,
-}
-
-impl Composition {
-    fn keyword(self) -> &'static str {
-        match self {
-            Self::All => keyword::ALL_OF,
-            Self::Any => keyword::ANY_OF,
-        }
-    }
-}
-
 /// Appends `clause` to the `composition` array of `schema`, creating the
 /// array on first use so several rules can target the same keyword.
-fn append(schema: &mut Schema, composition: Composition, clause: Value) {
+fn append(schema: &mut Schema, clause: Value) {
     let clauses = schema
         .ensure_object()
-        .entry(composition.keyword())
+        .entry(keyword::ALL_OF)
         .or_insert_with(|| Value::Array(Vec::new()));
     if let Value::Array(values) = clauses {
         values.push(clause);
@@ -157,12 +141,6 @@ fn merged(clauses: Vec<Value>) -> Value {
 /// A subclause pinning a property to the wire form of one model value.
 fn constant<T: Serialize>(value: &T) -> Value {
     json!({ keyword::CONST: wire(value) })
-}
-
-/// A subclause accepting the wire forms of the listed model values.
-fn enumeration<T: Serialize>(values: &[T]) -> Value {
-    let accepted: Vec<Value> = values.iter().map(wire).collect();
-    json!({ keyword::ENUM: accepted })
 }
 
 /// A subclause bounding an array property's length.
@@ -273,7 +251,6 @@ pub fn declare_server_ranges(schema: &mut Schema) {
     );
     append(
         schema,
-        Composition::All,
         described(
             "server.port and server.port_range are mutually exclusive",
             not(requires(&[
@@ -468,7 +445,6 @@ pub fn error_limit_rides_limit_exceeded(schema: &mut Schema) {
     let limit = property!(ErrorData, limit);
     append(
         schema,
-        Composition::All,
         otherwise(
             merged(vec![
                 properties(vec![(code, constant(&ErrorCode::LimitExceeded))]),
@@ -485,7 +461,6 @@ pub fn forbid_symlink_language_facts(schema: &mut Schema) {
     use crate::read::File;
     append(
         schema,
-        Composition::All,
         when(
             properties(vec![(
                 property!(File, content),
@@ -503,35 +478,12 @@ pub fn forbid_symlink_language_facts(schema: &mut Schema) {
     );
 }
 
-/// A [`RelationFilter`](crate::read::RelationFilter) names what it matches by:
-/// an exact `kind` in one language's vocabulary, or a portable `facet`.
-pub fn require_kind_or_facet(schema: &mut Schema) {
-    use crate::read::RelationFilter;
-    append(
-        schema,
-        Composition::Any,
-        described(
-            "Matching by exact kind, in one language's vocabulary.",
-            requires(&[property!(RelationFilter, kind)]),
-        ),
-    );
-    append(
-        schema,
-        Composition::Any,
-        described(
-            "Matching by portable facet, which reaches every served language.",
-            requires(&[property!(RelationFilter, facet)]),
-        ),
-    );
-}
-
 /// A [`SearchHit`] carries `span` and `line` together or not at all, and node
 /// and file hits always carry both.
 pub fn pair_span_with_line(schema: &mut Schema) {
     let span_and_line = [property!(SearchHit, span), property!(SearchHit, line)];
     append(
         schema,
-        Composition::All,
         one_of(vec![
             requires(&span_and_line),
             not(any_of(vec![
@@ -542,7 +494,6 @@ pub fn pair_span_with_line(schema: &mut Schema) {
     );
     append(
         schema,
-        Composition::All,
         when(
             properties(vec![(
                 property!(SearchHit, hit),
@@ -556,100 +507,6 @@ pub fn pair_span_with_line(schema: &mut Schema) {
     );
 }
 
-/// [`SearchParams`] with a `traversal` keep `target` at `symbol` or `all`,
-/// and `paths` only narrow project-scoped searches.
-pub fn restrict_traversal_and_paths(schema: &mut Schema) {
-    append(
-        schema,
-        Composition::All,
-        when(
-            requires(&[property!(SearchParams, traversal)]),
-            properties(vec![(
-                property!(SearchParams, target),
-                enumeration(&[SearchParamsTarget::Symbol, SearchParamsTarget::All]),
-            )]),
-        ),
-    );
-    append(
-        schema,
-        Composition::All,
-        when(
-            requires(&[property!(SearchParams, paths)]),
-            properties(vec![(
-                property!(SearchParams, scope),
-                constant(&SearchScope::Project),
-            )]),
-        ),
-    );
-}
-
-/// [`SearchParams`] ask for something: a text `query`, a provider `filter`,
-/// or a bounded relationship `traversal`.
-pub fn require_query_filter_or_traversal(schema: &mut Schema) {
-    append(
-        schema,
-        Composition::Any,
-        described(
-            "Satisfied by a text query, with or without a filter alongside it.",
-            requires(&[property!(SearchParams, query)]),
-        ),
-    );
-    append(
-        schema,
-        Composition::Any,
-        described(
-            "Satisfied by a filter alone, for a search with no text to match.",
-            requires(&[property!(SearchParams, filter)]),
-        ),
-    );
-    append(
-        schema,
-        Composition::Any,
-        described(
-            "Satisfied by a bounded relationship traversal.",
-            requires(&[property!(SearchParams, traversal)]),
-        ),
-    );
-}
-
-/// A read names at most one alternate tree to serve from - a version-control
-/// `rev` or a materialized `projection`, never both - so the answer's origin
-/// is always a single tree.
-fn forbid_rev_with_projection(schema: &mut Schema, rev: &str, projection: &str) {
-    append(schema, Composition::All, not(requires(&[rev, projection])));
-}
-
-/// [`GetSymbolParams`](crate::read::GetSymbolParams) reads one tree: `rev`
-/// and `projection` never combine.
-pub fn forbid_get_symbol_rev_with_projection(schema: &mut Schema) {
-    use crate::read::GetSymbolParams;
-    forbid_rev_with_projection(
-        schema,
-        property!(GetSymbolParams, rev),
-        property!(GetSymbolParams, projection),
-    );
-}
-
-/// [`NodesParams`](crate::read::NodesParams) reads one tree: `rev` and
-/// `projection` never combine.
-pub fn forbid_nodes_rev_with_projection(schema: &mut Schema) {
-    use crate::read::NodesParams;
-    forbid_rev_with_projection(
-        schema,
-        property!(NodesParams, rev),
-        property!(NodesParams, projection),
-    );
-}
-
-/// [`SearchParams`] read one tree: `rev` and `projection` never combine.
-pub fn forbid_search_rev_with_projection(schema: &mut Schema) {
-    forbid_rev_with_projection(
-        schema,
-        property!(SearchParams, rev),
-        property!(SearchParams, projection),
-    );
-}
-
 /// [`InsertSymbolParams`](crate::change::InsertSymbolParams) addresses exactly one
 /// target, and `create_missing` combines only with `file`.
 pub fn insert_symbol_addresses_one_target(schema: &mut Schema) {
@@ -657,19 +514,65 @@ pub fn insert_symbol_addresses_one_target(schema: &mut Schema) {
     let anchor = property!(InsertSymbolParams, anchor);
     let file = property!(InsertSymbolParams, file);
     let create_missing = property!(InsertSymbolParams, create_missing);
-    append(
-        schema,
-        Composition::All,
-        one_of(vec![requires(&[anchor]), requires(&[file])]),
-    );
+    append(schema, one_of(vec![requires(&[anchor]), requires(&[file])]));
     let anchor_and_create_missing = [anchor, create_missing];
     append(
         schema,
-        Composition::All,
         not(merged(vec![
             requires(&anchor_and_create_missing),
             properties(vec![(create_missing, constant(&true))]),
         ])),
+    );
+}
+
+/// A [`PatchParams`](crate::change::PatchParams) states
+/// [`PATCH_BYTES_MAX`](crate::change::PATCH_BYTES_MAX) as `patch`'s inline-string
+/// length: the shared [`BodySource`](crate::change::BodySource) `$defs` entry carries
+/// no bound of its own, so every embedding stamps the limit its own runtime check
+/// enforces, as a sibling of the `$ref` the field generates.
+pub fn declare_patch_body_length(schema: &mut Schema) {
+    use crate::change::{PATCH_BYTES_MAX, PatchParams};
+    let patch = property!(PatchParams, patch);
+    annotate_property(schema, patch, keyword::MIN_LENGTH, json!(1));
+    annotate_property(schema, patch, keyword::MAX_LENGTH, json!(PATCH_BYTES_MAX));
+}
+
+/// A [`ReplaceSymbolParams`](crate::change::ReplaceSymbolParams) states
+/// [`BODY_BYTES_MAX`](crate::change::BODY_BYTES_MAX) as `body`'s inline-string
+/// `maxLength`, the same rule [`declare_patch_body_length`] states for `patch`.
+pub fn declare_replace_symbol_body_length(schema: &mut Schema) {
+    use crate::change::{BODY_BYTES_MAX, ReplaceSymbolParams};
+    annotate_property(
+        schema,
+        property!(ReplaceSymbolParams, body),
+        keyword::MAX_LENGTH,
+        json!(BODY_BYTES_MAX),
+    );
+}
+
+/// An [`InsertSymbolParams`](crate::change::InsertSymbolParams) states
+/// [`BODY_BYTES_MAX`](crate::change::BODY_BYTES_MAX) as `body`'s inline-string
+/// `maxLength`, the same rule [`declare_patch_body_length`] states for `patch`.
+pub fn declare_insert_symbol_body_length(schema: &mut Schema) {
+    use crate::change::{BODY_BYTES_MAX, InsertSymbolParams};
+    annotate_property(
+        schema,
+        property!(InsertSymbolParams, body),
+        keyword::MAX_LENGTH,
+        json!(BODY_BYTES_MAX),
+    );
+}
+
+/// A [`ReplaceNodeParams`](crate::change::ReplaceNodeParams) states
+/// [`BODY_BYTES_MAX`](crate::change::BODY_BYTES_MAX) as `body`'s inline-string
+/// `maxLength`, the same rule [`declare_patch_body_length`] states for `patch`.
+pub fn declare_replace_node_body_length(schema: &mut Schema) {
+    use crate::change::{BODY_BYTES_MAX, ReplaceNodeParams};
+    annotate_property(
+        schema,
+        property!(ReplaceNodeParams, body),
+        keyword::MAX_LENGTH,
+        json!(BODY_BYTES_MAX),
     );
 }
 
@@ -686,15 +589,14 @@ mod tests {
     #[test]
     fn test_append_creates_then_extends_one_keyword() {
         let mut schema = schema_from(json!({}));
-        append(&mut schema, Composition::All, json!({ "required": ["a"] }));
-        append(&mut schema, Composition::All, json!({ "required": ["b"] }));
-        append(&mut schema, Composition::Any, json!({ "required": ["c"] }));
+        append(&mut schema, json!({ "required": ["a"] }));
+        append(&mut schema, json!({ "required": ["b"] }));
         assert_eq!(
             schema.as_value(),
             &json!({
-                "allOf": [{ "required": ["a"] }, { "required": ["b"] }],
-                "anyOf": [{ "required": ["c"] }]
-            })
+                "allOf": [{ "required": ["a"] }, { "required": ["b"] }]
+            }),
+            "every rule extends one keyword, and each clause must hold"
         );
     }
 
@@ -712,10 +614,6 @@ mod tests {
         assert_eq!(
             properties(vec![("semantic", constant(&false))]),
             json!({ "properties": { "semantic": { "const": false } } })
-        );
-        assert_eq!(
-            enumeration(&[SearchScope::Project, SearchScope::All]),
-            json!({ "enum": ["project", "all"] })
         );
         assert_eq!(
             described("Why.", one_of(vec![requires(&["a"])])),
@@ -855,7 +753,7 @@ mod tests {
     /// proves serde serves it under the same name, closing the rename gap.
     #[test]
     fn rule_properties_exist_in_model_schemas() {
-        let cases: [(&str, Value, &[&str]); 9] = [
+        let cases: [(&str, Value, &[&str]); 7] = [
             (
                 "EngineConfiguration",
                 serde_json::to_value(schema_for!(crate::configuration::EngineConfiguration))
@@ -865,12 +763,12 @@ mod tests {
             (
                 "GetSymbolParams",
                 serde_json::to_value(schema_for!(crate::read::GetSymbolParams)).expect("schema"),
-                &["rev", "projection"],
+                &["rev"],
             ),
             (
                 "NodesParams",
                 serde_json::to_value(schema_for!(crate::read::NodesParams)).expect("schema"),
-                &["rev", "projection"],
+                &["rev"],
             ),
             (
                 "ExecutionConfiguration",
@@ -894,25 +792,6 @@ mod tests {
                 serde_json::to_value(schema_for!(SearchHit)).expect("schema"),
                 &["hit", "span", "line"],
             ),
-            (
-                "SearchParams",
-                serde_json::to_value(schema_for!(SearchParams)).expect("schema"),
-                &[
-                    "query",
-                    "filter",
-                    "traversal",
-                    "target",
-                    "scope",
-                    "paths",
-                    "rev",
-                    "projection",
-                ],
-            ),
-            (
-                "RelationFilter",
-                serde_json::to_value(schema_for!(crate::read::RelationFilter)).expect("schema"),
-                &["kind", "facet"],
-            ),
         ];
         for (model, schema, names) in cases {
             let properties = schema["properties"]
@@ -925,36 +804,6 @@ mod tests {
                      would silently detach the rule from the model"
                 );
             }
-        }
-    }
-
-    /// Every read-params schema forbids naming `rev` and `projection`
-    /// together, in the exact clause shape the transform builds.
-    #[test]
-    fn read_params_schemas_forbid_rev_with_projection() {
-        let cases = [
-            (
-                "GetSymbolParams",
-                serde_json::to_value(schema_for!(crate::read::GetSymbolParams)).expect("schema"),
-            ),
-            (
-                "NodesParams",
-                serde_json::to_value(schema_for!(crate::read::NodesParams)).expect("schema"),
-            ),
-            (
-                "SearchParams",
-                serde_json::to_value(schema_for!(SearchParams)).expect("schema"),
-            ),
-        ];
-        let forbidden = json!({ "not": { "required": ["rev", "projection"] } });
-        for (model, schema) in cases {
-            let clauses = schema["allOf"]
-                .as_array()
-                .unwrap_or_else(|| panic!("{model} schema must carry allOf clauses"));
-            assert!(
-                clauses.contains(&forbidden),
-                "{model} schema must forbid rev with projection: {clauses:?}"
-            );
         }
     }
 
@@ -1012,5 +861,68 @@ mod tests {
                  {SEARCH_HIT_TARGET_TAG}, got {target_tags:?}"
             );
         }
+    }
+
+    /// `PatchParams.patch` states the `BodySource` `$defs` `$ref`'s inline-string
+    /// length as a sibling of `$ref`, pinned to [`crate::change::PATCH_BYTES_MAX`].
+    #[test]
+    fn patch_params_schema_states_patch_body_length() {
+        use crate::change::PATCH_BYTES_MAX;
+        let schema = serde_json::to_value(schema_for!(crate::change::PatchParams)).expect("schema");
+        let patch = &schema["properties"]["patch"];
+        assert_eq!(patch["minLength"], json!(1));
+        assert_eq!(patch["maxLength"], json!(PATCH_BYTES_MAX));
+        assert!(
+            patch["$ref"].is_string(),
+            "patch must keep referencing the shared BodySource $defs entry: {patch}"
+        );
+    }
+
+    /// `ReplaceSymbolParams.body`, `InsertSymbolParams.body`, and
+    /// `ReplaceNodeParams.body` each state the `BodySource` `$ref`'s inline-string
+    /// `maxLength` as a sibling of `$ref`, pinned to [`crate::change::BODY_BYTES_MAX`].
+    #[test]
+    fn body_carrying_params_schemas_state_body_length() {
+        use crate::change::{BODY_BYTES_MAX, InsertSymbolParams, ReplaceNodeParams};
+        let cases = [
+            (
+                "ReplaceSymbolParams",
+                serde_json::to_value(schema_for!(crate::change::ReplaceSymbolParams))
+                    .expect("schema"),
+            ),
+            (
+                "InsertSymbolParams",
+                serde_json::to_value(schema_for!(InsertSymbolParams)).expect("schema"),
+            ),
+            (
+                "ReplaceNodeParams",
+                serde_json::to_value(schema_for!(ReplaceNodeParams)).expect("schema"),
+            ),
+        ];
+        for (model, schema) in cases {
+            let body = &schema["properties"]["body"];
+            assert_eq!(
+                body["maxLength"],
+                json!(BODY_BYTES_MAX),
+                "{model}.body must state the enforced maxLength"
+            );
+            assert!(
+                body["$ref"].is_string(),
+                "{model}.body must keep referencing the shared BodySource $defs entry: {body}"
+            );
+        }
+    }
+
+    /// `BodySource` generates exactly one `$defs` entry, shared by every embedding
+    /// rather than duplicated per field.
+    #[test]
+    fn body_source_is_one_defs_entry_shared_across_embeddings() {
+        let schema =
+            serde_json::to_value(schema_for!(crate::change::ReplaceSymbolParams)).expect("schema");
+        let defs = schema["$defs"].as_object().expect("schema carries $defs");
+        assert!(
+            defs.contains_key("BodySource"),
+            "BodySource must be its own $defs entry: {defs:?}"
+        );
     }
 }

@@ -43,7 +43,7 @@ async fn served_wire_errors_validate_against_the_error_data_schema() -> TestResu
         ("search", json!({ "query": "" })),
         (
             "search",
-            json!({ "query": "beacon", "scope": "dependencies" }),
+            json!({ "query": "beacon", "paths": { "include": ["[unclosed"] } }),
         ),
         ("get_symbol", json!({ "name": "beacon", "limit": 0 })),
         ("nodes", json!({ "path": "missing.rs", "position": 0 })),
@@ -69,14 +69,6 @@ async fn served_wire_errors_validate_against_the_error_data_schema() -> TestResu
         (
             "nodes",
             json!({ "path": "lib.rs", "position": 0, "rev": "HEAD~1" }),
-        ),
-        (
-            "get_symbol",
-            json!({
-                "name": "beacon",
-                "rev": "main",
-                "projection": "rift://projection/my-feature-one"
-            }),
         ),
     ];
     for (tool, request) in failing_requests {

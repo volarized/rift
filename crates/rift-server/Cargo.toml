@@ -6,6 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 description = "Workspace application service for Rift"
+# A suite's helper file sits beside it in `tests/`, where Cargo's own
+# discovery would compile the helper as a test binary of its own. Every
+# suite is listed below instead, and a helper is reached with
+# `mod <name>;` from each suite that uses it. A suite added to `tests/`
+# without a `[[test]]` entry here compiles into nothing and stops
+# running, so the architecture gate refuses one.
+autotests = false
 
 [lints]
 workspace = true
@@ -30,5 +37,10 @@ tracing.workspace = true
 
 [dev-dependencies]
 rift-history = { workspace = true, features = ["fixtures"] }
+schemars.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+
+[[test]]
+name = "engine_pool"
+path = "tests/engine_pool.rs"

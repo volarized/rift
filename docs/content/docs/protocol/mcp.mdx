@@ -34,7 +34,7 @@ Callers read code through these tools:
 | Tool | Result |
 | --- | --- |
 | [`get_symbol`](#tool-get_symbol) | declarations and their source by known name |
-| [`search`](#tool-search) | ranked files and symbols across a selected source scope |
+| [`search`](#tool-search) | ranked files and symbols across the workspace tree |
 | [`nodes`](#tool-nodes) | the syntax nodes covering one position, with witnessed addresses |
 
 `get_symbol` and `search` page by `page_index`. The request names the zero-based page under its
@@ -47,9 +47,7 @@ Every read result also carries `warnings`. A `stale_index` warning reports an an
 from an index that lags the tree the read captured, and names the two tree revision digests that
 disagree.
 
-Every read carries an optional `projection` and an optional `rev`, and reads the workspace tree
-when both are absent. The server refuses a read naming a `projection` with
-`capability_unavailable`.
+Every read carries an optional `rev`, and reads the workspace tree when it is absent.
 
 ### Revision-addressed reads [#revision-reads]
 
@@ -71,9 +69,8 @@ currently holds:
 { "name": "ReadService", "rev": "main" }
 ```
 
-`rev` and `projection` never combine: a request naming both refuses as `invalid_request`. A
-revision search refuses `force_include`: reaching index-excluded files is a walk of the working
-tree, which a revision does not have.
+A revision search refuses `force_include`: reaching index-excluded files is a walk of the
+working tree, which a revision does not have.
 
 A workspace with no git repository refuses a revision read and names the remedy:
 
@@ -116,13 +113,6 @@ index is parsed on demand and searched alongside the indexed hits, up to 256 mat
 request; a request whose `force_include` matches more than that refuses with `limit_exceeded`
 rather than searching a silently truncated set.
 
-The request shape also carries a `filter` over resolved provider facts and a bounded relationship
-`traversal`. A request naming either refuses with `capability_unavailable`, as does
-`target: "node"` and `scope: "dependencies"`.
-
-Search defaults to `scope: "project"`; `scope: "all"` also includes dependency,
-standard-library, and external declarations.
-
 This request narrows the search to the tests tree, then reaches one file the workspace's
 `[source]` policy excludes from the index:
 
@@ -133,30 +123,6 @@ This request narrows the search to the tests tree, then reaches one file the wor
     "include": ["tests/**"],
     "force_include": ["tests/legacy/test_solver.py"]
   }
-}
-```
-
-This request names a `traversal`, which the server does not serve:
-
-```json
-{
-  "traversal": {
-    "seed": "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService",
-    "intent": "find_tests"
-  }
-}
-```
-
-**Error data:**
-
-```json
-{
-  "code": "capability_unavailable",
-  "message": "no configured provider serves this request: capability filtered and traversal search; adjust the request to a served capability, or configure a provider that serves it",
-  "retry": "operator_action",
-  "phase": "read",
-  "diagnostics": [],
-  "causes": []
 }
 ```
 
@@ -172,7 +138,8 @@ index. A multi-word query matches a unit that carries any one of its terms anywh
 content, and a unit carrying more of the query's terms ranks above one carrying fewer.
 
 A symbol whose only match sits in its declaration, not its name, still returns as a `symbol`
-hit, tagged `matched_by: ["content"]`:
+hit. The ranked lane placed it, so the hit is tagged `matched_by: ["ranked"]`, not
+`["content"]` - a claim only the identifier or line matcher can make against literal bytes:
 
 **Request:**
 
@@ -208,7 +175,7 @@ hit, tagged `matched_by: ["content"]`:
     }
   },
   "score": 0.31,
-  "matched_by": ["content"],
+  "matched_by": ["ranked"],
   "span": {
     "unit": "rift://source/project/crates/rift-core/src/identity.rs",
     "range": { "start": 1496, "end": 1925 }
@@ -219,7 +186,7 @@ hit, tagged `matched_by: ["content"]`:
 ```
 
 Every file [`[search.text]`](/docs/configuration#search) includes joins the same index. A hit on
-one of those files returns as a `file` hit, tagged the same way:
+one of those files returns as a `file` hit, tagged `matched_by: ["ranked"]` the same way:
 
 **Request:**
 
@@ -242,7 +209,7 @@ one of those files returns as a `file` hit, tagged the same way:
     }
   },
   "score": 0.51,
-  "matched_by": ["content"],
+  "matched_by": ["ranked"],
   "span": {
     "unit": "rift://source/project/README.md",
     "range": { "start": 820, "end": 920 }
