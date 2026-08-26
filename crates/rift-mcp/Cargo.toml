@@ -34,7 +34,7 @@ schemars.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["io-std", "net"] }
 tokio-util.workspace = true
 tracing.workspace = true
 
