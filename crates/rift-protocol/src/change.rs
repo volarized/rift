@@ -131,6 +131,14 @@ pub enum OperationPreconditionKind {
     /// valid UTF-8 text.
     #[serde(rename = "body_readable")]
     BodyReadable,
+    /// Wire value `engine_proposed_edits`. The failed entry names an operation whose
+    /// configured engine declined it or proposed no edit for the addressed subject.
+    #[serde(rename = "engine_proposed_edits")]
+    EngineProposedEdits,
+    /// Wire value `target_is_file`. The failed entry names a path a write requires to
+    /// be a file, that a directory occupies on disk.
+    #[serde(rename = "target_is_file")]
+    TargetIsFile,
 }
 
 /// Result of this check.

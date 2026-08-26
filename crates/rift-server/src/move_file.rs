@@ -1,12 +1,13 @@
 //! File move through a configured language engine's will-rename request.
 //!
-//! The server moves one visible file and asks the language engine for
-//! reference updates; the proposal compiles through the rename kernel into
-//! whole-file rewrites, and the move and every rewrite land through one
-//! atomic publish. Without an engine, without the will-rename capability,
-//! or with filters that do not cover the file, the move still lands and
-//! the result carries a warning that references were not updated. So does
-//! a move whose engine answers with no edit at all, whatever its readiness
+//! The server moves any visible regular file and asks the language engine
+//! for reference updates; the proposal compiles through the rename kernel
+//! into whole-file rewrites, and the move and every rewrite land through
+//! one atomic publish. Without a syntax provider claiming the file's
+//! language, without an engine, without the will-rename capability, or
+//! with filters that do not cover the file, the move still lands and the
+//! result carries a warning that references were not updated. So does a
+//! move whose engine answers with no edit at all, whatever its readiness
 //! said before that answer: the contract already permits a move that needs
 //! no reference rewritten, and the warning tells the caller which case
 //! this was rather than staying silent about it.
@@ -26,7 +27,7 @@ use rift_protocol::change::{
 use rift_protocol::read::{Diagnostic, DiagnosticCode, Severity};
 
 use crate::engine::{EnginePool, EngineSlot};
-use crate::read::{ReadError, ReadFault, ReadService, digest_hex8};
+use crate::read::{ReadError, ReadFault, ReadService};
 use crate::rename::{
     PlanEnd, PlannedRewrite, ProposalContext, compiled_rewrites, failed_precondition,
     plan_diagnostic, proposal_documents, refused_oversized, workspace_tree_root,
@@ -66,14 +67,18 @@ pub enum MoveResolution {
 
 /// Why the moved file's references were not updated.
 ///
-/// The first three name an engine that was never asked. The last two name
-/// one that was, and proposed no edit: [`Self::AnsweredNothing`] when the
-/// engine had never confirmed its own readiness at the time it answered,
-/// so nothing distinguishes that answer from the answer of an engine with
-/// nothing to update; [`Self::NoReferenceEdits`] once it had, which is the
-/// engine's own settled verdict that the move needs no reference rewrite.
+/// [`Self::NoLanguageClaimed`] names a file no shipped syntax provider parses, so no
+/// language identity exists to ask an engine about. The next three name a known language
+/// whose engine was never asked. The last two name one that was, and proposed no edit:
+/// [`Self::AnsweredNothing`] when the engine had never confirmed its own readiness at the
+/// time it answered, so nothing distinguishes that answer from the answer of an engine with
+/// nothing to update; [`Self::NoReferenceEdits`] once it had, which is the engine's own
+/// settled verdict that the move needs no reference rewrite.
 #[derive(Debug)]
 pub(crate) enum ReferencesNotUpdated {
+    /// No shipped syntax provider parses the moved file, so its language is unknown and
+    /// no engine could be asked about it.
+    NoLanguageClaimed,
     /// No engine claims the moved file's language.
     NoEngine {
         /// The unserved language identity segment.
@@ -118,6 +123,9 @@ impl ReferencesNotUpdated {
     /// were not updated.
     pub(crate) fn diagnostic(&self) -> Diagnostic {
         let reason = match self {
+            Self::NoLanguageClaimed => "no syntax provider claims this file's language, so \
+                                         no engine could be asked to update references"
+                .to_owned(),
             Self::NoEngine { language_segment } => {
                 format!("no engine is configured for language {language_segment}")
             }
@@ -181,12 +189,11 @@ async fn planned_move(
     params: &MoveFileParams,
 ) -> Result<MovePlan, PlanEnd> {
     let (from, to) = move_targets(params)?;
-    let source = resolved_source(reads, &from)?;
+    let source = resolved_source(reads, workspace_root, &from).await?;
     refused_occupied_destination(workspace_root, &to).await?;
     refused_invisible_destination(reads, workspace_root, &to)?;
-    verified_moved_bytes(workspace_root, &from, &source.text).await?;
     refused_oversized(&from, source.text.len(), MOVE_OPERATION)?;
-    let proposal = engine_proposal(engines, &from, &to, &source.language_segment).await?;
+    let proposal = engine_proposal(engines, &from, &to, source.language_segment.as_deref()).await?;
     match proposal {
         EngineProposal::Nothing(reason) => Ok(unedited_plan(from, to, source.text, Some(reason))),
         EngineProposal::Answered { edit, encoding } => {
@@ -195,9 +202,10 @@ async fn planned_move(
     }
 }
 
-/// The moved file's language segment and verified snapshot bytes.
+/// The moved file's language segment - present only when the syntax index claims the
+/// path - and its bytes, read directly from disk.
 struct MovedSource {
-    language_segment: String,
+    language_segment: Option<String>,
     text: String,
 }
 
@@ -237,25 +245,89 @@ fn move_targets(params: &MoveFileParams) -> Result<(CoreProjectPath, CoreProject
     Ok((from, to))
 }
 
-/// The moved file's indexed source, or the refusal for a path the served
-/// snapshot does not hold - missing, invisible, or not a file.
-fn resolved_source(reads: &ReadService, from: &CoreProjectPath) -> Result<MovedSource, PlanEnd> {
-    let Some(file) = reads.index().file(from) else {
-        return Err(PlanEnd::Refused(ChangeResult::refused(
-            RefusalReason::UnmetPrecondition,
-            vec![failed_precondition(
-                OperationPreconditionKind::TargetExists,
-                &[],
-                from,
-                PreconditionValue::Boolean { value: true },
-                PreconditionValue::Boolean { value: false },
-            )],
-        )));
+/// Resolves the moved file's current bytes directly from the filesystem, and its language
+/// segment when the syntax index claims the path.
+///
+/// Any visible regular file is movable: absence from the syntax index only means no
+/// language identity exists to ask an engine with, which [`engine_proposal`] and the
+/// move's own warning path already cover. An indexed path already passed the workspace's
+/// `[source]` policy at index construction; a path the index does not hold is checked
+/// against that policy directly here, so an excluded path stays unreachable regardless of
+/// whether a provider would otherwise claim it. A missing path refuses `target_exists`; a
+/// directory refuses `target_is_file`.
+async fn resolved_source(
+    reads: &ReadService,
+    workspace_root: &Path,
+    from: &CoreProjectPath,
+) -> Result<MovedSource, PlanEnd> {
+    let language_segment = reads
+        .index()
+        .file(from)
+        .map(|file| file.syntax().language().identity_segment());
+    let absolute = workspace_root.join(from.as_str());
+    if language_segment.is_none() && !source_visible(reads, &absolute) {
+        return Err(PlanEnd::Refused(crate::publish::not_visible_refusal(from)));
+    }
+    let metadata = match tokio::fs::metadata(&absolute).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(PlanEnd::Refused(missing_source_refusal(from)));
+        }
+        Err(error) => {
+            return Err(PlanEnd::from(ReadFault::storage(
+                from.as_str(),
+                "stat",
+                &error,
+            )));
+        }
     };
+    if !metadata.is_file() {
+        return Err(PlanEnd::Refused(directory_source_refusal(from)));
+    }
+    let text = tokio::fs::read_to_string(&absolute)
+        .await
+        .map_err(|error| PlanEnd::from(ReadFault::storage(from.as_str(), "read", &error)))?;
     Ok(MovedSource {
-        language_segment: file.syntax().language().identity_segment(),
-        text: file.source().to_owned(),
+        language_segment,
+        text,
     })
+}
+
+/// Whether `absolute` is visible under the workspace's `[source]` policy, checked directly
+/// for a path the syntax index does not claim - the same policy an indexed path already
+/// passed at index construction.
+fn source_visible(reads: &ReadService, absolute: &Path) -> bool {
+    reads
+        .source_policy()
+        .is_some_and(|policy| policy.visible(absolute))
+}
+
+/// The moved file's source condition failed: it does not exist.
+fn missing_source_refusal(path: &CoreProjectPath) -> ChangeResult {
+    ChangeResult::refused(
+        RefusalReason::UnmetPrecondition,
+        vec![failed_precondition(
+            OperationPreconditionKind::TargetExists,
+            &[],
+            path,
+            PreconditionValue::Boolean { value: true },
+            PreconditionValue::Boolean { value: false },
+        )],
+    )
+}
+
+/// The moved file's source condition failed: a directory occupies the path.
+fn directory_source_refusal(path: &CoreProjectPath) -> ChangeResult {
+    ChangeResult::refused(
+        RefusalReason::UnmetPrecondition,
+        vec![failed_precondition(
+            OperationPreconditionKind::TargetIsFile,
+            &[],
+            path,
+            PreconditionValue::Boolean { value: true },
+            PreconditionValue::Boolean { value: false },
+        )],
+    )
 }
 
 /// Refuses a destination something already occupies on disk, symlinks
@@ -302,35 +374,6 @@ fn refused_invisible_destination(
     }
 }
 
-/// Proves the moved file's disk bytes still match the served snapshot, so
-/// the engine and the compile see exactly the bytes that will move.
-async fn verified_moved_bytes(
-    workspace_root: &Path,
-    from: &CoreProjectPath,
-    source: &str,
-) -> Result<(), PlanEnd> {
-    let disk = tokio::fs::read_to_string(workspace_root.join(from.as_str()))
-        .await
-        .map_err(|error| PlanEnd::from(ReadFault::storage(from.as_str(), "read", &error)))?;
-    if disk == source {
-        return Ok(());
-    }
-    Err(PlanEnd::Refused(ChangeResult::refused(
-        RefusalReason::UnmetPrecondition,
-        vec![failed_precondition(
-            OperationPreconditionKind::SourceUnchanged,
-            &[],
-            from,
-            PreconditionValue::Text {
-                value: digest_hex8(source),
-            },
-            PreconditionValue::Text {
-                value: digest_hex8(&disk),
-            },
-        )],
-    )))
-}
-
 /// What the engine phase produced for one move.
 enum EngineProposal {
     /// The engine contributed no reference updates; the reason rides the
@@ -359,13 +402,20 @@ enum MoveExchange {
 }
 
 /// Asks the engine serving the moved file's language for reference
-/// updates, when one exists and its capability covers the file.
+/// updates, when one exists and its capability covers the file. `None`
+/// names a file no syntax provider claims: no language identity exists to
+/// ask about, so no engine is queried at all.
 async fn engine_proposal(
     engines: &EnginePool,
     from: &CoreProjectPath,
     to: &CoreProjectPath,
-    language_segment: &str,
+    language_segment: Option<&str>,
 ) -> Result<EngineProposal, PlanEnd> {
+    let Some(language_segment) = language_segment else {
+        return Ok(EngineProposal::Nothing(
+            ReferencesNotUpdated::NoLanguageClaimed,
+        ));
+    };
     let language = crate::rename::segment_language(language_segment);
     let Some(slot) = engines.engine_for(&language) else {
         return Ok(EngineProposal::Nothing(ReferencesNotUpdated::NoEngine {
@@ -754,6 +804,114 @@ mod tests {
         );
     }
 
+    /// Reproduces the defect a reused `target_exists` precondition left behind: a plain
+    /// visible file present on disk, that no syntax provider claims, plainly exists and
+    /// must move - never refuse as though it were absent.
+    #[tokio::test]
+    async fn a_source_no_syntax_provider_claims_still_moves_and_names_the_unclaimed_language() {
+        let (directory, reads, engines) = workspace(&[("notes.txt", "hello\n")]);
+        let resolution = plan_move(
+            &reads,
+            &engines,
+            directory.path(),
+            &params("notes.txt", "moved.txt"),
+        )
+        .await
+        .expect("a visible regular file no provider claims is still movable");
+        let MoveResolution::Planned(plan) = resolution else {
+            panic!("an unindexed visible file must still plan a move: {resolution:?}");
+        };
+        assert_eq!(plan.moved_next, "hello\n");
+        assert!(plan.rewrites.is_empty());
+        assert!(
+            matches!(
+                plan.references_not_updated,
+                Some(ReferencesNotUpdated::NoLanguageClaimed)
+            ),
+            "absence from the syntax index must never refuse the move, and must name the \
+             unclaimed language, not a false target_exists: {:?}",
+            plan.references_not_updated
+        );
+        engines.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn directory_as_move_source_refuses_target_is_file() {
+        let (directory, reads, engines) = workspace(&[("lib.rs", "pub fn beacon() {}\n")]);
+        fs::create_dir(directory.path().join("adir")).expect("fixture directory creates");
+        let result = refused(
+            plan_move(
+                &reads,
+                &engines,
+                directory.path(),
+                &params("adir", "moved.rs"),
+            )
+            .await
+            .expect("the refusal is typed"),
+        );
+        let condition = precondition(&result);
+        assert_eq!(condition.kind, OperationPreconditionKind::TargetIsFile);
+        assert_eq!(condition.paths, vec![ProjectPath("adir".to_owned())]);
+        assert_eq!(
+            condition.expected,
+            PreconditionValue::Boolean { value: true }
+        );
+        assert_eq!(
+            condition.observed,
+            PreconditionValue::Boolean { value: false }
+        );
+        assert!(
+            directory.path().join("adir").is_dir(),
+            "the directory is untouched"
+        );
+        assert!(!directory.path().join("moved.rs").exists());
+    }
+
+    #[tokio::test]
+    async fn source_excluded_by_policy_refuses_unsupported() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        fs::create_dir(directory.path().join("excluded")).expect("fixture directory creates");
+        fs::write(directory.path().join("excluded/hidden.txt"), "hidden\n").expect("fixture write");
+        let visibility =
+            rift_core::SourceVisibility::new(Vec::new(), vec!["excluded/**".to_owned()], true);
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &visibility,
+            &TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )
+        .expect("fixture workspace indexes");
+        let engines = EnginePool::new(directory.path(), BTreeMap::new());
+        let result = refused(
+            plan_move(
+                &reads,
+                &engines,
+                directory.path(),
+                &params("excluded/hidden.txt", "moved.txt"),
+            )
+            .await
+            .expect("the refusal is typed"),
+        );
+        let ChangeResult::Refused {
+            reason,
+            diagnostics,
+            ..
+        } = result
+        else {
+            panic!("an excluded source must refuse");
+        };
+        assert_eq!(reason, RefusalReason::Unsupported);
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.message.contains("excluded/hidden.txt")
+                    && diagnostic.message.contains("[source]")
+            }),
+            "the diagnostic must name the excluded source path and the policy: {diagnostics:?}"
+        );
+        assert!(directory.path().join("excluded/hidden.txt").exists());
+    }
+
     #[tokio::test]
     async fn occupied_destination_refuses_target_exists_inverted() {
         let (directory, reads, engines) = workspace(&[
@@ -834,24 +992,26 @@ mod tests {
         );
     }
 
+    /// The source resolves from the filesystem, so a file the index built against one
+    /// snapshot but that has since changed on disk moves the bytes actually standing
+    /// there rather than a stale copy: there is no earlier snapshot left to drift from.
     #[tokio::test]
-    async fn drifted_source_refuses_source_unchanged() {
+    async fn a_source_changed_since_indexing_moves_its_current_disk_bytes() {
         let (directory, reads, engines) = workspace(&[("lib.rs", "pub fn beacon() {}\n")]);
         fs::write(directory.path().join("lib.rs"), "pub fn drifted() {}\n")
             .expect("fixture file writes");
-        let result = refused(
-            plan_move(
-                &reads,
-                &engines,
-                directory.path(),
-                &params("lib.rs", "moved.rs"),
-            )
-            .await
-            .expect("the refusal is typed"),
-        );
-        let condition = precondition(&result);
-        assert_eq!(condition.kind, OperationPreconditionKind::SourceUnchanged);
-        assert_ne!(condition.expected, condition.observed);
+        let resolution = plan_move(
+            &reads,
+            &engines,
+            directory.path(),
+            &params("lib.rs", "moved.rs"),
+        )
+        .await
+        .expect("the move plans");
+        let MoveResolution::Planned(plan) = resolution else {
+            panic!("a changed but still-present source still plans: {resolution:?}");
+        };
+        assert_eq!(plan.moved_next, "pub fn drifted() {}\n");
     }
 
     #[cfg(unix)]
@@ -876,19 +1036,59 @@ mod tests {
         assert_eq!(error.descriptor().code(), "storage_failure");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn a_source_gone_from_disk_is_a_storage_failure() {
-        let (directory, reads, engines) = workspace(&[("lib.rs", "pub fn beacon() {}\n")]);
-        fs::remove_file(directory.path().join("lib.rs")).expect("fixture file removes");
-        let error = plan_move(
+    async fn an_unreadable_source_directory_is_a_storage_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let sealed = directory.path().join("sealed");
+        fs::create_dir(&sealed).expect("fixture directory creates");
+        fs::write(sealed.join("lib.rs"), "pub fn beacon() {}\n").expect("fixture file writes");
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )
+        .expect("fixture workspace indexes");
+        let engines = EnginePool::new(directory.path(), BTreeMap::new());
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000))
+            .expect("fixture permissions set");
+        let result = plan_move(
             &reads,
             &engines,
             directory.path(),
-            &params("lib.rs", "moved.rs"),
+            &params("sealed/lib.rs", "moved.rs"),
         )
-        .await
-        .expect_err("an unreadable source is a storage failure");
+        .await;
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o755))
+            .expect("fixture permissions restore");
+        let error = result.expect_err("an unreadable source is a storage failure");
         assert_eq!(error.descriptor().code(), "storage_failure");
+        engines.shutdown().await;
+    }
+
+    /// A file the index still holds a stale entry for, but that vanished from disk since,
+    /// resolves through the same fresh filesystem check as a source that was never
+    /// indexed: it refuses `target_exists`, not a raw storage failure.
+    #[tokio::test]
+    async fn a_source_gone_from_disk_refuses_target_exists() {
+        let (directory, reads, engines) = workspace(&[("lib.rs", "pub fn beacon() {}\n")]);
+        fs::remove_file(directory.path().join("lib.rs")).expect("fixture file removes");
+        let result = refused(
+            plan_move(
+                &reads,
+                &engines,
+                directory.path(),
+                &params("lib.rs", "moved.rs"),
+            )
+            .await
+            .expect("the refusal is typed"),
+        );
+        let condition = precondition(&result);
+        assert_eq!(condition.kind, OperationPreconditionKind::TargetExists);
+        assert_eq!(condition.paths, vec![ProjectPath("lib.rs".to_owned())]);
     }
 
     #[tokio::test]
@@ -965,6 +1165,10 @@ mod tests {
     #[test]
     fn every_reason_names_itself_and_carries_the_move_code() {
         let reasons = [
+            (
+                ReferencesNotUpdated::NoLanguageClaimed,
+                "no syntax provider claims this file's language",
+            ),
             (
                 ReferencesNotUpdated::NoEngine {
                     language_segment: "rust".to_owned(),

@@ -2427,6 +2427,16 @@
                 "const": "body_readable",
                 "description": "Wire value `body_readable`. The failed entry names the [`BodySource`] `file`\nform: absent, not a plain file, unreadable, or holding bytes that are not\nvalid UTF-8 text.",
                 "type": "string"
+              },
+              {
+                "const": "engine_proposed_edits",
+                "description": "Wire value `engine_proposed_edits`. The failed entry names an operation whose\nconfigured engine declined it or proposed no edit for the addressed subject.",
+                "type": "string"
+              },
+              {
+                "const": "target_is_file",
+                "description": "Wire value `target_is_file`. The failed entry names a path a write requires to\nbe a file, that a directory occupies on disk.",
+                "type": "string"
               }
             ]
           },
@@ -3454,6 +3464,16 @@
                 "const": "body_readable",
                 "description": "Wire value `body_readable`. The failed entry names the [`BodySource`] `file`\nform: absent, not a plain file, unreadable, or holding bytes that are not\nvalid UTF-8 text.",
                 "type": "string"
+              },
+              {
+                "const": "engine_proposed_edits",
+                "description": "Wire value `engine_proposed_edits`. The failed entry names an operation whose\nconfigured engine declined it or proposed no edit for the addressed subject.",
+                "type": "string"
+              },
+              {
+                "const": "target_is_file",
+                "description": "Wire value `target_is_file`. The failed entry names a path a write requires to\nbe a file, that a directory occupies on disk.",
+                "type": "string"
               }
             ]
           },
@@ -4373,6 +4393,16 @@
               {
                 "const": "body_readable",
                 "description": "Wire value `body_readable`. The failed entry names the [`BodySource`] `file`\nform: absent, not a plain file, unreadable, or holding bytes that are not\nvalid UTF-8 text.",
+                "type": "string"
+              },
+              {
+                "const": "engine_proposed_edits",
+                "description": "Wire value `engine_proposed_edits`. The failed entry names an operation whose\nconfigured engine declined it or proposed no edit for the addressed subject.",
+                "type": "string"
+              },
+              {
+                "const": "target_is_file",
+                "description": "Wire value `target_is_file`. The failed entry names a path a write requires to\nbe a file, that a directory occupies on disk.",
                 "type": "string"
               }
             ]
@@ -6107,6 +6137,16 @@
                 "const": "body_readable",
                 "description": "Wire value `body_readable`. The failed entry names the [`BodySource`] `file`\nform: absent, not a plain file, unreadable, or holding bytes that are not\nvalid UTF-8 text.",
                 "type": "string"
+              },
+              {
+                "const": "engine_proposed_edits",
+                "description": "Wire value `engine_proposed_edits`. The failed entry names an operation whose\nconfigured engine declined it or proposed no edit for the addressed subject.",
+                "type": "string"
+              },
+              {
+                "const": "target_is_file",
+                "description": "Wire value `target_is_file`. The failed entry names a path a write requires to\nbe a file, that a directory occupies on disk.",
+                "type": "string"
               }
             ]
           },
@@ -7028,6 +7068,16 @@
                 "const": "body_readable",
                 "description": "Wire value `body_readable`. The failed entry names the [`BodySource`] `file`\nform: absent, not a plain file, unreadable, or holding bytes that are not\nvalid UTF-8 text.",
                 "type": "string"
+              },
+              {
+                "const": "engine_proposed_edits",
+                "description": "Wire value `engine_proposed_edits`. The failed entry names an operation whose\nconfigured engine declined it or proposed no edit for the addressed subject.",
+                "type": "string"
+              },
+              {
+                "const": "target_is_file",
+                "description": "Wire value `target_is_file`. The failed entry names a path a write requires to\nbe a file, that a directory occupies on disk.",
+                "type": "string"
               }
             ]
           },
@@ -7948,6 +7998,16 @@
               {
                 "const": "body_readable",
                 "description": "Wire value `body_readable`. The failed entry names the [`BodySource`] `file`\nform: absent, not a plain file, unreadable, or holding bytes that are not\nvalid UTF-8 text.",
+                "type": "string"
+              },
+              {
+                "const": "engine_proposed_edits",
+                "description": "Wire value `engine_proposed_edits`. The failed entry names an operation whose\nconfigured engine declined it or proposed no edit for the addressed subject.",
+                "type": "string"
+              },
+              {
+                "const": "target_is_file",
+                "description": "Wire value `target_is_file`. The failed entry names a path a write requires to\nbe a file, that a directory occupies on disk.",
                 "type": "string"
               }
             ]
@@ -8871,6 +8931,16 @@
               {
                 "const": "body_readable",
                 "description": "Wire value `body_readable`. The failed entry names the [`BodySource`] `file`\nform: absent, not a plain file, unreadable, or holding bytes that are not\nvalid UTF-8 text.",
+                "type": "string"
+              },
+              {
+                "const": "engine_proposed_edits",
+                "description": "Wire value `engine_proposed_edits`. The failed entry names an operation whose\nconfigured engine declined it or proposed no edit for the addressed subject.",
+                "type": "string"
+              },
+              {
+                "const": "target_is_file",
+                "description": "Wire value `target_is_file`. The failed entry names a path a write requires to\nbe a file, that a directory occupies on disk.",
                 "type": "string"
               }
             ]
@@ -9868,6 +9938,16 @@
                 "const": "body_readable",
                 "description": "Wire value `body_readable`. The failed entry names the [`BodySource`] `file`\nform: absent, not a plain file, unreadable, or holding bytes that are not\nvalid UTF-8 text.",
                 "type": "string"
+              },
+              {
+                "const": "engine_proposed_edits",
+                "description": "Wire value `engine_proposed_edits`. The failed entry names an operation whose\nconfigured engine declined it or proposed no edit for the addressed subject.",
+                "type": "string"
+              },
+              {
+                "const": "target_is_file",
+                "description": "Wire value `target_is_file`. The failed entry names a path a write requires to\nbe a file, that a directory occupies on disk.",
+                "type": "string"
               }
             ]
           },
@@ -10863,6 +10943,16 @@
               {
                 "const": "body_readable",
                 "description": "Wire value `body_readable`. The failed entry names the [`BodySource`] `file`\nform: absent, not a plain file, unreadable, or holding bytes that are not\nvalid UTF-8 text.",
+                "type": "string"
+              },
+              {
+                "const": "engine_proposed_edits",
+                "description": "Wire value `engine_proposed_edits`. The failed entry names an operation whose\nconfigured engine declined it or proposed no edit for the addressed subject.",
+                "type": "string"
+              },
+              {
+                "const": "target_is_file",
+                "description": "Wire value `target_is_file`. The failed entry names a path a write requires to\nbe a file, that a directory occupies on disk.",
                 "type": "string"
               }
             ]

@@ -984,13 +984,15 @@ pub(crate) fn unsupported_refusal(detail: String) -> ChangeResult {
     }
 }
 
-/// The engine declined the rename: an unmet condition naming the addressed
-/// declaration, with the engine's verdict as the finding.
+/// The engine declined the rename, or proposed no edit for it: an unmet
+/// condition naming the addressed declaration, with the engine's own words
+/// as the finding. The declaration itself is untouched and may well still
+/// exist, so this never claims [`OperationPreconditionKind::TargetExists`].
 fn declined_refusal(address: &SymbolAddress, detail: String) -> ChangeResult {
     ChangeResult::Refused {
         reason: RefusalReason::UnmetPrecondition,
         preconditions: vec![failed_precondition(
-            OperationPreconditionKind::TargetExists,
+            OperationPreconditionKind::EngineProposedEdits,
             &[PreconditionAddress::Symbol {
                 symbol: address.wire_symbol(),
             }],
@@ -1712,5 +1714,80 @@ mod tests {
             .await
             .expect_err("an unreadable path is a storage failure");
         assert!(matches!(unreadable, PlanEnd::Failed(_)));
+    }
+
+    /// One framed JSON-RPC message.
+    fn framed(body: &str) -> String {
+        format!("Content-Length: {}\r\n\r\n{body}", body.len())
+    }
+
+    /// A workspace served by a canned `sh` engine that advertises a bare `renameProvider`
+    /// (no prepare capability, so the flow calls `textDocument/rename` directly) and
+    /// answers that one request with a JSON-RPC error - the engine's own verdict declining
+    /// the rename, under a code no retry policy treats as transient. The script never
+    /// reads its stdin; it writes this fixed sequence regardless of what the session
+    /// sends.
+    fn workspace_with_declining_engine(
+        files: &[(&str, &str)],
+    ) -> (tempfile::TempDir, ReadService, EnginePool) {
+        let (directory, reads) = workspace(files);
+        let capabilities =
+            framed(r#"{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"renameProvider":true}}}"#);
+        let declined = framed(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"No references found at position"}}"#,
+        );
+        let script = format!("printf '%s' '{capabilities}{declined}'; sleep 0.2");
+        let engine = rift_protocol::configuration::EngineConfiguration {
+            program: "sh".to_owned(),
+            arguments: vec!["-c".to_owned(), script],
+            environment: BTreeMap::new(),
+            languages: vec!["rust".to_owned()],
+            initialization_options: None,
+            startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            output_limit: rift_protocol::configuration::ByteSize::from_bytes(4_096),
+            retry: rift_protocol::retry::RetryPolicy::default(),
+            restart: rift_protocol::retry::RestartPolicy::default(),
+        };
+        let engines = EnginePool::new(
+            directory.path(),
+            BTreeMap::from([("fake".to_owned(), engine)]),
+        );
+        (directory, reads, engines)
+    }
+
+    /// Reproduces the defect a reused `target_exists` precondition left behind: an engine
+    /// declining a rename of a declaration that plainly still exists must never claim the
+    /// declaration is absent.
+    #[tokio::test]
+    async fn an_engine_decline_names_its_own_condition_not_target_absence() {
+        let (directory, reads, engines) =
+            workspace_with_declining_engine(&[("lib.rs", "pub fn beacon() {}\n")]);
+        let params = RenameSymbolParams {
+            symbol: SymbolId("rift://symbol/rust/lib.rs/beacon".to_owned()),
+            new_name: "flare".to_owned(),
+        };
+        let resolution = plan_rename(&reads, &engines, directory.path(), &params)
+            .await
+            .expect("a declined rename plans as a typed refusal, not an error");
+        let RenameResolution::Refused(result) = resolution else {
+            panic!("an engine decline must refuse: {resolution:?}");
+        };
+        assert_eq!(refusal_reason(&result), RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            first_precondition_kind(&result),
+            OperationPreconditionKind::EngineProposedEdits,
+            "the failed condition must name the engine's decline, never target_exists"
+        );
+        assert!(
+            refusal_detail(&result).contains("No references found at position"),
+            "the engine's own words must ride the refusal: {}",
+            refusal_detail(&result)
+        );
+        assert!(
+            reads.index().file(&project_path("lib.rs")).is_some(),
+            "the declaration the engine declined to rename must still be there"
+        );
+        engines.shutdown().await;
     }
 }
