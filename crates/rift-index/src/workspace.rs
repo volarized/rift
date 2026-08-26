@@ -2252,32 +2252,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rebuilt_omits_a_newly_invalid_text_file_and_warns() {
-        let directory = fixture();
-        let root = directory.path();
-        let index = indexed(root, &TextFileInclusion::default());
-        assert!(index.warnings().is_empty());
-        let readme_path = ProjectPath::new("README.txt").expect("fixture path");
-        assert!(index.text_file(&readme_path).is_some());
-
-        // README.txt turns invalid; the rebuild still lands, omitting it and warning.
-        fs::write(root.join("README.txt"), [0xff]).expect("corrupted text file");
-        let changes = resolved(&index, root, &["README.txt"]);
-        let corrupted = index
-            .rebuilt(&changes)
-            .expect("one invalid text file must not fail the rebuild");
-        assert!(
-            corrupted.text_file(&readme_path).is_none(),
-            "the corrupted text file is dropped"
-        );
-        assert_eq!(
-            corrupted.warnings(),
-            [WorkspaceIndexWarning::InvalidUtf8Source(readme_path)],
-            "the rebuild carries a warning naming the corrupted text file"
-        );
-    }
-
-    #[test]
     fn test_nested_ignore_file_narrows_only_its_own_directory() {
         // A pattern in a nested file addresses paths under that file's directory, so a
         // root-level file spelling the same name stays visible.

@@ -23,6 +23,7 @@ rift-provider.workspace = true
 rift-search.workspace = true
 rift-syntax.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
@@ -30,5 +31,4 @@ tracing.workspace = true
 [dev-dependencies]
 rift-history = { workspace = true, features = ["fixtures"] }
 serde_json.workspace = true
-tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
