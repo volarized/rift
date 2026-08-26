@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn stale_snapshot_finding_carries_its_code_and_the_render() {
         let error = rift_server::ReadError::from(ReadFault::Unsupported {
-            capability: "probe",
+            capability: "probe".to_owned(),
         });
         let finding = super::stale_snapshot_diagnostic(&error);
         assert_eq!(finding.code.as_deref(), Some("rift.snapshot.stale"));

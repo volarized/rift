@@ -1555,9 +1555,8 @@ pub fn compute() -> i32 {
         );
         assert!(matches!(
             error.fault(),
-            ReadFault::Unsupported {
-                capability: "force_include at a revision"
-            }
+            ReadFault::Unsupported { capability }
+            if capability == "force_include at a revision"
         ));
         Ok(())
     }
