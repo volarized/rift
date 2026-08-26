@@ -159,6 +159,7 @@ async fn planned_move(
     let (from, to) = move_targets(params)?;
     let source = resolved_source(reads, &from)?;
     refused_occupied_destination(workspace_root, &to).await?;
+    refused_invisible_destination(reads, workspace_root, &to)?;
     verified_moved_bytes(workspace_root, &from, &source.text).await?;
     refused_oversized(&from, source.text.len(), MOVE_OPERATION)?;
     let proposal = engine_proposal(engines, &from, &to, &source.language_segment).await?;
@@ -257,6 +258,27 @@ async fn refused_occupied_destination(
         ))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(ReadFault::storage(to.as_str(), "read", &error).into()),
+    }
+}
+
+/// Refuses a destination the workspace's `[source]` policy makes
+/// invisible. Absence from the syntax index only means no engine can
+/// update references at that path; visibility is a separate policy the
+/// destination must clear before the file lands there, checked here
+/// synchronously alongside the async occupancy check above.
+fn refused_invisible_destination(
+    reads: &ReadService,
+    workspace_root: &Path,
+    to: &CoreProjectPath,
+) -> Result<(), PlanEnd> {
+    match crate::publish::resolve_write_target(
+        reads,
+        workspace_root,
+        to,
+        crate::publish::SymlinkResolution::Resolve,
+    )? {
+        Ok(_) => Ok(()),
+        Err(refusal) => Err(PlanEnd::Refused(refusal)),
     }
 }
 
@@ -574,6 +596,61 @@ mod tests {
         assert_eq!(
             condition.expected,
             PreconditionValue::Boolean { value: false }
+        );
+    }
+
+    #[tokio::test]
+    async fn destination_excluded_by_source_policy_refuses_unsupported() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n").expect("fixture write");
+        let visibility =
+            rift_core::SourceVisibility::new(Vec::new(), vec!["excluded/**".to_owned()], true);
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &visibility,
+            &TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )
+        .expect("fixture workspace indexes");
+        let engines = EnginePool::new(directory.path(), BTreeMap::new());
+        let result = refused(
+            plan_move(
+                &reads,
+                &engines,
+                directory.path(),
+                &params("lib.rs", "excluded/moved.rs"),
+            )
+            .await
+            .expect("the refusal is typed"),
+        );
+        let ChangeResult::Refused {
+            reason,
+            diagnostics,
+            ..
+        } = result
+        else {
+            panic!("an excluded destination must refuse");
+        };
+        assert_eq!(
+            reason,
+            RefusalReason::Unsupported,
+            "a policy-excluded destination refuses as unsupported, not unmet_precondition"
+        );
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.message.contains("excluded/moved.rs")
+                    && diagnostic.message.contains("[source]")
+            }),
+            "the diagnostic must name the excluded path and the policy: {diagnostics:?}"
+        );
+        assert!(
+            !directory.path().join("excluded").exists(),
+            "a refused move must leave the tree untouched"
+        );
+        assert!(
+            directory.path().join("lib.rs").exists(),
+            "the source stays in place"
         );
     }
 

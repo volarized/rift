@@ -8,6 +8,7 @@ mod history;
 mod hook;
 mod move_file;
 mod patch;
+mod publish;
 mod read;
 mod remove;
 mod rename;

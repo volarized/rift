@@ -31,7 +31,8 @@ use crate::remove::RemovePlan;
 use crate::rename::{PlannedRewrite, RenamePlan, survivor_findings};
 use crate::rewrite::{FileRewrite, ReplacedRegion, RewriteKind};
 
-/// Most re-parse findings one applied change reports.
+/// Most findings one applied change reports: reparse findings and, for a
+/// rewrite that published through a symlink, the warning naming it.
 const CHANGE_DIAGNOSTICS_MAX: usize = 16;
 
 /// Most edits one applied change reports, mirroring the bound the
@@ -222,6 +223,14 @@ impl ChangeService {
         let path = CoreProjectPath::new(file.0.as_str()).map_err(|error| {
             ReadFault::invalid("file", rift_core::fault_label(&error.fault().violation()))
         })?;
+        if let Err(refusal) = crate::publish::resolve_write_target(
+            reads,
+            &self.root,
+            &path,
+            crate::publish::SymlinkResolution::Resolve,
+        )? {
+            return Ok(refusal);
+        }
         let absolute = self.root.join(path.as_str());
         let existing = match fs::read_to_string(&absolute) {
             Ok(content) => Some(content),
@@ -509,86 +518,24 @@ impl ChangeService {
         self.apply_rewrites(reads, &rewrites)
     }
 
-    /// Restores the files a partial publish already changed: a modified or
-    /// deleted file gets its indexed source back, and a created file is
-    /// removed. Rollback is best-effort inside the failure path: a file
-    /// whose index entry cannot serve its source stays as published, and
-    /// the storage error the caller returns names the file that stopped
-    /// the publish.
-    fn roll_back_published(&self, reads: &ReadService, published: &[&FileRewrite]) {
-        for landed in published {
-            let absolute = self.root.join(landed.path.as_str());
-            match &landed.kind {
-                RewriteKind::Create => {
-                    let _ = fs::remove_file(&absolute);
-                }
-                RewriteKind::Modify { .. } | RewriteKind::Delete => {
-                    if let Some(file) = reads.index().file(&landed.path) {
-                        let _ = fs::write(&absolute, file.source());
-                    }
-                }
-            }
-        }
-    }
-
-    /// Stages and publishes whole-file rewrites, all or none.
-    ///
-    /// Every stage lands before the first publish; a failed publish
-    /// restores every file already published, from its indexed source or,
-    /// for a file this batch created, by removing it.
+    /// Stages and publishes whole-file rewrites, all or none, through
+    /// [`crate::publish::publish_rewrites`], then builds the result: only
+    /// the filesystem transaction lives there, this keeps building the
+    /// [`ChangeResult`].
     fn apply_rewrites(
         &self,
         reads: &ReadService,
         rewrites: &[FileRewrite],
     ) -> Result<ChangeResult, ReadError> {
-        let mut staged: Vec<Option<PathBuf>> = Vec::with_capacity(rewrites.len());
-        for rewrite in rewrites {
-            if rewrite.kind.removes_file() {
-                staged.push(None);
-                continue;
-            }
-            let absolute = self.root.join(rewrite.path.as_str());
-            if matches!(rewrite.kind, RewriteKind::Create)
-                && let Some(parent) = absolute.parent()
-                && let Err(error) = fs::create_dir_all(parent)
-            {
-                discard_staged(staged.iter().flatten());
-                return Err(ReadFault::storage(
-                    rewrite.path.as_str(),
-                    "create_dir",
-                    &error,
-                ));
-            }
-            let staged_path = absolute.with_extension("rift-staged");
-            if let Err(error) = fs::write(&staged_path, &rewrite.next_source) {
-                discard_staged(staged.iter().flatten());
-                let _ = fs::remove_file(&staged_path);
-                return Err(ReadFault::storage(rewrite.path.as_str(), "stage", &error));
-            }
-            staged.push(Some(staged_path));
-        }
-        let mut published: Vec<&FileRewrite> = Vec::with_capacity(rewrites.len());
-        for (rewrite, staged_path) in rewrites.iter().zip(&staged) {
-            let absolute = self.root.join(rewrite.path.as_str());
-            let outcome = match (&rewrite.kind, staged_path) {
-                (RewriteKind::Delete, _) => fs::remove_file(&absolute),
-                (_, Some(staged_path)) => fs::rename(staged_path, &absolute),
-                (_, None) => Err(std::io::Error::other(
-                    "staged rewrite is missing its staged file",
-                )),
-            };
-            if let Err(error) = outcome {
-                self.roll_back_published(reads, &published);
-                discard_staged(staged.iter().flatten());
-                return Err(ReadFault::storage(rewrite.path.as_str(), "publish", &error));
-            }
-            published.push(rewrite);
-        }
+        let warnings = match crate::publish::publish_rewrites(reads, &self.root, rewrites)? {
+            Ok(warnings) => warnings,
+            Err(refusal) => return Ok(refusal),
+        };
         let ranged = regions_fit_the_edit_bound(rewrites);
         let mut identity = Sha256::new();
         let mut paths = Vec::with_capacity(rewrites.len());
         let mut edits = Vec::with_capacity(rewrites.len());
-        let mut diagnostics = Vec::new();
+        let mut diagnostics = warnings;
         for rewrite in rewrites {
             identity.update(rewrite.path.as_str().as_bytes());
             identity.update([0]);
@@ -604,14 +551,7 @@ impl ChangeService {
                 )),
             };
             edits.extend(rewrite_edits(rewrite, &unit, ranged));
-            if !rewrite.kind.removes_file() {
-                diagnostics.extend(reparse_diagnostics(
-                    unit,
-                    &rewrite.path,
-                    &rewrite.next_source,
-                ));
-                diagnostics.truncate(CHANGE_DIAGNOSTICS_MAX);
-            }
+            fold_and_bound_diagnostics(&mut diagnostics, rewrite, unit);
         }
         let digest = identity.finalize();
         Ok(ChangeResult::Applied {
@@ -698,7 +638,11 @@ impl ChangeService {
     /// Writes one plan atomically and reports what landed.
     ///
     /// The public operation holds the application lock from resolution
-    /// through this rename, so the disk proof cannot race another Rift write.
+    /// through this call, so the disk proof cannot race another Rift
+    /// write. Publishing goes through [`Self::apply_rewrites`] - the same
+    /// gate and staging transaction every other write path shares - so a
+    /// symlinked target publishes beside its resolved file rather than
+    /// replacing the link.
     fn apply(&self, reads: &ReadService, plan: ChangePlan) -> Result<ChangeResult, ReadError> {
         let Some(file) = reads.index().file(&plan.path) else {
             return Err(ReadFault::not_found(plan.path.as_str()));
@@ -720,37 +664,15 @@ impl ChangeService {
         next_source.push_str(&source[..start]);
         next_source.push_str(&plan.text);
         next_source.push_str(&source[end..]);
-
-        let absolute = self.root.join(plan.path.as_str());
-        let staged = absolute.with_extension("rift-staged");
-        fs::write(&staged, &next_source)
-            .map_err(|error| ReadFault::storage(plan.path.as_str(), "stage", &error))?;
-        if let Err(error) = fs::rename(&staged, &absolute) {
-            let _ = fs::remove_file(&staged);
-            return Err(ReadFault::storage(plan.path.as_str(), "publish", &error));
-        }
-        let unit = file_id(file.path());
-        let edit = Edit::Replace {
-            span: SourceSpan {
-                unit: unit.clone(),
-                range: TextRange {
-                    start: plan.range.start,
-                    end: plan.range.end,
-                },
+        let region = ReplacedRegion {
+            range: ByteRange {
+                start: plan.range.start,
+                end: plan.range.end,
             },
             text: plan.text,
         };
-        Ok(ChangeResult::Applied {
-            summary: ChangeSummary {
-                id: change_id(plan.path.as_str(), &next_source),
-                paths: vec![rift_protocol::read::ProjectPath(
-                    plan.path.as_str().to_owned(),
-                )],
-                edits: vec![edit],
-                diagnostics: reparse_diagnostics(unit, &plan.path, &next_source),
-                guarantees: Vec::new(),
-            },
-        })
+        let rewrite = FileRewrite::modify(plan.path, source, next_source, vec![region]);
+        self.apply_rewrites(reads, std::slice::from_ref(&rewrite))
     }
 }
 
@@ -815,13 +737,6 @@ fn replace_edit(unit: &FileId, start: u64, end: u64, text: String) -> Edit {
             range: TextRange { start, end },
         },
         text,
-    }
-}
-
-/// Removes every staged sidecar file, ignoring entries already gone.
-fn discard_staged<'a>(staged_paths: impl IntoIterator<Item = &'a PathBuf>) {
-    for staged in staged_paths {
-        let _ = fs::remove_file(staged);
     }
 }
 
@@ -1104,12 +1019,6 @@ fn decoded(encoded: &str) -> Option<String> {
         .map(std::borrow::Cow::into_owned)
 }
 
-/// Mints the identity of one landed change from its path and result bytes.
-fn change_id(path: &str, next_source: &str) -> ChangeId {
-    let digest = Sha256::digest(format!("{path}\u{0}{next_source}").as_bytes());
-    ChangeId(crate::read::digest_wire_hex(&digest))
-}
-
 /// Re-parses the changed file and reports parser findings, bounded.
 ///
 /// A change that breaks the syntax still lands - the tree is the caller's -
@@ -1145,6 +1054,26 @@ fn reparse_diagnostics(unit: FileId, path: &CoreProjectPath, source: &str) -> Ve
             })
             .collect(),
     }
+}
+
+/// Folds `rewrite`'s reparse diagnostics into the batch's running list,
+/// then enforces [`CHANGE_DIAGNOSTICS_MAX`]. A deletion contributes no
+/// reparse diagnostics of its own - it is never reparsed - but the bound
+/// still applies to it, so warnings carried in from earlier in the batch
+/// cannot outlive a batch made only of deletions.
+fn fold_and_bound_diagnostics(
+    diagnostics: &mut Vec<Diagnostic>,
+    rewrite: &FileRewrite,
+    unit: FileId,
+) {
+    if !rewrite.kind.removes_file() {
+        diagnostics.extend(reparse_diagnostics(
+            unit,
+            &rewrite.path,
+            &rewrite.next_source,
+        ));
+    }
+    diagnostics.truncate(CHANGE_DIAGNOSTICS_MAX);
 }
 
 /// The extension of `path`'s final segment, without its leading dot.
@@ -1196,7 +1125,8 @@ mod tests {
     };
     use rift_protocol::configuration::HistoryConfiguration;
     use rift_protocol::read::{
-        FileId, GetSymbolParams, Language, NodeId, NodesParams, ProjectPath, SymbolId,
+        Diagnostic, DiagnosticContinuation, DiagnosticReliability, Extensions, FileId,
+        GetSymbolParams, Language, NodeId, NodesParams, ProjectPath, Severity, SymbolId,
     };
     use rift_syntax::ByteRange;
 
@@ -1871,6 +1801,62 @@ mod tests {
             )
             .expect_err("a .rift-state file target must be rejected");
         assert_eq!(error.descriptor().code(), "invalid_request");
+        Ok(())
+    }
+
+    /// `insert_at_file` resolves through the write gate before reading or
+    /// writing, for both the existing-file and the `create_missing` arms.
+    #[test]
+    fn insert_symbol_file_target_refuses_into_an_excluded_directory() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let visibility = SourceVisibility::new(Vec::new(), vec!["excluded/**".to_owned()], true);
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &visibility,
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let changes = ChangeService::new(directory.path());
+        for create_missing in [false, true] {
+            let result = changes.insert_symbol(
+                &reads,
+                &InsertSymbolParams {
+                    anchor: None,
+                    file: Some(ProjectPath("excluded/notes.rs".to_owned())),
+                    position: InsertPosition::After,
+                    body: "pub fn late() {}".to_owned(),
+                    create_missing,
+                },
+            )?;
+            let ChangeResult::Refused {
+                reason,
+                diagnostics,
+                ..
+            } = result
+            else {
+                panic!("an excluded destination must refuse, create_missing={create_missing}");
+            };
+            assert_eq!(
+                reason,
+                RefusalReason::Unsupported,
+                "a policy-excluded target refuses as unsupported, not unmet_precondition \
+                 (create_missing={create_missing})"
+            );
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.message.contains("excluded/notes.rs")
+                        && diagnostic.message.contains("[source]")
+                }),
+                "the diagnostic must name the excluded path and the policy \
+                 (create_missing={create_missing}): {diagnostics:?}"
+            );
+        }
+        assert!(
+            !directory.path().join("excluded").exists(),
+            "a refused insert must leave the tree untouched"
+        );
         Ok(())
     }
 
@@ -2836,6 +2822,40 @@ mod tests {
         Ok(())
     }
 
+    /// Staging used to land at `absolute.with_extension("rift-staged")`,
+    /// so a workspace file already named `notes.rift-staged` sat exactly
+    /// where a change to `notes.rs` staged its own next content. The
+    /// exclusive tempfile staging never touches a real workspace path
+    /// until publish, so this file survives untouched.
+    #[test]
+    fn change_to_a_file_does_not_touch_a_workspace_file_literally_named_rift_staged() -> TestResult
+    {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("notes.rs"), "pub fn beacon() {}\n")?;
+        fs::write(directory.path().join("notes.rift-staged"), "sentinel\n")?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let changes = ChangeService::new(directory.path());
+        let patch = "--- a/notes.rs\n+++ b/notes.rs\n@@ -1 +1 @@\n-pub fn beacon() {}\n+pub fn renamed() {}\n"
+            .to_owned();
+        applied_summary(changes.patch(&reads, &PatchParams { patch })?);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("notes.rs"))?,
+            "pub fn renamed() {}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("notes.rift-staged"))?,
+            "sentinel\n",
+            "a workspace file literally named notes.rift-staged must be untouched"
+        );
+        Ok(())
+    }
+
     #[test]
     fn insert_symbol_file_target_before_reports_a_zero_width_edit_at_the_start() -> TestResult {
         let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
@@ -2965,6 +2985,47 @@ mod tests {
             "{} regions must exceed the edit bound of {}",
             super::CHANGE_EDITS_MAX + 1,
             super::CHANGE_EDITS_MAX
+        );
+        Ok(())
+    }
+
+    fn warning(message: &str) -> Diagnostic {
+        Diagnostic {
+            severity: Severity::Warning,
+            code: None,
+            message: message.to_owned(),
+            span: None,
+            related: Vec::new(),
+            tags: Vec::new(),
+            reliability: DiagnosticReliability::Reliable,
+            continuation: DiagnosticContinuation::Unknown,
+            extensions: Extensions(std::collections::BTreeMap::new()),
+            language: None,
+        }
+    }
+
+    /// A deletion contributes no reparse diagnostics of its own, but the
+    /// bound must still apply to it: warnings carried in from earlier in
+    /// the batch - here simulated directly, since a delete no longer
+    /// resolves through a symlink and so cannot generate them itself -
+    /// must not outlive a batch made only of deletions.
+    #[test]
+    fn test_fold_and_bound_diagnostics_bounds_a_deletions_carried_over_warnings() -> TestResult {
+        let mut diagnostics: Vec<Diagnostic> = (0..super::CHANGE_DIAGNOSTICS_MAX + 4)
+            .map(|index| warning(&format!("carried warning {index}")))
+            .collect();
+        let rewrite = FileRewrite::delete(CoreProjectPath::new("gone.rs")?, "");
+        let unit = FileId("rift://file/gone.rs".to_owned());
+        super::fold_and_bound_diagnostics(&mut diagnostics, &rewrite, unit);
+        assert_eq!(
+            diagnostics.len(),
+            super::CHANGE_DIAGNOSTICS_MAX,
+            "a deletion contributes nothing of its own, but the bound still applies to it"
+        );
+        assert_eq!(diagnostics[0].message, "carried warning 0");
+        assert_eq!(
+            diagnostics[super::CHANGE_DIAGNOSTICS_MAX - 1].message,
+            format!("carried warning {}", super::CHANGE_DIAGNOSTICS_MAX - 1)
         );
         Ok(())
     }

@@ -245,7 +245,7 @@ pub(crate) fn resolve_segment(
     match resolve_patch_target(&parsed)? {
         Err(refusal) => Ok(Err(refusal)),
         Ok(PatchTarget::Modify(path)) => resolve_modify(root, reads, &path, &parsed),
-        Ok(PatchTarget::Create(path)) => resolve_create(root, &path, &parsed),
+        Ok(PatchTarget::Create(path)) => resolve_create(root, reads, &path, &parsed),
         Ok(PatchTarget::Delete(path)) => resolve_delete(root, reads, &path, &parsed),
     }
 }
@@ -407,7 +407,7 @@ fn visible_source(
         .source_policy()
         .is_some_and(|policy| policy.visible(absolute));
     if !visible {
-        return Ok(Err(not_visible_refusal(path)));
+        return Ok(Err(crate::publish::not_visible_refusal(path)));
     }
     match fs::read_to_string(absolute) {
         Ok(disk) => Ok(Ok(disk)),
@@ -436,24 +436,27 @@ fn resolve_base_image(
     }
 }
 
-/// Refuses a target the `[source]` policy makes invisible: excluded by
-/// `[source].exclude`, `.gitignore`, or the hard floor. The file is there; the
-/// workspace asked for it not to be.
-fn not_visible_refusal(path: &CoreProjectPath) -> ChangeResult {
-    crate::rename::unsupported_refusal(format!(
-        "{} is outside the workspace's [source] visibility policy",
-        path.as_str()
-    ))
-}
-
 /// Resolves a segment that creates a new file. The starting image is
 /// empty, so a hunk carrying context or deleted lines cannot locate a
 /// position and refuses exactly as a genuine mismatch would.
+///
+/// Resolves the target through the write gate first: a create into a
+/// path the `[source]` policy excludes refuses the same way a modify
+/// already does, rather than reaching the filesystem at all.
 fn resolve_create(
     root: &Path,
+    reads: &ReadService,
     path: &CoreProjectPath,
     parsed: &Patch<'_, str>,
 ) -> Result<Result<FileRewrite, ChangeResult>, ReadError> {
+    if let Err(refusal) = crate::publish::resolve_write_target(
+        reads,
+        root,
+        path,
+        crate::publish::SymlinkResolution::Resolve,
+    )? {
+        return Ok(Err(refusal));
+    }
     match root.join(path.as_str()).try_exists() {
         Ok(true) => return Ok(Err(already_exists_refusal(path))),
         Ok(false) => {}
@@ -1914,6 +1917,192 @@ mod tests {
             fs::read_to_string(directory.path().join("justfile"))?,
             "default:\n    echo hello\n",
             "an excluded target is untouched"
+        );
+        Ok(())
+    }
+
+    /// `resolve_create` consults the same `[source]` policy a modify already
+    /// does, rather than reaching the filesystem unconditionally.
+    #[test]
+    fn patch_create_into_an_excluded_directory_refuses_unsupported() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let visibility = SourceVisibility::new(Vec::new(), vec!["excluded/**".to_owned()], true);
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &visibility,
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let changes = ChangeService::new(directory.path());
+        let patch =
+            "--- /dev/null\n+++ b/excluded/new.rs\n@@ -0,0 +1 @@\n+pub fn fresh() {}\n".to_owned();
+        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let ChangeResult::Refused {
+            reason,
+            diagnostics,
+            ..
+        } = result
+        else {
+            panic!("a create into an excluded directory must refuse");
+        };
+        assert_eq!(
+            reason,
+            RefusalReason::Unsupported,
+            "a policy-excluded create refuses as unsupported, not unmet_precondition"
+        );
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.message.contains("excluded/new.rs")
+                    && diagnostic.message.contains("[source]")
+            }),
+            "the diagnostic must name the excluded path and the policy: {diagnostics:?}"
+        );
+        assert!(
+            !directory.path().join("excluded").exists(),
+            "a refused create must leave the tree untouched"
+        );
+        Ok(())
+    }
+
+    /// `report.rs` and `report.log` share a stem: staging both through
+    /// `Path::with_extension` used to collide on one `report.rift-staged`
+    /// path, so the second write silently destroyed the first file's
+    /// bytes. The exclusive tempfile staging closes this.
+    #[test]
+    fn patch_applies_two_files_sharing_a_stem_without_collision() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let changes = ChangeService::new(directory.path());
+        let patch = [
+            "--- /dev/null",
+            "+++ b/report.rs",
+            "@@ -0,0 +1 @@",
+            "+pub fn one() {}",
+            "--- /dev/null",
+            "+++ b/report.log",
+            "@@ -0,0 +1 @@",
+            "+report line",
+            "",
+        ]
+        .join("\n");
+        let summary = applied_summary(changes.patch(&reads, &PatchParams { patch })?);
+        assert_eq!(summary.paths.len(), 2);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("report.rs"))?,
+            "pub fn one() {}\n",
+            "report.rs must hold its own content, not report.log's"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("report.log"))?,
+            "report line\n",
+            "report.log must hold its own content, not report.rs's"
+        );
+        Ok(())
+    }
+
+    /// A patch through an in-workspace symlink leaves the link a link and
+    /// writes through to its resolved target, with the result naming both
+    /// paths.
+    #[cfg(unix)]
+    #[test]
+    fn patch_through_an_in_workspace_symlink_updates_the_resolved_target_and_warns() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("real.rs"), "pub fn beacon() {}\n")?;
+        std::os::unix::fs::symlink("real.rs", directory.path().join("link.rs"))?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let changes = ChangeService::new(directory.path());
+        let patch =
+            "--- a/link.rs\n+++ b/link.rs\n@@ -1 +1 @@\n-pub fn beacon() {}\n+pub fn renamed() {}\n"
+                .to_owned();
+        let summary = applied_summary(changes.patch(&reads, &PatchParams { patch })?);
+        assert_eq!(summary.paths, vec![ProjectPath("link.rs".to_owned())]);
+        assert!(
+            fs::symlink_metadata(directory.path().join("link.rs"))?
+                .file_type()
+                .is_symlink(),
+            "the link itself must remain a symlink"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("real.rs"))?,
+            "pub fn renamed() {}\n",
+            "the resolved target's bytes must update"
+        );
+        assert!(
+            summary
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("link.rs")
+                    && diagnostic.message.contains("real.rs")),
+            "the result must carry a warning naming both paths: {:?}",
+            summary.diagnostics
+        );
+        Ok(())
+    }
+
+    /// A symlink whose target lies outside the workspace refuses before
+    /// staging, naming the link, and leaves both the link and the outside
+    /// file untouched.
+    #[cfg(unix)]
+    #[test]
+    fn patch_through_a_symlink_outside_the_workspace_refuses_and_leaves_both_untouched()
+    -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        fs::write(outside.path().join("secret.rs"), "pub fn secret() {}\n")?;
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.rs"),
+            directory.path().join("link.rs"),
+        )?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let changes = ChangeService::new(directory.path());
+        let patch =
+            "--- a/link.rs\n+++ b/link.rs\n@@ -1 +1 @@\n-pub fn secret() {}\n+pub fn exposed() {}\n"
+                .to_owned();
+        let result = changes.patch(&reads, &PatchParams { patch })?;
+        let ChangeResult::Refused {
+            reason,
+            diagnostics,
+            ..
+        } = result
+        else {
+            panic!("a symlink resolving outside the workspace must refuse");
+        };
+        assert_eq!(reason, RefusalReason::Unsupported);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("link.rs")),
+            "{diagnostics:?}"
+        );
+        assert!(
+            fs::symlink_metadata(directory.path().join("link.rs"))?
+                .file_type()
+                .is_symlink(),
+            "the link itself must remain untouched"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.path().join("secret.rs"))?,
+            "pub fn secret() {}\n",
+            "the outside file must remain untouched"
         );
         Ok(())
     }
