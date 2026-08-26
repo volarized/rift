@@ -11,7 +11,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault};
+use rift_core::{CapturedStream, CliCode, Error, ErrorCode, ErrorContext, ErrorName, Fault};
+use rift_protocol::error as wire;
 use rift_protocol::lock::ServerLock;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
@@ -26,9 +27,11 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use rmcp::{ErrorData, ServerHandler, ServiceError, ServiceExt as _};
 
 use crate::election::{ServerPresence, probe};
+use crate::failure::WireFailure as _;
 use crate::http::MCP_PATH;
 use crate::spawn::{
-    PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, spawn_detached_server,
+    PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, StartupCapture,
+    spawn_detached_server_with_captured_stderr,
 };
 
 /// Bound on one upstream connect-and-initialize attempt.
@@ -95,7 +98,7 @@ pub async fn serve_proxy(root: &Path) -> Result<(), ProxyServeError> {
     tracing::info!(component = "mcp", transport = "stdio", "MCP proxy starting");
     let proxy = RiftProxy::new(root);
     let warmup = tokio::spawn(warm_up(proxy.clone()));
-    let outcome = serve_connection(proxy, rmcp::transport::stdio()).await;
+    let outcome = serve_connection(proxy, crate::transport::guarded_stdio()).await;
     warmup.abort();
     outcome
 }
@@ -317,13 +320,16 @@ fn reuse_current(current_generation: u64, observed: Option<u64>) -> bool {
 /// Connects to the workspace's serving server, electing one when needed.
 ///
 /// One adoption attempt against the recorded server first; a workspace
-/// without a live server gets one detached spawn, then a poll of at most
-/// [`START_POLL_ATTEMPT_COUNT`] probes at [`PRESENCE_POLL_INTERVAL`], each
-/// adoption bounded by [`UPSTREAM_CONNECT_TIMEOUT`]. The poll also stops
-/// at the [`START_WAIT_MAX`] deadline, so slow connect attempts shorten
-/// the attempt count instead of stretching the window. Connect failures
-/// inside the window keep polling; exhaustion refuses with the operator's
-/// next step.
+/// without a live server gets one detached spawn, its startup stderr
+/// captured, then a poll of at most [`START_POLL_ATTEMPT_COUNT`] probes at
+/// [`PRESENCE_POLL_INTERVAL`], each adoption bounded by
+/// [`UPSTREAM_CONNECT_TIMEOUT`]. The poll also stops at the
+/// [`START_WAIT_MAX`] deadline, so slow connect attempts shorten the
+/// attempt count instead of stretching the window. Connect failures inside
+/// the window keep polling; a spawned server that exits before the window
+/// closes refuses with its captured stderr, unless it lost the
+/// concurrent-start election - that case keeps polling for the winner, who
+/// may still be binding; exhaustion refuses with the operator's next step.
 ///
 /// # Cancel safety
 ///
@@ -333,16 +339,24 @@ async fn connect_upstream(root: &Path) -> Result<RunningService<RoleClient, ()>,
     if let Some(running) = adopt_serving(root).await {
         return Ok(running);
     }
-    // A lost spawn race is fine - another process started the server and
-    // the poll below adopts it. A spawn that cannot launch is reported, and
-    // the poll still gives a concurrently started server its chance.
-    if let Err(error) = spawn_detached_server(root) {
-        tracing::warn!(component = "mcp", %error, "detached server spawn failed");
-    }
+    // A lost spawn race is fine - this process's own spawned server finds
+    // the workspace already served, exits on its own, and the poll below
+    // adopts the winner once it finishes binding. A spawn that cannot
+    // launch at all is reported, and the poll still gives a concurrently
+    // started server its chance.
+    let mut startup = match spawn_detached_server_with_captured_stderr(root) {
+        Ok(startup) => Some(startup),
+        Err(error) => {
+            tracing::warn!(component = "mcp", %error, "detached server spawn failed");
+            None
+        }
+    };
     let deadline = tokio::time::Instant::now() + START_WAIT_MAX;
     for _ in 0..START_POLL_ATTEMPT_COUNT {
-        if let Some(running) = adopt_serving(root).await {
-            return Ok(running);
+        match spawn_poll_outcome(adopt_serving(root).await, &mut startup) {
+            SpawnPollOutcome::Ready(running) => return Ok(running),
+            SpawnPollOutcome::Failed(refusal) => return Err(refusal),
+            SpawnPollOutcome::Waiting => {}
         }
         if tokio::time::Instant::now() >= deadline {
             break;
@@ -350,6 +364,120 @@ async fn connect_upstream(root: &Path) -> Result<RunningService<RoleClient, ()>,
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
     }
     Err(upstream_unavailable())
+}
+
+/// One poll iteration's outcome against a possibly still-spawning server.
+enum SpawnPollOutcome<Adopted> {
+    /// The workspace's server answered; `startup`'s capture is never
+    /// consulted, so the daemon's stderr keeps draining on its own.
+    Ready(Adopted),
+    /// The spawned server exited before it started serving, for a reason
+    /// adoption cannot resolve.
+    Failed(ErrorData),
+    /// Neither has happened yet, or the spawned server exited only because
+    /// it lost the concurrent-start election - the winner may still be
+    /// binding, and the next adoption attempt can still find it.
+    Waiting,
+}
+
+/// Classifies one poll iteration: an adopted connection wins outright;
+/// otherwise a `startup` capture that has finished and names a lost
+/// concurrent-start election keeps the caller waiting for the winner;
+/// otherwise a finished capture names why the spawn failed; otherwise the
+/// caller keeps waiting.
+///
+/// Split from [`connect_upstream`] so the ordering - success checked
+/// before the spawned server's exit - is testable without a real process
+/// or a real upstream connection.
+fn spawn_poll_outcome<Adopted>(
+    adopted: Option<Adopted>,
+    startup: &mut Option<StartupCapture>,
+) -> SpawnPollOutcome<Adopted> {
+    if let Some(running) = adopted {
+        return SpawnPollOutcome::Ready(running);
+    }
+    match startup.as_mut().and_then(StartupCapture::exited) {
+        Some(capture) if lost_start_election(&capture) => SpawnPollOutcome::Waiting,
+        Some(capture) => SpawnPollOutcome::Failed(server_start_failed(&capture)),
+        None => SpawnPollOutcome::Waiting,
+    }
+}
+
+/// Whether a spawned server's captured stderr names the benign
+/// concurrent-start election loss: this process's own spawn found the
+/// workspace already served and exited on its own, printing the same
+/// `server_already_serving` refusal an operator sees from `rift server
+/// start --foreground`. The marker is built from the CLI registry so the
+/// match cannot drift from the code the binary actually prints.
+fn lost_start_election(capture: &CapturedStream) -> bool {
+    let marker = format!(
+        "error[{code}]",
+        code = ErrorName::Cli(CliCode::ServerAlreadyServing).code()
+    );
+    capture.text.contains(&marker)
+}
+
+/// The refusal a request gets when the spawned server exited before it
+/// published a live connection.
+///
+/// Names what the server printed to its own standard error. The caller
+/// has no shell channel of its own, so it learns what actually failed
+/// instead of being pointed at a command it cannot run.
+fn server_start_failed(capture: &CapturedStream) -> ErrorData {
+    let fault = if capture.text.is_empty() {
+        SpawnFault::NoOutput
+    } else {
+        SpawnFault::CapturedStderr {
+            text: capture.text.clone(),
+            truncated: capture.truncated,
+        }
+    };
+    Error::new(fault).tool_error(wire::ErrorPhase::Read)
+}
+
+/// Why a detached server spawn failed to start serving.
+#[derive(Debug)]
+enum SpawnFault {
+    /// The spawned server exited before publishing its lock document, and
+    /// wrote nothing to its own standard error.
+    NoOutput,
+    /// The spawned server exited before publishing its lock document; its
+    /// captured standard error names what happened.
+    CapturedStderr {
+        /// The captured prefix.
+        text: String,
+        /// Whether the capture stopped short of the full stream.
+        truncated: bool,
+    },
+}
+
+impl Fault for SpawnFault {
+    fn name(&self) -> ErrorName {
+        ErrorName::Wire(ErrorCode::TemporarilyUnavailable)
+    }
+
+    fn context(&self) -> Vec<ErrorContext> {
+        match self {
+            Self::NoOutput => vec![ErrorContext::new(
+                "detail",
+                "the spawned server exited before it started serving, with no output on its \
+                 standard error",
+            )],
+            Self::CapturedStderr { text, truncated } => {
+                let mut context = vec![
+                    ErrorContext::new(
+                        "detail",
+                        "the spawned server exited before it started serving",
+                    ),
+                    ErrorContext::new("stderr", text.clone()),
+                ];
+                if *truncated {
+                    context.push(ErrorContext::new("stderr_truncated", "true"));
+                }
+                context
+            }
+        }
+    }
 }
 
 /// The recorded serving server as a live connection, when both halves hold.
@@ -460,8 +588,9 @@ fn transport_failed(error: &ServiceError) -> bool {
 fn upstream_unavailable() -> ErrorData {
     ErrorData::internal_error(
         format!(
-            "no rift server answered for this workspace within {START_WAIT_MAX:?}; \
-             run `rift server start --foreground` to see the server's diagnostics"
+            "no rift server answered for this workspace within {START_WAIT_MAX:?}; the \
+             workspace has no server this caller can reach, and starting one is an \
+             operator action on this host"
         ),
         None,
     )
@@ -560,12 +689,13 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ConnectAttemptFailure, ProxyFault, RiftProxy, Upstream, adopt_serving, connect_recorded,
-        fallback_info, forwarded_error, mirrored_info, quit_reason_result, reuse_current,
-        serve_connection, transport_failed, upstream_unavailable, version_mismatch,
+        ConnectAttemptFailure, ProxyFault, RiftProxy, SpawnPollOutcome, StartupCapture, Upstream,
+        adopt_serving, connect_recorded, fallback_info, forwarded_error, lost_start_election,
+        mirrored_info, quit_reason_result, reuse_current, serve_connection, server_start_failed,
+        spawn_poll_outcome, transport_failed, upstream_unavailable, version_mismatch,
     };
     use crate::election::claim;
-    use rift_core::Error;
+    use rift_core::{CapturedStream, Error};
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -687,13 +817,209 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_refusal_names_the_window_and_the_next_step() {
+    fn unavailable_refusal_names_the_window_without_a_shell_command_the_caller_cannot_run() {
         let refusal = upstream_unavailable();
         assert_eq!(refusal.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
         assert!(refusal.message.contains("15s"), "{}", refusal.message);
         assert!(
-            refusal.message.contains("rift server start --foreground"),
+            refusal.message.contains("operator action"),
             "{}",
+            refusal.message
+        );
+        assert!(
+            !refusal.message.contains('`'),
+            "the caller has no shell to run a command in: {}",
+            refusal.message
+        );
+    }
+
+    /// A test double whose reads block on a channel, so a test controls
+    /// exactly when the simulated pipe closes. A sent message larger than
+    /// one read buffer is retained across calls, the same way a real
+    /// pipe's bytes are.
+    struct BlockingChannelStream {
+        receiver: std::sync::mpsc::Receiver<Vec<u8>>,
+        pending: Vec<u8>,
+    }
+
+    impl BlockingChannelStream {
+        fn new(receiver: std::sync::mpsc::Receiver<Vec<u8>>) -> Self {
+            Self {
+                receiver,
+                pending: Vec::new(),
+            }
+        }
+    }
+
+    impl std::io::Read for BlockingChannelStream {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.pending.is_empty() {
+                match self.receiver.recv() {
+                    Ok(bytes) => self.pending = bytes,
+                    Err(_closed) => return Ok(0),
+                }
+            }
+            let taken = self.pending.len().min(buffer.len());
+            buffer[..taken].copy_from_slice(&self.pending[..taken]);
+            self.pending.drain(..taken);
+            Ok(taken)
+        }
+    }
+
+    /// Polls `startup` until its capture is taken, bounded so a defect in
+    /// the background drain fails the test instead of hanging it.
+    fn wait_for_exit(startup: &mut StartupCapture) -> CapturedStream {
+        for _ in 0..1_000 {
+            if let Some(captured) = startup.exited() {
+                return captured;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the background drain must finish once the stream closes");
+    }
+
+    #[test]
+    fn spawn_poll_outcome_prefers_adoption_over_a_finished_capture() {
+        let (sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
+        let mut startup = Some(StartupCapture::spawn(BlockingChannelStream::new(receiver)));
+        drop(sender);
+        // The capture has finished (the stream closed), and adoption also
+        // succeeded on this same iteration: adoption must win, and the
+        // capture must never be consulted.
+        let _ = wait_for_exit(startup.as_mut().expect("capture must still be present"));
+        let outcome = spawn_poll_outcome(Some(7_u32), &mut startup);
+        assert!(
+            matches!(outcome, SpawnPollOutcome::Ready(7)),
+            "adoption must win over a finished capture"
+        );
+    }
+
+    #[test]
+    fn spawn_poll_outcome_waits_while_the_capture_is_still_open() {
+        let (_sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
+        let mut startup = Some(StartupCapture::spawn(BlockingChannelStream::new(receiver)));
+        let outcome = spawn_poll_outcome::<u32>(None, &mut startup);
+        assert!(matches!(outcome, SpawnPollOutcome::Waiting));
+    }
+
+    #[test]
+    fn spawn_poll_outcome_fails_once_the_spawned_server_exited() {
+        let (sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
+        let mut startup = Some(StartupCapture::spawn(BlockingChannelStream::new(receiver)));
+        sender
+            .send(b"listener bind failed: address in use".to_vec())
+            .expect("receiver still open");
+        drop(sender);
+        let outcome = loop {
+            let outcome = spawn_poll_outcome::<u32>(None, &mut startup);
+            if !matches!(outcome, SpawnPollOutcome::Waiting) {
+                break outcome;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let SpawnPollOutcome::Failed(refusal) = outcome else {
+            panic!("an exited spawn must fail the poll");
+        };
+        assert!(
+            refusal.message.contains("listener bind failed"),
+            "{}",
+            refusal.message
+        );
+    }
+
+    /// Before the fix, any captured exit - including a lost election -
+    /// failed the poll outright. Runs the poll repeatedly across the
+    /// capture's background drain finishing, and asserts the outcome never
+    /// becomes `Failed`: the proxy keeps waiting for the winner instead of
+    /// hard-refusing while it is still binding.
+    #[test]
+    fn spawn_poll_outcome_keeps_waiting_when_the_spawned_server_lost_the_election() {
+        let (sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
+        let mut startup = Some(StartupCapture::spawn(BlockingChannelStream::new(receiver)));
+        sender
+            .send(
+                b"rift: error[server_already_serving]: another rift server already serves \
+                  this workspace; connect to the listed server, or run `rift server stop` \
+                  before serving again"
+                    .to_vec(),
+            )
+            .expect("receiver still open");
+        drop(sender);
+        for _ in 0..200 {
+            let outcome = spawn_poll_outcome::<u32>(None, &mut startup);
+            assert!(
+                matches!(outcome, SpawnPollOutcome::Waiting),
+                "a spawned server that lost the concurrent-start election must keep the poll \
+                 waiting for the winner, not fail it"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn lost_start_election_recognizes_the_server_already_serving_marker() {
+        let capture = CapturedStream {
+            text: "rift: error[server_already_serving]: another rift server already serves \
+                   this workspace; connect to the listed server, or run `rift server stop` \
+                   before serving again"
+                .to_owned(),
+            captured_bytes: 0,
+            total_bytes: 0,
+            truncated: false,
+        };
+        assert!(lost_start_election(&capture));
+    }
+
+    #[test]
+    fn lost_start_election_rejects_an_unrelated_startup_failure() {
+        let capture = CapturedStream {
+            text: "listener bind failed: address in use".to_owned(),
+            captured_bytes: 0,
+            total_bytes: 0,
+            truncated: false,
+        };
+        assert!(!lost_start_election(&capture));
+    }
+
+    #[test]
+    fn server_start_failed_names_no_output_when_stderr_was_empty() {
+        let refusal = server_start_failed(&CapturedStream::default());
+        assert!(refusal.message.contains("no output"), "{}", refusal.message);
+    }
+
+    #[test]
+    fn server_start_failed_carries_the_captured_stderr_text() {
+        let capture = CapturedStream {
+            text: "panicked at src/main.rs:1".to_owned(),
+            captured_bytes: 26,
+            total_bytes: 26,
+            truncated: false,
+        };
+        let refusal = server_start_failed(&capture);
+        assert!(
+            refusal.message.contains("panicked at src/main.rs:1"),
+            "{}",
+            refusal.message
+        );
+        assert!(
+            !refusal.message.contains('`'),
+            "the caller has no shell to run a command in: {}",
+            refusal.message
+        );
+    }
+
+    #[test]
+    fn server_start_failed_names_truncation_when_the_capture_was_cut_short() {
+        let capture = CapturedStream {
+            text: "panicked at src/main.rs:1".to_owned(),
+            captured_bytes: 26,
+            total_bytes: 9_000,
+            truncated: true,
+        };
+        let refusal = server_start_failed(&capture);
+        assert!(
+            refusal.message.contains("stderr_truncated true"),
+            "a truncated capture must say so: {}",
             refusal.message
         );
     }

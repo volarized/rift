@@ -13,7 +13,7 @@ use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rift_mcp::{PRESENCE_POLL_INTERVAL, ServerPresence, claim, probe};
 use rift_protocol::lock::{
@@ -293,6 +293,17 @@ fn refusing_port_in_range() -> TestResult<u16> {
     Err("no free port in the serving range".into())
 }
 
+/// A loopback port inside the serving range, bound and held open so a
+/// server pinned to it exactly fails to bind.
+fn held_port_in_range() -> TestResult<TcpListener> {
+    for port in SERVER_PORT_MIN..=SERVER_PORT_MAX {
+        if let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+            return Ok(listener);
+        }
+    }
+    Err("no free port in the serving range".into())
+}
+
 #[tokio::test]
 async fn cold_start_elects_a_server_that_survives_the_proxy() -> TestResult {
     let _serial = SERIAL.lock().await;
@@ -443,8 +454,11 @@ async fn stale_lock_document_yields_a_fresh_election() -> TestResult {
 /// The refusal an agent sees when the workspace cannot produce a server.
 ///
 /// The test holds the election itself and records a server that refuses
-/// connections, so the proxy's adoption, spawn, and poll all fail. The
-/// warmup and the request each wait out one full start window, so this
+/// connections, so adoption always fails and every spawn this proxy makes
+/// finds the election already held, losing it the same way a concurrent
+/// spawn race's loser does. A lost election keeps the poll waiting for a
+/// winner that, here, never comes, so the warmup and the request each wait
+/// out one full start window before the generic timeout refusal - this
 /// test deliberately spends about two windows of wall clock.
 #[tokio::test]
 async fn held_election_without_a_server_refuses_with_operator_guidance() -> TestResult {
@@ -483,13 +497,18 @@ async fn held_election_without_a_server_refuses_with_operator_guidance() -> Test
         panic!("expected a protocol-level refusal, got {refusal:?}");
     };
     assert!(
-        data.message.contains("no rift server answered"),
-        "{}",
+        data.message.contains("15s"),
+        "the refusal must name the window the caller waited out: {}",
         data.message
     );
     assert!(
-        data.message.contains("rift server start --foreground"),
-        "{}",
+        data.message.contains("operator action"),
+        "the refusal must name an action the operator can take: {}",
+        data.message
+    );
+    assert!(
+        !data.message.contains('`'),
+        "the caller has no shell to run a command in: {}",
         data.message
     );
 
@@ -504,6 +523,67 @@ async fn held_election_without_a_server_refuses_with_operator_guidance() -> Test
         "{stderr}"
     );
     drop(guard);
+    Ok(())
+}
+
+/// The refusal an agent sees when the workspace's own spawned server
+/// exists but cannot bind its configured port: the detached spawn
+/// succeeds, the child prints its own startup failure to stderr and exits
+/// before publishing a lock document, and the proxy answers with that
+/// captured stderr instead of waiting out the poll's own window.
+///
+/// The pinned port stays held for the whole test, so both the warmup
+/// task's own spawn attempt and the request's each fail the same way; the
+/// elapsed-time bound proves the refusal came from the captured exit, not
+/// from exhausting `START_WAIT_MAX`.
+#[tokio::test]
+async fn a_spawned_server_that_cannot_bind_its_port_refuses_with_its_captured_stderr() -> TestResult
+{
+    let _serial = SERIAL.lock().await;
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    fs::write(root.join("lib.rs"), LIBRARY)?;
+    let held = held_port_in_range()?;
+    let port = held.local_addr()?.port();
+    fs::write(
+        root.join("rift.toml"),
+        format!("{SEMANTIC_DISABLED}[server]\nport = {port}\nidle_timeout = \"60s\"\n"),
+    )?;
+    let _cleanup = StopOnDrop::new(root);
+
+    let client = proxy_client(root).await?;
+    let started = Instant::now();
+    let refusal = within(
+        "the refusal from a server that could not bind its port",
+        client.call_tool(
+            CallToolRequestParams::new("get_symbol")
+                .with_arguments(arguments(&json!({"name": "beacon"}))?),
+        ),
+    )
+    .await?
+    .expect_err("a spawned server that cannot bind its port must refuse the call");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "a bind failure must refuse near-immediately, not after the poll's own window: {:?}",
+        started.elapsed()
+    );
+    let rmcp::ServiceError::McpError(data) = refusal else {
+        panic!("expected a protocol-level refusal, got {refusal:?}");
+    };
+    assert!(
+        data.message
+            .contains("every loopback port in the serving range is bound"),
+        "the refusal must carry the spawned server's own captured stderr: {}",
+        data.message
+    );
+    assert!(
+        !data.message.contains("server_already_serving"),
+        "a genuine bind failure must not be mistaken for a lost election: {}",
+        data.message
+    );
+
+    client.cancel().await?;
+    drop(held);
     Ok(())
 }
 

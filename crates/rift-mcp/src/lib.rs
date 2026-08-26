@@ -7,6 +7,7 @@ mod proxy;
 pub mod schema;
 mod server;
 mod spawn;
+mod transport;
 mod validation;
 
 pub use election::{
