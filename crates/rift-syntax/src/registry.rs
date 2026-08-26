@@ -14,6 +14,7 @@ use crate::json::JsonSyntaxProvider;
 use crate::markdown::MarkdownSyntaxProvider;
 use crate::provider::SyntaxProvider;
 use crate::rust::RustSyntaxProvider;
+use crate::toml::TomlSyntaxProvider;
 use crate::typescript::TypeScriptDialect;
 use crate::yaml::YamlSyntaxProvider;
 
@@ -27,6 +28,7 @@ fn build_registry() -> Vec<Box<dyn SyntaxProvider>> {
         Box::new(MarkdownSyntaxProvider::default()),
         Box::new(JsonSyntaxProvider::default()),
         Box::new(YamlSyntaxProvider::default()),
+        Box::new(TomlSyntaxProvider::default()),
     ]
 }
 
@@ -157,7 +159,9 @@ mod tests {
     fn test_source_file_extensions_union_lists_every_declared_extension() {
         assert_eq!(
             source_file_extensions(),
-            ["rs", "js", "jsx", "ts", "tsx", "md", "json", "yaml", "yml"]
+            [
+                "rs", "js", "jsx", "ts", "tsx", "md", "json", "yaml", "yml", "toml"
+            ]
         );
     }
 
@@ -203,6 +207,19 @@ mod tests {
         };
         let by_language = provider_for_language(&language).expect("the YAML provider serves yaml");
         assert_eq!(by_language.extensions(), ["yaml", "yml"]);
+    }
+
+    #[test]
+    fn test_provider_for_extension_serves_toml() {
+        let provider = provider_for_extension("toml").expect("the TOML provider claims toml");
+        assert_eq!(provider.language().name, "toml");
+        assert_eq!(provider.language().dialect, None);
+        let language = Language {
+            name: "toml".to_owned(),
+            dialect: None,
+        };
+        let by_language = provider_for_language(&language).expect("the TOML provider serves toml");
+        assert_eq!(by_language.extensions(), ["toml"]);
     }
 
     #[test]

@@ -71,6 +71,20 @@ const YAML_KINDS: &[&str] = &[
 /// Grammar fields the YAML rules read from the pinned grammar.
 const YAML_FIELDS: &[&str] = &["key", "value"];
 
+/// Node kinds the TOML rules read from the pinned grammar, restated here so
+/// a grammar bump that renames one fails this suite before it fails
+/// extraction. The pinned grammar declares no fields at all, so there is no
+/// matching `TOML_FIELDS` constant.
+const TOML_KINDS: &[&str] = &[
+    "pair",
+    "table",
+    "table_array_element",
+    "bare_key",
+    "quoted_key",
+    "dotted_key",
+    "comment",
+];
+
 fn rust_language() -> Language {
     tree_sitter_rust::LANGUAGE.into()
 }
@@ -97,6 +111,10 @@ fn json_language() -> Language {
 
 fn yaml_language() -> Language {
     tree_sitter_yaml::LANGUAGE.into()
+}
+
+fn toml_language() -> Language {
+    tree_sitter_toml_ng::LANGUAGE.into()
 }
 
 fn assert_abi_in_runtime_window(name: &str, language: &Language) {
@@ -360,6 +378,40 @@ fn test_yaml_grammar_parses_valid_and_malformed_fixtures() {
     assert!(
         malformed_tree.root_node().has_error(),
         "an unclosed flow sequence must report an error"
+    );
+}
+
+#[test]
+fn test_toml_grammar_uses_supported_abi() {
+    assert_abi_in_runtime_window("TOML", &toml_language());
+}
+
+/// The pinned TOML grammar declares no fields at all - only kind ids are
+/// asserted here, and the field count is pinned to `0` so a grammar bump
+/// that starts declaring fields is a fact this suite would want reviewed.
+#[test]
+fn test_toml_grammar_resolves_every_read_kind_and_declares_no_fields() {
+    let language = toml_language();
+    assert_kinds_resolve("TOML", &language, TOML_KINDS);
+    assert_eq!(
+        language.field_count(),
+        0,
+        "pinned TOML grammar must declare no fields"
+    );
+}
+
+/// A pair with no value at all parses as an `ERROR` node wrapping the bare
+/// key and `=`, not a `pair` node; the malformed fixture is exactly that.
+#[test]
+fn test_toml_grammar_parses_valid_and_malformed_fixtures() {
+    let language = toml_language();
+    let valid_tree = parse(&language, include_str!("fixtures/toml/valid.toml"));
+    assert!(!valid_tree.root_node().has_error(), "valid TOML must parse");
+
+    let malformed_tree = parse(&language, include_str!("fixtures/toml/malformed.toml"));
+    assert!(
+        malformed_tree.root_node().has_error(),
+        "a pair missing its value must report an error"
     );
 }
 

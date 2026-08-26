@@ -1898,8 +1898,9 @@ mod tests {
             (
                 EventKind::Modify(ModifyKind::Any),
                 "src/rift.toml",
-                super::WatchImpact::None,
-                "only the root configuration file is the workspace's",
+                source_path("src/rift.toml")?,
+                "a nested rift.toml is an ordinary visible source file; only the root \
+                 configuration file drives a whole-workspace rebuild",
             ),
             (
                 EventKind::Modify(ModifyKind::Any),

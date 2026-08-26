@@ -127,6 +127,13 @@ jobs:
           bun install --frozen-lockfile --cwd "$RUNNER_TEMP"
           bunx typescript-language-server@6.0.0 --version
 
+      # tombi publishes to PyPI as `tombi`, and setup-uv already put `uv` on
+      # PATH above; `uv tool install` puts the binary in its tool bin dir
+      # and adds that dir to PATH itself, so no further wiring is needed.
+      - run: |
+          uv tool install tombi
+          tombi --version
+
       # Each local gate target is its own CI step. There is no separate
       # coverage step: `just test` is the one instrumented run, and its
       # lcov output is the artifact uploaded below.

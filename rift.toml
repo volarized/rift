@@ -11,6 +11,11 @@ respect_gitignore = true
 program = "rust-analyzer"
 languages = ["rust"]
 
+[engines.toml]
+program = "tombi"
+arguments = ["lsp"]
+languages = ["toml"]
+
 [[hooks]]
 type = "command"
 id = "format"

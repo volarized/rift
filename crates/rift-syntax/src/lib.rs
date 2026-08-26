@@ -10,6 +10,7 @@ mod markdown;
 mod provider;
 pub mod registry;
 mod rust;
+mod toml;
 mod typescript;
 mod yaml;
 
@@ -20,6 +21,7 @@ pub use json::JsonSyntaxProvider;
 pub use markdown::MarkdownSyntaxProvider;
 pub use provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 pub use rust::{RustQuery, RustQueryCapture, RustSyntaxProvider};
+pub use toml::TomlSyntaxProvider;
 pub use typescript::{TypeScriptDialect, TypeScriptSyntaxProvider};
 pub use yaml::YamlSyntaxProvider;
 
