@@ -208,7 +208,7 @@ fn dispatch(behavior: &str, message: &Value, input: &mut EngineInput, state: &mu
         },
         "workspace/willRenameFiles" => answer_will_rename(behavior, message, state),
         "textDocument/diagnostic" => answer_diagnostic(behavior, id, state),
-        "textDocument/references" => answer_references(message, state),
+        "textDocument/references" => answer_references(behavior, message, state),
         _ => {}
     }
 }
@@ -321,9 +321,22 @@ fn answer_diagnostic(behavior: &str, id: &Value, state: &mut EngineState) {
 ///
 /// The scan reuses [`word_edits`], the same word-boundary search the rename behaviors run,
 /// so a fixture's cross-file call sites are exactly its rename occurrences minus the
-/// requested position.
-fn answer_references(message: &Value, state: &EngineState) {
+/// requested position. `refuses-references` answers a JSON-RPC error instead;
+/// `mutates-then-answers-references` drifts the requested document on disk before answering
+/// normally, the same race `mutates-then-renames` proves for a rename proposal.
+fn answer_references(behavior: &str, message: &Value, state: &EngineState) {
     record_lifecycle("references");
+    if behavior == "refuses-references" {
+        print_message(&json!({
+            "jsonrpc": "2.0",
+            "id": message["id"],
+            "error": {"code": -32602, "message": "cannot answer references here"},
+        }));
+        return;
+    }
+    if behavior == "mutates-then-answers-references" {
+        drift_target(message);
+    }
     let uri = message["params"]["textDocument"]["uri"]
         .as_str()
         .unwrap_or_default();
