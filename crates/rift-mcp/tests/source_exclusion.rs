@@ -142,6 +142,10 @@ async fn source_exclude_drops_an_already_indexed_file_from_get_symbol_and_the_le
 /// current-tree request, exactly as it reaches past `.gitignore`: the file is parsed on
 /// demand outside the index. Excluding the symbol file and then naming it in
 /// `force_include` proves the glob still resolves it.
+///
+/// Both assertions read the hit paths rather than the result count: `rift.toml` is itself
+/// an indexed source file, and the exclusion it declares spells the excluded path, so a
+/// query for that path's own declaration also matches the configuration that excludes it.
 #[tokio::test]
 async fn force_include_still_reaches_a_file_source_exclude_dropped() -> TestResult {
     let directory = tempfile::tempdir()?;
@@ -163,7 +167,9 @@ async fn force_include_still_reaches_a_file_source_exclude_dropped() -> TestResu
     )
     .await?;
     assert!(
-        plain["results"].as_array().is_some_and(Vec::is_empty),
+        plain["results"].as_array().is_some_and(|results| !results
+            .iter()
+            .any(|hit| hit["path"] == json!("phantom_symbol.rs"))),
         "an excluded file must not answer a plain search: {plain:#}"
     );
 
