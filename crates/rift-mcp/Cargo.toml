@@ -50,10 +50,6 @@ name = "configuration_admission"
 path = "tests/configuration_admission.rs"
 
 [[test]]
-name = "engine_diagnostics"
-path = "tests/engine_diagnostics.rs"
-
-[[test]]
 name = "error_contract"
 path = "tests/error_contract.rs"
 

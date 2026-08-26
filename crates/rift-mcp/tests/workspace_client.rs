@@ -1,12 +1,13 @@
 //! Shared scaffolding for the engine integration suites.
 //!
 //! Every suite builds a workspace whose own `rift.toml` turns the semantic
-//! search tier off and, where the suite drives an engine, carries an
-//! `[engines.<name>]` table - the scripted fake engine, or the real one -
-//! and drives the tools through a live rmcp client. Engine-specific
-//! helpers live beside this module: `fake_engine.rs` for the scripted
-//! suites, `live_engine_gate.rs` for the gated live suite, and
-//! `hermetic_search.rs` for the table and why every fixture declares it.
+//! search tier off and, where the suite drives a real engine, carries an
+//! `[engines.<name>]` table built from the shared fixture in
+//! `engine_fixture.rs`, and drives the tools through a live rmcp client.
+//! Engine-specific fixture data lives beside this module: `rust_engine.rs`,
+//! `typescript_engine.rs`, and `toml_engine.rs`; `live_engine_gate.rs`
+//! gates the live suites those fixtures drive, and `hermetic_search.rs`
+//! carries the table every fixture declares to keep the semantic tier off.
 
 use std::error::Error;
 use std::fs;

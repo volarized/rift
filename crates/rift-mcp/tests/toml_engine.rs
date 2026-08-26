@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+use crate::engine_fixture::EngineFixture;
+
 /// The engine program the live TOML fixture names in `program`.
 ///
 /// The name resolves through `PATH`; the CI job installs it with
@@ -34,16 +36,24 @@ pub(crate) fn require_tombi(fixture_root: &Path) {
     }
 }
 
-/// The real `[engines.toml]` table: tombi's language server over the
-/// fixture tree.
+/// The real `[engines.toml]` table, built from [`fixture`].
+pub(crate) fn toml_engine_configuration() -> String {
+    fixture().configuration_toml()
+}
+
+/// The fixture data the shared harness turns into the `[engines.toml]`
+/// table: tombi's language server over the fixture tree.
 ///
 /// tombi answers `initialize` and a first `textDocument/diagnostic` pull
 /// immediately - it has no background project load to announce over
 /// `$/progress` the way rust-analyzer does - so the suite makes one call
 /// with no warm-up loop.
-pub(crate) fn toml_engine_configuration() -> String {
-    format!(
-        "[engines.toml]\nprogram = \"{TOMBI_PROGRAM}\"\narguments = [\"{TOMBI_LSP_ARGUMENT}\"]\n\
-         languages = [\"toml\"]\nstartup_timeout = \"2m\"\nrequest_timeout = \"2m\"\n"
-    )
+pub(crate) fn fixture() -> EngineFixture {
+    EngineFixture {
+        name: "toml",
+        program: TOMBI_PROGRAM,
+        arguments: vec![TOMBI_LSP_ARGUMENT],
+        languages: vec!["toml"],
+        extra_toml: String::new(),
+    }
 }

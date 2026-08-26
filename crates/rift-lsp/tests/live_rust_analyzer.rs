@@ -15,6 +15,7 @@
 
 #![cfg(unix)]
 
+mod engine_fixture;
 mod live_engine_gate;
 mod rust_engine;
 
@@ -25,7 +26,7 @@ use lsp_types::FileOperationPatternKind;
 use rift_core::ProjectPath;
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::session::{EngineLaunch, EngineSession};
-use rust_engine::{RUST_ANALYZER_PROGRAM, require_rust_analyzer, rust_analyzer_environment};
+use rust_engine::require_rust_analyzer;
 
 /// The cargo project fixture: a manifest, a crate root, a module, and the
 /// module's cross-file reference.
@@ -34,19 +35,9 @@ const CRATE_ROOT: &str = include_str!("fixtures/rust/lib.rs");
 const HUB: &str = include_str!("fixtures/rust/hub.rs");
 const CALLER: &str = include_str!("fixtures/rust/caller.rs");
 
-/// The live launch. rust-analyzer answers initialize in milliseconds and
-/// loads the cargo project afterwards, so a later request can wait on a
-/// cold sysroot walk: the bounds are generous, and still bounds.
+/// The live launch, built from the shared fixture's rust-analyzer data.
 fn launch() -> EngineLaunch {
-    EngineLaunch {
-        program: RUST_ANALYZER_PROGRAM.to_owned(),
-        arguments: Vec::new(),
-        environment: rust_analyzer_environment(),
-        initialization_options: None,
-        startup_timeout: Duration::from_mins(2),
-        request_timeout: Duration::from_mins(2),
-        stderr_capture_bytes: 65_536,
-    }
+    rust_engine::fixture().launch()
 }
 
 /// One cargo project on disk, outside the repository's toolchain pin.

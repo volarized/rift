@@ -1,6 +1,12 @@
-//! The rust-analyzer probe and the environment its fixtures launch under.
+//! The rust-analyzer probe and the real `[engines.rust]` table, for the
+//! end-to-end lane driven through the real `rift` binary.
+//!
+//! Mirrors `rift-mcp`'s own `rust_engine.rs`; Cargo compiles each crate's
+//! integration tests as their own binary, so the module is duplicated
+//! rather than shared.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::engine_fixture::EngineFixture;
@@ -30,11 +36,6 @@ pub(crate) fn rust_analyzer_environment() -> BTreeMap<String, String> {
 
 /// Fails the test unless `rust-analyzer` answers `--version` from the
 /// fixture tree under the fixture's own environment.
-///
-/// Probing from the fixture tree, and not from the repository root, asks
-/// the question the engine child asks. A default toolchain without the
-/// component fails here with the command's own words instead of failing
-/// later as an engine that would not start.
 pub(crate) fn require_rust_analyzer(fixture_root: &Path) {
     let probe = std::process::Command::new(RUST_ANALYZER_PROGRAM)
         .arg("--version")
@@ -63,14 +64,25 @@ pub(crate) fn require_rust_analyzer(fixture_root: &Path) {
     }
 }
 
-/// The fixture data the shared harness turns into a launch: rust-analyzer,
-/// resolved through `PATH`, with the toolchain override that lets it start
-/// outside this repository's own pinned channel.
+/// The real `[engines.rust]` table, built from [`fixture`].
+pub(crate) fn rust_engine_configuration() -> String {
+    fixture().configuration_toml()
+}
+
+/// The fixture data the shared harness turns into the `[engines.rust]`
+/// table: rust-analyzer over the fixture's cargo project, with the
+/// toolchain override that lets it start outside this repository's own
+/// pinned channel.
 pub(crate) fn fixture() -> EngineFixture {
+    let mut environment = String::new();
+    for (key, value) in rust_analyzer_environment() {
+        writeln!(environment, "{key} = \"{value}\"").expect("a string write cannot fail");
+    }
     EngineFixture {
+        name: "rust",
         program: RUST_ANALYZER_PROGRAM,
         arguments: Vec::new(),
-        environment: rust_analyzer_environment(),
-        initialization_options: None,
+        languages: vec!["rust"],
+        extra_toml: format!("\n[engines.rust.environment]\n{environment}"),
     }
 }

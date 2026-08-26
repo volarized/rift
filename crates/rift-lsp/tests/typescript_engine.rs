@@ -8,8 +8,13 @@
 //! suites: the tool-level suite reads the sources beside them, and this
 //! one needs only the resolvable package.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Instant;
+
+use serde_json::json;
+
+use crate::engine_fixture::EngineFixture;
 
 /// The package manager that installs the fixture's pinned `typescript`.
 pub(crate) const BUN_PROGRAM: &str = "bun";
@@ -85,5 +90,20 @@ pub(crate) fn install_typescript_engine(fixture_root: &Path) {
              suite. {error}",
             fixture_root.display(),
         ),
+    }
+}
+
+/// The fixture data the shared harness turns into a launch: the pinned
+/// language server started through `bunx`, with one semantic server kept
+/// to a single instance so the session contract this suite pins is the
+/// one the tool-level suite drives too.
+pub(crate) fn fixture() -> EngineFixture {
+    EngineFixture {
+        program: BUNX_PROGRAM,
+        arguments: vec![LANGUAGE_SERVER_PACKAGE.to_owned(), "--stdio".to_owned()],
+        environment: BTreeMap::new(),
+        initialization_options: Some(json!({
+            "tsserver": { "useSyntaxServer": "never" }
+        })),
     }
 }

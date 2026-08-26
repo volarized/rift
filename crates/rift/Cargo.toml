@@ -6,6 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 description = "Persistent filesystem projections and validated source transactions for agents"
+# `engine_fixture.rs`, `live_engine_gate.rs`, and `rust_engine.rs` are shared helper files
+# compiled separately into every test binary that declares them; Cargo's own discovery
+# would compile each as a test binary of its own. The suites are listed below instead, and
+# a helper is reached with `mod <name>;` from each suite that uses it.
+autotests = false
 
 [lints]
 workspace = true
@@ -44,3 +49,15 @@ axum.workspace = true
 rmcp = { workspace = true, features = ["client", "transport-child-process"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["net", "test-util"] }
+
+[[test]]
+name = "mcp_proxy"
+path = "tests/mcp_proxy.rs"
+
+[[test]]
+name = "server_cli"
+path = "tests/server_cli.rs"
+
+[[test]]
+name = "update_cli"
+path = "tests/update_cli.rs"

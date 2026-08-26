@@ -32,6 +32,7 @@
 
 #![cfg(unix)]
 
+mod engine_fixture;
 mod hermetic_search;
 mod live_engine_gate;
 mod rust_engine;
