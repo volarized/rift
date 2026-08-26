@@ -27,6 +27,7 @@ use sha2::{Digest as _, Sha256};
 use crate::move_file::MovePlan;
 use crate::patch;
 use crate::read::{ReadError, ReadFault, ReadService, digest_hex8, file_id, node_witness};
+use crate::remove::RemovePlan;
 use crate::rename::{PlannedRewrite, RenamePlan, survivor_findings};
 use crate::rewrite::{FileRewrite, ReplacedRegion, RewriteKind};
 
@@ -268,53 +269,24 @@ impl ChangeService {
             .application
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let address: NodeAddress = params.node.0.parse()?;
-        let Some(file) = reads.index().file(&address.path) else {
-            return Ok(ChangeResult::refused(
-                RefusalReason::UnmetPrecondition,
-                vec![OperationPrecondition::new(
-                    OperationPreconditionKind::TargetExists,
-                    OperationPreconditionStatus::Failed,
-                    vec![PreconditionAddress::Node {
-                        node: params.node.clone(),
-                    }],
-                    vec![address.path.as_str().to_owned()],
-                    PreconditionValue::Boolean { value: true },
-                    PreconditionValue::Boolean { value: false },
-                )],
-            ));
-        };
-        verified_address_language("node", &address.language_segment, file.syntax())?;
-        let observed_witness = node_witness(file.source(), address.range);
-        if observed_witness != address.witness {
-            return Ok(ChangeResult::refused(
-                RefusalReason::UnmetPrecondition,
-                vec![OperationPrecondition::new(
-                    OperationPreconditionKind::SourceUnchanged,
-                    OperationPreconditionStatus::Failed,
-                    vec![PreconditionAddress::Node {
-                        node: params.node.clone(),
-                    }],
-                    vec![address.path.as_str().to_owned()],
-                    PreconditionValue::Text {
-                        value: address.witness,
+        match resolve_node(reads, &params.node)? {
+            NodeResolution::Refused {
+                reason,
+                preconditions,
+            } => Ok(ChangeResult::refused(reason, preconditions)),
+            NodeResolution::Verified { address, .. } => {
+                let resolution = self.verified_against_disk(
+                    reads,
+                    &address.path,
+                    ChangePlan {
+                        path: address.path.clone(),
+                        range: address.range,
+                        text: params.body.clone(),
                     },
-                    PreconditionValue::Text {
-                        value: observed_witness,
-                    },
-                )],
-            ));
+                )?;
+                self.conclude(reads, resolution)
+            }
         }
-        let resolution = self.verified_against_disk(
-            reads,
-            &address.path,
-            ChangePlan {
-                path: address.path.clone(),
-                range: address.range,
-                text: params.body.clone(),
-            },
-        )?;
-        self.conclude(reads, resolution)
     }
 
     /// Verifies and writes one engine-proposed rename plan atomically, then
@@ -412,6 +384,46 @@ impl ChangeService {
             && let Some(reason) = &plan.references_not_updated
         {
             summary.diagnostics.push(reason.diagnostic());
+        }
+        Ok(result)
+    }
+
+    /// Verifies and writes one planned removal atomically.
+    ///
+    /// The plan's base is re-proven against the disk first, the same proof `apply_rename`
+    /// and `apply_move` run, because the reference check that produced the plan ran before
+    /// this call and the tree may have moved since. An applied removal whose reference check
+    /// found something standing, or could not run at all, carries that as the summary's
+    /// warning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] for a filesystem failure; a file that drifted since the plan
+    /// was compiled returns a refused [`ChangeResult`] instead.
+    pub fn apply_remove(
+        &self,
+        reads: &ReadService,
+        plan: &RemovePlan,
+    ) -> Result<ChangeResult, ReadError> {
+        let _application = self
+            .application
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let checks = std::iter::once((&plan.path, plan.base_source.as_str()));
+        if let Some(refusal) = self.rewrite_precondition_failure(reads, &plan.addresses, checks)? {
+            return Ok(refusal);
+        }
+        let rewrite = FileRewrite::modify(
+            plan.path.clone(),
+            &plan.base_source,
+            plan.next_source.clone(),
+            vec![plan.replaced.clone()],
+        );
+        let mut result = self.apply_rewrites(reads, std::slice::from_ref(&rewrite))?;
+        if let ChangeResult::Applied { summary } = &mut result
+            && let Some(diagnostic) = &plan.diagnostic
+        {
+            summary.diagnostics.push(diagnostic.clone());
         }
         Ok(result)
     }
@@ -840,11 +852,80 @@ fn spliced_at_file_edge(
 
 /// A parsed witnessed node address.
 #[derive(Debug)]
-struct NodeAddress {
-    language_segment: String,
-    path: CoreProjectPath,
-    range: ByteRange,
-    witness: String,
+pub(crate) struct NodeAddress {
+    pub(crate) language_segment: String,
+    pub(crate) path: CoreProjectPath,
+    pub(crate) range: ByteRange,
+    pub(crate) witness: String,
+}
+
+/// One witnessed node address resolved against the served snapshot: the file holding it and
+/// the parsed address, or the refusal resolution produced for a missing file or a witness
+/// that no longer matches the source.
+#[derive(Debug)]
+pub(crate) enum NodeResolution<'reads> {
+    /// The address's witness matches the served snapshot's bytes at its range.
+    Verified {
+        /// The indexed file holding the node.
+        file: &'reads rift_index::IndexedFile,
+        /// The parsed, witness-verified address.
+        address: NodeAddress,
+    },
+    /// Resolution produced a refusal; the tree stays untouched.
+    Refused {
+        /// The condition the caller can act on.
+        reason: RefusalReason,
+        /// The checked conditions, including the failed entry.
+        preconditions: Vec<OperationPrecondition>,
+    },
+}
+
+/// Resolves one witnessed node address: parses it, resolves its file against the served
+/// snapshot, verifies its address language, and proves its witness still matches the
+/// source. `replace_node` and the remove tools share this resolution.
+///
+/// # Errors
+///
+/// Returns [`ReadError`] for a malformed address or a language segment that does not match
+/// the indexed file's language.
+pub(crate) fn resolve_node<'reads>(
+    reads: &'reads ReadService,
+    node: &rift_protocol::read::NodeId,
+) -> Result<NodeResolution<'reads>, ReadError> {
+    let address: NodeAddress = node.0.parse()?;
+    let Some(file) = reads.index().file(&address.path) else {
+        return Ok(NodeResolution::Refused {
+            reason: RefusalReason::UnmetPrecondition,
+            preconditions: vec![OperationPrecondition::new(
+                OperationPreconditionKind::TargetExists,
+                OperationPreconditionStatus::Failed,
+                vec![PreconditionAddress::Node { node: node.clone() }],
+                vec![address.path.as_str().to_owned()],
+                PreconditionValue::Boolean { value: true },
+                PreconditionValue::Boolean { value: false },
+            )],
+        });
+    };
+    verified_address_language("node", &address.language_segment, file.syntax())?;
+    let observed_witness = node_witness(file.source(), address.range);
+    if observed_witness != address.witness {
+        return Ok(NodeResolution::Refused {
+            reason: RefusalReason::UnmetPrecondition,
+            preconditions: vec![OperationPrecondition::new(
+                OperationPreconditionKind::SourceUnchanged,
+                OperationPreconditionStatus::Failed,
+                vec![PreconditionAddress::Node { node: node.clone() }],
+                vec![address.path.as_str().to_owned()],
+                PreconditionValue::Text {
+                    value: address.witness,
+                },
+                PreconditionValue::Text {
+                    value: observed_witness,
+                },
+            )],
+        });
+    }
+    Ok(NodeResolution::Verified { file, address })
 }
 
 /// A parsed symbol address: the language segment it files under, and its
@@ -998,7 +1079,7 @@ impl std::str::FromStr for NodeAddress {
 ///
 /// Returns [`ReadError`] naming both spellings when they differ: an address
 /// filed under one language cannot act on a document filed under another.
-fn verified_address_language(
+pub(crate) fn verified_address_language(
     field: &'static str,
     language_segment: &str,
     document: &SyntaxDocument,

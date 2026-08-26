@@ -165,8 +165,9 @@ async fn applied_rename_rewrites_the_module_and_its_caller() -> TestResult {
             .as_array()
             .map(Vec::len)
             .unwrap_or_default(),
-        2,
-        "one whole-file edit per rewritten file: {structured:#}"
+        3,
+        "one edit per engine-proposed region: hub.rs's declaration, and caller.rs's import \
+         and call site, which the engine proposes as two separate regions: {structured:#}"
     );
     assert!(
         coded_findings(&structured, "rift.rename.survivor").is_empty(),
@@ -355,6 +356,145 @@ async fn engine_refused_new_name_carries_the_engine_words() -> TestResult {
         fs::read_to_string(directory.path().join("hub.rs"))?,
         HUB,
         "a refused rename leaves the tree as it was"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+fn remove_request(force: bool) -> CallToolRequestParams {
+    tool_request(
+        "remove_symbol",
+        &json!({ "symbol": BEACON_SYMBOL, "force": force }),
+    )
+}
+
+/// `caller.rs` calls `hub::beacon` once, so the engine's own reference check finds it and
+/// refuses the removal, naming the caller's path in the failed `no_references` condition.
+/// The engine is warmed first for the same reason the move and patch tests warm it: a
+/// reference check answered while rust-analyzer is still loading the caller cannot be told
+/// apart from a genuinely clean file.
+#[tokio::test]
+async fn remove_symbol_with_a_standing_reference_refuses_and_names_the_caller() -> TestResult {
+    if !engine_live() {
+        return Ok(());
+    }
+    let (directory, client, server_task) =
+        served_workspace(&project(), Some(rust_engine_configuration())).await?;
+    require_rust_analyzer(directory.path());
+    warmed_engine(&client).await?;
+
+    let structured = call_retrying_acceptance(&client, remove_request(false)).await?;
+    assert_eq!(structured["status"], json!("refused"), "{structured:#}");
+    assert_eq!(structured["reason"], json!("unmet_precondition"));
+    let preconditions = structured["preconditions"]
+        .as_array()
+        .expect("a failed condition rides the refusal");
+    assert_eq!(preconditions[0]["kind"], json!("no_references"));
+    assert_eq!(
+        preconditions[0]["expected"],
+        json!({ "kind": "count", "value": 0 })
+    );
+    let paths = preconditions[0]["paths"]
+        .as_array()
+        .expect("the failed condition names the reference paths");
+    assert!(
+        paths.contains(&json!("caller.rs")),
+        "the refusal must name the caller's path: {structured:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("hub.rs"))?,
+        HUB,
+        "a refused removal leaves the tree untouched"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// The same removal, forced: it applies over the standing reference and carries it as a
+/// warning instead of refusing.
+#[tokio::test]
+async fn forced_remove_symbol_applies_and_carries_the_reference_warning() -> TestResult {
+    if !engine_live() {
+        return Ok(());
+    }
+    let (directory, client, server_task) =
+        served_workspace(&project(), Some(rust_engine_configuration())).await?;
+    require_rust_analyzer(directory.path());
+    warmed_engine(&client).await?;
+
+    let structured = call_retrying_acceptance(&client, remove_request(true)).await?;
+    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
+    let findings = coded_findings(&structured, "rift.remove.reference");
+    assert_eq!(
+        findings.len(),
+        1,
+        "the standing reference rides as a warning instead of refusing: {structured:#}"
+    );
+    assert!(
+        findings[0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("caller.rs"),
+        "the warning must name the caller's path: {findings:#?}"
+    );
+    let written = fs::read_to_string(directory.path().join("hub.rs"))?;
+    assert!(
+        !written.contains("fn beacon"),
+        "the declaration must be removed: {written}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A JSON member's declaration, spelled `"port": 8080` with nothing blank around it, has no
+/// separator to widen over: the removal takes exactly the addressed span. No `[engines]`
+/// table claims `json` in this fixture, so the removal applies unchecked, and the warning
+/// names why.
+const SETTINGS_JSON: &str = "{\"server\": {\"port\": 8080}}\n";
+
+/// The cargo project fixture, plus a JSON file no configured engine serves.
+fn project_with_settings() -> Vec<(&'static str, &'static str)> {
+    let mut files = project();
+    files.push(("settings.json", SETTINGS_JSON));
+    files
+}
+
+#[tokio::test]
+async fn remove_symbol_in_an_unengined_language_applies_unchecked() -> TestResult {
+    if !engine_live() {
+        return Ok(());
+    }
+    let (directory, client, server_task) =
+        served_workspace(&project_with_settings(), Some(rust_engine_configuration())).await?;
+
+    let structured = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "remove_symbol",
+            &json!({
+                "symbol": "rift://symbol/json/settings.json/server%20%3E%20port",
+                "force": false
+            }),
+        ),
+    )
+    .await?;
+    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
+    let findings = coded_findings(&structured, "rift.remove.unchecked");
+    assert_eq!(
+        findings.len(),
+        1,
+        "the removal must say it was not checked: {structured:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("settings.json"))?,
+        "{\"server\": {}}\n",
+        "the mid-line member is removed exactly, with no separator to widen over"
     );
 
     client.cancel().await?;
