@@ -639,6 +639,29 @@ mod tests {
         next
     }
 
+    /// One temporary workspace holding `files`, indexed, with an empty engine pool: no
+    /// configured language claims an engine.
+    fn workspace(files: &[(&str, &str)]) -> (tempfile::TempDir, ReadService, EnginePool) {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        for (name, source) in files {
+            std::fs::write(directory.path().join(name), source).expect("fixture file writes");
+        }
+        let reads = ReadService::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )
+        .expect("fixture workspace indexes");
+        let engines = EnginePool::new(directory.path(), std::collections::BTreeMap::new());
+        (directory, reads, engines)
+    }
+
+    fn symbol(qualified_name: &str) -> rift_protocol::read::SymbolId {
+        rift_protocol::read::SymbolId(format!("rift://symbol/rust/lib.rs/{qualified_name}"))
+    }
+
     #[test]
     fn widens_the_first_declaration_over_its_trailing_separator() {
         let source = "fn a() {}\n\nfn b() {}\n\nfn c() {}\n";
@@ -762,5 +785,135 @@ mod tests {
             preconditions[0].observed,
             PreconditionValue::Count { value: 3 }
         );
+    }
+
+    #[tokio::test]
+    async fn plan_remove_symbol_with_a_malformed_address_fails() {
+        let (directory, reads, engines) = workspace(&[("lib.rs", "pub fn beacon() {}\n")]);
+        let error = plan_remove_symbol(
+            &reads,
+            &engines,
+            directory.path(),
+            &RemoveSymbolParams {
+                symbol: rift_protocol::read::SymbolId("not-an-address".to_owned()),
+                force: false,
+            },
+        )
+        .await
+        .expect_err("malformed symbol address must error");
+        assert_eq!(error.descriptor().code(), "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn plan_remove_node_with_a_malformed_address_fails() {
+        let (directory, reads, engines) = workspace(&[("lib.rs", "pub fn beacon() {}\n")]);
+        let error = plan_remove_node(
+            &reads,
+            &engines,
+            directory.path(),
+            &RemoveNodeParams {
+                node: NodeId("rift://node/rust/lib.rs@9-3#zzzzzzzz".to_owned()),
+                force: false,
+            },
+        )
+        .await
+        .expect_err("inverted span must error");
+        assert_eq!(error.descriptor().code(), "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn plan_remove_symbol_for_a_missing_declaration_refuses_target_exists() {
+        let (directory, reads, engines) = workspace(&[("lib.rs", "pub fn beacon() {}\n")]);
+        let resolution = plan_remove_symbol(
+            &reads,
+            &engines,
+            directory.path(),
+            &RemoveSymbolParams {
+                symbol: symbol("vanished"),
+                force: false,
+            },
+        )
+        .await
+        .expect("the refusal is typed");
+        let RemoveResolution::Refused(result) = resolution else {
+            panic!("a missing declaration must refuse");
+        };
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("a missing declaration must refuse with preconditions");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::TargetExists
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_remove_symbol_refuses_when_disk_drifted_from_snapshot() {
+        let (directory, reads, engines) = workspace(&[("lib.rs", "pub fn beacon() {}\n")]);
+        std::fs::write(directory.path().join("lib.rs"), "pub fn beacon() { }\n")
+            .expect("fixture file writes");
+        let resolution = plan_remove_symbol(
+            &reads,
+            &engines,
+            directory.path(),
+            &RemoveSymbolParams {
+                symbol: symbol("beacon"),
+                force: false,
+            },
+        )
+        .await
+        .expect("the refusal is typed");
+        let RemoveResolution::Refused(result) = resolution else {
+            panic!("drifted disk must refuse");
+        };
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("drifted disk must refuse with preconditions");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::SourceUnchanged
+        );
+        assert_ne!(preconditions[0].expected, preconditions[0].observed);
+        let untouched =
+            std::fs::read_to_string(directory.path().join("lib.rs")).expect("fixture file reads");
+        assert_eq!(
+            untouched, "pub fn beacon() { }\n",
+            "refusal leaves the tree untouched"
+        );
+    }
+
+    #[test]
+    fn reference_check_from_locations_falls_back_to_the_raw_uri_outside_the_tree_root() {
+        let tree_root = TreeRoot::new(Path::new("/workspace")).expect("root parses");
+        let outside = rift_lsp::uri::parse_uri("file:///outside/other.rs").expect("uri parses");
+        let expected = outside.as_str().to_owned();
+        let location = Location {
+            uri: outside,
+            range: lsp_types::Range::default(),
+        };
+        let check = reference_check_from_locations(&tree_root, std::slice::from_ref(&location));
+        let ReferenceCheck::Found { count, paths } = check else {
+            panic!("a located reference must be found");
+        };
+        assert_eq!(count, 1);
+        assert_eq!(paths, vec![expected]);
+    }
+
+    #[test]
+    fn widens_an_empty_span_in_an_empty_source_without_locating_a_line() {
+        let span = ByteRange { start: 0, end: 0 };
+        assert_eq!(widened_removal_span("", span), span);
     }
 }
