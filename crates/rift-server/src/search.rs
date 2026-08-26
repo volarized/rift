@@ -1029,10 +1029,8 @@ pub fn compute() -> i32 {
     #[test]
     fn search_without_include_omits_source_but_keeps_symbol_path_span_and_line() -> TestResult {
         let (_directory, service) = fixture()?;
-        let params: SearchParams = serde_json::from_value(json!({
-            "query": "Beacon",
-            "limit": 10
-        }))?;
+        let request = json!({ "query": "Beacon", "limit": 10 });
+        let params: SearchParams = serde_json::from_value(request)?;
         let value = serde_json::to_value(service.search(&params, &[])?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert!(!results.is_empty());
