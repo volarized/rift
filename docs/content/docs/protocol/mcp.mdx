@@ -105,13 +105,19 @@ contributes no version.
 
 <McpTool name="search" />
 
-`search` takes a lexical `query`, narrowed or extended by a `paths` selector. `include` and
-`exclude` glob the project-relative path - the same glob engine backs the workspace's
+`search` takes a lexical `query`, narrowed or extended by a `paths` selector. `paths.include` and
+`paths.exclude` glob the project-relative path - the same glob engine backs the workspace's
 [`[source]`](/docs/configuration#source) policy - narrowing the indexed candidates before
-scoring. `force_include` reaches past both: a file `[source]` or `.gitignore` excluded from the
+scoring.
+
+`paths.force_include` reaches past both: a file `[source]` or `.gitignore` excluded from the
 index is parsed on demand and searched alongside the indexed hits, up to 256 matched files per
-request; a request whose `force_include` matches more than that refuses with `limit_exceeded`
-rather than searching a silently truncated set.
+request. A request whose `paths.force_include` matches more than that refuses with
+`limit_exceeded` rather than searching a silently truncated set.
+
+The top-level `include` field is a separate selector: it requests extra payload per hit instead
+of narrowing which files are searched, and `source` - the excerpt around the hit - is its only
+served member.
 
 This request narrows the search to the tests tree, then reaches one file the workspace's
 `[source]` policy excludes from the index:
@@ -219,6 +225,15 @@ one of those files returns as a `file` hit, tagged `matched_by: ["ranked"]` the 
 }
 ```
 
+A visible file with no extension - `justfile`, `Dockerfile` - joins the same index by default,
+since no configured [`[search.text]`](/docs/configuration#search) extension could ever match it:
+
+```json
+{ "query": "cargo fmt --all --check" }
+```
+
+returns `justfile` the same way: a `file` hit carrying `semantic: false`.
+
 Neither hit above carries `source`: a request pays that lookup only when `include` names it.
 `include: ["source"]` attaches the excerpt as `source` on every hit; an omitted `include` returns
 the hit's symbol or file, `path`, `span`, and `line` alone, as both hits above do.
@@ -262,6 +277,22 @@ discovery revisions produced that catalog.
 
 ## Changes
 
+`replace_symbol`, `insert_symbol`, `replace_node`, and `insert_node` take `body`, and `patch`
+takes `patch`, as a [`BodySource`](/docs/protocol/reference#BodySource): inline text, or an
+object naming `file`. `file` is an absolute path the server reads directly - unlike every other
+path in the protocol, which is project-relative - so a caller that does not run on the same
+machine as the server cannot use this form. Both forms are bounded by the field that embeds them:
+1 MiB for `body`, 4 MiB for `patch`.
+
+Every write tool resolves its target through the workspace's
+[`[source]`](/docs/configuration#source) policy before it stages a byte, `move_file`'s
+destination included, and refuses `unsupported`, naming the policy, when the target lies outside
+it. A target that is a symlink publishes beside its resolved file rather than replacing the link,
+once that file stays inside the workspace and passes the same policy; the result then carries a
+warning naming both paths. A resolved target outside the workspace, a broken link, or a link
+cycle refuses the same way instead, and a deletion removes the addressed link itself without
+following it.
+
 <McpTool name="replace_symbol" />
 
 The span the parser derives reaches back over the declaration's attached outer attributes and doc comments -
@@ -283,6 +314,13 @@ it, resolution refuses and names the missing target.
 `replace_node` reaches below a declaration through a witnessed node address from
 [`nodes`](#tool-nodes).
 
+<McpTool name="insert_node" />
+
+`insert_node` reaches below a declaration the same way, addressing an `anchor` node rather than a
+symbol. `body` lands verbatim at the node's own boundary, before or after it: a node is not a
+declaration, so none of `insert_symbol`'s blank-line separator or column preservation applies,
+and the caller supplies whatever spacing the inserted bytes need.
+
 <McpTool name="patch" />
 
 `patch` applies a unified diff following [`git apply`](https://git-scm.com/docs/git-apply)
@@ -294,7 +332,8 @@ the earlier position breaking a tie.
 The target is any file the workspace's [`[source]`](/docs/configuration#source) policy makes
 visible, parsed or not: `justfile` and `docs/content/docs/configuration.mdx` both resolve, the
 second through the same text index [`search`](#tool-search) reads. A path the policy excludes
-refuses `unsupported`, naming the policy.
+refuses `unsupported`, naming the policy; a directory occupying the target refuses
+`unmet_precondition` naming `target_is_file`.
 
 A header's line counts are a hint on the same footing. The server derives each hunk's counts
 from the hunk's own body before parsing it, the way `git apply` derives them, so a miscounted
@@ -304,8 +343,15 @@ A `--- /dev/null` header creates the named file; a `+++ /dev/null` header delete
 renames or copies a file refuses as `unsupported`, because `patch` carries no rename or copy
 support.
 
+Matching compares line content, not its ending: an LF-formatted diff locates against CRLF
+source, and the reverse. A located hunk's context keeps the exact bytes already in the source,
+and a line the hunk inserts takes the ending already prevailing at that position, so no hunk
+introduces a foreign ending elsewhere in the file.
+
 A hunk that resolves nowhere refuses with `unmet_precondition`, naming the failed hunk's
 ordinal, the file line the search reached, and the context it expected against what stood there.
+A real mismatch names each side's content and line ending, so two lines that print alike are
+never reported as the same.
 
 <McpTool name="rename_symbol" />
 
@@ -313,14 +359,17 @@ The [language engine](/docs/architecture#semantic-edits) configured for the symb
 proposes the edit set; the server compiles that proposal into the same witnessed rewrites every
 change tool produces. A language no [`[engines]`](/docs/configuration#engines) table claims
 refuses as `unsupported`, and an engine that declines the new name refuses as
-`unmet_precondition` carrying the engine's own words. After the change applies, the server sweeps
-the tree for surviving occurrences of the old name and reports each one as a warning.
+`unmet_precondition` naming `engine_proposed_edits`, carrying the engine's own words. After the
+change applies, the server sweeps the tree for surviving occurrences of the old name and reports
+each one as a warning.
 
 <McpTool name="move_file" />
 
-An engine advertising `workspace/willRenameFiles` proposes the reference updates, and they land
-with the move as one change. Without such an engine the file still moves, and the result carries
-a warning saying references were not updated.
+Any visible regular file moves, including one no syntax provider claims; a directory in its
+place refuses `unmet_precondition` naming `target_is_file`. An engine advertising
+`workspace/willRenameFiles` proposes the reference updates, and they land with the move as one
+change. Without such an engine, or without a provider that claims the file's language, the move
+still applies and the result carries a `rift.move.references_not_updated` warning.
 
 <McpTool name="remove_symbol" />
 
@@ -334,6 +383,11 @@ refuses `unmet_precondition` naming `no_references`, unless `force` applies the 
 and carries the references as a warning. Without a configured engine, or one that does not
 advertise `textDocument/references`, the removal applies and carries a warning naming why it was
 not checked.
+
+An engine that answers with no references before confirming its own readiness is a third case:
+that answer looks the same as one from an engine that checked and found nothing, so the removal
+refuses `temporarily_unavailable` instead of applying. `force` overrides this refusal too,
+carrying a warning that the engine's readiness was unconfirmed.
 
 <McpTool name="remove_node" />
 

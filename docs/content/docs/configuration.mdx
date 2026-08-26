@@ -35,6 +35,7 @@ changes, and index rebuilds:
 num_workers = 4
 worker_queue_timeout = "30s"
 idle_timeout = "30m"
+readiness_timeout = "30s"
 ```
 
 - `num_workers` caps the workers running blocking operations at once, 1 to 64
@@ -43,6 +44,10 @@ idle_timeout = "30m"
   stacking another waiter
 - `idle_timeout` stops the server after that long with no served request, 1s to 1d; the next
   `rift mcp` or `rift server start` brings it back
+- `readiness_timeout` bounds one request's whole wait for the workspace's index and its language
+  engines to prove they're ready to answer, 1s to 1h - index validation starts the clock, and
+  once the request has resolved which engines it needs, waiting on them spends whatever time is
+  left
 - `port` pins the exact loopback port, 1024 or above; omitted, the server picks the first free
   port from `port_range` - `port_range = { min = 12000, max = 13000 }` is the default - and the
   two keys exclude each other
@@ -166,7 +171,9 @@ busy_timeout = "1s"
 
 - `extensions` names which file extensions, without the leading dot, join the index alongside
   source files - `md`, `mdx`, and `txt` by default, prose formats with no syntax provider of
-  their own
+  their own; a visible file with no extension - `justfile`, `Dockerfile` - joins by default too,
+  since no configured extension could ever match it, unless its first 8 KiB holds a NUL byte,
+  which excludes it as a compiled artifact
 - `max_chunk` bounds how large a file may grow before it's split into several indexed chunks,
   1kb to 16mb; an operator who wants a file out of the index entirely excludes it in
   [`[source]`](/docs/configuration#source) or drops its extension from `extensions`
