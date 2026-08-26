@@ -60,6 +60,26 @@ async fn served_wire_errors_validate_against_the_error_data_schema() -> TestResu
             "insert_symbol",
             json!({ "anchor": "not-an-address", "position": "after", "body": "x" }),
         ),
+        // Both node writers resolve their address through `resolve_node_range`, so a range
+        // that names no indexed node refuses identically on each: in bounds but landing on
+        // no node, and past the end of the file. The witness is well formed in every one,
+        // so only the range can explain the refusal.
+        (
+            "replace_node",
+            json!({ "node": "rift://node/rust/lib.rs@0-5#00000000", "body": "x" }),
+        ),
+        (
+            "remove_node",
+            json!({ "node": "rift://node/rust/lib.rs@0-5#00000000", "force": false }),
+        ),
+        (
+            "replace_node",
+            json!({ "node": "rift://node/rust/lib.rs@0-999#00000000", "body": "x" }),
+        ),
+        (
+            "remove_node",
+            json!({ "node": "rift://node/rust/lib.rs@0-999#00000000", "force": false }),
+        ),
         (
             "get_symbol",
             json!({ "name": "beacon", "include_history": true }),

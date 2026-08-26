@@ -28,7 +28,10 @@ use sha2::{Digest as _, Sha256};
 
 use crate::move_file::MovePlan;
 use crate::patch;
-use crate::read::{ReadError, ReadFault, ReadService, digest_hex8, file_id, node_witness};
+use crate::read::{
+    NodeRangeResolution, ReadError, ReadFault, ReadService, digest_hex8, file_id,
+    resolve_node_range,
+};
 use crate::remove::RemovePlan;
 use crate::rename::{PlannedRewrite, RenamePlan, survivor_findings};
 use crate::rewrite::{FileRewrite, ReplacedRegion, RewriteKind};
@@ -925,9 +928,9 @@ pub(crate) fn resolve_node<'reads>(
         });
     };
     verified_address_language("node", &address.language_segment, file.syntax())?;
-    let observed_witness = node_witness(file.source(), address.range);
-    if observed_witness != address.witness {
-        return Ok(NodeResolution::Refused {
+    match resolve_node_range(file, address.range, &address.witness)? {
+        NodeRangeResolution::Verified => Ok(NodeResolution::Verified { file, address }),
+        NodeRangeResolution::WitnessChanged { observed } => Ok(NodeResolution::Refused {
             reason: RefusalReason::UnmetPrecondition,
             preconditions: vec![OperationPrecondition::new(
                 OperationPreconditionKind::SourceUnchanged,
@@ -935,15 +938,12 @@ pub(crate) fn resolve_node<'reads>(
                 vec![PreconditionAddress::Node { node: node.clone() }],
                 vec![address.path.as_str().to_owned()],
                 PreconditionValue::Text {
-                    value: address.witness,
+                    value: address.witness.clone(),
                 },
-                PreconditionValue::Text {
-                    value: observed_witness,
-                },
+                PreconditionValue::Text { value: observed },
             )],
-        });
+        }),
     }
-    Ok(NodeResolution::Verified { file, address })
 }
 
 /// A parsed symbol address: the language segment it files under, and its
@@ -1234,7 +1234,7 @@ mod tests {
     use rift_syntax::ByteRange;
 
     use super::ChangeService;
-    use crate::read::{ReadService, node_witness};
+    use crate::read::{ReadService, digest_hex8};
     use crate::rewrite::{FileRewrite, REWRITE_FILE_BYTES_MAX, ReplacedRegion};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -2735,8 +2735,10 @@ mod tests {
         let source = "pub fn beacon() {}\n";
         let (directory, reads, changes) = fixture(source)?;
         let end = source.len() as u64 + 10;
-        let range = ByteRange { start: 0, end };
-        let witness = node_witness(source, range);
+        // A forged witness for a range wholly past the file: no legitimate listing could
+        // ever carry this address, so resolution must refuse before the witness even
+        // matters.
+        let witness = digest_hex8("");
         let error = changes
             .replace_node(
                 &reads,
@@ -2751,6 +2753,37 @@ mod tests {
         assert!(
             error.to_string().contains("outside the addressed file"),
             "message must name the span fault: {error}"
+        );
+        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(untouched, source);
+        Ok(())
+    }
+
+    #[test]
+    fn replace_node_range_naming_no_syntax_node_fails_as_invalid_not_source_unchanged() -> TestResult
+    {
+        let source = "pub fn beacon() {}\n";
+        let (directory, reads, changes) = fixture(source)?;
+        // A byte range inside the file but not equal to any real node's own range: half of
+        // the `beacon` identifier. Its witness is computed correctly, so a mismatch cannot
+        // explain the refusal - only the missing node can.
+        let start = source.find("beacon").expect("fixture names beacon");
+        let end = start + "bea".len();
+        let witness = digest_hex8(&source[start..end]);
+        let error = changes
+            .replace_node(
+                &reads,
+                &ReplaceNodeParams {
+                    node: NodeId(format!("rift://node/rust/lib.rs@{start}-{end}#{witness}")),
+                    region: None,
+                    body: "x".to_owned().into(),
+                },
+            )
+            .expect_err("a range naming no syntax node must error");
+        assert_eq!(error.descriptor().code(), "invalid_request");
+        assert!(
+            error.to_string().contains("outside the addressed file"),
+            "message must name the range, not a witness mismatch: {error}"
         );
         let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
         assert_eq!(untouched, source);

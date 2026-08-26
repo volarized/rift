@@ -96,7 +96,7 @@ fn corpus() -> Vec<(&'static str, Value)> {
         (
             "replace_node",
             json!({
-                "node": "rift://node/rust/lib.rs@0-18#00000000",
+                "node": "rift://node/rust/lib.rs@0-22#00000000",
                 "body": "pub fn beacon_one() {}"
             }),
         ),
@@ -147,13 +147,17 @@ fn remove_corpus() -> Vec<(&'static str, Value)> {
                 "force": false
             }),
         ),
-        // A stale witness, proving `remove_node` reaches the same witness verification
-        // `replace_node` shares through `resolve_node`; the live-fetched witness case runs in
-        // `live_witnessed_remove_node_checks_references_and_validates`.
+        // A stale witness on a range that does name a real node, proving `remove_node`
+        // reaches the same witness verification `replace_node` shares through
+        // `resolve_node_range`. The address names `remove_caller.rs`, which no other
+        // corpus entry writes to, so the range still lands however far the corpus has
+        // rewritten `lib.rs` by the time this entry runs. The live-fetched witness case
+        // runs in `live_witnessed_remove_node_checks_references_and_validates`, and a
+        // range naming no node at all is an `invalid_request` the error corpus covers.
         (
             "remove_node",
             json!({
-                "node": "rift://node/rust/lib.rs@0-18#00000000",
+                "node": "rift://node/rust/remove_caller.rs@0-48#00000000",
                 "force": false
             }),
         ),

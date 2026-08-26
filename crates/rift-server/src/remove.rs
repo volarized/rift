@@ -280,20 +280,32 @@ async fn concluded_plan(
 }
 
 /// Compiles the target and its widened span into the plan the change lane writes.
+///
+/// `widened` is already resolved: `resolved_symbol_target` and `resolved_node_target` only
+/// ever hand [`widened_removal_span`] a range proven to land inside `target.indexed_source`,
+/// and widening only moves along that same source's own line boundaries. Nothing here
+/// clamps the range again.
+///
+/// # Panics
+///
+/// Panics when `widened` does not land inside `target.indexed_source` - a programmer error,
+/// since every caller resolves the range first.
 fn built_plan(
     target: RemovalTarget,
     widened: ByteRange,
     addresses: Vec<PreconditionAddress>,
     diagnostic: Option<Diagnostic>,
 ) -> RemovePlan {
-    let source_len = target.indexed_source.len();
-    let start = usize::try_from(widened.start)
-        .unwrap_or(source_len)
-        .min(source_len);
-    let end = usize::try_from(widened.end)
-        .unwrap_or(source_len)
-        .min(source_len);
-    let mut next_source = String::with_capacity(source_len.saturating_sub(end - start));
+    let start = usize::try_from(widened.start).expect("widened span fits this platform's usize");
+    let end = usize::try_from(widened.end).expect("widened span fits this platform's usize");
+    assert!(
+        end <= target.indexed_source.len(),
+        "removal span must land inside its already-resolved source: start={start}, end={end}, \
+         source_len={}",
+        target.indexed_source.len()
+    );
+    let mut next_source =
+        String::with_capacity(target.indexed_source.len().saturating_sub(end - start));
     next_source.push_str(&target.indexed_source[..start]);
     next_source.push_str(&target.indexed_source[end..]);
     RemovePlan {
@@ -568,14 +580,24 @@ fn is_blank_content(content: &str) -> bool {
 ///
 /// A span that sits mid-line - its start preceded by more than indentation, or its end
 /// followed by more than blanks - is returned unchanged.
+///
+/// `span` must already land inside `source`: both removal callers resolve it first. Widening
+/// only moves `start` and `end` along `source`'s own line boundaries, so it cannot push
+/// either past `source`'s length.
+///
+/// # Panics
+///
+/// Panics when `span` does not land inside `source` - a programmer error, since every caller
+/// resolves the span first.
 pub(crate) fn widened_removal_span(source: &str, span: ByteRange) -> ByteRange {
     let source_len = source.len();
-    let mut start = usize::try_from(span.start)
-        .unwrap_or(source_len)
-        .min(source_len);
-    let mut end = usize::try_from(span.end)
-        .unwrap_or(source_len)
-        .min(source_len);
+    let mut start = usize::try_from(span.start).expect("span fits this platform's usize");
+    let mut end = usize::try_from(span.end).expect("span fits this platform's usize");
+    assert!(
+        start <= end && end <= source_len,
+        "removal span must land inside its own source: start={start}, end={end}, \
+         source_len={source_len}"
+    );
     let spans = line_spans(source);
 
     if let Some(line) = line_at(&spans, start) {
@@ -819,6 +841,117 @@ mod tests {
         .await
         .expect_err("inverted span must error");
         assert_eq!(error.descriptor().code(), "invalid_request");
+    }
+
+    /// A listed node's real id, read back through `nodes` the way a caller would.
+    fn listed_node_id(reads: &ReadService, path: &str, position: u64) -> String {
+        let listing = reads
+            .nodes(rift_protocol::read::NodesParams {
+                path: rift_protocol::read::ProjectPath(path.to_owned()),
+                position,
+                rev: None,
+            })
+            .expect("fixture position must list a node");
+        listing.nodes[0].id.0.clone()
+    }
+
+    #[tokio::test]
+    async fn plan_remove_node_with_a_forged_out_of_bounds_range_fails_untouched() {
+        let source = "pub fn beacon() {}\n";
+        let (directory, reads, engines) = workspace(&[("lib.rs", source)]);
+        let end = source.len() as u64 + 10;
+        // A forged witness for a range wholly past the file, exactly what `replace_node`
+        // refuses for the identical address: the two tools must agree.
+        let witness = crate::read::digest_hex8("");
+        let error = plan_remove_node(
+            &reads,
+            &engines,
+            directory.path(),
+            &RemoveNodeParams {
+                node: NodeId(format!("rift://node/rust/lib.rs@0-{end}#{witness}")),
+                force: false,
+            },
+        )
+        .await
+        .expect_err("a range past the file end must error");
+        assert_eq!(error.descriptor().code(), "invalid_request");
+        assert!(
+            error.to_string().contains("outside the addressed file"),
+            "message must name the span fault: {error}"
+        );
+        let untouched =
+            std::fs::read_to_string(directory.path().join("lib.rs")).expect("fixture file reads");
+        assert_eq!(
+            untouched, source,
+            "a refused removal must leave the tree untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_remove_node_with_a_range_naming_no_syntax_node_fails_naming_the_range() {
+        let source = "pub fn beacon() {}\n";
+        let (directory, reads, engines) = workspace(&[("lib.rs", source)]);
+        let start = source.find("beacon").expect("fixture names beacon");
+        let end = start + "bea".len();
+        let witness = crate::read::digest_hex8(&source[start..end]);
+        let error = plan_remove_node(
+            &reads,
+            &engines,
+            directory.path(),
+            &RemoveNodeParams {
+                node: NodeId(format!("rift://node/rust/lib.rs@{start}-{end}#{witness}")),
+                force: false,
+            },
+        )
+        .await
+        .expect_err("a range naming no syntax node must error");
+        assert_eq!(error.descriptor().code(), "invalid_request");
+        assert!(
+            error.to_string().contains("outside the addressed file"),
+            "message must name the range, not a witness mismatch: {error}"
+        );
+        let untouched =
+            std::fs::read_to_string(directory.path().join("lib.rs")).expect("fixture file reads");
+        assert_eq!(
+            untouched, source,
+            "a refused removal must leave the tree untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_remove_node_with_a_stale_witness_refuses_source_unchanged() {
+        let source = "pub fn beacon() {}\n";
+        let (directory, reads, engines) = workspace(&[("lib.rs", source)]);
+        let listed = listed_node_id(&reads, "lib.rs", 3);
+        let mut stale = listed;
+        stale.replace_range(stale.len() - 8.., "00000000");
+        let resolution = plan_remove_node(
+            &reads,
+            &engines,
+            directory.path(),
+            &RemoveNodeParams {
+                node: NodeId(stale),
+                force: false,
+            },
+        )
+        .await
+        .expect("a stale witness is a typed refusal, not an error");
+        let RemoveResolution::Refused(result) = resolution else {
+            panic!("a stale witness must refuse");
+        };
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("a stale witness must refuse with preconditions");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::SourceUnchanged
+        );
     }
 
     #[tokio::test]
