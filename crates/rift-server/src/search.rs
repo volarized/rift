@@ -13,7 +13,7 @@ use rift_index::{
 };
 use rift_protocol::read::{
     File, FileContent, MatchedField, PathPattern, PathSelector, SearchHit, SearchHitTarget,
-    SearchParams, SearchParamsTarget, SearchResult, SymbolId,
+    SearchInclude, SearchParams, SearchParamsTarget, SearchResult, SymbolId,
 };
 use rift_search::{Declaration, DescribedUnit, RankedUnit};
 use rift_syntax::{ByteRange, SyntaxSymbol};
@@ -54,6 +54,11 @@ impl ReadService {
         let root = self.index().root();
         let selector = params.paths.as_ref();
         let matcher = path_matcher(root, selector)?;
+        let criteria = SearchCriteria {
+            query,
+            target: params.target,
+            payloads: HitPayloads::requested(params),
+        };
         // The whole candidate pool is collected up to the index's own `results_max` bound -
         // bounded work whatever the page size - then ordered by relevance, so
         // `pagination.total_pages` counts the full result set and every page is one window
@@ -65,8 +70,7 @@ impl ReadService {
             self.index(),
             matcher.as_ref(),
             root,
-            query,
-            params.target,
+            criteria,
             fetch_limit,
             &mut results,
         )?;
@@ -76,13 +80,12 @@ impl ReadService {
             collect_force_include_hits(
                 self.index(),
                 selector,
-                query,
-                params.target,
+                criteria,
                 fetch_limit,
                 &mut results,
             )?;
         }
-        collect_ranked_hits(self.index(), query, params.target, ranked, &mut results);
+        collect_ranked_hits(self.index(), criteria, ranked, &mut results);
         order_by_relevance(&mut results);
         let (results, pagination) = page(results, params.page_index, limit);
         Ok(SearchResult {
@@ -158,6 +161,35 @@ fn force_include_requested(params: &SearchParams) -> bool {
         .paths
         .as_ref()
         .is_some_and(|selector| !selector.force_include.is_empty())
+}
+
+/// Which extra payload `params.include` asked to attach to every hit, derived once per
+/// request. `SearchInclude::Signature`, `Relationships`, and `Diagnostics` name payloads no
+/// code path produces yet, so `source` is the only field this carries.
+#[derive(Clone, Copy, Debug, Default)]
+struct HitPayloads {
+    source: bool,
+}
+
+impl HitPayloads {
+    fn requested(params: &SearchParams) -> Self {
+        Self {
+            source: params
+                .include
+                .as_deref()
+                .is_some_and(|include| include.contains(&SearchInclude::Source)),
+        }
+    }
+}
+
+/// Query term, kind selector, and requested payloads shared by every hit-collection pass
+/// one `search` call runs: identifier matching, `force_include`, and the merge of ranked
+/// units.
+#[derive(Clone, Copy, Debug)]
+struct SearchCriteria<'a> {
+    query: &'a str,
+    target: SearchParamsTarget,
+    payloads: HitPayloads,
 }
 
 fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
@@ -236,11 +268,15 @@ fn collect_indexed_hits(
     index: &WorkspaceIndex,
     matcher: Option<&PathMatcher>,
     root: &Path,
-    query: &str,
-    target: SearchParamsTarget,
+    criteria: SearchCriteria<'_>,
     fetch_limit: usize,
     results: &mut Vec<SearchHit>,
 ) -> Result<(), ReadError> {
+    let SearchCriteria {
+        query,
+        target,
+        payloads,
+    } = criteria;
     if matches!(target, SearchParamsTarget::All | SearchParamsTarget::Symbol) {
         for matched in index
             .symbols(query, fetch_limit)
@@ -249,7 +285,7 @@ fn collect_indexed_hits(
             if !includes(matcher, root, matched.file.path()) {
                 continue;
             }
-            results.push(symbol_search_hit(matched));
+            results.push(symbol_search_hit(matched, payloads));
             if results.len() >= fetch_limit {
                 return Ok(());
             }
@@ -265,7 +301,7 @@ fn collect_indexed_hits(
             if !includes(matcher, root, file.path()) {
                 continue;
             }
-            results.push(file_search_hit(file, line, text));
+            results.push(file_search_hit(file, line, text, payloads));
             if results.len() >= fetch_limit {
                 break;
             }
@@ -282,14 +318,18 @@ fn collect_indexed_hits(
 fn collect_force_include_hits(
     index: &WorkspaceIndex,
     selector: &PathSelector,
-    query: &str,
-    target: SearchParamsTarget,
+    criteria: SearchCriteria<'_>,
     fetch_limit: usize,
     results: &mut Vec<SearchHit>,
 ) -> Result<(), ReadError> {
     if selector.force_include.is_empty() {
         return Ok(());
     }
+    let SearchCriteria {
+        query,
+        target,
+        payloads,
+    } = criteria;
     let extra = index
         .force_include_files(
             &pattern_strings(&selector.force_include),
@@ -298,7 +338,7 @@ fn collect_force_include_hits(
         .map_err(ReadFault::index)?;
     if matches!(target, SearchParamsTarget::All | SearchParamsTarget::Symbol) {
         for matched in rift_index::symbol_matches(&extra, query, fetch_limit - results.len()) {
-            results.push(symbol_search_hit(matched));
+            results.push(symbol_search_hit(matched, payloads));
         }
     }
     if results.len() < fetch_limit
@@ -307,24 +347,26 @@ fn collect_force_include_hits(
         for (file, line, text) in
             rift_index::source_line_matches(&extra, query, fetch_limit - results.len())
         {
-            results.push(file_search_hit(file, line, text));
+            results.push(file_search_hit(file, line, text, payloads));
         }
     }
     Ok(())
 }
 
-fn symbol_search_hit(matched: SymbolMatch<'_>) -> SearchHit {
+fn symbol_search_hit(matched: SymbolMatch<'_>, payloads: HitPayloads) -> SearchHit {
     let score = symbol_match_score(matched.rank);
-    build_symbol_hit(matched, score, vec![MatchedField::Name])
+    build_symbol_hit(matched, score, vec![MatchedField::Name], payloads)
 }
 
 /// Builds one symbol hit's wire shape. `symbol_search_hit` and `merge_symbol_hit` share
 /// this: both surface the same declaration, differing only in score and which indexed field
-/// produced the match.
+/// produced the match. The excerpt behind `source` is sliced only when `payloads` asked for
+/// it, so a request that omits `include` never pays that lookup.
 fn build_symbol_hit(
     matched: SymbolMatch<'_>,
     score: f64,
     matched_by: Vec<MatchedField>,
+    payloads: HitPayloads,
 ) -> SearchHit {
     SearchHit {
         hit: SearchHitTarget::Symbol {
@@ -333,7 +375,9 @@ fn build_symbol_hit(
         score,
         matched_by,
         relationships: None,
-        source: Some(excerpt(matched.file, matched.symbol.range).text),
+        source: payloads
+            .source
+            .then(|| excerpt(matched.file, matched.symbol.range).text),
         diagnostics: None,
         span: Some(source_span(matched.file.path(), matched.symbol.range)),
         line: Some(line::line_number_at(
@@ -346,7 +390,15 @@ fn build_symbol_hit(
     }
 }
 
-fn file_search_hit(file: &IndexedFile, line_index: usize, text: String) -> SearchHit {
+/// Builds one file hit's wire shape. `text` is still needed to size `range` whether or not
+/// `payloads` asked for `source`, so only the field assignment - never the byte count - is
+/// conditional.
+fn file_search_hit(
+    file: &IndexedFile,
+    line_index: usize,
+    text: String,
+    payloads: HitPayloads,
+) -> SearchHit {
     let start = line::line_start_offset(file.source(), line_index);
     let end = start.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
     let range = ByteRange { start, end };
@@ -366,7 +418,7 @@ fn file_search_hit(file: &IndexedFile, line_index: usize, text: String) -> Searc
         score: 1.0,
         matched_by: vec![MatchedField::Content],
         relationships: None,
-        source: Some(text),
+        source: payloads.source.then_some(text),
         diagnostics: None,
         span: Some(source_span(file.path(), range)),
         line: Some(u64::try_from(line_index).unwrap_or(u64::MAX)),
@@ -394,11 +446,15 @@ const fn symbol_match_score(rank: SymbolMatchRank) -> f64 {
 /// requests' scores mean the same thing because one fusion produced both.
 fn collect_ranked_hits(
     index: &WorkspaceIndex,
-    query: &str,
-    target: SearchParamsTarget,
+    criteria: SearchCriteria<'_>,
     ranked: &[RankedUnit],
     results: &mut Vec<SearchHit>,
 ) {
+    let SearchCriteria {
+        query,
+        target,
+        payloads,
+    } = criteria;
     if matches!(target, SearchParamsTarget::All | SearchParamsTarget::Symbol) {
         for matched in ranked
             .iter()
@@ -412,7 +468,7 @@ fn collect_ranked_hits(
                 // zero); skipping it silently is correct, not a defect to surface.
                 continue;
             };
-            merge_symbol_hit(results, file, symbol, matched.score());
+            merge_symbol_hit(results, file, symbol, matched.score(), payloads);
         }
     }
     if matches!(target, SearchParamsTarget::All | SearchParamsTarget::File) {
@@ -421,7 +477,7 @@ fn collect_ranked_hits(
                 continue;
             };
             let (line_number, range, text) = locate_query_line(file.content(), query);
-            merge_file_hit(results, file, line_number, range, text, score);
+            merge_file_hit(results, file, line_number, range, text, score, payloads);
         }
     }
 }
@@ -493,6 +549,7 @@ fn merge_symbol_hit(
     file: &IndexedFile,
     symbol: &SyntaxSymbol,
     score: f64,
+    payloads: HitPayloads,
 ) {
     let identity = SymbolId(rift_core::symbol_identity(
         &file.syntax().language().identity_segment(),
@@ -517,6 +574,7 @@ fn merge_symbol_hit(
         matched,
         score,
         vec![MatchedField::Content],
+        payloads,
     ));
 }
 
@@ -529,6 +587,7 @@ fn merge_file_hit(
     range: ByteRange,
     text: String,
     score: f64,
+    payloads: HitPayloads,
 ) {
     let path = project_path(file.path());
     let existing = results.iter_mut().find(|hit| {
@@ -540,7 +599,14 @@ fn merge_file_hit(
         absorb_content_match(existing, score);
         return;
     }
-    results.push(ranked_file_hit(file, line_number, range, text, score));
+    results.push(ranked_file_hit(
+        file,
+        line_number,
+        range,
+        text,
+        score,
+        payloads,
+    ));
 }
 
 /// Records that `existing` also matched by content: adds [`MatchedField::Content`] when
@@ -558,6 +624,7 @@ fn ranked_file_hit(
     range: ByteRange,
     text: String,
     score: f64,
+    payloads: HitPayloads,
 ) -> SearchHit {
     SearchHit {
         hit: SearchHitTarget::File {
@@ -575,7 +642,7 @@ fn ranked_file_hit(
         score,
         matched_by: vec![MatchedField::Content],
         relationships: None,
-        source: Some(text),
+        source: payloads.source.then_some(text),
         diagnostics: None,
         span: Some(source_span(file.path(), range)),
         line: Some(line_number),
@@ -957,6 +1024,33 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
+    /// An omitted `include` never pays the `source` lookup: every hit still carries its
+    /// symbol or file, `path`, `span`, and `line`, and none carries `source`.
+    #[test]
+    fn search_without_include_omits_source_but_keeps_symbol_path_span_and_line() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "Beacon",
+            "limit": 10
+        }))?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let results = value["results"].as_array().ok_or("results must be array")?;
+        assert!(!results.is_empty());
+        assert!(
+            results.iter().all(|hit| hit["source"].is_null()),
+            "an omitted include must never carry source: {results:#?}"
+        );
+        assert!(
+            results.iter().all(|hit| !hit["path"].is_null()
+                && !hit["span"].is_null()
+                && !hit["line"].is_null()
+                && !hit["hit"].is_null()),
+            "an omitted include must still carry the hit's symbol or file, path, span, and \
+             line: {results:#?}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn symbol_scores_preserve_semantic_rank() {
         let scores = [
@@ -1056,7 +1150,8 @@ pub fn compute() -> i32 {
         let (_directory, service) = rich_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
             "query": "lookout marker",
-            "target": "file"
+            "target": "file",
+            "include": ["source"]
         }))?;
         let value = serde_json::to_value(service.search(&params, &[])?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
@@ -1395,7 +1490,8 @@ pub fn compute() -> i32 {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "phantom_gitignored",
             "target": "file",
-            "paths": {"force_include": ["gitignored.rs"]}
+            "paths": {"force_include": ["gitignored.rs"]},
+            "include": ["source"]
         }))?;
         let value = serde_json::to_value(service.search(&params, &[])?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
@@ -1597,10 +1693,17 @@ pub fn compute() -> i32 {
             },
             0.5,
             vec![MatchedField::Name],
+            super::HitPayloads::default(),
         );
         let mut results = vec![existing];
 
-        super::merge_symbol_hit(&mut results, file, symbol, 0.9);
+        super::merge_symbol_hit(
+            &mut results,
+            file,
+            symbol,
+            0.9,
+            super::HitPayloads::default(),
+        );
         assert_eq!(results.len(), 1, "the same symbol must not duplicate");
         assert_eq!(results[0].score, 0.9, "the higher score must win");
         assert_eq!(
@@ -1610,7 +1713,13 @@ pub fn compute() -> i32 {
 
         // A second merge at a lower score keeps the existing higher score and does not
         // duplicate the already-present Content field.
-        super::merge_symbol_hit(&mut results, file, symbol, 0.1);
+        super::merge_symbol_hit(
+            &mut results,
+            file,
+            symbol,
+            0.1,
+            super::HitPayloads::default(),
+        );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].score, 0.9);
         assert_eq!(
@@ -1713,8 +1822,11 @@ pub fn compute() -> i32 {
         let mut results = Vec::new();
         super::collect_ranked_hits(
             unrelated.index(),
-            "Beacon",
-            SearchParamsTarget::Symbol,
+            super::SearchCriteria {
+                query: "Beacon",
+                target: SearchParamsTarget::Symbol,
+                payloads: super::HitPayloads::default(),
+            },
             &ranked,
             &mut results,
         );
@@ -1741,8 +1853,11 @@ pub fn compute() -> i32 {
         let mut results = Vec::new();
         super::collect_ranked_hits(
             unrelated.index(),
-            "Beacon",
-            SearchParamsTarget::File,
+            super::SearchCriteria {
+                query: "Beacon",
+                target: SearchParamsTarget::File,
+                payloads: super::HitPayloads::default(),
+            },
             &ranked,
             &mut results,
         );
@@ -1790,8 +1905,11 @@ pub fn compute() -> i32 {
         let mut results = Vec::new();
         super::collect_ranked_hits(
             service.index(),
-            "word",
-            SearchParamsTarget::File,
+            super::SearchCriteria {
+                query: "word",
+                target: SearchParamsTarget::File,
+                payloads: super::HitPayloads::default(),
+            },
             &ranked,
             &mut results,
         );
@@ -1872,6 +1990,7 @@ pub fn compute() -> i32 {
             range,
             "alpha units beta".to_owned(),
             0.4,
+            super::HitPayloads::default(),
         );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].score, 0.4);
@@ -1884,6 +2003,7 @@ pub fn compute() -> i32 {
             range,
             "alpha units beta".to_owned(),
             0.9,
+            super::HitPayloads::default(),
         );
         assert_eq!(
             results.len(),
@@ -1905,6 +2025,7 @@ pub fn compute() -> i32 {
             range,
             "alpha units beta".to_owned(),
             0.1,
+            super::HitPayloads::default(),
         );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].score, 0.9);

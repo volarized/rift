@@ -44,6 +44,10 @@ fn corpus() -> Vec<(&'static str, Value)> {
             json!({ "name": "beacon_one", "include_history": true }),
         ),
         ("search", json!({ "query": "beacon" })),
+        (
+            "search",
+            json!({ "query": "beacon", "include": ["source"] }),
+        ),
         ("search", json!({ "query": "beacon", "limit": 1 })),
         (
             "search",
@@ -369,7 +373,7 @@ fn assert_no_bare_sha256_digest(value: &Value, context: &str) {
 /// `lexical_ranking_unavailable`: that warning is reserved for a tier that will not answer
 /// without operator action, and one that fired in ordinary operation would be one every
 /// caller learned to ignore.
-fn assert_wire_hygiene(name: &str, structured: &Value) {
+fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
     let context = format!("{name} result");
     assert_no_bare_sha256_digest(structured, &context);
     assert_source_unit_ids_use_project_resolver(structured, &context);
@@ -395,11 +399,26 @@ fn assert_wire_hygiene(name: &str, structured: &Value) {
     if name == "search"
         && let Some(results) = structured["results"].as_array()
     {
+        let source_requested = request["include"]
+            .as_array()
+            .is_some_and(|include| include.iter().any(|value| value == "source"));
         for hit in results {
             assert!(
                 !hit["path"].is_null(),
                 "a search hit's path must not be null: {hit:#}"
             );
+            if source_requested {
+                assert!(
+                    !hit["source"].is_null(),
+                    "a hit must carry source once the request names \
+                     include: [\"source\"]: {hit:#}"
+                );
+            } else {
+                assert!(
+                    hit["source"].is_null(),
+                    "a hit must omit source when the request never names it: {hit:#}"
+                );
+            }
         }
     }
 }
@@ -623,7 +642,7 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
                 .structured_content
                 .ok_or_else(|| format!("{name} must return structured content"))?;
             assert_validates(output_validator, &structured, &format!("{name} result"));
-            assert_wire_hygiene(name, &structured);
+            assert_wire_hygiene(name, &request, &structured);
             arms.observe(&structured);
             let Some(pagination) = structured.get("pagination") else {
                 break;
