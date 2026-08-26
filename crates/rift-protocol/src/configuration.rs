@@ -1223,8 +1223,9 @@ pub struct CommandHook {
     pub id: String,
     /// What the hook is: a test suite, a linter, a build, or something else.
     pub kind: HookKind,
-    /// The executable Rift starts. An absolute path is refused; a bare name
-    /// resolves through `PATH`, a relative one below `working_directory`.
+    /// The executable Rift starts. A bare name resolves through `PATH`; a
+    /// path resolves below `working_directory`. An absolute path or a `.`
+    /// or `..` segment is refused.
     #[schemars(length(min = 1))]
     pub program: String,
     /// The program's literal arguments, in order. May be empty.
@@ -1234,7 +1235,8 @@ pub struct CommandHook {
     /// byte order.
     pub changed_paths: ChangedPaths,
     /// Directory the process starts in, relative to the changed tree's
-    /// root. Empty selects the root.
+    /// root. Empty selects the root. An absolute path or a `.` or `..`
+    /// segment is refused.
     pub working_directory: ProjectPath,
     /// Environment values added on top of the environment the server
     /// inherited.
@@ -1475,6 +1477,22 @@ pub enum ConfigurationViolation {
         /// The refused executable path.
         program: String,
     },
+    /// A hook's `program` path carries a `.` or `..` segment, which could
+    /// resolve outside `working_directory`.
+    HookProgramDotSegment {
+        /// The hook naming the executable.
+        id: String,
+        /// The refused executable path.
+        program: String,
+    },
+    /// A hook's `working_directory` is not a project-relative path: it is
+    /// absolute, or carries a `.` or `..` segment.
+    HookWorkingDirectoryInvalid {
+        /// The hook declaring the directory.
+        id: String,
+        /// The rejected directory.
+        working_directory: String,
+    },
     /// A hook environment key is empty, or carries `=` or a NUL byte.
     HookEnvironmentKeyInvalid {
         /// The hook declaring the entry.
@@ -1595,9 +1613,17 @@ impl ConfigurationViolation {
                 vec![("id", id.clone())]
             }
             Self::HookProgramEmpty { id } => vec![("id", id.clone())],
-            Self::HookExecutableAbsolute { id, program } => {
+            Self::HookExecutableAbsolute { id, program }
+            | Self::HookProgramDotSegment { id, program } => {
                 vec![("id", id.clone()), ("program", program.clone())]
             }
+            Self::HookWorkingDirectoryInvalid {
+                id,
+                working_directory,
+            } => vec![
+                ("id", id.clone()),
+                ("working_directory", working_directory.clone()),
+            ],
             Self::HookEnvironmentKeyInvalid { id, key } => {
                 vec![("id", id.clone()), ("key", key.clone())]
             }
@@ -1708,6 +1734,7 @@ fn hooks_violation(hooks: &[CommandHook]) -> Option<ConfigurationViolation> {
 fn hook_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
     identity_violation(hook)
         .or_else(|| command_violation(hook))
+        .or_else(|| working_directory_violation(hook))
         .or_else(|| environment_violation(hook))
         .or_else(|| guarantee_violation(hook))
         .or_else(|| hook_bounds_violation(hook))
@@ -1720,17 +1747,51 @@ fn identity_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
     })
 }
 
-/// The rules on what the hook runs: a present, non-absolute program.
+/// The rules on what the hook runs: a present, non-absolute,
+/// dot-segment-free program.
 fn command_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
     if hook.program.is_empty() {
         return Some(ConfigurationViolation::HookProgramEmpty {
             id: hook.id.clone(),
         });
     }
-    is_absolute_program(&hook.program).then(|| ConfigurationViolation::HookExecutableAbsolute {
-        id: hook.id.clone(),
-        program: hook.program.clone(),
+    if is_absolute_program(&hook.program) {
+        return Some(ConfigurationViolation::HookExecutableAbsolute {
+            id: hook.id.clone(),
+            program: hook.program.clone(),
+        });
+    }
+    hook.program.split('/').any(is_dot_path_segment).then(|| {
+        ConfigurationViolation::HookProgramDotSegment {
+            id: hook.id.clone(),
+            program: hook.program.clone(),
+        }
     })
+}
+
+/// The rule on `working_directory`: empty selects the workspace root;
+/// otherwise it must be relative, with no `.` or `..` segment.
+fn working_directory_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
+    (!is_project_relative_path(&hook.working_directory.0)).then(|| {
+        ConfigurationViolation::HookWorkingDirectoryInvalid {
+            id: hook.id.clone(),
+            working_directory: hook.working_directory.0.clone(),
+        }
+    })
+}
+
+/// Whether `value` is a valid project-relative path: empty names the
+/// workspace root; a non-empty value must not be absolute (by
+/// [`is_absolute_program`]'s rule, which also refuses any backslash) and
+/// must carry no `.` or `..` segment.
+fn is_project_relative_path(value: &str) -> bool {
+    value.is_empty() || (!is_absolute_program(value) && !value.split('/').any(is_dot_path_segment))
+}
+
+/// Whether `segment` is `.` or `..`: a path segment that resolves outside
+/// the location it names.
+fn is_dot_path_segment(segment: &str) -> bool {
+    matches!(segment, "." | "..")
 }
 
 /// The rule on every `environment` entry's key.
@@ -3062,7 +3123,7 @@ mod tests {
 
     #[test]
     fn test_hook_command_rules_are_enforced() {
-        let break_and_expect: [HookBoundCase; 4] = [
+        let break_and_expect: [HookBoundCase; 7] = [
             (
                 |hook| hook.id = "spaced id".to_owned(),
                 |violation| matches!(violation, ConfigurationViolation::HookIdInvalid { .. }),
@@ -3089,8 +3150,111 @@ mod tests {
                     )
                 },
             ),
+            (
+                |hook| hook.program = "../evil".to_owned(),
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::HookProgramDotSegment { .. }
+                    )
+                },
+            ),
+            (
+                |hook| hook.program = "scripts/../evil".to_owned(),
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::HookProgramDotSegment { .. }
+                    )
+                },
+            ),
+            (
+                |hook| hook.program = "./evil".to_owned(),
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::HookProgramDotSegment { .. }
+                    )
+                },
+            ),
         ];
         assert_hooks_refused(break_and_expect);
+    }
+
+    #[test]
+    fn test_hook_working_directory_rules_are_enforced() {
+        let break_and_expect: [HookBoundCase; 5] = [
+            (
+                |hook| hook.working_directory = ProjectPath("/etc".to_owned()),
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::HookWorkingDirectoryInvalid { .. }
+                    )
+                },
+            ),
+            (
+                |hook| hook.working_directory = ProjectPath("C:\\Windows".to_owned()),
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::HookWorkingDirectoryInvalid { .. }
+                    )
+                },
+            ),
+            (
+                |hook| hook.working_directory = ProjectPath("..".to_owned()),
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::HookWorkingDirectoryInvalid { .. }
+                    )
+                },
+            ),
+            (
+                |hook| hook.working_directory = ProjectPath("../outside".to_owned()),
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::HookWorkingDirectoryInvalid { .. }
+                    )
+                },
+            ),
+            (
+                |hook| hook.working_directory = ProjectPath("scripts/../outside".to_owned()),
+                |violation| {
+                    matches!(
+                        violation,
+                        ConfigurationViolation::HookWorkingDirectoryInvalid { .. }
+                    )
+                },
+            ),
+        ];
+        assert_hooks_refused(break_and_expect);
+    }
+
+    #[test]
+    fn test_hook_working_directory_and_program_accept_project_relative_forms() {
+        let mut accepted = hook();
+        accepted.program = "scripts/tool".to_owned();
+        accepted.working_directory = ProjectPath("scripts".to_owned());
+        let with_relative_forms = WorkspaceConfiguration {
+            hooks: vec![accepted],
+            ..WorkspaceConfiguration::default()
+        };
+        assert_eq!(with_relative_forms.validate(), Ok(()));
+
+        let mut root = hook();
+        root.working_directory = ProjectPath(String::new());
+        let with_root = WorkspaceConfiguration {
+            hooks: vec![root],
+            ..WorkspaceConfiguration::default()
+        };
+        assert_eq!(
+            with_root.validate(),
+            Ok(()),
+            "an empty working_directory must keep meaning the workspace root"
+        );
     }
 
     #[test]
@@ -3276,6 +3440,20 @@ mod tests {
                     program: "/bin/echo".to_owned(),
                 },
                 vec![("id", id()), ("program", "/bin/echo".to_owned())],
+            ),
+            (
+                ConfigurationViolation::HookProgramDotSegment {
+                    id: id(),
+                    program: "../evil".to_owned(),
+                },
+                vec![("id", id()), ("program", "../evil".to_owned())],
+            ),
+            (
+                ConfigurationViolation::HookWorkingDirectoryInvalid {
+                    id: id(),
+                    working_directory: "../outside".to_owned(),
+                },
+                vec![("id", id()), ("working_directory", "../outside".to_owned())],
             ),
             (
                 ConfigurationViolation::HookEnvironmentKeyInvalid {

@@ -12,7 +12,9 @@ use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use rift_core::{CapturedStream, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX};
+use rift_core::{
+    CapturedStream, ProjectPath as CoreProjectPath, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX,
+};
 use rift_protocol::configuration::{ChangedPaths, CommandHook};
 use rift_protocol::read::ProjectPath;
 
@@ -84,11 +86,22 @@ fn run_one(hook: &CommandHook, tree_root: &Path, ordered_paths: &[&str]) -> Hook
             hook.program
         ));
     }
-
-    let working_directory = if hook.working_directory.0.is_empty() {
+    if has_dot_segment(&hook.program) {
+        return error(format!(
+            "executable path segment escapes the workspace: {}",
+            hook.program
+        ));
+    }
+    let Ok(working_directory) = CoreProjectPath::new(hook.working_directory.0.clone()) else {
+        return error(format!(
+            "working directory escapes the workspace: {}",
+            hook.working_directory.0
+        ));
+    };
+    let working_directory = if working_directory.as_str().is_empty() {
         tree_root.to_path_buf()
     } else {
-        tree_root.join(&hook.working_directory.0)
+        tree_root.join(working_directory.as_str())
     };
     let mut command = Command::new(&hook.program);
     command.args(&hook.arguments);
@@ -130,6 +143,16 @@ fn run_one(hook: &CommandHook, tree_root: &Path, ordered_paths: &[&str]) -> Hook
         stdout,
         stderr,
     }
+}
+
+/// Whether `program` carries a `.` or `..` segment, which could resolve
+/// outside `working_directory`. Configuration acceptance refuses this
+/// already; this check catches a `rift.toml` edited on disk after
+/// acceptance, which acceptance never saw.
+fn has_dot_segment(program: &str) -> bool {
+    program
+        .split('/')
+        .any(|segment| matches!(segment, "." | ".."))
 }
 
 /// The run's verdict from how the wait ended.
@@ -353,6 +376,86 @@ mod tests {
         let runs = run_hooks(&[hook("", &[])], directory.path(), &[]);
         let status = &runs[0].status;
         assert!(error_text(status).contains("program"), "{status:?}");
+    }
+
+    #[test]
+    fn test_bare_program_name_is_accepted() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let runs = run_hooks(&[hook("echo", &["hi"])], directory.path(), &[]);
+        assert_eq!(runs[0].status, HookStatus::Passed);
+    }
+
+    #[test]
+    fn test_project_relative_program_below_the_root_is_accepted() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let bin = directory.path().join("bin");
+        std::fs::create_dir(&bin).expect("create bin");
+        let script = bin.join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\necho below-root\n").expect("write script");
+        let mut permissions = std::fs::metadata(&script)
+            .expect("script metadata")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&script, permissions).expect("set script executable");
+        let runs = run_hooks(&[hook("bin/run.sh", &[])], directory.path(), &[]);
+        assert_eq!(runs[0].status, HookStatus::Passed, "{:?}", runs[0].status);
+    }
+
+    #[test]
+    fn test_program_dot_segment_is_refused_before_spawning() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        for program in ["../evil", "sub/../evil", "./evil"] {
+            let runs = run_hooks(&[hook(program, &[])], directory.path(), &[]);
+            let status = &runs[0].status;
+            assert!(
+                error_text(status).contains("escapes the workspace"),
+                "{program}: {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_absolute_working_directory_is_refused_before_spawning() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut escaping = hook("echo", &[]);
+        escaping.working_directory = ProjectPath("/etc".to_owned());
+        let runs = run_hooks(&[escaping], directory.path(), &[]);
+        let status = &runs[0].status;
+        assert!(
+            error_text(status).contains("working directory"),
+            "{status:?}"
+        );
+    }
+
+    #[test]
+    fn test_working_directory_dot_segment_is_refused_before_spawning() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        for working_directory in ["..", "../outside", "scripts/../outside"] {
+            let mut escaping = hook("echo", &[]);
+            escaping.working_directory = ProjectPath(working_directory.to_owned());
+            let runs = run_hooks(&[escaping], directory.path(), &[]);
+            let status = &runs[0].status;
+            assert!(
+                error_text(status).contains("working directory"),
+                "{working_directory}: {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_empty_working_directory_is_still_the_root() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut at_root = hook("pwd", &[]);
+        at_root.working_directory = ProjectPath(String::new());
+        let runs = run_hooks(&[at_root], directory.path(), &[]);
+        assert_eq!(runs[0].status, HookStatus::Passed);
+        let printed = runs[0].stdout.text.trim_end();
+        let canonical_root =
+            std::fs::canonicalize(directory.path()).expect("temporary directory must resolve");
+        assert_eq!(
+            std::fs::canonicalize(printed).expect("printed directory must resolve"),
+            canonical_root
+        );
     }
 
     #[test]
