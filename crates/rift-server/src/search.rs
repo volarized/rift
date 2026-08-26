@@ -1,5 +1,6 @@
-//! `search` tool execution: lexical symbol and source-line search, narrowed or extended by a
-//! request's `paths` selector. Extracted from `read` so that module stays below its size bound.
+//! `search` tool execution: lexical symbol and content-line search over syntax-indexed and
+//! `[search.text]` files alike, narrowed or extended by a request's `paths` selector.
+//! Extracted from `read` so that module stays below its size bound.
 
 use std::cmp::Ordering;
 use std::path::Path;
@@ -255,7 +256,7 @@ fn includes(matcher: Option<&PathMatcher>, root: &Path, path: &ProjectPath) -> b
     matcher.is_none_or(|matcher| matcher.includes(&root.join(path.as_str())))
 }
 
-/// Symbol and source-line hits from the index, filtered by `matcher` and collected up to
+/// Symbol and content-line hits from the index, filtered by `matcher` and collected up to
 /// `fetch_limit` - the index's `results_max` bound, never the smaller page size - because
 /// [`order_hits`] orders this whole pool before one page is cut out of it: stopping
 /// collection at the page size could drop a later, higher-scoring candidate, and the page
@@ -290,17 +291,47 @@ fn collect_indexed_hits(
     if results.len() < fetch_limit
         && matches!(target, SearchParamsTarget::All | SearchParamsTarget::File)
     {
-        for (file, line, text) in index
-            .source_matches(query, fetch_limit)
-            .map_err(ReadFault::index)?
-        {
-            if !includes(matcher, root, file.path()) {
-                continue;
-            }
-            results.push(file_search_hit(file, line, text, payloads));
-            if results.len() >= fetch_limit {
-                break;
-            }
+        collect_indexed_content_hits(index, matcher, root, query, fetch_limit, payloads, results)?;
+    }
+    Ok(())
+}
+
+/// Source-line and text-lane content-line hits for `query`, filtered by `matcher` and
+/// appended to `results` up to `fetch_limit`. A syntax-indexed file's line answers with
+/// `semantic: true`; a `[search.text]` file's line answers with `semantic: false`, the field
+/// whose description already reads "where no provider claims the path" - both lanes run the
+/// same lexical search, over the two file classes the index holds.
+fn collect_indexed_content_hits(
+    index: &WorkspaceIndex,
+    matcher: Option<&PathMatcher>,
+    root: &Path,
+    query: &str,
+    fetch_limit: usize,
+    payloads: HitPayloads,
+    results: &mut Vec<SearchHit>,
+) -> Result<(), ReadError> {
+    for (file, line, text) in index
+        .source_matches(query, fetch_limit)
+        .map_err(ReadFault::index)?
+    {
+        if !includes(matcher, root, file.path()) {
+            continue;
+        }
+        results.push(file_search_hit(file, line, text, payloads));
+        if results.len() >= fetch_limit {
+            return Ok(());
+        }
+    }
+    for (file, line, text) in index
+        .text_matches(query, fetch_limit)
+        .map_err(ReadFault::index)?
+    {
+        if !includes(matcher, root, file.path()) {
+            continue;
+        }
+        results.push(text_search_hit(file, line, text, payloads));
+        if results.len() >= fetch_limit {
+            break;
         }
     }
     Ok(())
@@ -408,6 +439,49 @@ fn file_search_hit(
                 regions: Vec::new(),
                 semantic: true,
             },
+        },
+        score: 1.0,
+        matched_by: vec![MatchedField::Content],
+        source: payloads.source.then_some(text),
+        span: Some(source_span(file.path(), range)),
+        line: Some(u64::try_from(line_index).unwrap_or(u64::MAX)),
+        path: Some(project_path(file.path())),
+        traversal_path: None,
+        distance: None,
+    }
+}
+
+/// Builds one text-lane file's wire value: no provider claims a text-lane path, so it carries
+/// no language and `semantic: false` - the field whose description already reads "where no
+/// provider claims the path". Shared by every hit a text-lane file produces, identifier-
+/// matched or ranked alike.
+fn text_file_wire(file: &TextSourceFile) -> File {
+    File {
+        id: file_id(file.path()),
+        content: FileContent::Regular {
+            size: u64::try_from(file.content().len()).unwrap_or(u64::MAX),
+            executable: false,
+        },
+        languages: Vec::new(),
+        regions: Vec::new(),
+        semantic: false,
+    }
+}
+
+/// Builds one text-lane content-line hit's wire shape, the same shape [`file_search_hit`]
+/// builds for a syntax-indexed file, over a `[search.text]` file instead.
+fn text_search_hit(
+    file: &TextSourceFile,
+    line_index: usize,
+    text: String,
+    payloads: HitPayloads,
+) -> SearchHit {
+    let start = line::line_start_offset(file.content(), line_index);
+    let end = start.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
+    let range = ByteRange { start, end };
+    SearchHit {
+        hit: SearchHitTarget::File {
+            file: text_file_wire(file),
         },
         score: 1.0,
         matched_by: vec![MatchedField::Content],
@@ -632,16 +706,7 @@ fn ranked_file_hit(
 ) -> SearchHit {
     SearchHit {
         hit: SearchHitTarget::File {
-            file: File {
-                id: file_id(file.path()),
-                content: FileContent::Regular {
-                    size: u64::try_from(file.content().len()).unwrap_or(u64::MAX),
-                    executable: false,
-                },
-                languages: Vec::new(),
-                regions: Vec::new(),
-                semantic: false,
-            },
+            file: text_file_wire(file),
         },
         score,
         matched_by: vec![MatchedField::Ranked],
@@ -954,34 +1019,120 @@ pub fn compute() -> i32 {
         let (_directory, service) = fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
             "query": "Beacon",
-            "limit": 3
+            "limit": 4
         }))?;
         let value = serde_json::to_value(service.search(&params, &[])?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
 
-        assert_eq!(results.len(), 3);
-        // The pool holds four candidates: both matching source lines and the struct symbol
-        // score 1.0, and the identity tie-break (`rift://file/...` sorts before
-        // `rift://symbol/...`) puts the file hits first; the `signal` method's substring
-        // match on the qualified name `Beacon::signal` scores lower and lands on the next
-        // page.
+        assert_eq!(results.len(), 4);
+        // The pool holds five candidates, all but one tied at score 1.0: two matching source
+        // lines in `src/lib.rs`, the text-lane `README.txt`'s one matching content line, and
+        // the struct symbol. The identity tie-break sorts `rift://file/README.txt` ahead of
+        // `rift://file/src/lib.rs` ahead of `rift://symbol/...`, so the text-lane hit leads
+        // and the struct symbol lands fourth; the `signal` method's substring match on the
+        // qualified name `Beacon::signal` scores lower and lands on the next page.
         assert_eq!(
             value["pagination"],
             json!({ "page_index": 0, "total_pages": 2 })
         );
         assert_eq!(results[0]["hit"]["target"], "file");
         assert_eq!(results[0]["score"], 1.0);
-        assert_eq!(results[0]["path"], json!("src/lib.rs"));
+        assert_eq!(results[0]["path"], json!("README.txt"));
+        assert_eq!(results[0]["hit"]["file"]["semantic"], json!(false));
         assert_eq!(results[1]["hit"]["target"], "file");
         assert_eq!(results[1]["score"], 1.0);
-        assert_eq!(results[2]["hit"]["target"], "symbol");
+        assert_eq!(results[1]["path"], json!("src/lib.rs"));
+        assert_eq!(results[2]["hit"]["target"], "file");
         assert_eq!(results[2]["score"], 1.0);
+        assert_eq!(results[2]["path"], json!("src/lib.rs"));
+        assert_eq!(results[3]["hit"]["target"], "symbol");
+        assert_eq!(results[3]["score"], 1.0);
         assert!(
-            results[2]["path"]
+            results[3]["path"]
                 .as_str()
                 .is_some_and(|path| !path.is_empty()),
             "every hit must carry a non-empty project-relative path: {:#?}",
-            results[2]
+            results[3]
+        );
+        Ok(())
+    }
+
+    /// Once the source lane alone fills `results_max`, `collect_indexed_content_hits`
+    /// returns before the text lane runs at all: a `[search.text]` file matching the same
+    /// query never joins the pool once the syntax-indexed source lane already spent it.
+    #[test]
+    fn search_source_lane_hitting_fetch_limit_skips_the_text_lane() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("src"))?;
+        let source = "// Beacon marker\npub fn foo() {}\n";
+        fs::write(directory.path().join("src/lib.rs"), source)?;
+        fs::write(directory.path().join("README.txt"), "Beacon docs\n")?;
+        let limits = WorkspaceIndexLimits::new(10, 4_096, 8_192, 8, 1).expect("positive limits");
+        let visibility = SourceVisibility::default();
+        let inclusion = rift_core::TextFileInclusion::default();
+        let history = HistoryConfiguration::default();
+        let service =
+            ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
+        let request = json!({
+            "query": "Beacon",
+            "target": "file",
+            "limit": 10
+        });
+        let params: SearchParams = serde_json::from_value(request)?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let results = value["results"].as_array().ok_or("results must be array")?;
+        assert_eq!(
+            results.len(),
+            1,
+            "the source lane alone fills results_max, so no other candidate joins the pool: \
+             {results:#?}"
+        );
+        assert_eq!(results[0]["hit"]["file"]["semantic"], json!(true));
+        assert!(
+            results.iter().all(|hit| hit["path"] != json!("README.txt")),
+            "the text lane never runs once the source lane already filled results_max: \
+             {results:#?}"
+        );
+        Ok(())
+    }
+
+    /// The text lane breaks the moment `results_max` is reached, leaving a later matching
+    /// candidate out of the pool - the pool never overshoots `results_max` even though
+    /// `text_matches` itself is called with the full bound rather than the room left.
+    #[test]
+    fn search_text_lane_stops_at_fetch_limit_leaving_a_later_candidate_out() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("src"))?;
+        let source = "// Beacon marker\npub fn foo() {}\n";
+        fs::write(directory.path().join("src/lib.rs"), source)?;
+        fs::write(directory.path().join("README.txt"), "Beacon docs\n")?;
+        fs::write(directory.path().join("notes.txt"), "Beacon notes\n")?;
+        let limits = WorkspaceIndexLimits::new(10, 4_096, 8_192, 8, 2).expect("positive limits");
+        let visibility = SourceVisibility::default();
+        let inclusion = rift_core::TextFileInclusion::default();
+        let history = HistoryConfiguration::default();
+        let service =
+            ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
+        let request = json!({
+            "query": "Beacon",
+            "target": "file",
+            "limit": 10
+        });
+        let params: SearchParams = serde_json::from_value(request)?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let results = value["results"].as_array().ok_or("results must be array")?;
+        assert_eq!(
+            results.len(),
+            2,
+            "the text lane stops the moment results_max is reached: {results:#?}"
+        );
+        let paths: Vec<_> = results.iter().map(|hit| hit["path"].clone()).collect();
+        assert!(paths.contains(&json!("src/lib.rs")));
+        assert!(paths.contains(&json!("README.txt")));
+        assert!(
+            !paths.contains(&json!("notes.txt")),
+            "the text lane never reaches notes.txt once results_max is already spent: \
+             {results:#?}"
         );
         Ok(())
     }
@@ -1165,6 +1316,95 @@ pub fn compute() -> i32 {
         assert_eq!(results.len(), 1);
         assert!(results[0]["line"].as_u64().is_some_and(|line| line > 1));
         assert_eq!(results[0]["source"], "    // lookout marker");
+        Ok(())
+    }
+
+    /// A sentence present in both a provider-claimed file (markdown, syntax index) and a
+    /// `.mdx` file (`[search.text]`, no provider claims it) returns both hits: the text-lane
+    /// lexical lane used to reach a text file only through the semantic tier, so this
+    /// sentence never reached the mdx file's hit before the lexical lane searched it too.
+    #[test]
+    fn search_returns_a_text_lane_hit_alongside_a_provider_claimed_hit_for_the_same_sentence()
+    -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let sentence = "agentic development toolkit";
+        fs::write(
+            directory.path().join("README.md"),
+            format!("# Rift\n\nRift is an {sentence}.\n"),
+        )?;
+        fs::write(
+            directory.path().join("guide.mdx"),
+            format!("Rift is an {sentence} for editors.\n"),
+        )?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": sentence,
+            "target": "file",
+            "limit": 10
+        }))?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let results = value["results"].as_array().ok_or("results must be array")?;
+        let readme = results
+            .iter()
+            .find(|hit| hit["hit"]["file"]["id"] == json!("rift://file/README.md"))
+            .ok_or("the provider-claimed file must return a hit")?;
+        assert_eq!(
+            readme["hit"]["file"]["semantic"],
+            json!(true),
+            "a provider-claimed file carries semantic true: {readme:#?}"
+        );
+        let mdx = results
+            .iter()
+            .find(|hit| hit["hit"]["file"]["id"] == json!("rift://file/guide.mdx"))
+            .ok_or("the text-lane file must return a hit through the lexical lane")?;
+        assert_eq!(
+            mdx["hit"]["file"]["semantic"],
+            json!(false),
+            "a text-lane file no provider claims carries semantic false: {mdx:#?}"
+        );
+        Ok(())
+    }
+
+    /// `justfile` carries no extension a `[search.text]` list could ever spell; the default
+    /// policy still reaches it by name alone, and a query for content only it holds returns
+    /// it.
+    #[test]
+    fn search_returns_a_justfile_hit_for_content_only_it_holds() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("justfile"),
+            "test:\n\tcargo test --workspace\n",
+        )?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "cargo test --workspace",
+            "target": "file",
+            "limit": 5
+        }))?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let results = value["results"].as_array().ok_or("results must be array")?;
+        assert_eq!(
+            results.len(),
+            1,
+            "only the justfile holds this content: {results:#?}"
+        );
+        assert_eq!(
+            results[0]["hit"]["file"]["id"],
+            json!("rift://file/justfile")
+        );
+        assert_eq!(results[0]["hit"]["file"]["semantic"], json!(false));
         Ok(())
     }
 
@@ -2080,12 +2320,14 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    /// `README.txt` reaches the answer only through the ranked lane - `collect_indexed_hits`
-    /// never reads a text file - so its hit proves a ranked-only match never claims
-    /// [`MatchedField::Content`]. The exact `Beacon` struct match reaches the answer through
-    /// both the identifier matcher and the ranked lane, and its hit carries both members.
+    /// The lexical lane now searches a text-lane file's content directly, so `README.txt`
+    /// reaches the answer through both the lexical lane (a literal `Beacon` in its content)
+    /// and the ranked lane, and its hit carries both members - exactly as the exact `Beacon`
+    /// struct match, reached through both the identifier matcher and the ranked lane, already
+    /// does. [`merge_symbol_hit`] and [`merge_file_hit`]'s own tests prove the absorb behavior
+    /// for a hit only one lane finds.
     #[tokio::test]
-    async fn search_matched_by_distinguishes_a_ranked_only_hit_from_one_both_lanes_found()
+    async fn search_matched_by_carries_both_members_once_the_lexical_lane_covers_text_files()
     -> TestResult {
         let (directory, service) = fixture()?;
         let database = directory.path().join("search.db");
@@ -2112,14 +2354,12 @@ pub fn compute() -> i32 {
             .find(|hit| {
                 matches!(&hit.hit, SearchHitTarget::File { file } if file.id.0.contains("README"))
             })
-            .ok_or("the text-only file must reach the answer through the ranked lane alone")?;
+            .ok_or("the text-lane file must reach the answer")?;
         assert!(
-            !readme.matched_by.contains(&MatchedField::Content),
-            "a ranked-only hit never claims literal content: {readme:#?}"
-        );
-        assert!(
-            readme.matched_by.contains(&MatchedField::Ranked),
-            "a ranked-only hit carries the ranked member: {readme:#?}"
+            readme.matched_by.contains(&MatchedField::Content)
+                && readme.matched_by.contains(&MatchedField::Ranked),
+            "the lexical lane finds README.txt's literal content and the ranked lane finds \
+             it too, so the hit carries both members: {readme:#?}"
         );
         Ok(())
     }

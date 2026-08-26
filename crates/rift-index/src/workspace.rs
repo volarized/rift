@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -13,8 +14,8 @@ use rift_core::constants::{
     WORKSPACE_FILES_MAX_DEFAULT, WORKSPACE_IGNORED_DIRECTORIES,
 };
 use rift_core::{
-    CompositionId, Error, ErrorCode, ErrorContext, ErrorName, Fault, ProjectPath, ProviderId,
-    SourceVisibility, TextFileInclusion, fault_label,
+    CompositionId, EXTENSIONLESS_SNIFF_BYTES_MAX, Error, ErrorCode, ErrorContext, ErrorName, Fault,
+    ProjectPath, ProviderId, SourceVisibility, TextFileInclusion, fault_label,
 };
 use rift_provider::{Component, CompositionBuilder, ProviderComposition};
 use rift_syntax::{
@@ -280,7 +281,9 @@ pub(crate) fn index_error_caused_by(
 }
 
 /// One immutable indexed Rust file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is not derived: `syntax` carries [`SyntaxDocument`], which is not `Eq`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexedFile {
     path: ProjectPath,
     source: String,
@@ -349,7 +352,9 @@ impl TextSourceFile {
 }
 
 /// Symbol plus source file matched by read index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Eq` is not derived: `symbol` and `file` carry types that are not `Eq`.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SymbolMatch<'a> {
     /// Containing file.
     pub file: &'a IndexedFile,
@@ -482,16 +487,19 @@ impl WorkspaceSourcePolicy {
     }
 
     /// Returns whether one source or included-text path passes current workspace policy:
-    /// visible, and carrying an extension a syntax provider serves or `[source.text]`
-    /// includes. Source and text-file candidates share this one predicate: only the
-    /// extension gate that includes a path in either class differs between them.
+    /// visible, and carrying an extension a syntax provider serves or eligible for the text
+    /// lane. Source and text-file candidates share this one predicate: only the extension
+    /// gate that includes a path in either class differs between them, and that text-lane
+    /// gate is `text_included`, the same one the scan's own `classify_path` consults, so
+    /// this answers exactly as a scan would classify the same path.
     #[must_use]
     pub fn includes(&self, path: &Path) -> bool {
         let Some(path) = self.normalized_path(path) else {
             return false;
         };
         let path = path.as_ref();
-        let extension_included = has_source_extension(path) || self.text_inclusion.includes(path);
+        let extension_included =
+            has_source_extension(path) || text_included(path, &self.text_inclusion);
         extension_included && self.visible_normalized(path)
     }
 
@@ -994,6 +1002,22 @@ impl WorkspaceIndex {
         Ok(source_line_matches(self.files(), query, limit))
     }
 
+    /// Finds lexical content lines containing `query` across included `[search.text]` files -
+    /// the same content-line search [`Self::source_matches`] runs over syntax-indexed files,
+    /// reaching a text-lane file's bytes directly rather than only through the semantic tier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] when limit exceeds configured maximum.
+    pub fn text_matches(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(&TextSourceFile, usize, String)>, WorkspaceIndexError> {
+        self.validate_result_limit(limit)?;
+        Ok(text_line_matches(self.text_files(), query, limit))
+    }
+
     /// Returns file by canonical project path.
     #[must_use]
     pub fn file(&self, path: &ProjectPath) -> Option<&IndexedFile> {
@@ -1138,10 +1162,34 @@ pub fn source_line_matches<'a>(
     query: &str,
     limit: usize,
 ) -> Vec<(&'a IndexedFile, usize, String)> {
+    line_matches(files, IndexedFile::source, query, limit)
+}
+
+/// Lexical content-line matches for `query` across included `[search.text]` files. Shared the
+/// same kernel as [`source_line_matches`]: the two file classes carry their whole text under
+/// different accessors, and the line scan itself does not care which.
+pub fn text_line_matches<'a>(
+    files: impl IntoIterator<Item = &'a TextSourceFile>,
+    query: &str,
+    limit: usize,
+) -> Vec<(&'a TextSourceFile, usize, String)> {
+    line_matches(files, TextSourceFile::content, query, limit)
+}
+
+/// Case-insensitive line scan behind [`source_line_matches`] and [`text_line_matches`]:
+/// `content` reads whichever field a file class holds its whole text in, and the scan itself
+/// is one representation shared by both classes and by an on-demand file set
+/// (`force_include`).
+fn line_matches<'a, File>(
+    files: impl IntoIterator<Item = &'a File>,
+    content: impl Fn(&'a File) -> &'a str,
+    query: &str,
+    limit: usize,
+) -> Vec<(&'a File, usize, String)> {
     let query = query.to_lowercase();
     let mut matches = Vec::new();
     for file in files {
-        for (line_index, line) in file.source().lines().enumerate() {
+        for (line_index, line) in content(file).lines().enumerate() {
             if line.to_lowercase().contains(&query) {
                 matches.push((file, line_index + 1, line.into()));
                 if matches.len() == limit {
@@ -1216,17 +1264,45 @@ struct DiscoveredPaths {
     text: Vec<PathBuf>,
 }
 
-/// Classifies `path` by extension alone, before any visibility policy is consulted: a
-/// provider-declared source extension is [`PathClass::Source`]; otherwise an extension
-/// [`TextFileInclusion`] includes is [`PathClass::Text`]; anything else is not a candidate.
+/// Classifies `path`, before any visibility policy is consulted: a provider-declared source
+/// extension is [`PathClass::Source`]; otherwise [`text_included`] decides [`PathClass::Text`];
+/// anything else is not a candidate.
 fn classify_path(path: &Path, text_inclusion: &TextFileInclusion) -> Option<PathClass> {
     if has_source_extension(path) {
-        Some(PathClass::Source)
-    } else if text_inclusion.includes(path) {
-        Some(PathClass::Text)
-    } else {
-        None
+        return Some(PathClass::Source);
     }
+    if text_included(path, text_inclusion) {
+        return Some(PathClass::Text);
+    }
+    None
+}
+
+/// Whether `path` is eligible for the text lane on its own name and bytes: a configured
+/// `[search.text]` extension, or no extension at all sniffed clean of a NUL byte within
+/// [`EXTENSIONLESS_SNIFF_BYTES_MAX`]. Shared by [`classify_path`] and
+/// [`WorkspaceSourcePolicy::includes`], the two places that decide whether a path joins the
+/// text lane, so a scan and the visibility predicate can never disagree about one candidate.
+fn text_included(path: &Path, text_inclusion: &TextFileInclusion) -> bool {
+    text_inclusion.includes(path) && (path.extension().is_some() || !extensionless_binary(path))
+}
+
+/// Whether an extensionless text-lane candidate's first [`EXTENSIONLESS_SNIFF_BYTES_MAX`]
+/// bytes hold a NUL byte, the signal a compiled artifact with no extension carries near its
+/// front. A candidate this process cannot open or read sniffs as binary too, so a race or a
+/// permission failure excludes the path rather than risks including it.
+fn extensionless_binary(path: &Path) -> bool {
+    let Ok(file) = fs::File::open(path) else {
+        return true;
+    };
+    let mut sniffed = Vec::new();
+    if file
+        .take(EXTENSIONLESS_SNIFF_BYTES_MAX)
+        .read_to_end(&mut sniffed)
+        .is_err()
+    {
+        return true;
+    }
+    sniffed.contains(&0)
 }
 
 /// Source and included text paths visible below `root`: the hard floor (`.git`, `.rift`,
@@ -1535,9 +1611,14 @@ fn source_walk(root: &Path, directory_depth_max: usize, gitignore: GitignorePoli
     builder.build()
 }
 
-/// The hard floor every workspace applies before `.gitignore` or
-/// `[source]` are consulted: `.git`, `.rift`, and `target` are never
-/// descended into, and a symlink is never followed or indexed.
+/// The hard floor every workspace applies before `.gitignore` or `[source]` are consulted:
+/// `.git`, `.rift`, and `target` are never descended into or indexed - whether the name
+/// resolves to a directory (the ordinary case, pruning the whole subtree) or, unusually, a
+/// file (a `.git` file in a worktree checkout, a stray `.rift` marker) - and a symlink is
+/// never followed or indexed. Excluding a file by this same name matters once an
+/// extensionless candidate can join the text lane on its own: `ProjectPath` refuses any path
+/// starting with `.rift`, so a `.rift` file left unfiltered here would abort the whole build
+/// instead of simply staying invisible.
 fn hard_floor_includes(entry: &DirEntry) -> bool {
     if entry.depth() == 0 {
         return true;
@@ -1545,10 +1626,7 @@ fn hard_floor_includes(entry: &DirEntry) -> bool {
     if entry.path_is_symlink() {
         return false;
     }
-    let is_dir = entry
-        .file_type()
-        .is_some_and(|file_type| file_type.is_dir());
-    !(is_dir && is_ignored_directory(entry.file_name()))
+    !is_hard_floor_name(entry.file_name())
 }
 
 /// Applies the hard floor to one absolute event path.
@@ -1590,7 +1668,9 @@ pub(crate) fn syntax_provider_for(path: &Path) -> &'static dyn SyntaxProvider {
     })
 }
 
-fn is_ignored_directory(name: &OsStr) -> bool {
+/// Whether `name` is one of the hard floor's names (`.git`, `.rift`, `target`), whatever the
+/// entry it names turns out to be - a directory or, unusually, a file.
+fn is_hard_floor_name(name: &OsStr) -> bool {
     name.to_str()
         .is_some_and(|name| WORKSPACE_IGNORED_DIRECTORIES.contains(&name))
 }
@@ -2345,6 +2425,25 @@ mod tests {
         assert!(!index.nodes(&path, 4).expect("indexed path").is_empty());
     }
 
+    /// `README.txt` reaches the index only through the text lane; `text_matches` finds its
+    /// content lines directly, the same way `source_matches` finds a syntax file's.
+    #[test]
+    fn test_index_text_matches_finds_content_lines_in_an_included_text_file() {
+        let directory = fixture();
+        let index = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+        )
+        .expect("workspace index");
+        let text = index.text_matches("ignored", 5).expect("lexical read");
+        assert_eq!(text.len(), 1);
+        assert_eq!(text[0].0.path().as_str(), "README.txt");
+        assert_eq!(text[0].1, 1);
+        assert_eq!(text[0].2, "ignored");
+    }
+
     #[test]
     fn test_workspace_source_policy_matches_configuration_gitignore_and_hard_floor() {
         let directory = fixture();
@@ -2433,6 +2532,8 @@ mod tests {
         fs::write(directory.path().join(".gitignore"), "hidden.mdx\n").expect("ignore policy");
         fs::write(directory.path().join("justfile"), "default:\n    echo hi\n")
             .expect("no extension at all");
+        fs::write(directory.path().join("notes.ini"), "[section]\nkey = 1\n")
+            .expect("an extension no provider or text policy claims");
         fs::write(directory.path().join("guide.mdx"), "guide").expect("no syntax provider");
         fs::write(directory.path().join("hidden.mdx"), "secret").expect("gitignored candidate");
         fs::write(
@@ -2451,11 +2552,19 @@ mod tests {
 
         assert!(
             policy.visible(&directory.path().join("justfile")),
-            "a tracked file no provider parses at all is still visible - patch reaches it"
+            "a tracked extensionless file is visible - patch reaches it"
         );
         assert!(
-            !policy.includes(&directory.path().join("justfile")),
-            "the extension gate still stands: the index never holds it"
+            policy.includes(&directory.path().join("justfile")),
+            "an extensionless file with no NUL byte joins the text lane by default"
+        );
+        assert!(
+            policy.visible(&directory.path().join("notes.ini")),
+            "a tracked file no provider or text policy claims is still visible"
+        );
+        assert!(
+            !policy.includes(&directory.path().join("notes.ini")),
+            "the extension gate still stands: an unclaimed extension never joins the index"
         );
         assert!(
             policy.visible(&directory.path().join("guide.mdx")),
@@ -3476,6 +3585,58 @@ mod tests {
         assert_eq!(classify_path(Path::new("logo.png"), &inclusion), None);
     }
 
+    /// `justfile` carries no extension a configured `[search.text]` list could ever spell;
+    /// it is eligible by name alone and holds no NUL byte, so it joins the text lane.
+    #[test]
+    fn test_classify_path_returns_text_for_an_extensionless_file_with_no_nul() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let path = directory.path().join("justfile");
+        fs::write(&path, "build:\n\tcargo build\n").expect("justfile");
+        let inclusion = TextFileInclusion::default();
+        assert_eq!(classify_path(&path, &inclusion), Some(PathClass::Text));
+    }
+
+    /// A NUL byte inside the sniff bound marks an extensionless candidate a compiled
+    /// artifact, which stays unindexed. This fixture's NUL sits at byte 8, well inside
+    /// [`EXTENSIONLESS_SNIFF_BYTES_MAX`].
+    #[test]
+    fn test_classify_path_excludes_an_extensionless_file_with_a_nul_within_the_sniff_bound() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let path = directory.path().join("artifact");
+        let mut bytes = vec![b'a'; 16];
+        bytes[8] = 0;
+        fs::write(&path, &bytes).expect("binary artifact");
+        let inclusion = TextFileInclusion::default();
+        assert_eq!(classify_path(&path, &inclusion), None);
+    }
+
+    /// A NUL byte past the sniff bound is never read, so the extensionless candidate still
+    /// joins the text lane. This fixture's only NUL sits eight bytes past
+    /// [`EXTENSIONLESS_SNIFF_BYTES_MAX`].
+    #[test]
+    fn test_classify_path_includes_an_extensionless_file_with_a_nul_past_the_sniff_bound() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let path = directory.path().join("scriptlike");
+        let sniff_bound = usize::try_from(EXTENSIONLESS_SNIFF_BYTES_MAX).expect("bound fits usize");
+        let mut bytes = vec![b'a'; sniff_bound + 16];
+        bytes[sniff_bound + 8] = 0;
+        fs::write(&path, &bytes).expect("late-nul file");
+        let inclusion = TextFileInclusion::default();
+        assert_eq!(classify_path(&path, &inclusion), Some(PathClass::Text));
+    }
+
+    /// A provider claims a path by extension alone, so an extensionless file never becomes
+    /// `Source`, whatever a syntax provider could parse from its content: the default
+    /// inclusion and the sniff apply to the text lane only.
+    #[test]
+    fn test_classify_path_extensionless_file_never_classifies_as_source() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let path = directory.path().join("Dockerfile");
+        fs::write(&path, "FROM scratch\n").expect("dockerfile");
+        let inclusion = TextFileInclusion::default();
+        assert_ne!(classify_path(&path, &inclusion), Some(PathClass::Source));
+    }
+
     #[test]
     fn test_build_includes_text_files_behind_gitignore_and_source_excludes() {
         let directory = tempfile::tempdir().expect("temporary workspace");
@@ -3504,8 +3665,9 @@ mod tests {
             .collect();
         assert_eq!(
             text_paths,
-            ["docs/notes.mdx"],
-            "the markdown provider claims md, so only mdx stays a text file"
+            [".gitignore", "docs/notes.mdx"],
+            "the markdown provider claims md, so only mdx stays a text file; `.gitignore` \
+             itself carries no extension, so it joins the text lane by default"
         );
         let source_paths: Vec<&str> = index.files().map(|file| file.path().as_str()).collect();
         assert_eq!(

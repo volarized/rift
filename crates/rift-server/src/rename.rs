@@ -1451,6 +1451,8 @@ mod tests {
                 end: source.len() as u64,
             },
             body_range: None,
+            signatures: Vec::new(),
+            documentation: Vec::new(),
         };
         assert_eq!(
             declaration_name_offset(source, &symbol),

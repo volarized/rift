@@ -6,7 +6,7 @@
 //! plugs in without touching the walk or its node and depth budgets.
 
 use rift_core::Error;
-use rift_protocol::read::SymbolFacet;
+use rift_protocol::read::{Documentation, Extensions, Language, Signature, SymbolFacet};
 use tree_sitter::Node;
 
 use crate::document::{ByteRange, SyntaxNode, SyntaxSymbol};
@@ -50,6 +50,10 @@ pub(crate) struct Declaration {
     pub(crate) visibility: Option<String>,
     /// The implementation part's span; `None` for a declaration without one.
     pub(crate) body_range: Option<ByteRange>,
+    /// Doc comments the grammar attaches to this declaration; empty when
+    /// nothing attaches. Carried through to [`SyntaxSymbol::documentation`]
+    /// unchanged - the walk itself never inspects a comment's syntax.
+    pub(crate) documentation: Vec<Documentation>,
 }
 
 /// Converts one node's span to the wire byte width.
@@ -71,6 +75,7 @@ pub(crate) fn extract(
     root: Node<'_>,
     source: SyntaxSource<'_>,
     limits: SyntaxLimits,
+    language: &Language,
     rules: &dyn GrammarRules,
 ) -> Result<(Vec<SyntaxNode>, Vec<SyntaxSymbol>), SyntaxError> {
     let text = source.text;
@@ -108,6 +113,7 @@ pub(crate) fn extract(
                 text,
                 &qualification,
                 range,
+                language,
                 rules,
             )?);
         }
@@ -138,17 +144,22 @@ pub(crate) fn extract(
 }
 
 /// Places one rendered declaration in the file's symbol space: qualification,
-/// container, and the attachment-extended span.
+/// container, the attachment-extended span, and the signature its facets and
+/// body range derive.
 fn qualified_symbol(
     declaration: Declaration,
     node: Node<'_>,
     text: &str,
     qualification: &str,
     item_range: ByteRange,
+    language: &Language,
     rules: &dyn GrammarRules,
 ) -> Result<SyntaxSymbol, SyntaxError> {
     let start = rules.declaration_start(node, text);
     let start = u64::try_from(start).map_err(|source| position_overflow(node, source))?;
+    let signatures = callable_signature(&declaration, node, text, language)
+        .into_iter()
+        .collect();
     Ok(SyntaxSymbol {
         qualified_name: qualify(
             rules.qualification_separator(),
@@ -166,6 +177,48 @@ fn qualified_symbol(
         },
         item_range,
         body_range: declaration.body_range,
+        signatures,
+        documentation: declaration.documentation,
+    })
+}
+
+/// One rendered callable form for a declaration the grammar marks
+/// [`SymbolFacet::Callable`] and gives an implementation: the source text
+/// from the declaration's own item start to where that implementation
+/// begins, trimmed of trailing whitespace. `None` for a declaration that is
+/// not callable, or one with no implementation - a trait method with no
+/// body, an interface method signature.
+///
+/// This is the one place `signatures` is derived: every provider's grammar
+/// already states whether a kind is callable (`Declaration::facets`) and
+/// where its implementation starts (`Declaration::body_range`), so deriving
+/// the header here, once, keeps a match on language out of this walk.
+fn callable_signature(
+    declaration: &Declaration,
+    node: Node<'_>,
+    text: &str,
+    language: &Language,
+) -> Option<Signature> {
+    if !declaration.facets.contains(&SymbolFacet::Callable) {
+        return None;
+    }
+    let body_range = declaration.body_range?;
+    let start = node.start_byte();
+    let end = usize::try_from(body_range.start)
+        .unwrap_or(text.len())
+        .min(text.len());
+    let display = text.get(start..end)?.trim_end().to_owned();
+    Some(Signature {
+        display,
+        links: Vec::new(),
+        language: language.clone(),
+        receiver: None,
+        parameters: Vec::new(),
+        returns: Vec::new(),
+        type_parameters: Vec::new(),
+        throws: Vec::new(),
+        effects: Vec::new(),
+        extensions: Extensions(std::collections::BTreeMap::new()),
     })
 }
 

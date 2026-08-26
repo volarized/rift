@@ -44,6 +44,11 @@
 //!   its value node's span.
 //! - Members carry no visibility and no portable symbol facet: `visibility`
 //!   stays `None` and `facets` stays empty.
+//! - `signatures` and `documentation` stay empty for every member and every
+//!   table: TOML has no callable form - a pair's `body_range` names a
+//!   value, not an implementation, and carries no `Callable` facet - and,
+//!   with nothing attached in front of a declaration, no comment for one to
+//!   carry either.
 
 use std::sync::OnceLock;
 
@@ -260,6 +265,7 @@ impl TomlRules {
             facets: Vec::new(),
             visibility: None,
             body_range,
+            documentation: Vec::new(),
         }))
     }
 
@@ -276,6 +282,7 @@ impl TomlRules {
             facets: Vec::new(),
             visibility: None,
             body_range: None,
+            documentation: Vec::new(),
         })
     }
 }
@@ -391,7 +398,13 @@ impl SyntaxProvider for TomlSyntaxProvider {
         let rules = TomlRules {
             kinds: toml_kinds(),
         };
-        let (nodes, symbols) = extract::extract(tree.root_node(), source, self.limits, &rules)?;
+        let (nodes, symbols) = extract::extract(
+            tree.root_node(),
+            source,
+            self.limits,
+            &self.language,
+            &rules,
+        )?;
         Ok(SyntaxDocument::new(
             self.language.clone(),
             source.path.clone(),

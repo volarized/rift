@@ -9,6 +9,7 @@
 
 use std::sync::OnceLock;
 
+use rift_protocol::read::{Documentation, DocumentationFormat};
 use tree_sitter::Node;
 
 /// Grammar field naming the marker that classifies a `line_comment` or
@@ -123,6 +124,83 @@ fn is_attached(node: Node<'_>) -> bool {
         return node.child_by_field_name(OUTER_DOC_MARKER_FIELD).is_some();
     }
     false
+}
+
+/// Reports whether `node` is specifically an outer doc comment - `///` or
+/// `/** */` - never an attribute. [`declaration_start`] extends a
+/// declaration's span over both; only a doc comment carries documentation
+/// text.
+fn is_doc_comment(node: Node<'_>) -> bool {
+    let kinds = attachment_kinds();
+    let kind_id = node.kind_id();
+    (kind_id == kinds.line_comment || kind_id == kinds.block_comment)
+        && node.child_by_field_name(OUTER_DOC_MARKER_FIELD).is_some()
+}
+
+/// Doc-comment text attached in front of `node` - the same siblings
+/// [`declaration_start`] extends the span over, filtered to outer doc
+/// comments alone, since an attribute contributes no text - stripped of
+/// comment syntax and joined in source order. Empty when nothing attaches.
+pub(super) fn attached_documentation(node: Node<'_>, text: &str) -> Vec<Documentation> {
+    let mut front = node;
+    let mut comments: Vec<&str> = Vec::new();
+    while let Some(previous) = front.prev_sibling() {
+        if !is_attached(previous) {
+            break;
+        }
+        // As in `declaration_start`: tree-sitter guarantees every sibling's byte range
+        // indexes validly into the exact text it was parsed from, so these two `None` arms
+        // guard a caller contract (text must be that same source), not a reachable parse
+        // outcome.
+        let Some(previous_text) = text.get(previous.byte_range()) else {
+            break;
+        };
+        let Some(gap) = text.get(previous.end_byte()..front.start_byte()) else {
+            break;
+        };
+        if !gap_permits_attachment(previous_text, gap) {
+            break;
+        }
+        if is_doc_comment(previous) {
+            comments.push(previous_text);
+        }
+        front = previous;
+    }
+    if comments.is_empty() {
+        return Vec::new();
+    }
+    comments.reverse();
+    let text = comments
+        .iter()
+        .map(|comment| strip_doc_comment_marker(comment))
+        .collect::<Vec<_>>()
+        .join("\n");
+    vec![Documentation {
+        format: DocumentationFormat::Markdown,
+        text,
+    }]
+}
+
+/// Strips one doc comment's syntax, keeping its written text: `///` (with
+/// one following space, when present) from a line comment, or the `/**`
+/// `*/` delimiters and surrounding whitespace from a block comment.
+///
+/// Its only caller passes text `is_doc_comment` already accepted, and the pinned grammar's
+/// outer doc markers guarantee that text always starts with `///` or with `/**` and ends
+/// with `*/` - `////` and `/***` carry no outer marker at all, so neither reaches this
+/// function. The trailing branch has no known input that reaches it.
+fn strip_doc_comment_marker(comment: &str) -> String {
+    let trimmed = comment.trim_end_matches(['\n', '\r']);
+    if let Some(rest) = trimmed.strip_prefix("///") {
+        rest.strip_prefix(' ').unwrap_or(rest).to_owned()
+    } else if let Some(rest) = trimmed
+        .strip_prefix("/**")
+        .and_then(|rest| rest.strip_suffix("*/"))
+    {
+        rest.trim().to_owned()
+    } else {
+        trimmed.to_owned()
+    }
 }
 
 /// Reports whether the whitespace between an attachable sibling and the
@@ -275,5 +353,71 @@ mod tests {
     #[test]
     fn gap_with_non_whitespace_content_does_not_permit_attachment() {
         assert!(!gap_permits_attachment("/// doc\n", "x"));
+    }
+
+    #[test]
+    fn a_single_line_doc_comment_becomes_one_documentation_entry_with_the_marker_stripped() {
+        let text = "/// A beacon.\npub struct Beacon;\n";
+        let symbols = symbols(text);
+        assert_eq!(symbols[0].documentation.len(), 1);
+        assert_eq!(symbols[0].documentation[0].text, "A beacon.");
+        assert_eq!(
+            symbols[0].documentation[0].format,
+            rift_protocol::read::DocumentationFormat::Markdown
+        );
+    }
+
+    #[test]
+    fn adjacent_doc_comment_lines_join_with_a_newline_in_source_order() {
+        let text = "/// Level.\n/// Second line.\npub enum Level {\n    Low,\n}\n";
+        let symbols = symbols(text);
+        assert_eq!(symbols[0].documentation.len(), 1);
+        assert_eq!(symbols[0].documentation[0].text, "Level.\nSecond line.");
+    }
+
+    #[test]
+    fn a_block_doc_comment_strips_its_delimiters() {
+        let text = "/** Beacon docs. */\npub struct Beacon;\n";
+        let symbols = symbols(text);
+        assert_eq!(symbols[0].documentation.len(), 1);
+        assert_eq!(symbols[0].documentation[0].text, "Beacon docs.");
+    }
+
+    /// An attached attribute is not a doc comment: the declaration's `range` still extends
+    /// over it, but `documentation` stays empty.
+    #[test]
+    fn an_attached_attribute_with_no_doc_comment_leaves_documentation_empty() {
+        let text = "#[derive(Debug)]\npub struct Beacon;\n";
+        let symbols = symbols(text);
+        assert_ne!(
+            symbols[0].range, symbols[0].item_range,
+            "the attribute still attaches"
+        );
+        assert!(symbols[0].documentation.is_empty());
+    }
+
+    /// A plain `//` comment never attaches at all, so it carries no documentation.
+    #[test]
+    fn a_plain_comment_leaves_documentation_empty() {
+        let text = "// just a note\npub struct Beacon;\n";
+        let symbols = symbols(text);
+        assert!(symbols[0].documentation.is_empty());
+    }
+
+    #[test]
+    fn a_declaration_with_nothing_attached_leaves_documentation_empty() {
+        let text = "pub struct Beacon;\n";
+        let symbols = symbols(text);
+        assert!(symbols[0].documentation.is_empty());
+    }
+
+    /// A doc comment attached to one declaration never leaks into its neighbor's.
+    #[test]
+    fn documentation_does_not_leak_across_adjacent_declarations() {
+        let text = "/// Doc A.\nstruct A;\nstruct B;\n";
+        let symbols = symbols(text);
+        assert_eq!(symbols.len(), 2);
+        assert_eq!(symbols[0].documentation[0].text, "Doc A.");
+        assert!(symbols[1].documentation.is_empty());
     }
 }

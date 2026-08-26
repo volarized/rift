@@ -31,6 +31,10 @@
 //! - Headings carry no visibility and no portable symbol facet: `visibility`
 //!   stays `None` and `facets` stays empty.
 //! - A document with no headings emits no symbols; its nodes still serve.
+//! - `signatures` and `documentation` stay empty for every heading: a
+//!   heading has no callable form, and its `body_range` is the section's own
+//!   prose, not a preceding comment, so there is nothing to attach as
+//!   documentation.
 
 use std::num::NonZeroU16;
 use std::sync::OnceLock;
@@ -204,6 +208,7 @@ impl MarkdownRules {
             facets: Vec::new(),
             visibility: None,
             body_range: section_body_range(section, heading)?,
+            documentation: Vec::new(),
         }))
     }
 
@@ -220,6 +225,7 @@ impl MarkdownRules {
             facets: Vec::new(),
             visibility: None,
             body_range: None,
+            documentation: Vec::new(),
         })
     }
 }
@@ -328,7 +334,13 @@ impl SyntaxProvider for MarkdownSyntaxProvider {
         let rules = MarkdownRules {
             kinds: markdown_kinds(),
         };
-        let (nodes, symbols) = extract::extract(tree.root_node(), source, self.limits, &rules)?;
+        let (nodes, symbols) = extract::extract(
+            tree.root_node(),
+            source,
+            self.limits,
+            &self.language,
+            &rules,
+        )?;
         Ok(SyntaxDocument::new(
             self.language.clone(),
             source.path.clone(),
