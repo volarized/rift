@@ -542,7 +542,9 @@ pub(crate) fn workspace_tree_root(workspace_root: &Path) -> Result<TreeRoot, Pla
 }
 
 /// Compiles per-file text edits into whole-file rewrites, dropping a file
-/// whose edits change nothing.
+/// whose edits change nothing. Each rewrite writes its file whole and
+/// carries the regions the engine's own edits named, which is what the
+/// result reports.
 pub(crate) async fn compiled_rewrites(
     workspace_root: &Path,
     documents: Vec<(CoreProjectPath, Vec<TextEdit>)>,

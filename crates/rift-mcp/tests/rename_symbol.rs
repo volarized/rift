@@ -97,12 +97,21 @@ async fn applied_rename_rewrites_every_referencing_file() -> TestResult {
         "both files carry the rename"
     );
     assert_eq!(
-        structured["summary"]["edits"]
-            .as_array()
-            .map(Vec::len)
-            .unwrap_or_default(),
-        2,
-        "one whole-file edit per rewritten file"
+        structured["summary"]["edits"],
+        json!([
+            {
+                "kind": "replace",
+                "span": { "unit": "rift://file/lib.rs", "range": { "start": 7, "end": 13 } },
+                "text": "flare"
+            },
+            {
+                "kind": "replace",
+                "span": { "unit": "rift://file/main.rs", "range": { "start": 18, "end": 24 } },
+                "text": "flare"
+            }
+        ]),
+        "each edit names the identifier the proposal resolved, not the file it stood in: \
+         {structured:#}"
     );
     assert!(
         survivor_findings(&structured).is_empty(),
