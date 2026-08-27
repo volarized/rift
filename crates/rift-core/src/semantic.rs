@@ -2,10 +2,11 @@
 
 use std::collections::BTreeSet;
 
-use rift_protocol::read::{
-    Documentation, ExtensionKey, Extensions, NodeId, Signature, SymbolFacet, TypeBinding,
+use rift_protocol::read::ExtensionKey;
+pub use rift_protocol::read::{
+    Documentation, DocumentationFormat, ExactKind, Extensions, Language, NodeId, Signature,
+    SourceKind, SourceLocation, SymbolFacet, TypeBinding,
 };
-pub use rift_protocol::read::{ExactKind, Language, SourceKind, SourceLocation};
 use serde::Serialize;
 
 use crate::{

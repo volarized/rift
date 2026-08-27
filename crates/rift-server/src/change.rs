@@ -2267,8 +2267,18 @@ mod tests {
     async fn insert_symbol_after_then_remove_symbol_round_trips_to_the_original_bytes() -> TestResult
     {
         for case in language_cases() {
-            assert_insert_then_remove_round_trips(&case, case.packed, "a").await?;
-            assert_insert_then_remove_round_trips(&case, case.two_on_one_line, "b").await?;
+            Box::pin(assert_insert_then_remove_round_trips(
+                &case,
+                case.packed,
+                "a",
+            ))
+            .await?;
+            Box::pin(assert_insert_then_remove_round_trips(
+                &case,
+                case.two_on_one_line,
+                "b",
+            ))
+            .await?;
         }
         Ok(())
     }

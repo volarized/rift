@@ -6,6 +6,8 @@ mod database;
 mod glob;
 mod lexical;
 mod log;
+mod semantic;
+
 mod revision;
 mod vector;
 mod workspace;

@@ -282,7 +282,7 @@ fn collect_indexed_hits(
             if !includes(matcher, root, matched.file.path()) {
                 continue;
             }
-            results.push(symbol_search_hit(matched, payloads));
+            results.push(symbol_search_hit(index, matched, payloads));
             if results.len() >= fetch_limit {
                 return Ok(());
             }
@@ -365,7 +365,7 @@ fn collect_force_include_hits(
         .map_err(ReadFault::index)?;
     if matches!(target, SearchParamsTarget::All | SearchParamsTarget::Symbol) {
         for matched in rift_index::symbol_matches(&extra, query, fetch_limit - results.len()) {
-            results.push(symbol_search_hit(matched, payloads));
+            results.push(symbol_search_hit(index, matched, payloads));
         }
     }
     if results.len() < fetch_limit
@@ -380,9 +380,13 @@ fn collect_force_include_hits(
     Ok(())
 }
 
-fn symbol_search_hit(matched: SymbolMatch<'_>, payloads: HitPayloads) -> SearchHit {
+fn symbol_search_hit(
+    index: &WorkspaceIndex,
+    matched: SymbolMatch<'_>,
+    payloads: HitPayloads,
+) -> SearchHit {
     let score = symbol_match_score(matched.rank);
-    build_symbol_hit(matched, score, vec![MatchedField::Name], payloads)
+    build_symbol_hit(index, matched, score, vec![MatchedField::Name], payloads)
 }
 
 /// Builds one symbol hit's wire shape. `symbol_search_hit` and `merge_symbol_hit` share
@@ -390,6 +394,7 @@ fn symbol_search_hit(matched: SymbolMatch<'_>, payloads: HitPayloads) -> SearchH
 /// produced the match. The excerpt behind `source` is sliced only when `payloads` asked for
 /// it, so a request that omits `include` never pays that lookup.
 fn build_symbol_hit(
+    index: &WorkspaceIndex,
     matched: SymbolMatch<'_>,
     score: f64,
     matched_by: Vec<MatchedField>,
@@ -397,7 +402,7 @@ fn build_symbol_hit(
 ) -> SearchHit {
     SearchHit {
         hit: SearchHitTarget::Symbol {
-            symbol: wire_symbol(matched),
+            symbol: wire_symbol(index, matched),
         },
         score,
         matched_by,
@@ -540,7 +545,7 @@ fn collect_ranked_hits(
             if !includes(matcher, root, file.path()) {
                 continue;
             }
-            merge_symbol_hit(results, file, symbol, matched.score(), payloads);
+            merge_symbol_hit(index, results, file, symbol, matched.score(), payloads);
         }
     }
     if matches!(target, SearchParamsTarget::All | SearchParamsTarget::File) {
@@ -620,6 +625,7 @@ fn locate_query_line(content: &str, query: &str) -> (u64, ByteRange, String) {
 /// Merges one resolved ranked symbol unit: an identifier-matched hit for the same symbol
 /// keeps its place and absorbs `score`; otherwise the ranked hit joins `results` new.
 fn merge_symbol_hit(
+    index: &WorkspaceIndex,
     results: &mut Vec<SearchHit>,
     file: &IndexedFile,
     symbol: &SyntaxSymbol,
@@ -646,6 +652,7 @@ fn merge_symbol_hit(
         rank: SymbolMatchRank::Substring,
     };
     results.push(build_symbol_hit(
+        index,
         matched,
         score,
         vec![MatchedField::Ranked],
@@ -2044,6 +2051,7 @@ pub fn compute() -> i32 {
         let (_directory, service) = fixture()?;
         let (file, symbol) = indexed_symbol(&service, "src/lib.rs", "Beacon")?;
         let existing = super::build_symbol_hit(
+            service.index(),
             super::SymbolMatch {
                 file,
                 symbol,
@@ -2056,6 +2064,7 @@ pub fn compute() -> i32 {
         let mut results = vec![existing];
 
         super::merge_symbol_hit(
+            service.index(),
             &mut results,
             file,
             symbol,
@@ -2072,6 +2081,7 @@ pub fn compute() -> i32 {
         // A second merge at a lower score keeps the existing higher score and does not
         // duplicate the already-present Semantic field.
         super::merge_symbol_hit(
+            service.index(),
             &mut results,
             file,
             symbol,
