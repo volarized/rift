@@ -72,7 +72,7 @@ pub struct SearchFault {
     violation: SearchViolation,
     subject: Option<String>,
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
-    carried: Option<CarriedIdentity>,
+    carried: Option<Box<CarriedIdentity>>,
 }
 
 /// The registry identity a wrapped failure already carried.
@@ -86,6 +86,7 @@ pub struct SearchFault {
 struct CarriedIdentity {
     name: ErrorName,
     limit: Option<LimitEvidence>,
+    context: Vec<ErrorContext>,
 }
 
 impl SearchFault {
@@ -114,15 +115,21 @@ impl SearchFault {
         self
     }
 
-    /// Adopts the registry identity and limit evidence `carried` already
-    /// classified itself as, so a bound a wrapped store enforced still reaches
-    /// the caller as that bound.
+    /// Adopts the registry identity, limit evidence, and typed evidence
+    /// `carried` already classified itself as, so a bound a wrapped store
+    /// enforced still reaches the caller as that bound, naming the field.
+    ///
+    /// The carried evidence is adopted as evidence, never as a rendered
+    /// sentence: rendering the wrapped failure into a `subject` repeated its
+    /// explanation and its action inside this one's, which is the stuttering
+    /// message v0.0.21 removed.
     #[must_use]
     pub fn carrying(mut self, carried: &dyn Fault) -> Self {
-        self.carried = Some(CarriedIdentity {
+        self.carried = Some(Box::new(CarriedIdentity {
             name: carried.name(),
             limit: carried.limit_evidence(),
-        });
+            context: carried.context(),
+        }));
         self
     }
 
@@ -152,6 +159,15 @@ impl Fault for SearchFault {
         if let Some(subject) = &self.subject {
             context.push(ErrorContext::new("subject", subject.clone()));
         }
+        let Some(carried) = &self.carried else {
+            return context;
+        };
+        // The wrapped fault's own violation label is this failure's cause, not a second
+        // violation: two `violation` entries in one message read as two failures.
+        context.extend(carried.context.iter().map(|entry| match entry.key() {
+            "violation" => ErrorContext::new("cause", entry.value()),
+            _ => entry.clone(),
+        }));
         context
     }
 

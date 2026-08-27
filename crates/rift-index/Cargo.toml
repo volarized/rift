@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 ignore.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 rift-core.workspace = true
 rift-history.workspace = true
 serde.workspace = true

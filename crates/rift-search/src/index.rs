@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use tokio::sync::Mutex as AsyncMutex;
 
 use rift_core::ProjectPath;
+use rift_index::{DatabasePool, WorkspaceDatabase};
 use rift_index::{
     LexicalChange, LexicalIndexError, LexicalIndexLimits, LexicalMatch, LexicalSearchIndex,
     LexicalUnit, LexicalUnitKind, RevisionScoped, SemanticVectorStore, StoredVector,
@@ -464,15 +465,15 @@ pub struct SearchIndex {
 }
 
 impl SearchIndex {
-    /// Opens both stores against one database file.
+    /// Opens the workspace database and attaches both tiers to its one pool.
     ///
-    /// The two apply one idempotent migration set, so opening the same file
-    /// again reads what the previous open left.
+    /// The tiers share the pool rather than opening one each: `SQLite`
+    /// serializes writers per file, so a second pool adds connections that lose
+    /// the same lock, never throughput.
     ///
     /// # Errors
     ///
-    /// Returns `store_failed` when either store cannot be opened or migrated,
-    /// carrying that store's own violation as the cause.
+    /// Returns `store_failed` when the database cannot be opened or migrated.
     ///
     /// # Cancel safety
     ///
@@ -482,12 +483,28 @@ impl SearchIndex {
         database_path: &Path,
         limits: SearchIndexLimits,
     ) -> Result<Self, SearchError> {
-        let lexical = LexicalSearchIndex::open(database_path, limits.lexical())
+        let lexical_limits = limits.lexical();
+        let pool = DatabasePool::new(
+            lexical_limits.pool_slots(),
+            lexical_limits.busy_timeout_ms(),
+        );
+        let database = WorkspaceDatabase::open(database_path, pool)
             .await
             .map_err(store_failed)?;
-        let vectors = SemanticVectorStore::open(database_path, limits.lexical())
-            .await
-            .map_err(store_failed)?;
+        Self::attached(database, limits)
+    }
+
+    /// Attaches both tiers to one already-open workspace database.
+    ///
+    /// # Errors
+    ///
+    /// Returns `store_failed` when a tier refuses the database.
+    pub fn attached(
+        database: Arc<WorkspaceDatabase>,
+        limits: SearchIndexLimits,
+    ) -> Result<Self, SearchError> {
+        let lexical = LexicalSearchIndex::attached(Arc::clone(&database), limits.lexical());
+        let vectors = SemanticVectorStore::attached(database);
         Ok(Self {
             writes: AsyncMutex::new(()),
             lexical,
@@ -1101,10 +1118,7 @@ fn model_identity(source: &ModelSource) -> String {
 
 /// One store failure, with that store's own violation riding as the cause.
 fn store_failed(source: LexicalIndexError) -> SearchError {
-    let subject = source.to_string();
-    let fault = SearchFault::new(SearchViolation::StoreFailed)
-        .about(subject)
-        .carrying(source.fault());
+    let fault = SearchFault::new(SearchViolation::StoreFailed).carrying(source.fault());
     SearchError::new(fault.caused_by(source))
 }
 
@@ -1278,5 +1292,88 @@ mod tests {
             }
         );
         assert_eq!(limits.depth(), 600);
+    }
+}
+
+#[cfg(test)]
+mod store_failure_tests {
+    use super::store_failed;
+    use rift_core::ProjectPath;
+    use rift_index::{
+        DatabasePool, LexicalIndexLimits, LexicalSearchIndex, LexicalUnit, LexicalUnitKind,
+        WorkspaceDatabase,
+    };
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// The bound one unit crosses, so the refusal carries limit evidence.
+    fn one_unit_limits() -> LexicalIndexLimits {
+        LexicalIndexLimits::new(1, 1 << 20, 32, 64, 4, 1_000)
+    }
+
+    async fn refusal() -> Result<String, Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database =
+            WorkspaceDatabase::open(&directory.path().join("db"), DatabasePool::new(4, 1_000))
+                .await?;
+        let index = LexicalSearchIndex::attached(database, one_unit_limits());
+        let units = [
+            LexicalUnit::new(
+                "rift://symbol/rust/a.rs/first",
+                ProjectPath::new("a.rs")?,
+                LexicalUnitKind::Symbol,
+                Some("first".to_owned()),
+                "fn first() {}",
+            )?,
+            LexicalUnit::new(
+                "rift://symbol/rust/a.rs/second",
+                ProjectPath::new("a.rs")?,
+                LexicalUnitKind::Symbol,
+                Some("second".to_owned()),
+                "fn second() {}",
+            )?,
+        ];
+        let refused = index
+            .replace_all(&units, "revision")
+            .await
+            .expect_err("two units must cross a units_max of one");
+        Ok(store_failed(refused).to_string())
+    }
+
+    #[tokio::test]
+    async fn a_wrapped_store_refusal_states_its_action_once() -> TestResult {
+        let message = refusal().await?;
+
+        let action = "resize the request below the named limit";
+        assert_eq!(
+            message.matches(action).count(),
+            1,
+            "the action must appear once: {message}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_wrapped_store_refusal_names_the_field_and_the_numbers() -> TestResult {
+        let message = refusal().await?;
+
+        assert!(message.contains("cause unit_limit"), "{message}");
+        assert!(message.contains("field units_max"), "{message}");
+        assert!(message.contains("observed 2"), "{message}");
+        assert!(message.contains("maximum 1"), "{message}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_wrapped_store_refusal_repeats_no_explanation() -> TestResult {
+        let message = refusal().await?;
+
+        let explanation = "the request exceeded a declared resource limit";
+        assert_eq!(
+            message.matches(explanation).count(),
+            1,
+            "the explanation must appear once: {message}"
+        );
+        Ok(())
     }
 }

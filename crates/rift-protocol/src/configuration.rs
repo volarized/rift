@@ -38,6 +38,22 @@ pub const SERVER_READINESS_TIMEOUT_MS_MIN: u64 = 1_000;
 pub const SERVER_READINESS_TIMEOUT_MS_MAX: u64 = 3_600_000;
 /// Milliseconds [`ServerConfiguration::readiness_timeout`] defaults to.
 const SERVER_READINESS_TIMEOUT_MS_DEFAULT: u64 = 30_000;
+/// Records the log store keeps, at least.
+pub const LOGS_RETENTION_RECORDS_MIN: u64 = 100;
+/// Records the log store keeps, at most.
+pub const LOGS_RETENTION_RECORDS_MAX: u64 = 1_000_000;
+/// Records the log store keeps by default.
+const LOGS_RETENTION_RECORDS_DEFAULT: u64 = 50_000;
+/// Records one `rift://logs` read returns, at most.
+pub const LOGS_PAGE_RECORDS_MAX: u64 = 5_000;
+/// Records one `rift://logs` read returns by default.
+const LOGS_PAGE_RECORDS_DEFAULT: u64 = 500;
+/// Bytes `logs.capture` may hold, at most.
+pub const LOGS_CAPTURE_BYTES_MAX: usize = 512;
+/// The filter the log store captures under by default: the same targets the
+/// stderr diagnostics carry.
+const LOGS_CAPTURE_DEFAULT: &str = "rift=info,rift_mcp=info,rift_server=info";
+
 /// Bytes one submitted execution block may hold, at most.
 pub const EXECUTION_CODE_BYTES_MAX: u64 = 32 << 10;
 /// Milliseconds one evaluation may run, at most: one day.
@@ -357,6 +373,9 @@ pub struct WorkspaceConfiguration {
     pub search: SearchConfiguration,
     /// Which files below the workspace root the index and reads consider visible.
     pub source: SourceConfiguration,
+    /// The server's own log records: how many the workspace database keeps,
+    /// how many one read returns, and which targets are captured.
+    pub logs: LogsConfiguration,
     /// Hooks run in the changed tree, in list order, each time a change
     /// applies.
     #[schemars(length(max = 32))]
@@ -388,6 +407,7 @@ impl WorkspaceConfiguration {
             .or_else(|| self.providers.history.violation())
             .or_else(|| self.search.violation())
             .or_else(|| self.source.violation())
+            .or_else(|| self.logs.violation())
             .or_else(|| hooks_violation(&self.hooks))
             .or_else(|| engines_violation(&self.engines))
     }
@@ -534,6 +554,68 @@ impl PortRange {
                 max: self.max,
             })
         })
+    }
+}
+
+/// The `[logs]` table. The server records its own diagnostics in the workspace
+/// database, where `rift://logs` reads them back, and this table bounds how
+/// many records the store keeps, how many one read returns, and which targets
+/// are captured at all. The server reads the table at startup, so a change
+/// applies on the next start.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogsConfiguration {
+    /// Records the store keeps before the oldest are dropped, 100 to 1000000.
+    #[schemars(range(min = 100, max = 1_000_000))]
+    pub retention_records: u64,
+    /// Records one `rift://logs` read returns at most, 1 to 5000.
+    #[schemars(range(min = 1, max = 5_000))]
+    pub page_records: u64,
+    /// Which targets are recorded, in the `RUST_LOG` spelling `tracing` takes:
+    /// comma-separated `target=level` pairs. A target this filter excludes
+    /// never reaches the store, whatever the stderr diagnostics carry.
+    #[schemars(length(max = 512))]
+    pub capture: String,
+}
+
+impl Default for LogsConfiguration {
+    fn default() -> Self {
+        Self {
+            retention_records: LOGS_RETENTION_RECORDS_DEFAULT,
+            page_records: LOGS_PAGE_RECORDS_DEFAULT,
+            capture: LOGS_CAPTURE_DEFAULT.to_owned(),
+        }
+    }
+}
+
+impl LogsConfiguration {
+    /// The table's bounds in key order.
+    fn violation(&self) -> Option<ConfigurationViolation> {
+        first_out_of_range([
+            (
+                "logs.retention_records",
+                self.retention_records,
+                LOGS_RETENTION_RECORDS_MIN,
+                LOGS_RETENTION_RECORDS_MAX,
+            ),
+            (
+                "logs.page_records",
+                self.page_records,
+                1,
+                LOGS_PAGE_RECORDS_MAX,
+            ),
+        ])
+        .or_else(|| self.capture_violation())
+    }
+
+    /// The capture filter's own bound, checked after the numeric rows.
+    fn capture_violation(&self) -> Option<ConfigurationViolation> {
+        first_out_of_range([(
+            "logs.capture",
+            self.capture.len() as u64,
+            0,
+            LOGS_CAPTURE_BYTES_MAX as u64,
+        )])
     }
 }
 

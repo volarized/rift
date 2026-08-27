@@ -11,16 +11,13 @@
 //! set covers both tiers and each store applies the same idempotent set.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::sync::Arc;
 
-use toasty::Db;
 use toasty::db::Connection;
 use toasty::stmt::{Type, Value};
-use toasty_driver_sqlite::Sqlite;
 
-use crate::lexical::{
-    LexicalIndexError, LexicalIndexLimits, MIGRATIONS, bound_as_usize, storage_error,
-};
+use crate::database::WorkspaceDatabase;
+use crate::lexical::{LexicalIndexError, storage_error};
 
 /// One stored vector: what produced it, what it came from, and its values.
 #[derive(Clone, Debug, PartialEq)]
@@ -58,40 +55,17 @@ impl StoredVector {
 /// The workspace's stored vectors, one row per model and digest.
 #[derive(Debug)]
 pub struct SemanticVectorStore {
-    database: Db,
-    limits: LexicalIndexLimits,
+    database: Arc<WorkspaceDatabase>,
 }
 
 impl SemanticVectorStore {
-    /// Opens (creating if absent) the vector store at `database_path`.
+    /// Attaches the semantic tier to one already-open workspace database.
     ///
-    /// The path is the workspace database the lexical index also opens. Both
-    /// apply the same migration set, which is idempotent, so the open order of
-    /// the two tiers does not matter.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LexicalIndexError`] when the database cannot be opened or its
-    /// schema migration fails.
-    ///
-    /// # Cancel safety
-    ///
-    /// Cancellation may leave the database file created without its schema
-    /// applied. Reopening retries safely: schema migrations are idempotent.
-    pub async fn open(
-        database_path: &Path,
-        limits: LexicalIndexLimits,
-    ) -> Result<Self, LexicalIndexError> {
-        let mut builder = Db::builder();
-        builder
-            .models(toasty::models!(SemanticVectorRecord))
-            .max_pool_size(bound_as_usize(limits.pool_slots()));
-        let database = builder
-            .build(Sqlite::open(database_path))
-            .await
-            .map_err(storage_error)?;
-        let _migration_report = MIGRATIONS.apply(&database).await.map_err(storage_error)?;
-        Ok(Self { database, limits })
+    /// The pool is shared with the lexical tier and the log store, because
+    /// `SQLite` serializes writers per file rather than per connection.
+    #[must_use]
+    pub fn attached(database: Arc<WorkspaceDatabase>) -> Self {
+        Self { database }
     }
 
     /// At most `max` of one model's vectors, in digest order.
@@ -182,8 +156,12 @@ impl SemanticVectorStore {
             return Ok(());
         }
         let width = width_as_i64(dimension);
-        let mut connection = self.connection().await?;
-        let mut transaction = connection.transaction().await.map_err(storage_error)?;
+        let mut access = self.database.writing().await?;
+        let mut transaction = access
+            .connection()
+            .transaction()
+            .await
+            .map_err(storage_error)?;
         for vector in vectors {
             toasty::sql::statement(
                 "INSERT INTO semantic_vectors(identity, model, digest, dimension, vector)
@@ -216,11 +194,11 @@ impl SemanticVectorStore {
     ///
     /// One statement, so the delete either lands whole or not at all.
     pub async fn prune_other_models(&self, model: &str) -> Result<u64, LexicalIndexError> {
-        let mut connection = self.connection().await?;
-        let dropped = self.count_other_models(&mut connection, model).await?;
+        let mut access = self.database.writing().await?;
+        let dropped = self.count_other_models(access.connection(), model).await?;
         toasty::sql::statement("DELETE FROM semantic_vectors WHERE model <> ?1")
             .bind(model.to_owned())
-            .exec(&mut connection)
+            .exec(access.connection())
             .await
             .map_err(storage_error)?;
         Ok(dropped)
@@ -251,8 +229,12 @@ impl SemanticVectorStore {
         if stale.is_empty() {
             return Ok(0);
         }
-        let mut connection = self.connection().await?;
-        let mut transaction = connection.transaction().await.map_err(storage_error)?;
+        let mut access = self.database.writing().await?;
+        let mut transaction = access
+            .connection()
+            .transaction()
+            .await
+            .map_err(storage_error)?;
         for digest in &stale {
             toasty::sql::statement("DELETE FROM semantic_vectors WHERE identity = ?1")
                 .bind(address(model, digest))
@@ -285,15 +267,9 @@ impl SemanticVectorStore {
         }
     }
 
-    /// A pooled connection with this store's busy timeout applied.
+    /// A pooled connection carrying the workspace database's required pragmas.
     async fn connection(&self) -> Result<Connection, LexicalIndexError> {
-        let mut connection = self.database.connection().await.map_err(storage_error)?;
-        let busy_timeout_ms = i64::from(self.limits.busy_timeout_ms());
-        toasty::sql::query(format!("PRAGMA busy_timeout = {busy_timeout_ms}"))
-            .exec(&mut connection)
-            .await
-            .map_err(storage_error)?;
-        Ok(connection)
+        self.database.connection().await
     }
 }
 
@@ -361,7 +337,7 @@ fn decode(blob: &[u8], dimension: usize) -> Option<Vec<f32>> {
 
 #[derive(Debug, toasty::Model)]
 #[table = "semantic_vectors"]
-struct SemanticVectorRecord {
+pub(crate) struct SemanticVectorRecord {
     #[key]
     identity: String,
     #[index]
@@ -374,7 +350,7 @@ struct SemanticVectorRecord {
 #[cfg(test)]
 mod tests {
     use super::{SemanticVectorStore, StoredVector, address, decode, encode};
-    use crate::lexical::LexicalIndexLimits;
+    use crate::DatabasePool;
     use std::collections::BTreeSet;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -385,8 +361,8 @@ mod tests {
     /// A row bound no suite here reaches, so a read answers with every row.
     const EVERY: usize = usize::MAX;
 
-    fn limits() -> LexicalIndexLimits {
-        LexicalIndexLimits::new(64, 1 << 20, 32, 64, 4, 1_000)
+    fn pool() -> DatabasePool {
+        DatabasePool::new(4, 1_000)
     }
 
     /// Whether a value round-tripped through the store unchanged. Storage is
@@ -407,7 +383,8 @@ mod tests {
     async fn opened(
         directory: &std::path::Path,
     ) -> Result<SemanticVectorStore, Box<dyn std::error::Error>> {
-        Ok(SemanticVectorStore::open(&directory.join("db"), limits()).await?)
+        let database = crate::WorkspaceDatabase::open(&directory.join("db"), pool()).await?;
+        Ok(SemanticVectorStore::attached(database))
     }
 
     #[tokio::test]
