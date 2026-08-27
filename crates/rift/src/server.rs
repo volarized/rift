@@ -13,8 +13,9 @@ use std::time::Duration;
 
 use rift_core::{CliCode, Error, ErrorContext, ErrorName, Fault};
 use rift_mcp::{
-    ElectionError, ElectionFault, PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX,
-    ServerPresence, StaleReason, probe, read_serving, serve_elected, spawn_detached_server,
+    ElectionError, ElectionFault, LogDrain, PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT,
+    START_WAIT_MAX, ServerPresence, StaleReason, open_log_store, probe, read_serving,
+    serve_elected, spawn_detached_server,
 };
 use rift_protocol::lock::ServerLock;
 use tokio_util::sync::CancellationToken;
@@ -225,12 +226,16 @@ impl fmt::Display for ServerOutcome {
 /// Returns [`ServerCommandError`] when the asked state was not reached.
 pub(super) async fn run(
     command: ServerCommand,
+    drain: LogDrain,
+    retention_records: u64,
 ) -> Result<Option<ServerOutcome>, ServerCommandError> {
     let root = Path::new(".");
     match command {
         ServerCommand::Start { foreground } => match start_mode(foreground) {
             StartMode::Detached => start_detached(root).await.map(Some),
-            StartMode::Foreground => serve_foreground(root).await.map(|()| None),
+            StartMode::Foreground => serve_foreground(root, drain, retention_records)
+                .await
+                .map(|()| None),
         },
         ServerCommand::Stop => stop(root).await.map(Some),
         ServerCommand::Restart => restart(root).await.map(Some),
@@ -321,9 +326,21 @@ async fn await_serving(
 ///
 /// The listening line prints before blocking. Ctrl-C cancels the shutdown
 /// token; an authorized stop request and the idle timeout end serving the
-/// same way.
-async fn serve_foreground(root: &Path) -> Result<(), ServerCommandError> {
+/// same way. This is the process that records: the drain writes what the
+/// tracing layer queued into the workspace database until the same token
+/// stops it.
+async fn serve_foreground(
+    root: &Path,
+    drain: LogDrain,
+    retention_records: u64,
+) -> Result<(), ServerCommandError> {
     let shutdown = CancellationToken::new();
+    // The drain starts before election, so a start that refuses is recorded too: the
+    // workspace that already has a server is exactly the one whose operator is about to
+    // ask why this one would not serve.
+    if let Some(store) = open_log_store(root).await {
+        tokio::spawn(drain.run(store, retention_records, shutdown.clone()));
+    }
     let server = match serve_elected(root, shutdown.clone()).await {
         Ok(server) => server,
         Err(error) => return Err(foreground_refused(root, error)),

@@ -9,7 +9,9 @@ use std::process::ExitCode;
 #[cfg(test)]
 use clap::{Command, CommandFactory};
 use clap::{Parser, Subcommand};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
+use tracing_subscriber::{EnvFilter, Layer as _};
 
 /// Default filter keeps dependency diagnostics out of MCP stderr.
 const DEFAULT_TRACING_FILTER: &str = "rift=info,rift_mcp=info,rift_server=info";
@@ -50,8 +52,9 @@ fn cli_command() -> Command {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    initialize_tracing();
-    match run(Cli::parse()).await {
+    let logs = rift_mcp::logs_configuration(Path::new("."));
+    let drain = initialize_tracing(&logs.capture);
+    match run(Cli::parse(), drain, logs.retention_records).await {
         Ok(Some(outcome)) => {
             println!("{outcome}");
             ExitCode::SUCCESS
@@ -67,16 +70,32 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Installs process tracing with human diagnostics on stderr.
-fn initialize_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(DEFAULT_TRACING_FILTER)),
+/// Installs process tracing: human diagnostics on stderr, and the same events
+/// recorded into the workspace database for `rift://logs` to read back.
+///
+/// The two carry their own filters. Stderr keeps `RUST_LOG` or the default
+/// targets, because that stream belongs to whoever started the process. The
+/// store captures under the workspace's `[logs] capture` filter, so a workspace
+/// can record itself at debug without an operator exporting an environment
+/// variable into the process a proxy spawns detached.
+///
+/// The returned drain writes what the layer queued. Only a serving process
+/// takes it; every other command drops it, and its records are dropped with it.
+fn initialize_tracing(capture: &str) -> rift_mcp::LogDrain {
+    let (sink, drain) = rift_mcp::log_capture();
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+                .with_writer(std::io::stderr)
+                .with_filter(
+                    EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_TRACING_FILTER)),
+                ),
         )
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-        .with_writer(std::io::stderr)
+        .with(sink.with_filter(EnvFilter::new(capture)))
         .init();
+    drain
 }
 
 #[derive(Debug)]
@@ -133,7 +152,11 @@ impl fmt::Display for CliOutcome {
     }
 }
 
-async fn run(cli: Cli) -> Result<Option<CliOutcome>, CliError> {
+async fn run(
+    cli: Cli,
+    drain: rift_mcp::LogDrain,
+    retention_records: u64,
+) -> Result<Option<CliOutcome>, CliError> {
     match cli.command {
         None => Ok(None),
         Some(CliCommand::Mcp) => {
@@ -142,7 +165,7 @@ async fn run(cli: Cli) -> Result<Option<CliOutcome>, CliError> {
                 .map_err(CliError::Mcp)?;
             Ok(None)
         }
-        Some(CliCommand::Server { command }) => server::run(command)
+        Some(CliCommand::Server { command }) => server::run(command, drain, retention_records)
             .await
             .map(|outcome| outcome.map(CliOutcome::Server))
             .map_err(CliError::Server),
@@ -175,7 +198,8 @@ mod tests {
     #[tokio::test]
     async fn empty_invocation_runs_no_command() {
         let cli = Cli::try_parse_from(["rift"]).expect("empty invocation must parse");
-        let outcome = super::run(cli)
+        let (_sink, drain) = rift_mcp::log_capture();
+        let outcome = super::run(cli, drain, 1_000)
             .await
             .expect("empty invocation must succeed");
         assert!(outcome.is_none());
