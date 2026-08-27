@@ -2,10 +2,9 @@
 
 use std::collections::BTreeSet;
 
-use rift_protocol::read::ExtensionKey;
 pub use rift_protocol::read::{
-    Documentation, DocumentationFormat, ExactKind, Extensions, Language, NodeId, Signature,
-    SourceKind, SourceLocation, SymbolFacet, TypeBinding,
+    Documentation, DocumentationFormat, ExactKind, ExtensionKey, ExtensionValue, Extensions,
+    Language, NodeId, Signature, SourceKind, SourceLocation, SymbolFacet, TypeBinding,
 };
 use serde::Serialize;
 
@@ -417,6 +416,120 @@ pub enum EquivalenceEvidence {
     Candidate(ContributionReference),
 }
 
+/// Portable role of one semantic reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceRole {
+    /// Reference declares its target.
+    Definition,
+    /// Reference reads its target.
+    Read,
+    /// Reference writes its target.
+    Write,
+    /// Reference imports its target.
+    Import,
+    /// Reference calls its target.
+    Call,
+    /// Reference names a type.
+    Type,
+    /// Provider does not expose a portable role.
+    Unknown,
+}
+
+/// One source occurrence and its candidate targets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticReference {
+    source: DeclarationBinding,
+    role: ReferenceRole,
+    targets: Vec<ContributionReference>,
+}
+
+impl SemanticReference {
+    /// Creates one validated reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContributionError`] when targets are empty, duplicated, or oversized.
+    pub fn new(
+        source: DeclarationBinding,
+        role: ReferenceRole,
+        targets: Vec<ContributionReference>,
+    ) -> Result<Self, ContributionError> {
+        let unique: BTreeSet<_> = targets.iter().collect();
+        if targets.is_empty()
+            || targets.len() > CONTRIBUTION_FACTS_MAX
+            || unique.len() != targets.len()
+        {
+            return Err(contribution_error(
+                ContributionViolation::InvalidReference,
+                "references.targets",
+            ));
+        }
+        Ok(Self {
+            source,
+            role,
+            targets,
+        })
+    }
+
+    /// Returns source occurrence.
+    #[must_use]
+    pub const fn source(&self) -> &DeclarationBinding {
+        &self.source
+    }
+
+    /// Returns portable role.
+    #[must_use]
+    pub const fn role(&self) -> ReferenceRole {
+        self.role
+    }
+
+    /// Returns candidate targets.
+    #[must_use]
+    pub fn targets(&self) -> &[ContributionReference] {
+        &self.targets
+    }
+}
+
+/// Portable relationship kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationshipKind {
+    /// Source references target.
+    Reference,
+    /// Source defines target.
+    Definition,
+    /// Source implements target.
+    Implementation,
+    /// Source is a type definition for target.
+    TypeDefinition,
+}
+
+/// One relationship declared by a provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContributionRelationship {
+    kind: RelationshipKind,
+    target: ContributionReference,
+}
+
+impl ContributionRelationship {
+    /// Creates one relationship.
+    #[must_use]
+    pub const fn new(kind: RelationshipKind, target: ContributionReference) -> Self {
+        Self { kind, target }
+    }
+
+    /// Returns portable relationship kind.
+    #[must_use]
+    pub const fn kind(&self) -> RelationshipKind {
+        self.kind
+    }
+
+    /// Returns target Contribution.
+    #[must_use]
+    pub const fn target(&self) -> &ContributionReference {
+        &self.target
+    }
+}
+
 /// One immutable provider record.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Contribution {
@@ -427,6 +540,8 @@ pub struct Contribution {
     source: Option<DeclarationBinding>,
     identity_anchor: Option<SymbolId>,
     equivalence: Vec<EquivalenceEvidence>,
+    references: Vec<SemanticReference>,
+    relationships: Vec<ContributionRelationship>,
     namespaced: Extensions,
 }
 
@@ -448,6 +563,8 @@ impl Contribution {
                 source: None,
                 identity_anchor: None,
                 equivalence: Vec::new(),
+                references: Vec::new(),
+                relationships: Vec::new(),
                 namespaced: Extensions(std::collections::BTreeMap::new()),
             },
         }
@@ -495,6 +612,18 @@ impl Contribution {
         &self.equivalence
     }
 
+    /// Returns semantic references.
+    #[must_use]
+    pub fn references(&self) -> &[SemanticReference] {
+        &self.references
+    }
+
+    /// Returns declared relationships.
+    #[must_use]
+    pub fn relationships(&self) -> &[ContributionRelationship] {
+        &self.relationships
+    }
+
     /// Returns provider-specific facts.
     #[must_use]
     pub const fn namespaced(&self) -> &Extensions {
@@ -527,6 +656,20 @@ impl ContributionBuilder {
     #[must_use]
     pub fn equivalence(mut self, evidence: Vec<EquivalenceEvidence>) -> Self {
         self.contribution.equivalence = evidence;
+        self
+    }
+
+    /// Sets semantic references.
+    #[must_use]
+    pub fn references(mut self, references: Vec<SemanticReference>) -> Self {
+        self.contribution.references = references;
+        self
+    }
+
+    /// Sets declared relationships.
+    #[must_use]
+    pub fn relationships(mut self, relationships: Vec<ContributionRelationship>) -> Self {
+        self.contribution.relationships = relationships;
         self
     }
 
@@ -653,6 +796,8 @@ pub enum ContributionViolation {
     InvalidNamespace,
     /// Provider-specific fact version is zero.
     InvalidNamespaceVersion,
+    /// Reference targets are empty, duplicated, or oversized.
+    InvalidReference,
     /// Portable facets contain duplicates.
     DuplicateFact,
     /// Normalized record state, identity, or members disagree.
@@ -705,6 +850,14 @@ fn validate_contribution(contribution: &Contribution) -> Result<(), Contribution
     validate_portable_facts(&contribution.facts)?;
     validate_source_and_origin(contribution)?;
     validate_evidence(contribution)?;
+    if contribution.references.len() > CONTRIBUTION_FACTS_MAX
+        || contribution.relationships.len() > CONTRIBUTION_FACTS_MAX
+    {
+        return Err(contribution_error(
+            ContributionViolation::TooManyFacts,
+            "references",
+        ));
+    }
     validate_namespaced(&contribution.namespaced)
 }
 
@@ -885,8 +1038,9 @@ mod tests {
     use super::{
         CONTRIBUTION_EVIDENCE_MAX, CONTRIBUTION_FACTS_MAX, CONTRIBUTION_NAMESPACE_BYTES_MAX,
         CONTRIBUTION_NAMESPACES_MAX, Contribution, ContributionKey, ContributionOrigin,
-        ContributionReference, ContributionViolation, EquivalenceEvidence, PortableSymbolFacts,
-        SourceApplicability, SourceRange, SymbolRecord, SymbolResolution,
+        ContributionReference, ContributionRelationship, ContributionViolation,
+        EquivalenceEvidence, PortableSymbolFacts, ReferenceRole, RelationshipKind,
+        SemanticReference, SourceApplicability, SourceRange, SymbolRecord, SymbolResolution,
     };
     use crate::{
         IndexRevision, ProviderId, ProviderRevision, ProviderSymbolId, SourcePath,
@@ -1294,6 +1448,49 @@ mod tests {
         assert_eq!(
             error.fault().violation(),
             ContributionViolation::TooMuchEvidence
+        );
+    }
+
+    #[test]
+    fn references_and_relationships_are_validated_and_retained() {
+        let target = ContributionReference::new(provider("syntax"), provider_symbol("Beacon"));
+        let binding = super::DeclarationBinding::new(
+            source_unit(),
+            SourceRange::new(20, 26).expect("range"),
+            None,
+        );
+        let duplicate = SemanticReference::new(
+            binding.clone(),
+            ReferenceRole::Read,
+            vec![target.clone(), target.clone()],
+        )
+        .expect_err("duplicate target");
+        assert_eq!(
+            duplicate.fault().violation(),
+            ContributionViolation::InvalidReference
+        );
+
+        let reference = SemanticReference::new(binding, ReferenceRole::Call, vec![target.clone()])
+            .expect("reference");
+        let relationship = ContributionRelationship::new(RelationshipKind::Implementation, target);
+        let value = Contribution::builder(
+            ContributionKey::new(
+                provider("native"),
+                publication(1),
+                provider_symbol("Caller"),
+            ),
+            SourceApplicability::Independent,
+            facts(),
+            ContributionOrigin::new(None, SourceKind::Synthetic).expect("origin"),
+        )
+        .references(vec![reference])
+        .relationships(vec![relationship])
+        .build()
+        .expect("contribution");
+        assert_eq!(value.references()[0].role(), ReferenceRole::Call);
+        assert_eq!(
+            value.relationships()[0].kind(),
+            RelationshipKind::Implementation
         );
     }
 

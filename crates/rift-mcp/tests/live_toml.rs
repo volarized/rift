@@ -67,6 +67,9 @@ fn coded_findings<'summary>(structured: &'summary Value, code: &str) -> Vec<&'su
 /// Most warm-up attempts one test makes, and the pause between them: at most
 /// fifteen seconds of waiting, then the test fails instead of hanging.
 const WARMUP_ATTEMPTS_MAX: usize = 60;
+
+/// Runs live Tombi tests one at a time.
+static TOMBI_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const WARMUP_PAUSE: Duration = Duration::from_millis(250);
 
 /// Drives `patch` until tombi's own finding rides an applied change.
@@ -106,6 +109,7 @@ async fn applied_patch_carries_the_toml_engine_diagnostic() -> TestResult {
     if !engine_live() {
         return Ok(());
     }
+    let _exclusive = TOMBI_TEST_LOCK.lock().await;
     let (directory, client, server_task) = served_relative_workspace(
         &[("config.toml", CONFIG)],
         Some(toml_engine_configuration()),
@@ -150,6 +154,7 @@ async fn applied_patch_over_a_clean_file_carries_no_finding() -> TestResult {
     if !engine_live() {
         return Ok(());
     }
+    let _exclusive = TOMBI_TEST_LOCK.lock().await;
     let (directory, client, server_task) = served_workspace(
         &[("config.toml", CONFIG_WITH_DUPLICATE)],
         Some(toml_engine_configuration()),

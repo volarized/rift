@@ -59,6 +59,8 @@ pub struct AssembledSymbol {
     facts: PortableSymbolFacts,
     origin: ContributionOrigin,
     container: Option<SymbolId>,
+    references: Vec<crate::NormalizedReference>,
+    relationships: Vec<crate::NormalizedRelationship>,
     namespaced: Vec<(ProviderId, Extensions)>,
     disagreements: Vec<PresentationDisagreement>,
 }
@@ -104,6 +106,18 @@ impl AssembledSymbol {
     #[must_use]
     pub const fn container(&self) -> Option<&SymbolId> {
         self.container.as_ref()
+    }
+
+    /// Returns normalized References.
+    #[must_use]
+    pub fn references(&self) -> &[crate::NormalizedReference] {
+        &self.references
+    }
+
+    /// Returns normalized Relationships.
+    #[must_use]
+    pub fn relationships(&self) -> &[crate::NormalizedRelationship] {
+        &self.relationships
     }
 
     /// Returns every provider-specific fact collection.
@@ -179,6 +193,18 @@ impl SymbolAssembler {
                 )
             })
             .collect();
+        let references = graph
+            .references()
+            .iter()
+            .filter(|reference| record.contributions().contains(reference.source()))
+            .cloned()
+            .collect();
+        let relationships = graph
+            .relationships()
+            .iter()
+            .filter(|relationship| record.contributions().contains(relationship.source()))
+            .cloned()
+            .collect();
         Some(AssembledSymbol {
             index_revision: record.index_revision(),
             identity: record.identity().cloned(),
@@ -187,6 +213,8 @@ impl SymbolAssembler {
             facts,
             origin: primary.origin().clone(),
             container,
+            references,
+            relationships,
             namespaced,
             disagreements,
         })
