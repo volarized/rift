@@ -145,8 +145,43 @@ jobs:
       - run: just docs
       - run: just audit
       - run: just test
-      - run: just release-test
-      - run: just installer-test
+      - name: Test release tooling
+        id: release_tests
+        run: just release-test
+        env:
+          PYTEST_ADDOPTS: >-
+            --junitxml=release.junit.xml -o junit_family=legacy
+
+      - name: Upload release test results
+        if: ${{ !cancelled() && steps.release_tests.outcome != 'skipped' }}
+        uses: codecov/codecov-action@v5.5.5
+        with:
+          disable_search: true
+          fail_ci_if_error: true
+          files: release.junit.xml
+          flags: release
+          name: rift-release
+          report_type: test_results
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Test installers
+        id: installer_tests
+        run: just installer-test
+        env:
+          PYTEST_ADDOPTS: >-
+            --junitxml=installers.junit.xml -o junit_family=legacy
+
+      - name: Upload installer test results
+        if: ${{ !cancelled() && steps.installer_tests.outcome != 'skipped' }}
+        uses: codecov/codecov-action@v5.5.5
+        with:
+          disable_search: true
+          fail_ci_if_error: true
+          files: installers.junit.xml
+          flags: installers
+          name: rift-installers
+          report_type: test_results
+          token: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Upload CLI coverage
         uses: codecov/codecov-action@v5.5.5
