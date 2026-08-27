@@ -432,8 +432,11 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
-    use rift_index::{DatabasePool, LogQuery, LogRecord, LogStore, WorkspaceDatabase};
+    use rift_index::{
+        DatabasePool, LOG_BATCH_RECORDS_MAX, LogQuery, LogRecord, LogStore, WorkspaceDatabase,
+    };
     use tokio_util::sync::CancellationToken;
 
     use super::{LOG_QUEUE_RECORDS, RecordedFields, log_capture, quoted};
@@ -610,6 +613,21 @@ mod tests {
         assert_eq!(latest[0].record().fields(), "{\"dropped\":8}");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_persistently_refused_batch_is_counted_as_dropped() {
+        let (_directory, store) = store().await;
+        let (_sink, drain) = log_capture();
+        let oversized = vec![record("oversized"); LOG_BATCH_RECORDS_MAX + 1];
+
+        drain.write_batch(&store, &oversized, 10_000).await;
+
+        assert_eq!(
+            drain.dropped.load(Ordering::Relaxed),
+            oversized.len() as u64
+        );
+        assert_eq!(store.count().await.expect("the count reads"), 0);
+    }
+
     #[test]
     fn a_closed_drain_does_not_report_queue_pressure() {
         let (sink, drain) = log_capture();
@@ -622,7 +640,10 @@ mod tests {
 
     #[test]
     fn a_json_string_escapes_what_json_reserves() {
-        assert_eq!(quoted("a\"b\\c\nd"), "\"a\\\"b\\\\c\\nd\"");
+        assert_eq!(
+            quoted("a\"b\\c\n\r\t\u{0001}d"),
+            "\"a\\\"b\\\\c\\n\\r\\t\\u0001d\""
+        );
     }
 
     #[test]
@@ -631,6 +652,14 @@ mod tests {
         fields.record_bool(&field("first"), true);
 
         assert_eq!(fields.rendered(), "{\"first\":\"true\"}");
+    }
+
+    #[test]
+    fn errors_are_recorded_by_their_display_text() {
+        let mut fields = RecordedFields::default();
+        fields.record_error(&field("first"), &std::io::Error::other("disk refused"));
+
+        assert_eq!(fields.rendered(), "{\"first\":\"disk refused\"}");
     }
 
     /// One field of a callsite this suite can record against.

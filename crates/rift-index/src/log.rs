@@ -572,6 +572,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_empty_batch_changes_nothing() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory).await?;
+
+        assert_eq!(store.append(&[], KEEP_EVERY).await?, 0);
+        assert_eq!(store.count().await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_reopened_store_keeps_its_records() -> TestResult {
         let directory = tempfile::tempdir()?;
         {
@@ -618,5 +628,10 @@ mod tests {
     #[test]
     fn a_value_within_the_bound_is_unchanged() {
         assert_eq!(bounded("short", 64), "short");
+    }
+
+    #[test]
+    fn a_bound_inside_a_multibyte_character_moves_to_its_start() {
+        assert_eq!(bounded("éé", 3), "é");
     }
 }

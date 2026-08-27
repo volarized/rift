@@ -127,12 +127,6 @@ impl WorkspaceDatabase {
         }))
     }
 
-    /// The bounds this database's connections carry.
-    #[must_use]
-    pub const fn pool(&self) -> DatabasePool {
-        self.pool
-    }
-
     /// Exclusive write access to the file: the file's write turn, and a
     /// connection to spend it on.
     ///
@@ -262,25 +256,15 @@ mod tests {
         let database = WorkspaceDatabase::open(&directory.path().join("db"), pool()).await?;
 
         let mut connection = database.connection().await?;
-        let tables =
-            toasty::sql::query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
-                .column_types([toasty::stmt::Type::String])
-                .exec(&mut connection)
-                .await?;
-
-        let names: Vec<String> = tables
-            .iter()
-            .filter_map(|row| match row {
-                toasty::stmt::Value::Record(record) => match record.as_slice() {
-                    [toasty::stmt::Value::String(name)] => Some(name.clone()),
-                    _ => None,
-                },
-                _ => None,
-            })
-            .collect();
-        for expected in ["lexical_units", "semantic_vectors", "log_records"] {
-            assert!(names.iter().any(|name| name == expected), "{names:?}");
-        }
+        let tables = toasty::sql::query(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' \
+             AND name IN ('lexical_units', 'semantic_vectors', 'log_records')",
+        )
+        .column_types([toasty::stmt::Type::I64])
+        .exec(&mut connection)
+        .await?;
+        crate::lexical::require_pragma_row(&tables, &[toasty::stmt::Value::I64(3)])?;
         Ok(())
     }
 

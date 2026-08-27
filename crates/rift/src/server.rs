@@ -528,12 +528,14 @@ pub(super) fn error_for_test() -> ServerCommandError {
 mod tests {
     use std::future::IntoFuture as _;
     use std::net::Ipv4Addr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{
         PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, STOP_POLL_ATTEMPT_COUNT,
         STOP_WAIT_MAX, ServerCommandFault, ServerOutcome, StaleReason, StartMode, await_serving,
         await_stopped, discard_stale_document, foreground_refused, holder_evidence,
-        stale_reason_phrase, start_mode, status, stop,
+        stale_reason_phrase, start_mode, status, stop, stop_log_drain,
     };
     use rift_core::Error;
     use rift_protocol::lock::{ServerLock, ServerLockViolation};
@@ -585,6 +587,35 @@ mod tests {
     fn foreground_flag_selects_the_mode() {
         assert!(matches!(start_mode(true), StartMode::Foreground));
         assert!(matches!(start_mode(false), StartMode::Detached));
+    }
+
+    #[tokio::test]
+    async fn a_failed_log_drain_is_joined() {
+        let drain = tokio::spawn(async { panic!("injected log drain failure") });
+
+        stop_log_drain(Some(drain)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_log_drain_is_aborted_at_its_deadline() {
+        struct Stopped(Arc<AtomicBool>);
+        impl Drop for Stopped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        let task_stopped = Arc::clone(&stopped);
+        let drain = tokio::spawn(async move {
+            let _stopped = Stopped(task_stopped);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+
+        stop_log_drain(Some(drain)).await;
+
+        assert!(stopped.load(Ordering::Acquire));
     }
 
     #[test]

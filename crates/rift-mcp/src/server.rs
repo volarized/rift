@@ -2800,6 +2800,11 @@ mod tests {
 
         assert!(server.search_index.is_none());
         assert!(server.logs.is_none());
+        let unavailable = serde_json::to_string(&server.read_logs("rift://logs").await?)?;
+        assert!(
+            unavailable.contains("the workspace log store could not be opened"),
+            "{unavailable}"
+        );
         assert_eq!(fs::read(database_path)?, corrupt);
         Ok(())
     }
@@ -3368,6 +3373,18 @@ pub fn beacon() -> u64 {
         assert!(error.message.contains("published epoch 0"), "{error:?}");
         assert!(error.message.contains("observed epoch 3"), "{error:?}");
         assert!(error.message.contains("rift://logs"), "{error:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stall_after_the_epoch_settled_names_tree_movement() -> TestResult {
+        let (_directory, server) = fixture().await?;
+
+        let detail = server.readiness_stall(Duration::from_millis(25)).await;
+
+        assert!(detail.contains("the index settled at epoch 0"), "{detail}");
+        assert!(detail.contains("tree kept moving"), "{detail}");
+        assert!(detail.contains("25ms"), "{detail}");
         Ok(())
     }
 
