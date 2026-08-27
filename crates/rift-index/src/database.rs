@@ -7,16 +7,16 @@
 //! met an index rebuild came back `database is locked`. One pool, opened once
 //! and shared, is what every store attaches to.
 //!
-//! The pool also owns what a connection has to be configured with, so the
-//! journal mode and the busy timeout are set and proven in one place rather
-//! than once per store.
+//! Read checkouts use WAL snapshots with `query_only` enabled. Write checkouts
+//! wait for one process-wide turn and start with `BEGIN IMMEDIATE`.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use toasty::Db;
-use toasty::db::Connection;
+use toasty::db::{Connection, Transaction};
 use toasty::stmt::{Type, Value};
+use toasty_core::driver::operation::TransactionMode;
 use toasty_driver_sqlite::Sqlite;
 use tokio::sync::{Mutex, MutexGuard};
 
@@ -28,14 +28,7 @@ use crate::lexical::{LexicalIndexStateRecord, LexicalUnitRecord};
 use crate::log::LogRecordRow;
 use crate::vector::SemanticVectorRecord;
 
-/// What one pooled connection is configured with.
-///
-/// These are the file's bounds, not a store's: a store's own limits - how many
-/// units it indexes, how many terms a query may carry - never reach the pool,
-/// because the pool is shared and one store's bounds are not another's. The
-/// v0.0.21 defect that taught this: a log drain that opened the file first
-/// configured the pool with its own placeholder bounds, and the index commit
-/// that followed refused at `unit_limit maximum 1`.
+/// Connection count and lock-wait bounds for one database file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DatabasePool {
     slots: u32,
@@ -75,12 +68,8 @@ pub struct WorkspaceDatabase {
     pool: DatabasePool,
     /// Serializes the file's writers.
     ///
-    /// `SQLite` admits one writer per file and refuses the rest with `database
-    /// is locked`; `busy_timeout` only decides how long a loser waits before it
-    /// is told so. A shared pool does not change that - it removes the second
-    /// pool, not the second writer. Writes therefore queue here, so a log
-    /// append that arrives during an index commit waits for it and lands,
-    /// rather than spending its busy budget and being dropped.
+    /// `SQLite` admits one writer per file. Writes queue here before taking a
+    /// connection, so in-process writers never compete for `SQLite`'s file lock.
     writes: Mutex<()>,
 }
 
@@ -120,6 +109,10 @@ impl WorkspaceDatabase {
                     source,
                 )
             })?;
+        let mut connection = database.connection().await.map_err(storage_error)?;
+        configure_journal(&mut connection).await?;
+        configure_connection(&mut connection, pool, ConnectionAccess::Write).await?;
+        drop(connection);
         let _migration_report = MIGRATIONS.apply(&database).await.map_err(|source| {
             lexical_error_caused_by(
                 crate::lexical::LexicalIndexViolation::Storage,
@@ -156,40 +149,28 @@ impl WorkspaceDatabase {
     /// Dropping the returned future releases the turn without writing.
     pub(crate) async fn writing(&self) -> Result<WriteAccess<'_>, LexicalIndexError> {
         let turn = self.writes.lock().await;
-        let connection = self.connection().await?;
+        let connection = self.configured_connection(ConnectionAccess::Write).await?;
         Ok(WriteAccess {
             _turn: turn,
             connection,
         })
     }
 
-    /// A pooled connection with the journal mode and busy timeout every store
-    /// in this file requires.
+    /// A read-only pooled connection with this file's connection-local pragmas.
     ///
     /// Foreign keys are not configured: no table here carries a foreign-key
     /// relationship to another.
     pub(crate) async fn connection(&self) -> Result<Connection, LexicalIndexError> {
+        self.configured_connection(ConnectionAccess::Read).await
+    }
+
+    /// Checks out and configures one connection for its next operation.
+    async fn configured_connection(
+        &self,
+        access: ConnectionAccess,
+    ) -> Result<Connection, LexicalIndexError> {
         let mut connection = self.database.connection().await.map_err(storage_error)?;
-
-        let journal_mode = toasty::sql::query("PRAGMA journal_mode = WAL")
-            .column_types([Type::String])
-            .exec(&mut connection)
-            .await
-            .map_err(storage_error)?;
-        require_pragma_row(&journal_mode, &[Value::String("wal".to_owned())])?;
-
-        let busy_timeout_ms = i64::from(self.pool.busy_timeout_ms());
-        toasty::sql::query(format!("PRAGMA busy_timeout = {busy_timeout_ms}"))
-            .exec(&mut connection)
-            .await
-            .map_err(storage_error)?;
-        let busy_timeout = toasty::sql::query("PRAGMA busy_timeout")
-            .column_types([Type::I64])
-            .exec(&mut connection)
-            .await
-            .map_err(storage_error)?;
-        require_pragma_row(&busy_timeout, &[Value::I64(busy_timeout_ms)])?;
-
+        configure_connection(&mut connection, self.pool, access).await?;
         Ok(connection)
     }
 }
@@ -202,15 +183,72 @@ pub(crate) struct WriteAccess<'database> {
 }
 
 impl WriteAccess<'_> {
-    /// The connection this turn writes through.
-    pub(crate) const fn connection(&mut self) -> &mut Connection {
-        &mut self.connection
+    /// Starts this turn's transaction with `BEGIN IMMEDIATE`.
+    ///
+    /// The write lock is acquired before any read prerequisite, so a transaction never
+    /// asks `SQLite` to upgrade a shared lock while another process writes.
+    pub(crate) async fn transaction(&mut self) -> Result<Transaction<'_>, LexicalIndexError> {
+        self.connection
+            .transaction_builder()
+            .mode(TransactionMode::Immediate)
+            .begin()
+            .await
+            .map_err(storage_error)
     }
+}
+
+/// Whether one checkout may write.
+#[derive(Clone, Copy, Debug)]
+enum ConnectionAccess {
+    Read,
+    Write,
+}
+
+/// Selects WAL once for the database file.
+async fn configure_journal(connection: &mut Connection) -> Result<(), LexicalIndexError> {
+    let journal_mode = toasty::sql::query("PRAGMA journal_mode = WAL")
+        .column_types([Type::String])
+        .exec(connection)
+        .await
+        .map_err(storage_error)?;
+    require_pragma_row(&journal_mode, &[Value::String("wal".to_owned())])
+}
+
+/// Applies connection-local durability, lock wait, and access policy.
+async fn configure_connection(
+    connection: &mut Connection,
+    pool: DatabasePool,
+    access: ConnectionAccess,
+) -> Result<(), LexicalIndexError> {
+    toasty::sql::query("PRAGMA synchronous = NORMAL")
+        .exec(&mut *connection)
+        .await
+        .map_err(storage_error)?;
+    let busy_timeout_ms = pool.busy_timeout_ms();
+    toasty::sql::query(format!("PRAGMA busy_timeout = {busy_timeout_ms}"))
+        .exec(&mut *connection)
+        .await
+        .map_err(storage_error)?;
+    let query_only = match access {
+        ConnectionAccess::Read => "ON",
+        ConnectionAccess::Write => "OFF",
+    };
+    toasty::sql::query(format!("PRAGMA query_only = {query_only}"))
+        .exec(connection)
+        .await
+        .map_err(storage_error)?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use toasty::stmt::{Type, Value};
+
     use super::{DatabasePool, WorkspaceDatabase};
+    use crate::log::LogRecordRow;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -255,6 +293,107 @@ mod tests {
         let reopened = WorkspaceDatabase::open(&path, pool()).await;
 
         assert!(reopened.is_ok(), "reopening must be idempotent");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkouts_carry_wal_normal_sync_busy_wait_and_access_policy() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let database = WorkspaceDatabase::open(&directory.path().join("db"), pool()).await?;
+        let mut reading = database.connection().await?;
+
+        let journal = toasty::sql::query("PRAGMA journal_mode")
+            .column_types([Type::String])
+            .exec(&mut reading)
+            .await?;
+        let synchronous = toasty::sql::query("PRAGMA synchronous")
+            .column_types([Type::I64])
+            .exec(&mut reading)
+            .await?;
+        let busy_timeout = toasty::sql::query("PRAGMA busy_timeout")
+            .column_types([Type::I64])
+            .exec(&mut reading)
+            .await?;
+        let query_only = toasty::sql::query("PRAGMA query_only")
+            .column_types([Type::I64])
+            .exec(&mut reading)
+            .await?;
+
+        crate::lexical::require_pragma_row(&journal, &[Value::String("wal".to_owned())])?;
+        crate::lexical::require_pragma_row(&synchronous, &[Value::I64(1)])?;
+        crate::lexical::require_pragma_row(&busy_timeout, &[Value::I64(1_000)])?;
+        crate::lexical::require_pragma_row(&query_only, &[Value::I64(1)])?;
+        let refused = toasty::sql::statement("DELETE FROM log_records")
+            .exec(&mut reading)
+            .await;
+        assert!(refused.is_err(), "a read checkout must refuse a write");
+        drop(reading);
+
+        let mut writing = database.writing().await?;
+        let mut transaction = writing.transaction().await?;
+        let query_only = toasty::sql::query("PRAGMA query_only")
+            .column_types([Type::I64])
+            .exec(&mut transaction)
+            .await?;
+        crate::lexical::require_pragma_row(&query_only, &[Value::I64(0)])?;
+        transaction.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn write_checkouts_wait_for_the_process_write_turn() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let database = WorkspaceDatabase::open(&directory.path().join("db"), pool()).await?;
+        let first = database.writing().await?;
+        let (waiting, reached_wait) = tokio::sync::oneshot::channel();
+        let contender_database = Arc::clone(&database);
+        let mut contender = tokio::spawn(async move {
+            let _ = waiting.send(());
+            contender_database.writing().await.map(drop)
+        });
+        reached_wait.await?;
+
+        let blocked = tokio::time::timeout(Duration::from_millis(1), &mut contender).await;
+        assert!(blocked.is_err(), "the second writer must remain queued");
+        drop(first);
+
+        tokio::time::timeout(Duration::from_secs(1), contender).await???;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wal_read_completes_while_an_immediate_write_is_uncommitted() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let database = WorkspaceDatabase::open(&directory.path().join("db"), pool()).await?;
+        let mut writing = database.writing().await?;
+        let mut transaction = writing.transaction().await?;
+        LogRecordRow::create()
+            .id(1)
+            .recorded_at(1)
+            .level("info".to_owned())
+            .target("rift_index::database".to_owned())
+            .component("storage".to_owned())
+            .operation("database.test".to_owned())
+            .message("uncommitted".to_owned())
+            .fields("{}".to_owned())
+            .exec(&mut transaction)
+            .await?;
+        let reader_database = Arc::clone(&database);
+        let reader = tokio::spawn(async move {
+            let mut connection = reader_database
+                .connection()
+                .await
+                .expect("the read connection opens");
+            LogRecordRow::all()
+                .count()
+                .exec(&mut connection)
+                .await
+                .expect("the snapshot count reads")
+        });
+
+        let visible = tokio::time::timeout(Duration::from_secs(1), reader).await??;
+        assert_eq!(visible, 0, "a reader must see the last committed snapshot");
+        transaction.commit().await?;
         Ok(())
     }
 }

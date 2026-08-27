@@ -62,10 +62,10 @@ impl LogSink {
     /// Queues one record, counting a drop rather than waiting for room.
     fn send(&self, record: LogRecord) {
         match self.sender.try_send(record) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_) | TrySendError::Closed(_)) => {
+            Err(TrySendError::Full(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
+            Ok(()) | Err(TrySendError::Closed(_)) => {}
         }
     }
 }
@@ -78,7 +78,7 @@ pub struct LogDrain {
 }
 
 impl LogDrain {
-    /// Writes queued records into `store` until the queue closes or `cancellation` fires.
+    /// Writes records until the queue closes, draining buffered records after cancellation.
     ///
     /// Records are written in batches: the task takes what the queue holds,
     /// waits [`LOG_FLUSH_INTERVAL`] for more, and writes at most
@@ -88,22 +88,40 @@ impl LogDrain {
     /// A write that fails is reported once to stderr and its batch is dropped:
     /// the alternative is a retry loop that logs its own failures into the queue
     /// it is failing to drain.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancellation closes the receiving end and drains the bounded queue before return.
     pub async fn run(
         mut self,
-        store: LogStore,
+        store: Arc<LogStore>,
         retention_records: u64,
         cancellation: CancellationToken,
     ) {
         let mut batch = Vec::with_capacity(LOG_BATCH_RECORDS_MAX);
+        let mut closing = false;
         loop {
             let received = tokio::select! {
-                () = cancellation.cancelled() => break,
+                biased;
+                () = cancellation.cancelled(), if !closing => {
+                    self.receiver.close();
+                    closing = true;
+                    continue;
+                }
                 received = self.receiver.recv_many(&mut batch, LOG_BATCH_RECORDS_MAX) => received,
             };
             if received == 0 {
                 break;
             }
-            tokio::time::sleep(LOG_FLUSH_INTERVAL).await;
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled(), if !closing => {
+                    self.receiver.close();
+                    closing = true;
+                }
+                () = tokio::time::sleep(LOG_FLUSH_INTERVAL), if !closing => {}
+                else => {}
+            }
             while batch.len() < LOG_BATCH_RECORDS_MAX {
                 match self.receiver.try_recv() {
                     Ok(record) => batch.push(record),
@@ -114,6 +132,7 @@ impl LogDrain {
             self.write_batch(&store, &batch, retention_records).await;
             batch.clear();
         }
+        self.note_drops(&mut batch);
         if !batch.is_empty() {
             self.write_batch(&store, &batch, retention_records).await;
         }
@@ -121,9 +140,8 @@ impl LogDrain {
 
     /// Writes one batch, retrying a refused write before giving it up.
     ///
-    /// The index lane commits to the same database and holds its write lock for
-    /// the length of a rebuild, so a refusal here is usually a busy database
-    /// rather than a broken one. A batch that still fails after
+    /// In-process writers queue before reaching `SQLite`. A refusal can still come from
+    /// another process or an operating failure. A batch that still fails after
     /// [`LOG_WRITE_ATTEMPTS_MAX`] is counted as dropped, which the next batch
     /// records: the queue behind this one is still filling.
     async fn write_batch(&self, store: &LogStore, batch: &[LogRecord], retention_records: u64) {
@@ -148,6 +166,9 @@ impl LogDrain {
     /// Appends one record naming the drops so far, when there are any. The
     /// count is what a reader needs to know the run is missing records.
     fn note_drops(&self, batch: &mut Vec<LogRecord>) {
+        if batch.len() == LOG_BATCH_RECORDS_MAX {
+            return;
+        }
         let dropped = self.dropped.swap(0, Ordering::Relaxed);
         if dropped == 0 {
             return;
@@ -176,24 +197,6 @@ pub fn log_capture() -> (LogSink, LogDrain) {
         },
         LogDrain { receiver, dropped },
     )
-}
-
-/// Opens the workspace's log store on the process's one workspace database.
-///
-/// A database that will not open costs the run its recorded diagnostics, never
-/// its service: the caller keeps serving with stderr diagnostics alone.
-pub async fn open_log_store(root: &Path) -> Option<LogStore> {
-    let database = crate::storage::workspace_database(root).await?;
-    match LogStore::attached(database).await {
-        Ok(store) => Some(store),
-        Err(error) => {
-            eprintln!(
-                "rift: the log store failed to attach: {error}{cause}",
-                cause = caused_by(&error)
-            );
-            None
-        }
-    }
 }
 
 /// The workspace's `[logs]` table, or the default table while `rift.toml` is
@@ -428,6 +431,11 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use rift_index::{DatabasePool, LogQuery, LogRecord, LogStore, WorkspaceDatabase};
+    use tokio_util::sync::CancellationToken;
+
     use super::{LOG_QUEUE_RECORDS, RecordedFields, log_capture, quoted};
     use tracing::field::Visit;
     use tracing_subscriber::layer::SubscriberExt;
@@ -440,6 +448,27 @@ mod tests {
             records.push(record);
         }
         records
+    }
+
+    fn record(message: &str) -> LogRecord {
+        LogRecord::new(
+            1,
+            "info",
+            "rift_mcp::logs",
+            "logs",
+            "logs.test",
+            message,
+            "{}",
+        )
+    }
+
+    async fn store() -> (tempfile::TempDir, Arc<LogStore>) {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let database =
+            WorkspaceDatabase::open(&directory.path().join("db"), DatabasePool::new(4, 1_000))
+                .await
+                .expect("the database opens");
+        (directory, Arc::new(LogStore::attached(database)))
     }
 
     #[test]
@@ -537,6 +566,58 @@ mod tests {
 
         assert_eq!(sink.dropped(), 8);
         assert_eq!(queued(&mut drain).len(), LOG_QUEUE_RECORDS);
+    }
+
+    #[tokio::test]
+    async fn cancellation_drains_every_buffered_record() {
+        let (_directory, store) = store().await;
+        let (sink, drain) = log_capture();
+        for message in ["one", "two", "three"] {
+            sink.send(record(message));
+        }
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        drain.run(Arc::clone(&store), 10_000, cancellation).await;
+
+        assert_eq!(store.count().await.expect("the count reads"), 3);
+    }
+
+    #[tokio::test]
+    async fn a_full_batch_defers_the_drop_record_without_oversizing_the_write() {
+        let (_directory, store) = store().await;
+        let (sink, drain) = log_capture();
+        for index in 0..(LOG_QUEUE_RECORDS + 8) {
+            sink.send(record(&format!("record {index}")));
+        }
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        drain.run(Arc::clone(&store), 10_000, cancellation).await;
+
+        assert_eq!(
+            store.count().await.expect("the count reads"),
+            (LOG_QUEUE_RECORDS + 1) as u64
+        );
+        let latest = store
+            .recent(&LogQuery::newest(1))
+            .await
+            .expect("the latest record reads");
+        assert_eq!(
+            latest[0].record().message(),
+            "the log queue was full and dropped records"
+        );
+        assert_eq!(latest[0].record().fields(), "{\"dropped\":8}");
+    }
+
+    #[test]
+    fn a_closed_drain_does_not_report_queue_pressure() {
+        let (sink, drain) = log_capture();
+        drop(drain);
+
+        sink.send(record("after shutdown"));
+
+        assert_eq!(sink.dropped(), 0);
     }
 
     #[test]

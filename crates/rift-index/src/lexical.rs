@@ -38,7 +38,7 @@ const LEXICAL_MATCHES_MAX_DEFAULT: u32 = 1_000;
 const LEXICAL_POOL_SLOTS_DEFAULT: u32 = 4;
 /// Default busy-wait budget, in milliseconds, `SQLite` grants a connection
 /// before returning `SQLITE_BUSY`.
-const LEXICAL_BUSY_TIMEOUT_MS_DEFAULT: u32 = 1_000;
+const LEXICAL_BUSY_TIMEOUT_MS_DEFAULT: u32 = 5_000;
 /// Maximum UTF-8 bytes accepted for one unit's declaration name, matching
 /// the wire's symbol-name maximum.
 const UNIT_NAME_BYTES_MAX: usize = 4_096;
@@ -1042,11 +1042,7 @@ impl LexicalSearchIndex {
         validate_lexical_batch(units, self.limits)?;
 
         let mut access = self.database.writing().await?;
-        let mut transaction = access
-            .connection()
-            .transaction()
-            .await
-            .map_err(storage_error)?;
+        let mut transaction = access.transaction().await?;
 
         toasty::sql::statement("DELETE FROM lexical_units_fts")
             .exec(&mut transaction)
@@ -1101,11 +1097,7 @@ impl LexicalSearchIndex {
         validate_lexical_units(change.inserted(), self.limits)?;
 
         let mut access = self.database.writing().await?;
-        let mut transaction = access
-            .connection()
-            .transaction()
-            .await
-            .map_err(storage_error)?;
+        let mut transaction = access.transaction().await?;
 
         for path in change.replaced() {
             delete_path_units(&mut transaction, path).await?;
@@ -1157,12 +1149,8 @@ impl LexicalSearchIndex {
         let expression = match_expression(query, terms_max)?;
         let effective_limit = i64::from(limit.min(self.limits.matches_max()));
 
-        let mut access = self.database.writing().await?;
-        let mut transaction = access
-            .connection()
-            .transaction()
-            .await
-            .map_err(storage_error)?;
+        let mut connection = self.database.connection().await?;
+        let mut transaction = connection.transaction().await.map_err(storage_error)?;
         let stored = stored_tree_revision(&mut transaction).await?;
         match stored {
             None => return Ok(RevisionScoped::NoRevision),
@@ -1256,7 +1244,7 @@ mod tests {
     fn test_lexical_index_limits_default_accepts_documented_pool_and_timeout() {
         let limits = LexicalIndexLimits::default();
         assert_eq!(limits.pool_slots(), 4);
-        assert_eq!(limits.busy_timeout_ms(), 1_000);
+        assert_eq!(limits.busy_timeout_ms(), 5_000);
     }
 
     fn symbol_unit_with_name(name: String) -> LexicalUnit {

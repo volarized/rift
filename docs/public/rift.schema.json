@@ -615,12 +615,12 @@
     },
     "SearchConfiguration": {
       "additionalProperties": false,
-      "description": "The `[search]` table. Search fuses a lexical ranking with a semantic one:\n`lexical` and `semantic` weigh the two against each other, `fusion_k` sets\nhow sharply a top rank counts, `pool_slots` and `busy_timeout` bound the\n`SQLite` connections behind the lexical tier, and `text` includes\nnon-source text files in the lexical index.",
+      "description": "The `[search]` table. Search fuses a lexical ranking with a semantic one:\n`lexical` and `semantic` weigh the two against each other, `fusion_k` sets\nhow sharply a top rank counts, `pool_slots` and `busy_timeout` bound the\nshared `SQLite` connections behind search and logs, and `text` includes\nnon-source text files in the lexical index.",
       "properties": {
         "busy_timeout": {
           "$ref": "#/$defs/Duration",
-          "default": "1s",
-          "description": "Wall-clock budget one lexical search connection waits for `SQLite`'s\nbusy lock before `SQLITE_BUSY`, 100ms to 30s.",
+          "default": "5s",
+          "description": "Wall-clock budget one connection waits for a database lock held by\nanother process before `SQLITE_BUSY`, 100ms to 30s.",
           "rift:range": {
             "max": "30s",
             "min": "100ms"
@@ -643,7 +643,7 @@
         },
         "pool_slots": {
           "default": 4,
-          "description": "Pooled `SQLite` connections the lexical search index may open at\nonce, 1 to 16.",
+          "description": "Pooled `SQLite` connections the workspace database may open at once,\n1 to 16. Search reads and stored logs share this pool.",
           "format": "uint64",
           "maximum": 16,
           "minimum": 1,
@@ -975,7 +975,7 @@
     "search": {
       "$ref": "#/$defs/SearchConfiguration",
       "default": {
-        "busy_timeout": "1s",
+        "busy_timeout": "5s",
         "fusion_k": 60,
         "lexical": {
           "weight": 0.7

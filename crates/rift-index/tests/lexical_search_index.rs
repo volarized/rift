@@ -13,6 +13,7 @@ use rift_index::{
 use tempfile::TempDir;
 use toasty::Db;
 use toasty::stmt::Type;
+use toasty_core::driver::operation::TransactionMode;
 use toasty_driver_sqlite::Sqlite;
 
 /// The matches one revision-qualified search returned, refusing any answer the store could
@@ -701,33 +702,34 @@ async fn test_lexical_search_index_open_migration_apply_conflict_refuses_distinc
     Ok(())
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_replace_all_against_readonly_directory_surfaces_storage_failure()
+async fn test_lexical_search_index_replace_all_against_external_writer_surfaces_storage_failure()
 -> Result<(), Box<dyn std::error::Error>> {
-    use std::os::unix::fs::PermissionsExt;
-
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabasePool::new(4, 25)).await?,
         LexicalIndexLimits::default(),
     );
 
-    // The pooled connection opened during `open` keeps its file descriptor
-    // writable regardless of later `chmod` calls on the database file
-    // itself (POSIX only checks permissions at `open`, not on each write).
-    // WAL activation on first use, however, must create fresh `-wal`/`-shm`
-    // files in the containing directory, so stripping directory write
-    // access is what forces a genuine SQLite write failure here.
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o555))?;
+    // The process write lane cannot coordinate another process. A second pool
+    // models that boundary and proves the configured busy timeout still turns
+    // an externally held write lock into the store's typed storage failure.
+    let mut blocker_builder = Db::builder();
+    blocker_builder.max_pool_size(1);
+    let blocker_database = blocker_builder.build(Sqlite::open(&path)).await?;
+    let mut blocker_connection = blocker_database.connection().await?;
+    let blocker = blocker_connection
+        .transaction_builder()
+        .mode(TransactionMode::Immediate)
+        .begin()
+        .await?;
     let outcome = index
         .replace_all(&[text_unit("docs/a.md", "content")?], "revision-1")
         .await;
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    blocker.rollback().await?;
 
-    let error =
-        outcome.expect_err("write against a read-only directory must surface a storage failure");
+    let error = outcome.expect_err("an externally held write lock must surface a storage failure");
     assert_eq!(error.fault().violation(), LexicalIndexViolation::Storage);
     assert_eq!(error.name(), ErrorName::Wire(ErrorCode::StorageFailure));
     assert!(

@@ -45,6 +45,18 @@ enum CliCommand {
     __CleanupUpdate { parent_pid: u32 },
 }
 
+impl Cli {
+    /// Whether this command owns the workspace server's log drain.
+    const fn records_logs(&self) -> bool {
+        matches!(
+            &self.command,
+            Some(CliCommand::Server {
+                command: server::ServerCommand::Start { foreground: true }
+            })
+        )
+    }
+}
+
 #[cfg(test)]
 fn cli_command() -> Command {
     Cli::command()
@@ -52,9 +64,13 @@ fn cli_command() -> Command {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let logs = rift_mcp::logs_configuration(Path::new("."));
-    let drain = initialize_tracing(&logs.capture);
-    match run(Cli::parse(), drain, logs.retention_records).await {
+    let cli = Cli::parse();
+    let logs = cli
+        .records_logs()
+        .then(|| rift_mcp::logs_configuration(Path::new(".")));
+    let drain = initialize_tracing(logs.as_ref().map(|logs| logs.capture.as_str()));
+    let retention_records = logs.map_or(0, |logs| logs.retention_records);
+    match run(cli, drain, retention_records).await {
         Ok(Some(outcome)) => {
             println!("{outcome}");
             ExitCode::SUCCESS
@@ -70,8 +86,7 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Installs process tracing: human diagnostics on stderr, and the same events
-/// recorded into the workspace database for `rift://logs` to read back.
+/// Installs stderr tracing and optional foreground-server recording.
 ///
 /// The two carry their own filters. Stderr keeps `RUST_LOG` or the default
 /// targets, because that stream belongs to whoever started the process. The
@@ -79,10 +94,18 @@ async fn main() -> ExitCode {
 /// can record itself at debug without an operator exporting an environment
 /// variable into the process a proxy spawns detached.
 ///
-/// The returned drain writes what the layer queued. Only a serving process
-/// takes it; every other command drops it, and its records are dropped with it.
-fn initialize_tracing(capture: &str) -> rift_mcp::LogDrain {
-    let (sink, drain) = rift_mcp::log_capture();
+/// The returned drain exists only for a foreground server. Other commands install no
+/// recording layer and allocate no log queue.
+fn initialize_tracing(capture: Option<&str>) -> Option<rift_mcp::LogDrain> {
+    let (sink, drain) = match capture {
+        Some(capture) => {
+            let (sink, drain) = rift_mcp::log_capture();
+            let filter = EnvFilter::try_new(capture)
+                .unwrap_or_else(|_| EnvFilter::new(DEFAULT_TRACING_FILTER));
+            (Some(sink.with_filter(filter)), Some(drain))
+        }
+        None => (None, None),
+    };
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
@@ -93,7 +116,7 @@ fn initialize_tracing(capture: &str) -> rift_mcp::LogDrain {
                         .unwrap_or_else(|_| EnvFilter::new(DEFAULT_TRACING_FILTER)),
                 ),
         )
-        .with(sink.with_filter(EnvFilter::new(capture)))
+        .with(sink)
         .init();
     drain
 }
@@ -154,7 +177,7 @@ impl fmt::Display for CliOutcome {
 
 async fn run(
     cli: Cli,
-    drain: rift_mcp::LogDrain,
+    drain: Option<rift_mcp::LogDrain>,
     retention_records: u64,
 ) -> Result<Option<CliOutcome>, CliError> {
     match cli.command {
@@ -198,8 +221,7 @@ mod tests {
     #[tokio::test]
     async fn empty_invocation_runs_no_command() {
         let cli = Cli::try_parse_from(["rift"]).expect("empty invocation must parse");
-        let (_sink, drain) = rift_mcp::log_capture();
-        let outcome = super::run(cli, drain, 1_000)
+        let outcome = super::run(cli, None, 1_000)
             .await
             .expect("empty invocation must succeed");
         assert!(outcome.is_none());
@@ -334,6 +356,28 @@ mod tests {
             Cli::try_parse_from(["rift", "server", "stop", "--foreground"]).is_err(),
             "--foreground belongs to start alone"
         );
+    }
+
+    #[test]
+    fn only_a_foreground_server_records_workspace_logs() {
+        let foreground = Cli::try_parse_from(["rift", "server", "start", "--foreground"])
+            .expect("foreground start must parse");
+        assert!(foreground.records_logs());
+
+        for arguments in [
+            ["rift", "mcp"].as_slice(),
+            ["rift", "server", "start"].as_slice(),
+            ["rift", "server", "stop"].as_slice(),
+            ["rift", "server", "restart"].as_slice(),
+            ["rift", "server", "status"].as_slice(),
+            ["rift", "update"].as_slice(),
+        ] {
+            let command = Cli::try_parse_from(arguments).expect("command must parse");
+            assert!(
+                !command.records_logs(),
+                "{arguments:?} must not allocate the workspace log queue"
+            );
+        }
     }
 
     #[test]

@@ -250,11 +250,12 @@ A visible path no syntax provider parses - `justfile`, `.gitignore` - refuses
 
 ### Server logs [#resource-logs]
 
-<VersionBadge version="v0.0.21" />
+<VersionBadge version="v0.0.22" />
 
-`rift://logs` reads the server's own diagnostics back, newest first. Every event the process
-emits under the `[logs] capture` filter lands in the workspace database, so an agent that met a
-refusal can ask what the server was doing without an operator reading its terminal:
+`rift://logs` reads the server's own diagnostics back, newest first. Events admitted by the
+`[logs] capture` filter enter a bounded queue and one task writes them to the workspace database,
+so an agent that met a refusal can ask what the server was doing without an operator reading its
+terminal. When the queue fills, the task drops later events and records the dropped count:
 
 | Resource | Content |
 | --- | --- |

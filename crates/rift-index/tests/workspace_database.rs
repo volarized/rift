@@ -60,7 +60,7 @@ async fn a_log_append_lands_while_the_index_commits_to_the_same_file() -> TestRe
     let directory = tempfile::tempdir()?;
     let database = WorkspaceDatabase::open(&directory.path().join("db"), database_pool()).await?;
     let index = LexicalSearchIndex::attached(Arc::clone(&database), index_limits());
-    let logs = LogStore::attached(Arc::clone(&database)).await?;
+    let logs = LogStore::attached(Arc::clone(&database));
     let units: Vec<LexicalUnit> = (0..COMMIT_UNITS).map(unit).collect::<Result<_, _>>()?;
 
     let commit = tokio::spawn(async move { index.replace_all(&units, "revision").await });
@@ -83,7 +83,7 @@ async fn a_log_append_lands_while_the_index_commits_to_the_same_file() -> TestRe
 async fn a_log_store_attached_first_leaves_the_index_its_own_bounds() -> TestResult {
     let directory = tempfile::tempdir()?;
     let database = WorkspaceDatabase::open(&directory.path().join("db"), database_pool()).await?;
-    let _logs = LogStore::attached(Arc::clone(&database)).await?;
+    let _logs = LogStore::attached(Arc::clone(&database));
     let index = LexicalSearchIndex::attached(Arc::clone(&database), index_limits());
     let units: Vec<LexicalUnit> = (0..COMMIT_UNITS).map(unit).collect::<Result<_, _>>()?;
 

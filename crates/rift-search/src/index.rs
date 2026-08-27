@@ -21,8 +21,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use tokio::sync::Mutex as AsyncMutex;
-
 use rift_core::ProjectPath;
 use rift_index::{DatabasePool, WorkspaceDatabase};
 use rift_index::{
@@ -447,15 +445,6 @@ struct HeldCorpus {
 /// than embedding it again.
 #[derive(Debug)]
 pub struct SearchIndex {
-    /// Serializes every write to the database file.
-    ///
-    /// `SQLite` admits one writer at a time and answers a second with `SQLITE_BUSY` once
-    /// its busy budget is spent. The lexical commit is on the publication path and the
-    /// vector store's batches are not, so leaving the two to race would let a background
-    /// batch refuse a caller's rebuild. Holding this across each write makes the order
-    /// explicit: a commit waits for at most one vector batch, and neither meets a busy
-    /// database.
-    writes: AsyncMutex<()>,
     lexical: LexicalSearchIndex,
     vectors: SemanticVectorStore,
     model: Mutex<Option<Arc<LoadedModel>>>,
@@ -506,7 +495,6 @@ impl SearchIndex {
         let lexical = LexicalSearchIndex::attached(Arc::clone(&database), limits.lexical());
         let vectors = SemanticVectorStore::attached(database);
         Ok(Self {
-            writes: AsyncMutex::new(()),
             lexical,
             vectors,
             model: Mutex::new(None),
@@ -575,10 +563,10 @@ impl SearchIndex {
         units: &[LexicalUnit],
         tree_revision: &str,
     ) -> Result<(), SearchError> {
-        let writing = self.writes.lock().await;
-        let written = self.lexical.replace_all(units, tree_revision).await;
-        drop(writing);
-        written.map_err(store_failed)
+        self.lexical
+            .replace_all(units, tree_revision)
+            .await
+            .map_err(store_failed)
     }
 
     /// Applies one change set's lexical units and stamps `tree_revision`, in one
@@ -599,10 +587,10 @@ impl SearchIndex {
         change: &LexicalChange,
         tree_revision: &str,
     ) -> Result<(), SearchError> {
-        let writing = self.writes.lock().await;
-        let written = self.lexical.apply(change, tree_revision).await;
-        drop(writing);
-        written.map_err(store_failed)
+        self.lexical
+            .apply(change, tree_revision)
+            .await
+            .map_err(store_failed)
     }
 
     /// Embeds the declarations one publication describes, prunes the vectors no live
@@ -734,10 +722,11 @@ impl SearchIndex {
     /// model beside the previous one's vectors; the next pass reads the corpus
     /// back under the model held here.
     async fn hold(&self, model: LoadedModel) -> Result<(), SearchError> {
-        let writing = self.writes.lock().await;
-        let pruned = self.vectors.prune_other_models(&model.identity).await;
-        drop(writing);
-        let _dropped = pruned.map_err(store_failed)?;
+        let _dropped = self
+            .vectors
+            .prune_other_models(&model.identity)
+            .await
+            .map_err(store_failed)?;
         self.publish_held(None);
         let mut held = self.model.lock().unwrap_or_else(PoisonError::into_inner);
         *held = Some(Arc::new(model));
@@ -774,10 +763,11 @@ impl SearchIndex {
         self.embed_batches(model, &selected(&documents, &stored, embedding))
             .await?;
         let live: BTreeSet<String> = documents.iter().map(|one| one.digest.clone()).collect();
-        let writing = self.writes.lock().await;
-        let pruned = self.vectors.prune_absent(&model.identity, &live).await;
-        drop(writing);
-        let _pruned = pruned.map_err(store_failed)?;
+        let _pruned = self
+            .vectors
+            .prune_absent(&model.identity, &live)
+            .await
+            .map_err(store_failed)?;
         let corpus = self.read_corpus(model).await?;
         self.publish(&documents, corpus, tree_revision);
         self.set_readiness(reached(as_count(documents.len()), total));
@@ -830,13 +820,10 @@ impl SearchIndex {
                     .await
                     .map_err(task_failed)??;
             let vectors = paired(chunk, embedded);
-            let writing = self.writes.lock().await;
-            let stored = self
-                .vectors
+            self.vectors
                 .store(&model.identity, model.encoder.dimension(), &vectors)
-                .await;
-            drop(writing);
-            stored.map_err(store_failed)?;
+                .await
+                .map_err(store_failed)?;
         }
         Ok(())
     }

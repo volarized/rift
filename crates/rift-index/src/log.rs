@@ -6,17 +6,11 @@
 //! index lane is still stuck, so the run explains itself without an operator
 //! copying a terminal.
 //!
-//! The rows live in the workspace database the lexical index already owns.
-//! Toasty records applied migrations in one table per file, so one migration
-//! set covers every store in the file and each applies the same idempotent set,
-//! the way the vector store does.
-//!
-//! The store is written by one drain task and read by request handlers. It
-//! never takes the index lane's connection, so a wedged rebuild cannot stop a
-//! record from landing or from being read back.
+//! The rows live in the workspace database the search tiers share. One drain
+//! task writes them through the database's write turn, while request handlers
+//! read committed WAL snapshots through read-only connections.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
 
 use toasty::db::Connection;
 
@@ -202,44 +196,13 @@ impl LogQuery {
 #[derive(Debug)]
 pub struct LogStore {
     database: Arc<WorkspaceDatabase>,
-    /// The next identity to file a record under, seeded from the store at open.
-    ///
-    /// The counter is held rather than read per write for a reason `SQLite`
-    /// enforces: a transaction that reads first holds a shared lock, and the
-    /// upgrade to a write lock is refused immediately with `database is locked`
-    /// when another connection is writing - `busy_timeout` does not apply to an
-    /// upgrade, because waiting for one can deadlock. The index lane writes to
-    /// this same file, so a `SELECT MAX(id)` inside the append lost every batch
-    /// that met a rebuild. Beginning with the insert takes the write lock as
-    /// the first act, which `busy_timeout` does cover.
-    next_identity: AtomicI64,
 }
 
 impl LogStore {
-    /// Attaches the log store to one already-open workspace database, seeding
-    /// the identity counter from what the store already holds.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LexicalIndexError`] when the seeding read fails.
-    ///
-    /// # Cancel safety
-    ///
-    /// Cancellation performs no writes; this issues one read-only query.
-    pub async fn attached(database: Arc<WorkspaceDatabase>) -> Result<Self, LexicalIndexError> {
-        let mut connection = database.connection().await?;
-        let newest = LogRecordRow::all()
-            .order_by(LogRecordRow::fields().id().desc())
-            .first()
-            .exec(&mut connection)
-            .await
-            .map_err(storage_error)?;
-        let highest = newest.map_or(0, |row| row.id);
-        drop(connection);
-        Ok(Self {
-            database,
-            next_identity: AtomicI64::new(highest + 1),
-        })
+    /// Attaches the log store to one already-open workspace database.
+    #[must_use]
+    pub fn attached(database: Arc<WorkspaceDatabase>) -> Self {
+        Self { database }
     }
 
     /// Appends one batch and trims the store back to `retention_records`.
@@ -275,22 +238,18 @@ impl LogStore {
                 LOG_BATCH_RECORDS_MAX as u64,
             ));
         }
-        // The identities are minted before the transaction opens, so its first statement
-        // is the insert. A transaction that read first would hold a shared lock, and
-        // SQLite refuses the upgrade to a write lock immediately - `busy_timeout` covers
-        // acquiring a lock, never upgrading one - so a batch that met an index rebuild
-        // writing to the same file was lost rather than delayed.
-        let minted = batch_as_i64(records.len());
-        let first_identity = self.next_identity.fetch_add(minted, Ordering::SeqCst);
         let mut access = self.database.writing().await?;
-        let mut transaction = access
-            .connection()
-            .transaction()
+        let mut transaction = access.transaction().await?;
+        let newest = LogRecordRow::all()
+            .order_by(LogRecordRow::fields().id().desc())
+            .first()
+            .exec(&mut transaction)
             .await
             .map_err(storage_error)?;
+        let first_identity = newest.map_or(1, |row| row.id.saturating_add(1));
         for (offset, record) in records.iter().enumerate() {
             LogRecordRow::create()
-                .id(first_identity + batch_as_i64(offset))
+                .id(first_identity.saturating_add(batch_as_i64(offset)))
                 .recorded_at(record.recorded_at_ms)
                 .level(record.level.clone())
                 .target(record.target.clone())
@@ -302,8 +261,7 @@ impl LogStore {
                 .await
                 .map_err(storage_error)?;
         }
-        let highest = first_identity + minted - 1;
-        let dropped = trim(&mut transaction, highest, retention_records).await?;
+        let dropped = trim(&mut transaction, retention_records).await?;
         transaction.commit().await.map_err(storage_error)?;
         Ok(dropped)
     }
@@ -364,25 +322,31 @@ impl LogStore {
 /// the configuration's own bound refuses zero, so this is the floor case alone.
 async fn trim(
     transaction: &mut toasty::db::Transaction<'_>,
-    highest: i64,
     retention_records: u64,
 ) -> Result<u64, LexicalIndexError> {
-    let retention = i64::try_from(retention_records).unwrap_or(i64::MAX);
-    let threshold = highest.saturating_sub(retention);
-    if threshold <= 0 {
-        return Ok(0);
-    }
-    let dropped = LogRecordRow::all()
-        .filter(LogRecordRow::fields().id().le(threshold))
+    let held = LogRecordRow::all()
         .count()
-        .exec(transaction)
+        .exec(&mut *transaction)
         .await
         .map_err(storage_error)?;
+    let dropped = held.saturating_sub(retention_records);
     if dropped == 0 {
         return Ok(0);
     }
+    let threshold_offset = usize::try_from(dropped.saturating_sub(1)).unwrap_or(usize::MAX);
+    let threshold = LogRecordRow::all()
+        .order_by(LogRecordRow::fields().id().asc())
+        .limit(1)
+        .offset(threshold_offset)
+        .first()
+        .exec(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    let Some(threshold) = threshold else {
+        return Ok(0);
+    };
     LogRecordRow::all()
-        .filter(LogRecordRow::fields().id().le(threshold))
+        .filter(LogRecordRow::fields().id().le(threshold.id))
         .delete()
         .exec(transaction)
         .await
@@ -474,7 +438,7 @@ mod tests {
 
     async fn store(directory: &tempfile::TempDir) -> Result<LogStore, Box<dyn std::error::Error>> {
         let database = crate::WorkspaceDatabase::open(&directory.path().join("db"), pool()).await?;
-        Ok(LogStore::attached(database).await?)
+        Ok(LogStore::attached(database))
     }
 
     #[tokio::test]

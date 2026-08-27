@@ -16,8 +16,8 @@
 //! sends an empty answer's operation again once, so the request that races
 //! the announcement is not the one the caller is answered from.
 //!
-//! The rename and the refusal below run cold. The move and the patch warm
-//! the engine first, and both for the same measured reason: rust-analyzer
+//! The rename, move, and patch warm the engine first. The refusal runs cold.
+//! The warm tests do so for the same measured reason: rust-analyzer
 //! announces its project load, ends the announcement, and still answers a
 //! will-rename with no edit and a pull with no items for a file it has not
 //! finished reading. An engine that says its work is done and then answers
@@ -155,6 +155,7 @@ async fn applied_rename_rewrites_the_module_and_its_caller() -> TestResult {
     let (directory, client, server_task) =
         served_relative_workspace(&project(), Some(rust_engine_configuration())).await?;
     require_rust_analyzer(directory.path());
+    warmed_engine(&client).await?;
 
     let structured = call_retrying_acceptance(&client, rename_request("flare")).await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");

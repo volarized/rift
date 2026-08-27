@@ -230,9 +230,7 @@ mod tests {
         )
         .await
         .expect("the database opens");
-        let store = LogStore::attached(database)
-            .await
-            .expect("the store attaches");
+        let store = LogStore::attached(database);
         store
             .append(
                 &[LogRecord::new(

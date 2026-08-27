@@ -742,7 +742,7 @@ impl ExecutionConfiguration {
 /// The `[search]` table. Search fuses a lexical ranking with a semantic one:
 /// `lexical` and `semantic` weigh the two against each other, `fusion_k` sets
 /// how sharply a top rank counts, `pool_slots` and `busy_timeout` bound the
-/// `SQLite` connections behind the lexical tier, and `text` includes
+/// shared `SQLite` connections behind search and logs, and `text` includes
 /// non-source text files in the lexical index.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -763,13 +763,13 @@ pub struct SearchConfiguration {
     #[schemars(range(min = 1, max = 1000))]
     #[serde(default = "default_search_fusion_k")]
     pub fusion_k: u64,
-    /// Pooled `SQLite` connections the lexical search index may open at
-    /// once, 1 to 16.
+    /// Pooled `SQLite` connections the workspace database may open at once,
+    /// 1 to 16. Search reads and stored logs share this pool.
     #[schemars(range(min = 1, max = 16))]
     #[serde(default = "default_search_pool_slots")]
     pub pool_slots: u64,
-    /// Wall-clock budget one lexical search connection waits for `SQLite`'s
-    /// busy lock before `SQLITE_BUSY`, 100ms to 30s.
+    /// Wall-clock budget one connection waits for a database lock held by
+    /// another process before `SQLITE_BUSY`, 100ms to 30s.
     #[serde(default = "default_search_busy_timeout")]
     pub busy_timeout: Duration,
 }
@@ -831,7 +831,7 @@ pub const SEARCH_BUSY_TIMEOUT_MS_MIN: u64 = 100;
 /// Milliseconds `search.busy_timeout` may hold, at most: thirty seconds.
 pub const SEARCH_BUSY_TIMEOUT_MS_MAX: u64 = 30_000;
 /// Milliseconds `search.busy_timeout` holds when the key is absent.
-const SEARCH_BUSY_TIMEOUT_MS_DEFAULT: u64 = 1_000;
+const SEARCH_BUSY_TIMEOUT_MS_DEFAULT: u64 = 5_000;
 
 /// `search.fusion_k` accepted, at least.
 pub const SEARCH_FUSION_K_MIN: u64 = 1;
@@ -1670,6 +1670,13 @@ pub enum ConfigurationViolation {
         /// The rejected pattern.
         pattern: String,
     },
+    /// A `logs.capture` value is not a tracing filter directive.
+    LogCaptureInvalid {
+        /// The rejected filter.
+        capture: String,
+        /// The filter parser's account of the failure.
+        detail: String,
+    },
     /// `server.port` and `server.port_range` are both set, so the file
     /// selects the port twice.
     PortSelectionConflict,
@@ -1754,6 +1761,11 @@ impl ConfigurationViolation {
             Self::PathPatternInvalid { field, pattern } => {
                 vec![("field", (*field).to_owned()), ("pattern", pattern.clone())]
             }
+            Self::LogCaptureInvalid { capture, detail } => vec![
+                ("field", "logs.capture".to_owned()),
+                ("capture", capture.clone()),
+                ("detail", detail.clone()),
+            ],
             Self::PortSelectionConflict => {
                 vec![("fields", "server.port, server.port_range".to_owned())]
             }
@@ -2410,7 +2422,7 @@ mod tests {
         assert_eq!(configuration.search.fusion_k, 60);
         assert_eq!(
             configuration.search.busy_timeout,
-            Duration::from_millis(1_000)
+            Duration::from_millis(SEARCH_BUSY_TIMEOUT_MS_DEFAULT)
         );
         assert!(configuration.source.include.is_empty());
         assert!(configuration.source.exclude.is_empty());
@@ -3617,6 +3629,17 @@ mod tests {
                 vec![("extension", "md".to_owned())],
             ),
             (
+                ConfigurationViolation::LogCaptureInvalid {
+                    capture: "[".to_owned(),
+                    detail: "invalid filter".to_owned(),
+                },
+                vec![
+                    ("field", "logs.capture".to_owned()),
+                    ("capture", "[".to_owned()),
+                    ("detail", "invalid filter".to_owned()),
+                ],
+            ),
+            (
                 ConfigurationViolation::EngineNameInvalid {
                     name: "Ty".to_owned(),
                 },
@@ -4494,7 +4517,7 @@ mod tests {
             (
                 "busy timeout default",
                 &search["busy_timeout"]["default"],
-                json!("1s"),
+                json!(Duration::from_millis(SEARCH_BUSY_TIMEOUT_MS_DEFAULT)),
             ),
             (
                 "source include max",

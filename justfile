@@ -96,7 +96,7 @@ rust-gate: format dashes generate-check check clippy docs audit test release-tes
 release tag:
     #!/usr/bin/env bash
     set -euo pipefail
-    tag="{{ tag }}"
+    tag={{ quote(tag) }}
     if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
         echo "error: release tag must match vX.Y.Z: $tag" >&2
         exit 1

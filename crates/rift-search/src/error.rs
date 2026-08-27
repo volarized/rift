@@ -122,7 +122,7 @@ impl SearchFault {
     /// The carried evidence is adopted as evidence, never as a rendered
     /// sentence: rendering the wrapped failure into a `subject` repeated its
     /// explanation and its action inside this one's, which is the stuttering
-    /// message v0.0.21 removed.
+    /// message v0.0.22 removed.
     #[must_use]
     pub fn carrying(mut self, carried: &dyn Fault) -> Self {
         self.carried = Some(Box::new(CarriedIdentity {

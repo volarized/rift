@@ -46,6 +46,7 @@ use tracing::Instrument as _;
 
 use crate::failure::{WireFailure, hook_failure_diagnostic, stale_snapshot_diagnostic};
 use crate::resource;
+use crate::storage::WorkspaceStorage;
 use crate::validation::{
     ConfigurationState, INDEX_CAPTURE_ATTEMPTS_MAX, IndexState, IndexSupervisor,
     IndexSupervisorContext, IndexValidation, LexicalLane, LexicalWrite, PendingWork,
@@ -409,12 +410,13 @@ fn search_index_limits(
 
 /// Attaches the search tiers to the process's one workspace database.
 ///
-/// The database itself is opened by [`crate::storage::workspace_database`], which every
-/// store in the file shares: `SQLite` serializes writers per file, so a pool per store
-/// would only add connections that lose the same write lock. The server serves identifier
-/// search alone when the database will not open.
-async fn open_search_index(root: &Path, limits: SearchIndexLimits) -> Option<Arc<SearchIndex>> {
-    let database = crate::storage::workspace_database(root).await?;
+/// [`WorkspaceStorage`] opens the database once for every store in the process. The server
+/// serves identifier search alone when the database did not open.
+fn open_search_index(
+    storage: &WorkspaceStorage,
+    limits: SearchIndexLimits,
+) -> Option<Arc<SearchIndex>> {
+    let database = storage.database()?;
     match SearchIndex::attached(database, limits) {
         Ok(index) => Some(Arc::new(index)),
         Err(error) => {
@@ -755,7 +757,31 @@ impl RiftMcp {
     /// Dropping this future discards construction. An accepted blocking scan
     /// finishes in the bounded executor before releasing its capacity permit.
     pub async fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, ReadError> {
-        let root = absolute_root(root)?;
+        Self::build_at(absolute_root(root)?, limits, None).await
+    }
+
+    /// Builds against storage already opened by the serving process.
+    pub(crate) async fn build_with_storage(
+        root: &Path,
+        limits: WorkspaceIndexLimits,
+        storage: WorkspaceStorage,
+    ) -> Result<Self, ReadError> {
+        Self::build_at(absolute_root(root)?, limits, Some(storage)).await
+    }
+
+    async fn resolve_storage(root: &Path, storage: Option<WorkspaceStorage>) -> WorkspaceStorage {
+        match storage {
+            Some(storage) => storage,
+            None => WorkspaceStorage::open(root).await,
+        }
+    }
+
+    /// Builds from one resolved root and its process-owned storage.
+    async fn build_at(
+        root: PathBuf,
+        limits: WorkspaceIndexLimits,
+        storage: Option<WorkspaceStorage>,
+    ) -> Result<Self, ReadError> {
         let configuration_root = root.clone();
         let startup_configuration =
             tokio::task::spawn_blocking(move || ConfigurationState::accept(&configuration_root))
@@ -778,10 +804,10 @@ impl RiftMcp {
             .await?;
         let (published, lexical_write) =
             initial_workspace(&root, limits, &validation, &blocking).await?;
-        // The search database lives under the workspace's own `.rift` directory, so it
-        // opens only once the workspace root itself is proven real by a successful initial
-        // scan - never before, or a missing root would be silently fabricated by creating
-        // `.rift` under it.
+        // Direct construction delays the database open until the initial scan proves the
+        // workspace root. A serving process supplies the owner it opened for foreground log
+        // capture; that path creates `.rift` only below an already-existing root.
+        let storage = Self::resolve_storage(&root, storage).await;
         let search_configuration = startup_configuration.search_configuration();
         // While `rift.toml` is invalid every request is refused until it is fixed, and the
         // table naming the model is the very part that could not be read. Acquiring the
@@ -792,12 +818,11 @@ impl RiftMcp {
             .then(|| model_acquisition(&search_configuration.semantic, &root))
             .flatten();
         let search_limits = search_index_limits(&search_configuration, acquisition.as_ref());
-        let search_index = open_search_index(&root, search_limits).await;
-        // The log store opens beside the search index and outside every lane the index
-        // takes. A workspace whose rebuild never settles is exactly the workspace whose
-        // logs a caller needs, so this handle answers `rift://logs` while the rest of the
-        // server is still waiting on its own readiness.
-        let logs = crate::logs::open_log_store(&root).await.map(Arc::new);
+        let search_index = open_search_index(&storage, search_limits);
+        // The log store shares the database owner without depending on index readiness. Its
+        // reads use committed WAL snapshots, so `rift://logs` can answer while a rebuild is
+        // still preparing the next publication.
+        let logs = storage.logs();
         // The lexical set commits before this snapshot becomes current, so the first
         // request to reach the server reads rows stamped with the tree revision it
         // captured. Embedding does not: the population lane runs the run's first pass
@@ -2756,40 +2781,26 @@ mod tests {
         Ok(())
     }
 
-    /// Corrupt bytes fail `SQLite`'s file-format check deterministically, exercising the
-    /// documented recreate-once path: the server still starts, and the recreated database
-    /// serves lexical search once repopulated.
+    /// Corrupt bytes fail `SQLite`'s file-format check deterministically. The server starts
+    /// without database-backed search or logs and leaves those bytes in place for recovery.
     #[tokio::test]
-    async fn build_recovers_from_a_corrupt_lexical_database_by_recreating_it_once() -> TestResult {
+    async fn build_preserves_a_corrupt_database_and_serves_without_it() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let guide_txt = "notes about the beacon subsystem\n";
-        fs::write(directory.path().join("guide.txt"), guide_txt)?;
         let state_directory = directory.path().join(".rift");
         fs::create_dir_all(&state_directory)?;
-        fs::write(state_directory.join("db"), b"not a sqlite database")?;
+        let database_path = state_directory.join("db");
+        let corrupt = b"not a sqlite database";
+        fs::write(&database_path, corrupt)?;
         super::hermetic_workspace(directory.path(), "")?;
 
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())
             .await
             .map_err(|error| format!("corrupt database must not fail startup: {error:?}"))?;
-        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
-        let server_task = tokio::spawn(async move {
-            let service = server
-                .serve(server_transport)
-                .await
-                .expect("server must initialize");
-            service.waiting().await.expect("server must stop cleanly");
-        });
-        let client = ().serve(client_transport).await?;
 
-        // The recreated database is populated by the population lane, after `build`
-        // returned. Poll for the hit under a bound; the helper's failure names the last
-        // answer that still missed it.
-        search_until_hit(client.peer(), "beacon subsystem", "guide.txt").await?;
-
-        client.cancel().await?;
-        server_task.await?;
+        assert!(server.search_index.is_none());
+        assert!(server.logs.is_none());
+        assert_eq!(fs::read(database_path)?, corrupt);
         Ok(())
     }
 
@@ -3437,11 +3448,15 @@ pub fn beacon() -> u64 {
             "a built server runs its supervisor"
         );
 
+        let stopped = server.validation.changed.notified();
+        tokio::pin!(stopped);
+        stopped.as_mut().enable();
         server.validation.cancellation.cancel();
         let handle = server.validation.task.lock().await.take();
         if let Some(handle) = handle {
             let _ = handle.await;
         }
+        stopped.as_mut().await;
 
         assert!(
             !server
@@ -3498,16 +3513,15 @@ pub fn beacon() -> u64 {
         let _guard = tracing::subscriber::set_default(subscriber);
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        // A directory at the database path fails the initial open; `remove_file` cannot
-        // remove a directory, so the recreate-once retry also fails against it unchanged -
-        // this is also the deterministic way to drive the recreate-once arm itself.
+        // A directory at the database path makes SQLite reject the open without changing
+        // the unexpected filesystem entry.
         super::hermetic_workspace(directory.path(), "")?;
         fs::create_dir_all(directory.path().join(".rift/db"))?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         assert!(
             server.search_index.is_none(),
-            "a database path occupied by a directory must exhaust the recreate-once retry \
-             and still leave the server running without the search index"
+            "a database path occupied by a directory must leave the server running without \
+             the search index"
         );
 
         // With no search index, identifier search still serves results rather than failing.

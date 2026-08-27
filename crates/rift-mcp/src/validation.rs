@@ -729,18 +729,20 @@ pub(crate) fn report_watch_outcome(
 /// coming can say so instead of waiting.
 struct SupervisorRunning {
     running: Arc<AtomicBool>,
+    changed: Arc<Notify>,
 }
 
 impl SupervisorRunning {
-    fn new(running: Arc<AtomicBool>) -> Self {
+    fn new(running: Arc<AtomicBool>, changed: Arc<Notify>) -> Self {
         running.store(true, Ordering::Release);
-        Self { running }
+        Self { running, changed }
     }
 }
 
 impl Drop for SupervisorRunning {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
+        self.changed.notify_waiters();
         tracing::warn!(
             component = "index",
             operation = "index.supervisor",
@@ -1393,7 +1395,10 @@ pub(crate) async fn run_index_supervisor(
     // The guard reports the supervisor's end however it comes: a return, a cancellation, or
     // a panic unwinding this task. A reader that meets the readiness deadline needs to know
     // which of those happened, and the process that panicked cannot tell them afterwards.
-    let _running = SupervisorRunning::new(Arc::clone(&validation.supervisor_running));
+    let _running = SupervisorRunning::new(
+        Arc::clone(&validation.supervisor_running),
+        Arc::clone(&validation.changed),
+    );
     loop {
         let received = tokio::select! {
             () = validation.cancellation.cancelled() => false,
