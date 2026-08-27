@@ -15,3 +15,4 @@ rift-core.workspace = true
 scip.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+stack-graphs.workspace = true

@@ -3,6 +3,7 @@
 mod adapter;
 mod assembly;
 mod scip;
+mod stack_graph;
 
 pub use adapter::{
     AdapterError, AdapterPublication, AdapterViolation, ProviderInputMode, PublicationCoverage,
@@ -29,6 +30,10 @@ pub use publication::{
     PublicationStore, PublicationViolation,
 };
 pub use scip::{ScipAdapter, ScipAdapterError, ScipViolation};
+pub use stack_graph::{
+    StackGraphAdapter, StackGraphAdapterError, StackGraphDefinition, StackGraphInput,
+    StackGraphReference, StackGraphScope, StackGraphViolation,
+};
 
 /// Compile-time marker for provider-layer ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
