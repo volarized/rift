@@ -20,6 +20,7 @@ globset.workspace = true
 lsp-types.workspace = true
 percent-encoding.workspace = true
 rift-core.workspace = true
+rift-provider.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["process"] }

@@ -8,6 +8,7 @@
 //! timeout.
 
 pub mod capabilities;
+pub mod contribution;
 pub mod correlation;
 pub mod framing;
 pub mod position;

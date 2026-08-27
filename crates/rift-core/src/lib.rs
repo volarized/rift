@@ -36,10 +36,11 @@ pub use semantic::{
     CONTRIBUTION_EVIDENCE_MAX, CONTRIBUTION_FACTS_MAX, CONTRIBUTION_NAMESPACE_BYTES_MAX,
     CONTRIBUTION_NAMESPACES_MAX, Contribution, ContributionBuilder, ContributionError,
     ContributionFault, ContributionKey, ContributionOrigin, ContributionReference,
-    ContributionViolation, DeclarationBinding, Documentation, DocumentationFormat,
-    EquivalenceEvidence, ExactKind, Extensions, Language, NodeId, PROVIDER_SYMBOL_ID_BYTES_MAX,
-    PortableSymbolFacts, Signature, SourceApplicability, SourceKind, SourceLocation, SourceRange,
-    SymbolFacet, SymbolRecord, SymbolResolution, TypeBinding,
+    ContributionRelationship, ContributionViolation, DeclarationBinding, Documentation,
+    DocumentationFormat, EquivalenceEvidence, ExactKind, ExtensionKey, ExtensionValue, Extensions,
+    Language, NodeId, PROVIDER_SYMBOL_ID_BYTES_MAX, PortableSymbolFacts, ReferenceRole,
+    RelationshipKind, SemanticReference, Signature, SourceApplicability, SourceKind,
+    SourceLocation, SourceRange, SymbolFacet, SymbolRecord, SymbolResolution, TypeBinding,
 };
 
 /// Iterates while charging one unit to a loop budget before each body execution.
