@@ -125,6 +125,34 @@
       "name": "get_symbol",
       "output_schema": {
         "$defs": {
+          "ContributionKey": {
+            "additionalProperties": false,
+            "description": "Identity of one immutable Contribution.",
+            "properties": {
+              "provider": {
+                "description": "Provider that published this Contribution.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "publication": {
+                "description": "Provider publication containing this Contribution.",
+                "format": "uint64",
+                "minimum": 1,
+                "type": "integer"
+              },
+              "symbol": {
+                "description": "Provider-local symbol identity.",
+                "maxLength": 8192,
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider",
+              "symbol",
+              "publication"
+            ],
+            "type": "object"
+          },
           "Digest": {
             "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
             "examples": [
@@ -1049,7 +1077,7 @@
           },
           "Symbol": {
             "additionalProperties": false,
-            "description": "Provider-resolved semantic identity. Source structure lives in Node and is connected\nthrough Relationship.",
+            "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in Node\nand is connected through Relationship.",
             "properties": {
               "container": {
                 "anyOf": [
@@ -1061,6 +1089,20 @@
                   }
                 ],
                 "description": "The symbol this one belongs to - the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method is written beside its type and a\nRust method inside an `impl` block, and both name the type here. Absent at the top\nlevel."
+              },
+              "contributions": {
+                "description": "Contributions selected for this request, in presentation order.",
+                "items": {
+                  "$ref": "#/$defs/ContributionKey"
+                },
+                "type": "array"
+              },
+              "disagreements": {
+                "description": "Presentation differences retained after field selection.",
+                "items": {
+                  "$ref": "#/$defs/SymbolDisagreement"
+                },
+                "type": "array"
               },
               "document_local": {
                 "description": "Whether language semantics confine this symbol to the document that declares it. The\nprovider classifies locality from its language model.",
@@ -1085,8 +1127,21 @@
                 "type": "array"
               },
               "id": {
-                "$ref": "#/$defs/SymbolId",
-                "description": "Unique identifier of this symbol across the whole workspace, and the URI that change\nrequests, filters, and relationship records accept unchanged."
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/SymbolId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Unique identifier of this Symbol across the whole workspace. Present only when\n`resolution` is `established`."
+              },
+              "index_revision": {
+                "description": "Captured index revision used to assemble this Symbol.",
+                "format": "uint64",
+                "minimum": 1,
+                "type": "integer"
               },
               "kind": {
                 "$ref": "#/$defs/ExactKind",
@@ -1112,6 +1167,10 @@
                 "$ref": "#/$defs/SymbolOrigin",
                 "description": "Where the declaration belongs, how it was produced, and its source unit when\nreadable."
               },
+              "resolution": {
+                "$ref": "#/$defs/SymbolResolution",
+                "description": "Whether normalization established one Symbol identity."
+              },
               "signatures": {
                 "description": "One entry per callable form. Where the language dispatches overloads separately they\nare separate symbols joined by the `overloads` edge; several entries here are\nalternative forms of one dispatch target, as `typing.overload` writes them.",
                 "items": {
@@ -1135,7 +1194,9 @@
               }
             },
             "required": [
-              "id",
+              "index_revision",
+              "resolution",
+              "contributions",
               "language",
               "name",
               "kind",
@@ -1146,7 +1207,27 @@
               "signatures",
               "documentation",
               "extensions",
+              "disagreements",
               "document_local"
+            ],
+            "type": "object"
+          },
+          "SymbolDisagreement": {
+            "additionalProperties": false,
+            "description": "One disagreement retained beside selected presentation facts.",
+            "properties": {
+              "contribution": {
+                "$ref": "#/$defs/ContributionKey",
+                "description": "Contribution carrying another value."
+              },
+              "field": {
+                "$ref": "#/$defs/SymbolPresentationField",
+                "description": "Presentation field that differs."
+              }
+            },
+            "required": [
+              "contribution",
+              "field"
             ],
             "type": "object"
           },
@@ -1372,6 +1453,71 @@
               "source_kind"
             ],
             "type": "object"
+          },
+          "SymbolPresentationField": {
+            "description": "Presentation field whose retained Contributions disagree.",
+            "oneOf": [
+              {
+                "const": "language",
+                "description": "Language differs.",
+                "type": "string"
+              },
+              {
+                "const": "name",
+                "description": "Short name differs.",
+                "type": "string"
+              },
+              {
+                "const": "qualified_name",
+                "description": "Provider-qualified name differs.",
+                "type": "string"
+              },
+              {
+                "const": "kind",
+                "description": "Exact kind differs.",
+                "type": "string"
+              },
+              {
+                "const": "container",
+                "description": "Containing symbol differs.",
+                "type": "string"
+              },
+              {
+                "const": "visibility",
+                "description": "Visibility differs.",
+                "type": "string"
+              },
+              {
+                "const": "document_local",
+                "description": "Document-local classification differs.",
+                "type": "string"
+              },
+              {
+                "const": "origin",
+                "description": "Origin differs.",
+                "type": "string"
+              }
+            ]
+          },
+          "SymbolResolution": {
+            "description": "Resolution state of one readable Symbol.",
+            "oneOf": [
+              {
+                "const": "established",
+                "description": "One identity anchor establishes Symbol identity.",
+                "type": "string"
+              },
+              {
+                "const": "unresolved",
+                "description": "No accepted evidence establishes Symbol identity.",
+                "type": "string"
+              },
+              {
+                "const": "conflicting",
+                "description": "More than one identity anchor applies.",
+                "type": "string"
+              }
+            ]
           },
           "SymbolVersion": {
             "additionalProperties": false,
@@ -1694,6 +1840,14 @@
                   "unit": "rift://source/project/src/config.rs"
                 },
                 "symbol": {
+                  "contributions": [
+                    {
+                      "provider": "syntax",
+                      "publication": 1,
+                      "symbol": "load_config"
+                    }
+                  ],
+                  "disagreements": [],
                   "document_local": false,
                   "documentation": [
                     {
@@ -1708,6 +1862,7 @@
                     "public"
                   ],
                   "id": "rift://symbol/rust/src/config.rs/load_config",
+                  "index_revision": 1,
                   "kind": "rust.function",
                   "language": {
                     "name": "rust"
@@ -1721,6 +1876,7 @@
                     "source_kind": "authored",
                     "unit": "rift://source/project/src/config.rs"
                   },
+                  "resolution": "established",
                   "signatures": [
                     {
                       "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
@@ -11524,6 +11680,34 @@
       "name": "search",
       "output_schema": {
         "$defs": {
+          "ContributionKey": {
+            "additionalProperties": false,
+            "description": "Identity of one immutable Contribution.",
+            "properties": {
+              "provider": {
+                "description": "Provider that published this Contribution.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "publication": {
+                "description": "Provider publication containing this Contribution.",
+                "format": "uint64",
+                "minimum": 1,
+                "type": "integer"
+              },
+              "symbol": {
+                "description": "Provider-local symbol identity.",
+                "maxLength": 8192,
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider",
+              "symbol",
+              "publication"
+            ],
+            "type": "object"
+          },
           "Digest": {
             "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
             "examples": [
@@ -13014,7 +13198,7 @@
           },
           "Symbol": {
             "additionalProperties": false,
-            "description": "Provider-resolved semantic identity. Source structure lives in Node and is connected\nthrough Relationship.",
+            "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in Node\nand is connected through Relationship.",
             "properties": {
               "container": {
                 "anyOf": [
@@ -13026,6 +13210,20 @@
                   }
                 ],
                 "description": "The symbol this one belongs to - the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method is written beside its type and a\nRust method inside an `impl` block, and both name the type here. Absent at the top\nlevel."
+              },
+              "contributions": {
+                "description": "Contributions selected for this request, in presentation order.",
+                "items": {
+                  "$ref": "#/$defs/ContributionKey"
+                },
+                "type": "array"
+              },
+              "disagreements": {
+                "description": "Presentation differences retained after field selection.",
+                "items": {
+                  "$ref": "#/$defs/SymbolDisagreement"
+                },
+                "type": "array"
               },
               "document_local": {
                 "description": "Whether language semantics confine this symbol to the document that declares it. The\nprovider classifies locality from its language model.",
@@ -13050,8 +13248,21 @@
                 "type": "array"
               },
               "id": {
-                "$ref": "#/$defs/SymbolId",
-                "description": "Unique identifier of this symbol across the whole workspace, and the URI that change\nrequests, filters, and relationship records accept unchanged."
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/SymbolId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Unique identifier of this Symbol across the whole workspace. Present only when\n`resolution` is `established`."
+              },
+              "index_revision": {
+                "description": "Captured index revision used to assemble this Symbol.",
+                "format": "uint64",
+                "minimum": 1,
+                "type": "integer"
               },
               "kind": {
                 "$ref": "#/$defs/ExactKind",
@@ -13077,6 +13288,10 @@
                 "$ref": "#/$defs/SymbolOrigin",
                 "description": "Where the declaration belongs, how it was produced, and its source unit when\nreadable."
               },
+              "resolution": {
+                "$ref": "#/$defs/SymbolResolution",
+                "description": "Whether normalization established one Symbol identity."
+              },
               "signatures": {
                 "description": "One entry per callable form. Where the language dispatches overloads separately they\nare separate symbols joined by the `overloads` edge; several entries here are\nalternative forms of one dispatch target, as `typing.overload` writes them.",
                 "items": {
@@ -13100,7 +13315,9 @@
               }
             },
             "required": [
-              "id",
+              "index_revision",
+              "resolution",
+              "contributions",
               "language",
               "name",
               "kind",
@@ -13111,7 +13328,27 @@
               "signatures",
               "documentation",
               "extensions",
+              "disagreements",
               "document_local"
+            ],
+            "type": "object"
+          },
+          "SymbolDisagreement": {
+            "additionalProperties": false,
+            "description": "One disagreement retained beside selected presentation facts.",
+            "properties": {
+              "contribution": {
+                "$ref": "#/$defs/ContributionKey",
+                "description": "Contribution carrying another value."
+              },
+              "field": {
+                "$ref": "#/$defs/SymbolPresentationField",
+                "description": "Presentation field that differs."
+              }
+            },
+            "required": [
+              "contribution",
+              "field"
             ],
             "type": "object"
           },
@@ -13316,6 +13553,71 @@
             ],
             "type": "object"
           },
+          "SymbolPresentationField": {
+            "description": "Presentation field whose retained Contributions disagree.",
+            "oneOf": [
+              {
+                "const": "language",
+                "description": "Language differs.",
+                "type": "string"
+              },
+              {
+                "const": "name",
+                "description": "Short name differs.",
+                "type": "string"
+              },
+              {
+                "const": "qualified_name",
+                "description": "Provider-qualified name differs.",
+                "type": "string"
+              },
+              {
+                "const": "kind",
+                "description": "Exact kind differs.",
+                "type": "string"
+              },
+              {
+                "const": "container",
+                "description": "Containing symbol differs.",
+                "type": "string"
+              },
+              {
+                "const": "visibility",
+                "description": "Visibility differs.",
+                "type": "string"
+              },
+              {
+                "const": "document_local",
+                "description": "Document-local classification differs.",
+                "type": "string"
+              },
+              {
+                "const": "origin",
+                "description": "Origin differs.",
+                "type": "string"
+              }
+            ]
+          },
+          "SymbolResolution": {
+            "description": "Resolution state of one readable Symbol.",
+            "oneOf": [
+              {
+                "const": "established",
+                "description": "One identity anchor establishes Symbol identity.",
+                "type": "string"
+              },
+              {
+                "const": "unresolved",
+                "description": "No accepted evidence establishes Symbol identity.",
+                "type": "string"
+              },
+              {
+                "const": "conflicting",
+                "description": "More than one identity anchor applies.",
+                "type": "string"
+              }
+            ]
+          },
           "TextRange": {
             "additionalProperties": false,
             "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the surface\nvalidation tests instead.",
@@ -13498,6 +13800,14 @@
               {
                 "hit": {
                   "symbol": {
+                    "contributions": [
+                      {
+                        "provider": "syntax",
+                        "publication": 1,
+                        "symbol": "load_config"
+                      }
+                    ],
+                    "disagreements": [],
                     "document_local": false,
                     "documentation": [
                       {
@@ -13512,6 +13822,7 @@
                       "public"
                     ],
                     "id": "rift://symbol/rust/src/config.rs/load_config",
+                    "index_revision": 1,
                     "kind": "rust.function",
                     "language": {
                       "name": "rust"
@@ -13525,6 +13836,7 @@
                       "source_kind": "authored",
                       "unit": "rift://source/project/src/config.rs"
                     },
+                    "resolution": "established",
                     "signatures": [
                       {
                         "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",

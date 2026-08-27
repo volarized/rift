@@ -375,19 +375,13 @@ pub struct SymbolMatch<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReadableSymbol {
     assembled: AssembledSymbol,
-    identity: SymbolId,
     facts: PortableSymbolFacts,
 }
 
 impl ReadableSymbol {
     fn new(assembled: AssembledSymbol) -> Option<Self> {
-        let identity = assembled.identity()?.clone();
         let facts = assembled.facts()?.clone();
-        Some(Self {
-            assembled,
-            identity,
-            facts,
-        })
+        Some(Self { assembled, facts })
     }
 
     /// Returns complete normalized assembly.
@@ -396,10 +390,10 @@ impl ReadableSymbol {
         &self.assembled
     }
 
-    /// Returns normalized symbol identity.
+    /// Returns established normalized symbol identity when available.
     #[must_use]
-    pub const fn identity(&self) -> &SymbolId {
-        &self.identity
+    pub const fn identity(&self) -> Option<&SymbolId> {
+        self.assembled.identity()
     }
 
     /// Returns selected and combined portable facts.
@@ -1061,7 +1055,7 @@ impl WorkspaceIndex {
     /// # Errors
     ///
     /// Returns `WorkspaceIndexError` when normalized Contributions do not
-    /// supply required identity and portable facts.
+    /// supply required portable facts.
     pub fn assembled_symbol(
         &self,
         matched: SymbolMatch<'_>,
@@ -3265,8 +3259,8 @@ mod tests {
             .assembled_symbol(matched)
             .expect("normalized readable symbol");
         assert_eq!(
-            readable.identity().as_str(),
-            "rift://symbol/rust/src/lib.rs/Rift::update"
+            readable.identity().map(rift_core::SymbolId::as_str),
+            Some("rift://symbol/rust/src/lib.rs/Rift::update")
         );
         assert_eq!(readable.facts().name(), "update");
         assert!(!readable.assembled().contributions().is_empty());
