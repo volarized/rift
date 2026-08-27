@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.0.20"
+version = "0.0.22"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
@@ -48,6 +48,7 @@ strum = { version = "0.28.0", features = ["derive"] }
 sha2 = "=0.10.9"
 tar = "0.4.46"
 toasty = { version = "=0.10.0", default-features = false, features = ["migration", "sqlite"] }
+toasty-core = "=0.10.0"
 toasty-driver-sqlite = "=0.10.0"
 # candle-core has a non-optional `tokenizers 0.22` dependency with the `onig` backend on
 # every non-wasm target, so the version is pinned to match it: a second tokenizers would

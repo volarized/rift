@@ -88,3 +88,32 @@ installer-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_installers.py
 
 rust-gate: format dashes generate-check check clippy docs audit test release-test installer-test
+
+# One signed tag on the commit `origin/main` names right now. The recipe reads
+# that commit from the remote, so the local checkout's branch and its uncommitted
+# work decide nothing. Pushing the tag starts `rift-release`: six target
+# archives, the checksum manifest, the GitHub release, and the docs deploy.
+release tag:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tag={{ quote(tag) }}
+    if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+        echo "error: release tag must match vX.Y.Z: $tag" >&2
+        exit 1
+    fi
+    if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+        echo "error: origin already carries $tag" >&2
+        exit 1
+    fi
+    git fetch --quiet origin main
+    commit="$(git rev-parse FETCH_HEAD)"
+    declared="$(git show "$commit:Cargo.toml" \
+        | sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p')"
+    if [ "$declared" != "${tag#v}" ]; then
+        echo "error: origin/main declares $declared; bump the workspace version before tagging $tag" >&2
+        exit 1
+    fi
+    echo "tagging $(git --no-pager log -1 --format='%h %s' "$commit")"
+    git tag --sign --message "Rift $tag" "$tag" "$commit"
+    git push --quiet origin "refs/tags/$tag" || { git tag --delete "$tag"; exit 1; }
+    echo "$tag pushed; watch with: gh run list --workflow rift-release"

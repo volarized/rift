@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use candle_core::{DType, Device, Tensor};
 use rift_core::ProjectPath;
+use rift_index::{DatabasePool, WorkspaceDatabase};
 use rift_index::{
     LexicalIndexLimits, LexicalSearchIndex, LexicalUnit, LexicalUnitKind, SemanticVectorStore,
     StoredVector,
@@ -19,6 +20,11 @@ use rift_search::{
 use tokenizers::models::wordpiece::WordPiece;
 use tokenizers::processors::bert::BertProcessing;
 use tokenizers::{Tokenizer, normalizers, pre_tokenizers};
+
+/// The pooled-connection bounds every suite here opens the database with.
+fn database_pool() -> DatabasePool {
+    DatabasePool::new(4, 1_000)
+}
 
 /// The fixture model's width, layers, and attention heads. Small enough that a
 /// forward pass costs nothing and large enough to exercise every tensor the
@@ -269,7 +275,8 @@ fn digest_of(declaration: &Declaration<'_>) -> String {
 }
 
 async fn store(root: &Path) -> Fallible<SemanticVectorStore> {
-    Ok(SemanticVectorStore::open(&database(root), lexical_limits()).await?)
+    let database = WorkspaceDatabase::open(&database(root), database_pool()).await?;
+    Ok(SemanticVectorStore::attached(database))
 }
 
 /// The vectors one model holds, in digest order.
@@ -315,7 +322,10 @@ async fn drop_stored_vectors(root: &Path, name: &str) -> TestResult {
 
 /// The order the lexical tier alone puts a query in.
 async fn lexical_order(root: &Path, query: &str, limit: u32) -> Fallible<Vec<String>> {
-    let index = LexicalSearchIndex::open(&database(root), lexical_limits()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&database(root), database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
     let RevisionScoped::Matched(matches) = index.search(REVISION, query, limit).await? else {
         return Err("the lexical store must hold the fixture revision".into());
     };

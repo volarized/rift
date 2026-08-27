@@ -56,6 +56,33 @@ The worker pool exists before the first request, so the server sizes it once at 
 change to this table applies on the next start, while every other table applies to later
 requests as soon as the file is accepted.
 
+## Logs
+
+<VersionBadge version="v0.0.22" />
+
+`logs` bounds what the server records about itself. Diagnostics admitted by `capture` enter a
+bounded queue and land in the workspace database, where the `rift://logs` resource reads them
+back - so a refusal an agent meets can be explained without an operator reading the server's
+terminal:
+
+```toml
+[logs]
+retention_records = 50000
+page_records = 500
+capture = "rift=info,rift_mcp=info,rift_server=info"
+```
+
+- `retention_records` caps the records the store keeps, 100 to 1000000; a write past the cap
+  drops the oldest records first
+- `page_records` caps what one `rift://logs` read returns, 1 to 5000
+- `capture` selects which targets are recorded, in the `RUST_LOG` spelling `tracing` takes -
+  `rift_mcp=debug` records the index lane's own rebuild decisions. A target this filter
+  excludes never reaches the store, whatever the terminal shows
+
+The server reads this table at startup, so a change applies on the next start. The records
+outlive the process that wrote them: they live beside the search index in `.rift/db`, and a
+workspace whose index will not settle still answers `rift://logs`.
+
 ## Source
 
 <VersionBadge version="v0.0.6" />
@@ -156,8 +183,8 @@ serve its previous immutable revision; the result then carries a `stale_index` e
 <VersionBadge version="v0.0.9" />
 
 [`search`](/docs/protocol/mcp#tool-search) runs on a lexical index. `[search.text]` decides
-which files join it beyond source files; `pool_slots` and `busy_timeout` bound the SQLite
-connections behind the whole index:
+which files join it beyond source files. `pool_slots` bounds pooled connections shared by
+search and stored logs; writes wait for one process-wide turn:
 
 ```toml
 [search.text]
@@ -166,7 +193,7 @@ max_chunk = "1mb"
 
 [search]
 pool_slots = 4
-busy_timeout = "1s"
+busy_timeout = "5s"
 ```
 
 - `extensions` names which file extensions, without the leading dot, join the index alongside
@@ -177,9 +204,9 @@ busy_timeout = "1s"
 - `max_chunk` bounds how large a file may grow before it's split into several indexed chunks,
   1kb to 16mb; an operator who wants a file out of the index entirely excludes it in
   [`[source]`](/docs/configuration#source) or drops its extension from `extensions`
-- `pool_slots` bounds SQLite connections the lexical index may hold open at once, 1 to 16
-- `busy_timeout` bounds how long one of those connections waits on SQLite's own lock before
-  failing with `SQLITE_BUSY`, 100ms to 30s
+- `pool_slots` bounds SQLite connections the workspace database may hold open at once, 1 to 16
+- `busy_timeout` bounds how long a connection waits for a database lock held by another
+  process before failing with `SQLITE_BUSY`, 100ms to 30s
 
 <VersionBadge
   version="v0.0.16"

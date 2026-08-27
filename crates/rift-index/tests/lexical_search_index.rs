@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use rift_core::{ErrorCode, ErrorName, ProjectPath};
+use rift_index::{DatabasePool, WorkspaceDatabase};
 use rift_index::{
     LexicalChange, LexicalIndexLimits, LexicalIndexViolation, LexicalMatch, LexicalSearchIndex,
     LexicalUnit, LexicalUnitKind, RevisionScoped,
@@ -12,6 +13,7 @@ use rift_index::{
 use tempfile::TempDir;
 use toasty::Db;
 use toasty::stmt::Type;
+use toasty_core::driver::operation::TransactionMode;
 use toasty_driver_sqlite::Sqlite;
 
 /// The matches one revision-qualified search returned, refusing any answer the store could
@@ -58,6 +60,11 @@ fn symbol_unit(
     )?)
 }
 
+/// The pooled-connection bounds every suite here opens the database with.
+fn database_pool() -> DatabasePool {
+    DatabasePool::new(4, 1_000)
+}
+
 fn database_path(directory: &TempDir) -> PathBuf {
     directory.path().join("lexical.db")
 }
@@ -67,7 +74,10 @@ async fn test_lexical_search_index_replace_all_and_search_multi_word_query_hits(
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
-    let index = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
 
     let units = [
         text_unit("docs/guide.md", "alpha configuration guide")?,
@@ -92,7 +102,10 @@ async fn test_lexical_search_index_search_orders_better_match_first()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
-    let index = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
 
     let units = [
         text_unit("docs/light.md", "beacon mentioned once")?,
@@ -120,7 +133,10 @@ async fn test_lexical_search_index_search_limit_and_matches_max_cap_results()
     let directory = TempDir::new()?;
     let limits = LexicalIndexLimits::new(100, 1_048_576, 32, 2, 4, 1_000);
     let path = database_path(&directory);
-    let index = LexicalSearchIndex::open(&path, limits).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        limits,
+    );
 
     let mut units = Vec::new();
     for identifier in 0..5 {
@@ -145,7 +161,10 @@ async fn test_lexical_search_index_search_empty_query_returns_empty()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
-    let index = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
 
     let units = [text_unit("docs/a.md", "content")?];
     index.replace_all(&units, "revision-1").await?;
@@ -161,7 +180,10 @@ async fn test_lexical_search_index_open_with_single_pool_slot_still_serves_searc
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let limits = LexicalIndexLimits::new(100, 1_048_576, 32, 100, 1, 1_000);
-    let index = LexicalSearchIndex::open(&path, limits).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        limits,
+    );
 
     let units = [text_unit("docs/a.md", "single slot content")?];
     index.replace_all(&units, "revision-1").await?;
@@ -181,7 +203,10 @@ async fn test_lexical_search_index_replace_all_over_units_max_refuses_and_prior_
     let directory = TempDir::new()?;
     let limits = LexicalIndexLimits::new(1, 1_048_576, 32, 100, 4, 1_000);
     let path = database_path(&directory);
-    let index = LexicalSearchIndex::open(&path, limits).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        limits,
+    );
 
     let first_batch = [text_unit("docs/kept.md", "kept content survives")?];
     index.replace_all(&first_batch, "revision-1").await?;
@@ -210,7 +235,10 @@ async fn test_lexical_search_index_replace_all_unit_over_bytes_max_refuses_namin
     let directory = TempDir::new()?;
     let limits = LexicalIndexLimits::new(100, 8, 32, 100, 4, 1_000);
     let path = database_path(&directory);
-    let index = LexicalSearchIndex::open(&path, limits).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        limits,
+    );
 
     let oversized = [text_unit("docs/big.md", "too many bytes here")?];
     let outcome = index.replace_all(&oversized, "revision-1").await;
@@ -228,7 +256,10 @@ async fn test_lexical_search_index_replace_all_duplicate_identity_refuses_atomic
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
-    let index = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
 
     let baseline = [text_unit("docs/kept.md", "baseline content")?];
     index.replace_all(&baseline, "revision-1").await?;
@@ -259,7 +290,10 @@ async fn test_lexical_search_index_second_replace_all_fully_supersedes_first()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
-    let index = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
 
     let first = [text_unit("docs/a.md", "firstwordonly content")?];
     index.replace_all(&first, "revision-1").await?;
@@ -280,7 +314,10 @@ async fn test_lexical_search_index_tree_revision_none_then_some_after_replace_al
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
-    let index = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
 
     assert_eq!(index.tree_revision().await?, None);
 
@@ -295,7 +332,10 @@ async fn test_lexical_search_index_content_returns_some_and_none()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
-    let index = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
 
     let units = [text_unit("docs/a.md", "found content")?];
     index.replace_all(&units, "revision-1").await?;
@@ -314,12 +354,18 @@ async fn test_lexical_search_index_reopen_from_file_serves_persisted_rows()
     let directory = TempDir::new()?;
     let path = database_path(&directory);
 
-    let index = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
     let units = [text_unit("docs/a.md", "persisted content")?];
     index.replace_all(&units, "revision-1").await?;
     drop(index);
 
-    let reopened = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    let reopened = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
     assert_eq!(
         reopened.content("docs/a.md").await?,
         Some("persisted content".to_owned())
@@ -342,7 +388,10 @@ async fn test_lexical_search_index_symbol_and_text_file_units_coexist()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
-    let index = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
 
     let symbol = symbol_unit(
         "crate::widgets::render",
@@ -372,7 +421,10 @@ async fn test_lexical_search_index_search_name_match_outranks_body_only_match()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
-    let index = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
 
     let named = symbol_unit(
         "crate::index::SearchHit",
@@ -403,7 +455,10 @@ async fn test_lexical_search_index_search_finds_camel_case_name_by_expanded_word
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
-    let index = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
 
     let unit = symbol_unit(
         "crate::account::getUserName",
@@ -455,7 +510,10 @@ async fn test_lexical_search_index_content_sees_only_committed_writes_during_con
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
-    let index = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
 
     let committed = [text_unit("docs/a.md", "alpha content")?];
     index.replace_all(&committed, "revision-1").await?;
@@ -524,7 +582,10 @@ async fn test_lexical_search_index_search_stored_invalid_path_refuses()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
-    let index = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
     // The stamp qualifies the query, so the store carries one before the corrupt row
     // reaches it; the decode this test is about runs only for a store holding this tree.
     index.replace_all(&[], "revision-1").await?;
@@ -553,7 +614,10 @@ async fn test_lexical_search_index_search_stored_invalid_kind_refuses()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
-    let index = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
     index.replace_all(&[], "revision-1").await?;
 
     let probe_database = open_concurrent_probe(&path).await?;
@@ -581,7 +645,7 @@ async fn test_lexical_search_index_open_at_unusable_path_refuses_with_storage_fa
     let directory = TempDir::new()?;
     let path = directory.path().join("missing-parent").join("lexical.db");
 
-    let outcome = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await;
+    let outcome = WorkspaceDatabase::open(&path, database_pool()).await;
     let error = outcome.expect_err("opening under a missing parent directory must refuse");
     assert_eq!(error.fault().violation(), LexicalIndexViolation::Storage);
     assert_eq!(error.fault().path(), Some(path.as_path()));
@@ -625,7 +689,7 @@ async fn test_lexical_search_index_open_migration_apply_conflict_refuses_distinc
     drop(probe_connection);
     drop(probe_database);
 
-    let outcome = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await;
+    let outcome = WorkspaceDatabase::open(&path, database_pool()).await;
     let error =
         outcome.expect_err("migration apply against a pre-existing conflicting table must refuse");
     assert_eq!(error.fault().violation(), LexicalIndexViolation::Storage);
@@ -638,30 +702,34 @@ async fn test_lexical_search_index_open_migration_apply_conflict_refuses_distinc
     Ok(())
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_replace_all_against_readonly_directory_surfaces_storage_failure()
+async fn test_lexical_search_index_replace_all_against_external_writer_surfaces_storage_failure()
 -> Result<(), Box<dyn std::error::Error>> {
-    use std::os::unix::fs::PermissionsExt;
-
     let directory = TempDir::new()?;
     let path = database_path(&directory);
-    let index = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, DatabasePool::new(4, 25)).await?,
+        LexicalIndexLimits::default(),
+    );
 
-    // The pooled connection opened during `open` keeps its file descriptor
-    // writable regardless of later `chmod` calls on the database file
-    // itself (POSIX only checks permissions at `open`, not on each write).
-    // WAL activation on first use, however, must create fresh `-wal`/`-shm`
-    // files in the containing directory, so stripping directory write
-    // access is what forces a genuine SQLite write failure here.
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o555))?;
+    // The process write lane cannot coordinate another process. A second pool
+    // models that boundary and proves the configured busy timeout still turns
+    // an externally held write lock into the store's typed storage failure.
+    let mut blocker_builder = Db::builder();
+    blocker_builder.max_pool_size(1);
+    let blocker_database = blocker_builder.build(Sqlite::open(&path)).await?;
+    let mut blocker_connection = blocker_database.connection().await?;
+    let blocker = blocker_connection
+        .transaction_builder()
+        .mode(TransactionMode::Immediate)
+        .begin()
+        .await?;
     let outcome = index
         .replace_all(&[text_unit("docs/a.md", "content")?], "revision-1")
         .await;
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    blocker.rollback().await?;
 
-    let error =
-        outcome.expect_err("write against a read-only directory must surface a storage failure");
+    let error = outcome.expect_err("an externally held write lock must surface a storage failure");
     assert_eq!(error.fault().violation(), LexicalIndexViolation::Storage);
     assert_eq!(error.name(), ErrorName::Wire(ErrorCode::StorageFailure));
     assert!(
@@ -675,8 +743,10 @@ async fn test_lexical_search_index_replace_all_against_readonly_directory_surfac
 async fn test_lexical_search_index_apply_replaces_one_path_and_keeps_the_rest()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let index =
-        LexicalSearchIndex::open(&database_path(&directory), LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
     let units = [
         symbol_unit(
             "rift://symbol/rust/kept.rs/keptalpha",
@@ -732,8 +802,10 @@ async fn test_lexical_search_index_apply_replaces_one_path_and_keeps_the_rest()
 async fn test_lexical_search_index_apply_deletes_every_chunk_filed_under_one_path()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let index =
-        LexicalSearchIndex::open(&database_path(&directory), LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
     // A chunked text file files every chunk under its own path, so one delete by path has
     // to reach all of them.
     let first = LexicalUnit::new(
@@ -777,7 +849,10 @@ async fn test_lexical_search_index_apply_refuses_a_resulting_set_past_units_max(
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
     let limits = LexicalIndexLimits::new(2, 65_536, 32, 64, 4, 1_000);
-    let index = LexicalSearchIndex::open(&database_path(&directory), limits).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        limits,
+    );
     index
         .replace_all(
             &[
@@ -814,8 +889,10 @@ async fn test_lexical_search_index_apply_refuses_a_resulting_set_past_units_max(
 async fn test_lexical_search_index_apply_refuses_two_units_sharing_one_identity()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let index =
-        LexicalSearchIndex::open(&database_path(&directory), LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
     index
         .replace_all(&[text_unit("docs/a.md", "alphaone")?], "revision-one")
         .await?;
@@ -848,7 +925,10 @@ async fn test_lexical_search_index_apply_survives_a_reopen_of_the_same_database(
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
-    let index = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
     index
         .replace_all(&[text_unit("docs/a.md", "alphaone")?], "revision-one")
         .await?;
@@ -859,7 +939,10 @@ async fn test_lexical_search_index_apply_survives_a_reopen_of_the_same_database(
     index.apply(&change, "revision-two").await?;
     drop(index);
 
-    let reopened = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    let reopened = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
     assert_eq!(
         reopened.tree_revision().await?,
         Some("revision-two".to_owned())
@@ -883,7 +966,10 @@ async fn test_lexical_search_index_deletes_one_path_through_its_own_index()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
-    let index = LexicalSearchIndex::open(&path, LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
     drop(index);
 
     // `apply` deletes by path on every incremental publication, so the planner
@@ -908,8 +994,10 @@ async fn test_lexical_search_index_deletes_one_path_through_its_own_index()
 async fn test_lexical_search_index_search_under_another_revision_names_the_stored_one()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let index =
-        LexicalSearchIndex::open(&database_path(&directory), LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
     index
         .replace_all(&[text_unit("docs/a.md", "alphaone")?], "revision-two")
         .await?;
@@ -928,8 +1016,10 @@ async fn test_lexical_search_index_search_under_another_revision_names_the_store
 async fn test_lexical_search_index_search_before_any_population_reports_no_revision()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let index =
-        LexicalSearchIndex::open(&database_path(&directory), LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
 
     assert_eq!(
         index.search("revision-one", "alphaone", 8).await?,
@@ -942,8 +1032,10 @@ async fn test_lexical_search_index_search_before_any_population_reports_no_revis
 async fn test_lexical_search_index_search_qualifies_an_empty_query_by_revision_too()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let index =
-        LexicalSearchIndex::open(&database_path(&directory), LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
 
     // A query with no term matches nothing, but the store still has to be the one the
     // caller asked for: an empty answer from another tree is not the same answer.
@@ -963,8 +1055,10 @@ async fn test_lexical_search_index_search_qualifies_an_empty_query_by_revision_t
 async fn test_lexical_search_index_apply_of_one_change_twice_leaves_one_unit_set()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let index =
-        LexicalSearchIndex::open(&database_path(&directory), LexicalIndexLimits::default()).await?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
     index.replace_all(&[], "revision-one").await?;
 
     // Two rebuilds captured from one publication both name the file as added, and the

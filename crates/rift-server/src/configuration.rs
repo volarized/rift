@@ -137,6 +137,14 @@ fn accept_configuration(raw: &str) -> Result<WorkspaceConfiguration, Configurati
     configuration
         .validate()
         .map_err(|violation| Error::new(ConfigurationFault::Invalid(violation)))?;
+    tracing_subscriber::EnvFilter::try_new(&configuration.logs.capture).map_err(|error| {
+        Error::new(ConfigurationFault::Invalid(
+            ConfigurationViolation::LogCaptureInvalid {
+                capture: configuration.logs.capture.clone(),
+                detail: error.to_string(),
+            },
+        ))
+    })?;
     Ok(configuration)
 }
 
@@ -392,6 +400,22 @@ download_timeout = "5m"
         assert!(
             message.contains("directory"),
             "the refusal must say the path is a directory: {message}"
+        );
+    }
+
+    #[test]
+    fn test_invalid_log_capture_filter_is_refused() {
+        let error = accept_configuration("[logs]\ncapture = \"[\"\n")
+            .expect_err("an invalid tracing filter must refuse the file");
+        assert!(
+            matches!(
+                error.fault(),
+                ConfigurationFault::Invalid(ConfigurationViolation::LogCaptureInvalid {
+                    capture,
+                    detail,
+                }) if capture == "[" && !detail.is_empty()
+            ),
+            "unexpected configuration failure: {error:?}"
         );
     }
 }

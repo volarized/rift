@@ -4,9 +4,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use rift_core::constants::{RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME};
 use rift_core::{ProjectPath as CoreProjectPath, SourceVisibility};
-use rift_index::{LexicalIndexLimits, PathChanges, WorkspaceIndexLimits, capture_digests};
+use rift_index::{
+    LexicalIndexLimits, LogStore, PathChanges, WorkspaceIndexLimits, capture_digests,
+};
 use rift_protocol::change::{
     ChangeResult, ChangeSummary, GuaranteeEvidence, InsertNodeParams, InsertSymbolParams,
     MoveFileParams, PatchParams, RemoveNodeParams, RemoveSymbolParams, RenameSymbolParams,
@@ -32,13 +33,20 @@ use rift_server::{
     plan_remove_symbol, plan_rename, run_hooks,
 };
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
-use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    Implementation, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ServerCapabilities,
+    ServerInfo,
+};
+use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData, Json, ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use crate::failure::{WireFailure, hook_failure_diagnostic, stale_snapshot_diagnostic};
+use crate::resource;
+use crate::storage::WorkspaceStorage;
 use crate::validation::{
     ConfigurationState, INDEX_CAPTURE_ATTEMPTS_MAX, IndexState, IndexSupervisor,
     IndexSupervisorContext, IndexValidation, LexicalLane, LexicalWrite, PendingWork,
@@ -400,49 +408,24 @@ fn search_index_limits(
     }
 }
 
-/// Opens the workspace's search database at `.rift/db`, creating `.rift` first.
+/// Attaches the search tiers to the process's one workspace database.
 ///
-/// The database is a derived index, rebuildable from the workspace tree at any time: an
-/// open failure deletes the file and retries exactly once before this run gives up on the
-/// search tier, rather than refusing to start the server over a file Rift itself can
-/// always regenerate. The server serves identifier search alone when both attempts fail.
-async fn open_search_index(root: &Path, limits: SearchIndexLimits) -> Option<Arc<SearchIndex>> {
-    let state_directory = root.join(RIFT_STATE_DIRECTORY);
-    if let Err(error) = tokio::fs::create_dir_all(&state_directory).await {
-        tracing::warn!(
-            component = "search",
-            operation = "search.open",
-            path = %state_directory.display(),
-            error = %error,
-            "could not create the workspace state directory; the server starts without the \
-             search index"
-        );
-        return None;
-    }
-    let database_path = state_directory.join(WORKSPACE_DATABASE_FILE_NAME);
-    match SearchIndex::open(&database_path, limits).await {
-        Ok(index) => return Some(Arc::new(index)),
-        Err(error) => {
-            tracing::warn!(
-                component = "search",
-                operation = "search.open",
-                path = %database_path.display(),
-                error = %error,
-                "search database failed to open; deleting and recreating it once"
-            );
-        }
-    }
-    let _ = tokio::fs::remove_file(&database_path).await;
-    match SearchIndex::open(&database_path, limits).await {
+/// [`WorkspaceStorage`] opens the database once for every store in the process. The server
+/// serves identifier search alone when the database did not open.
+fn open_search_index(
+    storage: &WorkspaceStorage,
+    limits: SearchIndexLimits,
+) -> Option<Arc<SearchIndex>> {
+    let database = storage.database()?;
+    match SearchIndex::attached(database, limits) {
         Ok(index) => Some(Arc::new(index)),
         Err(error) => {
             tracing::warn!(
                 component = "search",
                 operation = "search.open",
-                path = %database_path.display(),
                 error = %error,
-                "search database failed to open after recreation; the server starts without \
-                 the search index"
+                "the search tiers could not attach to the workspace database; the server \
+                 starts without the search index"
             );
             None
         }
@@ -717,6 +700,11 @@ pub struct RiftMcp {
     /// The lexical lane, absent exactly when [`Self::search_index`] is. A rebuild commits
     /// through it before its snapshot becomes current.
     lexical: Option<LexicalLane>,
+    /// The workspace's recorded diagnostics, absent when the store could not be
+    /// opened at startup; `rift://logs` then answers with that reason rather
+    /// than refusing. The handle is the read side alone: the drain task that
+    /// writes records holds its own.
+    logs: Option<Arc<LogStore>>,
     engines: Arc<EngineHold>,
     tool_router: ToolRouter<Self>,
 }
@@ -769,7 +757,31 @@ impl RiftMcp {
     /// Dropping this future discards construction. An accepted blocking scan
     /// finishes in the bounded executor before releasing its capacity permit.
     pub async fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, ReadError> {
-        let root = absolute_root(root)?;
+        Self::build_at(absolute_root(root)?, limits, None).await
+    }
+
+    /// Builds against storage already opened by the serving process.
+    pub(crate) async fn build_with_storage(
+        root: &Path,
+        limits: WorkspaceIndexLimits,
+        storage: WorkspaceStorage,
+    ) -> Result<Self, ReadError> {
+        Self::build_at(absolute_root(root)?, limits, Some(storage)).await
+    }
+
+    async fn resolve_storage(root: &Path, storage: Option<WorkspaceStorage>) -> WorkspaceStorage {
+        match storage {
+            Some(storage) => storage,
+            None => WorkspaceStorage::open(root).await,
+        }
+    }
+
+    /// Builds from one resolved root and its process-owned storage.
+    async fn build_at(
+        root: PathBuf,
+        limits: WorkspaceIndexLimits,
+        storage: Option<WorkspaceStorage>,
+    ) -> Result<Self, ReadError> {
         let configuration_root = root.clone();
         let startup_configuration =
             tokio::task::spawn_blocking(move || ConfigurationState::accept(&configuration_root))
@@ -792,10 +804,10 @@ impl RiftMcp {
             .await?;
         let (published, lexical_write) =
             initial_workspace(&root, limits, &validation, &blocking).await?;
-        // The search database lives under the workspace's own `.rift` directory, so it
-        // opens only once the workspace root itself is proven real by a successful initial
-        // scan - never before, or a missing root would be silently fabricated by creating
-        // `.rift` under it.
+        // Direct construction delays the database open until the initial scan proves the
+        // workspace root. A serving process supplies the owner it opened for foreground log
+        // capture; that path creates `.rift` only below an already-existing root.
+        let storage = Self::resolve_storage(&root, storage).await;
         let search_configuration = startup_configuration.search_configuration();
         // While `rift.toml` is invalid every request is refused until it is fixed, and the
         // table naming the model is the very part that could not be read. Acquiring the
@@ -806,7 +818,11 @@ impl RiftMcp {
             .then(|| model_acquisition(&search_configuration.semantic, &root))
             .flatten();
         let search_limits = search_index_limits(&search_configuration, acquisition.as_ref());
-        let search_index = open_search_index(&root, search_limits).await;
+        let search_index = open_search_index(&storage, search_limits);
+        // The log store shares the database owner without depending on index readiness. Its
+        // reads use committed WAL snapshots, so `rift://logs` can answer while a rebuild is
+        // still preparing the next publication.
+        let logs = storage.logs();
         // The lexical set commits before this snapshot becomes current, so the first
         // request to reach the server reads rows stamped with the tree revision it
         // captured. Embedding does not: the population lane runs the run's first pass
@@ -876,6 +892,7 @@ impl RiftMcp {
             search_index,
             population,
             lexical,
+            logs,
             engines,
             tool_router: Self::tool_router(),
         })
@@ -1310,15 +1327,49 @@ impl RiftMcp {
         &self,
         phase: wire::ErrorPhase,
     ) -> Result<Arc<PublishedWorkspace>, ErrorData> {
-        let deadline = tokio::time::Instant::now() + self.readiness_timeout().await;
-        match tokio::time::timeout_at(deadline, self.reconcile_workspace(phase)).await {
-            Ok(result) => result,
-            Err(_) => Err(ReadFault::unavailable(
-                "current workspace read",
-                "readiness deadline elapsed",
-            )
-            .tool_error(phase)),
+        let timeout = self.readiness_timeout().await;
+        let deadline = tokio::time::Instant::now() + timeout;
+        let Ok(result) = tokio::time::timeout_at(deadline, self.reconcile_workspace(phase)).await
+        else {
+            let detail = self.readiness_stall(timeout).await;
+            tracing::warn!(
+                component = "index",
+                operation = "index.readiness",
+                detail = detail.as_str(),
+                "a request spent its whole readiness budget"
+            );
+            return Err(ReadFault::unavailable("current workspace read", detail).tool_error(phase));
+        };
+        result
+    }
+
+    /// What the elapsed wait was waiting for, in the words an operator can act
+    /// on.
+    ///
+    /// "readiness deadline elapsed" alone sends a reader to the timeout, which
+    /// is almost never the fault: the epochs say whether the index is behind
+    /// the filesystem and by how far, and `rift://logs` holds the rebuild
+    /// records that go with them.
+    async fn readiness_stall(&self, timeout: Duration) -> String {
+        let observed = self.validation.observed_epoch();
+        let published = {
+            let state = self.published.read().await;
+            let (current, _failure) = state.snapshot();
+            current.epoch
+        };
+        let waited_ms = timeout.as_millis();
+        if published == observed {
+            return format!(
+                "the index settled at epoch {published} but the tree kept moving under the \
+                 request for {waited_ms}ms; read rift://logs for the rebuilds it made"
+            );
         }
+        format!(
+            "the index is {behind} filesystem events behind the tree after {waited_ms}ms \
+             (published epoch {published}, observed epoch {observed}); read rift://logs for \
+             what the index lane did",
+            behind = observed.saturating_sub(published)
+        )
     }
 
     /// The `[server] readiness_timeout` this request's wait is bounded by,
@@ -1423,6 +1474,23 @@ impl RiftMcp {
             }
             if current.epoch == observed_epoch {
                 return Ok(current);
+            }
+            // The supervisor is the only publisher. Once it is gone the epochs can never
+            // meet again, so waiting for them spends the whole readiness budget to reach
+            // the same refusal, once per request, forever.
+            if !self.validation.supervisor_running.load(Ordering::Acquire) {
+                return Err(ReadFault::unavailable(
+                    "current workspace read",
+                    format!(
+                        "the index supervisor stopped, so the index stays {behind} filesystem \
+                         events behind the tree (published epoch {published}, observed epoch \
+                         {observed_epoch}); restart the workspace server, and read \
+                         rift://logs for what it did before it stopped",
+                        behind = observed_epoch.saturating_sub(current.epoch),
+                        published = current.epoch,
+                    ),
+                )
+                .tool_error(phase));
             }
             if let Some((failed_epoch, error)) = failure
                 && failed_epoch == observed_epoch
@@ -1734,18 +1802,83 @@ impl RiftMcp {
     }
 }
 
+impl RiftMcp {
+    /// Answers one `rift://logs` read.
+    ///
+    /// The read takes no part in workspace readiness. A request that waits for
+    /// the index to settle is exactly the request whose refusal these records
+    /// explain, so making the explanation wait on the same gate would leave the
+    /// failure unreadable. The page comes from the last accepted `[logs]`
+    /// table, or the default table while `rift.toml` is invalid.
+    async fn read_logs(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
+        let page_records = {
+            let state = self.published.read().await;
+            let (current, _failure) = state.snapshot();
+            current.configuration.logs_configuration().page_records
+        };
+        let query = resource::log_query(uri, page_records)?;
+        let Some(store) = self.logs.as_ref() else {
+            return Ok(resource::logs_unavailable(
+                uri,
+                "the workspace log store could not be opened, so this run recorded nothing",
+            ));
+        };
+        match store.recent(&query).await {
+            Ok(records) => Ok(resource::rendered_logs(uri, &records)),
+            Err(error) => Err(ErrorData::internal_error(
+                format!("the log store refused the read: {error}"),
+                None,
+            )),
+        }
+    }
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RiftMcp {
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        Ok(ListResourcesResult::with_all_items(
+            resource::declared_resources(),
+        ))
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, ErrorData> {
+        Ok(ListResourceTemplatesResult::with_all_items(
+            resource::declared_templates(),
+        ))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        self.read_logs(&request.uri).await.map(Into::into)
+    }
+
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("rift", env!("CARGO_PKG_VERSION")))
-            .with_instructions(
-                "Read and edit the current workspace: get_symbol and search find \
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
+        .with_server_info(Implementation::new("rift", env!("CARGO_PKG_VERSION")))
+        .with_instructions(
+            "Read and edit the current workspace: get_symbol and search find \
                  declarations, nodes lists witnessed syntax nodes at a byte position, \
                  and replace_symbol, insert_symbol, replace_node, rename_symbol, \
                  move_file, and patch change code atomically behind verified \
-                 preconditions.",
-            )
+                 preconditions. The rift://logs resource reads the server's own \
+                 diagnostics back, including while a tool refuses.",
+        )
     }
 }
 
@@ -2648,40 +2781,31 @@ mod tests {
         Ok(())
     }
 
-    /// Corrupt bytes fail `SQLite`'s file-format check deterministically, exercising the
-    /// documented recreate-once path: the server still starts, and the recreated database
-    /// serves lexical search once repopulated.
+    /// Corrupt bytes fail `SQLite`'s file-format check deterministically. The server starts
+    /// without database-backed search or logs and leaves those bytes in place for recovery.
     #[tokio::test]
-    async fn build_recovers_from_a_corrupt_lexical_database_by_recreating_it_once() -> TestResult {
+    async fn build_preserves_a_corrupt_database_and_serves_without_it() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let guide_txt = "notes about the beacon subsystem\n";
-        fs::write(directory.path().join("guide.txt"), guide_txt)?;
         let state_directory = directory.path().join(".rift");
         fs::create_dir_all(&state_directory)?;
-        fs::write(state_directory.join("db"), b"not a sqlite database")?;
+        let database_path = state_directory.join("db");
+        let corrupt = b"not a sqlite database";
+        fs::write(&database_path, corrupt)?;
         super::hermetic_workspace(directory.path(), "")?;
 
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())
             .await
             .map_err(|error| format!("corrupt database must not fail startup: {error:?}"))?;
-        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
-        let server_task = tokio::spawn(async move {
-            let service = server
-                .serve(server_transport)
-                .await
-                .expect("server must initialize");
-            service.waiting().await.expect("server must stop cleanly");
-        });
-        let client = ().serve(client_transport).await?;
 
-        // The recreated database is populated by the population lane, after `build`
-        // returned. Poll for the hit under a bound; the helper's failure names the last
-        // answer that still missed it.
-        search_until_hit(client.peer(), "beacon subsystem", "guide.txt").await?;
-
-        client.cancel().await?;
-        server_task.await?;
+        assert!(server.search_index.is_none());
+        assert!(server.logs.is_none());
+        let unavailable = serde_json::to_string(&server.read_logs("rift://logs").await?)?;
+        assert!(
+            unavailable.contains("the workspace log store could not be opened"),
+            "{unavailable}"
+        );
+        assert_eq!(fs::read(database_path)?, corrupt);
         Ok(())
     }
 
@@ -3228,8 +3352,135 @@ pub fn beacon() -> u64 {
             .await
             .expect_err("a stalled publication must miss the freshness deadline");
         assert!(
-            error.message.contains("readiness deadline elapsed"),
+            error.message.contains("filesystem events behind the tree"),
             "unexpected refusal: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_read_names_the_epochs_it_waited_on() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        server
+            .validation
+            .observed_epoch
+            .fetch_add(3, std::sync::atomic::Ordering::SeqCst);
+
+        let error = get_symbol(&server, "beacon")
+            .await
+            .expect_err("a stalled publication must refuse");
+
+        assert!(error.message.contains("published epoch 0"), "{error:?}");
+        assert!(error.message.contains("observed epoch 3"), "{error:?}");
+        assert!(error.message.contains("rift://logs"), "{error:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stall_after_the_epoch_settled_names_tree_movement() -> TestResult {
+        let (_directory, server) = fixture().await?;
+
+        let detail = server.readiness_stall(Duration::from_millis(25)).await;
+
+        assert!(detail.contains("the index settled at epoch 0"), "{detail}");
+        assert!(detail.contains("tree kept moving"), "{detail}");
+        assert!(detail.contains("25ms"), "{detail}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_read_refuses_at_once_when_the_supervisor_has_stopped() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        server
+            .validation
+            .observed_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        server
+            .validation
+            .supervisor_running
+            .store(false, std::sync::atomic::Ordering::Release);
+
+        // The readiness budget is thirty seconds; a real-clock test that reached it would
+        // take that long, so refusing without waiting is what this asserts.
+        let refused_at = std::time::Instant::now();
+        let error = get_symbol(&server, "beacon")
+            .await
+            .expect_err("a stopped supervisor must refuse the read");
+
+        assert!(
+            refused_at.elapsed() < Duration::from_secs(5),
+            "the refusal must not wait out the readiness budget: {:?}",
+            refused_at.elapsed()
+        );
+        assert!(
+            error.message.contains("the index supervisor stopped"),
+            "{error:?}"
+        );
+        assert!(
+            error.message.contains("restart the workspace server"),
+            "{error:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_log_resource_answers_while_workspace_reads_refuse() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        server
+            .validation
+            .observed_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        server
+            .validation
+            .supervisor_running
+            .store(false, std::sync::atomic::Ordering::Release);
+        get_symbol(&server, "beacon")
+            .await
+            .expect_err("the stalled workspace must refuse a read");
+
+        let answer = server.read_logs("rift://logs").await?;
+
+        // The read is the whole point of the resource: the request that just refused is
+        // the one whose reason lives in these records.
+        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = answer
+            .contents
+            .first()
+            .expect("a log read answers with one content")
+        else {
+            unreachable!("a log read answers with text");
+        };
+        let body: serde_json::Value = serde_json::from_str(text)?;
+        assert!(body["records"].is_array(), "{text}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_supervisor_reports_that_it_stopped() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        assert!(
+            server
+                .validation
+                .supervisor_running
+                .load(std::sync::atomic::Ordering::Acquire),
+            "a built server runs its supervisor"
+        );
+
+        let stopped = server.validation.changed.notified();
+        tokio::pin!(stopped);
+        stopped.as_mut().enable();
+        server.validation.cancellation.cancel();
+        let handle = server.validation.task.lock().await.take();
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
+        stopped.as_mut().await;
+
+        assert!(
+            !server
+                .validation
+                .supervisor_running
+                .load(std::sync::atomic::Ordering::Acquire),
+            "a supervisor that ended must say so"
         );
         Ok(())
     }
@@ -3279,16 +3530,15 @@ pub fn beacon() -> u64 {
         let _guard = tracing::subscriber::set_default(subscriber);
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        // A directory at the database path fails the initial open; `remove_file` cannot
-        // remove a directory, so the recreate-once retry also fails against it unchanged -
-        // this is also the deterministic way to drive the recreate-once arm itself.
+        // A directory at the database path makes SQLite reject the open without changing
+        // the unexpected filesystem entry.
         super::hermetic_workspace(directory.path(), "")?;
         fs::create_dir_all(directory.path().join(".rift/db"))?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         assert!(
             server.search_index.is_none(),
-            "a database path occupied by a directory must exhaust the recreate-once retry \
-             and still leave the server running without the search index"
+            "a database path occupied by a directory must leave the server running without \
+             the search index"
         );
 
         // With no search index, identifier search still serves results rather than failing.
@@ -3986,7 +4236,7 @@ pub fn beacon() -> u64 {
             .await
             .expect_err("a stalled publication must miss the freshness deadline");
         assert!(
-            error.message.contains("readiness deadline elapsed"),
+            error.message.contains("filesystem events behind the tree"),
             "unexpected refusal: {error:?}"
         );
         Ok(())

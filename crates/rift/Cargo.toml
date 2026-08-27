@@ -56,6 +56,10 @@ name = "end_to_end"
 path = "tests/end_to_end.rs"
 
 [[test]]
+name = "logs_resource"
+path = "tests/logs_resource.rs"
+
+[[test]]
 name = "mcp_proxy"
 path = "tests/mcp_proxy.rs"
 

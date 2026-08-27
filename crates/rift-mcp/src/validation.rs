@@ -20,8 +20,8 @@ use rift_index::{
     WorkspaceIndexLimits, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::{
-    EngineConfiguration, HistoryConfiguration, SearchConfiguration, ServerConfiguration,
-    WorkspaceConfiguration,
+    EngineConfiguration, HistoryConfiguration, LogsConfiguration, SearchConfiguration,
+    ServerConfiguration, WorkspaceConfiguration,
 };
 use rift_protocol::error as wire;
 use rift_search::{Embedding, SearchError, SearchIndex};
@@ -265,6 +265,15 @@ pub(crate) struct IndexValidation {
     pub(crate) source_policy: SyncRwLock<Option<Arc<WorkspaceSourcePolicy>>>,
     pub(crate) cancellation: CancellationToken,
     pub(crate) task: AsyncMutex<Option<JoinHandle<()>>>,
+    /// Whether the index supervisor is still running.
+    ///
+    /// The supervisor is the only writer of published snapshots. If it ends -
+    /// cancelled, or unwound by a panic in a rebuild - the observed epoch keeps
+    /// advancing with every filesystem event and nothing ever publishes again,
+    /// so every read waits its whole readiness budget and refuses. That was
+    /// silent: the flag makes it a named refusal on the first request instead
+    /// of a timeout on every one.
+    pub(crate) supervisor_running: Arc<AtomicBool>,
 }
 
 /// Owned shutdown handle for the workspace index supervisor.
@@ -375,6 +384,17 @@ impl ConfigurationState {
             .unwrap_or_default()
     }
 
+    /// The `[logs]` table from the last acceptance, or the default table while
+    /// `rift.toml` is invalid. A `rift://logs` read is answered under this
+    /// table exactly when the file the read is meant to explain is the one that
+    /// failed acceptance, so the default has to serve that case.
+    pub(crate) fn logs_configuration(&self) -> LogsConfiguration {
+        self.accepted
+            .as_ref()
+            .map(|configuration| configuration.logs.clone())
+            .unwrap_or_default()
+    }
+
     /// The `[engines]` tables from the last acceptance, or no engines while
     /// `rift.toml` is invalid.
     pub(crate) fn engines_configuration(&self) -> BTreeMap<String, EngineConfiguration> {
@@ -431,6 +451,7 @@ impl IndexValidation {
             Arc::new(Self {
                 observed_epoch: Arc::new(AtomicU64::new(0)),
                 watch_failed: Arc::new(AtomicBool::new(false)),
+                supervisor_running: Arc::new(AtomicBool::new(true)),
                 invalidations,
                 changed: Arc::new(Notify::new()),
                 publication_lane: SyncMutex::new(PendingWork::default()),
@@ -697,6 +718,35 @@ pub(crate) fn report_watch_outcome(
             component = "index",
             operation = "watch.observe",
             "index watch failed"
+        );
+    }
+}
+
+/// Marks the index supervisor running for as long as it is held.
+///
+/// Dropping it - on return, on cancellation, or while a panic unwinds the task -
+/// clears the flag and records the end, so a request that finds no publication
+/// coming can say so instead of waiting.
+struct SupervisorRunning {
+    running: Arc<AtomicBool>,
+    changed: Arc<Notify>,
+}
+
+impl SupervisorRunning {
+    fn new(running: Arc<AtomicBool>, changed: Arc<Notify>) -> Self {
+        running.store(true, Ordering::Release);
+        Self { running, changed }
+    }
+}
+
+impl Drop for SupervisorRunning {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
+        self.changed.notify_waiters();
+        tracing::warn!(
+            component = "index",
+            operation = "index.supervisor",
+            "the index supervisor stopped; no further snapshot publishes in this process"
         );
     }
 }
@@ -1342,6 +1392,13 @@ pub(crate) async fn run_index_supervisor(
     let published = Arc::clone(&context.published);
     let blocking = context.blocking.clone();
     let population = context.population.clone();
+    // The guard reports the supervisor's end however it comes: a return, a cancellation, or
+    // a panic unwinding this task. A reader that meets the readiness deadline needs to know
+    // which of those happened, and the process that panicked cannot tell them afterwards.
+    let _running = SupervisorRunning::new(
+        Arc::clone(&validation.supervisor_running),
+        Arc::clone(&validation.changed),
+    );
     loop {
         let received = tokio::select! {
             () = validation.cancellation.cancelled() => false,

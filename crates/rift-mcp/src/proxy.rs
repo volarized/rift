@@ -15,8 +15,9 @@ use rift_core::{CapturedStream, CliCode, Error, ErrorCode, ErrorContext, ErrorNa
 use rift_protocol::error as wire;
 use rift_protocol::lock::ServerLock;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, ServerPeerInfo,
+    CallToolRequestParams, CallToolResponse, Implementation, ListResourceTemplatesResult,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
+    ReadResourceResponse, ServerCapabilities, ServerInfo, ServerPeerInfo,
 };
 use rmcp::service::{
     ClientInitializeError, Peer, QuitReason, RequestContext, RoleClient, RoleServer,
@@ -624,8 +625,13 @@ fn forwarded_error(error: ServiceError) -> ErrorData {
 
 /// The advertisement served before the first successful upstream connect.
 fn fallback_info() -> ServerInfo {
-    ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-        .with_server_info(Implementation::new("rift", env!("CARGO_PKG_VERSION")))
+    ServerInfo::new(
+        ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .build(),
+    )
+    .with_server_info(Implementation::new("rift", env!("CARGO_PKG_VERSION")))
 }
 
 /// The upstream's negotiated facts as this proxy's own advertisement.
@@ -672,6 +678,40 @@ impl ServerHandler for RiftProxy {
             peer.call_tool_once(request).await
         })
         .await
+    }
+
+    async fn list_resources(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        self.forward(request, |peer, request| async move {
+            peer.list_resources(request).await
+        })
+        .await
+    }
+
+    async fn list_resource_templates(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, ErrorData> {
+        self.forward(request, |peer, request| async move {
+            peer.list_resource_templates(request).await
+        })
+        .await
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        self.forward(request, |peer, request| async move {
+            peer.read_resource(request).await
+        })
+        .await
+        .map(Into::into)
     }
 }
 

@@ -248,6 +248,36 @@ A visible path no syntax provider parses - `justfile`, `.gitignore` - refuses
 
 ## Resources
 
+### Server logs [#resource-logs]
+
+<VersionBadge version="v0.0.22" />
+
+`rift://logs` reads the server's own diagnostics back, newest first. Events admitted by the
+`[logs] capture` filter enter a bounded queue and one task writes them to the workspace database,
+so an agent that met a refusal can ask what the server was doing without an operator reading its
+terminal. When the queue fills, the task drops later events and records the dropped count:
+
+| Resource | Content |
+| --- | --- |
+| `rift://logs` | every recorded diagnostic, newest first |
+| `rift://logs/level/{level}` | one severity: `trace`, `debug`, `info`, `warn`, or `error` |
+| `rift://logs/component/{component}` | one component's records, as its spans label them |
+
+The answer is a JSON object carrying `records` and `record_count`. Each record names its
+`identity` (the store's own ascending number), `recorded_at_ms`, `level`, `target`,
+`component`, `operation`, `message`, and the remaining `fields` as an object. A span that
+closed carries its `elapsed_ms`, which is how long the work it wrapped took.
+
+The read never waits on workspace readiness. A request that refuses because the index will not
+settle is exactly the request whose reason these records hold, so the log read answers while
+every workspace read is still refusing. A store that could not be opened answers with an empty
+set and an `unavailable` reason rather than a refusal.
+
+`[logs] page_records` bounds one read; `retention_records` bounds the store. Both are
+[workspace configuration](/docs/configuration#logs).
+
+### Planned resources
+
 <VersionBadge version="planned" />
 
 Resources expose workspace state to consumers such as a UI. They carry data shaped for paging:

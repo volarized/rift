@@ -17,11 +17,14 @@ use rift_core::{
     Error, ErrorCode, ErrorContext, ErrorName, Fault, LimitEvidence, ProjectPath, fault_label,
 };
 use serde::Serialize;
+use std::sync::Arc;
+
+use toasty::Executor;
 use toasty::db::Connection;
 use toasty::migration::{MigrationFile, MigrationSet};
 use toasty::stmt::{Type, Value};
-use toasty::{Db, Executor};
-use toasty_driver_sqlite::Sqlite;
+
+use crate::database::WorkspaceDatabase;
 
 /// Default maximum indexed lexical units per index.
 const LEXICAL_UNITS_MAX_DEFAULT: u32 = 20_000;
@@ -35,7 +38,7 @@ const LEXICAL_MATCHES_MAX_DEFAULT: u32 = 1_000;
 const LEXICAL_POOL_SLOTS_DEFAULT: u32 = 4;
 /// Default busy-wait budget, in milliseconds, `SQLite` grants a connection
 /// before returning `SQLITE_BUSY`.
-const LEXICAL_BUSY_TIMEOUT_MS_DEFAULT: u32 = 1_000;
+const LEXICAL_BUSY_TIMEOUT_MS_DEFAULT: u32 = 5_000;
 /// Maximum UTF-8 bytes accepted for one unit's declaration name, matching
 /// the wire's symbol-name maximum.
 const UNIT_NAME_BYTES_MAX: usize = 4_096;
@@ -91,6 +94,24 @@ CREATE INDEX semantic_vectors_model ON semantic_vectors(model)",
         3,
         "lexical_units_path",
         "CREATE INDEX lexical_units_path ON lexical_units(path)",
+    ),
+    MigrationFile::new(
+        4,
+        "log_records",
+        "CREATE TABLE log_records(
+        id BIGINT PRIMARY KEY NOT NULL,
+        recorded_at BIGINT NOT NULL,
+        level TEXT NOT NULL,
+        target TEXT NOT NULL,
+        component TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        message TEXT NOT NULL,
+        fields TEXT NOT NULL
+    )
+-- #[toasty::breakpoint]
+CREATE INDEX log_records_level ON log_records(level)
+-- #[toasty::breakpoint]
+CREATE INDEX log_records_component ON log_records(component)",
     ),
 ];
 pub(crate) const MIGRATIONS: MigrationSet = MigrationSet::new(MIGRATION_FILES);
@@ -388,6 +409,8 @@ pub enum LexicalIndexViolation {
     IdentityEmpty,
     /// A `replace_all` batch repeated one identity across units.
     DuplicateIdentity,
+    /// One write carried more records than the batch bound accepts.
+    RecordLimit,
 }
 
 /// The bound and observed value behind a `limit_exceeded` violation, minted from the exact
@@ -432,7 +455,8 @@ impl Fault for LexicalIndexFault {
             LexicalIndexViolation::Storage => ErrorName::Wire(ErrorCode::StorageFailure),
             LexicalIndexViolation::UnitLimit
             | LexicalIndexViolation::UnitTooLarge
-            | LexicalIndexViolation::QueryTermLimit => ErrorName::Wire(ErrorCode::LimitExceeded),
+            | LexicalIndexViolation::QueryTermLimit
+            | LexicalIndexViolation::RecordLimit => ErrorName::Wire(ErrorCode::LimitExceeded),
             LexicalIndexViolation::StoredPathInvalid
             | LexicalIndexViolation::StoredKindInvalid
             | LexicalIndexViolation::DuplicateIdentity => ErrorName::Wire(ErrorCode::InternalError),
@@ -446,6 +470,7 @@ impl Fault for LexicalIndexFault {
             context.push(ErrorContext::new("path", path.display().to_string()));
         }
         if let Some(breach) = self.limit {
+            context.push(ErrorContext::new("field", breach.field));
             context.push(ErrorContext::new("observed", breach.observed.to_string()));
             context.push(ErrorContext::new("maximum", breach.maximum.to_string()));
         }
@@ -479,7 +504,7 @@ fn lexical_error(violation: LexicalIndexViolation) -> LexicalIndexError {
     })
 }
 
-fn lexical_error_caused_by(
+pub(crate) fn lexical_error_caused_by(
     violation: LexicalIndexViolation,
     path: Option<&Path>,
     source: impl std::error::Error + Send + Sync + 'static,
@@ -519,6 +544,21 @@ fn lexical_error_over_limit(
 /// fallback only guards the conversion, never fires in practice.
 fn limit_count(count: usize) -> u64 {
     u64::try_from(count).unwrap_or(u64::MAX)
+}
+
+/// Refuses one oversized write batch, naming the field the bound belongs to.
+pub(crate) fn batch_limit_error(
+    field: &'static str,
+    observed: u64,
+    maximum: u64,
+) -> LexicalIndexError {
+    lexical_error_over_limit(
+        LexicalIndexViolation::RecordLimit,
+        None,
+        field,
+        observed,
+        maximum,
+    )
 }
 
 /// Maps one Toasty operating failure onto [`LexicalIndexViolation::Storage`].
@@ -717,7 +757,7 @@ fn validate_lexical_units(
 
 #[derive(Debug, toasty::Model)]
 #[table = "lexical_units"]
-struct LexicalUnitRecord {
+pub(crate) struct LexicalUnitRecord {
     #[key]
     identity: String,
     path: String,
@@ -729,7 +769,7 @@ struct LexicalUnitRecord {
 
 #[derive(Debug, toasty::Model)]
 #[table = "lexical_index_state"]
-struct LexicalIndexStateRecord {
+pub(crate) struct LexicalIndexStateRecord {
     #[key]
     id: i64,
     tree_revision: String,
@@ -746,7 +786,10 @@ fn checked_byte_length(bytes: usize) -> i64 {
 }
 
 /// Verifies a single-row pragma result matches the value just requested.
-fn require_pragma_row(rows: &[Value], expected: &[Value]) -> Result<(), LexicalIndexError> {
+pub(crate) fn require_pragma_row(
+    rows: &[Value],
+    expected: &[Value],
+) -> Result<(), LexicalIndexError> {
     if let [Value::Record(record)] = rows
         && record.as_slice() == expected
     {
@@ -954,68 +997,24 @@ impl LexicalChange {
 /// `SQLite` FTS5-backed lexical search index.
 #[derive(Debug)]
 pub struct LexicalSearchIndex {
-    database: Db,
+    database: Arc<WorkspaceDatabase>,
     limits: LexicalIndexLimits,
 }
 
 impl LexicalSearchIndex {
-    /// Opens (creating if absent) the lexical index at `database_path`.
+    /// Attaches the lexical tier to one already-open workspace database.
     ///
-    /// # Errors
-    ///
-    /// Returns [`LexicalIndexError`] when the database cannot be opened or
-    /// its schema migration fails.
-    ///
-    /// # Cancel safety
-    ///
-    /// Cancellation may leave the database file created without its schema
-    /// applied. Reopening retries safely: schema migrations are idempotent.
-    pub async fn open(
-        database_path: &Path,
-        limits: LexicalIndexLimits,
-    ) -> Result<Self, LexicalIndexError> {
-        let mut builder = Db::builder();
-        builder
-            .models(toasty::models!(LexicalUnitRecord, LexicalIndexStateRecord))
-            .max_pool_size(bound_as_usize(limits.pool_slots()));
-        let database = builder
-            .build(Sqlite::open(database_path))
-            .await
-            .map_err(|source| {
-                lexical_error_caused_by(LexicalIndexViolation::Storage, Some(database_path), source)
-            })?;
-        let _migration_report = MIGRATIONS.apply(&database).await.map_err(|source| {
-            lexical_error_caused_by(LexicalIndexViolation::Storage, Some(database_path), source)
-        })?;
-        Ok(Self { database, limits })
+    /// The pool is shared with every other store in the file, because `SQLite`
+    /// serializes writers per file: a second pool would only add a connection
+    /// that loses the same write lock.
+    #[must_use]
+    pub fn attached(database: Arc<WorkspaceDatabase>, limits: LexicalIndexLimits) -> Self {
+        Self { database, limits }
     }
 
-    /// Acquires a pooled connection configured with this adapter's required
-    /// pragmas. Foreign keys are not configured: this schema's tables carry
-    /// no foreign-key relationships between them.
+    /// A pooled connection carrying the workspace database's required pragmas.
     async fn configured_connection(&self) -> Result<Connection, LexicalIndexError> {
-        let mut connection = self.database.connection().await.map_err(storage_error)?;
-
-        let journal_mode = toasty::sql::query("PRAGMA journal_mode = WAL")
-            .column_types([Type::String])
-            .exec(&mut connection)
-            .await
-            .map_err(storage_error)?;
-        require_pragma_row(&journal_mode, &[Value::String("wal".to_owned())])?;
-
-        let busy_timeout_ms = i64::from(self.limits.busy_timeout_ms());
-        toasty::sql::query(format!("PRAGMA busy_timeout = {busy_timeout_ms}"))
-            .exec(&mut connection)
-            .await
-            .map_err(storage_error)?;
-        let busy_timeout = toasty::sql::query("PRAGMA busy_timeout")
-            .column_types([Type::I64])
-            .exec(&mut connection)
-            .await
-            .map_err(storage_error)?;
-        require_pragma_row(&busy_timeout, &[Value::I64(busy_timeout_ms)])?;
-
-        Ok(connection)
+        self.database.connection().await
     }
 
     /// Atomically replaces every indexed unit and stamps `tree_revision`.
@@ -1042,8 +1041,8 @@ impl LexicalSearchIndex {
     ) -> Result<(), LexicalIndexError> {
         validate_lexical_batch(units, self.limits)?;
 
-        let mut connection = self.configured_connection().await?;
-        let mut transaction = connection.transaction().await.map_err(storage_error)?;
+        let mut access = self.database.writing().await?;
+        let mut transaction = access.transaction().await?;
 
         toasty::sql::statement("DELETE FROM lexical_units_fts")
             .exec(&mut transaction)
@@ -1097,8 +1096,8 @@ impl LexicalSearchIndex {
     ) -> Result<(), LexicalIndexError> {
         validate_lexical_units(change.inserted(), self.limits)?;
 
-        let mut connection = self.configured_connection().await?;
-        let mut transaction = connection.transaction().await.map_err(storage_error)?;
+        let mut access = self.database.writing().await?;
+        let mut transaction = access.transaction().await?;
 
         for path in change.replaced() {
             delete_path_units(&mut transaction, path).await?;
@@ -1150,7 +1149,7 @@ impl LexicalSearchIndex {
         let expression = match_expression(query, terms_max)?;
         let effective_limit = i64::from(limit.min(self.limits.matches_max()));
 
-        let mut connection = self.configured_connection().await?;
+        let mut connection = self.database.connection().await?;
         let mut transaction = connection.transaction().await.map_err(storage_error)?;
         let stored = stored_tree_revision(&mut transaction).await?;
         match stored {
@@ -1245,7 +1244,7 @@ mod tests {
     fn test_lexical_index_limits_default_accepts_documented_pool_and_timeout() {
         let limits = LexicalIndexLimits::default();
         assert_eq!(limits.pool_slots(), 4);
-        assert_eq!(limits.busy_timeout_ms(), 1_000);
+        assert_eq!(limits.busy_timeout_ms(), 5_000);
     }
 
     fn symbol_unit_with_name(name: String) -> LexicalUnit {

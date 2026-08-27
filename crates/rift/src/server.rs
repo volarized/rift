@@ -13,8 +13,9 @@ use std::time::Duration;
 
 use rift_core::{CliCode, Error, ErrorContext, ErrorName, Fault};
 use rift_mcp::{
-    ElectionError, ElectionFault, PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX,
-    ServerPresence, StaleReason, probe, read_serving, serve_elected, spawn_detached_server,
+    ElectionError, ElectionFault, LogDrain, PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT,
+    START_WAIT_MAX, ServerPresence, StaleReason, WorkspaceStorage, probe, read_serving,
+    serve_elected_with_storage, spawn_detached_server,
 };
 use rift_protocol::lock::ServerLock;
 use tokio_util::sync::CancellationToken;
@@ -28,6 +29,8 @@ const STOP_WAIT_MAX: Duration = Duration::from_secs(10);
 const STOP_POLL_ATTEMPT_COUNT: u32 = 100;
 /// Bound on the whole stop request: connect, send, and read the answer.
 const STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest wait for queued diagnostics to reach the workspace database.
+const LOG_DRAIN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Failure while running one `rift server` command.
 pub(super) type ServerCommandError = Error<ServerCommandFault>;
@@ -225,12 +228,16 @@ impl fmt::Display for ServerOutcome {
 /// Returns [`ServerCommandError`] when the asked state was not reached.
 pub(super) async fn run(
     command: ServerCommand,
+    drain: Option<LogDrain>,
+    retention_records: u64,
 ) -> Result<Option<ServerOutcome>, ServerCommandError> {
     let root = Path::new(".");
     match command {
         ServerCommand::Start { foreground } => match start_mode(foreground) {
             StartMode::Detached => start_detached(root).await.map(Some),
-            StartMode::Foreground => serve_foreground(root).await.map(|()| None),
+            StartMode::Foreground => serve_foreground(root, drain, retention_records)
+                .await
+                .map(|()| None),
         },
         ServerCommand::Stop => stop(root).await.map(Some),
         ServerCommand::Restart => restart(root).await.map(Some),
@@ -321,12 +328,34 @@ async fn await_serving(
 ///
 /// The listening line prints before blocking. Ctrl-C cancels the shutdown
 /// token; an authorized stop request and the idle timeout end serving the
-/// same way.
-async fn serve_foreground(root: &Path) -> Result<(), ServerCommandError> {
+/// same way. This is the process that records: the drain writes what the
+/// tracing layer queued into the workspace database until the same token
+/// stops it.
+async fn serve_foreground(
+    root: &Path,
+    drain: Option<LogDrain>,
+    retention_records: u64,
+) -> Result<(), ServerCommandError> {
     let shutdown = CancellationToken::new();
-    let server = match serve_elected(root, shutdown.clone()).await {
+    let storage = WorkspaceStorage::open(root).await;
+    // The drain starts before election, so a start that refuses is recorded too: the
+    // workspace that already has a server is exactly the one whose operator is about to
+    // ask why this one would not serve.
+    let log_drain = match (drain, storage.logs()) {
+        (Some(drain), Some(store)) => Some(tokio::spawn(drain.run(
+            store,
+            retention_records,
+            shutdown.clone(),
+        ))),
+        _ => None,
+    };
+    let server = match serve_elected_with_storage(root, shutdown.clone(), storage).await {
         Ok(server) => server,
-        Err(error) => return Err(foreground_refused(root, error)),
+        Err(error) => {
+            shutdown.cancel();
+            stop_log_drain(log_drain).await;
+            return Err(foreground_refused(root, error));
+        }
     };
     println!(
         "{}",
@@ -335,11 +364,36 @@ async fn serve_foreground(root: &Path) -> Result<(), ServerCommandError> {
             pid: std::process::id(),
         }
     );
-    tokio::spawn(cancel_on_interrupt(shutdown));
-    server
+    let interrupt = tokio::spawn(cancel_on_interrupt(shutdown.clone()));
+    let stopped = server
         .stopped()
         .await
-        .map_err(|error| Error::new(ServerCommandFault::Election(error)))
+        .map_err(|error| Error::new(ServerCommandFault::Election(error)));
+    shutdown.cancel();
+    interrupt.abort();
+    let _ = interrupt.await;
+    stop_log_drain(log_drain).await;
+    stopped
+}
+
+/// Joins the diagnostics drain within the foreground server's shutdown deadline.
+async fn stop_log_drain(drain: Option<tokio::task::JoinHandle<()>>) {
+    let Some(mut drain) = drain else {
+        return;
+    };
+    match tokio::time::timeout(LOG_DRAIN_SHUTDOWN_TIMEOUT, &mut drain).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(component = "logs", %error, "log drain task failed"),
+        Err(_) => {
+            drain.abort();
+            let _ = drain.await;
+            tracing::warn!(
+                component = "logs",
+                timeout = ?LOG_DRAIN_SHUTDOWN_TIMEOUT,
+                "log drain missed its shutdown deadline"
+            );
+        }
+    }
 }
 
 /// Cancels `shutdown` when the process receives an interrupt.
@@ -474,12 +528,14 @@ pub(super) fn error_for_test() -> ServerCommandError {
 mod tests {
     use std::future::IntoFuture as _;
     use std::net::Ipv4Addr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{
         PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, STOP_POLL_ATTEMPT_COUNT,
         STOP_WAIT_MAX, ServerCommandFault, ServerOutcome, StaleReason, StartMode, await_serving,
         await_stopped, discard_stale_document, foreground_refused, holder_evidence,
-        stale_reason_phrase, start_mode, status, stop,
+        stale_reason_phrase, start_mode, status, stop, stop_log_drain,
     };
     use rift_core::Error;
     use rift_protocol::lock::{ServerLock, ServerLockViolation};
@@ -531,6 +587,35 @@ mod tests {
     fn foreground_flag_selects_the_mode() {
         assert!(matches!(start_mode(true), StartMode::Foreground));
         assert!(matches!(start_mode(false), StartMode::Detached));
+    }
+
+    #[tokio::test]
+    async fn a_failed_log_drain_is_joined() {
+        let drain = tokio::spawn(async { panic!("injected log drain failure") });
+
+        stop_log_drain(Some(drain)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_log_drain_is_aborted_at_its_deadline() {
+        struct Stopped(Arc<AtomicBool>);
+        impl Drop for Stopped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        let task_stopped = Arc::clone(&stopped);
+        let drain = tokio::spawn(async move {
+            let _stopped = Stopped(task_stopped);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+
+        stop_log_drain(Some(drain)).await;
+
+        assert!(stopped.load(Ordering::Acquire));
     }
 
     #[test]

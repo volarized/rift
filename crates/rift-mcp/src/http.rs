@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::RiftMcp;
 use crate::server::EngineHold;
+use crate::storage::WorkspaceStorage;
 use crate::validation::IndexSupervisor;
 
 /// A route under the server's one API base path, spelled here once.
@@ -147,8 +148,18 @@ pub async fn serve_http(
     root: &Path,
     shutdown: CancellationToken,
 ) -> Result<HttpServer, HttpServeError> {
+    let storage = WorkspaceStorage::open(root).await;
+    serve_http_with_storage(root, shutdown, storage).await
+}
+
+/// Serves HTTP through storage already opened by the serving process.
+pub(crate) async fn serve_http_with_storage(
+    root: &Path,
+    shutdown: CancellationToken,
+    storage: WorkspaceStorage,
+) -> Result<HttpServer, HttpServeError> {
     tracing::info!(component = "mcp", transport = "http", "MCP server starting");
-    let server = RiftMcp::build(root, WorkspaceIndexLimits::default())
+    let server = RiftMcp::build_with_storage(root, WorkspaceIndexLimits::default(), storage)
         .await
         .map_err(HttpServeFault::workspace)?;
     let server_table = server.server_configuration().await;

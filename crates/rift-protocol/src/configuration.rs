@@ -38,6 +38,22 @@ pub const SERVER_READINESS_TIMEOUT_MS_MIN: u64 = 1_000;
 pub const SERVER_READINESS_TIMEOUT_MS_MAX: u64 = 3_600_000;
 /// Milliseconds [`ServerConfiguration::readiness_timeout`] defaults to.
 const SERVER_READINESS_TIMEOUT_MS_DEFAULT: u64 = 30_000;
+/// Records the log store keeps, at least.
+pub const LOGS_RETENTION_RECORDS_MIN: u64 = 100;
+/// Records the log store keeps, at most.
+pub const LOGS_RETENTION_RECORDS_MAX: u64 = 1_000_000;
+/// Records the log store keeps by default.
+const LOGS_RETENTION_RECORDS_DEFAULT: u64 = 50_000;
+/// Records one `rift://logs` read returns, at most.
+pub const LOGS_PAGE_RECORDS_MAX: u64 = 5_000;
+/// Records one `rift://logs` read returns by default.
+const LOGS_PAGE_RECORDS_DEFAULT: u64 = 500;
+/// Bytes `logs.capture` may hold, at most.
+pub const LOGS_CAPTURE_BYTES_MAX: usize = 512;
+/// The filter the log store captures under by default: the same targets the
+/// stderr diagnostics carry.
+const LOGS_CAPTURE_DEFAULT: &str = "rift=info,rift_mcp=info,rift_server=info";
+
 /// Bytes one submitted execution block may hold, at most.
 pub const EXECUTION_CODE_BYTES_MAX: u64 = 32 << 10;
 /// Milliseconds one evaluation may run, at most: one day.
@@ -357,6 +373,9 @@ pub struct WorkspaceConfiguration {
     pub search: SearchConfiguration,
     /// Which files below the workspace root the index and reads consider visible.
     pub source: SourceConfiguration,
+    /// The server's own log records: how many the workspace database keeps,
+    /// how many one read returns, and which targets are captured.
+    pub logs: LogsConfiguration,
     /// Hooks run in the changed tree, in list order, each time a change
     /// applies.
     #[schemars(length(max = 32))]
@@ -388,6 +407,7 @@ impl WorkspaceConfiguration {
             .or_else(|| self.providers.history.violation())
             .or_else(|| self.search.violation())
             .or_else(|| self.source.violation())
+            .or_else(|| self.logs.violation())
             .or_else(|| hooks_violation(&self.hooks))
             .or_else(|| engines_violation(&self.engines))
     }
@@ -537,6 +557,68 @@ impl PortRange {
     }
 }
 
+/// The `[logs]` table. The server records its own diagnostics in the workspace
+/// database, where `rift://logs` reads them back, and this table bounds how
+/// many records the store keeps, how many one read returns, and which targets
+/// are captured at all. The server reads the table at startup, so a change
+/// applies on the next start.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogsConfiguration {
+    /// Records the store keeps before the oldest are dropped, 100 to 1000000.
+    #[schemars(range(min = 100, max = 1_000_000))]
+    pub retention_records: u64,
+    /// Records one `rift://logs` read returns at most, 1 to 5000.
+    #[schemars(range(min = 1, max = 5_000))]
+    pub page_records: u64,
+    /// Which targets are recorded, in the `RUST_LOG` spelling `tracing` takes:
+    /// comma-separated `target=level` pairs. A target this filter excludes
+    /// never reaches the store, whatever the stderr diagnostics carry.
+    #[schemars(length(max = 512))]
+    pub capture: String,
+}
+
+impl Default for LogsConfiguration {
+    fn default() -> Self {
+        Self {
+            retention_records: LOGS_RETENTION_RECORDS_DEFAULT,
+            page_records: LOGS_PAGE_RECORDS_DEFAULT,
+            capture: LOGS_CAPTURE_DEFAULT.to_owned(),
+        }
+    }
+}
+
+impl LogsConfiguration {
+    /// The table's bounds in key order.
+    fn violation(&self) -> Option<ConfigurationViolation> {
+        first_out_of_range([
+            (
+                "logs.retention_records",
+                self.retention_records,
+                LOGS_RETENTION_RECORDS_MIN,
+                LOGS_RETENTION_RECORDS_MAX,
+            ),
+            (
+                "logs.page_records",
+                self.page_records,
+                1,
+                LOGS_PAGE_RECORDS_MAX,
+            ),
+        ])
+        .or_else(|| self.capture_violation())
+    }
+
+    /// The capture filter's own bound, checked after the numeric rows.
+    fn capture_violation(&self) -> Option<ConfigurationViolation> {
+        first_out_of_range([(
+            "logs.capture",
+            self.capture.len() as u64,
+            0,
+            LOGS_CAPTURE_BYTES_MAX as u64,
+        )])
+    }
+}
+
 /// The `[providers]` table: the built-in providers run without
 /// configuration, and this table bounds or disables them.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -660,7 +742,7 @@ impl ExecutionConfiguration {
 /// The `[search]` table. Search fuses a lexical ranking with a semantic one:
 /// `lexical` and `semantic` weigh the two against each other, `fusion_k` sets
 /// how sharply a top rank counts, `pool_slots` and `busy_timeout` bound the
-/// `SQLite` connections behind the lexical tier, and `text` includes
+/// shared `SQLite` connections behind search and logs, and `text` includes
 /// non-source text files in the lexical index.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -681,13 +763,13 @@ pub struct SearchConfiguration {
     #[schemars(range(min = 1, max = 1000))]
     #[serde(default = "default_search_fusion_k")]
     pub fusion_k: u64,
-    /// Pooled `SQLite` connections the lexical search index may open at
-    /// once, 1 to 16.
+    /// Pooled `SQLite` connections the workspace database may open at once,
+    /// 1 to 16. Search reads and stored logs share this pool.
     #[schemars(range(min = 1, max = 16))]
     #[serde(default = "default_search_pool_slots")]
     pub pool_slots: u64,
-    /// Wall-clock budget one lexical search connection waits for `SQLite`'s
-    /// busy lock before `SQLITE_BUSY`, 100ms to 30s.
+    /// Wall-clock budget one connection waits for a database lock held by
+    /// another process before `SQLITE_BUSY`, 100ms to 30s.
     #[serde(default = "default_search_busy_timeout")]
     pub busy_timeout: Duration,
 }
@@ -749,7 +831,7 @@ pub const SEARCH_BUSY_TIMEOUT_MS_MIN: u64 = 100;
 /// Milliseconds `search.busy_timeout` may hold, at most: thirty seconds.
 pub const SEARCH_BUSY_TIMEOUT_MS_MAX: u64 = 30_000;
 /// Milliseconds `search.busy_timeout` holds when the key is absent.
-const SEARCH_BUSY_TIMEOUT_MS_DEFAULT: u64 = 1_000;
+const SEARCH_BUSY_TIMEOUT_MS_DEFAULT: u64 = 5_000;
 
 /// `search.fusion_k` accepted, at least.
 pub const SEARCH_FUSION_K_MIN: u64 = 1;
@@ -1588,6 +1670,13 @@ pub enum ConfigurationViolation {
         /// The rejected pattern.
         pattern: String,
     },
+    /// A `logs.capture` value is not a tracing filter directive.
+    LogCaptureInvalid {
+        /// The rejected filter.
+        capture: String,
+        /// The filter parser's account of the failure.
+        detail: String,
+    },
     /// `server.port` and `server.port_range` are both set, so the file
     /// selects the port twice.
     PortSelectionConflict,
@@ -1672,6 +1761,11 @@ impl ConfigurationViolation {
             Self::PathPatternInvalid { field, pattern } => {
                 vec![("field", (*field).to_owned()), ("pattern", pattern.clone())]
             }
+            Self::LogCaptureInvalid { capture, detail } => vec![
+                ("field", "logs.capture".to_owned()),
+                ("capture", capture.clone()),
+                ("detail", detail.clone()),
+            ],
             Self::PortSelectionConflict => {
                 vec![("fields", "server.port, server.port_range".to_owned())]
             }
@@ -2328,7 +2422,7 @@ mod tests {
         assert_eq!(configuration.search.fusion_k, 60);
         assert_eq!(
             configuration.search.busy_timeout,
-            Duration::from_millis(1_000)
+            Duration::from_millis(SEARCH_BUSY_TIMEOUT_MS_DEFAULT)
         );
         assert!(configuration.source.include.is_empty());
         assert!(configuration.source.exclude.is_empty());
@@ -3535,6 +3629,17 @@ mod tests {
                 vec![("extension", "md".to_owned())],
             ),
             (
+                ConfigurationViolation::LogCaptureInvalid {
+                    capture: "[".to_owned(),
+                    detail: "invalid filter".to_owned(),
+                },
+                vec![
+                    ("field", "logs.capture".to_owned()),
+                    ("capture", "[".to_owned()),
+                    ("detail", "invalid filter".to_owned()),
+                ],
+            ),
+            (
                 ConfigurationViolation::EngineNameInvalid {
                     name: "Ty".to_owned(),
                 },
@@ -4412,7 +4517,7 @@ mod tests {
             (
                 "busy timeout default",
                 &search["busy_timeout"]["default"],
-                json!("1s"),
+                json!(Duration::from_millis(SEARCH_BUSY_TIMEOUT_MS_DEFAULT)),
             ),
             (
                 "source include max",

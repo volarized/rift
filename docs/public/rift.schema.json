@@ -470,6 +470,35 @@
       },
       "type": "object"
     },
+    "LogsConfiguration": {
+      "additionalProperties": false,
+      "description": "The `[logs]` table. The server records its own diagnostics in the workspace\ndatabase, where `rift://logs` reads them back, and this table bounds how\nmany records the store keeps, how many one read returns, and which targets\nare captured at all. The server reads the table at startup, so a change\napplies on the next start.",
+      "properties": {
+        "capture": {
+          "default": "rift=info,rift_mcp=info,rift_server=info",
+          "description": "Which targets are recorded, in the `RUST_LOG` spelling `tracing` takes:\ncomma-separated `target=level` pairs. A target this filter excludes\nnever reaches the store, whatever the stderr diagnostics carry.",
+          "maxLength": 512,
+          "type": "string"
+        },
+        "page_records": {
+          "default": 500,
+          "description": "Records one `rift://logs` read returns at most, 1 to 5000.",
+          "format": "uint64",
+          "maximum": 5000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "retention_records": {
+          "default": 50000,
+          "description": "Records the store keeps before the oldest are dropped, 100 to 1000000.",
+          "format": "uint64",
+          "maximum": 1000000,
+          "minimum": 100,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "PathPattern": {
       "description": "Project-relative glob using *, ?, **, and character classes. Forward-slash separated on\nevery platform, whatever separator the host OS uses natively.",
       "examples": [
@@ -586,12 +615,12 @@
     },
     "SearchConfiguration": {
       "additionalProperties": false,
-      "description": "The `[search]` table. Search fuses a lexical ranking with a semantic one:\n`lexical` and `semantic` weigh the two against each other, `fusion_k` sets\nhow sharply a top rank counts, `pool_slots` and `busy_timeout` bound the\n`SQLite` connections behind the lexical tier, and `text` includes\nnon-source text files in the lexical index.",
+      "description": "The `[search]` table. Search fuses a lexical ranking with a semantic one:\n`lexical` and `semantic` weigh the two against each other, `fusion_k` sets\nhow sharply a top rank counts, `pool_slots` and `busy_timeout` bound the\nshared `SQLite` connections behind search and logs, and `text` includes\nnon-source text files in the lexical index.",
       "properties": {
         "busy_timeout": {
           "$ref": "#/$defs/Duration",
-          "default": "1s",
-          "description": "Wall-clock budget one lexical search connection waits for `SQLite`'s\nbusy lock before `SQLITE_BUSY`, 100ms to 30s.",
+          "default": "5s",
+          "description": "Wall-clock budget one connection waits for a database lock held by\nanother process before `SQLITE_BUSY`, 100ms to 30s.",
           "rift:range": {
             "max": "30s",
             "min": "100ms"
@@ -614,7 +643,7 @@
         },
         "pool_slots": {
           "default": 4,
-          "description": "Pooled `SQLite` connections the lexical search index may open at\nonce, 1 to 16.",
+          "description": "Pooled `SQLite` connections the workspace database may open at once,\n1 to 16. Search reads and stored logs share this pool.",
           "format": "uint64",
           "maximum": 16,
           "minimum": 1,
@@ -924,6 +953,15 @@
       "maxItems": 32,
       "type": "array"
     },
+    "logs": {
+      "$ref": "#/$defs/LogsConfiguration",
+      "default": {
+        "capture": "rift=info,rift_mcp=info,rift_server=info",
+        "page_records": 500,
+        "retention_records": 50000
+      },
+      "description": "The server's own log records: how many the workspace database keeps,\nhow many one read returns, and which targets are captured."
+    },
     "providers": {
       "$ref": "#/$defs/ProvidersConfiguration",
       "default": {
@@ -937,7 +975,7 @@
     "search": {
       "$ref": "#/$defs/SearchConfiguration",
       "default": {
-        "busy_timeout": "1s",
+        "busy_timeout": "5s",
         "fusion_k": 60,
         "lexical": {
           "weight": 0.7

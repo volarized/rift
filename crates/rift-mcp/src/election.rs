@@ -18,7 +18,10 @@ use rift_core::{CliCode, Error, ErrorCode, ErrorContext, ErrorName, Fault};
 use rift_protocol::lock::{SERVER_LOCK_FILE_NAME, ServerLock, ServerLockViolation};
 use tokio_util::sync::CancellationToken;
 
-use crate::http::{HttpServeError, HttpServer, serve_http};
+#[cfg(test)]
+use crate::http::serve_http;
+use crate::http::{HttpServeError, HttpServer, serve_http_with_storage};
+use crate::storage::WorkspaceStorage;
 
 /// The zero-byte election file's name under the `.rift` state directory.
 ///
@@ -392,9 +395,27 @@ pub async fn serve_elected(
     root: &Path,
     shutdown: CancellationToken,
 ) -> Result<ElectedServer, ElectionError> {
+    let storage = WorkspaceStorage::open(root).await;
+    serve_elected_with_storage(root, shutdown, storage).await
+}
+
+/// Serves the workspace through storage already opened by this process.
+///
+/// # Errors
+///
+/// Returns the same failures as [`serve_elected`].
+///
+/// # Cancel safety
+///
+/// Dropping this future follows [`serve_elected`]'s cancellation behavior.
+pub async fn serve_elected_with_storage(
+    root: &Path,
+    shutdown: CancellationToken,
+    storage: WorkspaceStorage,
+) -> Result<ElectedServer, ElectionError> {
     let guard = claim(root)?;
     let serving_stop = shutdown.child_token();
-    let server = serve_http(root, serving_stop.clone())
+    let server = serve_http_with_storage(root, serving_stop.clone(), storage)
         .await
         .map_err(ElectionFault::serve)?;
     let document = served_document(server.port(), server.token());
