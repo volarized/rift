@@ -1304,8 +1304,7 @@ impl RiftMcp {
     ) -> Result<Arc<PublishedWorkspace>, ErrorData> {
         let timeout = self.readiness_timeout().await;
         let deadline = tokio::time::Instant::now() + timeout;
-        let Ok(result) =
-            tokio::time::timeout_at(deadline, self.reconcile_workspace(phase)).await
+        let Ok(result) = tokio::time::timeout_at(deadline, self.reconcile_workspace(phase)).await
         else {
             let detail = self.readiness_stall(timeout).await;
             tracing::warn!(
