@@ -628,7 +628,7 @@ impl ReadService {
                 None => None,
             };
             hits.push(GetSymbolHit {
-                symbol: wire_symbol(matched),
+                symbol: wire_symbol(&self.index, matched),
                 span: source_span(matched.file.path(), matched.symbol.range),
                 node: params.include_body.then(|| symbol_node(matched)),
                 source: params
@@ -750,7 +750,52 @@ fn symbol_node(matched: SymbolMatch<'_>) -> Node {
     )
 }
 
-pub(crate) fn wire_symbol(matched: SymbolMatch<'_>) -> Symbol {
+pub(crate) fn wire_symbol(index: &WorkspaceIndex, matched: SymbolMatch<'_>) -> Symbol {
+    index
+        .assembled_symbol(matched)
+        .and_then(|assembled| assembled_wire_symbol(matched, &assembled))
+        .unwrap_or_else(|| syntax_wire_symbol(matched))
+}
+
+fn assembled_wire_symbol(
+    matched: SymbolMatch<'_>,
+    assembled: &rift_provider::AssembledSymbol,
+) -> Option<Symbol> {
+    let facts = assembled.facts();
+    let identity = assembled.identity()?;
+    let mut extension_values = BTreeMap::new();
+    for (_, extensions) in assembled.namespaced() {
+        for (key, value) in &extensions.0 {
+            extension_values
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+    }
+    Some(Symbol {
+        id: SymbolId(identity.as_str().to_owned()),
+        language: facts.language().clone(),
+        name: facts.name().to_owned(),
+        kind: facts.kind().clone(),
+        facets: facts.symbol_facets().to_vec(),
+        origin: SymbolOrigin {
+            location: assembled.origin().location().cloned(),
+            source_kind: assembled.origin().source_kind(),
+            unit: Some(source_unit_id(matched.file.path())),
+        },
+        container: assembled
+            .container()
+            .map(|container| SymbolId(container.as_str().to_owned())),
+        modifiers: facts.modifier_words().to_vec(),
+        visibility: facts.visibility_spelling().map(str::to_owned),
+        types: facts.type_bindings().to_vec(),
+        signatures: facts.signatures_slice().to_vec(),
+        documentation: facts.documentation_blocks().to_vec(),
+        extensions: Extensions(extension_values),
+        document_local: facts.is_document_local(),
+    })
+}
+
+fn syntax_wire_symbol(matched: SymbolMatch<'_>) -> Symbol {
     let symbol = matched.symbol;
     let language = matched.file.syntax().language();
     Symbol {
