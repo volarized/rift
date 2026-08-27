@@ -10,16 +10,16 @@ use rift_core::{
 };
 use rift_history::{HistoryError, Repository};
 use rift_index::{
-    FileDigest, IndexedFile, PathChanges, SymbolMatch, WorkspaceDigests, WorkspaceFingerprint,
-    WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits, WorkspaceIndexWarning,
-    WorkspaceSourcePolicy,
+    FileDigest, IndexedFile, PathChanges, ReadableSymbol, SymbolMatch, WorkspaceDigests,
+    WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits,
+    WorkspaceIndexWarning, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::HistoryConfiguration;
 use rift_protocol::read::{
     Digest, ExactKind, Extensions, FileId, GetSymbolHit, GetSymbolParams, GetSymbolResult,
     Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, Pagination, ProjectPath,
-    ReadWarning, RevisionId, SourceExcerpt, SourceKind, SourceLocation, SourceUnitId,
-    SourceUnitSpan, Symbol, SymbolId, SymbolOrigin, TextRange,
+    ReadWarning, RevisionId, SourceExcerpt, SourceUnitId, SourceUnitSpan, Symbol, SymbolId,
+    SymbolOrigin, TextRange,
 };
 use rift_syntax::{ByteRange, SyntaxNode, SyntaxProvider, SyntaxSymbol, registry};
 use sha2::{Digest as _, Sha256};
@@ -628,7 +628,7 @@ impl ReadService {
                 None => None,
             };
             hits.push(GetSymbolHit {
-                symbol: wire_symbol(&self.index, matched),
+                symbol: wire_symbol(&self.index, matched)?,
                 span: source_span(matched.file.path(), matched.symbol.range),
                 node: params.include_body.then(|| symbol_node(matched)),
                 source: params
@@ -750,19 +750,18 @@ fn symbol_node(matched: SymbolMatch<'_>) -> Node {
     )
 }
 
-pub(crate) fn wire_symbol(index: &WorkspaceIndex, matched: SymbolMatch<'_>) -> Symbol {
-    index
-        .assembled_symbol(matched)
-        .and_then(|assembled| assembled_wire_symbol(matched, &assembled))
-        .unwrap_or_else(|| syntax_wire_symbol(matched))
+pub(crate) fn wire_symbol(
+    index: &WorkspaceIndex,
+    matched: SymbolMatch<'_>,
+) -> Result<Symbol, ReadError> {
+    let readable = index.assembled_symbol(matched).map_err(ReadFault::index)?;
+    Ok(assembled_wire_symbol(matched, &readable))
 }
 
-fn assembled_wire_symbol(
-    matched: SymbolMatch<'_>,
-    assembled: &rift_provider::AssembledSymbol,
-) -> Option<Symbol> {
-    let facts = assembled.facts()?;
-    let identity = assembled.identity()?;
+fn assembled_wire_symbol(matched: SymbolMatch<'_>, readable: &ReadableSymbol) -> Symbol {
+    let assembled = readable.assembled();
+    let facts = readable.facts();
+    let identity = readable.identity();
     let mut extension_values = BTreeMap::new();
     for (_, extensions) in assembled.namespaced() {
         for (key, value) in &extensions.0 {
@@ -771,7 +770,7 @@ fn assembled_wire_symbol(
                 .or_insert_with(|| value.clone());
         }
     }
-    Some(Symbol {
+    Symbol {
         id: SymbolId(identity.as_str().to_owned()),
         language: facts.language().clone(),
         name: facts.name().to_owned(),
@@ -792,37 +791,6 @@ fn assembled_wire_symbol(
         documentation: facts.documentation_blocks().to_vec(),
         extensions: Extensions(extension_values),
         document_local: facts.is_document_local(),
-    })
-}
-
-fn syntax_wire_symbol(matched: SymbolMatch<'_>) -> Symbol {
-    let symbol = matched.symbol;
-    let language = matched.file.syntax().language();
-    Symbol {
-        id: symbol_id(matched.file, symbol),
-        language: language.clone(),
-        name: symbol.name.clone(),
-        kind: wire_kind(language, symbol.kind),
-        facets: symbol.facets.clone(),
-        origin: SymbolOrigin {
-            location: Some(SourceLocation::Project { package: None }),
-            source_kind: SourceKind::Authored,
-            unit: Some(source_unit_id(matched.file.path())),
-        },
-        container: symbol.container.as_ref().map(|container| {
-            SymbolId(rift_core::symbol_identity(
-                &language.identity_segment(),
-                matched.file.path().as_str(),
-                container,
-            ))
-        }),
-        modifiers: Vec::new(),
-        visibility: symbol.visibility.clone(),
-        types: Vec::new(),
-        signatures: symbol.signatures.clone(),
-        documentation: symbol.documentation.clone(),
-        extensions: Extensions(BTreeMap::new()),
-        document_local: false,
     }
 }
 

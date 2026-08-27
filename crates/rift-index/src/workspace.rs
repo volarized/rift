@@ -15,7 +15,8 @@ use rift_core::constants::{
 };
 use rift_core::{
     CompositionId, EXTENSIONLESS_SNIFF_BYTES_MAX, Error, ErrorCode, ErrorContext, ErrorName, Fault,
-    ProjectPath, ProviderId, SourceVisibility, TextFileInclusion, fault_label, symbol_identity,
+    PortableSymbolFacts, ProjectPath, ProviderId, SourceVisibility, SymbolId, TextFileInclusion,
+    fault_label, symbol_identity,
 };
 use rift_provider::{
     AssembledSymbol, Component, CompositionBuilder, NormalizedGraph, ProviderComposition,
@@ -369,6 +370,61 @@ pub struct SymbolMatch<'a> {
     /// Stable semantic match priority.
     pub rank: SymbolMatchRank,
 }
+
+/// Normalized symbol fields required by read results.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReadableSymbol {
+    assembled: AssembledSymbol,
+    identity: SymbolId,
+    facts: PortableSymbolFacts,
+}
+
+impl ReadableSymbol {
+    fn new(assembled: AssembledSymbol) -> Option<Self> {
+        let identity = assembled.identity()?.clone();
+        let facts = assembled.facts()?.clone();
+        Some(Self {
+            assembled,
+            identity,
+            facts,
+        })
+    }
+
+    /// Returns complete normalized assembly.
+    #[must_use]
+    pub const fn assembled(&self) -> &AssembledSymbol {
+        &self.assembled
+    }
+
+    /// Returns normalized symbol identity.
+    #[must_use]
+    pub const fn identity(&self) -> &SymbolId {
+        &self.identity
+    }
+
+    /// Returns selected and combined portable facts.
+    #[must_use]
+    pub const fn facts(&self) -> &PortableSymbolFacts {
+        &self.facts
+    }
+}
+
+#[derive(Debug)]
+struct ReadableSymbolMissing {
+    identity: String,
+}
+
+impl std::fmt::Display for ReadableSymbolMissing {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "normalized Contribution graph has no readable symbol for {}",
+            self.identity
+        )
+    }
+}
+
+impl std::error::Error for ReadableSymbolMissing {}
 
 /// Stable semantic priority for symbol-name matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1001,14 +1057,24 @@ impl WorkspaceIndex {
     }
 
     /// Assembles readable symbol through its normalized record.
-    #[must_use]
-    pub fn assembled_symbol(&self, matched: SymbolMatch<'_>) -> Option<AssembledSymbol> {
+    ///
+    /// # Errors
+    ///
+    /// Returns `WorkspaceIndexError` when normalized Contributions do not
+    /// supply required identity and portable facts.
+    pub fn assembled_symbol(
+        &self,
+        matched: SymbolMatch<'_>,
+    ) -> Result<ReadableSymbol, WorkspaceIndexError> {
         let identity = symbol_identity(
             &matched.file.syntax().language().identity_segment(),
             matched.file.path().as_str(),
             &matched.symbol.qualified_name,
         );
-        self.semantics.assembled(&identity)
+        self.semantics
+            .assembled(&identity)
+            .and_then(ReadableSymbol::new)
+            .ok_or_else(|| provider_error(ReadableSymbolMissing { identity }))
     }
 
     /// Conditions this build or rebuild encountered but did not treat as fatal, in
@@ -1168,6 +1234,31 @@ impl WorkspaceIndex {
             )?);
         }
         Ok(files)
+    }
+
+    /// Builds one request index over source files selected by `force_include`.
+    ///
+    /// This index publishes selected syntax through same Contribution pipeline
+    /// as workspace index, while keeping selected files outside persistent index.
+    ///
+    /// # Errors
+    ///
+    /// Returns `WorkspaceIndexError` when selection, parsing, publication, or
+    /// normalization fails.
+    pub fn force_include_index(
+        &self,
+        force_include: &[String],
+        files_max: usize,
+    ) -> Result<Self, WorkspaceIndexError> {
+        let files = self.force_include_files(force_include, files_max)?;
+        Self::from_parts(
+            self.root.clone(),
+            files,
+            Vec::new(),
+            self.composition.clone(),
+            self.limits,
+            self.text_inclusion.clone(),
+        )
     }
 
     fn validate_result_limit(&self, limit: usize) -> Result<(), WorkspaceIndexError> {
@@ -3152,6 +3243,63 @@ mod tests {
         let missing = ProjectPath::new("src/missing.rs").expect("missing path");
         assert!(index.file(&missing).is_none());
         assert!(index.nodes(&missing, 0).is_none());
+    }
+
+    #[test]
+    fn assembled_symbol_requires_normalized_record_and_portable_facts() {
+        let directory = fixture();
+        let index = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+        )
+        .expect("workspace index");
+        let matched = index
+            .symbols("update", 1)
+            .expect("symbol query")
+            .into_iter()
+            .next()
+            .expect("update symbol");
+        let readable = index
+            .assembled_symbol(matched)
+            .expect("normalized readable symbol");
+        assert_eq!(
+            readable.identity().as_str(),
+            "rift://symbol/rust/src/lib.rs/Rift::update"
+        );
+        assert_eq!(readable.facts().name(), "update");
+        assert!(!readable.assembled().contributions().is_empty());
+
+        let other_directory = tempfile::tempdir().expect("other workspace");
+        fs::write(
+            other_directory.path().join("other.rs"),
+            "pub fn foreign() {}\n",
+        )
+        .expect("other source");
+        let other = WorkspaceIndex::build(
+            other_directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+        )
+        .expect("other index");
+        let foreign = other
+            .symbols("foreign", 1)
+            .expect("foreign query")
+            .into_iter()
+            .next()
+            .expect("foreign symbol");
+        let error = index
+            .assembled_symbol(foreign)
+            .expect_err("foreign normalized record must be absent");
+        assert_eq!(error.fault().violation(), WorkspaceIndexViolation::Provider);
+        let source =
+            std::error::Error::source(&error).expect("provider failure must retain missing record");
+        assert!(
+            source.to_string().contains("foreign"),
+            "missing record must name identity: {source}"
+        );
     }
 
     #[test]
