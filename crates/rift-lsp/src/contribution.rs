@@ -537,6 +537,7 @@ mod tests {
         assert_eq!(
             output.publication().contributions()[1]
                 .facts()
+                .expect("portable facts")
                 .container_reference()
                 .expect("parent")
                 .symbol()
@@ -617,7 +618,13 @@ mod tests {
             .convert(&response, &BTreeMap::new())
             .expect("flat answer");
         let contribution = &output.publication().contributions()[0];
-        assert_eq!(contribution.facts().qualified_name(), "Beacon.new");
+        assert_eq!(
+            contribution
+                .facts()
+                .expect("portable facts")
+                .qualified_name(),
+            "Beacon.new"
+        );
         assert_eq!(
             contribution
                 .namespaced()

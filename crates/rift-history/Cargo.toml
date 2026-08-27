@@ -14,6 +14,7 @@ workspace = true
 gix.workspace = true
 rift-core.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 
 [features]
 # Deterministic git fixtures for dependent crates' tests; never a production feature.

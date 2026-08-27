@@ -56,7 +56,7 @@ pub struct AssembledSymbol {
     identity: Option<SymbolId>,
     resolution: SymbolResolution,
     contributions: Vec<ContributionKey>,
-    facts: PortableSymbolFacts,
+    facts: Option<PortableSymbolFacts>,
     origin: ContributionOrigin,
     container: Option<SymbolId>,
     references: Vec<crate::NormalizedReference>,
@@ -90,10 +90,10 @@ impl AssembledSymbol {
         &self.contributions
     }
 
-    /// Returns selected and combined portable facts.
+    /// Returns selected and combined portable facts when supplied.
     #[must_use]
-    pub const fn facts(&self) -> &PortableSymbolFacts {
-        &self.facts
+    pub const fn facts(&self) -> Option<&PortableSymbolFacts> {
+        self.facts.as_ref()
     }
 
     /// Returns selected origin.
@@ -164,26 +164,34 @@ impl SymbolAssembler {
                 .then_with(|| left_key.cmp(right_key))
         });
         let primary = contributions.first()?.1;
+        let primary_facts = contributions
+            .iter()
+            .find_map(|(_, contribution)| contribution.facts());
         let selected_visibility = contributions
             .iter()
-            .find_map(|(_, contribution)| contribution.facts().visibility_spelling());
+            .find_map(|(_, contribution)| contribution.facts()?.visibility_spelling());
         let selected_container = contributions
             .iter()
-            .find_map(|(_, contribution)| contribution.facts().container_reference());
-        let facts = combined_facts(
-            &contributions,
-            primary,
-            selected_visibility,
-            selected_container,
-        );
+            .find_map(|(_, contribution)| contribution.facts()?.container_reference());
+        let facts = primary_facts.map(|facts| {
+            combined_facts(
+                &contributions,
+                facts,
+                selected_visibility,
+                selected_container,
+            )
+        });
         let container =
             selected_container.and_then(|reference| graph.identity_for(reference).cloned());
-        let disagreements = presentation_disagreements(
-            &contributions,
-            primary,
-            selected_visibility,
-            selected_container,
-        );
+        let disagreements = primary_facts.map_or_else(Vec::new, |facts| {
+            presentation_disagreements(
+                &contributions,
+                primary,
+                facts,
+                selected_visibility,
+                selected_container,
+            )
+        });
         let namespaced = contributions
             .iter()
             .map(|(key, contribution)| {
@@ -234,16 +242,15 @@ fn provider_rank(key: &ContributionKey, precedence: &[ProviderId]) -> (usize, Pr
 
 fn combined_facts(
     contributions: &[(ContributionKey, &Contribution)],
-    primary: &Contribution,
+    primary: &PortableSymbolFacts,
     visibility: Option<&str>,
     container: Option<&rift_core::ContributionReference>,
 ) -> PortableSymbolFacts {
-    let primary_facts = primary.facts();
     let mut facts = PortableSymbolFacts::new(
-        primary_facts.language().clone(),
-        primary_facts.name(),
-        primary_facts.qualified_name(),
-        primary_facts.kind().clone(),
+        primary.language().clone(),
+        primary.name(),
+        primary.qualified_name(),
+        primary.kind().clone(),
     )
     .facets(unique_values(contributions, |facts| facts.symbol_facets()))
     .modifiers(unique_values(contributions, |facts| facts.modifier_words()))
@@ -254,7 +261,7 @@ fn combined_facts(
     .documentation(unique_values(contributions, |facts| {
         facts.documentation_blocks()
     }))
-    .document_local(primary_facts.is_document_local());
+    .document_local(primary.is_document_local());
     if let Some(visibility) = visibility {
         facts = facts.visibility(visibility);
     }
@@ -270,7 +277,10 @@ fn unique_values<T: Clone + PartialEq>(
 ) -> Vec<T> {
     let mut combined = Vec::new();
     for (_, contribution) in contributions {
-        for value in values(contribution.facts()) {
+        let Some(facts) = contribution.facts() else {
+            continue;
+        };
+        for value in values(facts) {
             if !combined.contains(value) {
                 combined.push(value.clone());
             }
@@ -282,55 +292,56 @@ fn unique_values<T: Clone + PartialEq>(
 fn presentation_disagreements(
     contributions: &[(ContributionKey, &Contribution)],
     primary: &Contribution,
+    selected: &PortableSymbolFacts,
     visibility: Option<&str>,
     container: Option<&rift_core::ContributionReference>,
 ) -> Vec<PresentationDisagreement> {
-    let selected = primary.facts();
     let mut disagreements = BTreeSet::new();
-    for (key, contribution) in contributions.iter().skip(1) {
-        let facts = contribution.facts();
-        retain_difference(
-            &mut disagreements,
-            key,
-            PresentationField::Language,
-            facts.language() != selected.language(),
-        );
-        retain_difference(
-            &mut disagreements,
-            key,
-            PresentationField::Name,
-            facts.name() != selected.name(),
-        );
-        retain_difference(
-            &mut disagreements,
-            key,
-            PresentationField::QualifiedName,
-            facts.qualified_name() != selected.qualified_name(),
-        );
-        retain_difference(
-            &mut disagreements,
-            key,
-            PresentationField::Kind,
-            facts.kind() != selected.kind(),
-        );
-        retain_difference(
-            &mut disagreements,
-            key,
-            PresentationField::Container,
-            facts.container_reference() != container,
-        );
-        retain_difference(
-            &mut disagreements,
-            key,
-            PresentationField::Visibility,
-            facts.visibility_spelling() != visibility,
-        );
-        retain_difference(
-            &mut disagreements,
-            key,
-            PresentationField::DocumentLocal,
-            facts.is_document_local() != selected.is_document_local(),
-        );
+    for (key, contribution) in contributions {
+        if let Some(facts) = contribution.facts() {
+            retain_difference(
+                &mut disagreements,
+                key,
+                PresentationField::Language,
+                facts.language() != selected.language(),
+            );
+            retain_difference(
+                &mut disagreements,
+                key,
+                PresentationField::Name,
+                facts.name() != selected.name(),
+            );
+            retain_difference(
+                &mut disagreements,
+                key,
+                PresentationField::QualifiedName,
+                facts.qualified_name() != selected.qualified_name(),
+            );
+            retain_difference(
+                &mut disagreements,
+                key,
+                PresentationField::Kind,
+                facts.kind() != selected.kind(),
+            );
+            retain_difference(
+                &mut disagreements,
+                key,
+                PresentationField::Container,
+                facts.container_reference() != container,
+            );
+            retain_difference(
+                &mut disagreements,
+                key,
+                PresentationField::Visibility,
+                facts.visibility_spelling() != visibility,
+            );
+            retain_difference(
+                &mut disagreements,
+                key,
+                PresentationField::DocumentLocal,
+                facts.is_document_local() != selected.is_document_local(),
+            );
+        }
         retain_difference(
             &mut disagreements,
             key,
@@ -462,7 +473,7 @@ mod tests {
         let lsp = Contribution::builder(
             lsp.key().clone(),
             lsp.applicability(),
-            lsp.facts().clone(),
+            lsp.facts().expect("portable facts").clone(),
             lsp.origin().clone(),
         )
         .equivalence(vec![rift_core::EquivalenceEvidence::Explicit(reference(
@@ -515,8 +526,15 @@ mod tests {
             lsp_first.identity().map(SymbolId::as_str),
             Some("symbol:beacon")
         );
-        assert_eq!(lsp_first.facts().name(), "beacon");
-        assert_eq!(lsp_first.facts().documentation_blocks().len(), 2);
+        assert_eq!(lsp_first.facts().expect("portable facts").name(), "beacon");
+        assert_eq!(
+            lsp_first
+                .facts()
+                .expect("portable facts")
+                .documentation_blocks()
+                .len(),
+            2
+        );
         assert!(lsp_first.container().is_none());
         assert!(
             lsp_first
@@ -528,7 +546,10 @@ mod tests {
 
         let syntax_first = SymbolAssembler::assemble(&graph, record, &[provider("syntax")])
             .expect("assembled symbol");
-        assert_eq!(syntax_first.facts().name(), "Beacon");
+        assert_eq!(
+            syntax_first.facts().expect("portable facts").name(),
+            "Beacon"
+        );
         assert_eq!(syntax_first.identity(), lsp_first.identity());
         assert_eq!(syntax_first.index_revision(), graph.index_revision());
         assert_eq!(syntax_first.resolution(), record.resolution());
@@ -542,6 +563,55 @@ mod tests {
                 .expect("contribution")
                 .origin()
         );
+    }
+
+    #[test]
+    fn assembly_retains_namespaced_fact_without_portable_fields() {
+        let namespaced = Extensions(BTreeMap::from([(
+            rift_core::ExtensionKey("org.rift.history".to_owned()),
+            rift_core::ExtensionValue {
+                version: 1,
+                data: serde_json::json!({"commit": "abc123"}),
+            },
+        )]));
+        let fact = Contribution::fact_builder(
+            ContributionKey::new(
+                provider("git"),
+                ProviderRevision::new(1).expect("revision"),
+                ProviderSymbolId::new("abc123").expect("provider symbol"),
+            ),
+            SourceApplicability::Independent,
+            ContributionOrigin::new(None, SourceKind::Synthetic).expect("origin"),
+        )
+        .namespaced(namespaced.clone())
+        .build()
+        .expect("namespaced fact");
+        let limits = PublicationLimits::default();
+        let publication = ProviderPublication::new(
+            provider("git"),
+            ProviderRevision::new(1).expect("revision"),
+            vec![fact],
+            limits,
+        )
+        .expect("publication");
+        let set = Arc::new(
+            PublicationSet::empty(limits)
+                .replaced(publication)
+                .expect("publication set"),
+        );
+        let graph = Normalizer::normalize(
+            IndexRevision::new(1).expect("index"),
+            SourceRevision::new(1).expect("source"),
+            TreeRevision::new(1).expect("tree"),
+            &set,
+            None,
+        )
+        .expect("graph");
+        let assembled =
+            SymbolAssembler::assemble(&graph, &graph.records()[0], &[]).expect("assembled fact");
+
+        assert!(assembled.facts().is_none());
+        assert_eq!(assembled.namespaced(), &[(provider("git"), namespaced)]);
     }
 
     #[test]

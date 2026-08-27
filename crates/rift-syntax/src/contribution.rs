@@ -242,12 +242,20 @@ mod tests {
         let beacon = publication
             .contributions()
             .iter()
-            .find(|contribution| contribution.facts().name() == "Beacon")
+            .find(|contribution| {
+                contribution
+                    .facts()
+                    .is_some_and(|facts| facts.name() == "Beacon")
+            })
             .expect("Beacon");
         let run = publication
             .contributions()
             .iter()
-            .find(|contribution| contribution.facts().name() == "run")
+            .find(|contribution| {
+                contribution
+                    .facts()
+                    .is_some_and(|facts| facts.name() == "run")
+            })
             .expect("run");
         assert_eq!(
             beacon.identity_anchor().map(SymbolId::as_str),
@@ -255,11 +263,15 @@ mod tests {
         );
         assert_eq!(
             run.facts()
+                .expect("portable facts")
                 .container_reference()
                 .map(|reference| reference.symbol().as_str()),
             Some("rift://symbol/rust/src/lib.rs/Beacon")
         );
-        assert_eq!(run.facts().visibility_spelling(), Some("pub"));
+        assert_eq!(
+            run.facts().expect("portable facts").visibility_spelling(),
+            Some("pub")
+        );
     }
 
     #[test]
