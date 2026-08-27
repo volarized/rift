@@ -848,13 +848,17 @@ mod tests {
         let main = publication
             .contributions()
             .iter()
-            .find(|contribution| contribution.facts().name() == "main")
+            .find(|contribution| {
+                contribution
+                    .facts()
+                    .is_some_and(|facts| facts.name() == "main")
+            })
             .expect("main");
         assert!(main.identity_anchor().is_none());
         assert_eq!(main.references().len(), 2);
         assert_eq!(main.relationships().len(), 2);
         assert_eq!(
-            main.facts().documentation_blocks()[0].format,
+            main.facts().expect("portable facts").documentation_blocks()[0].format,
             DocumentationFormat::Markdown
         );
         let data = &main

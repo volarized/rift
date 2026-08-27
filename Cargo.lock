@@ -3435,6 +3435,7 @@ dependencies = [
  "gix",
  "rift-core",
  "serde",
+ "serde_json",
  "tempfile",
 ]
 

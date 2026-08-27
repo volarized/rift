@@ -409,8 +409,8 @@ fn contribution_anchors(
             SourceApplicability::Exact { .. }
         )
         && let Some(source) = contribution.source()
+        && let Some(facts) = contribution.facts()
     {
-        let facts = contribution.facts();
         let identity = symbol_identity(
             &facts.language().identity_segment(),
             source.unit().key().as_str(),
@@ -1211,7 +1211,7 @@ mod tests {
         let semantic = Contribution::builder(
             semantic_base.key().clone(),
             semantic_base.applicability(),
-            semantic_base.facts().clone(),
+            semantic_base.facts().expect("portable facts").clone(),
             semantic_base.origin().clone(),
         )
         .source(semantic_base.source().expect("source").clone())

@@ -535,7 +535,7 @@ impl ContributionRelationship {
 pub struct Contribution {
     key: ContributionKey,
     applicability: SourceApplicability,
-    facts: PortableSymbolFacts,
+    facts: Option<PortableSymbolFacts>,
     origin: ContributionOrigin,
     source: Option<DeclarationBinding>,
     identity_anchor: Option<SymbolId>,
@@ -546,7 +546,7 @@ pub struct Contribution {
 }
 
 impl Contribution {
-    /// Starts one Contribution builder.
+    /// Starts one Contribution builder with portable facts.
     #[must_use]
     pub fn builder(
         key: ContributionKey,
@@ -558,7 +558,30 @@ impl Contribution {
             contribution: Self {
                 key,
                 applicability,
-                facts,
+                facts: Some(facts),
+                origin,
+                source: None,
+                identity_anchor: None,
+                equivalence: Vec::new(),
+                references: Vec::new(),
+                relationships: Vec::new(),
+                namespaced: Extensions(std::collections::BTreeMap::new()),
+            },
+        }
+    }
+
+    /// Starts one Contribution builder without portable facts.
+    #[must_use]
+    pub fn fact_builder(
+        key: ContributionKey,
+        applicability: SourceApplicability,
+        origin: ContributionOrigin,
+    ) -> ContributionBuilder {
+        ContributionBuilder {
+            contribution: Self {
+                key,
+                applicability,
+                facts: None,
                 origin,
                 source: None,
                 identity_anchor: None,
@@ -582,10 +605,10 @@ impl Contribution {
         self.applicability
     }
 
-    /// Returns portable facts.
+    /// Returns portable facts when supplied.
     #[must_use]
-    pub const fn facts(&self) -> &PortableSymbolFacts {
-        &self.facts
+    pub const fn facts(&self) -> Option<&PortableSymbolFacts> {
+        self.facts.as_ref()
     }
 
     /// Returns fact origin.
@@ -847,7 +870,9 @@ fn contribution_error(violation: ContributionViolation, field: &'static str) -> 
 
 fn validate_contribution(contribution: &Contribution) -> Result<(), ContributionError> {
     validate_provider_symbol(contribution)?;
-    validate_portable_facts(&contribution.facts)?;
+    if let Some(facts) = &contribution.facts {
+        validate_portable_facts(facts)?;
+    }
     validate_source_and_origin(contribution)?;
     validate_evidence(contribution)?;
     if contribution.references.len() > CONTRIBUTION_FACTS_MAX
@@ -1139,7 +1164,7 @@ mod tests {
             }
         );
 
-        let facts = contribution.facts();
+        let facts = contribution.facts().expect("portable facts");
         assert_eq!(facts.language().name, "rust");
         assert_eq!(facts.name(), "Beacon");
         assert_eq!(facts.qualified_name(), "Beacon");
@@ -1258,6 +1283,28 @@ mod tests {
             contribution.applicability(),
             SourceApplicability::Independent
         );
+    }
+
+    #[test]
+    fn namespaced_fact_does_not_require_portable_facts() {
+        let namespaced = Extensions(BTreeMap::from([(
+            ExtensionKey("org.rift.history".to_owned()),
+            ExtensionValue {
+                version: 1,
+                data: json!({"commit": "abc123"}),
+            },
+        )]));
+        let contribution = Contribution::fact_builder(
+            ContributionKey::new(provider("git"), publication(1), provider_symbol("abc123")),
+            SourceApplicability::Independent,
+            ContributionOrigin::new(None, SourceKind::Synthetic).expect("origin"),
+        )
+        .namespaced(namespaced.clone())
+        .build()
+        .expect("namespaced fact");
+
+        assert!(contribution.facts().is_none());
+        assert_eq!(contribution.namespaced(), &namespaced);
     }
 
     #[test]

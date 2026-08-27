@@ -2,12 +2,14 @@
 
 mod adapter;
 mod assembly;
+mod fact;
 mod scip;
 
 pub use adapter::{
     AdapterError, AdapterPublication, AdapterViolation, ProviderInputMode, PublicationCoverage,
 };
 pub use assembly::{AssembledSymbol, PresentationDisagreement, PresentationField, SymbolAssembler};
+pub use fact::{DirectFactAdapter, DirectFactError, DirectFactInput, DirectFactViolation};
 
 mod composition;
 mod normalization;

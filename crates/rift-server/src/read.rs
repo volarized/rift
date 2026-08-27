@@ -761,7 +761,7 @@ fn assembled_wire_symbol(
     matched: SymbolMatch<'_>,
     assembled: &rift_provider::AssembledSymbol,
 ) -> Option<Symbol> {
-    let facts = assembled.facts();
+    let facts = assembled.facts()?;
     let identity = assembled.identity()?;
     let mut extension_values = BTreeMap::new();
     for (_, extensions) in assembled.namespaced() {

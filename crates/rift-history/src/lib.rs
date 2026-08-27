@@ -7,10 +7,14 @@
 //! one path, so a read can be answered from any revision without touching
 //! the working tree.
 
+mod contribution;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixture;
 mod repository;
 
+pub use contribution::{
+    HistoryContributionAdapter, HistoryContributionError, HistoryContributionViolation,
+};
 pub use repository::{
     HistoryError, HistoryFault, PathHistory, PathRevision, REVISION_TREE_ENTRIES_MAX, Repository,
     ResolvedRevision, TreeFile,
