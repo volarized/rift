@@ -1,6 +1,7 @@
 //! Provider and source catalog contracts.
 
 mod composition;
+mod normalization;
 mod publication;
 
 pub use composition::{
@@ -9,6 +10,7 @@ pub use composition::{
     JoinCoverage, JoinItem, JoinSides, KeyJoinPolicy, KeyedFlow, MissingSide, PerKeyCache,
     ProviderComposition, StageDescriptor, StagePath, join_keyed,
 };
+pub use normalization::{AssociationCandidate, AssociationState, NormalizedGraph, Normalizer};
 pub use publication::{
     CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT, CONTRIBUTIONS_TOTAL_MAX_DEFAULT, PROVIDERS_MAX_DEFAULT,
     ProviderPublication, PublicationError, PublicationFault, PublicationLimits, PublicationSet,

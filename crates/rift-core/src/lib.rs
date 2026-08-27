@@ -38,7 +38,7 @@ pub use semantic::{
     ContributionFault, ContributionKey, ContributionOrigin, ContributionReference,
     ContributionViolation, DeclarationBinding, EquivalenceEvidence, ExactKind, Language,
     PROVIDER_SYMBOL_ID_BYTES_MAX, PortableSymbolFacts, SourceApplicability, SourceKind,
-    SourceRange, SymbolRecord, SymbolResolution,
+    SourceLocation, SourceRange, SymbolRecord, SymbolResolution,
 };
 
 /// Iterates while charging one unit to a loop budget before each body execution.
