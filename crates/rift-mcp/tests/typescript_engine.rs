@@ -23,6 +23,9 @@ pub(crate) const BUNX_PROGRAM: &str = "bunx";
 /// to whatever the registry publishes next.
 pub(crate) const LANGUAGE_SERVER_PACKAGE: &str = "typescript-language-server@6.0.0";
 
+/// Runs fixture installation and executable probes one at a time.
+static TYPESCRIPT_INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Installs the fixture's pinned `typescript` and proves the language
 /// server runs, or fails the test with the command's own words.
 ///
@@ -30,6 +33,9 @@ pub(crate) const LANGUAGE_SERVER_PACKAGE: &str = "typescript-language-server@6.0
 /// resolves from. The install reads the committed lockfile, so it resolves
 /// nothing and answers from bun's cache when the package is already there.
 pub(crate) fn install_typescript_engine(fixture_root: &Path) {
+    let _exclusive = TYPESCRIPT_INSTALL_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let started = Instant::now();
     let install = std::process::Command::new(BUN_PROGRAM)
         .args(["install", "--frozen-lockfile"])

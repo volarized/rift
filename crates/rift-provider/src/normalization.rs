@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rift_core::{
-    Contribution, ContributionError, ContributionKey, ContributionReference, EquivalenceEvidence,
-    IndexRevision, SourceApplicability, SourceRevision, SymbolId, SymbolRecord, SymbolResolution,
-    TreeRevision, symbol_identity,
+    Contribution, ContributionError, ContributionKey, ContributionReference, DeclarationBinding,
+    EquivalenceEvidence, IndexRevision, ReferenceRole, RelationshipKind, SourceApplicability,
+    SourceRevision, SourceUnitId, SymbolId, SymbolRecord, SymbolResolution, TreeRevision,
+    symbol_identity,
 };
 
 use crate::PublicationSet;
@@ -26,6 +27,127 @@ pub struct AssociationCandidate {
     source: ContributionReference,
     target: ContributionReference,
     state: AssociationState,
+}
+
+/// Target retained after normalization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NormalizedTarget {
+    /// Target record has established workspace identity.
+    Symbol(SymbolId),
+    /// Target remains provider-local.
+    Contribution(ContributionReference),
+}
+
+/// One Relationship in a captured normalized graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedRelationship {
+    index_revision: IndexRevision,
+    source: ContributionKey,
+    kind: RelationshipKind,
+    target: NormalizedTarget,
+}
+
+impl NormalizedRelationship {
+    /// Returns captured index revision.
+    #[must_use]
+    pub const fn index_revision(&self) -> IndexRevision {
+        self.index_revision
+    }
+
+    /// Returns Contribution supplying Relationship.
+    #[must_use]
+    pub const fn source(&self) -> &ContributionKey {
+        &self.source
+    }
+
+    /// Returns portable Relationship kind.
+    #[must_use]
+    pub const fn kind(&self) -> RelationshipKind {
+        self.kind
+    }
+
+    /// Returns normalized target.
+    #[must_use]
+    pub const fn target(&self) -> &NormalizedTarget {
+        &self.target
+    }
+}
+
+/// One Reference in a captured normalized graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedReference {
+    index_revision: IndexRevision,
+    source: ContributionKey,
+    binding: DeclarationBinding,
+    role: ReferenceRole,
+    targets: Vec<NormalizedTarget>,
+}
+
+impl NormalizedReference {
+    /// Returns captured index revision.
+    #[must_use]
+    pub const fn index_revision(&self) -> IndexRevision {
+        self.index_revision
+    }
+
+    /// Returns Contribution supplying Reference.
+    #[must_use]
+    pub const fn source(&self) -> &ContributionKey {
+        &self.source
+    }
+
+    /// Returns source occurrence.
+    #[must_use]
+    pub const fn binding(&self) -> &DeclarationBinding {
+        &self.binding
+    }
+
+    /// Returns portable role.
+    #[must_use]
+    pub const fn role(&self) -> ReferenceRole {
+        self.role
+    }
+
+    /// Returns normalized targets.
+    #[must_use]
+    pub fn targets(&self) -> &[NormalizedTarget] {
+        &self.targets
+    }
+}
+
+/// Contributions available at one source position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scope {
+    index_revision: IndexRevision,
+    unit: SourceUnitId,
+    position: u64,
+    contributions: Vec<ContributionKey>,
+}
+
+impl Scope {
+    /// Returns captured index revision.
+    #[must_use]
+    pub const fn index_revision(&self) -> IndexRevision {
+        self.index_revision
+    }
+
+    /// Returns source unit.
+    #[must_use]
+    pub const fn unit(&self) -> &SourceUnitId {
+        &self.unit
+    }
+
+    /// Returns UTF-8 byte position.
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// Returns available Contributions.
+    #[must_use]
+    pub fn contributions(&self) -> &[ContributionKey] {
+        &self.contributions
+    }
 }
 
 impl AssociationCandidate {
@@ -70,6 +192,8 @@ pub struct NormalizedGraph {
     records: Vec<SymbolRecord>,
     records_by_contribution: BTreeMap<ContributionReference, usize>,
     candidates: Vec<AssociationCandidate>,
+    references: Vec<NormalizedReference>,
+    relationships: Vec<NormalizedRelationship>,
 }
 
 impl NormalizedGraph {
@@ -134,6 +258,55 @@ impl NormalizedGraph {
                     .iter()
                     .find(|contribution| contribution.key() == key)
             })
+    }
+
+    /// Returns normalized References.
+    #[must_use]
+    pub fn references(&self) -> &[NormalizedReference] {
+        &self.references
+    }
+
+    /// Returns normalized Relationships.
+    #[must_use]
+    pub fn relationships(&self) -> &[NormalizedRelationship] {
+        &self.relationships
+    }
+
+    /// Builds availability at one source position.
+    #[must_use]
+    pub fn scope_at(&self, unit: SourceUnitId, position: u64) -> Scope {
+        let mut contributions = self
+            .publications
+            .publications()
+            .flat_map(crate::ProviderPublication::contributions)
+            .filter(|contribution| {
+                if !contribution
+                    .applicability()
+                    .applies_to(self.source_revision, self.tree_revision)
+                {
+                    return false;
+                }
+                contribution.source().map_or(
+                    matches!(
+                        contribution.applicability(),
+                        SourceApplicability::Independent
+                    ),
+                    |binding| {
+                        binding.unit() == &unit
+                            && binding.range().start() <= position
+                            && position < binding.range().end()
+                    },
+                )
+            })
+            .map(|contribution| contribution.key().clone())
+            .collect::<Vec<_>>();
+        contributions.sort();
+        Scope {
+            index_revision: self.index_revision,
+            unit,
+            position,
+            contributions,
+        }
     }
 }
 
@@ -445,18 +618,13 @@ struct GraphBuild<'a> {
     candidates: Vec<AssociationCandidate>,
 }
 
-fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, ContributionError> {
-    let GraphBuild {
-        index_revision,
-        source_revision,
-        tree_revision,
-        publications,
-        contributions,
-        anchors,
-        mut groups,
-        conflicting,
-        mut candidates,
-    } = input;
+fn build_records(
+    index_revision: IndexRevision,
+    contributions: &[&Contribution],
+    anchors: &[BTreeSet<SymbolId>],
+    groups: &mut UnionFind,
+    conflicting: &BTreeSet<usize>,
+) -> Result<(Vec<SymbolRecord>, BTreeMap<ContributionReference, usize>), ContributionError> {
     let mut members = BTreeMap::<usize, Vec<usize>>::new();
     for index in 0..contributions.len() {
         members.entry(groups.find(index)).or_default().push(index);
@@ -489,6 +657,72 @@ fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, ContributionErr
         }
         records.push(record);
     }
+    Ok((records, records_by_contribution))
+}
+
+fn normalize_edges(
+    index_revision: IndexRevision,
+    contributions: &[&Contribution],
+    records: &[SymbolRecord],
+    records_by_contribution: &BTreeMap<ContributionReference, usize>,
+) -> (Vec<NormalizedReference>, Vec<NormalizedRelationship>) {
+    let normalize_target = |target: &ContributionReference| {
+        records_by_contribution
+            .get(target)
+            .and_then(|index| records.get(*index))
+            .and_then(SymbolRecord::identity)
+            .cloned()
+            .map_or_else(
+                || NormalizedTarget::Contribution(target.clone()),
+                NormalizedTarget::Symbol,
+            )
+    };
+    let mut references = Vec::new();
+    let mut relationships = Vec::new();
+    for contribution in contributions {
+        references.extend(
+            contribution
+                .references()
+                .iter()
+                .map(|reference| NormalizedReference {
+                    index_revision,
+                    source: contribution.key().clone(),
+                    binding: reference.source().clone(),
+                    role: reference.role(),
+                    targets: reference.targets().iter().map(&normalize_target).collect(),
+                }),
+        );
+        relationships.extend(contribution.relationships().iter().map(|relationship| {
+            NormalizedRelationship {
+                index_revision,
+                source: contribution.key().clone(),
+                kind: relationship.kind(),
+                target: normalize_target(relationship.target()),
+            }
+        }));
+    }
+    (references, relationships)
+}
+
+fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, ContributionError> {
+    let GraphBuild {
+        index_revision,
+        source_revision,
+        tree_revision,
+        publications,
+        contributions,
+        anchors,
+        mut groups,
+        conflicting,
+        mut candidates,
+    } = input;
+    let (records, records_by_contribution) = build_records(
+        index_revision,
+        contributions,
+        anchors,
+        &mut groups,
+        conflicting,
+    )?;
     candidates.sort_by(|left, right| {
         (
             left.source.provider(),
@@ -503,6 +737,12 @@ fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, ContributionErr
                 right.target.symbol(),
             ))
     });
+    let (references, relationships) = normalize_edges(
+        index_revision,
+        contributions,
+        &records,
+        &records_by_contribution,
+    );
 
     Ok(NormalizedGraph {
         index_revision,
@@ -512,6 +752,8 @@ fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, ContributionErr
         records,
         records_by_contribution,
         candidates,
+        references,
+        relationships,
     })
 }
 
@@ -559,8 +801,9 @@ mod tests {
 
     use rift_core::{
         Contribution, ContributionKey, ContributionOrigin, ContributionReference,
-        DeclarationBinding, EquivalenceEvidence, ExactKind, IndexRevision, Language,
-        PortableSymbolFacts, ProviderId, ProviderRevision, ProviderSymbolId, SourceApplicability,
+        ContributionRelationship, DeclarationBinding, EquivalenceEvidence, ExactKind,
+        IndexRevision, Language, PortableSymbolFacts, ProviderId, ProviderRevision,
+        ProviderSymbolId, ReferenceRole, RelationshipKind, SemanticReference, SourceApplicability,
         SourceKind, SourceLocation, SourceRange, SourceResolverId, SourceRevision, SourceUnitId,
         SymbolId, SymbolResolution, TreeRevision,
     };
@@ -941,6 +1184,87 @@ mod tests {
                 .and_then(rift_core::SymbolRecord::identity)
                 .map(SymbolId::as_str),
             Some("rift://symbol/rust/src/lib.rs/Beacon")
+        );
+    }
+
+    #[test]
+    fn references_relationships_and_scope_keep_resolution_state() {
+        let target = reference("syntax", "Beacon");
+        let syntax = exact(
+            "syntax",
+            1,
+            "Beacon",
+            1,
+            binding("src/lib.rs", 0),
+            Some("rift://symbol/rust/src/lib.rs/Beacon"),
+            vec![],
+        );
+        let semantic_base = exact(
+            "native",
+            1,
+            "caller",
+            1,
+            binding("src/lib.rs", 16),
+            None,
+            vec![],
+        );
+        let semantic = Contribution::builder(
+            semantic_base.key().clone(),
+            semantic_base.applicability(),
+            semantic_base.facts().clone(),
+            semantic_base.origin().clone(),
+        )
+        .source(semantic_base.source().expect("source").clone())
+        .references(vec![
+            SemanticReference::new(
+                binding("src/lib.rs", 24),
+                ReferenceRole::Read,
+                vec![target.clone()],
+            )
+            .expect("reference"),
+        ])
+        .relationships(vec![
+            ContributionRelationship::new(RelationshipKind::Reference, target),
+            ContributionRelationship::new(
+                RelationshipKind::Implementation,
+                reference("missing", "Trait"),
+            ),
+        ])
+        .build()
+        .expect("semantic contribution");
+        let set = publications(vec![
+            publication("syntax", 1, vec![syntax]),
+            publication("native", 1, vec![semantic]),
+            publication("docs", 1, vec![independent("docs", 1, "guide", vec![])]),
+        ]);
+        let graph = normalize(&set, 1, None);
+
+        assert!(matches!(
+            graph.references()[0].targets(),
+            [super::NormalizedTarget::Symbol(identity)]
+                if identity.as_str() == "rift://symbol/rust/src/lib.rs/Beacon"
+        ));
+        assert!(matches!(
+            graph.relationships()[0].target(),
+            super::NormalizedTarget::Symbol(identity)
+                if identity.as_str() == "rift://symbol/rust/src/lib.rs/Beacon"
+        ));
+        assert!(matches!(
+            graph.relationships()[1].target(),
+            super::NormalizedTarget::Contribution(target)
+                if target.provider().as_str() == "missing"
+        ));
+
+        let inside = graph.scope_at(source_unit("src/lib.rs"), 2);
+        assert_eq!(inside.index_revision(), graph.index_revision());
+        assert_eq!(inside.position(), 2);
+        assert_eq!(inside.unit(), &source_unit("src/lib.rs"));
+        assert_eq!(inside.contributions().len(), 2);
+        let outside = graph.scope_at(source_unit("src/lib.rs"), 100);
+        assert_eq!(outside.contributions().len(), 1);
+        assert_eq!(
+            outside.contributions()[0].reference().provider().as_str(),
+            "docs"
         );
     }
 }
