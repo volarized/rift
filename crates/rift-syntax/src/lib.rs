@@ -1,5 +1,6 @@
 //! Syntax fact extraction.
 
+mod contribution;
 mod document;
 mod ecmascript;
 mod extract;
@@ -14,6 +15,7 @@ mod toml;
 mod typescript;
 mod yaml;
 
+pub use contribution::{SYNTAX_PROVIDER_ID, SyntaxPublicationBuilder, SyntaxPublicationError};
 pub use document::{ByteRange, SyntaxDocument, SyntaxNode, SyntaxSymbol};
 pub use failure::{SyntaxBound, SyntaxError, SyntaxFault, SyntaxViolation};
 pub use javascript::JavaScriptSyntaxProvider;
