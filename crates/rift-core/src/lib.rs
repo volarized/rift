@@ -8,6 +8,7 @@ mod limits;
 mod measurement;
 mod name;
 mod path;
+mod semantic;
 
 pub mod constants;
 pub mod line;
@@ -20,7 +21,7 @@ pub use error::{
 };
 pub use identity::{
     CompositionId, CompositionRevision, IdError, IdFault, IndexRevision, ModelId, ModelRevision,
-    ProviderId, ProviderRevision, RevisionError, RevisionFault, SourceResolverId,
+    ProviderId, ProviderRevision, ProviderSymbolId, RevisionError, RevisionFault, SourceResolverId,
     SourceResolverIdError, SourceResolverIdFault, SourceResolverIdViolation, SourceRevision,
     SourceUnitId, SourceUnitIdError, SourceUnitIdFault, SymbolId, TreeRevision, WorkspaceId,
     encode_path, symbol_identity,
@@ -31,6 +32,14 @@ pub use measurement::{
 };
 pub use name::is_canonical_ascii_name;
 pub use path::{PathError, PathFault, PathKind, PathViolation, ProjectPath, SourcePath};
+pub use semantic::{
+    CONTRIBUTION_EVIDENCE_MAX, CONTRIBUTION_FACTS_MAX, CONTRIBUTION_NAMESPACE_BYTES_MAX,
+    CONTRIBUTION_NAMESPACES_MAX, Contribution, ContributionBuilder, ContributionError,
+    ContributionFault, ContributionKey, ContributionOrigin, ContributionReference,
+    ContributionViolation, DeclarationBinding, EquivalenceEvidence, ExactKind, Language,
+    PROVIDER_SYMBOL_ID_BYTES_MAX, PortableSymbolFacts, SourceApplicability, SourceKind,
+    SourceRange, SymbolRecord, SymbolResolution,
+};
 
 /// Iterates while charging one unit to a loop budget before each body execution.
 ///

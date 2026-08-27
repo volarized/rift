@@ -118,6 +118,7 @@ macro_rules! define_id {
 define_id!(WorkspaceId, "Canonical workspace identity.");
 define_id!(SymbolId, "Language-qualified symbol identity.");
 define_id!(ProviderId, "Provider component identity.");
+define_id!(ProviderSymbolId, "Provider-local symbol identity.");
 define_id!(CompositionId, "Provider composition identity.");
 define_id!(ModelId, "Resolved embedding model identity.");
 
@@ -471,9 +472,9 @@ mod tests {
 
     use super::{
         CompositionId, CompositionRevision, IndexRevision, ModelId, ModelRevision, ProviderId,
-        ProviderRevision, SourceResolverId, SourceResolverIdViolation, SourceRevision,
-        SourceUnitId, SourceUnitIdError, SourceUnitIdFault, SymbolId, TreeRevision, WorkspaceId,
-        encode_path, symbol_identity,
+        ProviderRevision, ProviderSymbolId, SourceResolverId, SourceResolverIdViolation,
+        SourceRevision, SourceUnitId, SourceUnitIdError, SourceUnitIdFault, SymbolId, TreeRevision,
+        WorkspaceId, encode_path, symbol_identity,
     };
     use crate::SourcePath;
     use crate::constants::{
@@ -505,6 +506,16 @@ mod tests {
         assert_eq!(
             symbol_identity("rust", "src/lib.rs", "Beacon"),
             "rift://symbol/rust/src/lib.rs/Beacon"
+        );
+    }
+
+    #[test]
+    fn provider_symbol_identity_rejects_empty_and_control_characters() {
+        assert!(ProviderSymbolId::new("").is_err());
+        assert!(ProviderSymbolId::new("rust\nitem").is_err());
+        assert_eq!(
+            ProviderSymbolId::new("rust:item").map(|identity| identity.to_string()),
+            Ok("rust:item".to_owned())
         );
     }
 

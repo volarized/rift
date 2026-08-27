@@ -1,12 +1,18 @@
 //! Provider and source catalog contracts.
 
 mod composition;
+mod publication;
 
 pub use composition::{
     CacheError, CacheFault, CacheUpdate, CacheViolation, Component, CompositionBuilder,
     CompositionEditor, CompositionError, CompositionFault, CompositionScope, Flow, FlowCardinality,
     JoinCoverage, JoinItem, JoinSides, KeyJoinPolicy, KeyedFlow, MissingSide, PerKeyCache,
     ProviderComposition, StageDescriptor, StagePath, join_keyed,
+};
+pub use publication::{
+    CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT, CONTRIBUTIONS_TOTAL_MAX_DEFAULT, PROVIDERS_MAX_DEFAULT,
+    ProviderPublication, PublicationError, PublicationFault, PublicationLimits, PublicationSet,
+    PublicationStore, PublicationViolation,
 };
 
 /// Compile-time marker for provider-layer ownership.
