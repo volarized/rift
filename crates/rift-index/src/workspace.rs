@@ -15,9 +15,11 @@ use rift_core::constants::{
 };
 use rift_core::{
     CompositionId, EXTENSIONLESS_SNIFF_BYTES_MAX, Error, ErrorCode, ErrorContext, ErrorName, Fault,
-    ProjectPath, ProviderId, SourceVisibility, TextFileInclusion, fault_label,
+    ProjectPath, ProviderId, SourceVisibility, TextFileInclusion, fault_label, symbol_identity,
 };
-use rift_provider::{Component, CompositionBuilder, ProviderComposition};
+use rift_provider::{
+    AssembledSymbol, Component, CompositionBuilder, NormalizedGraph, ProviderComposition,
+};
 use rift_syntax::{
     SyntaxDocument, SyntaxError, SyntaxNode, SyntaxProvider, SyntaxSource, SyntaxSymbol, registry,
 };
@@ -28,6 +30,7 @@ use crate::change_set::{FileDigest, PathChanges, WorkspaceDigests};
 use crate::chunk::text_chunks;
 use crate::glob::PathMatcher;
 use crate::lexical::{LexicalUnit, LexicalUnitKind};
+use crate::semantic::WorkspaceSemantics;
 
 #[derive(Debug)]
 pub(crate) struct WorkspaceFiles;
@@ -148,6 +151,8 @@ pub enum WorkspaceIndexViolation {
     Filesystem,
     /// Rust syntax analysis failed.
     Syntax,
+    /// Provider publication or normalization failed.
+    Provider,
     /// Composition recipe failed validation.
     Composition,
     /// Requested result bound exceeds configured maximum.
@@ -221,6 +226,7 @@ impl Fault for WorkspaceIndexFault {
                     || ErrorName::Wire(ErrorCode::InternalError),
                     |error| error.descriptor().name(),
                 ),
+            WorkspaceIndexViolation::Provider => ErrorName::Wire(ErrorCode::InternalError),
             WorkspaceIndexViolation::History => self.history_source().map_or_else(
                 || ErrorName::Wire(ErrorCode::InternalError),
                 |error| error.descriptor().name(),
@@ -441,6 +447,13 @@ impl WorkspaceFingerprint {
         }
         Self(hasher.finalize().into())
     }
+
+    /// Derives non-zero revision number for this captured publication.
+    fn revision_number(&self) -> u64 {
+        let mut prefix = [0_u8; size_of::<u64>()];
+        prefix.copy_from_slice(&self.0[..size_of::<u64>()]);
+        u64::from_be_bytes(prefix).max(1)
+    }
 }
 
 impl WorkspaceSourcePolicy {
@@ -621,6 +634,7 @@ pub struct WorkspaceIndex {
     limits: WorkspaceIndexLimits,
     text_inclusion: TextFileInclusion,
     fingerprint: WorkspaceFingerprint,
+    semantics: WorkspaceSemantics,
     warnings: Vec<WorkspaceIndexWarning>,
 }
 
@@ -678,6 +692,12 @@ impl WorkspaceIndex {
         }
         warnings.sort_by(|left, right| left.path().cmp(right.path()));
         let fingerprint = WorkspaceFingerprint::from_files(&files, &text_files);
+        let semantics = WorkspaceSemantics::build(
+            files.values().map(|file| file.syntax()),
+            fingerprint.revision_number(),
+            None,
+        )
+        .map_err(provider_error)?;
         Ok(Self {
             root,
             files,
@@ -686,6 +706,7 @@ impl WorkspaceIndex {
             limits,
             text_inclusion: text_inclusion.clone(),
             fingerprint,
+            semantics,
             warnings,
         })
     }
@@ -733,6 +754,12 @@ impl WorkspaceIndex {
         }
         warnings.sort_by(|left, right| left.path().cmp(right.path()));
         let fingerprint = WorkspaceFingerprint::from_files(&files, &text_files);
+        let semantics = WorkspaceSemantics::build(
+            files.values().map(|file| file.syntax()),
+            fingerprint.revision_number(),
+            Some(self.semantics.graph()),
+        )
+        .map_err(provider_error)?;
         Ok(Self {
             root: self.root.clone(),
             files,
@@ -741,6 +768,7 @@ impl WorkspaceIndex {
             limits: self.limits,
             text_inclusion: self.text_inclusion.clone(),
             fingerprint,
+            semantics,
             warnings,
         })
     }
@@ -820,11 +848,17 @@ impl WorkspaceIndex {
         composition: ProviderComposition,
         limits: WorkspaceIndexLimits,
         text_inclusion: TextFileInclusion,
-    ) -> Self {
+    ) -> Result<Self, WorkspaceIndexError> {
         let files = keyed_by_path(files, IndexedFile::path);
         let text_files = keyed_by_path(text_files, TextSourceFile::path);
         let fingerprint = WorkspaceFingerprint::from_files(&files, &text_files);
-        Self {
+        let semantics = WorkspaceSemantics::build(
+            files.values().map(|file| file.syntax()),
+            fingerprint.revision_number(),
+            None,
+        )
+        .map_err(provider_error)?;
+        Ok(Self {
             root,
             files,
             text_files,
@@ -832,8 +866,9 @@ impl WorkspaceIndex {
             limits,
             text_inclusion,
             fingerprint,
+            semantics,
             warnings: Vec::new(),
-        }
+        })
     }
 
     /// Returns canonical real workspace root.
@@ -957,6 +992,23 @@ impl WorkspaceIndex {
     #[must_use]
     pub const fn fingerprint(&self) -> &WorkspaceFingerprint {
         &self.fingerprint
+    }
+
+    /// Returns normalized Contribution graph captured by this index.
+    #[must_use]
+    pub const fn normalized_graph(&self) -> &NormalizedGraph {
+        self.semantics.graph()
+    }
+
+    /// Assembles readable symbol through its normalized record.
+    #[must_use]
+    pub fn assembled_symbol(&self, matched: SymbolMatch<'_>) -> Option<AssembledSymbol> {
+        let identity = symbol_identity(
+            &matched.file.syntax().language().identity_segment(),
+            matched.file.path().as_str(),
+            &matched.symbol.qualified_name,
+        );
+        self.semantics.assembled(&identity)
     }
 
     /// Conditions this build or rebuild encountered but did not treat as fatal, in
@@ -1245,6 +1297,10 @@ pub(crate) fn composition_error(
     source: impl std::error::Error + Send + Sync + 'static,
 ) -> WorkspaceIndexError {
     index_error_caused_by(WorkspaceIndexViolation::Composition, None, source)
+}
+
+fn provider_error(source: impl std::error::Error + Send + Sync + 'static) -> WorkspaceIndexError {
+    index_error_caused_by(WorkspaceIndexViolation::Provider, None, source)
 }
 
 /// A candidate path's included granularity: a provider-declared source extension always wins

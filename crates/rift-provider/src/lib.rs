@@ -1,5 +1,9 @@
 //! Provider and source catalog contracts.
 
+mod assembly;
+
+pub use assembly::{AssembledSymbol, PresentationDisagreement, PresentationField, SymbolAssembler};
+
 mod composition;
 mod normalization;
 mod publication;
