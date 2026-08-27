@@ -406,7 +406,7 @@ fn build_symbol_hit(
 ) -> Result<SearchHit, ReadError> {
     Ok(SearchHit {
         hit: SearchHitTarget::Symbol {
-            symbol: wire_symbol(index, matched)?,
+            symbol: Box::new(wire_symbol(index, matched)?),
         },
         score,
         matched_by,
@@ -641,9 +641,12 @@ fn merge_symbol_hit(
         file.path().as_str(),
         &symbol.qualified_name,
     ));
-    let existing = results.iter_mut().find(
-        |hit| matches!(&hit.hit, SearchHitTarget::Symbol { symbol } if symbol.id == identity),
-    );
+    let existing = results.iter_mut().find(|hit| {
+        matches!(
+            &hit.hit,
+            SearchHitTarget::Symbol { symbol } if symbol.id.as_ref() == Some(&identity)
+        )
+    });
     if let Some(existing) = existing {
         absorb_ranked_match(existing, score);
         return Ok(());
@@ -753,10 +756,18 @@ fn hit_ordering(left: &SearchHit, right: &SearchHit, order: ResultOrder) -> Orde
     }
 }
 
-/// The wire id `order_hits` breaks a `relevance` or `path` tie on.
+/// The wire identity `order_hits` breaks a `relevance` or `path` tie on.
 fn hit_identity(hit: &SearchHit) -> &str {
     match &hit.hit {
-        SearchHitTarget::Symbol { symbol } => symbol.id.0.as_str(),
+        SearchHitTarget::Symbol { symbol } => symbol.id.as_ref().map_or_else(
+            || {
+                symbol
+                    .contributions
+                    .first()
+                    .map_or(symbol.name.as_str(), |key| key.symbol.as_str())
+            },
+            |identity| identity.0.as_str(),
+        ),
         SearchHitTarget::File { file } => file.id.0.as_str(),
         SearchHitTarget::Node { node } => node.id.0.as_str(),
     }

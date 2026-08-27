@@ -210,7 +210,7 @@ pub enum SearchHitTarget {
     /// A symbol hit: the declaration a provider resolved.
     Symbol {
         /// The declaration that matched.
-        symbol: Symbol,
+        symbol: Box<Symbol>,
     },
     /// A node hit: one place in a syntax tree, without its enclosing symbol record.
     Node {
@@ -341,7 +341,16 @@ pub enum SearchParamsTarget {
                 "hit": {
                     "target": "symbol",
                     "symbol": {
+                        "index_revision": 1,
                         "id": "rift://symbol/rust/src/config.rs/load_config",
+                        "resolution": "established",
+                        "contributions": [
+                            {
+                                "provider": "syntax",
+                                "symbol": "load_config",
+                                "publication": 1
+                            }
+                        ],
                         "language": {
                             "name": "rust"
                         },
@@ -436,6 +445,7 @@ pub enum SearchParamsTarget {
                             }
                         ],
                         "extensions": {},
+                        "disagreements": [],
                         "document_local": false
                     }
                 },

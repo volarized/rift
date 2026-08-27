@@ -1863,7 +1863,11 @@ mod tests {
         let changes = ChangeService::new(directory.path());
         let params: GetSymbolParams = serde_json::from_value(serde_json::json!({"name": "App"}))?;
         let hits = reads.get_symbol(&params)?.hits;
-        let minted = hits[0].symbol.id.clone();
+        let minted = hits[0]
+            .symbol
+            .id
+            .clone()
+            .expect("syntax-backed symbol is established");
         assert_eq!(minted.0, "rift://symbol/typescript:tsx/App.tsx/App");
         let result = changes.replace_symbol(
             &reads,
@@ -1906,7 +1910,11 @@ mod tests {
         let request = serde_json::json!({"name": "Requirements"});
         let params: GetSymbolParams = serde_json::from_value(request)?;
         let hits = reads.get_symbol(&params)?.hits;
-        let minted = hits[0].symbol.id.clone();
+        let minted = hits[0]
+            .symbol
+            .id
+            .clone()
+            .expect("syntax-backed symbol is established");
         assert_eq!(
             minted.0,
             "rift://symbol/markdown/README.md/Install%20%3E%20Requirements"
@@ -1948,7 +1956,11 @@ mod tests {
         let request = serde_json::json!({"name": "port"});
         let params: GetSymbolParams = serde_json::from_value(request)?;
         let hits = reads.get_symbol(&params)?.hits;
-        let minted = hits[0].symbol.id.clone();
+        let minted = hits[0]
+            .symbol
+            .id
+            .clone()
+            .expect("syntax-backed symbol is established");
         assert_eq!(
             minted.0,
             "rift://symbol/json/settings.json/server%20%3E%20port"

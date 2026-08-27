@@ -30,7 +30,7 @@ files. [Hooks](/docs/configuration#hooks) extend this pipeline with configured t
 formatters, linters, and test runners, which check each change after it lands.
 
 <FlatDiagram
-  alt="An agent talks to rift mcp over stdio, which forwards MCP to one rift server per workspace on a localhost HTTP port named by a lock file; an HTTP-capable agent connects directly. Source resolvers catalog project and dependency source, providers analyze it, and their facts feed an embedded search index. Semantic providers delegate resolution to language engines - an embedded library, a language server, or a SCIP index - which read the targeted tree and answer with facts and edit plans. Hooks check each change. Changes land in the workspace by default; an opt-in projection collects them for publication."
+  alt="An agent talks to rift mcp over stdio, which forwards MCP to one rift server per workspace on a localhost HTTP port named by a lock file; an HTTP-capable agent connects directly. Source resolvers catalog project and dependency source, providers publish Contributions, normalization builds the SymbolRecord graph, and readable Symbols feed an embedded search index. Semantic providers delegate resolution to language engines - an embedded library, a language server, or a SCIP index - which read the targeted tree and answer with facts and edit plans. Hooks check each change. Changes land in the workspace by default; an opt-in projection collects them for publication."
   chart={`
     flowchart LR
       agent["agent"]:::agent -- "MCP over stdio" --> mcp["rift mcp"]:::rift
@@ -47,7 +47,8 @@ formatters, linters, and test runners, which check each change after it lands.
       providers -- "resolve" --> engines["language engines<br/>embedded, LSP, or SCIP"]:::provider
       engines -- "facts + edit plans" --> providers
       engines -. "read" .-> workspace
-      providers -- "symbols + text" --> search["search index<br/>lexical + vectors"]:::store
+      providers -- "Contributions" --> normalization["normalization<br/>SymbolRecord graph"]:::rift
+      normalization -- "readable Symbols" --> search["search index<br/>lexical + vectors"]:::store
       server -- "query + rank" --> search
       search -- "embeddings" --> localmodel["local embedding model<br/>ships with Rift"]:::model
       server -- "changes" --> workspace
@@ -148,9 +149,13 @@ which package owns it or which generator produced it.
 
 ## Providers
 
-Providers analyze cataloged source at different depths. An answer carries the facts the serving
-providers resolved. A condition the caller must weigh before relying on the answer - a stale
-index, an absent capability - arrives as a typed entry in the result's `warnings`.
+Providers analyze cataloged source at different depths and publish immutable `Contribution`
+records in provider-owned symbol spaces. Rift normalizes applicable Contributions into
+workspace-local `SymbolRecord` values, then assembles readable `Symbol` values for one captured
+index revision.
+
+A condition the caller must weigh before relying on the answer - a stale index, an absent
+capability - arrives as a typed entry in the result's `warnings`.
 
 ### Syntax
 
@@ -188,12 +193,13 @@ edits](#semantic-edits).
 A language no table claims keeps everything the syntax tier gives it: reads answer, the direct
 change tools apply, and only the engine-served tools refuse.
 
-<VersionBadge version="planned" />
+<VersionBadge version="v0.0.23" />
 
-Reads deepen next. A semantic provider merges the facts a grammar cannot resolve - references,
-definitions, types, and hover information - into the same declarations tree-sitter found, so
-answers carry `types` and `relationships` where a provider resolved them. A provider may
-invalidate dependent facts, such as callers after a signature changes.
+Semantic providers publish the facts a grammar cannot resolve - references, definitions, types,
+and hover information - as separate Contributions. Normalization associates them with syntax
+Contributions only when exact declaration bindings or explicit equivalence evidence establish
+one identity. Presentation order selects readable fields after identity resolution. A provider
+may invalidate dependent facts, such as callers after a signature changes.
 
 Semantic providers also expose dependency, standard-library, and synthetic declarations when
 their language engine knows them without readable source.
@@ -251,32 +257,33 @@ The composition API can change the flow before Rift starts:
 
 - insert, replace, or remove a named step
 - transform one step's input or output
-- branch one output into several providers, then merge compatible facts
+- branch one output into several providers, then publish each provider's Contributions
 - nest one composition inside another
 
 Provider compositions support several flow shapes:
 
-- syntax and semantics consume the same source catalog, then merge by declaration identity
+- syntax and semantics consume the same source catalog, then publish separate Contributions
 - history maps syntax analysis over source catalogs keyed by Git revision, then aggregates
   revision-qualified facts
 - a custom external step can produce generated source or facts for another provider to analyze
 
-A transform that changes source units or facts becomes a named, revisioned step, so later answers
-still identify what produced them.
+A transform that changes source units or facts becomes a named, revisioned step and publishes new
+Contributions, so later answers still identify its inputs.
 
 For example, a CSS integration can send templates and configuration to a registered Tailwind CLI,
-parse its generated CSS with a CSS syntax provider, and merge those facts with authored CSS. The
+parse its generated CSS with a CSS syntax provider, and publish those facts beside authored CSS. The
 server runs the command with declared inputs, environment, timeout, and output limits; the
 composition step decodes its output.
 
 Rift validates the composition's inputs, outputs, merge rules, and cycles before it runs. The server
 then owns scheduling, caching, and invalidation; MCP requests do not assemble or modify the
-composition.
+composition. Composition controls data flow and provider selection. It cannot establish
+Contribution equivalence or `SymbolRecord` identity.
 
 The workspace resource assigns each provider a stable
 [`ProviderId`](/docs/protocol/reference#ProviderId) and reports its lifecycle state. A
-provider derives a new immutable fact revision from one tree revision, then publishes the
-revision atomically.
+provider derives an immutable Contribution collection from one tree revision, then publishes the
+collection atomically.
 
 While a provider catches up after a change, requests may serve its previous revision, and the
 result carries a `stale_index` entry in `warnings` naming the two tree revision digests. A
@@ -287,10 +294,10 @@ revisions it uses. Later writes create new revisions; they do not alter the capt
 request addresses one page with `page_index`, and a page past the end returns an empty page
 with the true `total_pages`.
 
-Providers merge in the order the server reports for their language through
-[`rift://workspace`](/docs/protocol/mcp#resource-workspace). The first provider that supplies a
-scalar fact wins that field; the server unions multi-valued facts, including relationships and
-diagnostics, by canonical identity, and each retained fact keeps its evidence.
+Normalization validates equivalence evidence without using provider order, candidate names, or
+provider composition as identity evidence. It retains unresolved and conflicting records instead
+of forcing one `SymbolId`. When Rift assembles a readable Symbol, provider order selects scalar
+presentation fields and combines list facts without discarding conflicting Contributions.
 
 ## Index
 
@@ -343,12 +350,11 @@ answer at all - one that refused to load, or holds no indexed tree - which raise
 [`search`](/docs/protocol/mcp#tool-search) is for reads where the exact name isn't known.
 It ranks symbol names, signatures, documentation, and file content from the index.
 
-What the index holds is what the providers produced. Syntax providers contribute each
+What the index holds comes from normalized Contributions. Syntax providers contribute each
 declaration's name, signature, and documentation; the lexical tier adds file content - source
 and plain text alike - so a hit can land in a comment, a configuration key, or a README as well
-as a declaration. Facts a semantic provider resolved arrive through the same merge the
-[Providers](#providers) section describes, so a richer engine deepens results without changing
-the tool.
+as a declaration. Facts a semantic provider resolved join the same Symbol only after normalization
+establishes their association, so a richer engine deepens results without changing the tool.
 
 Matching serves two query shapes. An identifier-shaped query - `ReadService`,
 `num_workers` - matches the declaration names it resembles. A prose query - `source
@@ -398,6 +404,10 @@ embeds the workspace again rather than mixing two spaces.
 [`get_symbol`](/docs/protocol/mcp#tool-get_symbol) retrieves a declaration when its name is
 known. The answer carries the declaration's body inline, so reading a function takes one call
 rather than a search followed by a file read.
+
+Each Symbol names its `index_revision`, `resolution`, applicable `contributions`, and retained
+`disagreements`. `id` is present when resolution is `established`; unresolved or conflicting
+Symbols keep provider-local Contribution identities without inventing a workspace `SymbolId`.
 
 Asking for history attaches the symbol's committed timeline to the same answer.
 

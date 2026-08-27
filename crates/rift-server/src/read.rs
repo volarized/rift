@@ -16,10 +16,11 @@ use rift_index::{
 };
 use rift_protocol::configuration::HistoryConfiguration;
 use rift_protocol::read::{
-    Digest, ExactKind, Extensions, FileId, GetSymbolHit, GetSymbolParams, GetSymbolResult,
-    Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, Pagination, ProjectPath,
-    ReadWarning, RevisionId, SourceExcerpt, SourceUnitId, SourceUnitSpan, Symbol, SymbolId,
-    SymbolOrigin, TextRange,
+    ContributionKey, Digest, ExactKind, Extensions, FileId, GetSymbolHit, GetSymbolParams,
+    GetSymbolResult, Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, Pagination,
+    ProjectPath, ReadWarning, RevisionId, SourceExcerpt, SourceUnitId, SourceUnitSpan, Symbol,
+    SymbolDisagreement, SymbolId, SymbolOrigin, SymbolPresentationField, SymbolResolution,
+    TextRange,
 };
 use rift_syntax::{ByteRange, SyntaxNode, SyntaxProvider, SyntaxSymbol, registry};
 use sha2::{Digest as _, Sha256};
@@ -761,7 +762,6 @@ pub(crate) fn wire_symbol(
 fn assembled_wire_symbol(matched: SymbolMatch<'_>, readable: &ReadableSymbol) -> Symbol {
     let assembled = readable.assembled();
     let facts = readable.facts();
-    let identity = readable.identity();
     let mut extension_values = BTreeMap::new();
     for (_, extensions) in assembled.namespaced() {
         for (key, value) in &extensions.0 {
@@ -771,7 +771,16 @@ fn assembled_wire_symbol(matched: SymbolMatch<'_>, readable: &ReadableSymbol) ->
         }
     }
     Symbol {
-        id: SymbolId(identity.as_str().to_owned()),
+        index_revision: assembled.index_revision().get(),
+        id: readable
+            .identity()
+            .map(|identity| SymbolId(identity.as_str().to_owned())),
+        resolution: wire_symbol_resolution(assembled.resolution()),
+        contributions: assembled
+            .contributions()
+            .iter()
+            .map(wire_contribution_key)
+            .collect(),
         language: facts.language().clone(),
         name: facts.name().to_owned(),
         kind: facts.kind().clone(),
@@ -790,7 +799,44 @@ fn assembled_wire_symbol(matched: SymbolMatch<'_>, readable: &ReadableSymbol) ->
         signatures: facts.signatures_slice().to_vec(),
         documentation: facts.documentation_blocks().to_vec(),
         extensions: Extensions(extension_values),
+        disagreements: assembled
+            .disagreements()
+            .iter()
+            .map(|disagreement| SymbolDisagreement {
+                contribution: wire_contribution_key(disagreement.contribution()),
+                field: wire_presentation_field(disagreement.field()),
+            })
+            .collect(),
         document_local: facts.is_document_local(),
+    }
+}
+
+fn wire_contribution_key(key: &rift_core::ContributionKey) -> ContributionKey {
+    ContributionKey {
+        provider: key.reference().provider().as_str().to_owned(),
+        symbol: key.reference().symbol().as_str().to_owned(),
+        publication: key.publication().get(),
+    }
+}
+
+fn wire_symbol_resolution(resolution: rift_core::SymbolResolution) -> SymbolResolution {
+    match resolution {
+        rift_core::SymbolResolution::Established => SymbolResolution::Established,
+        rift_core::SymbolResolution::Unresolved => SymbolResolution::Unresolved,
+        rift_core::SymbolResolution::Conflicting => SymbolResolution::Conflicting,
+    }
+}
+
+fn wire_presentation_field(field: rift_provider::PresentationField) -> SymbolPresentationField {
+    match field {
+        rift_provider::PresentationField::Language => SymbolPresentationField::Language,
+        rift_provider::PresentationField::Name => SymbolPresentationField::Name,
+        rift_provider::PresentationField::QualifiedName => SymbolPresentationField::QualifiedName,
+        rift_provider::PresentationField::Kind => SymbolPresentationField::Kind,
+        rift_provider::PresentationField::Container => SymbolPresentationField::Container,
+        rift_provider::PresentationField::Visibility => SymbolPresentationField::Visibility,
+        rift_provider::PresentationField::DocumentLocal => SymbolPresentationField::DocumentLocal,
+        rift_provider::PresentationField::Origin => SymbolPresentationField::Origin,
     }
 }
 
@@ -1508,26 +1554,40 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn symbol_read_returns_source_and_stable_identity() -> TestResult {
+    fn symbol_read_returns_normalized_identity_and_contributions() -> TestResult {
         let (_directory, service) = fixture()?;
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
+        let symbol = &value["hits"][0]["symbol"];
 
-        assert_eq!(value["hits"][0]["symbol"]["name"], "Beacon");
-        assert_eq!(value["hits"][0]["symbol"]["visibility"], "pub");
+        assert_eq!(symbol["name"], "Beacon");
+        assert_eq!(symbol["visibility"], "pub");
+        assert_eq!(symbol["resolution"], "established");
+        let index_revision = symbol["index_revision"]
+            .as_u64()
+            .expect("index revision is an integer");
+        assert_ne!(index_revision, 0);
+        assert_eq!(symbol["contributions"][0]["provider"], "syntax");
+        assert_eq!(symbol["contributions"][0]["publication"], index_revision);
         assert!(
-            value["hits"][0]["symbol"]["facets"]
+            symbol["contributions"][0]["symbol"]
+                .as_str()
+                .is_some_and(|identity| !identity.is_empty())
+        );
+        assert_eq!(symbol["disagreements"], json!([]));
+        assert!(
+            symbol["facets"]
                 .as_array()
                 .is_some_and(|facets| facets.contains(&json!("public")))
         );
         assert!(
-            value["hits"][0]["symbol"]["id"]
+            symbol["id"]
                 .as_str()
                 .is_some_and(|id| id.contains("/Beacon"))
         );
         assert_eq!(value["hits"][0]["source"]["text"], "pub struct Beacon;");
         assert_eq!(
-            value["hits"][0]["symbol"]["origin"]["unit"],
+            symbol["origin"]["unit"],
             json!("rift://source/project/src/lib.rs")
         );
         assert_eq!(
@@ -2077,6 +2137,65 @@ pub fn compute() -> i32 {
         assert_eq!(context[0].value(), "initial index build");
         assert_eq!(context[1].key(), "detail");
         assert_eq!(context[1].value(), "worker panicked");
+    }
+
+    #[test]
+    fn wire_semantic_enums_map_every_internal_value() {
+        let resolutions = [
+            (
+                rift_core::SymbolResolution::Established,
+                rift_protocol::read::SymbolResolution::Established,
+            ),
+            (
+                rift_core::SymbolResolution::Unresolved,
+                rift_protocol::read::SymbolResolution::Unresolved,
+            ),
+            (
+                rift_core::SymbolResolution::Conflicting,
+                rift_protocol::read::SymbolResolution::Conflicting,
+            ),
+        ];
+        for (internal, wire) in resolutions {
+            assert_eq!(super::wire_symbol_resolution(internal), wire);
+        }
+
+        let fields = [
+            (
+                rift_provider::PresentationField::Language,
+                rift_protocol::read::SymbolPresentationField::Language,
+            ),
+            (
+                rift_provider::PresentationField::Name,
+                rift_protocol::read::SymbolPresentationField::Name,
+            ),
+            (
+                rift_provider::PresentationField::QualifiedName,
+                rift_protocol::read::SymbolPresentationField::QualifiedName,
+            ),
+            (
+                rift_provider::PresentationField::Kind,
+                rift_protocol::read::SymbolPresentationField::Kind,
+            ),
+            (
+                rift_provider::PresentationField::Container,
+                rift_protocol::read::SymbolPresentationField::Container,
+            ),
+            (
+                rift_provider::PresentationField::Visibility,
+                rift_protocol::read::SymbolPresentationField::Visibility,
+            ),
+            (
+                rift_provider::PresentationField::DocumentLocal,
+                rift_protocol::read::SymbolPresentationField::DocumentLocal,
+            ),
+            (
+                rift_provider::PresentationField::Origin,
+                rift_protocol::read::SymbolPresentationField::Origin,
+            ),
+        ];
+        for (internal, wire) in fields {
+            assert_eq!(super::wire_presentation_field(internal), wire);
+        }
     }
 
     #[test]

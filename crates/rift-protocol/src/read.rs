@@ -296,7 +296,16 @@ fn default_get_symbol_params_page_index() -> u64 {
         "hits": [
             {
                 "symbol": {
+                    "index_revision": 1,
                     "id": "rift://symbol/rust/src/config.rs/load_config",
+                    "resolution": "established",
+                    "contributions": [
+                        {
+                            "provider": "syntax",
+                            "symbol": "load_config",
+                            "publication": 1
+                        }
+                    ],
                     "language": {
                         "name": "rust"
                     },
@@ -391,6 +400,7 @@ fn default_get_symbol_params_page_index() -> u64 {
                         }
                     ],
                     "extensions": {},
+                    "disagreements": [],
                     "document_local": false
                 },
                 "span": {
@@ -1333,14 +1343,85 @@ pub struct SourceUnitSpan {
     pub range: TextRange,
 }
 
-/// Provider-resolved semantic identity. Source structure lives in Node and is connected
-/// through Relationship.
+/// Identity of one immutable Contribution.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContributionKey {
+    /// Provider that published this Contribution.
+    #[schemars(length(max = 4096))]
+    pub provider: String,
+    /// Provider-local symbol identity.
+    #[schemars(length(max = 8192))]
+    pub symbol: String,
+    /// Provider publication containing this Contribution.
+    #[schemars(range(min = 1_u64))]
+    pub publication: u64,
+}
+
+/// Resolution state of one readable Symbol.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SymbolResolution {
+    /// One identity anchor establishes Symbol identity.
+    Established,
+    /// No accepted evidence establishes Symbol identity.
+    Unresolved,
+    /// More than one identity anchor applies.
+    Conflicting,
+}
+
+/// Presentation field whose retained Contributions disagree.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SymbolPresentationField {
+    /// Language differs.
+    Language,
+    /// Short name differs.
+    Name,
+    /// Provider-qualified name differs.
+    QualifiedName,
+    /// Exact kind differs.
+    Kind,
+    /// Containing symbol differs.
+    Container,
+    /// Visibility differs.
+    Visibility,
+    /// Document-local classification differs.
+    DocumentLocal,
+    /// Origin differs.
+    Origin,
+}
+
+/// One disagreement retained beside selected presentation facts.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SymbolDisagreement {
+    /// Contribution carrying another value.
+    pub contribution: ContributionKey,
+    /// Presentation field that differs.
+    pub field: SymbolPresentationField,
+}
+
+/// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
+/// and is connected through Relationship.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Symbol {
-    /// Unique identifier of this symbol across the whole workspace, and the URI that change
-    /// requests, filters, and relationship records accept unchanged.
-    pub id: SymbolId,
+    /// Captured index revision used to assemble this Symbol.
+    #[schemars(range(min = 1_u64))]
+    pub index_revision: u64,
+    /// Unique identifier of this Symbol across the whole workspace. Present only when
+    /// `resolution` is `established`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<SymbolId>,
+    /// Whether normalization established one Symbol identity.
+    pub resolution: SymbolResolution,
+    /// Contributions selected for this request, in presentation order.
+    pub contributions: Vec<ContributionKey>,
     /// The language this symbol belongs to.
     pub language: Language,
     /// The human-readable name, as written in the source: `parseConfig`. Rendered
@@ -1381,6 +1462,8 @@ pub struct Symbol {
     /// Language-specific facts with no portable equivalent, namespaced by the provider that
     /// emitted them.
     pub extensions: Extensions,
+    /// Presentation differences retained after field selection.
+    pub disagreements: Vec<SymbolDisagreement>,
     /// Whether language semantics confine this symbol to the document that declares it. The
     /// provider classifies locality from its language model.
     pub document_local: bool,
@@ -1639,7 +1722,8 @@ pub struct TypeExpression {
 mod tests {
     use super::{
         Digest, Duration, FileId, GetSymbolParams, Language, PAGE_INDEX_DEFAULT,
-        REVISION_ID_BYTES_MAX, ReadWarning, RevisionId, RevisionIdViolation, SourceUnitId,
+        REVISION_ID_BYTES_MAX, ReadWarning, RevisionId, RevisionIdViolation, SourceUnitId, Symbol,
+        SymbolResolution,
     };
     use schemars::schema_for;
     use serde_json::json;
@@ -1738,6 +1822,43 @@ mod tests {
         assert_eq!(value, json!("0123abcd"));
         let parsed: Digest = serde_json::from_value(value).expect("deserialize");
         assert_eq!(parsed, digest);
+    }
+
+    #[test]
+    fn unresolved_symbol_round_trips_with_contribution_identity() {
+        let value = json!({
+            "index_revision": 7,
+            "resolution": "unresolved",
+            "contributions": [{
+                "provider": "framework",
+                "symbol": "component:Beacon",
+                "publication": 3
+            }],
+            "language": { "name": "rust" },
+            "name": "Beacon",
+            "kind": "rust.struct",
+            "facets": ["type"],
+            "origin": {
+                "location": { "kind": "project" },
+                "source_kind": "authored"
+            },
+            "modifiers": [],
+            "types": [],
+            "signatures": [],
+            "documentation": [],
+            "extensions": {},
+            "disagreements": [],
+            "document_local": false
+        });
+        let symbol: Symbol =
+            serde_json::from_value(value.clone()).expect("unresolved Symbol decodes");
+        assert_eq!(symbol.id, None);
+        assert_eq!(symbol.resolution, SymbolResolution::Unresolved);
+        assert_eq!(symbol.contributions[0].provider, "framework");
+        assert_eq!(
+            serde_json::to_value(symbol).expect("unresolved Symbol encodes"),
+            value
+        );
     }
 
     #[test]
