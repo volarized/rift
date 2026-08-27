@@ -3,9 +3,9 @@
 use std::collections::BTreeSet;
 
 use rift_protocol::read::{
-    Documentation, ExtensionKey, Extensions, NodeId, Signature, SourceLocation, SymbolFacet,
+    Documentation, ExtensionKey, Extensions, NodeId, Signature, SymbolFacet, TypeBinding,
 };
-pub use rift_protocol::read::{ExactKind, Language, SourceKind};
+pub use rift_protocol::read::{ExactKind, Language, SourceKind, SourceLocation};
 use serde::Serialize;
 
 use crate::{
@@ -242,9 +242,13 @@ pub struct PortableSymbolFacts {
     qualified_name: String,
     kind: ExactKind,
     facets: Vec<SymbolFacet>,
+    container: Option<ContributionReference>,
+    modifiers: Vec<String>,
     visibility: Option<String>,
+    types: Vec<TypeBinding>,
     signatures: Vec<Signature>,
     documentation: Vec<Documentation>,
+    document_local: bool,
 }
 
 impl PortableSymbolFacts {
@@ -262,9 +266,13 @@ impl PortableSymbolFacts {
             qualified_name: qualified_name.into(),
             kind,
             facets: Vec::new(),
+            container: None,
+            modifiers: Vec::new(),
             visibility: None,
+            types: Vec::new(),
             signatures: Vec::new(),
             documentation: Vec::new(),
+            document_local: false,
         }
     }
 
@@ -272,6 +280,20 @@ impl PortableSymbolFacts {
     #[must_use]
     pub fn facets(mut self, facets: Vec<SymbolFacet>) -> Self {
         self.facets = facets;
+        self
+    }
+
+    /// Sets containing symbol reference.
+    #[must_use]
+    pub fn container(mut self, container: ContributionReference) -> Self {
+        self.container = Some(container);
+        self
+    }
+
+    /// Sets language modifiers.
+    #[must_use]
+    pub fn modifiers(mut self, modifiers: Vec<String>) -> Self {
+        self.modifiers = modifiers;
         self
     }
 
@@ -289,10 +311,24 @@ impl PortableSymbolFacts {
         self
     }
 
+    /// Sets type facts.
+    #[must_use]
+    pub fn types(mut self, types: Vec<TypeBinding>) -> Self {
+        self.types = types;
+        self
+    }
+
     /// Sets documentation blocks.
     #[must_use]
     pub fn documentation(mut self, documentation: Vec<Documentation>) -> Self {
         self.documentation = documentation;
+        self
+    }
+
+    /// Sets document-local classification.
+    #[must_use]
+    pub const fn document_local(mut self, document_local: bool) -> Self {
+        self.document_local = document_local;
         self
     }
 
@@ -326,10 +362,28 @@ impl PortableSymbolFacts {
         &self.facets
     }
 
+    /// Returns containing symbol reference.
+    #[must_use]
+    pub const fn container_reference(&self) -> Option<&ContributionReference> {
+        self.container.as_ref()
+    }
+
+    /// Returns language modifiers.
+    #[must_use]
+    pub fn modifier_words(&self) -> &[String] {
+        &self.modifiers
+    }
+
     /// Returns authored visibility spelling.
     #[must_use]
     pub fn visibility_spelling(&self) -> Option<&str> {
         self.visibility.as_deref()
+    }
+
+    /// Returns type facts.
+    #[must_use]
+    pub fn type_bindings(&self) -> &[TypeBinding] {
+        &self.types
     }
 
     /// Returns callable signatures.
@@ -342,6 +396,12 @@ impl PortableSymbolFacts {
     #[must_use]
     pub fn documentation_blocks(&self) -> &[Documentation] {
         &self.documentation
+    }
+
+    /// Returns document-local classification.
+    #[must_use]
+    pub const fn is_document_local(&self) -> bool {
+        self.document_local
     }
 }
 
@@ -679,6 +739,8 @@ fn validate_portable_facts(facts: &PortableSymbolFacts) -> Result<(), Contributi
     }
     let counts = [
         facts.facets.len(),
+        facts.modifiers.len(),
+        facts.types.len(),
         facts.signatures.len(),
         facts.documentation.len(),
     ];
