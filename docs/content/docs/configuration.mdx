@@ -56,6 +56,32 @@ The worker pool exists before the first request, so the server sizes it once at 
 change to this table applies on the next start, while every other table applies to later
 requests as soon as the file is accepted.
 
+## Logs
+
+<VersionBadge version="v0.0.21" />
+
+`logs` bounds what the server records about itself. Every diagnostic the process emits also
+lands in the workspace database, where the `rift://logs` resource reads it back - so a refusal
+an agent meets can be explained without an operator reading the server's terminal:
+
+```toml
+[logs]
+retention_records = 50000
+page_records = 500
+capture = "rift=info,rift_mcp=info,rift_server=info"
+```
+
+- `retention_records` caps the records the store keeps, 100 to 1000000; a write past the cap
+  drops the oldest records first
+- `page_records` caps what one `rift://logs` read returns, 1 to 5000
+- `capture` selects which targets are recorded, in the `RUST_LOG` spelling `tracing` takes -
+  `rift_mcp=debug` records the index lane's own rebuild decisions. A target this filter
+  excludes never reaches the store, whatever the terminal shows
+
+The server reads this table at startup, so a change applies on the next start. The records
+outlive the process that wrote them: they live beside the search index in `.rift/db`, and a
+workspace whose index will not settle still answers `rift://logs`.
+
 ## Source
 
 <VersionBadge version="v0.0.6" />

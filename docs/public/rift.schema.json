@@ -470,6 +470,35 @@
       },
       "type": "object"
     },
+    "LogsConfiguration": {
+      "additionalProperties": false,
+      "description": "The `[logs]` table. The server records its own diagnostics in the workspace\ndatabase, where `rift://logs` reads them back, and this table bounds how\nmany records the store keeps, how many one read returns, and which targets\nare captured at all. The server reads the table at startup, so a change\napplies on the next start.",
+      "properties": {
+        "capture": {
+          "default": "rift=info,rift_mcp=info,rift_server=info",
+          "description": "Which targets are recorded, in the `RUST_LOG` spelling `tracing` takes:\ncomma-separated `target=level` pairs. A target this filter excludes\nnever reaches the store, whatever the stderr diagnostics carry.",
+          "maxLength": 512,
+          "type": "string"
+        },
+        "page_records": {
+          "default": 500,
+          "description": "Records one `rift://logs` read returns at most, 1 to 5000.",
+          "format": "uint64",
+          "maximum": 5000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "retention_records": {
+          "default": 50000,
+          "description": "Records the store keeps before the oldest are dropped, 100 to 1000000.",
+          "format": "uint64",
+          "maximum": 1000000,
+          "minimum": 100,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "PathPattern": {
       "description": "Project-relative glob using *, ?, **, and character classes. Forward-slash separated on\nevery platform, whatever separator the host OS uses natively.",
       "examples": [
@@ -923,6 +952,15 @@
       },
       "maxItems": 32,
       "type": "array"
+    },
+    "logs": {
+      "$ref": "#/$defs/LogsConfiguration",
+      "default": {
+        "capture": "rift=info,rift_mcp=info,rift_server=info",
+        "page_records": 500,
+        "retention_records": 50000
+      },
+      "description": "The server's own log records: how many the workspace database keeps,\nhow many one read returns, and which targets are captured."
     },
     "providers": {
       "$ref": "#/$defs/ProvidersConfiguration",
