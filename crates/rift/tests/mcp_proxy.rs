@@ -141,6 +141,13 @@ async fn cold_start_elects_a_server_that_survives_the_proxy() -> TestResult {
     let _cleanup = StopOnDrop::new(root);
 
     let client = proxy_client(root).await?;
+    let initialized = serde_json::to_value(
+        client
+            .peer_info()
+            .ok_or("the proxy must return initialize data")?,
+    )?;
+    let advertised_identity = initialized["_meta"]["sh.volar/rift"].clone();
+
     let listing = within("the proxied tool listing", client.list_tools(None)).await??;
     assert_eq!(
         listing
@@ -153,6 +160,30 @@ async fn cold_start_elects_a_server_that_survives_the_proxy() -> TestResult {
     assert_beacon(&beacon_lookup(&client).await?);
 
     let serving = serving_document(root).ok_or("the proxy must have elected a server")?;
+    assert_eq!(
+        advertised_identity,
+        serde_json::to_value(&serving.identity)?,
+        "initialize and the lock document must identify the same server"
+    );
+
+    let inserted = proxied_call(
+        &client,
+        "insert_symbol",
+        &json!({
+            "anchor": "rift://symbol/rust/lib.rs/beacon",
+            "position": "after",
+            "body": "pub fn lantern() {}",
+        }),
+    )
+    .await?;
+    assert_eq!(inserted["status"], json!("applied"), "{inserted:#}");
+    let lantern = proxied_call(&client, "get_symbol", &json!({"name": "lantern"})).await?;
+    assert_eq!(
+        lantern["hits"][0]["symbol"]["name"],
+        json!("lantern"),
+        "{lantern:#}"
+    );
+
     client.cancel().await?;
     let survivor = serving_document(root).ok_or("the server must survive the proxy's exit")?;
     assert_eq!(

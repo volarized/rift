@@ -721,7 +721,7 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::time::Duration;
 
-    use rift_protocol::lock::{SERVER_TOKEN_LENGTH, ServerLock};
+    use rift_protocol::lock::{ProductIdentity, SERVER_TOKEN_LENGTH, ServerLock};
     use rmcp::model::{ProtocolVersion, ServerCapabilities, ServerPeerInfo};
     use rmcp::service::{QuitReason, RoleClient, RunningService, serve_directly};
     use rmcp::transport::DynamicTransportError;
@@ -731,13 +731,30 @@ mod tests {
     use super::{
         ConnectAttemptFailure, ProxyFault, RiftProxy, SpawnPollOutcome, StartupCapture, Upstream,
         adopt_serving, connect_recorded, fallback_info, forwarded_error, lost_start_election,
-        mirrored_info, quit_reason_result, reuse_current, serve_connection, server_start_failed,
-        spawn_poll_outcome, transport_failed, upstream_unavailable, version_mismatch,
+        mirrored_info, quit_reason_result, require_identity_match, reuse_current, serve_connection,
+        server_start_failed, spawn_poll_outcome, transport_failed, upstream_unavailable,
     };
     use crate::election::claim;
     use rift_core::{CapturedStream, Error};
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    const EXECUTABLE_DIGEST_A: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const EXECUTABLE_DIGEST_B: &str =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const SCHEMA_DIGEST_A: &str =
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const SCHEMA_DIGEST_B: &str =
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+    fn identity(version: &str, executable_digest: &str, schema_digest: &str) -> ProductIdentity {
+        ProductIdentity {
+            version: version.to_owned(),
+            executable_digest: executable_digest.to_owned(),
+            schema_digest: schema_digest.to_owned(),
+        }
+    }
 
     fn transport_send_failure() -> ServiceError {
         ServiceError::TransportSend(DynamicTransportError::from_parts(
@@ -752,7 +769,7 @@ mod tests {
             port,
             token: "a".repeat(SERVER_TOKEN_LENGTH),
             pid: 4_242,
-            version: "0.0.11".to_owned(),
+            identity: identity("0.0.11", EXECUTABLE_DIGEST_A, SCHEMA_DIGEST_A),
         }
     }
 
@@ -851,9 +868,46 @@ mod tests {
     }
 
     #[test]
-    fn version_mismatch_compares_exact_spellings() {
-        assert!(!version_mismatch("0.0.11", "0.0.11"));
-        assert!(version_mismatch("0.0.10", "0.0.11"));
+    fn matching_product_identities_are_accepted() {
+        let expected = identity("0.0.11", EXECUTABLE_DIGEST_A, SCHEMA_DIGEST_A);
+        let lock = recorded_lock(12_345);
+        assert_eq!(require_identity_match(&expected, &lock), Ok(()));
+    }
+
+    #[test]
+    fn same_version_with_a_different_executable_digest_is_refused() {
+        let expected = identity("0.0.11", EXECUTABLE_DIGEST_B, SCHEMA_DIGEST_A);
+        let lock = recorded_lock(12_345);
+        let refusal = require_identity_match(&expected, &lock)
+            .expect_err("another executable at the same version must be refused");
+        assert!(refusal.message.contains(EXECUTABLE_DIGEST_A));
+        assert!(refusal.message.contains(EXECUTABLE_DIGEST_B));
+        assert!(refusal.message.contains("pid 4242"), "{}", refusal.message);
+        assert!(
+            refusal.message.contains("rift server stop"),
+            "{}",
+            refusal.message
+        );
+    }
+
+    #[test]
+    fn a_different_schema_digest_is_refused() {
+        let expected = identity("0.0.11", EXECUTABLE_DIGEST_A, SCHEMA_DIGEST_B);
+        let lock = recorded_lock(12_345);
+        let refusal = require_identity_match(&expected, &lock)
+            .expect_err("another served tool schema must be refused");
+        assert!(refusal.message.contains(SCHEMA_DIGEST_A));
+        assert!(refusal.message.contains(SCHEMA_DIGEST_B));
+    }
+
+    #[test]
+    fn a_different_package_version_is_refused() {
+        let expected = identity("0.0.12", EXECUTABLE_DIGEST_A, SCHEMA_DIGEST_A);
+        let lock = recorded_lock(12_345);
+        let refusal = require_identity_match(&expected, &lock)
+            .expect_err("another package version must be refused");
+        assert!(refusal.message.contains("0.0.11"));
+        assert!(refusal.message.contains("0.0.12"));
     }
 
     #[test]

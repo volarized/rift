@@ -551,6 +551,8 @@ pub(crate) fn publish_rewrites(
 mod tests {
     use std::error::Error;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     use rift_core::{ProjectPath as CoreProjectPath, SourceVisibility, TextFileInclusion};
     use rift_index::WorkspaceIndexLimits;
@@ -861,6 +863,131 @@ mod tests {
         assert!(
             directory.path().join("blocked.rs").is_dir(),
             "the blocking directory is untouched"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn permission_mode(path: &std::path::Path) -> std::io::Result<u32> {
+        Ok(fs::metadata(path)?.permissions().mode() & 0o777)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_publish_rewrites_preserves_executable_permissions() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let target = directory.path().join("run.sh");
+        let source = "#!/bin/sh\necho old\n";
+        fs::write(&target, source)?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o751))?;
+        let reads = reads_over(directory.path(), &SourceVisibility::default())?;
+        let next = "#!/bin/sh\necho new\n";
+        let rewrites = vec![FileRewrite::modify(
+            path("run.sh"),
+            source,
+            next.to_owned(),
+            vec![ReplacedRegion {
+                range: ByteRange { start: 15, end: 18 },
+                text: "new".to_owned(),
+            }],
+        )];
+        publish_rewrites(&reads, directory.path(), &rewrites)?
+            .expect("an executable rewrite must publish");
+        assert_eq!(fs::read_to_string(&target)?, next);
+        assert_eq!(
+            permission_mode(&target)?,
+            0o751,
+            "publishing new bytes must retain executable permissions"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_publish_rewrites_preserves_non_executable_permissions() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let target = directory.path().join("notes.txt");
+        let source = "old notes\n";
+        fs::write(&target, source)?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640))?;
+        let reads = reads_over(directory.path(), &SourceVisibility::default())?;
+        let next = "new notes\n";
+        let rewrites = vec![FileRewrite::modify(
+            path("notes.txt"),
+            source,
+            next.to_owned(),
+            vec![ReplacedRegion {
+                range: ByteRange { start: 0, end: 3 },
+                text: "new".to_owned(),
+            }],
+        )];
+        publish_rewrites(&reads, directory.path(), &rewrites)?
+            .expect("a non-executable rewrite must publish");
+        assert_eq!(fs::read_to_string(&target)?, next);
+        assert_eq!(
+            permission_mode(&target)?,
+            0o640,
+            "publishing new bytes must retain non-executable permissions"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_publish_rewrites_rollback_restores_permissions() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let target = directory.path().join("run.sh");
+        let source = "#!/bin/sh\necho old\n";
+        fs::write(&target, source)?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o751))?;
+        fs::create_dir(directory.path().join("blocked.rs"))?;
+        let reads = reads_over(directory.path(), &SourceVisibility::default())?;
+        let rewrites = vec![
+            FileRewrite::modify(
+                path("run.sh"),
+                source,
+                "#!/bin/sh\necho new\n".to_owned(),
+                vec![ReplacedRegion {
+                    range: ByteRange { start: 15, end: 18 },
+                    text: "new".to_owned(),
+                }],
+            ),
+            FileRewrite::create(path("blocked.rs"), "pub fn blocked() {}\n".to_owned()),
+        ];
+        let error = publish_rewrites(&reads, directory.path(), &rewrites)
+            .expect_err("a directory standing where a file is expected must fail the publish");
+        assert_eq!(error.descriptor().code(), "storage_failure");
+        assert_eq!(fs::read_to_string(&target)?, source);
+        assert_eq!(
+            permission_mode(&target)?,
+            0o751,
+            "rollback must restore captured permissions with captured bytes"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_publish_rewrites_rollback_restores_deleted_file_permissions() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let target = directory.path().join("run.sh");
+        let source = "#!/bin/sh\necho old\n";
+        fs::write(&target, source)?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o751))?;
+        fs::create_dir(directory.path().join("blocked.rs"))?;
+        let reads = reads_over(directory.path(), &SourceVisibility::default())?;
+        let rewrites = vec![
+            FileRewrite::delete(path("run.sh"), source),
+            FileRewrite::create(path("blocked.rs"), "pub fn blocked() {}\n".to_owned()),
+        ];
+        let error = publish_rewrites(&reads, directory.path(), &rewrites)
+            .expect_err("a directory standing where a file is expected must fail the publish");
+        assert_eq!(error.descriptor().code(), "storage_failure");
+        assert_eq!(fs::read_to_string(&target)?, source);
+        assert_eq!(
+            permission_mode(&target)?,
+            0o751,
+            "rollback must recreate a deleted file with captured permissions"
         );
         Ok(())
     }

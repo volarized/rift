@@ -1501,6 +1501,99 @@ mod tests {
         }
     }
 
+    fn assert_source_unchanged_refusal(result: ChangeResult) {
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("a change with no byte difference must refuse, got {result:?}");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(preconditions.len(), 1);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::SourceUnchanged
+        );
+    }
+
+    #[test]
+    fn test_apply_rewrites_refuses_an_empty_batch_as_source_unchanged() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let result = changes.apply_rewrites(&reads, &[])?;
+        assert_source_unchanged_refusal(result);
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_rewrites_refuses_a_byte_equal_replacement_as_source_unchanged() -> TestResult {
+        let source = "pub fn beacon() {}\n";
+        let (directory, reads, changes) = fixture(source)?;
+        let rewrites = vec![FileRewrite::modify(
+            CoreProjectPath::new("lib.rs")?,
+            source,
+            source.to_owned(),
+            vec![ReplacedRegion {
+                range: ByteRange {
+                    start: 0,
+                    end: source.len() as u64,
+                },
+                text: source.to_owned(),
+            }],
+        )];
+        let result = changes.apply_rewrites(&reads, &rewrites)?;
+        assert_source_unchanged_refusal(result);
+        assert_eq!(fs::read_to_string(directory.path().join("lib.rs"))?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_rewrites_omits_unchanged_members_from_an_applied_batch() -> TestResult {
+        let changed_source = "pub fn changed() {}\n";
+        let unchanged_source = "pub fn steady() {}\n";
+        let (directory, reads, changes) = multi_file_fixture(&[
+            ("changed.rs", changed_source),
+            ("steady.rs", unchanged_source),
+        ])?;
+        let changed_next = "pub fn renamed() {}\n";
+        let rewrites = vec![
+            FileRewrite::modify(
+                CoreProjectPath::new("changed.rs")?,
+                changed_source,
+                changed_next.to_owned(),
+                vec![ReplacedRegion {
+                    range: ByteRange { start: 7, end: 14 },
+                    text: "renamed".to_owned(),
+                }],
+            ),
+            FileRewrite::modify(
+                CoreProjectPath::new("steady.rs")?,
+                unchanged_source,
+                unchanged_source.to_owned(),
+                vec![ReplacedRegion {
+                    range: ByteRange {
+                        start: 0,
+                        end: unchanged_source.len() as u64,
+                    },
+                    text: unchanged_source.to_owned(),
+                }],
+            ),
+        ];
+        let summary = applied_summary(changes.apply_rewrites(&reads, &rewrites)?);
+        assert_eq!(summary.paths, vec![ProjectPath("changed.rs".to_owned())]);
+        assert_eq!(summary.edits.len(), 1);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("changed.rs"))?,
+            changed_next
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("steady.rs"))?,
+            unchanged_source
+        );
+        Ok(())
+    }
+
     #[test]
     fn replace_symbol_rewrites_the_declaration_atomically() -> TestResult {
         let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
@@ -3688,6 +3781,28 @@ mod tests {
             "missing parent directories are created on publish"
         );
         assert!(!directory.path().join("hub.rs").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_apply_move_preserves_executable_permissions() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = "pub fn run() {}\n";
+        let (directory, reads, changes) = multi_file_fixture(&[("run.rs", source)])?;
+        let from = directory.path().join("run.rs");
+        fs::set_permissions(&from, fs::Permissions::from_mode(0o751))?;
+        let plan = move_plan("run.rs", "moved.rs", (source, source), vec![], None);
+        applied_summary(changes.apply_move(&reads, &plan)?);
+        let to = directory.path().join("moved.rs");
+        assert!(!from.exists());
+        assert_eq!(fs::read_to_string(&to)?, source);
+        assert_eq!(
+            fs::metadata(&to)?.permissions().mode() & 0o777,
+            0o751,
+            "moving a file must retain its executable permissions"
+        );
         Ok(())
     }
 

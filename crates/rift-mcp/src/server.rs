@@ -1895,6 +1895,7 @@ mod tests {
     use rift_protocol::configuration::{
         Duration as WireDuration, SearchConfiguration, SemanticSearchConfiguration, SemanticSource,
     };
+    use rift_protocol::lock::ProductIdentity;
     use rift_protocol::read::{GetSymbolResult, ReadWarning, SearchParams, SearchResult};
     use rift_search::{ModelSource, RevisionScoped, SemanticReadiness};
     use rift_server::{ChangeService, ConfigurationFault, ReadError, ReadFault};
@@ -1903,6 +1904,7 @@ mod tests {
     use rmcp::ServiceExt as _;
     use rmcp::model::{CallToolRequestParams, ErrorCode};
     use serde_json::json;
+    use sha2::{Digest as _, Sha256};
 
     use crate::validation::RebuildRequest;
 
@@ -2641,7 +2643,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exported_schema_document_matches_served_tools() -> TestResult {
+    async fn initialize_schema_digest_matches_the_canonical_served_tool_list() -> TestResult {
         let (_directory, server) = fixture().await?;
         let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
         let server_task = tokio::spawn(async move {
@@ -2655,7 +2657,20 @@ mod tests {
         let mut advertised = client.list_all_tools().await?;
         advertised.sort_by(|left, right| left.name.cmp(&right.name));
 
-        let document: serde_json::Value = serde_json::from_str(&crate::schema::schema_document())?;
+        let schema_document = crate::schema::schema_document();
+        let schema_digest = format!("{:x}", Sha256::digest(schema_document.as_bytes()));
+        let peer_info = client
+            .peer_info()
+            .ok_or("initialize must advertise server information")?;
+        let initialize = serde_json::to_value(peer_info)?;
+        let identity: ProductIdentity =
+            serde_json::from_value(initialize["_meta"]["sh.volar/rift"].clone())?;
+        assert_eq!(
+            identity.schema_digest, schema_digest,
+            "initialize must name the digest of the canonical served tool document"
+        );
+
+        let document: serde_json::Value = serde_json::from_str(&schema_document)?;
         let exported = document["tools"]
             .as_array()
             .ok_or("exported document must carry a tools array")?;

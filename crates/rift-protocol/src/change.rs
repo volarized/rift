@@ -702,6 +702,13 @@ mod tests {
     }
 
     #[test]
+    fn test_change_summary_schema_requires_paths_and_edits() {
+        let schema = serde_json::to_value(schema_for!(ChangeSummary)).expect("change schema");
+        assert_eq!(schema["properties"]["paths"]["minItems"], json!(1));
+        assert_eq!(schema["properties"]["edits"]["minItems"], json!(1));
+    }
+
+    #[test]
     fn change_result_applied_round_trips_through_json() {
         let result = ChangeResult::Applied {
             summary: ChangeSummary {
