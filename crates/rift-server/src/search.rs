@@ -92,7 +92,7 @@ impl ReadService {
             criteria,
             ranked,
             &mut results,
-        );
+        )?;
         order_hits(&mut results, params.order);
         results.truncate(fetch_limit);
         let (results, pagination) = page(results, params.page_index, limit);
@@ -282,7 +282,7 @@ fn collect_indexed_hits(
             if !includes(matcher, root, matched.file.path()) {
                 continue;
             }
-            results.push(symbol_search_hit(index, matched, payloads));
+            results.push(symbol_search_hit(index, matched, payloads)?);
             if results.len() >= fetch_limit {
                 return Ok(());
             }
@@ -338,10 +338,11 @@ fn collect_indexed_content_hits(
 }
 
 /// Reaches files `selector.force_include` names outside the index - bypassing `[source]`
-/// policy and `.gitignore`, never the hard floor - parses them on demand, and searches them
-/// with the same scoring pipeline as indexed hits, appending up to `fetch_limit` total
-/// results: the full collection bound the pool pages under, never one page's size.
-/// Bounded to [`FORCE_INCLUDE_FILES_MAX`] matched files; a crossed bound refuses the search.
+/// policy and `.gitignore`, never the hard floor - parses and publishes them on demand,
+/// then searches them with the same scoring pipeline as indexed hits, appending up to
+/// `fetch_limit` total results: the full collection bound the pool pages under, never one
+/// page's size. Bounded to [`FORCE_INCLUDE_FILES_MAX`] matched files; a crossed bound
+/// refuses the search.
 fn collect_force_include_hits(
     index: &WorkspaceIndex,
     selector: &PathSelector,
@@ -358,21 +359,24 @@ fn collect_force_include_hits(
         payloads,
     } = criteria;
     let extra = index
-        .force_include_files(
+        .force_include_index(
             &pattern_strings(&selector.force_include),
             FORCE_INCLUDE_FILES_MAX,
         )
         .map_err(ReadFault::index)?;
     if matches!(target, SearchParamsTarget::All | SearchParamsTarget::Symbol) {
-        for matched in rift_index::symbol_matches(&extra, query, fetch_limit - results.len()) {
-            results.push(symbol_search_hit(index, matched, payloads));
+        for matched in extra
+            .symbols(query, fetch_limit - results.len())
+            .map_err(ReadFault::index)?
+        {
+            results.push(symbol_search_hit(&extra, matched, payloads)?);
         }
     }
     if results.len() < fetch_limit
         && matches!(target, SearchParamsTarget::All | SearchParamsTarget::File)
     {
         for (file, line, text) in
-            rift_index::source_line_matches(&extra, query, fetch_limit - results.len())
+            rift_index::source_line_matches(extra.files(), query, fetch_limit - results.len())
         {
             results.push(file_search_hit(file, line, text, payloads));
         }
@@ -384,7 +388,7 @@ fn symbol_search_hit(
     index: &WorkspaceIndex,
     matched: SymbolMatch<'_>,
     payloads: HitPayloads,
-) -> SearchHit {
+) -> Result<SearchHit, ReadError> {
     let score = symbol_match_score(matched.rank);
     build_symbol_hit(index, matched, score, vec![MatchedField::Name], payloads)
 }
@@ -399,10 +403,10 @@ fn build_symbol_hit(
     score: f64,
     matched_by: Vec<MatchedField>,
     payloads: HitPayloads,
-) -> SearchHit {
-    SearchHit {
+) -> Result<SearchHit, ReadError> {
+    Ok(SearchHit {
         hit: SearchHitTarget::Symbol {
-            symbol: wire_symbol(index, matched),
+            symbol: wire_symbol(index, matched)?,
         },
         score,
         matched_by,
@@ -417,7 +421,7 @@ fn build_symbol_hit(
         path: Some(project_path(matched.file.path())),
         traversal_path: None,
         distance: None,
-    }
+    })
 }
 
 /// Builds one file hit's wire shape. `text` is still needed to size `range` whether or not
@@ -523,7 +527,7 @@ fn collect_ranked_hits(
     criteria: SearchCriteria<'_>,
     ranked: &[RankedUnit],
     results: &mut Vec<SearchHit>,
-) {
+) -> Result<(), ReadError> {
     let SearchCriteria {
         query,
         target,
@@ -538,14 +542,13 @@ fn collect_ranked_hits(
             else {
                 // The search index held this symbol at a tree revision the request's
                 // revision guard already proved current, but a symbol it named can still be
-                // gone from this exact index (a race the guard narrows, never closes to
-                // zero); skipping it silently is correct, not a defect to surface.
+                // gone from this exact index; skipping it silently is correct.
                 continue;
             };
             if !includes(matcher, root, file.path()) {
                 continue;
             }
-            merge_symbol_hit(index, results, file, symbol, matched.score(), payloads);
+            merge_symbol_hit(index, results, file, symbol, matched.score(), payloads)?;
         }
     }
     if matches!(target, SearchParamsTarget::All | SearchParamsTarget::File) {
@@ -560,6 +563,7 @@ fn collect_ranked_hits(
             merge_file_hit(results, file, line_number, range, text, score, payloads);
         }
     }
+    Ok(())
 }
 
 /// Resolves one ranked symbol unit's identity back to its declaration in `index`. `path`
@@ -631,7 +635,7 @@ fn merge_symbol_hit(
     symbol: &SyntaxSymbol,
     score: f64,
     payloads: HitPayloads,
-) {
+) -> Result<(), ReadError> {
     let identity = SymbolId(rift_core::symbol_identity(
         &file.syntax().language().identity_segment(),
         file.path().as_str(),
@@ -642,13 +646,12 @@ fn merge_symbol_hit(
     );
     if let Some(existing) = existing {
         absorb_ranked_match(existing, score);
-        return;
+        return Ok(());
     }
     let matched = SymbolMatch {
         file,
         symbol,
-        // Unused: this caller supplies `score` directly, never `symbol_match_score`, so
-        // no identifier rank need be a genuine one here.
+        // This caller supplies `score` directly and never reads identifier rank.
         rank: SymbolMatchRank::Substring,
     };
     results.push(build_symbol_hit(
@@ -657,7 +660,8 @@ fn merge_symbol_hit(
         score,
         vec![MatchedField::Ranked],
         payloads,
-    ));
+    )?);
+    Ok(())
 }
 
 /// Merges one ranked text-file unit: an identifier-matched hit at the same path and line
@@ -2044,8 +2048,7 @@ pub fn compute() -> i32 {
     #[test]
     #[expect(
         clippy::float_cmp,
-        reason = "the score under test is `f64::max` over exact literals, not a measurement \
-                  subject to rounding drift"
+        reason = "the score under test is f64::max over exact literals, not a measurement subject to rounding drift"
     )]
     fn merge_symbol_hit_unions_matched_by_and_keeps_the_higher_score() -> TestResult {
         let (_directory, service) = fixture()?;
@@ -2060,7 +2063,7 @@ pub fn compute() -> i32 {
             0.5,
             vec![MatchedField::Name],
             super::HitPayloads::default(),
-        );
+        )?;
         let mut results = vec![existing];
 
         super::merge_symbol_hit(
@@ -2070,7 +2073,7 @@ pub fn compute() -> i32 {
             symbol,
             0.9,
             super::HitPayloads::default(),
-        );
+        )?;
         assert_eq!(results.len(), 1, "the same symbol must not duplicate");
         assert_eq!(results[0].score, 0.9, "the higher score must win");
         assert_eq!(
@@ -2087,7 +2090,7 @@ pub fn compute() -> i32 {
             symbol,
             0.1,
             super::HitPayloads::default(),
-        );
+        )?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].score, 0.9);
         assert_eq!(
@@ -2199,7 +2202,7 @@ pub fn compute() -> i32 {
             },
             &ranked,
             &mut results,
-        );
+        )?;
         assert!(
             results.is_empty(),
             "a symbol identity absent from the index must be skipped silently: {results:#?}"
@@ -2232,7 +2235,7 @@ pub fn compute() -> i32 {
             },
             &ranked,
             &mut results,
-        );
+        )?;
         assert!(
             results.is_empty(),
             "a text-file path absent from the index must be skipped silently: {results:#?}"
@@ -2286,7 +2289,7 @@ pub fn compute() -> i32 {
             },
             &ranked,
             &mut results,
-        );
+        )?;
         assert_eq!(
             results.len(),
             1,
