@@ -820,7 +820,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CONTRIBUTION_EVIDENCE_MAX, Contribution, ContributionKey, ContributionOrigin,
+        CONTRIBUTION_EVIDENCE_MAX, CONTRIBUTION_FACTS_MAX, CONTRIBUTION_NAMESPACE_BYTES_MAX,
+        CONTRIBUTION_NAMESPACES_MAX, Contribution, ContributionKey, ContributionOrigin,
         ContributionReference, ContributionViolation, EquivalenceEvidence, PortableSymbolFacts,
         SourceApplicability, SourceRange, SymbolRecord, SymbolResolution,
     };
@@ -876,6 +877,9 @@ mod tests {
             ExactKind("rust.struct".to_owned()),
         )
         .facets(vec![SymbolFacet::Type, SymbolFacet::Public])
+        .visibility("pub")
+        .signatures(Vec::new())
+        .documentation(Vec::new())
     }
 
     fn contribution() -> Contribution {
@@ -906,9 +910,43 @@ mod tests {
     #[test]
     fn contribution_builds_with_exact_source_anchor() {
         let contribution = contribution();
-        assert_eq!(contribution.key().reference().provider().as_str(), "syntax");
-        assert_eq!(contribution.facts().name(), "Beacon");
+        let key = contribution.key();
+        assert_eq!(key.reference().provider().as_str(), "syntax");
+        assert_eq!(key.reference().symbol().as_str(), "Beacon");
+        assert_eq!(key.publication(), publication(1));
+        assert_eq!(
+            contribution.applicability(),
+            SourceApplicability::Exact {
+                source_revision: source_revision(1),
+                tree_revision: tree_revision(1),
+            }
+        );
+
+        let facts = contribution.facts();
+        assert_eq!(facts.language().name, "rust");
+        assert_eq!(facts.name(), "Beacon");
+        assert_eq!(facts.qualified_name(), "Beacon");
+        assert_eq!(facts.kind().0, "rust.struct");
+        assert_eq!(
+            facts.symbol_facets(),
+            &[SymbolFacet::Type, SymbolFacet::Public]
+        );
+        assert_eq!(facts.visibility_spelling(), Some("pub"));
+        assert!(facts.signatures_slice().is_empty());
+        assert!(facts.documentation_blocks().is_empty());
+
+        let origin = contribution.origin();
+        assert!(origin.location().is_some());
+        assert_eq!(origin.source_kind(), SourceKind::Authored);
+
+        let source = contribution.source().expect("source");
+        assert_eq!(source.unit(), &source_unit());
+        assert_eq!(source.range().start(), 0);
+        assert_eq!(source.range().end(), 12);
+        assert!(source.node().is_none());
         assert!(contribution.identity_anchor().is_some());
+        assert!(contribution.equivalence().is_empty());
+        assert!(contribution.namespaced().0.is_empty());
     }
 
     #[test]
@@ -923,7 +961,29 @@ mod tests {
     }
 
     #[test]
-    fn identity_anchor_requires_source_binding() {
+    fn invalid_ranges_and_origins_name_their_fields() {
+        let range_error = SourceRange::new(4, 4).expect_err("empty range");
+        assert_eq!(
+            range_error.fault().violation(),
+            ContributionViolation::InvalidSourceRange
+        );
+        assert_eq!(range_error.fault().field(), "source.range");
+        assert_eq!(range_error.context()[0].key(), "field");
+        assert!(range_error.to_string().contains("source.range"));
+
+        let origin_error =
+            ContributionOrigin::new(None, SourceKind::Authored).expect_err("missing location");
+        assert_eq!(
+            origin_error.fault().violation(),
+            ContributionViolation::InvalidOrigin
+        );
+        assert_eq!(origin_error.fault().field(), "origin");
+    }
+
+    #[test]
+    fn source_binding_and_identity_require_matching_origin() {
+        let synthetic =
+            ContributionOrigin::new(None, SourceKind::Synthetic).expect("synthetic origin");
         let error = Contribution::builder(
             ContributionKey::new(
                 provider("syntax"),
@@ -932,7 +992,7 @@ mod tests {
             ),
             SourceApplicability::Independent,
             facts(),
-            ContributionOrigin::new(None, SourceKind::Synthetic).expect("synthetic origin"),
+            synthetic.clone(),
         )
         .identity_anchor(SymbolId::new("rust:Beacon").expect("symbol"))
         .build()
@@ -940,6 +1000,29 @@ mod tests {
         assert_eq!(
             error.fault().violation(),
             ContributionViolation::UnboundIdentity
+        );
+
+        let source = super::DeclarationBinding::new(
+            source_unit(),
+            SourceRange::new(0, 12).expect("range"),
+            None,
+        );
+        let error = Contribution::builder(
+            ContributionKey::new(
+                provider("syntax"),
+                publication(1),
+                provider_symbol("Beacon"),
+            ),
+            SourceApplicability::Independent,
+            facts(),
+            synthetic,
+        )
+        .source(source)
+        .build()
+        .expect_err("synthetic source binding");
+        assert_eq!(
+            error.fault().violation(),
+            ContributionViolation::InvalidOrigin
         );
     }
 
@@ -982,27 +1065,153 @@ mod tests {
     }
 
     #[test]
-    fn namespace_key_and_version_are_validated() {
-        let mut map = BTreeMap::new();
-        map.insert(
+    fn portable_fact_validation_covers_names_language_kind_and_bounds() {
+        let cases = [
+            (
+                PortableSymbolFacts::new(
+                    Language {
+                        name: "rust".to_owned(),
+                        dialect: None,
+                    },
+                    "",
+                    "Beacon",
+                    ExactKind("rust.struct".to_owned()),
+                ),
+                ContributionViolation::InvalidName,
+            ),
+            (
+                PortableSymbolFacts::new(
+                    Language {
+                        name: "Rust".to_owned(),
+                        dialect: None,
+                    },
+                    "Beacon",
+                    "Beacon",
+                    ExactKind("rust.struct".to_owned()),
+                ),
+                ContributionViolation::InvalidLanguage,
+            ),
+            (
+                PortableSymbolFacts::new(
+                    Language {
+                        name: "rust".to_owned(),
+                        dialect: Some("Rust".to_owned()),
+                    },
+                    "Beacon",
+                    "Beacon",
+                    ExactKind("rust.struct".to_owned()),
+                ),
+                ContributionViolation::InvalidLanguage,
+            ),
+            (
+                PortableSymbolFacts::new(
+                    Language {
+                        name: "rust".to_owned(),
+                        dialect: None,
+                    },
+                    "Beacon",
+                    "Beacon",
+                    ExactKind("9struct".to_owned()),
+                ),
+                ContributionViolation::InvalidKind,
+            ),
+        ];
+        for (facts, violation) in cases {
+            let error = Contribution::builder(
+                ContributionKey::new(provider("docs"), publication(1), provider_symbol("Beacon")),
+                SourceApplicability::Independent,
+                facts,
+                ContributionOrigin::new(None, SourceKind::Synthetic).expect("synthetic origin"),
+            )
+            .build()
+            .expect_err("invalid portable facts");
+            assert_eq!(error.fault().violation(), violation);
+        }
+
+        let error = Contribution::builder(
+            ContributionKey::new(provider("docs"), publication(1), provider_symbol("Beacon")),
+            SourceApplicability::Independent,
+            facts().facets(vec![SymbolFacet::Type; CONTRIBUTION_FACTS_MAX + 1]),
+            ContributionOrigin::new(None, SourceKind::Synthetic).expect("synthetic origin"),
+        )
+        .build()
+        .expect_err("portable fact bound");
+        assert_eq!(
+            error.fault().violation(),
+            ContributionViolation::TooManyFacts
+        );
+    }
+
+    #[test]
+    fn namespace_keys_versions_counts_and_bytes_are_validated() {
+        let build = |map| {
+            Contribution::builder(
+                ContributionKey::new(provider("docs"), publication(1), provider_symbol("Beacon")),
+                SourceApplicability::Independent,
+                facts(),
+                ContributionOrigin::new(None, SourceKind::Synthetic).expect("synthetic origin"),
+            )
+            .namespaced(Extensions(map))
+            .build()
+        };
+
+        let mut invalid_key = BTreeMap::new();
+        invalid_key.insert(
             ExtensionKey("Bad".to_owned()),
             ExtensionValue {
                 version: 1,
                 data: json!({"value": true}),
             },
         );
-        let error = Contribution::builder(
-            ContributionKey::new(provider("docs"), publication(1), provider_symbol("Beacon")),
-            SourceApplicability::Independent,
-            facts(),
-            ContributionOrigin::new(None, SourceKind::Synthetic).expect("synthetic origin"),
-        )
-        .namespaced(Extensions(map))
-        .build()
-        .expect_err("invalid namespace");
+        let error = build(invalid_key).expect_err("invalid namespace");
         assert_eq!(
             error.fault().violation(),
             ContributionViolation::InvalidNamespace
+        );
+
+        let mut zero_version = BTreeMap::new();
+        zero_version.insert(
+            ExtensionKey("com.example.field".to_owned()),
+            ExtensionValue {
+                version: 0,
+                data: json!(null),
+            },
+        );
+        let error = build(zero_version).expect_err("zero namespace version");
+        assert_eq!(
+            error.fault().violation(),
+            ContributionViolation::InvalidNamespaceVersion
+        );
+
+        let mut oversized = BTreeMap::new();
+        oversized.insert(
+            ExtensionKey("com.example.field".to_owned()),
+            ExtensionValue {
+                version: 1,
+                data: json!("x".repeat(CONTRIBUTION_NAMESPACE_BYTES_MAX)),
+            },
+        );
+        let error = build(oversized).expect_err("oversized namespace value");
+        assert_eq!(
+            error.fault().violation(),
+            ContributionViolation::TooManyNamespacedFacts
+        );
+
+        let too_many = (0..=CONTRIBUTION_NAMESPACES_MAX)
+            .map(|index| {
+                (
+                    ExtensionKey(format!("com.example.field{index}")),
+                    ExtensionValue {
+                        version: 1,
+                        data: json!(null),
+                    },
+                )
+            })
+            .collect();
+        let error = build(too_many).expect_err("namespace count bound");
+        assert_eq!(
+            error.fault().violation(),
+            ContributionViolation::TooManyNamespacedFacts
         );
     }
 
@@ -1028,15 +1237,51 @@ mod tests {
     #[test]
     fn symbol_record_state_requires_matching_identity() {
         let key = contribution().key().clone();
-        let invalid = SymbolRecord::new(
-            IndexRevision::new(1).expect("index revision"),
-            None,
+        let index_revision = IndexRevision::new(1).expect("index revision");
+        let identity = SymbolId::new("rust:src/lib.rs:Beacon").expect("symbol");
+        let record = SymbolRecord::new(
+            index_revision,
+            Some(identity.clone()),
             SymbolResolution::Established,
-            vec![key],
+            vec![key.clone()],
         )
-        .expect_err("established record without identity");
+        .expect("established record");
+        assert_eq!(record.index_revision(), index_revision);
+        assert_eq!(record.identity(), Some(&identity));
+        assert_eq!(record.resolution(), SymbolResolution::Established);
+        assert_eq!(record.contributions(), std::slice::from_ref(&key));
+
+        let unresolved = SymbolRecord::new(
+            index_revision,
+            None,
+            SymbolResolution::Unresolved,
+            vec![key.clone()],
+        )
+        .expect("unresolved record");
+        assert_eq!(unresolved.resolution(), SymbolResolution::Unresolved);
+
+        let invalid = SymbolRecord::new(
+            index_revision,
+            Some(identity),
+            SymbolResolution::Conflicting,
+            vec![key.clone()],
+        )
+        .expect_err("conflicting record with identity");
         assert_eq!(
             invalid.fault().violation(),
+            ContributionViolation::InvalidRecord
+        );
+        assert_eq!(invalid.fault().field(), "symbol_record");
+
+        let empty = SymbolRecord::new(
+            index_revision,
+            None,
+            SymbolResolution::Unresolved,
+            Vec::new(),
+        )
+        .expect_err("record without contributions");
+        assert_eq!(
+            empty.fault().violation(),
             ContributionViolation::InvalidRecord
         );
     }

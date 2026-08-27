@@ -358,6 +358,8 @@ fn publication_error(violation: PublicationViolation, field: &'static str) -> Pu
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, RwLock};
+
     use rift_core::{
         Contribution, ContributionKey, ContributionOrigin, ExactKind, Language,
         PortableSymbolFacts, ProviderId, ProviderRevision, ProviderSymbolId, SourceApplicability,
@@ -413,6 +415,120 @@ mod tests {
             error.fault().violation(),
             PublicationViolation::DuplicateProviderSymbol
         );
+    }
+
+    #[test]
+    fn publication_limits_keys_and_accessors_are_enforced() {
+        let error = PublicationLimits::new(0, 1, 1).expect_err("zero limit");
+        assert_eq!(error.fault().violation(), PublicationViolation::ZeroLimit);
+        assert_eq!(error.context()[0].key(), "field");
+        assert!(error.to_string().contains("limits"));
+
+        let limits = PublicationLimits::new(1, 1, 2).expect("limits");
+        assert_eq!(limits.providers_max(), 1);
+        assert_eq!(limits.contributions_per_provider_max(), 1);
+        assert_eq!(limits.contributions_total_max(), 2);
+
+        let publication = ProviderPublication::new(
+            provider("syntax"),
+            revision(1),
+            vec![contribution("syntax", 1, "Beacon")],
+            limits,
+        )
+        .expect("publication");
+        assert_eq!(publication.provider(), &provider("syntax"));
+        assert_eq!(publication.revision(), revision(1));
+        assert_eq!(publication.contributions().len(), 1);
+
+        let error = ProviderPublication::new(
+            provider("syntax"),
+            revision(1),
+            vec![
+                contribution("syntax", 1, "Beacon"),
+                contribution("syntax", 1, "Other"),
+            ],
+            limits,
+        )
+        .expect_err("provider contribution bound");
+        assert_eq!(
+            error.fault().violation(),
+            PublicationViolation::ProviderContributionLimit
+        );
+
+        let error = ProviderPublication::new(
+            provider("syntax"),
+            revision(1),
+            vec![contribution("docs", 1, "Beacon")],
+            limits,
+        )
+        .expect_err("provider mismatch");
+        assert_eq!(
+            error.fault().violation(),
+            PublicationViolation::ProviderMismatch
+        );
+
+        let error = ProviderPublication::new(
+            provider("syntax"),
+            revision(1),
+            vec![contribution("syntax", 2, "Beacon")],
+            limits,
+        )
+        .expect_err("revision mismatch");
+        assert_eq!(
+            error.fault().violation(),
+            PublicationViolation::RevisionMismatch
+        );
+    }
+
+    #[test]
+    fn publication_set_exposes_order_and_enforces_provider_bound() {
+        let limits = PublicationLimits::new(1, 1, 2).expect("limits");
+        let store = PublicationStore::new(limits);
+        let empty = store.snapshot();
+        assert_eq!(empty.provider_count(), 0);
+        assert_eq!(empty.publications().count(), 0);
+        assert!(empty.provider(&provider("syntax")).is_none());
+
+        let publication = ProviderPublication::new(
+            provider("syntax"),
+            revision(1),
+            vec![contribution("syntax", 1, "Beacon")],
+            limits,
+        )
+        .expect("publication");
+        let current = store.replace(publication).expect("replacement");
+        assert_eq!(current.provider_count(), 1);
+        assert_eq!(current.publications().count(), 1);
+
+        let second = ProviderPublication::new(
+            provider("docs"),
+            revision(1),
+            vec![contribution("docs", 1, "Other")],
+            limits,
+        )
+        .expect("second publication");
+        let error = store.replace(second).expect_err("provider bound");
+        assert_eq!(
+            error.fault().violation(),
+            PublicationViolation::ProviderLimit
+        );
+    }
+
+    #[test]
+    fn poisoned_publication_lock_recovers_current_value() {
+        let limits = PublicationLimits::default();
+        let initial = Arc::new(super::PublicationSet::empty(limits));
+        let lock = Arc::new(RwLock::new(initial));
+        let poisoned = Arc::clone(&lock);
+        std::thread::spawn(move || {
+            let _guard = poisoned.write().expect("write");
+            panic!("poison publication lock");
+        })
+        .join()
+        .expect_err("thread panic");
+        assert_eq!(super::read_current(&lock).provider_count(), 0);
+        *super::write_current(&lock) = Arc::new(super::PublicationSet::empty(limits));
+        assert_eq!(super::read_current(&lock).contribution_count(), 0);
     }
 
     #[test]
