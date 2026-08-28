@@ -206,18 +206,44 @@ enum Settlement {
     Retry,
 }
 
-/// Decides whether one diagnostic report is ready to return.
-fn diagnostic_settlement(
-    readiness: EngineReadiness,
-    full: bool,
+/// Shape of one diagnostic report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReportShape {
+    /// Report carries only a partial result.
+    Partial,
+    /// Full report carries no finding.
+    FullEmpty,
+    /// Full report carries at least one finding.
+    FullNonempty,
+}
+
+impl ReportShape {
+    fn from_report(full: bool, empty: bool) -> Self {
+        if !full {
+            Self::Partial
+        } else if empty {
+            Self::FullEmpty
+        } else {
+            Self::FullNonempty
+        }
+    }
+}
+
+/// Evidence around one diagnostic report attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DiagnosticEvidence {
+    shape: ReportShape,
     repeated: bool,
     final_attempt: bool,
-) -> Settlement {
-    if !full || readiness == EngineReadiness::Analyzing {
+}
+
+/// Decides whether one diagnostic report is ready to return.
+fn diagnostic_settlement(readiness: EngineReadiness, evidence: DiagnosticEvidence) -> Settlement {
+    if evidence.shape == ReportShape::Partial || readiness == EngineReadiness::Analyzing {
         return Settlement::Retry;
     }
-    if readiness == EngineReadiness::Ready
-        || (readiness == EngineReadiness::Unconfirmed && repeated && final_attempt)
+    if (readiness == EngineReadiness::Ready && evidence.shape == ReportShape::FullNonempty)
+        || (evidence.repeated && evidence.final_attempt)
     {
         Settlement::Ready
     } else {
@@ -348,8 +374,8 @@ impl EngineSlot {
         .await
     }
 
-    /// Runs one document exchange until progress ends or two equal full
-    /// answers arrive.
+    /// Runs one document exchange until a nonempty report follows completed
+    /// progress or two equal full reports reach the configured bound.
     ///
     /// `begin` runs once on each live session before the first operation.
     /// Retries repeat only `operation`. `finish` runs once before a live
@@ -369,7 +395,7 @@ impl EngineSlot {
             &'session mut EngineSession,
         ) -> SessionFuture<'session, Result<T, EngineError>>,
         finish: impl for<'session> FnMut(&'session mut EngineSession) -> SessionFuture<'session, ()>,
-        mut is_full: impl FnMut(&T) -> bool,
+        mut report_state: impl FnMut(&T) -> (bool, bool),
     ) -> Result<T, EngineError> {
         let mut previous = None;
         self.request_deciding(
@@ -380,11 +406,14 @@ impl EngineSlot {
                 let repeated = previous.as_ref().is_some_and(|(prior_generation, prior)| {
                     *prior_generation == session_generation && prior == &answer
                 });
+                let (full, empty) = report_state(&answer);
                 if diagnostic_settlement(
                     session.readiness(),
-                    is_full(&answer),
-                    repeated,
-                    final_attempt,
+                    DiagnosticEvidence {
+                        shape: ReportShape::from_report(full, empty),
+                        repeated,
+                        final_attempt,
+                    },
                 ) == Settlement::Ready
                 {
                     Answer::Ready(answer)
@@ -753,11 +782,13 @@ mod tests {
                 true,
                 false,
                 false,
+                false,
                 Settlement::Retry,
             ),
             (
                 "stale empty",
                 EngineReadiness::Unconfirmed,
+                true,
                 true,
                 false,
                 true,
@@ -767,6 +798,7 @@ mod tests {
                 "progress start",
                 EngineReadiness::Analyzing,
                 true,
+                false,
                 true,
                 true,
                 Settlement::Retry,
@@ -777,12 +809,23 @@ mod tests {
                 true,
                 false,
                 false,
+                false,
                 Settlement::Ready,
+            ),
+            (
+                "progress end empty",
+                EngineReadiness::Ready,
+                true,
+                true,
+                false,
+                false,
+                Settlement::Retry,
             ),
             (
                 "oscillating",
                 EngineReadiness::Unconfirmed,
                 true,
+                false,
                 false,
                 true,
                 Settlement::Retry,
@@ -791,6 +834,7 @@ mod tests {
                 "stable before bound",
                 EngineReadiness::Unconfirmed,
                 true,
+                false,
                 true,
                 false,
                 Settlement::Retry,
@@ -799,6 +843,7 @@ mod tests {
                 "stable at bound",
                 EngineReadiness::Unconfirmed,
                 true,
+                false,
                 true,
                 true,
                 Settlement::Ready,
@@ -807,14 +852,22 @@ mod tests {
                 "partial",
                 EngineReadiness::Unconfirmed,
                 false,
+                false,
                 true,
                 true,
                 Settlement::Retry,
             ),
         ];
-        for (name, readiness, full, repeated, final_attempt, expected) in rows {
+        for (name, readiness, full, empty, repeated, final_attempt, expected) in rows {
             assert_eq!(
-                diagnostic_settlement(readiness, full, repeated, final_attempt),
+                diagnostic_settlement(
+                    readiness,
+                    DiagnosticEvidence {
+                        shape: ReportShape::from_report(full, empty),
+                        repeated,
+                        final_attempt,
+                    },
+                ),
                 expected,
                 "{name}"
             );

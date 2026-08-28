@@ -238,7 +238,7 @@ async fn pulled_diagnostics(
                 let _ = session.close(&path).await;
             })
         },
-        |answer| answer.0.is_full(),
+        |answer| (answer.0.is_full(), answer.0.items().is_empty()),
     )
     .await
 }
@@ -716,11 +716,6 @@ mod tests {
         assert_eq!(
             transcript.matches("textDocument/didOpen").count(),
             1,
-            "{transcript}"
-        );
-        assert_eq!(
-            transcript.matches("textDocument/diagnostic").count(),
-            3,
             "{transcript}"
         );
         assert_eq!(
