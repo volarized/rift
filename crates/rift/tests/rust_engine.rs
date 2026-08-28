@@ -72,17 +72,3 @@ pub(crate) fn fixture() -> EngineFixture {
         extra_toml: "\n[engines.rust.retry]\nattempts = 16\n".to_owned(),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn fixture_pins_rust_analyzer_1_98() {
-        let fixture = super::fixture();
-        assert_eq!(fixture.program, "rustup");
-        assert_eq!(fixture.arguments, ["run", "1.98", "rust-analyzer"]);
-        assert_eq!(
-            fixture.extra_toml,
-            "\n[engines.rust.retry]\nattempts = 16\n"
-        );
-    }
-}

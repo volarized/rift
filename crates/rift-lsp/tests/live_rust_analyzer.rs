@@ -180,3 +180,10 @@ async fn work_done_progress_marks_the_project_load() {
     eprintln!("rust-analyzer ended its load progress after {settled:?}");
     session.shutdown().await;
 }
+
+#[test]
+fn rust_engine_fixture_pins_1_98() {
+    let fixture = rust_engine::fixture();
+    assert_eq!(fixture.program, "rustup");
+    assert_eq!(fixture.arguments, ["run", "1.98", "rust-analyzer"]);
+}

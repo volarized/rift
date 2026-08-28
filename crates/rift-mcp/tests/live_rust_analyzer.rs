@@ -563,3 +563,10 @@ async fn remove_symbol_in_an_unengined_language_applies_unchecked() -> TestResul
     server_task.await?;
     Ok(())
 }
+
+#[test]
+fn rust_engine_fixture_pins_1_98() {
+    let fixture = rust_engine::fixture();
+    assert_eq!(fixture.program, "rustup");
+    assert_eq!(fixture.arguments, ["run", "1.98", "rust-analyzer"]);
+}

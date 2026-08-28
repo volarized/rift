@@ -958,3 +958,14 @@ async fn hooks_with_an_absolute_program_or_a_dot_segment_directory_refuse() -> T
     require_success(&stopped, "stop after the working-directory refusal")?;
     Ok(())
 }
+
+#[test]
+fn rust_engine_fixture_pins_1_98_and_bounded_retries() {
+    let fixture = rust_engine::fixture();
+    assert_eq!(fixture.program, "rustup");
+    assert_eq!(fixture.arguments, ["run", "1.98", "rust-analyzer"]);
+    assert_eq!(
+        fixture.extra_toml,
+        "\n[engines.rust.retry]\nattempts = 16\n"
+    );
+}
