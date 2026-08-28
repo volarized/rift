@@ -58,13 +58,18 @@ pub(crate) fn rust_engine_configuration() -> String {
 
 /// The fixture data the shared harness turns into the `[engines.rust]`
 /// table: rust-analyzer 1.98 over the fixture's cargo project.
+///
+/// Coverage starts several cold rust-analyzer processes in parallel. Its
+/// fixture retry table keeps shipped pacing but extends attempts to 16, a
+/// 25.75s wait bound, so instrumented process contention cannot turn this
+/// engine test into a machine-speed test.
 pub(crate) fn fixture() -> EngineFixture {
     EngineFixture {
         name: "rust",
         program: RUSTUP_PROGRAM,
         arguments: RUST_ANALYZER_ARGUMENTS.to_vec(),
         languages: vec!["rust"],
-        extra_toml: String::new(),
+        extra_toml: "\n[engines.rust.retry]\nattempts = 16\n".to_owned(),
     }
 }
 
