@@ -334,29 +334,31 @@ The table holds at most 16 engines. The server starts one on the first request f
 serves and keeps the session across later requests, because a language server pays for its
 project load once and answers from it afterwards.
 
-`retry` bounds what Rift does while an engine's answer is not settled, and three things leave it
-unsettled.
+`retry` bounds what Rift does while an engine's answer is not settled.
 
-A language server may decline a request it is already serving, or report that the file moved
-under it while it was answering. LSP asks the client to send such a request again, so Rift does.
+A language server may decline a request it is already serving, report that the file moved under it,
+or answer before it has loaded the declaration. All engine refusals receive the configured bounded
+schedule. If every attempt refuses, Rift returns the latest engine words. A capability the engine
+never advertised is not an engine refusal and returns at once.
 
 A server still loading your project answers anyway, and answers thinly: rust-analyzer reports no
 diagnostics at all for a file it has not analyzed, and refuses a rename with `No references found
-at position` for a declaration it has not indexed. Neither is its verdict. The engine says which
-it is, because a language server announces the work it is doing over LSP's `$/progress`, so Rift
-treats an answer that arrives while that work is outstanding as provisional: it discards the
-answer and asks again.
+at position` for a declaration it has not indexed. Neither is its verdict. LSP's `$/progress`
+traffic tells Rift when work remains outstanding, so an answer that arrives during that work is
+provisional. Progress does not bind completed work to one semantic request, so an empty answer or
+a refusal remains bounded by the retry table after progress ends.
 
 Before the first announcement arrives there is nothing to read, and one shape of thin answer says
 exactly what a settled engine says: a `move_file` the engine answers with no edit, and a
 diagnostics pull it answers with no finding, are also what a loaded engine answers for a move
-with no import to rewrite and for a file that is clean. An engine that has announced no work at
-all is therefore asked through the configured retry schedule for an empty move, reference, or
-diagnostic answer. A classified workspace change invalidates readiness from earlier work. A move
+with no import to rewrite and for a file that is clean. Every empty move or reference answer is
+therefore asked through the configured retry schedule while one document remains open. A
+classified workspace change invalidates readiness from earlier work. A move
 that spends the table with no proposal applies with a
 `rift.move.references_not_updated` warning, while an unconfirmed empty reference check refuses
-unless forced. Diagnostics require equal full reports at the final attempt; a report still
-changing at that bound becomes `rift.engine.unready`, not an empty finding list. An engine's
+unless forced. A nonempty full diagnostic report can settle after progress ends. An empty full
+report requires equal evidence at the final attempt; a report still changing at that bound becomes
+`rift.engine.unready`, not an empty finding list. An engine's
 `workspace/diagnostic/refresh` request invalidates an earlier report before that comparison.
 
 The waits grow from `delay` and stop growing at `delay_limit`, which keeps the resends off an
@@ -370,9 +372,6 @@ refusal when final emptiness remains unconfirmed. A diagnostics pull runs after 
 already applied, so it cannot fail the call: the summary carries `rift.engine.unready` when the
 engine never settled, or `rift.engine.failed` when it failed outright, rather than an empty
 finding list that would tell the caller changed file is clean.
-
-A refusal the settled engine did not invite again - it disagrees with the new name, it has no
-such capability - is never resent.
 
 `restart` bounds what Rift does when the engine itself fails: one that ended, that could not be
 started, or that stopped answering is replaced automatically, and the replacement serves the

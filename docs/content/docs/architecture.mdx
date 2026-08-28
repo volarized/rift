@@ -628,24 +628,26 @@ A language server answers from the moment it initializes, and answers wrongly un
 loaded the project: rust-analyzer refuses a rename with `No references found at position` for a
 declaration it has not indexed yet. It announces that load over LSP's `$/progress`, and while
 the work is outstanding the server discards what came back and asks the engine again, under that
-engine's [`retry`](/docs/configuration#engines) table. It does the same for a refusal LSP marks
-as re-askable, and it replaces an engine that died mid-request under `restart`. Whatever tool
-asked, nothing below this point sees an answer the engine gave while it was still working.
+engine's [`retry`](/docs/configuration#engines) table. Every engine refusal receives that same
+bounded schedule: a refusal can be the engine's final verdict, or an early answer from an engine
+that has not loaded the declaration yet. If every attempt refuses, Rift returns the latest engine
+words. An engine that died mid-request is replaced under `restart`.
 
-That wait needs something announced to wait on, and the first request of a session can arrive
-before the first announcement does. An engine that has announced nothing and answers nothing
+Progress does not say which request the announced work settles. An engine that answers nothing
 looks exactly like one that has finished and has nothing to report:
 `workspace/willRenameFiles` comes back with no edit, `textDocument/references` with no location,
-and `textDocument/diagnostic` with no item. Rift therefore asks an unconfirmed empty answer through
-the configured retry schedule. Each classified workspace change invalidates earlier readiness.
-The retry table, not one remembered answer from an earlier operation, bounds every check.
+and `textDocument/diagnostic` with no item. Rift therefore asks every empty semantic answer through
+the configured retry schedule, whether progress completed or never appeared. The document remains
+open across those attempts. Each classified workspace change invalidates earlier readiness. The
+retry table, not one remembered answer from an earlier operation, bounds every check.
 
-When a move or reference check spends that table, Rift keeps the final empty answer but also keeps
-the engine unconfirmed. The caller then gets the operation-specific warning or refusal. A
-diagnostic pull has a stronger rule: an engine that announces progress after changed bytes settles
-after that work ends, while an engine that announces no progress must return equal full reports at
-the end of the retry schedule. A `workspace/diagnostic/refresh` request invalidates earlier pull evidence. An
-answer that still changes at the bound is unready, never proof of clean bytes.
+When a move or reference check spends that table, Rift keeps the final empty answer. A move carries
+its operation-specific warning. A reference check is clean when readiness is confirmed; an
+unconfirmed final answer warns or refuses. A diagnostic pull has a stronger rule: a nonempty full
+report can settle after announced work ends, while an empty full report must repeat at the end of
+the retry schedule. A
+`workspace/diagnostic/refresh` request invalidates earlier pull evidence. An answer that still
+changes at the bound is unready, never proof of clean bytes.
 
 When the whole budget is spent while announced work remains outstanding, a rename or a move fails
 `temporarily_unavailable` with the tree untouched, so the caller can send the same request again
@@ -701,8 +703,9 @@ not, and the warning names it so the caller can check the imports itself.
 After any change applies - a rename, a move, a [`patch`](/docs/protocol/mcp#tool-patch) - the
 server groups changed paths by engine. Each engine first receives one ordered
 `workspace/didChangeWatchedFiles` notification with added, modified, and removed classifications.
-Rift then opens each surviving document with final bytes, pulls diagnostics, closes it, and maps
-findings onto the change summary beside the syntax provider's own.
+Rift then opens each surviving document with final bytes, pulls diagnostics through the bounded
+retry schedule, closes it once, and maps findings onto the change summary beside the syntax
+provider's own.
 
 The pull reads landed bytes, so what comes back is the engine's reading of the change rather than
 of the tree before it. One batch lets a parent declaration and its new module arrive together,
@@ -710,11 +713,12 @@ and lets a removed diagnostic disappear before any post-change pull.
 
 A pull the engine answers while it is still loading the project comes back empty, and so does a
 pull over code that is genuinely clean. The server tells the two apart from the engine's own
-`$/progress` traffic: `window/workDoneProgress/create` and the matching progress token mark work
-outstanding before the begin notification can race a request. While work remains, its answer is
-provisional and the server pulls again under that engine's
-[`retry`](/docs/configuration#engines) table. An engine that announced no progress settles only on
-equal full reports at the end of that schedule.
+`$/progress` traffic and repeated report evidence: `window/workDoneProgress/create` and the
+matching progress token mark work outstanding before the begin notification can race a request.
+While work remains, its answer is provisional and the server pulls again under that engine's
+[`retry`](/docs/configuration#engines) table. Once work ends, a nonempty full report settles. An
+empty full report still requires equal reports at the end of that schedule, because progress does
+not bind its completed work to this document.
 
 An engine that advertises no pull contributes nothing and says nothing about it, because a
 capability the engine never advertised is not a failure. typescript-language-server is that case:
