@@ -486,14 +486,14 @@ impl ReadService {
     }
 
     /// Derives this snapshot's lexical search units: one per indexed
-    /// symbol and included text file, chunked where a text file exceeds
+    /// symbol and baseline text file, chunked where text exceeds
     /// `[search.text].max_chunk`.
     #[must_use]
     pub fn lexical_units(&self) -> Vec<rift_index::LexicalUnit> {
         self.index.lexical_units()
     }
 
-    /// Returns each included text file split into more than one lexical
+    /// Returns each baseline text file split into more than one lexical
     /// chunk, paired with its chunk count, so a caller can warn about the
     /// split instead of it passing silently.
     #[must_use]
@@ -920,18 +920,35 @@ pub(crate) fn file_id(path: &CoreProjectPath) -> FileId {
     ))
 }
 
-/// Projects one index-build warning onto its wire form. Invalid UTF-8 is the only source
-/// today: the message states that the file's bytes are not UTF-8 and that it is therefore
-/// absent from the index.
+/// Projects one index-build warning onto its wire form.
 fn wire_index_warning(warning: &WorkspaceIndexWarning) -> ReadWarning {
-    match warning {
-        WorkspaceIndexWarning::InvalidUtf8Source(path) => ReadWarning::SourceUnavailable {
-            unit: file_id(path),
-            detail: format!(
+    let (path, detail) = match warning {
+        WorkspaceIndexWarning::InvalidUtf8Source(path) => (
+            path,
+            format!(
                 "{path}'s bytes are not valid UTF-8, so the file is absent from the index",
                 path = path.as_str(),
             ),
-        },
+        ),
+        WorkspaceIndexWarning::BinarySource(path) => (
+            path,
+            format!(
+                "{path} contains a NUL byte, so the file is absent from the index",
+                path = path.as_str(),
+            ),
+        ),
+        WorkspaceIndexWarning::FileTooLarge(path) => (
+            path,
+            format!(
+                "{path} exceeds the file byte limit, so the file is absent from the index",
+                path = path.as_str(),
+            ),
+        ),
+    };
+
+    ReadWarning::SourceUnavailable {
+        unit: file_id(path),
+        detail,
     }
 }
 

@@ -71,7 +71,11 @@ fn laid_out_workspace(
 ) -> TestResult<tempfile::TempDir> {
     let directory = tempfile::tempdir()?;
     for (name, source) in files {
-        fs::write(directory.path().join(name), source)?;
+        let path = directory.path().join(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, source)?;
     }
     let mut configuration = crate::hermetic_search::SEMANTIC_DISABLED.to_owned();
     if let Some(engine) = engine {

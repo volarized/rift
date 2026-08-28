@@ -1109,6 +1109,7 @@ mod tests {
         match result {
             ChangeResult::Refused { reason, .. } => *reason,
             ChangeResult::Applied { .. } => panic!("expected a refusal, got an applied change"),
+            ChangeResult::Unchanged => panic!("expected a refusal, got unchanged result"),
         }
     }
 
@@ -1119,6 +1120,7 @@ mod tests {
                 .map(|finding| finding.message.clone())
                 .unwrap_or_default(),
             ChangeResult::Applied { .. } => panic!("expected a refusal, got an applied change"),
+            ChangeResult::Unchanged => panic!("expected a refusal, got unchanged result"),
         }
     }
 
@@ -1131,6 +1133,7 @@ mod tests {
                     .kind
             }
             ChangeResult::Applied { .. } => panic!("expected a refusal, got an applied change"),
+            ChangeResult::Unchanged => panic!("expected a refusal, got unchanged result"),
         }
     }
 

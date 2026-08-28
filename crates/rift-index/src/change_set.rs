@@ -26,6 +26,15 @@ impl FileDigest {
         Self(Sha256::digest(bytes).into())
     }
 
+    /// Digests file bytes and executable metadata for workspace observation.
+    #[must_use]
+    pub fn of_file_state(bytes: &[u8], executable: bool) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hasher.update([u8::from(executable)]);
+        Self(hasher.finalize().into())
+    }
+
     /// The digest's bytes, as workspace identity material absorbs them.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {

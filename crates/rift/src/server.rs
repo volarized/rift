@@ -254,7 +254,7 @@ fn status(root: &Path) -> ServerOutcome {
         ServerPresence::Serving(lock) => ServerOutcome::Serving {
             port: lock.port,
             pid: lock.pid,
-            version: lock.version,
+            version: lock.identity.version,
         },
         ServerPresence::Stale(reason) => ServerOutcome::Stale {
             reason: stale_reason_phrase(&reason),
@@ -538,7 +538,7 @@ mod tests {
         stale_reason_phrase, start_mode, status, stop, stop_log_drain,
     };
     use rift_core::Error;
-    use rift_protocol::lock::{ServerLock, ServerLockViolation};
+    use rift_protocol::lock::{ProductIdentity, ServerLock, ServerLockViolation};
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -547,7 +547,11 @@ mod tests {
             port: 12_345,
             token: "a".repeat(rift_protocol::lock::SERVER_TOKEN_LENGTH),
             pid: 4_242,
-            version: "0.0.11".to_owned(),
+            identity: ProductIdentity {
+                version: "0.0.11".to_owned(),
+                executable_digest: "a".repeat(64),
+                schema_digest: "b".repeat(64),
+            },
         }
     }
 

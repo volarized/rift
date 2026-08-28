@@ -9,13 +9,9 @@
 //! `[engines.toml]` entry for it, the same way it resolves `[engines.rust]`
 //! for a `.rs` file.
 //!
-//! tombi announces no `$/progress` work, so the server's readiness gate has
-//! nothing to read: a pull answered before tombi has the document ready
-//! comes back empty, and an empty answer is indistinguishable from a clean
-//! file. The asserting test therefore warms the engine first, the way the
-//! rust and typescript live suites do, for the same measured reason - this
-//! suite ran with no warm-up until a cold linux runner applied the change
-//! and carried no finding.
+//! tombi announces no `$/progress` work, so the server settles diagnostics
+//! from consecutive equal full reports. Each test starts cold and makes
+//! only its asserted change.
 
 #![cfg(unix)]
 
@@ -25,10 +21,7 @@ mod live_engine_gate;
 mod toml_engine;
 mod workspace_client;
 
-use std::time::Duration;
-
 use live_engine_gate::engine_live;
-use rmcp::service::{RoleClient, RunningService};
 use serde_json::{Value, json};
 use toml_engine::{require_tombi, toml_engine_configuration};
 use workspace_client::{
@@ -64,36 +57,6 @@ fn coded_findings<'summary>(structured: &'summary Value, code: &str) -> Vec<&'su
         .unwrap_or_default()
 }
 
-/// Most warm-up attempts one test makes, and the pause between them: at most
-/// fifteen seconds of waiting, then the test fails instead of hanging.
-const WARMUP_ATTEMPTS_MAX: usize = 60;
-
-/// Runs live Tombi tests one at a time.
-static TOMBI_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-const WARMUP_PAUSE: Duration = Duration::from_millis(250);
-
-/// Drives `patch` until tombi's own finding rides an applied change.
-///
-/// Each attempt introduces the duplicate key and removes it again, so the
-/// file is left exactly as the attempt found it and the next assertion runs
-/// against the same starting bytes. The loop ends on the first attempt whose
-/// summary carries the finding, which is the only signal that separates a
-/// tombi still opening the document from a tombi reporting a clean file.
-async fn warmed_engine(client: &RunningService<RoleClient, ()>) -> TestResult {
-    for _attempt in 0..WARMUP_ATTEMPTS_MAX {
-        let introduce = tool_request("patch", &json!({ "patch": DUPLICATE_KEY_PATCH }));
-        let introduced = call_retrying_acceptance(client, introduce).await?;
-        let answered = !coded_findings(&introduced, "duplicate-key").is_empty();
-        let remove = tool_request("patch", &json!({ "patch": REMOVE_DUPLICATE_KEY_PATCH }));
-        call_retrying_acceptance(client, remove).await?;
-        if answered {
-            return Ok(());
-        }
-        tokio::time::sleep(WARMUP_PAUSE).await;
-    }
-    Err("tombi never reported the duplicate key".into())
-}
-
 /// The applied patch carries tombi's own finding for the file it changed:
 /// the pull runs on the document Rift just wrote, and tombi's document-tree
 /// construction catches the duplicate key with no schema and no network
@@ -109,14 +72,12 @@ async fn applied_patch_carries_the_toml_engine_diagnostic() -> TestResult {
     if !engine_live() {
         return Ok(());
     }
-    let _exclusive = TOMBI_TEST_LOCK.lock().await;
     let (directory, client, server_task) = served_relative_workspace(
         &[("config.toml", CONFIG)],
         Some(toml_engine_configuration()),
     )
     .await?;
     require_tombi(directory.path());
-    warmed_engine(&client).await?;
 
     let introduce = tool_request("patch", &json!({ "patch": DUPLICATE_KEY_PATCH }));
     let structured = call_retrying_acceptance(&client, introduce).await?;
@@ -154,7 +115,6 @@ async fn applied_patch_over_a_clean_file_carries_no_finding() -> TestResult {
     if !engine_live() {
         return Ok(());
     }
-    let _exclusive = TOMBI_TEST_LOCK.lock().await;
     let (directory, client, server_task) = served_workspace(
         &[("config.toml", CONFIG_WITH_DUPLICATE)],
         Some(toml_engine_configuration()),

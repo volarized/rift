@@ -20,7 +20,7 @@
 //! clean bytes, and a settled-looking answer from an engine that has never
 //! proven it is settled is not evidence of anything.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use lsp_types::request::{DocumentDiagnosticRequest, Request as _};
 use lsp_types::{Diagnostic as LspDiagnostic, DiagnosticSeverity, NumberOrString};
@@ -39,85 +39,154 @@ use crate::read::{ReadService, file_id};
 /// Most mapped engine findings one applied change carries.
 pub const ENGINE_DIAGNOSTICS_PER_CHANGE_MAX: usize = 16;
 
+use rift_lsp::session::PulledDiagnostics;
+
+#[derive(Clone)]
+struct ChangedDocument {
+    path: CoreProjectPath,
+    language: Language,
+    source: Option<String>,
+    change: rift_index::PathChange,
+}
+
+/// Resolves each classified path against its owning snapshot.
+///
+/// Removed paths retain their previous language but carry no source, so
+/// callers can notify engines without opening deleted documents. Added and
+/// modified paths carry bytes from the current snapshot.
+fn changed_documents(
+    previous: &ReadService,
+    current: &ReadService,
+    changes: &rift_index::PathChanges,
+) -> Vec<ChangedDocument> {
+    changes
+        .iter()
+        .filter_map(|(path, change)| {
+            let file = match change {
+                rift_index::PathChange::Removed => previous.index().file(path),
+                rift_index::PathChange::Added | rift_index::PathChange::Modified => {
+                    current.index().file(path)
+                }
+            }?;
+            Some(ChangedDocument {
+                path: path.clone(),
+                language: file.syntax().language().clone(),
+                source: match change {
+                    rift_index::PathChange::Removed => None,
+                    rift_index::PathChange::Added | rift_index::PathChange::Modified => {
+                        Some(file.source().to_owned())
+                    }
+                },
+                change,
+            })
+        })
+        .collect()
+}
+
+fn file_change_type(change: rift_index::PathChange) -> lsp_types::FileChangeType {
+    match change {
+        rift_index::PathChange::Added => lsp_types::FileChangeType::CREATED,
+        rift_index::PathChange::Modified => lsp_types::FileChangeType::CHANGED,
+        rift_index::PathChange::Removed => lsp_types::FileChangeType::DELETED,
+    }
+}
+
 /// Most paths one `rift.engine.unready` warning names.
 const ENGINE_UNREADY_PATHS_MAX: usize = 16;
 
-/// Pulls engine diagnostics for every changed path an engine serves.
+/// Pulls diagnostics for one rebuild classification.
+pub async fn engine_change_set_diagnostics(
+    engines: &EnginePool,
+    previous: &ReadService,
+    current: &ReadService,
+    change_set: &rift_index::ChangeSet,
+) -> Vec<Diagnostic> {
+    let changes = match change_set {
+        rift_index::ChangeSet::Incremental(changes) => changes.clone(),
+        rift_index::ChangeSet::Full => rift_index::PathChanges::between(
+            &previous.index().digests(),
+            &current.index().digests(),
+        ),
+    };
+    classified_engine_change_diagnostics(engines, previous, current, &changes).await
+}
+
+/// Pulls diagnostics after one classified workspace change.
 ///
-/// `reads` is the snapshot published after the change, so each document
-/// opens with exactly the bytes the change landed; a path the snapshot no
-/// longer holds - one the change deleted - is skipped. Findings are
-/// bounded by [`ENGINE_DIAGNOSTICS_PER_CHANGE_MAX`] across all paths. An
-/// engine that fails contributes one warning naming it and is not asked
-/// again within this walk; an engine without the pull capability
-/// contributes nothing. The slot has already spent that engine's whole
-/// retry budget on the path before any warning is raised.
-///
-/// A path whose pull could not be proven settled - the engine exhausted
-/// every attempt still analyzing, or answered empty while it had never
-/// confirmed its own readiness - is held out of the mapped findings and
-/// named instead in one `rift.engine.unready` warning per engine and
-/// language, grouping every such path from this walk.
+/// Each engine receives one ordered watched-file notification before any
+/// surviving document opens. Removed paths retain their previous language
+/// for routing but are never opened. Added and modified paths open with
+/// current snapshot bytes. Findings stay bounded by
+/// [`ENGINE_DIAGNOSTICS_PER_CHANGE_MAX`].
 ///
 /// # Cancel safety
 ///
 /// Dropping the future leaves at most one engine request pending; the
 /// session discards its stale response on the next call.
-pub async fn engine_change_diagnostics(
+pub async fn classified_engine_change_diagnostics(
     engines: &EnginePool,
-    reads: &ReadService,
-    paths: &[ProjectPath],
+    previous: &ReadService,
+    current: &ReadService,
+    changes: &rift_index::PathChanges,
 ) -> Vec<Diagnostic> {
+    let mut batches: BTreeMap<String, (&EngineSlot, Vec<ChangedDocument>)> = BTreeMap::new();
+    for document in changed_documents(previous, current, changes) {
+        let Some(slot) = engines.engine_for(&document.language) else {
+            continue;
+        };
+        batches
+            .entry(slot.name().to_owned())
+            .or_insert_with(|| (slot, Vec::new()))
+            .1
+            .push(document);
+    }
+
     let mut findings = Vec::new();
-    let mut ended_engines: BTreeSet<String> = BTreeSet::new();
     let mut unready: BTreeMap<(String, String), (Language, Vec<ProjectPath>)> = BTreeMap::new();
-    for path in paths {
+    for (engine, (slot, documents)) in batches {
         if findings.len() >= ENGINE_DIAGNOSTICS_PER_CHANGE_MAX {
             break;
         }
-        let Ok(core_path) = CoreProjectPath::new(path.0.as_str()) else {
-            continue;
-        };
-        let Some(file) = reads.index().file(&core_path) else {
-            continue;
-        };
-        let language = file.syntax().language().clone();
-        let Some(slot) = engines.engine_for(&language) else {
-            continue;
-        };
-        if ended_engines.contains(slot.name()) {
+        let notification: Vec<_> = documents
+            .iter()
+            .map(|document| (document.path.clone(), file_change_type(document.change)))
+            .collect();
+        if let Err(error) = notify_engine_changes(slot, notification).await {
+            findings.push(engine_warning(&engine, &error));
             continue;
         }
-        match pulled_diagnostics(slot, &core_path, &language, file.source()).await {
-            Ok((items, _encoding, readiness))
-                if items.is_empty() && readiness == EngineReadiness::Unconfirmed =>
-            {
-                unready_paths(&mut unready, slot.name(), &language).push(path.clone());
-            }
-            Ok((items, encoding, _readiness)) => {
-                let unit = file_id(&core_path);
-                let index = LineIndex::new(file.source());
-                let remaining = ENGINE_DIAGNOSTICS_PER_CHANGE_MAX - findings.len();
-                findings.extend(
-                    items
-                        .iter()
-                        .take(remaining)
-                        .map(|item| mapped_diagnostic(item, &unit, &index, encoding, &language)),
-                );
-            }
-            Err(error) if matches!(error.fault(), EngineFault::Analyzing { .. }) => {
-                unready_paths(&mut unready, slot.name(), &language).push(path.clone());
-            }
-            Err(error) => {
-                if !matches!(error.fault(), EngineFault::CapabilityAbsent { .. }) {
-                    findings.push(engine_warning(slot.name(), &error));
+
+        for document in documents
+            .iter()
+            .filter(|document| document.source.is_some())
+        {
+            let source = document.source.as_deref().unwrap_or_default();
+            match pulled_diagnostics(slot, &document.path, &document.language, source).await {
+                Ok((items, encoding, _readiness)) => {
+                    let unit = file_id(&document.path);
+                    let index = LineIndex::new(source);
+                    let remaining = ENGINE_DIAGNOSTICS_PER_CHANGE_MAX - findings.len();
+                    findings.extend(items.iter().take(remaining).map(|item| {
+                        mapped_diagnostic(item, &unit, &index, encoding, &document.language)
+                    }));
                 }
-                // Silence for an absent capability, one warning otherwise;
-                // either way this engine is not asked again in this walk.
-                ended_engines.insert(slot.name().to_owned());
+                Err(error) if matches!(error.fault(), EngineFault::Analyzing { .. }) => {
+                    unready_paths(&mut unready, &engine, &document.language)
+                        .push(ProjectPath(document.path.as_str().to_owned()));
+                }
+                Err(error) => {
+                    if !matches!(error.fault(), EngineFault::CapabilityAbsent { .. }) {
+                        findings.push(engine_warning(&engine, &error));
+                    }
+                    break;
+                }
+            }
+            if findings.len() >= ENGINE_DIAGNOSTICS_PER_CHANGE_MAX {
+                break;
             }
         }
     }
+
     for ((engine, _identity_segment), (language, unready_for)) in unready {
         if findings.len() >= ENGINE_DIAGNOSTICS_PER_CHANGE_MAX {
             break;
@@ -140,59 +209,60 @@ fn unready_paths<'record>(
         .1
 }
 
-/// One open-pull-close conversation on the claimed engine's slot.
+/// Opens, pulls, and closes one document through one engine slot.
 async fn pulled_diagnostics(
     slot: &EngineSlot,
     path: &CoreProjectPath,
     language: &Language,
     source: &str,
-) -> Result<(Vec<LspDiagnostic>, PositionEncoding, EngineReadiness), EngineError> {
-    // The boxed future may only borrow the session, so each attempt gets
-    // its own owned copy of the request data.
+) -> Result<(PulledDiagnostics, PositionEncoding, EngineReadiness), EngineError> {
     let request_path = path.clone();
     let request_language = language.name.clone();
     let request_source = source.to_owned();
-    slot.request(move |session: &mut EngineSession| {
-        let path = request_path.clone();
-        let language = request_language.clone();
-        let text = request_source.clone();
-        Box::pin(async move { pull_on_session(session, &path, &language, text).await })
-    })
+    slot.request_settled(
+        move |session: &mut EngineSession| {
+            let path = request_path.clone();
+            let language = request_language.clone();
+            let text = request_source.clone();
+            Box::pin(async move { pull_on_session(session, &path, &language, text).await })
+        },
+        |answer| answer.0.is_full(),
+    )
     .await
 }
 
-/// Notifies, opens, pulls, and closes one document on a running session.
-///
-/// The capability gate runs before the notification and the open, so an
-/// engine without pulls is never handed one. The notification records
-/// that this path changed on disk before the pull is sent, so the pull
-/// starts only once the announced work that notification triggers has
-/// been read - the outer slot resends the whole attempt while the session
-/// still reads as analyzing, so a progress cycle interleaved before the
-/// pull's own answer is not missed. A failed pull still attempts the
-/// close; a session the fault already ended refuses it, which changes
-/// nothing.
+/// Opens, pulls, and closes one document.
 async fn pull_on_session(
     session: &mut EngineSession,
     path: &CoreProjectPath,
     language_id: &str,
     text: String,
-) -> Result<(Vec<LspDiagnostic>, PositionEncoding, EngineReadiness), EngineError> {
+) -> Result<(PulledDiagnostics, PositionEncoding, EngineReadiness), EngineError> {
     if !session.capabilities().pull_diagnostics {
         return Err(rift_core::Error::new(EngineFault::CapabilityAbsent {
             capability: DocumentDiagnosticRequest::METHOD.to_owned(),
         }));
     }
     let encoding = session.capabilities().position_encoding;
-    let notified_paths = std::slice::from_ref(path);
-    session.notify_changed_paths(notified_paths).await?;
     session.open(path, language_id, text).await?;
     let pulled = session.pull_diagnostics(path).await;
     let readiness = session.readiness();
-    // The close is best-effort: a session the pull's fault ended refuses
-    // it, and the pull's own outcome is what the caller acts on.
     let _ = session.close(path).await;
     Ok((pulled?, encoding, readiness))
+}
+
+async fn notify_engine_changes(
+    slot: &EngineSlot,
+    changes: Vec<(CoreProjectPath, lsp_types::FileChangeType)>,
+) -> Result<(), EngineError> {
+    slot.request(move |session: &mut EngineSession| {
+        let changes = changes.clone();
+        Box::pin(async move {
+            session.notify_changed_paths(&changes).await?;
+            Ok(())
+        })
+    })
+    .await
 }
 
 /// One LSP diagnostic mapped into the change summary's carrier.
@@ -445,6 +515,198 @@ mod tests {
         assert!(warning.message.contains("caller.rs"), "{}", warning.message);
     }
 
+    #[test]
+    fn classified_documents_use_previous_removals_and_current_writes() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        std::fs::write(directory.path().join("lib.rs"), "pub fn before() {}\n")
+            .expect("previous file writes");
+        std::fs::write(directory.path().join("old.rs"), "pub fn old() {}\n")
+            .expect("removed file writes");
+        let previous = ReadService::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )
+        .expect("previous workspace indexes");
+
+        std::fs::write(directory.path().join("lib.rs"), "pub fn after() {}\n")
+            .expect("modified file writes");
+        std::fs::write(directory.path().join("new.rs"), "pub fn new() {}\n")
+            .expect("added file writes");
+        std::fs::remove_file(directory.path().join("old.rs")).expect("old file removes");
+        let current = ReadService::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )
+        .expect("current workspace indexes");
+        let changes = rift_index::PathChanges::between(
+            &previous.index().digests(),
+            &current.index().digests(),
+        );
+
+        let documents = changed_documents(&previous, &current, &changes);
+        assert_eq!(documents.len(), 3);
+        assert_eq!(documents[0].change, rift_index::PathChange::Modified);
+        assert_eq!(documents[0].source.as_deref(), Some("pub fn after() {}\n"));
+        assert_eq!(documents[1].change, rift_index::PathChange::Added);
+        assert_eq!(documents[1].source.as_deref(), Some("pub fn new() {}\n"));
+        assert_eq!(documents[2].change, rift_index::PathChange::Removed);
+        assert_eq!(documents[2].source, None);
+    }
+
+    fn added_changes(reads: &ReadService, paths: &[ProjectPath]) -> rift_index::PathChanges {
+        rift_index::PathChanges::resolve(
+            paths.iter().filter_map(|path| {
+                let path = CoreProjectPath::new(&path.0).ok()?;
+                let digest = reads.index().file(&path)?.digest();
+                Some((path, Some(digest)))
+            }),
+            |_| None,
+        )
+    }
+
+    /// Create and delete events share one notification before document work.
+    #[tokio::test]
+    async fn classified_batch_notifies_before_open_and_pull() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        std::fs::write(directory.path().join("old.rs"), "pub fn old() {}\n")
+            .expect("previous file writes");
+        let previous = ReadService::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )
+        .expect("previous workspace indexes");
+
+        std::fs::remove_file(directory.path().join("old.rs")).expect("old file removes");
+        std::fs::write(directory.path().join("new.rs"), "pub fn new() {}\n")
+            .expect("current file writes");
+        let current = ReadService::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )
+        .expect("current workspace indexes");
+        let changes = rift_index::ChangeSet::Incremental(rift_index::PathChanges::between(
+            &previous.index().digests(),
+            &current.index().digests(),
+        ));
+
+        let transcript = directory.path().join("engine-transcript");
+        let register = framed(
+            r#"{"jsonrpc":"2.0","id":"watch","method":"client/registerCapability","params":{"registrations":[{"id":"watch-rust","method":"workspace/didChangeWatchedFiles","registerOptions":{"watchers":[{"globPattern":"**/*.rs","kind":7}]}}]}}"#,
+        );
+        let capabilities = framed(
+            r#"{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"referencesProvider":true,"diagnosticProvider":{"identifier":"fake","interFileDependencies":false,"workspaceDiagnostics":false}}}}"#,
+        );
+        let references = framed(
+            r#"{"jsonrpc":"2.0","id":1,"result":[{"uri":"file:///new.rs","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}]}"#,
+        );
+        let retry =
+            framed(r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32802,"message":"retry pull"}}"#);
+        let pull = framed(
+            r#"{"jsonrpc":"2.0","id":3,"result":{"kind":"full","items":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"message":"engine finding"}]}}"#,
+        );
+        let pull_again = pull.replacen("\"id\":3", "\"id\":4", 1);
+        let shutdown = framed(r#"{"jsonrpc":"2.0","id":5,"result":null}"#);
+        let script = format!(
+            "printf '%s' '{capabilities}{register}{references}{retry}{pull}{pull_again}{shutdown}' & exec cat > \"$1\""
+        );
+        let engine = rift_protocol::configuration::EngineConfiguration {
+            program: "sh".to_owned(),
+            arguments: vec![
+                "-c".to_owned(),
+                script,
+                "rift-engine".to_owned(),
+                transcript.display().to_string(),
+            ],
+            environment: BTreeMap::new(),
+            languages: vec!["rust".to_owned()],
+            initialization_options: None,
+            startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            output_limit: rift_protocol::configuration::ByteSize::from_bytes(16_384),
+            retry: rift_protocol::retry::RetryPolicy {
+                attempts: 3,
+                delay: rift_protocol::configuration::Duration::from_millis(1),
+                delay_limit: rift_protocol::configuration::Duration::from_millis(1),
+            },
+            restart: rift_protocol::retry::RestartPolicy::default(),
+        };
+        let engines = EnginePool::new(
+            directory.path(),
+            BTreeMap::from([("fake".to_owned(), engine)]),
+        );
+
+        let language = Language {
+            name: "rust".to_owned(),
+            dialect: None,
+        };
+        let slot = engines.engine_for(&language).expect("engine serves rust");
+        let request_path = CoreProjectPath::new("new.rs").expect("fixture path");
+        slot.request(move |session| {
+            let path = request_path.clone();
+            Box::pin(async move {
+                session
+                    .references(
+                        &path,
+                        lsp_types::Position {
+                            line: 0,
+                            character: 0,
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+            })
+        })
+        .await
+        .expect("registration exchange completes");
+        let findings = engine_change_set_diagnostics(&engines, &previous, &current, &changes).await;
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        engines.shutdown().await;
+        let transcript = std::fs::read_to_string(transcript).expect("transcript reads");
+        let notification = transcript
+            .find("workspace/didChangeWatchedFiles")
+            .expect("classified notification writes");
+        let open = transcript
+            .find("textDocument/didOpen")
+            .expect("added document opens");
+        let pull = transcript
+            .find("textDocument/diagnostic")
+            .expect("added document pulls");
+        assert!(notification < open && open < pull, "{transcript}");
+        assert!(transcript.contains("new.rs"), "{transcript}");
+        assert!(transcript.contains("old.rs"), "{transcript}");
+        assert!(transcript.contains(r#""type":1"#), "{transcript}");
+        assert!(transcript.contains(r#""type":3"#), "{transcript}");
+        assert_eq!(
+            transcript
+                .matches("workspace/didChangeWatchedFiles")
+                .count(),
+            1,
+            "{transcript}"
+        );
+        assert_eq!(
+            transcript.matches("textDocument/didOpen").count(),
+            3,
+            "{transcript}"
+        );
+        assert_eq!(
+            transcript.matches("textDocument/diagnostic").count(),
+            3,
+            "{transcript}"
+        );
+    }
+
     #[tokio::test]
     async fn paths_without_an_engine_or_index_entry_contribute_nothing() {
         let directory = tempfile::tempdir().expect("fixture directory");
@@ -464,7 +726,9 @@ mod tests {
             ProjectPath("vanished.rs".to_owned()),
             ProjectPath("/absolute".to_owned()),
         ];
-        let findings = engine_change_diagnostics(&engines, &reads, &paths).await;
+        let changes = added_changes(&reads, &paths);
+        let findings =
+            classified_engine_change_diagnostics(&engines, &reads, &reads, &changes).await;
         assert!(findings.is_empty());
     }
 
@@ -475,10 +739,9 @@ mod tests {
 
     /// A workspace served by a canned `sh` engine that advertises pull
     /// diagnostics and never announces any work of its own: every
-    /// `textDocument/diagnostic` pull it answers - the first, and the one
-    /// resend an unconfirmed engine earns - carries no item. The script
-    /// never reads its stdin; it writes both answers regardless of what
-    /// the session sends.
+    /// `textDocument/diagnostic` pull it answers carries no item. The
+    /// script never reads its stdin; it writes both answers regardless of
+    /// what the session sends.
     fn workspace_with_unconfirmed_engine(
         files: &[(&str, &str)],
     ) -> (tempfile::TempDir, ReadService, EnginePool) {
@@ -530,29 +793,78 @@ mod tests {
         (directory, reads, engines)
     }
 
-    /// Reproduces the defect an unread readiness left behind: an
-    /// unconfirmed engine's settled-looking empty pull - the one this
-    /// session already spent its one resend on - used to read as clean
-    /// bytes. It must instead surface as `rift.engine.unready`, naming
-    /// the engine and the path, rather than silently reporting nothing.
+    /// Two equal full empty reports from an engine without progress settle as clean.
     #[tokio::test]
-    async fn an_unconfirmed_engines_settled_looking_empty_pull_is_reported_unready() {
+    async fn an_unconfirmed_engines_stable_empty_report_is_clean() {
         let (directory, reads, engines) =
             workspace_with_unconfirmed_engine(&[("lib.rs", "pub fn beacon() {}\n")]);
         let paths = vec![ProjectPath("lib.rs".to_owned())];
-        let findings = engine_change_diagnostics(&engines, &reads, &paths).await;
+        let changes = added_changes(&reads, &paths);
+        let findings =
+            classified_engine_change_diagnostics(&engines, &reads, &reads, &changes).await;
+        assert!(findings.is_empty(), "{findings:#?}");
+        engines.shutdown().await;
+        drop(directory);
+    }
+
+    /// Two early equal reports cannot settle an engine before its retry
+    /// table ends. Later equal reports carry finding produced after
+    /// delayed analysis, and that finding must reach caller.
+    #[tokio::test]
+    async fn an_unconfirmed_engines_early_equal_reports_do_not_hide_a_later_finding() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        std::fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")
+            .expect("fixture file writes");
+        let reads = ReadService::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )
+        .expect("fixture workspace indexes");
+        let capabilities = framed(
+            r#"{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"diagnosticProvider":{"identifier":"fake","interFileDependencies":false,"workspaceDiagnostics":false}}}}"#,
+        );
+        let empty = |id: u64| {
+            framed(&format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"kind":"full","items":[]}}}}"#
+            ))
+        };
+        let finding = framed(
+            r#"{"jsonrpc":"2.0","id":3,"result":{"kind":"full","items":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"message":"late finding","code":"late"}]}}"#,
+        );
+        let finding_again = finding.replacen("\"id\":3", "\"id\":4", 1);
+        let script = format!(
+            "printf '%s' '{capabilities}{}{finding}{finding_again}'; sleep 0.2",
+            empty(1) + &empty(2),
+        );
+        let engine = rift_protocol::configuration::EngineConfiguration {
+            program: "sh".to_owned(),
+            arguments: vec!["-c".to_owned(), script],
+            environment: BTreeMap::new(),
+            languages: vec!["rust".to_owned()],
+            initialization_options: None,
+            startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            output_limit: rift_protocol::configuration::ByteSize::from_bytes(4_096),
+            retry: rift_protocol::retry::RetryPolicy {
+                attempts: 4,
+                delay: rift_protocol::configuration::Duration::from_millis(1),
+                delay_limit: rift_protocol::configuration::Duration::from_millis(1),
+            },
+            restart: rift_protocol::retry::RestartPolicy::default(),
+        };
+        let engines = EnginePool::new(
+            directory.path(),
+            BTreeMap::from([("fake".to_owned(), engine)]),
+        );
+        let changes = added_changes(&reads, &[ProjectPath("lib.rs".to_owned())]);
+        let findings =
+            classified_engine_change_diagnostics(&engines, &reads, &reads, &changes).await;
         assert_eq!(findings.len(), 1, "{findings:#?}");
-        assert_eq!(findings[0].code.as_deref(), Some("rift.engine.unready"));
-        assert!(
-            findings[0].message.contains("fake"),
-            "{}",
-            findings[0].message
-        );
-        assert!(
-            findings[0].message.contains("lib.rs"),
-            "{}",
-            findings[0].message
-        );
+        assert_eq!(findings[0].code.as_deref(), Some("late"));
+        assert_eq!(findings[0].message, "late finding");
         engines.shutdown().await;
         drop(directory);
     }
@@ -621,7 +933,9 @@ mod tests {
         let (directory, reads, engines) =
             workspace_with_an_engine_still_analyzing(&[("lib.rs", "pub fn beacon() {}\n")]);
         let paths = vec![ProjectPath("lib.rs".to_owned())];
-        let findings = engine_change_diagnostics(&engines, &reads, &paths).await;
+        let changes = added_changes(&reads, &paths);
+        let findings =
+            classified_engine_change_diagnostics(&engines, &reads, &reads, &changes).await;
         assert_eq!(findings.len(), 1, "{findings:#?}");
         assert_eq!(findings[0].code.as_deref(), Some("rift.engine.unready"));
         assert!(
@@ -638,12 +952,9 @@ mod tests {
         drop(directory);
     }
 
-    /// A workspace served by a canned `sh` engine whose first path never
-    /// confirms readiness - two empty pulls, exactly
-    /// [`workspace_with_unconfirmed_engine`]'s script - and whose second
-    /// path answers with [`ENGINE_DIAGNOSTICS_PER_CHANGE_MAX`] mapped
-    /// diagnostics, filling the finding cap before the walk ever appends
-    /// the first path's queued unready warning.
+    /// A workspace served by a canned `sh` engine whose first path
+    /// settles after two equal empty pulls and whose second path answers with
+    /// [`ENGINE_DIAGNOSTICS_PER_CHANGE_MAX`] mapped diagnostics twice.
     fn workspace_with_an_unconfirmed_path_and_a_flooding_path(
         files: &[(&str, &str)],
     ) -> (tempfile::TempDir, ReadService, EnginePool) {
@@ -678,8 +989,9 @@ mod tests {
         let flooding_pull = framed(&format!(
             r#"{{"jsonrpc":"2.0","id":3,"result":{{"kind":"full","items":[{items}]}}}}"#
         ));
+        let flooding_pull_again = flooding_pull.replacen("\"id\":3", "\"id\":4", 1);
         let script = format!(
-            "printf '%s' '{capabilities}{}{}{flooding_pull}'; sleep 0.2",
+            "printf '%s' '{capabilities}{}{}{flooding_pull}{flooding_pull_again}'; sleep 0.2",
             empty_pull(1),
             empty_pull(2),
         );
@@ -721,7 +1033,9 @@ mod tests {
             ProjectPath("a.rs".to_owned()),
             ProjectPath("b.rs".to_owned()),
         ];
-        let findings = engine_change_diagnostics(&engines, &reads, &paths).await;
+        let changes = added_changes(&reads, &paths);
+        let findings =
+            classified_engine_change_diagnostics(&engines, &reads, &reads, &changes).await;
         assert_eq!(
             findings.len(),
             ENGINE_DIAGNOSTICS_PER_CHANGE_MAX,

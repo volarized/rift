@@ -18,14 +18,10 @@
 //!   assigned to one is that variable, named by the declarator. A
 //!   destructuring declarator declares its names through a pattern, not a
 //!   single name, and emits no symbol.
-//! - A declaration's span is its own node: the grammars attach decorators
-//!   as children of the declared node, so nothing outside it belongs to the
-//!   declaration and `range` equals `item_range`.
-//! - `documentation` is always empty: with `range` equal to `item_range`, no
-//!   leading `JSDoc` comment is ever part of a declaration's span here, so
-//!   there is nothing to attach. A `Signature` still renders for a callable
-//!   declaration - `signatures` derives from `body_range` and the
-//!   `Callable` facet alone, in the shared walk.
+//! - A declaration's complete span includes directly attached `JSDoc` comments.
+//!   Decorators remain children of the declared node.
+//! - `documentation` remains empty. A `Signature` renders for a callable
+//!   declaration from `body_range` and the `Callable` facet.
 
 use std::num::NonZeroU16;
 
@@ -386,10 +382,30 @@ impl GrammarRules for EcmaScriptRules {
         text.get(name.byte_range()).map(Into::into)
     }
 
-    /// A declaration starts at its own node: the grammars attach decorators
-    /// as children, so no preceding sibling belongs to the declaration.
-    fn declaration_start(&self, node: Node<'_>, _text: &str) -> usize {
-        node.start_byte()
+    /// Extends declaration start over directly attached `JSDoc` comments.
+    fn declaration_start(&self, node: Node<'_>, text: &str) -> usize {
+        let mut front = node;
+        while let Some(previous) = front.prev_sibling() {
+            if previous.kind() != "comment" {
+                break;
+            }
+            let Some(comment) = text.get(previous.byte_range()) else {
+                break;
+            };
+            if !comment.trim_start().starts_with("/**") {
+                break;
+            }
+            let Some(gap) = text.get(previous.end_byte()..front.start_byte()) else {
+                break;
+            };
+            if !gap.chars().all(char::is_whitespace)
+                || gap.bytes().filter(|byte| *byte == b'\n').count() > 1
+            {
+                break;
+            }
+            front = previous;
+        }
+        front.start_byte()
     }
 
     fn qualification_separator(&self) -> &'static str {

@@ -48,7 +48,14 @@ fn corpus() -> Vec<(&'static str, Value)> {
             "search",
             json!({ "query": "beacon", "include": ["source"] }),
         ),
-        ("search", json!({ "query": "beacon", "limit": 1 })),
+        (
+            "search",
+            json!({
+                "query": "beacon",
+                "limit": 1,
+                "paths": { "include": ["lib.rs"] }
+            }),
+        ),
         (
             "search",
             json!({ "query": "beacon", "limit": 1, "page_index": 100 }),
@@ -238,9 +245,8 @@ fn patch_corpus() -> Vec<(&'static str, Value)> {
                 "patch": "--- a/lib.rs\n+++ b/renamed.rs\n@@ -1 +1 @@\n-pub fn beacon_one() -> u8 { 1 }\n+pub fn beacon_one() -> u8 { 1 }\n"
             }),
         ),
-        // `justfile` carries no extension at all, so no syntax provider and no
-        // `[search.text]` extension admit it; `patch` still reaches it through the
-        // `[source]` policy alone.
+        // `justfile` carries no extension and no syntax provider; `patch` still
+        // reaches it through the `[source]` policy.
         (
             "patch",
             json!({
@@ -281,8 +287,7 @@ fn invalid_move_file_corpus() -> Vec<Value> {
 
 /// Search requests only the lexical search-index tier can fully answer: a multi-word
 /// prose query merging in hits identifier search alone would not surface, and a query
-/// that only `notes.txt` (included by the default `[search.text]` extensions) answers,
-/// since identifier search never reaches a non-source file.
+/// that only `notes.txt` answers, since identifier search never reaches its content.
 fn lexical_search_corpus() -> Vec<(&'static str, Value)> {
     vec![
         ("search", json!({ "query": "beacon two three" })),
@@ -575,10 +580,8 @@ async fn served_fixture() -> TestResult<(
         directory.path().join("remove_caller.rs"),
         "pub fn calls_watched() {\n    beacon_watched();\n}\n",
     )?;
-    // No extension gate admits it: no syntax provider claims it and no `[search.text]`
-    // extension includes it. Visible to the `[source]` policy all the same, so `patch`
-    // reaches it and `nodes` refuses `capability_unavailable` naming its missing
-    // extension.
+    // No syntax provider claims it. Baseline content still makes it visible to `patch`,
+    // while `nodes` refuses `capability_unavailable` naming missing extension.
     fs::write(directory.path().join("justfile"), "default:\n    echo hi\n")?;
     // A committed baseline, so the corpus can prove revision-addressed reads:
     // `hidden.rs` stays gitignored and uncommitted, everything else lands in
@@ -845,6 +848,68 @@ fn every_tool_example_validates_against_its_advertised_schemas() -> TestResult {
             }
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn tools_list_distinguishes_lookup_names_from_write_addresses() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+    let tools = client.list_all_tools().await?;
+
+    let schema = |name: &str| -> TestResult<Value> {
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == name)
+            .ok_or_else(|| format!("{name} must be advertised"))?;
+        Ok(Value::Object(tool.input_schema.as_ref().clone()))
+    };
+
+    let get_symbol = schema("get_symbol")?;
+    let name = &get_symbol["properties"]["name"];
+    assert_eq!(name["type"], "string");
+
+    let insert_symbol = schema("insert_symbol")?;
+    assert!(
+        insert_symbol["properties"]["anchor"]["anyOf"]
+            .as_array()
+            .is_some_and(|arms| arms.iter().any(|arm| arm["$ref"] == "#/$defs/SymbolId")),
+        "insert_symbol.anchor must carry the SymbolId schema: {insert_symbol:#}"
+    );
+    let replace_symbol = schema("replace_symbol")?;
+    assert_eq!(
+        replace_symbol["properties"]["symbol"]["$ref"],
+        "#/$defs/SymbolId"
+    );
+
+    let replace_node = schema("replace_node")?;
+    assert_eq!(replace_node["properties"]["node"]["$ref"], "#/$defs/NodeId");
+
+    let mut missing = Vec::new();
+    if !name["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("not a full `SymbolId`"))
+    {
+        missing.push("get_symbol.name must distinguish a declaration name from a full SymbolId");
+    }
+    if !replace_symbol["properties"]["symbol"]["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("returned by `get_symbol`"))
+    {
+        missing.push("replace_symbol.symbol must name where its full SymbolId comes from");
+    }
+    if !replace_node["properties"]["node"]["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("returned by `nodes`"))
+    {
+        missing.push("replace_node.node must name where its full NodeId comes from");
+    }
+    assert!(
+        missing.is_empty(),
+        "tools/list leaves write address contract unclear: {missing:#?}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
     Ok(())
 }
 
@@ -1137,10 +1202,12 @@ kind = "other"
 program = "echo"
 arguments = ["checked"]
 changed_paths = "append"
+writes = "none"
 working_directory = ""
 environment = {}
 timeout = "30s"
 output_limit = "4kb"
+failure_severity = "error"
 guarantees = [
     { kind = "behavior_checked", scope = { kind = "reach", reach = "project" }, detail = "echo ran over the changed paths" },
 ]
@@ -1153,10 +1220,12 @@ kind = "other"
 program = "false"
 arguments = []
 changed_paths = "none"
+writes = "none"
 working_directory = ""
 environment = {}
 timeout = "30s"
 output_limit = "4kb"
+failure_severity = "error"
 guarantees = []
 determinism = "deterministic"
 "#,

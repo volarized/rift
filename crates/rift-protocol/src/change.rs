@@ -225,18 +225,18 @@ pub struct ChangeSummary {
     /// Identity of this applied change.
     pub id: ChangeId,
     /// Paths whose entries differ because of this change, sorted bytewise.
-    #[schemars(length(max = 256))]
+    #[schemars(length(min = 1, max = 256))]
     pub paths: Vec<ProjectPath>,
     /// Concrete edits in canonical file-and-range order. A modification carries one
     /// edit per replaced range; a file the change created or removed carries one edit
     /// spanning the whole file.
-    #[schemars(length(max = 256))]
+    #[schemars(length(min = 1, max = 256))]
     pub edits: Vec<Edit>,
     /// Resolution findings in source order, then one finding per hook that
     /// did not pass.
     #[schemars(length(max = 256))]
     pub diagnostics: Vec<Diagnostic>,
-    /// Properties the workspace's passing hooks established about this
+    /// Properties the workspace's passing validation hooks established about this
     /// change, in hook list order.
     #[schemars(length(max = 512))]
     pub guarantees: Vec<GuaranteeEvidence>,
@@ -341,6 +341,9 @@ pub enum ChangeResult {
         #[schemars(length(max = 256))]
         diagnostics: Vec<Diagnostic>,
     },
+    /// A completed transform pipeline left the targeted tree unchanged.
+    #[serde(rename = "unchanged")]
+    Unchanged,
 }
 
 impl ChangeResult {
@@ -416,7 +419,7 @@ impl From<&str> for BodySource {
 ]))]
 #[schemars(transform = schema::declare_replace_symbol_body_length)]
 pub struct ReplaceSymbolParams {
-    /// The declaration to replace.
+    /// The declaration identity returned by `get_symbol`.
     pub symbol: SymbolId,
     /// Which part of the declaration to replace. Omitted - the only form this release
     /// serves - replaces the whole declaration; a named region fails as
@@ -452,7 +455,7 @@ pub struct ReplaceSymbolParams {
 #[schemars(transform = schema::insert_symbol_addresses_one_target)]
 #[schemars(transform = schema::declare_insert_symbol_body_length)]
 pub struct InsertSymbolParams {
-    /// The existing declaration the new one lands beside.
+    /// The existing declaration identity returned by `get_symbol`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<SymbolId>,
     /// The destination file the content lands in, created first when `create_missing`
@@ -484,7 +487,7 @@ pub struct InsertSymbolParams {
 ]))]
 #[schemars(transform = schema::declare_replace_node_body_length)]
 pub struct ReplaceNodeParams {
-    /// The node to replace, witness included.
+    /// The node identity returned by `nodes`, witness included.
     pub node: NodeId,
     /// Which named part of the node to replace. Omitted - the only form this release
     /// serves - replaces the node whole; a named region fails as
@@ -514,7 +517,7 @@ pub struct ReplaceNodeParams {
 ]))]
 #[schemars(transform = schema::declare_insert_node_body_length)]
 pub struct InsertNodeParams {
-    /// The node the new content lands beside, witness included.
+    /// The node identity returned by `nodes`, witness included.
     pub anchor: NodeId,
     /// Which side of the node receives the new content.
     pub position: InsertPosition,
@@ -541,7 +544,7 @@ pub const RENAME_NEW_NAME_BYTES_MAX: usize = 256;
     }
 ]))]
 pub struct RenameSymbolParams {
-    /// The declaration to rename, in the address form the read tools return.
+    /// The declaration identity returned by `get_symbol`.
     pub symbol: SymbolId,
     /// The declaration's new name. The engine judges identifier validity for its
     /// language; a name the engine refuses returns an `unmet_precondition` refusal
@@ -627,7 +630,7 @@ pub struct MoveFileParams {
     }
 ]))]
 pub struct RemoveSymbolParams {
-    /// The declaration to remove.
+    /// The declaration identity returned by `get_symbol`.
     pub symbol: SymbolId,
     /// Applies the removal even when references stand, carrying them as a warning instead
     /// of refusing.
@@ -653,7 +656,7 @@ pub struct RemoveSymbolParams {
     }
 ]))]
 pub struct RemoveNodeParams {
-    /// The node to remove, witness included.
+    /// The node identity returned by `nodes`, witness included.
     pub node: NodeId,
     /// Applies the removal even when references stand, carrying them as a warning instead
     /// of refusing.

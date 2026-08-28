@@ -74,65 +74,28 @@ impl From<&SourceConfiguration> for SourceVisibility {
     }
 }
 
-/// Which non-source text files the lexical index includes: the resolved `[search.text]`
-/// policy, independent of the wire model it was read from.
+/// Resolved `[search.text]` chunk bound.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextFileInclusion {
-    extensions: Vec<String>,
     chunk_bytes_max: u64,
 }
 
 impl TextFileInclusion {
-    /// Builds one text-inclusion policy from its extension list and chunk bound.
+    /// Builds one text-file policy from its chunk bound.
     #[must_use]
-    pub const fn new(extensions: Vec<String>, chunk_bytes_max: u64) -> Self {
-        Self {
-            extensions,
-            chunk_bytes_max,
-        }
+    pub const fn new(chunk_bytes_max: u64) -> Self {
+        Self { chunk_bytes_max }
     }
 
-    /// Extensions, without the leading dot, included as text-file lexical units.
-    #[must_use]
-    pub fn extensions(&self) -> &[String] {
-        &self.extensions
-    }
-
-    /// Bytes one lexical chunk derived from an included text file may hold.
+    /// Bytes one lexical chunk derived from baseline text may hold.
     #[must_use]
     pub const fn chunk_bytes_max(&self) -> u64 {
         self.chunk_bytes_max
     }
-
-    /// Whether `path` joins the text lane on its name alone: a configured `[search.text]`
-    /// extension, matched case-insensitively against the configured lowercase spellings -
-    /// `README.MD` is included by `extensions = ["md"]`, matching how case-insensitive
-    /// filesystems already present extensions to callers, while configuration acceptance
-    /// still refuses any entry that is not itself lowercase - or no extension at all.
-    /// `justfile`, `Dockerfile`, and `.gitignore` carry no extension a configured list could
-    /// ever name, so an extensionless path is eligible by default; the caller that reads the
-    /// candidate's bytes still sniffs it for [`EXTENSIONLESS_SNIFF_BYTES_MAX`] before treating
-    /// it as text, which this method - path-only, no I/O - cannot do.
-    #[must_use]
-    pub fn includes(&self, path: &std::path::Path) -> bool {
-        match path.extension().and_then(std::ffi::OsStr::to_str) {
-            Some(extension) => self
-                .extensions
-                .iter()
-                .any(|included| included.eq_ignore_ascii_case(extension)),
-            None => true,
-        }
-    }
 }
 
-/// Bytes sniffed from the front of an extensionless text-lane candidate before it may join
-/// the index: a NUL byte within this many bytes is a compiled artifact, not text, and the
-/// candidate stays out. A path carrying an extension is never sniffed - its extension already
-/// settled inclusion.
-pub const EXTENSIONLESS_SNIFF_BYTES_MAX: u64 = 8 * 1024;
-
 impl Default for TextFileInclusion {
-    /// Every default `[search.text]` extension included, at the default chunk bound.
+    /// Uses default `[search.text]` chunk bound.
     fn default() -> Self {
         Self::from(&SearchConfiguration::default())
     }
@@ -140,10 +103,7 @@ impl Default for TextFileInclusion {
 
 impl From<&SearchConfiguration> for TextFileInclusion {
     fn from(search: &SearchConfiguration) -> Self {
-        Self::new(
-            search.text.extensions.clone(),
-            search.text.max_chunk.bytes(),
-        )
+        Self::new(search.text.max_chunk.bytes())
     }
 }
 
@@ -199,61 +159,18 @@ mod tests {
     #[test]
     fn test_text_file_inclusion_converts_from_wire_search_configuration() {
         let mut search = rift_protocol::configuration::SearchConfiguration::default();
-        search.text.extensions = vec!["md".to_owned(), "rst".to_owned()];
         search.text.max_chunk = ByteSize::from_bytes(2 << 20);
         let inclusion = TextFileInclusion::from(&search);
-        assert_eq!(inclusion.extensions(), ["md", "rst"]);
         assert_eq!(inclusion.chunk_bytes_max(), 2 << 20);
     }
 
     #[test]
     fn test_text_file_inclusion_default_matches_default_search_configuration() {
         let inclusion = TextFileInclusion::default();
-        assert_eq!(inclusion.extensions(), ["md", "mdx", "txt"]);
         assert_eq!(inclusion.chunk_bytes_max(), 1 << 20);
         assert_eq!(
             inclusion,
             TextFileInclusion::from(&rift_protocol::configuration::SearchConfiguration::default())
-        );
-    }
-
-    #[test]
-    fn test_text_file_inclusion_includes_a_configured_extension_case_insensitively() {
-        let inclusion = TextFileInclusion::new(vec!["md".to_owned()], 1_024);
-        assert!(inclusion.includes(std::path::Path::new("docs/readme.md")));
-        assert!(
-            inclusion.includes(std::path::Path::new("docs/README.MD")),
-            "a mixed-case filesystem extension must still be included"
-        );
-        assert!(!inclusion.includes(std::path::Path::new("docs/readme.txt")));
-    }
-
-    /// `justfile`, `Dockerfile`, and `.gitignore` carry no extension a configured list could
-    /// ever spell, so every extensionless path is eligible on its name alone, whatever the
-    /// configured extension list holds.
-    #[test]
-    fn test_text_file_inclusion_includes_every_extensionless_path_by_default() {
-        let inclusion = TextFileInclusion::new(vec!["md".to_owned()], 1_024);
-        for path in ["justfile", "Dockerfile", ".gitignore", "scripts/build"] {
-            assert!(
-                inclusion.includes(std::path::Path::new(path)),
-                "an extensionless path must be eligible on its name alone: {path}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_text_extension_configuration_still_refuses_uppercase_entries() {
-        use rift_protocol::configuration::{ConfigurationViolation, WorkspaceConfiguration};
-        let mut configuration = WorkspaceConfiguration::default();
-        configuration.search.text.extensions = vec!["MD".to_owned()];
-        assert_eq!(
-            configuration.validate(),
-            Err(ConfigurationViolation::TextExtensionInvalid {
-                extension: "MD".to_owned(),
-            }),
-            "config-side acceptance must still refuse an uppercase extension entry, even though \
-             the runtime path-matching predicate is case-insensitive"
         );
     }
 

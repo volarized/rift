@@ -611,6 +611,15 @@ pub(crate) fn is_blank_content(content: &str) -> bool {
     content.bytes().all(|byte| byte == b' ' || byte == b'\t')
 }
 
+/// Whether line content carries only blank bytes and structural punctuation.
+fn is_separator_content(content: &str) -> bool {
+    let has_punctuation = content.bytes().any(|byte| byte.is_ascii_punctuation());
+    let contains_only_separator_bytes = content
+        .bytes()
+        .all(|byte| byte == b' ' || byte == b'\t' || byte.is_ascii_punctuation());
+    has_punctuation && contains_only_separator_bytes
+}
+
 /// The start a removal takes when real source follows it on its own line and a blank run
 /// stands before that line: the end of the last non-blank line's content, so the source left
 /// behind rejoins the line it sat on before whatever put it here separated the two.
@@ -636,38 +645,27 @@ fn rejoined_start(source: &str, spans: &[LineSpan], start: usize) -> usize {
     line_ending_at(spans, retreated).map_or(retreated, |previous| previous.content_end)
 }
 
-/// Widens `span` over the whitespace-only bytes and separator that isolate a removed
-/// declaration or node, so the removal leaves no dangling indentation and no blank-line run
-/// where it stood.
+/// Widens `span` over bytes that isolate a removed declaration or node.
 ///
 /// The rule, in order:
 /// 1. If every byte between the line start and `span.start` is blank, the widened span
 ///    starts at the line start: the removal takes its own leading indentation with it.
-/// 2. If every byte between `span.end` and the end of its line is blank, the widened span
-///    extends past that line's ending: the removal takes the separator that followed it.
+/// 2. If the line suffix is blank, or carries only blank bytes and structural punctuation,
+///    the widened span extends past that line's ending.
 /// 3. Past that ending, the widened span takes one further adjacent blank-line run: from the
-///    trailing side (every further wholly blank line, in source order) when one stands there,
-///    otherwise from the leading side (every wholly blank line immediately before `start`, in
-///    reverse), otherwise neither. A removal between two declarations therefore collapses to
-///    the one separator that already stood on either side of it, never both, and a removal
-///    whose own insertion left a blank run behind it - nothing trailing, everything leading -
-///    takes that run back.
-///
+///    trailing side when one stands there, otherwise from the leading side, otherwise neither.
+///    A removal between two declarations therefore keeps one separator.
 /// 4. A span that began its own line but is followed on that line by real source takes the
-///    blank run before it and the line ending that separated it from the last non-blank
-///    line, so what follows rejoins the line it sat on before the insertion split them. A
-///    line preceded directly by real source retreats nowhere.
+///    blank run before it and the preceding line ending, so following source rejoins its line.
 ///
 /// A span whose start is preceded by more than indentation is returned unchanged.
 ///
 /// `span` must already land inside `source`: both removal callers resolve it first. Widening
-/// only moves `start` and `end` along `source`'s own line boundaries, so it cannot push
-/// either past `source`'s length.
+/// only moves `start` and `end` along `source`'s own line boundaries.
 ///
 /// # Panics
 ///
-/// Panics when `span` does not land inside `source` - a programmer error, since every caller
-/// resolves the span first.
+/// Panics when `span` does not land inside `source`.
 pub(crate) fn widened_removal_span(source: &str, span: ByteRange) -> ByteRange {
     let source_len = source.len();
     let mut start = usize::try_from(span.start).expect("span fits this platform's usize");
@@ -690,10 +688,11 @@ pub(crate) fn widened_removal_span(source: &str, span: ByteRange) -> ByteRange {
 
     if let Some(line) = line_at(&spans, end) {
         let suffix = source.get(end..line.content_end).unwrap_or_default();
-        if !is_blank_content(suffix) && began_its_line {
+        let separator_follows = began_its_line && is_separator_content(suffix);
+        if !is_blank_content(suffix) && !separator_follows && began_its_line {
             start = rejoined_start(source, &spans, start);
         }
-        if is_blank_content(suffix) {
+        if is_blank_content(suffix) || separator_follows {
             let own_ending_end = line.end;
             let mut trailing_end = own_ending_end;
             while let Some(next) = line_at(&spans, trailing_end) {
@@ -1167,12 +1166,10 @@ mod tests {
     /// A workspace served by a canned `sh` engine that advertises
     /// `textDocument/references` and never announces work through `$/progress`: its
     /// readiness stays [`rift_lsp::session::EngineReadiness::Unconfirmed`] throughout. Two
-    /// references answers ride the script, both empty - the first, and the one resend an
-    /// unconfirmed engine earns (`EngineSlot::request`'s `claim_empty_answer_resend`) -
-    /// because an empty answer from an engine that has never announced work claims one
-    /// resend before the outer exchange settles on it. The retry wait is trimmed to 1ms so
-    /// the resend lands well inside the script's own `sleep` window. The script never
-    /// reads its stdin; it writes both answers regardless of what the session sends.
+    /// references answers ride the script, both empty. Configured retry attempts bound
+    /// resends before outer exchange settles on final answer. Retry wait is 1ms so second
+    /// request lands inside script's own `sleep` window. Script never reads stdin; it writes
+    /// both answers regardless of what session sends.
     fn workspace_with_unconfirmed_references_engine(
         files: &[(&str, &str)],
     ) -> (tempfile::TempDir, ReadService, EnginePool) {
@@ -1205,7 +1202,7 @@ mod tests {
     /// The same fixture, except the engine announces and ends one work-done progress token
     /// before it answers the references request: its readiness has settled to
     /// [`rift_lsp::session::EngineReadiness::Ready`] by the time that answer lands, so no
-    /// resend is claimed and the default retry policy is unused.
+    /// resend is needed and default retry policy is unused.
     fn workspace_with_confirmed_ready_references_engine(
         files: &[(&str, &str)],
     ) -> (tempfile::TempDir, ReadService, EnginePool) {

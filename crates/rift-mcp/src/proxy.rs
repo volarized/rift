@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use rift_core::{CapturedStream, CliCode, Error, ErrorCode, ErrorContext, ErrorName, Fault};
 use rift_protocol::error as wire;
-use rift_protocol::lock::ServerLock;
+use rift_protocol::lock::{ProductIdentity, ServerLock};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, Implementation, ListResourceTemplatesResult,
     ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
@@ -44,6 +44,8 @@ pub type ProxyServeError = Error<ProxyFault>;
 /// One proxy failure: what stopped `rift mcp` from serving agents.
 #[derive(Debug)]
 pub enum ProxyFault {
+    /// Current process identity could not be computed.
+    Identity(std::io::Error),
     /// MCP initialization over stdio failed.
     Initialize(Box<ServerInitializeError>),
     /// The MCP service task failed.
@@ -56,12 +58,15 @@ impl Fault for ProxyFault {
     fn name(&self) -> ErrorName {
         match self {
             Self::Initialize(_) => ErrorName::Wire(ErrorCode::TemporarilyUnavailable),
-            Self::Task(_) | Self::UnexpectedQuit => ErrorName::Wire(ErrorCode::InternalError),
+            Self::Identity(_) | Self::Task(_) | Self::UnexpectedQuit => {
+                ErrorName::Wire(ErrorCode::InternalError)
+            }
         }
     }
 
     fn context(&self) -> Vec<ErrorContext> {
         let detail = match self {
+            Self::Identity(_) => "product identity failed",
             Self::Initialize(_) => "MCP initialization failed",
             Self::Task(_) => "MCP service task failed",
             Self::UnexpectedQuit => "MCP service ended unexpectedly",
@@ -71,6 +76,7 @@ impl Fault for ProxyFault {
 
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Identity(source) => Some(source),
             Self::Initialize(source) => Some(source.as_ref()),
             Self::Task(source) => Some(source),
             Self::UnexpectedQuit => None,
@@ -97,7 +103,10 @@ impl Fault for ProxyFault {
 /// connection; the detached server keeps serving the workspace.
 pub async fn serve_proxy(root: &Path) -> Result<(), ProxyServeError> {
     tracing::info!(component = "mcp", transport = "stdio", "MCP proxy starting");
-    let proxy = RiftProxy::new(root);
+    let identity = crate::identity::product_identity()
+        .await
+        .map_err(|error| Error::new(ProxyFault::Identity(error)))?;
+    let proxy = RiftProxy::new(root, identity);
     let warmup = tokio::spawn(warm_up(proxy.clone()));
     let outcome = serve_connection(proxy, crate::transport::guarded_stdio()).await;
     warmup.abort();
@@ -174,6 +183,7 @@ async fn warm_up(proxy: RiftProxy) {
 #[derive(Clone, Debug)]
 struct RiftProxy {
     root: Arc<Path>,
+    identity: Arc<ProductIdentity>,
     upstream: Arc<tokio::sync::Mutex<UpstreamSlot>>,
     advertised: Arc<std::sync::Mutex<Option<ServerInfo>>>,
 }
@@ -195,9 +205,10 @@ struct Upstream {
 }
 
 impl RiftProxy {
-    fn new(root: &Path) -> Self {
+    fn new(root: &Path, identity: ProductIdentity) -> Self {
         Self {
             root: Arc::from(root),
+            identity: Arc::new(identity),
             upstream: Arc::new(tokio::sync::Mutex::new(UpstreamSlot {
                 connected: None,
                 generation_next: 0,
@@ -234,7 +245,7 @@ impl RiftProxy {
         // transport tasks before the replacement connects.
         let replaced = slot.connected.take();
         drop(replaced);
-        let running = connect_upstream(&self.root).await?;
+        let running = connect_upstream(&self.root, &self.identity).await?;
         self.mirror_advertised(&running);
         let generation = slot.generation_next;
         slot.generation_next += 1;
@@ -285,7 +296,9 @@ impl RiftProxy {
     /// advertisement once a connect succeeded, and a tools-enabled fallback
     /// naming this binary before then.
     fn advertised_info(&self) -> ServerInfo {
-        self.lock_advertised().clone().unwrap_or_else(fallback_info)
+        self.lock_advertised()
+            .clone()
+            .unwrap_or_else(|| fallback_info(&self.identity))
     }
 
     /// Records the connected upstream's advertisement for `get_info`.
@@ -336,8 +349,11 @@ fn reuse_current(current_generation: u64, observed: Option<u64>) -> bool {
 ///
 /// Dropping this future abandons the connect; a spawned server keeps
 /// serving and the next attempt adopts it.
-async fn connect_upstream(root: &Path) -> Result<RunningService<RoleClient, ()>, ErrorData> {
-    if let Some(running) = adopt_serving(root).await {
+async fn connect_upstream(
+    root: &Path,
+    identity: &ProductIdentity,
+) -> Result<RunningService<RoleClient, ()>, ErrorData> {
+    if let Some(running) = adopt_serving(root, identity).await? {
         return Ok(running);
     }
     // A lost spawn race is fine - this process's own spawned server finds
@@ -354,7 +370,7 @@ async fn connect_upstream(root: &Path) -> Result<RunningService<RoleClient, ()>,
     };
     let deadline = tokio::time::Instant::now() + START_WAIT_MAX;
     for _ in 0..START_POLL_ATTEMPT_COUNT {
-        match spawn_poll_outcome(adopt_serving(root).await, &mut startup) {
+        match spawn_poll_outcome(adopt_serving(root, identity).await?, &mut startup) {
             SpawnPollOutcome::Ready(running) => return Ok(running),
             SpawnPollOutcome::Failed(refusal) => return Err(refusal),
             SpawnPollOutcome::Waiting => {}
@@ -486,11 +502,14 @@ impl Fault for SpawnFault {
 /// A probe that names no serving server, and a recorded server that
 /// refuses the connect or initialize, both answer `None`: the recorded
 /// state is stale and the caller elects afresh.
-async fn adopt_serving(root: &Path) -> Option<RunningService<RoleClient, ()>> {
+async fn adopt_serving(
+    root: &Path,
+    identity: &ProductIdentity,
+) -> Result<Option<RunningService<RoleClient, ()>>, ErrorData> {
     let ServerPresence::Serving(lock) = probe(root) else {
-        return None;
+        return Ok(None);
     };
-    warn_version_skew(&lock);
+    require_identity_match(identity, &lock)?;
     match connect_recorded(&lock, UPSTREAM_CONNECT_TIMEOUT).await {
         Ok(running) => {
             tracing::info!(
@@ -499,18 +518,38 @@ async fn adopt_serving(root: &Path) -> Option<RunningService<RoleClient, ()>> {
                 pid = lock.pid,
                 "proxy connected to workspace server"
             );
-            Some(running)
+            Ok(Some(running))
         }
         Err(failure) => {
             let detail = failure.detail();
-            tracing::debug!(
+            tracing::info!(
                 component = "mcp",
                 %detail,
                 "recorded server did not answer; treating the lock as stale"
             );
-            None
+            Ok(None)
         }
     }
+}
+
+/// Refuses a serving process whose executable or served tools differ.
+fn require_identity_match(expected: &ProductIdentity, lock: &ServerLock) -> Result<(), ErrorData> {
+    if lock.identity == *expected {
+        return Ok(());
+    }
+    Err(ErrorData::internal_error(
+        format!(
+            "workspace server identity differs from this rift process: server pid {}, version {}, executable digest {}, schema digest {}; this process version {}, executable digest {}, schema digest {}; run rift server stop, then retry",
+            lock.pid,
+            lock.identity.version,
+            lock.identity.executable_digest,
+            lock.identity.schema_digest,
+            expected.version,
+            expected.executable_digest,
+            expected.schema_digest,
+        ),
+        None,
+    ))
 }
 
 /// Why one bounded connect attempt produced no live connection.
@@ -552,27 +591,6 @@ async fn connect_recorded(
         Ok(Ok(running)) => Ok(running),
         Ok(Err(error)) => Err(ConnectAttemptFailure::Initialize(Box::new(error))),
         Err(_elapsed) => Err(ConnectAttemptFailure::TimedOut),
-    }
-}
-
-/// Whether a lock's recorded version differs from this binary's.
-fn version_mismatch(lock_version: &str, binary_version: &str) -> bool {
-    lock_version != binary_version
-}
-
-/// Warns when the serving server was built at another release.
-///
-/// The mismatch is served anyway - MCP negotiates itself - but the warning
-/// gives the operator the stale-binary diagnosis when behavior looks off.
-fn warn_version_skew(lock: &ServerLock) {
-    let binary_version = env!("CARGO_PKG_VERSION");
-    if version_mismatch(&lock.version, binary_version) {
-        tracing::warn!(
-            component = "mcp",
-            server_version = %lock.version,
-            proxy_version = %binary_version,
-            "workspace server was built from a different rift version"
-        );
     }
 }
 
@@ -624,14 +642,16 @@ fn forwarded_error(error: ServiceError) -> ErrorData {
 }
 
 /// The advertisement served before the first successful upstream connect.
-fn fallback_info() -> ServerInfo {
-    ServerInfo::new(
+fn fallback_info(identity: &ProductIdentity) -> ServerInfo {
+    let mut info = ServerInfo::new(
         ServerCapabilities::builder()
             .enable_tools()
             .enable_resources()
             .build(),
     )
-    .with_server_info(Implementation::new("rift", env!("CARGO_PKG_VERSION")))
+    .with_server_info(Implementation::new("rift", env!("CARGO_PKG_VERSION")));
+    info.meta = Some(crate::identity::identity_meta(identity));
+    info
 }
 
 /// The upstream's negotiated facts as this proxy's own advertisement.
@@ -754,6 +774,10 @@ mod tests {
             executable_digest: executable_digest.to_owned(),
             schema_digest: schema_digest.to_owned(),
         }
+    }
+
+    fn test_identity() -> ProductIdentity {
+        identity("0.0.11", EXECUTABLE_DIGEST_A, SCHEMA_DIGEST_A)
     }
 
     fn transport_send_failure() -> ServiceError {
@@ -1120,7 +1144,7 @@ mod tests {
 
     #[test]
     fn fallback_advertisement_names_rift_and_enables_tools() {
-        let info = fallback_info();
+        let info = fallback_info(&test_identity());
         assert_eq!(info.server_info.name, "rift");
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
         assert!(info.capabilities.tools.is_some());
@@ -1145,9 +1169,9 @@ mod tests {
     #[test]
     fn advertised_info_serves_the_fallback_then_the_recorded_mirror() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let proxy = RiftProxy::new(directory.path());
+        let proxy = RiftProxy::new(directory.path(), test_identity());
         assert_eq!(proxy.advertised_info().server_info.name, "rift");
-        let mirrored = fallback_info().with_instructions("recorded");
+        let mirrored = fallback_info(&test_identity()).with_instructions("recorded");
         *proxy.lock_advertised() = Some(mirrored);
         assert_eq!(
             proxy.advertised_info().instructions.as_deref(),
@@ -1185,7 +1209,7 @@ mod tests {
     #[tokio::test]
     async fn forward_maps_a_non_transport_failure_without_retry() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let proxy = RiftProxy::new(directory.path());
+        let proxy = RiftProxy::new(directory.path(), test_identity());
         let (running, _upstream_alive) = direct_upstream();
         {
             let mut slot = proxy.upstream.lock().await;
@@ -1211,7 +1235,7 @@ mod tests {
     #[tokio::test]
     async fn mirror_skips_an_upstream_without_negotiated_info() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let proxy = RiftProxy::new(directory.path());
+        let proxy = RiftProxy::new(directory.path(), test_identity());
         let (running, _upstream_alive) = direct_upstream();
         proxy.mirror_advertised(&running);
         assert!(
@@ -1223,7 +1247,7 @@ mod tests {
     #[test]
     fn poisoned_advertised_lock_still_serves_info() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let proxy = RiftProxy::new(directory.path());
+        let proxy = RiftProxy::new(directory.path(), test_identity());
         let poisoner = proxy.clone();
         std::thread::spawn(move || {
             let _guard = poisoner
@@ -1239,7 +1263,8 @@ mod tests {
             "the lock must be poisoned for the recovery arm to matter"
         );
         assert_eq!(proxy.advertised_info().server_info.name, "rift");
-        *proxy.lock_advertised() = Some(fallback_info().with_instructions("recovered"));
+        *proxy.lock_advertised() =
+            Some(fallback_info(&test_identity()).with_instructions("recovered"));
         assert_eq!(
             proxy.advertised_info().instructions.as_deref(),
             Some("recovered")
@@ -1256,7 +1281,9 @@ mod tests {
         };
         guard.publish(&recorded_lock(port))?;
         assert!(
-            adopt_serving(directory.path()).await.is_none(),
+            adopt_serving(directory.path(), &test_identity())
+                .await?
+                .is_none(),
             "a recorded server that answers nothing must be treated as stale"
         );
         Ok(())
@@ -1293,9 +1320,12 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let (server_transport, client_transport) = tokio::io::duplex(1024);
         drop(client_transport);
-        let error = serve_connection(RiftProxy::new(directory.path()), server_transport)
-            .await
-            .expect_err("a closed transport must fail initialization");
+        let error = serve_connection(
+            RiftProxy::new(directory.path(), test_identity()),
+            server_transport,
+        )
+        .await
+        .expect_err("a closed transport must fail initialization");
         assert!(matches!(error.fault(), ProxyFault::Initialize(_)));
         assert_eq!(error.descriptor().code(), "temporarily_unavailable");
     }
@@ -1306,7 +1336,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
         let connection = tokio::spawn(serve_connection(
-            RiftProxy::new(directory.path()),
+            RiftProxy::new(directory.path(), test_identity()),
             server_transport,
         ));
         let client = ().serve(client_transport).await.expect("client must initialize");

@@ -26,10 +26,12 @@ kind = "test"
 program = "cargo"
 arguments = ["test"]
 changed_paths = "none"
+writes = "none"
 working_directory = ""
 environment = {}
 timeout = "0ms"
 output_limit = "4kb"
+failure_severity = "error"
 guarantees = []
 determinism = "deterministic"
 "#;
@@ -43,10 +45,12 @@ kind = "test"
 program = "cargo"
 arguments = ["test"]
 changed_paths = "none"
+writes = "none"
 working_directory = ""
 environment = {}
 timeout = "120s"
 output_limit = "4kb"
+failure_severity = "error"
 guarantees = []
 determinism = "deterministic"
 "#;
@@ -54,14 +58,12 @@ determinism = "deterministic"
 /// A `[search.text]` block whose `max_chunk` breaks its documented 1kb..16mb bound.
 const INVALID_TEXT_CONFIGURATION: &str = r#"
 [search.text]
-extensions = ["md", "mdx", "txt"]
 max_chunk = "1b"
 "#;
 
-/// A `[search.text]` block with a custom, in-bound extension list and chunk bound.
+/// A `[search.text]` block with an in-bound chunk limit.
 const VALID_TEXT_CONFIGURATION: &str = r#"
 [search.text]
-extensions = ["md", "rst"]
 max_chunk = "2mb"
 "#;
 

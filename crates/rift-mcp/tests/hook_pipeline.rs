@@ -563,3 +563,56 @@ async fn transform_that_erases_direct_difference_returns_unchanged() -> TestResu
     );
     stop(client, server_task).await
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hook_permission_writes_are_restored_and_never_reported_as_byte_edits() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+
+    let cases = [
+        ("transform-permissions", "format", "changed_paths", false),
+        ("validation-permissions", "test", "none", true),
+    ];
+    for (id, kind, writes, guarantee) in cases {
+        let hooks = [Hook {
+            id,
+            kind,
+            script: "permissions.sh",
+            writes,
+            failure_severity: "warning",
+            timeout: "30s",
+            guarantee,
+        }];
+        let scripts = [("permissions.sh", "chmod 600 lib.rs\n")];
+        let (directory, client, server_task) = served_workspace(&hooks, &scripts, &[]).await?;
+        let target = directory.path().join("lib.rs");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640))?;
+        let initial_mode = fs::metadata(&target)?.permissions().mode();
+
+        let result = replace(&client, "pub fn beacon() -> u8 { 1 }").await?;
+
+        assert_eq!(result["status"], json!("applied"));
+        assert_eq!(
+            fs::metadata(&target)?.permissions().mode(),
+            initial_mode,
+            "hook permission write must be restored for {id}"
+        );
+        assert_eq!(
+            result["summary"]["edits"]
+                .as_array()
+                .ok_or("applied result must carry edits")?
+                .len(),
+            1,
+            "permission state must not produce a byte edit for {id}"
+        );
+        assert_eq!(diagnostic(&result, id)?["severity"], json!("warning"));
+        assert!(
+            result["summary"]["guarantees"]
+                .as_array()
+                .is_some_and(Vec::is_empty),
+            "a validation hook that changes permissions must add no guarantee"
+        );
+        stop(client, server_task).await?;
+    }
+    Ok(())
+}

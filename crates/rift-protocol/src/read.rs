@@ -241,9 +241,9 @@ pub struct GetSymbolHit {
     }
 ]))]
 pub struct GetSymbolParams {
-    /// The declaration name to look up - a name, not a free-text query; `search` takes
-    /// those. An exact symbol name ranks first, then prefix matches, then qualified-name
-    /// substrings.
+    /// The declaration name to look up - a name, not a full `SymbolId` or free-text
+    /// query; `search` takes free text. An exact symbol name ranks first, then prefix
+    /// matches, then qualified-name substrings.
     #[schemars(length(min = 1, max = 4096))]
     pub name: String,
     /// Narrows the answer to one language. Omitted searches every served language.

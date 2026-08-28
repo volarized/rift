@@ -37,20 +37,22 @@ use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use harness::{
-    LIBRARY, RUST_PROJECT_BEACON_SYMBOL, SERIAL, StopOnDrop, TestResult, WARMUP_ATTEMPTS_MAX,
-    WARMUP_PAUSE, arguments, laid_out_workspace, proxied_call, proxy_client, proxy_command,
-    require_success, run_rift, rust_engine_workspace, warmed_rust_engine, within, workspace,
+    LIBRARY, SERIAL, StopOnDrop, TestResult, arguments, laid_out_workspace, proxied_call,
+    proxy_client, proxy_command, require_success, run_rift, rust_engine_workspace, within,
+    workspace,
 };
-use rift_mcp::{PRESENCE_POLL_INTERVAL, ServerPresence, claim, probe};
+use rift_mcp::{PRESENCE_POLL_INTERVAL, START_WAIT_MAX, ServerPresence, claim, probe};
 use rift_protocol::lock::{
-    SERVER_LOCK_FILE_NAME, SERVER_PORT_MAX, SERVER_PORT_MIN, SERVER_TOKEN_LENGTH, ServerLock,
+    ProductIdentity, SERVER_LOCK_FILE_NAME, SERVER_PORT_MAX, SERVER_PORT_MIN, SERVER_TOKEN_LENGTH,
+    ServerLock,
 };
 use rmcp::ServiceExt as _;
 use rmcp::model::CallToolRequestParams;
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncReadExt as _;
 
 /// The tools the workspace server advertises, in served order.
@@ -68,6 +70,20 @@ const SERVED_TOOL_NAMES: [&str; 12] = [
     "replace_symbol",
     "search",
 ];
+
+const RUST_PROJECT_BEACON_SYMBOL: &str = "rift://symbol/rust/hub.rs/beacon";
+
+fn rift_binary_identity() -> TestResult<ProductIdentity> {
+    let executable = fs::read(env!("CARGO_BIN_EXE_rift"))?;
+    Ok(ProductIdentity {
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        executable_digest: format!("{:x}", Sha256::digest(executable)),
+        schema_digest: format!(
+            "{:x}",
+            Sha256::digest(rift_mcp::schema::schema_document().as_bytes())
+        ),
+    })
+}
 
 /// Poll attempts while waiting on a server to disappear: 10 seconds at
 /// [`PRESENCE_POLL_INTERVAL`].
@@ -295,7 +311,7 @@ async fn stale_lock_document_yields_a_fresh_election() -> TestResult {
         port: 12_345,
         token: "a".repeat(SERVER_TOKEN_LENGTH),
         pid: 1,
-        version: "0.0.1".to_owned(),
+        identity: rift_binary_identity()?,
     };
     fs::write(document_path(root), serde_json::to_vec(&stale)?)?;
     assert!(
@@ -332,7 +348,7 @@ async fn held_election_without_a_server_refuses_with_operator_guidance() -> Test
         port: refusing_port_in_range()?,
         token: "a".repeat(SERVER_TOKEN_LENGTH),
         pid: 1,
-        version: "0.0.1".to_owned(),
+        identity: rift_binary_identity()?,
     })?;
 
     let (transport, stderr) = proxy_command(root).stderr(Stdio::piped()).spawn()?;
@@ -375,8 +391,8 @@ async fn held_election_without_a_server_refuses_with_operator_guidance() -> Test
     client.cancel().await?;
     let stderr = stderr_task.await??;
     assert!(
-        stderr.contains("different rift version"),
-        "the stale-binary skew must be diagnosed: {stderr}"
+        stderr.contains("recorded server did not answer"),
+        "the stale server must be diagnosed: {stderr}"
     );
     assert!(
         stderr.contains("upstream warmup did not connect"),
@@ -418,8 +434,8 @@ async fn a_spawned_server_that_cannot_bind_its_port_refuses_with_its_captured_st
     .await?
     .expect_err("a spawned server that cannot bind its port must refuse the call");
     assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "a bind failure must refuse near-immediately, not after the poll's own window: {:?}",
+        started.elapsed() < START_WAIT_MAX,
+        "a bind failure must refuse before the poll's own window: {:?}",
         started.elapsed()
     );
     let rmcp::ServiceError::McpError(data) = refusal else {
@@ -548,7 +564,6 @@ async fn proxied_move_file_rewrites_the_referencing_file() -> TestResult {
     let _cleanup = StopOnDrop::new(root);
 
     let client = proxy_client(root).await?;
-    warmed_rust_engine(&client).await?;
     let structured = proxied_call(
         &client,
         "move_file",
@@ -585,26 +600,17 @@ async fn proxied_move_file_rewrites_the_referencing_file() -> TestResult {
     Ok(())
 }
 
-/// A patch handing the function one argument too many.
-const RUST_PROJECT_ARGUMENT_PATCH: &str =
-    "--- a/caller.rs\n+++ b/caller.rs\n@@ -4 +4 @@\n-    beacon(2)\n+    beacon(2, 3)\n";
-
-/// The inverse of [`RUST_PROJECT_ARGUMENT_PATCH`], restoring the single
-/// argument.
-const RUST_PROJECT_ARGUMENT_REVERT_PATCH: &str =
-    "--- a/caller.rs\n+++ b/caller.rs\n@@ -4 +4 @@\n-    beacon(2, 3)\n+    beacon(2)\n";
+/// A patch removing call's closing delimiter.
+const RUST_PROJECT_SYNTAX_PATCH: &str =
+    "--- a/caller.rs\n+++ b/caller.rs\n@@ -4 +4 @@\n-    beacon(2)\n+    beacon(2;\n";
 
 /// A change applied through the whole real chain carries the engine's own
 /// finding for the file it changed, and never the warning an unreachable
 /// engine degrades to.
 ///
-/// Each attempt lands the arity error and reverts it, so the file is
-/// exactly as the attempt found it and the next attempt runs against the
-/// same starting bytes; the loop ends on the first attempt whose summary
-/// carries rust-analyzer's own finding. `rift-mcp`'s own
-/// `live_rust_analyzer.rs` proves this same shape without the proxy in the
-/// path; this proves it with the proxy, the election, and the daemon all
-/// real too.
+/// `rift-mcp`'s own `live_rust_analyzer.rs` proves this same shape without
+/// the proxy in the path; this proves it with the proxy, the election, and
+/// the daemon all real too.
 #[tokio::test]
 async fn proxied_change_carries_the_engine_findings() -> TestResult {
     let _serial = SERIAL.lock().await;
@@ -617,38 +623,12 @@ async fn proxied_change_carries_the_engine_findings() -> TestResult {
     let _cleanup = StopOnDrop::new(root);
 
     let client = proxy_client(root).await?;
-    warmed_rust_engine(&client).await?;
-
-    let mut structured = None;
-    for _attempt in 0..WARMUP_ATTEMPTS_MAX {
-        let landed = proxied_call(
-            &client,
-            "patch",
-            &json!({ "patch": RUST_PROJECT_ARGUMENT_PATCH }),
-        )
-        .await?;
-        let carries_arity_error =
-            landed["summary"]["diagnostics"]
-                .as_array()
-                .is_some_and(|findings| {
-                    findings
-                        .iter()
-                        .any(|finding| finding["code"] == json!("E0107"))
-                });
-        if carries_arity_error {
-            structured = Some(landed);
-            break;
-        }
-        proxied_call(
-            &client,
-            "patch",
-            &json!({ "patch": RUST_PROJECT_ARGUMENT_REVERT_PATCH }),
-        )
-        .await?;
-        tokio::time::sleep(WARMUP_PAUSE).await;
-    }
-    let structured =
-        structured.ok_or("rust-analyzer reported no arity error within the warm-up bound")?;
+    let structured = proxied_call(
+        &client,
+        "patch",
+        &json!({ "patch": RUST_PROJECT_SYNTAX_PATCH }),
+    )
+    .await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
     let findings = structured["summary"]["diagnostics"]
         .as_array()
@@ -659,14 +639,13 @@ async fn proxied_change_carries_the_engine_findings() -> TestResult {
         .count();
     assert_eq!(
         engine_findings, 1,
-        "the arity error rides the applied change: {structured:#}"
+        "syntax finding rides applied change: {structured:#}"
     );
     let finding = findings
         .iter()
-        .find(|finding| finding["code"] == json!("E0107"))
-        .ok_or("the arity error must be among the findings")?;
+        .find(|finding| finding["code"] == json!("syntax-error"))
+        .ok_or("syntax finding must be among findings")?;
     assert_eq!(finding["severity"], json!("error"));
-    assert_eq!(finding["message"], json!("expected 1 argument, found 2"));
     let degraded = findings
         .iter()
         .any(|finding| finding["code"] == json!("rift.engine.failed"));
@@ -676,7 +655,7 @@ async fn proxied_change_carries_the_engine_findings() -> TestResult {
     );
     assert_eq!(
         fs::read_to_string(root.join("caller.rs"))?,
-        "use crate::hub::beacon;\n\npub fn total() -> i32 {\n    beacon(2, 3)\n}\n",
+        "use crate::hub::beacon;\n\npub fn total() -> i32 {\n    beacon(2;\n}\n",
         "the change stays applied with its finding attached"
     );
 

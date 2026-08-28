@@ -33,10 +33,12 @@ kind = "test"
 program = "cargo"
 arguments = ["test"]
 changed_paths = "none"
+writes = "none"
 working_directory = ""
 environment = {}
 timeout = "0ms"
 output_limit = "4kb"
+failure_severity = "error"
 guarantees = []
 determinism = "deterministic"
 "#;

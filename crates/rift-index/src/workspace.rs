@@ -14,9 +14,9 @@ use rift_core::constants::{
     WORKSPACE_FILES_MAX_DEFAULT, WORKSPACE_IGNORED_DIRECTORIES,
 };
 use rift_core::{
-    CompositionId, EXTENSIONLESS_SNIFF_BYTES_MAX, Error, ErrorCode, ErrorContext, ErrorName, Fault,
-    PortableSymbolFacts, ProjectPath, ProviderId, SourceVisibility, SymbolId, TextFileInclusion,
-    fault_label, symbol_identity,
+    CompositionId, Error, ErrorCode, ErrorContext, ErrorName, Fault, PortableSymbolFacts,
+    ProjectPath, ProviderId, SourceVisibility, SymbolId, TextFileInclusion, fault_label,
+    symbol_identity,
 };
 use rift_provider::{
     AssembledSymbol, Component, CompositionBuilder, NormalizedGraph, ProviderComposition,
@@ -287,7 +287,7 @@ pub(crate) fn index_error_caused_by(
     })
 }
 
-/// One immutable indexed Rust file.
+/// One immutable file enriched with syntax facts.
 ///
 /// `Eq` is not derived: `syntax` carries [`SyntaxDocument`], which is not `Eq`.
 #[derive(Debug, Clone, PartialEq)]
@@ -295,6 +295,7 @@ pub struct IndexedFile {
     path: ProjectPath,
     source: String,
     digest: FileDigest,
+    executable: bool,
     syntax: SyntaxDocument,
 }
 
@@ -321,6 +322,12 @@ impl IndexedFile {
         self.digest
     }
 
+    /// Whether this file was executable when the index captured it.
+    #[must_use]
+    pub const fn executable(&self) -> bool {
+        self.executable
+    }
+
     /// Returns syntax facts.
     #[must_use]
     pub const fn syntax(&self) -> &SyntaxDocument {
@@ -328,14 +335,16 @@ impl IndexedFile {
     }
 }
 
-/// One immutable indexed non-source text file: a path and its whole content, with no syntax
-/// facts. A file over `[search.text].max_chunk` still lands here whole; chunking only
-/// happens when [`WorkspaceIndex::lexical_units`] derives search units from it.
+/// One immutable visible UTF-8 file in the baseline content catalog.
+///
+/// A file over `[search.text].max_chunk` lands here whole. Search unit
+/// derivation splits its content while keeping one file identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextSourceFile {
     path: ProjectPath,
     content: String,
     digest: FileDigest,
+    executable: bool,
 }
 
 impl TextSourceFile {
@@ -355,6 +364,12 @@ impl TextSourceFile {
     #[must_use]
     pub const fn digest(&self) -> FileDigest {
         self.digest
+    }
+
+    /// Whether this file was executable when the catalog captured it.
+    #[must_use]
+    pub const fn executable(&self) -> bool {
+        self.executable
     }
 }
 
@@ -444,7 +459,6 @@ pub struct WorkspaceSourcePolicy {
     watched_root: PathBuf,
     matcher: PathMatcher,
     gitignore: Option<GitignoreChain>,
-    text_inclusion: TextFileInclusion,
 }
 
 /// Separates one path from its content digest in workspace identity material.
@@ -453,7 +467,7 @@ const FINGERPRINT_PATH_SEPARATOR: u8 = 0;
 const FINGERPRINT_FILE_SEPARATOR: u8 = 0xff;
 
 impl WorkspaceFingerprint {
-    /// Captures visible source and included text paths and bytes without parsing syntax.
+    /// Captures visible file paths and bytes without parsing syntax.
     ///
     /// Work is bounded by [`WorkspaceIndexLimits`]. A claimed file whose bytes are not
     /// UTF-8 is omitted from the capture rather than failing it.
@@ -465,14 +479,10 @@ impl WorkspaceFingerprint {
         root: &Path,
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
-        text_inclusion: &TextFileInclusion,
     ) -> Result<Self, WorkspaceIndexError> {
-        Ok(capture_digests(root, limits, visibility, text_inclusion)?.fingerprint())
+        Ok(capture_digests(root, limits, visibility)?.fingerprint())
     }
 
-    /// Folds one publication's own files, in project-path order, absorbing each file's
-    /// digest rather than its bytes. Both classes are already keyed by path, so this costs
-    /// one hash update per file however large the workspace's sources are.
     /// Folds one publication's own files, absorbing each file's digest rather than its
     /// bytes. Files already carry the digest of what the index read, so this costs one
     /// hash update per file however large the workspace's sources are.
@@ -485,7 +495,7 @@ impl WorkspaceFingerprint {
 
     /// Folds every visible file's digest in project-path order.
     ///
-    /// Source and included text files fold as one ordered set, and the order is the
+    /// Syntax and baseline text files fold as one ordered set, and the order is the
     /// project path's - never the order a directory walk produced, which sorts `docs/a.rs`
     /// and `docs-x/a.rs` the other way round, and never source-then-text, which interleaves
     /// differently again. Both constructions fold here, so an index and a request-time
@@ -519,7 +529,7 @@ impl WorkspaceSourcePolicy {
         root: &Path,
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
-        text_inclusion: &TextFileInclusion,
+        _text_inclusion: &TextFileInclusion,
     ) -> Result<Self, WorkspaceIndexError> {
         let watched_root = root.to_path_buf();
         let root = canonical_root(root)?;
@@ -533,7 +543,6 @@ impl WorkspaceSourcePolicy {
             watched_root,
             matcher,
             gitignore,
-            text_inclusion: text_inclusion.clone(),
         })
     }
 
@@ -549,21 +558,13 @@ impl WorkspaceSourcePolicy {
         self.visible_normalized(path.as_ref())
     }
 
-    /// Returns whether one source or included-text path passes current workspace policy:
-    /// visible, and carrying an extension a syntax provider serves or eligible for the text
-    /// lane. Source and text-file candidates share this one predicate: only the extension
-    /// gate that includes a path in either class differs between them, and that text-lane
-    /// gate is `text_included`, the same one the scan's own `classify_path` consults, so
-    /// this answers exactly as a scan would classify the same path.
+    /// Returns whether one path passes current workspace visibility policy.
     #[must_use]
     pub fn includes(&self, path: &Path) -> bool {
         let Some(path) = self.normalized_path(path) else {
             return false;
         };
-        let path = path.as_ref();
-        let extension_included =
-            has_source_extension(path) || text_included(path, &self.text_inclusion);
-        extension_included && self.visible_normalized(path)
+        self.visible_normalized(path.as_ref())
     }
 
     /// Carries the checks [`Self::visible`] and [`Self::includes`] share, against a path
@@ -649,15 +650,21 @@ impl WorkspaceSourcePolicy {
     }
 }
 
-/// One condition a build or rebuild encountered while assembling an index but did not
-/// treat as fatal: the index still publishes, and a caller sees why a file is missing
-/// rather than only its absence.
+/// One file omitted from the baseline content catalog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceIndexWarning {
-    /// A claimed file's bytes are not valid UTF-8. The file is omitted from the index and
-    /// from a digest capture over the same tree; addressing it directly still refuses
-    /// `content_unavailable`.
+    /// File bytes are not valid UTF-8.
     InvalidUtf8Source(ProjectPath),
+    /// File bytes contain a NUL byte.
+    BinarySource(ProjectPath),
+    /// File exceeds the configured per-file byte bound.
+    FileTooLarge(ProjectPath),
+}
+
+/// Outcome of reading one baseline catalog candidate.
+enum CatalogRead {
+    Included(TextSourceFile),
+    Skipped(WorkspaceIndexWarning),
 }
 
 impl WorkspaceIndexWarning {
@@ -665,7 +672,9 @@ impl WorkspaceIndexWarning {
     #[must_use]
     pub fn path(&self) -> &ProjectPath {
         match self {
-            Self::InvalidUtf8Source(path) => path,
+            Self::InvalidUtf8Source(path) | Self::BinarySource(path) | Self::FileTooLarge(path) => {
+                path
+            }
         }
     }
 }
@@ -689,21 +698,16 @@ pub struct WorkspaceIndex {
 }
 
 impl WorkspaceIndex {
-    /// Scans current Rust files and included text files directly from workspace root,
-    /// applying `visibility`'s `.gitignore` and `[source]` include/exclude policy, and
-    /// `text_inclusion`'s extension list, on top of the hard floor.
+    /// Scans visible regular files below workspace root.
     ///
-    /// Symlinks, `.git`, `.rift`, and `target` are never followed or
-    /// indexed, whatever `visibility` says.
-    ///
-    /// A claimed file whose bytes are not UTF-8 does not fail the build: it is omitted
-    /// from the index and recorded in [`Self::warnings`] instead, so one bad file cannot
-    /// take the rest of the workspace down.
+    /// Hard floor, ignore rules, and source policy apply once. Every valid UTF-8
+    /// file without a NUL byte enters baseline content catalog. Registered providers add
+    /// syntax facts to same file identity.
     ///
     /// # Errors
     ///
-    /// Returns [`WorkspaceIndexError`] for invalid root, I/O, syntax, an invalid
-    /// `[source]` pattern, or an exceeded bound.
+    /// Returns `WorkspaceIndexError` for invalid root, I/O, syntax, invalid
+    /// source pattern, or exceeded workspace bound.
     pub fn build(
         root: &Path,
         limits: WorkspaceIndexLimits,
@@ -712,33 +716,29 @@ impl WorkspaceIndex {
     ) -> Result<Self, WorkspaceIndexError> {
         let root = canonical_root(root)?;
         let composition = composition()?;
-        let classified = discover(&root, limits, visibility, text_inclusion)?;
+        let classified = discover(&root, limits, visibility)?;
         let mut workspace_bytes = 0_usize;
         let mut warnings = Vec::new();
         let mut files = BTreeMap::new();
-        for path in classified.source {
-            let provider = syntax_provider_for(&path);
-            let file = read_file(&root, &path, provider, limits, &mut workspace_bytes);
-            include_or_warn(
-                file,
-                || project_path_below(&root, &path),
-                &mut warnings,
-                |file| {
-                    files.insert(file.path().clone(), Arc::new(file));
-                },
-            )?;
-        }
         let mut text_files = BTreeMap::new();
+        for path in classified.source {
+            match read_catalog_file(&root, &path, limits, &mut workspace_bytes)? {
+                CatalogRead::Included(text_file) => {
+                    let file =
+                        indexed_file_from_catalog(&text_file, &path, syntax_provider_for(&path))?;
+                    files.insert(file.path().clone(), Arc::new(file));
+                    text_files.insert(text_file.path().clone(), Arc::new(text_file));
+                }
+                CatalogRead::Skipped(warning) => warnings.push(warning),
+            }
+        }
         for path in classified.text {
-            let file = read_text_file(&root, &path, limits, &mut workspace_bytes);
-            include_or_warn(
-                file,
-                || project_path_below(&root, &path),
-                &mut warnings,
-                |file| {
+            match read_catalog_file(&root, &path, limits, &mut workspace_bytes)? {
+                CatalogRead::Included(file) => {
                     text_files.insert(file.path().clone(), Arc::new(file));
-                },
-            )?;
+                }
+                CatalogRead::Skipped(warning) => warnings.push(warning),
+            }
         }
         warnings.sort_by(|left, right| left.path().cmp(right.path()));
         let fingerprint = WorkspaceFingerprint::from_files(&files, &text_files);
@@ -823,10 +823,7 @@ impl WorkspaceIndex {
         })
     }
 
-    /// Reads one changed path into the index being built, classified the way a whole scan
-    /// classifies it: source when a syntax provider serves the extension, included text
-    /// otherwise. A path the filesystem no longer holds is skipped. A path whose bytes are
-    /// not UTF-8 is omitted and recorded in `warnings` instead of failing the rebuild.
+    /// Reads one changed visible path into syntax facts and baseline content catalog.
     fn read_indexed_path(
         &self,
         path: &ProjectPath,
@@ -836,55 +833,39 @@ impl WorkspaceIndex {
         warnings: &mut Vec<WorkspaceIndexWarning>,
     ) -> Result<(), WorkspaceIndexError> {
         let absolute = self.root.join(path.as_str());
-        let Some(class) = classify_path(&absolute, &self.text_inclusion) else {
-            return Ok(());
-        };
+        let class = classify_path(&absolute);
         if !absolute.is_file() {
             return Ok(());
         }
-        match class {
-            PathClass::Source => {
-                let provider = syntax_provider_for(&absolute);
-                let file = read_file(
-                    &self.root,
-                    &absolute,
-                    provider,
-                    self.limits,
-                    workspace_bytes,
-                );
-                include_or_warn(
-                    file,
-                    || Ok(path.clone()),
-                    warnings,
-                    |file| {
-                        files.insert(file.path().clone(), Arc::new(file));
-                    },
-                )?;
+        match read_catalog_file(&self.root, &absolute, self.limits, workspace_bytes)? {
+            CatalogRead::Included(text_file) => {
+                if class == PathClass::Source {
+                    let indexed_file = indexed_file_from_catalog(
+                        &text_file,
+                        &absolute,
+                        syntax_provider_for(&absolute),
+                    )?;
+                    files.insert(indexed_file.path().clone(), Arc::new(indexed_file));
+                }
+                text_files.insert(text_file.path().clone(), Arc::new(text_file));
             }
-            PathClass::Text => {
-                let file = read_text_file(&self.root, &absolute, self.limits, workspace_bytes);
-                include_or_warn(
-                    file,
-                    || Ok(path.clone()),
-                    warnings,
-                    |file| {
-                        text_files.insert(file.path().clone(), Arc::new(file));
-                    },
-                )?;
-            }
+            CatalogRead::Skipped(warning) => warnings.push(warning),
         }
         Ok(())
     }
 
-    /// The bytes the shared files already contribute to `workspace_bytes_max`, so a
-    /// rebuild enforces the same aggregate bound a whole scan does.
+    /// Bytes shared files already contribute to workspace byte bound.
     fn indexed_bytes(
         files: &BTreeMap<ProjectPath, Arc<IndexedFile>>,
         text_files: &BTreeMap<ProjectPath, Arc<TextSourceFile>>,
     ) -> usize {
-        let source: usize = files.values().map(|file| file.source().len()).sum();
-        let text: usize = text_files.values().map(|file| file.content().len()).sum();
-        source.saturating_add(text)
+        let catalog: usize = text_files.values().map(|file| file.content().len()).sum();
+        let syntax_only: usize = files
+            .iter()
+            .filter(|(path, _)| !text_files.contains_key(*path))
+            .map(|(_, file)| file.source().len())
+            .sum();
+        catalog.saturating_add(syntax_only)
     }
 
     /// Assembles an index from files another source already accepted - the
@@ -932,7 +913,7 @@ impl WorkspaceIndex {
         self.files.values().map(AsRef::as_ref)
     }
 
-    /// Returns the included text files in project-path order.
+    /// Returns baseline text files in project-path order.
     pub fn text_files(&self) -> impl ExactSizeIterator<Item = &TextSourceFile> {
         self.text_files.values().map(AsRef::as_ref)
     }
@@ -943,7 +924,7 @@ impl WorkspaceIndex {
         self.files.len()
     }
 
-    /// How many included text files this index holds.
+    /// How many baseline text files this index holds.
     #[must_use]
     pub fn text_file_count(&self) -> usize {
         self.text_files.len()
@@ -971,7 +952,7 @@ impl WorkspaceIndex {
     }
 
     /// Derives lexical search units from this index: one unit per indexed symbol, carrying
-    /// its declaration source, and one or more units per included text file - one whole unit
+    /// its declaration source, and one or more units per baseline text file - one whole unit
     /// when the file is within `[search.text].max_chunk`, one unit per chunk otherwise. A
     /// chunked file's units share its real path and share an identity built from that path
     /// plus the chunk index, so a hit still maps back to the file it came from.
@@ -1071,10 +1052,10 @@ impl WorkspaceIndex {
             .ok_or_else(|| provider_error(ReadableSymbolMissing { identity }))
     }
 
-    /// Conditions this build or rebuild encountered but did not treat as fatal, in
-    /// project-path order. A claimed file whose bytes are not UTF-8 is the only source
-    /// today; the build still succeeds, and a caller weighs the warning against the answer
-    /// it names.
+    /// Files omitted from baseline content catalog, in project-path order.
+    ///
+    /// Build and rebuild continue after invalid UTF-8, NUL bytes, or a file beyond
+    /// configured per-file byte bound.
     #[must_use]
     pub fn warnings(&self) -> &[WorkspaceIndexWarning] {
         &self.warnings
@@ -1136,13 +1117,13 @@ impl WorkspaceIndex {
         self.files.get(path).map(AsRef::as_ref)
     }
 
-    /// Returns one included text file by canonical project path.
+    /// Returns one baseline text file by canonical project path.
     #[must_use]
     pub fn text_file(&self, path: &ProjectPath) -> Option<&TextSourceFile> {
         self.text_files.get(path).map(AsRef::as_ref)
     }
 
-    /// The chunk bound included text files are split at when lexical units are derived.
+    /// Chunk bound applied to baseline text when lexical units are derived.
     fn text_chunk_bytes_max(&self) -> u64 {
         self.text_inclusion.chunk_bytes_max()
     }
@@ -1162,9 +1143,8 @@ impl WorkspaceIndex {
     /// Work is bounded by the same directory-depth limit as the index and by `files_max`
     /// matches; a `files_max`-plus-one-th match refuses rather than truncating silently.
     ///
-    /// This walk covers source units only: `force_include`'s contract is reading a source
-    /// declaration on demand for one request, not including text files in the persistent
-    /// lexical index, so a `[search.text]` extension never joins it.
+    /// This walk covers provider source only. Baseline text uses its own bounded force-include
+    /// walk so provider parsing remains separate from file content.
     ///
     /// # Errors
     ///
@@ -1230,25 +1210,89 @@ impl WorkspaceIndex {
         Ok(files)
     }
 
-    /// Builds one request index over source files selected by `force_include`.
+    /// Walks request-selected visible files into baseline content catalog.
+    fn force_include_text_files(
+        &self,
+        force_include: &[String],
+        files_max: usize,
+    ) -> Result<Vec<TextSourceFile>, WorkspaceIndexError> {
+        if force_include.is_empty() {
+            return Ok(Vec::new());
+        }
+        let matcher = PathMatcher::build(&self.root, force_include, &[])?;
+        let mut extra_bytes = 0_usize;
+        let mut files = Vec::new();
+        let walker = source_walk(
+            &self.root,
+            self.limits.directory_depth_max,
+            GitignorePolicy::Ignore,
+        );
+        for entry in walker {
+            let entry = entry.map_err(|error| walk_error(&self.root, error))?;
+            let file_type = entry.file_type();
+            if file_type.is_some_and(|file_type| file_type.is_dir()) {
+                if entry.depth() > self.limits.directory_depth_max {
+                    return Err(index_error_at(
+                        WorkspaceIndexViolation::TooDeep,
+                        entry.path(),
+                    ));
+                }
+                continue;
+            }
+            if !file_type.is_some_and(|file_type| file_type.is_file()) {
+                continue;
+            }
+            let path = entry.path();
+            if !matcher.includes(path) {
+                continue;
+            }
+            let project_path = project_path_below(&self.root, path)?;
+            if self.text_file(&project_path).is_some() {
+                continue;
+            }
+            if files.len() >= files_max {
+                return Err(index_error_at(WorkspaceIndexViolation::TooManyFiles, path));
+            }
+            if let CatalogRead::Included(file) =
+                read_catalog_file(&self.root, path, self.limits, &mut extra_bytes)?
+            {
+                files.push(file);
+            }
+        }
+        Ok(files)
+    }
+
+    /// Builds one request index over files selected by force include.
     ///
-    /// This index publishes selected syntax through same Contribution pipeline
-    /// as workspace index, while keeping selected files outside persistent index.
+    /// Each selected path is read once into baseline content catalog. Paths with a syntax
+    /// provider also receive syntax facts from those same bytes.
     ///
     /// # Errors
     ///
-    /// Returns `WorkspaceIndexError` when selection, parsing, publication, or
-    /// normalization fails.
+    /// Returns `WorkspaceIndexError` when selection, parsing, or bounds fail.
     pub fn force_include_index(
         &self,
         force_include: &[String],
         files_max: usize,
     ) -> Result<Self, WorkspaceIndexError> {
-        let files = self.force_include_files(force_include, files_max)?;
+        let text_files = self.force_include_text_files(force_include, files_max)?;
+        let files = text_files
+            .iter()
+            .filter_map(|file| {
+                let context_path = self.root.join(file.path().as_str());
+                has_source_extension(&context_path).then(|| {
+                    indexed_file_from_catalog(
+                        file,
+                        &context_path,
+                        syntax_provider_for(&context_path),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Self::from_parts(
             self.root.clone(),
             files,
-            Vec::new(),
+            text_files,
             self.composition.clone(),
             self.limits,
             self.text_inclusion.clone(),
@@ -1388,8 +1432,7 @@ fn provider_error(source: impl std::error::Error + Send + Sync + 'static) -> Wor
     index_error_caused_by(WorkspaceIndexViolation::Provider, None, source)
 }
 
-/// A candidate path's included granularity: a provider-declared source extension always wins
-/// over a `[search.text]` extension when both sets would include it.
+/// Whether a visible path receives provider syntax facts or baseline text only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PathClass {
     /// Parsed for symbols by a syntax provider.
@@ -1405,54 +1448,21 @@ struct DiscoveredPaths {
     text: Vec<PathBuf>,
 }
 
-/// Classifies `path`, before any visibility policy is consulted: a provider-declared source
-/// extension is [`PathClass::Source`]; otherwise [`text_included`] decides [`PathClass::Text`];
-/// anything else is not a candidate.
-fn classify_path(path: &Path, text_inclusion: &TextFileInclusion) -> Option<PathClass> {
+/// Classifies every regular file for the baseline catalog. A provider-declared
+/// extension adds syntax facts without removing file content from the catalog.
+fn classify_path(path: &Path) -> PathClass {
     if has_source_extension(path) {
-        return Some(PathClass::Source);
+        PathClass::Source
+    } else {
+        PathClass::Text
     }
-    if text_included(path, text_inclusion) {
-        return Some(PathClass::Text);
-    }
-    None
 }
 
-/// Whether `path` is eligible for the text lane on its own name and bytes: a configured
-/// `[search.text]` extension, or no extension at all sniffed clean of a NUL byte within
-/// [`EXTENSIONLESS_SNIFF_BYTES_MAX`]. Shared by [`classify_path`] and
-/// [`WorkspaceSourcePolicy::includes`], the two places that decide whether a path joins the
-/// text lane, so a scan and the visibility predicate can never disagree about one candidate.
-fn text_included(path: &Path, text_inclusion: &TextFileInclusion) -> bool {
-    text_inclusion.includes(path) && (path.extension().is_some() || !extensionless_binary(path))
-}
-
-/// Whether an extensionless text-lane candidate's first [`EXTENSIONLESS_SNIFF_BYTES_MAX`]
-/// bytes hold a NUL byte, the signal a compiled artifact with no extension carries near its
-/// front. A candidate this process cannot open or read sniffs as binary too, so a race or a
-/// permission failure excludes the path rather than risks including it.
-fn extensionless_binary(path: &Path) -> bool {
-    let Ok(file) = fs::File::open(path) else {
-        return true;
-    };
-    let mut sniffed = Vec::new();
-    if file
-        .take(EXTENSIONLESS_SNIFF_BYTES_MAX)
-        .read_to_end(&mut sniffed)
-        .is_err()
-    {
-        return true;
-    }
-    sniffed.contains(&0)
-}
-
-/// Source and included text paths visible below `root`: the hard floor (`.git`, `.rift`,
+/// Source and baseline text paths visible below `root`: the hard floor (`.git`, `.rift`,
 /// `target`, symlinks) is always applied, `visibility.respect_gitignore()` then layers the
 /// workspace's own `.gitignore` chain, and `visibility.include()`/`.exclude()` narrow or drop
-/// candidate files. A path is classified by extension first - source wins over text when an
-/// extension is included by both - and the same visibility policy then applies to whichever
-/// class it landed in, so a text file reaches the same `.gitignore` and `[source]` policy a
-/// source file does.
+/// candidate files. A provider extension adds syntax facts; every other accepted file joins
+/// baseline text. Both classes use the same `.gitignore` and `[source]` policy.
 ///
 /// Directories are walked in file-name order so a bound violation is reported
 /// deterministically; both returned lists are sorted by path. Source and text paths share one
@@ -1461,7 +1471,6 @@ fn discover(
     root: &Path,
     limits: WorkspaceIndexLimits,
     visibility: &SourceVisibility,
-    text_inclusion: &TextFileInclusion,
 ) -> Result<DiscoveredPaths, WorkspaceIndexError> {
     let matcher = PathMatcher::build(root, visibility.include(), visibility.exclude())?;
     let gitignore = GitignorePolicy::from_respecting(visibility.respect_gitignore());
@@ -1482,9 +1491,7 @@ fn discover(
             continue;
         }
         let path = entry.path();
-        let Some(class) = classify_path(path, text_inclusion) else {
-            continue;
-        };
+        let class = classify_path(path);
         if !matcher.includes(path) {
             continue;
         }
@@ -1624,31 +1631,37 @@ pub fn capture_digests(
     root: &Path,
     limits: WorkspaceIndexLimits,
     visibility: &SourceVisibility,
-    text_inclusion: &TextFileInclusion,
 ) -> Result<WorkspaceDigests, WorkspaceIndexError> {
     let root = canonical_root(root)?;
-    let classified = discover(&root, limits, visibility, text_inclusion)?;
+    let classified = discover(&root, limits, visibility)?;
     capture_paths(&root, &classified, limits)
 }
 
-/// Reads one class's path list into the digest set a capture returns, applying the
-/// per-file byte bound only to [`PathClass::Source`] paths. A path whose bytes are not
-/// UTF-8 is omitted from `digests` rather than failing the capture, matching what a build
-/// omits from the index over the same tree.
+/// Reads one path class into captured file states.
 fn capture_path_class(
     digests: &mut BTreeMap<ProjectPath, FileDigest>,
     workspace_bytes: &mut usize,
     root: &Path,
     paths: &[PathBuf],
     limits: WorkspaceIndexLimits,
-    class: PathClass,
+    _class: PathClass,
 ) -> Result<(), WorkspaceIndexError> {
     for path in paths {
-        let bytes = fs::read(path).map_err(|error| {
+        let mut handle = fs::File::open(path).map_err(|error| {
             index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
         })?;
-        if class == PathClass::Source && bytes.len() > limits.file_bytes_max() {
-            return Err(index_error_at(WorkspaceIndexViolation::FileTooLarge, path));
+        let metadata = handle.metadata().map_err(|error| {
+            index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
+        })?;
+        let mut bytes = Vec::new();
+        handle.read_to_end(&mut bytes).map_err(|error| {
+            index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
+        })?;
+        if bytes.len() > limits.file_bytes_max()
+            || bytes.contains(&0)
+            || std::str::from_utf8(&bytes).is_err()
+        {
+            continue;
         }
         *workspace_bytes = workspace_bytes
             .checked_add(bytes.len())
@@ -1660,9 +1673,10 @@ fn capture_path_class(
             ));
         }
         let project_path = project_path_below(root, path)?;
-        if let Ok(content) = source_utf8(bytes, path) {
-            digests.insert(project_path, FileDigest::of(content.as_bytes()));
-        }
+        digests.insert(
+            project_path,
+            FileDigest::of_file_state(&bytes, metadata_is_executable(&metadata)),
+        );
     }
     Ok(())
 }
@@ -1675,7 +1689,7 @@ impl WorkspaceDigests {
     }
 }
 
-/// One digest set over both file classes, keyed by project path.
+/// One file-state set over both file classes, keyed by project path.
 fn keyed_digests(
     files: &BTreeMap<ProjectPath, Arc<IndexedFile>>,
     text_files: &BTreeMap<ProjectPath, Arc<TextSourceFile>>,
@@ -1683,12 +1697,18 @@ fn keyed_digests(
     WorkspaceDigests::new(
         files
             .iter()
-            .map(|(path, file)| (path.clone(), file.digest()))
-            .chain(
-                text_files
-                    .iter()
-                    .map(|(path, file)| (path.clone(), file.digest())),
-            ),
+            .map(|(path, file)| {
+                (
+                    path.clone(),
+                    FileDigest::of_file_state(file.source().as_bytes(), file.executable()),
+                )
+            })
+            .chain(text_files.iter().map(|(path, file)| {
+                (
+                    path.clone(),
+                    FileDigest::of_file_state(file.content().as_bytes(), file.executable()),
+                )
+            })),
     )
 }
 
@@ -1792,7 +1812,7 @@ pub(crate) fn has_source_extension(path: &Path) -> bool {
         .is_some_and(|extension| registry::source_file_extensions().contains(&extension))
 }
 
-/// The registered provider for one path the extension gate already accepted.
+/// Registered provider for one path claimed by provider extension.
 ///
 /// # Panics
 ///
@@ -1840,19 +1860,48 @@ fn read_file(
     limits: WorkspaceIndexLimits,
     workspace_bytes: &mut usize,
 ) -> Result<IndexedFile, WorkspaceIndexError> {
-    let bytes = fs::read(path).map_err(|error| {
+    let handle = fs::File::open(path).map_err(|error| {
         index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
     })?;
+    let metadata = handle.metadata().map_err(|error| {
+        index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
+    })?;
+    let mut bytes = Vec::new();
+    handle
+        .take(limits.file_bytes_max().saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
+        })?;
     let project_path = project_path_below(root, path)?;
-    included_file(project_path, bytes, path, provider, limits, workspace_bytes)
+    let mut file = included_file(project_path, bytes, path, provider, limits, workspace_bytes)?;
+    file.executable = metadata_is_executable(&metadata);
+    Ok(file)
 }
 
-/// Includes one source file's bytes in an index, whatever supplied them: the
-/// per-file and aggregate byte bounds, UTF-8, and the syntax parse are the
-/// same for a directory walk and a committed revision tree. `context_path`
-/// names the file in refusals. Bytes that are not UTF-8 refuse rather than
-/// indexing an empty or lossily-decoded source; a caller that means to omit
-/// the file rather than fail outright catches that refusal itself.
+pub(crate) fn indexed_file_from_catalog(
+    file: &TextSourceFile,
+    context_path: &Path,
+    provider: &dyn SyntaxProvider,
+) -> Result<IndexedFile, WorkspaceIndexError> {
+    let syntax = provider
+        .analyze(SyntaxSource {
+            path: file.path(),
+            text: file.content(),
+        })
+        .map_err(|error| {
+            index_error_caused_by(WorkspaceIndexViolation::Syntax, Some(context_path), error)
+        })?;
+    Ok(IndexedFile {
+        path: file.path().clone(),
+        source: file.content().to_owned(),
+        digest: file.digest(),
+        executable: file.executable(),
+        syntax,
+    })
+}
+
+/// Includes one provider-backed file under the workspace bounds.
 pub(crate) fn included_file(
     project_path: ProjectPath,
     bytes: Vec<u8>,
@@ -1889,10 +1938,12 @@ pub(crate) fn included_file(
         path: project_path,
         digest: FileDigest::of(source.as_bytes()),
         source,
+        executable: false,
         syntax,
     })
 }
 
+#[cfg(test)]
 fn read_text_file(
     root: &Path,
     path: &Path,
@@ -1902,16 +1953,69 @@ fn read_text_file(
     let bytes = fs::read(path).map_err(|error| {
         index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
     })?;
+    let metadata = fs::metadata(path).map_err(|error| {
+        index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
+    })?;
     let project_path = project_path_below(root, path)?;
-    included_text_file(project_path, bytes, path, limits, workspace_bytes)
+    let mut file = included_text_file(project_path, bytes, path, limits, workspace_bytes)?;
+    file.executable = metadata_is_executable(&metadata);
+    Ok(file)
 }
 
-/// Includes one text file's bytes in an index: unlike [`included_file`], there is no
-/// per-file byte bound - a text file joins the lexical index whole, however large, and
-/// [`WorkspaceIndex::lexical_units`] splits an oversized one into chunks rather than the
-/// index refusing it. The aggregate `workspace_bytes_max` bound still applies, and UTF-8
-/// validity is still required, matching a source file's `InvalidSource` refusal.
-/// `context_path` names the file in refusals.
+/// Reads one baseline catalog candidate with bounded binary detection.
+fn read_catalog_file(
+    root: &Path,
+    path: &Path,
+    limits: WorkspaceIndexLimits,
+    workspace_bytes: &mut usize,
+) -> Result<CatalogRead, WorkspaceIndexError> {
+    let handle = fs::File::open(path).map_err(|error| {
+        index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
+    })?;
+    let metadata = handle.metadata().map_err(|error| {
+        index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
+    })?;
+    let mut bytes = Vec::new();
+    handle
+        .take(limits.file_bytes_max().saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
+        })?;
+    let project_path = project_path_below(root, path)?;
+    if bytes.len() > limits.file_bytes_max() {
+        return Ok(CatalogRead::Skipped(WorkspaceIndexWarning::FileTooLarge(
+            project_path,
+        )));
+    }
+    if bytes.contains(&0) {
+        return Ok(CatalogRead::Skipped(WorkspaceIndexWarning::BinarySource(
+            project_path,
+        )));
+    }
+    if std::str::from_utf8(&bytes).is_err() {
+        return Ok(CatalogRead::Skipped(
+            WorkspaceIndexWarning::InvalidUtf8Source(project_path),
+        ));
+    }
+    let mut file = included_text_file(project_path, bytes, path, limits, workspace_bytes)?;
+    file.executable = metadata_is_executable(&metadata);
+    Ok(CatalogRead::Included(file))
+}
+
+#[cfg(unix)]
+fn metadata_is_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn metadata_is_executable(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+/// Includes one UTF-8 file in the baseline content catalog.
 pub(crate) fn included_text_file(
     project_path: ProjectPath,
     bytes: Vec<u8>,
@@ -1933,6 +2037,7 @@ pub(crate) fn included_text_file(
         path: project_path,
         digest: FileDigest::of(content.as_bytes()),
         content,
+        executable: false,
     })
 }
 
@@ -1949,35 +2054,6 @@ fn source_utf8(bytes: Vec<u8>, context_path: &Path) -> Result<String, WorkspaceI
             error,
         )
     })
-}
-
-/// Whether a read failure is exactly [`source_utf8`]'s refusal - the one failure a build or
-/// rebuild omits and warns about instead of propagating.
-fn is_invalid_utf8_source(error: &WorkspaceIndexError) -> bool {
-    error.fault().violation() == WorkspaceIndexViolation::InvalidSource
-}
-
-/// Applies one included-file read's outcome: on success, hands the value to `insert`; on
-/// the shared invalid-UTF-8 failure, records a warning naming the path `warned_path`
-/// resolves instead; any other failure propagates. `warned_path` is evaluated only when the
-/// read failed, so the common successful path pays nothing for it.
-fn include_or_warn<Included>(
-    read: Result<Included, WorkspaceIndexError>,
-    warned_path: impl FnOnce() -> Result<ProjectPath, WorkspaceIndexError>,
-    warnings: &mut Vec<WorkspaceIndexWarning>,
-    insert: impl FnOnce(Included),
-) -> Result<(), WorkspaceIndexError> {
-    match read {
-        Ok(included) => {
-            insert(included);
-            Ok(())
-        }
-        Err(error) if is_invalid_utf8_source(&error) => {
-            warnings.push(WorkspaceIndexWarning::InvalidUtf8Source(warned_path()?));
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
 }
 
 /// The project-relative address of `absolute`, which the caller has already proven lies
@@ -2168,11 +2244,9 @@ mod tests {
         .expect("the fixture workspace must index")
     }
 
-    /// Every byte the index already counts against its aggregate bound.
+    /// Every byte baseline catalog counts against aggregate bound.
     fn counted_bytes(index: &WorkspaceIndex) -> usize {
-        let source: usize = index.files().map(|file| file.source().len()).sum();
-        let text: usize = index.text_files().map(|file| file.content().len()).sum();
-        source + text
+        WorkspaceIndex::indexed_bytes(&index.files, &index.text_files)
     }
 
     /// Resolves the paths named against `index`, reading each one's current bytes.
@@ -2236,12 +2310,6 @@ mod tests {
 
     #[test]
     fn test_capture_and_index_fingerprint_one_tree_the_same_way() {
-        // Two orders could split the two constructions apart. A directory walk sorts
-        // `docs/a.rs` after `docs-x/a.rs`, because it compares path components and `docs`
-        // is a prefix of `docs-x`, while project paths compare as text, where `-` sorts
-        // before `/`. And folding source files before text files interleaves differently
-        // again from folding both by path. Both constructions fold one project-path
-        // ordered set of every visible file, so neither pair can make them disagree.
         let directory = tempfile::tempdir().expect("temporary workspace");
         let root = directory.path();
         fs::create_dir_all(root.join("docs")).expect("fixture directory");
@@ -2250,22 +2318,21 @@ mod tests {
         fs::write(root.join("docs-x/a.rs"), "pub fn b() {}\n").expect("fixture source");
         fs::write(root.join("docs/notes.txt"), "notes\n").expect("fixture prose");
         fs::write(root.join("zeta.rs"), "pub fn zeta() {}\n").expect("fixture source");
-        let inclusion = TextFileInclusion::new(vec!["txt".to_owned()], 1_024);
+        let inclusion = TextFileInclusion::new(1_024);
 
         let index = indexed(root, &inclusion);
-        assert_eq!(index.text_file_count(), 1, "the fixture folds both classes");
+        assert_eq!(
+            index.text_file_count(),
+            4,
+            "catalog holds every visible file"
+        );
         let captured = WorkspaceFingerprint::capture(
             root,
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &inclusion,
         )
-        .expect("the fixture workspace must capture");
-        assert_eq!(
-            index.fingerprint(),
-            &captured,
-            "an index and a request-time capture of one tree must agree"
-        );
+        .expect("fixture workspace must capture");
+        assert_eq!(index.fingerprint(), &captured);
     }
 
     #[test]
@@ -2307,55 +2374,42 @@ mod tests {
     fn test_rebuilt_reindexes_an_edited_text_file() {
         let directory = fixture();
         let root = directory.path();
-        let text_inclusion = TextFileInclusion::new(vec!["txt".to_owned()], 1_024);
+        let text_inclusion = TextFileInclusion::new(1_024);
         let index = indexed(root, &text_inclusion);
-        assert_eq!(
-            index.text_file_count(),
-            1,
-            "the fixture's README.txt is included"
-        );
+        assert_eq!(index.text_file_count(), 2);
         fs::write(root.join("README.txt"), "edited prose").expect("edited text file");
 
         let changes = resolved(&index, root, &["README.txt"]);
-        let next = index.rebuilt(&changes).expect("the rebuild must land");
+        let next = index.rebuilt(&changes).expect("rebuild must land");
 
         let text_path = ProjectPath::new("README.txt").expect("fixture path");
         assert_eq!(
             next.text_file(&text_path)
-                .expect("the edited text file stays indexed")
+                .expect("edited text file stays indexed")
                 .content(),
             "edited prose"
         );
-        assert_ne!(
-            index.fingerprint(),
-            next.fingerprint(),
-            "replacing a text file's bytes changes workspace identity"
-        );
+        assert_ne!(index.fingerprint(), next.fingerprint());
     }
 
     #[test]
     fn test_rebuilt_adds_removes_and_reclassifies_named_paths() {
         let directory = fixture();
         let root = directory.path();
-        let text_inclusion = TextFileInclusion::new(vec!["txt".to_owned()], 1_024);
+        let text_inclusion = TextFileInclusion::new(1_024);
         let index = indexed(root, &text_inclusion);
-        assert_eq!(index.text_file_count(), 1);
+        assert_eq!(index.text_file_count(), 2);
 
         fs::write(root.join("src/added.rs"), "pub fn added() {}\n").expect("added source");
         fs::remove_file(root.join("README.txt")).expect("removed text file");
         let changes = resolved(&index, root, &["src/added.rs", "README.txt"]);
-        let next = index.rebuilt(&changes).expect("the rebuild must land");
+        let next = index.rebuilt(&changes).expect("rebuild must land");
 
         assert!(
             next.file(&ProjectPath::new("src/added.rs").expect("fixture path"))
-                .is_some(),
-            "an added source file joins the index"
+                .is_some()
         );
-        assert_eq!(
-            next.text_file_count(),
-            0,
-            "a removed text file leaves the index"
-        );
+        assert_eq!(next.text_file_count(), 2);
         assert_eq!(next.file_count(), index.file_count() + 1);
     }
 
@@ -2457,10 +2511,44 @@ mod tests {
             "the rebuild carries a warning naming the corrupted file"
         );
 
+        fs::write(root.join("src/lib.rs"), b"pub fn hidden() {}\0").expect("binary source");
+        let changes = resolved(&corrupted, root, &["src/lib.rs"]);
+        let binary = corrupted
+            .rebuilt(&changes)
+            .expect("one binary provider file must not fail rebuild");
+        assert!(binary.file(&lib_path).is_none());
+        assert!(binary.text_file(&lib_path).is_none());
+        assert_eq!(
+            binary.warnings(),
+            [WorkspaceIndexWarning::BinarySource(lib_path.clone())]
+        );
+        assert!(
+            binary
+                .text_file(&ProjectPath::new("README.txt").expect("path"))
+                .is_some(),
+            "unrelated valid file remains indexed"
+        );
+
+        fs::write(
+            root.join("src/lib.rs"),
+            vec![b'x'; binary.limits.file_bytes_max() + 1],
+        )
+        .expect("oversized source");
+        let changes = resolved(&binary, root, &["src/lib.rs"]);
+        let oversized = binary
+            .rebuilt(&changes)
+            .expect("one oversized provider file must not fail rebuild");
+        assert!(oversized.file(&lib_path).is_none());
+        assert!(oversized.text_file(&lib_path).is_none());
+        assert_eq!(
+            oversized.warnings(),
+            [WorkspaceIndexWarning::FileTooLarge(lib_path.clone())]
+        );
+
         // Repairing the bytes and rebuilding again clears the warning and restores the file.
         fs::write(root.join("src/lib.rs"), "pub struct Rift;\n").expect("repaired source");
-        let changes = resolved(&corrupted, root, &["src/lib.rs"]);
-        let repaired = corrupted
+        let changes = resolved(&oversized, root, &["src/lib.rs"]);
+        let repaired = oversized
             .rebuilt(&changes)
             .expect("the repaired file must rebuild");
         assert!(
@@ -2614,8 +2702,8 @@ mod tests {
         assert!(!policy.includes(&directory.path().join("src/generated/code.rs")));
         assert!(!policy.includes(&directory.path().join("target/code.rs")));
         assert!(
-            !policy.includes(&directory.path().join("src/logo.png")),
-            "an extension neither a source provider nor [search.text] includes must be refused"
+            policy.includes(&directory.path().join("src/logo.png")),
+            "visibility does not depend on a file extension"
         );
         assert!(!policy.includes(Path::new("outside.rs")));
         assert!(policy.may_include_descendant(&directory.path().join("src")));
@@ -2628,10 +2716,8 @@ mod tests {
     }
 
     #[test]
-    fn test_workspace_source_policy_includes_text_extensions_under_the_same_visibility_rules() {
-        // A `[search.text]` extension must reach the same visibility predicate a source
-        // extension does: `.gitignore` and `[source]` exclude a text candidate exactly as
-        // they would a source one.
+    fn test_workspace_source_policy_applies_same_visibility_to_all_files() {
+        // `.gitignore` and `[source]` apply to provider files and baseline text alike.
         let directory = tempfile::tempdir().expect("temporary workspace");
         fs::create_dir_all(directory.path().join("docs/generated")).expect("directories");
         fs::write(directory.path().join(".gitignore"), "docs/ignored.mdx\n").expect("ignore file");
@@ -2661,8 +2747,8 @@ mod tests {
             "[source] exclude must hide a text candidate exactly as it would a source one"
         );
         assert!(
-            !policy.includes(&directory.path().join("logo.png")),
-            "an extension outside both included sets must be refused"
+            policy.includes(&directory.path().join("logo.png")),
+            "visibility does not depend on a file extension"
         );
     }
 
@@ -2704,8 +2790,8 @@ mod tests {
             "a tracked file no provider or text policy claims is still visible"
         );
         assert!(
-            !policy.includes(&directory.path().join("notes.ini")),
-            "the extension gate still stands: an unclaimed extension never joins the index"
+            policy.includes(&directory.path().join("notes.ini")),
+            "a visible file joins the baseline catalog without an extension gate"
         );
         assert!(
             policy.visible(&directory.path().join("guide.mdx")),
@@ -2844,15 +2930,22 @@ mod tests {
         let index = build_index(&directory, &SourceVisibility::default()).expect("index");
 
         let floor_reach = index
-            .force_include_files(&[".git/**".to_owned()], 10)
+            .force_include_index(&[".git/**".to_owned()], 10)
             .expect("force_include walk");
         assert!(
-            floor_reach.is_empty(),
+            floor_reach.text_files().next().is_none(),
             "the hard floor must stay unreachable via force_include"
         );
 
+        let one_provider = index
+            .force_include_index(&["a.rs".to_owned()], 1)
+            .expect("one provider path counts once");
+        let a = ProjectPath::new("a.rs").expect("path");
+        assert!(one_provider.file(&a).is_some());
+        assert!(one_provider.text_file(&a).is_some());
+
         let bound_error = index
-            .force_include_files(&["*.rs".to_owned()], 1)
+            .force_include_index(&["*.rs".to_owned()], 1)
             .expect_err("two matches must refuse a one-file bound");
         assert_eq!(
             bound_error.fault().violation(),
@@ -3077,16 +3170,19 @@ mod tests {
     #[test]
     fn test_index_enforces_file_workspace_depth_and_result_bounds() {
         let directory = fixture();
-        let file_error = WorkspaceIndex::build(
+        let bounded = WorkspaceIndex::build(
             directory.path(),
             WorkspaceIndexLimits::new(2, 4, 100, 4, 5).expect("positive limits"),
             &SourceVisibility::default(),
             &rift_core::TextFileInclusion::default(),
         )
-        .expect_err("file byte bound");
-        assert_eq!(
-            file_error.fault().violation(),
-            WorkspaceIndexViolation::FileTooLarge
+        .expect("oversized files are omitted");
+        assert_eq!(bounded.warnings().len(), 2);
+        assert!(
+            bounded
+                .warnings()
+                .iter()
+                .all(|warning| matches!(warning, WorkspaceIndexWarning::FileTooLarge(_)))
         );
 
         let index = WorkspaceIndex::build(
@@ -3571,12 +3667,9 @@ mod tests {
 
         let oversized = root.join("oversized.rs");
         fs::write(&oversized, b"123456789").expect("oversized source");
-        let error =
-            capture_paths(&root, &source_only(vec![oversized]), limits).expect_err("file bound");
-        assert_eq!(
-            error.fault().violation(),
-            WorkspaceIndexViolation::FileTooLarge
-        );
+        let digests = capture_paths(&root, &source_only(vec![oversized]), limits)
+            .expect("oversized source is omitted");
+        assert!(digests.is_empty());
 
         let first = root.join("first.rs");
         let second = root.join("second.rs");
@@ -3613,11 +3706,10 @@ mod tests {
     }
 
     #[test]
-    fn test_capture_paths_text_class_has_no_per_file_bound_but_counts_toward_workspace_bound() {
+    fn test_capture_paths_applies_per_file_bound_to_every_file_class() {
         let directory = tempfile::tempdir().expect("workspace");
         let root = fs::canonicalize(directory.path()).expect("canonical root");
-        // file_bytes_max is 4: a text file far larger must not refuse as FileTooLarge, and
-        // workspace_bytes_max is generous so only the per-file bound is under test here.
+        // file_bytes_max is 4. Every file class shares this bound.
         let limits = WorkspaceIndexLimits::new(5, 4, 1_000, 4, 5).expect("limits");
         let big_text = root.join("big.md");
         fs::write(&big_text, b"much larger than four bytes").expect("big text file");
@@ -3625,8 +3717,9 @@ mod tests {
             source: Vec::new(),
             text: vec![big_text],
         };
-        capture_paths(&root, &paths, limits)
-            .expect("a text file over file_bytes_max must not refuse");
+        let digests = capture_paths(&root, &paths, limits)
+            .expect("a text file over file_bytes_max is omitted");
+        assert!(digests.is_empty());
 
         let tight = WorkspaceIndexLimits::new(5, 4, 10, 4, 5).expect("limits");
         let over_workspace = root.join("over.md");
@@ -3635,12 +3728,9 @@ mod tests {
             source: Vec::new(),
             text: vec![over_workspace],
         };
-        let error = capture_paths(&root, &paths, tight)
-            .expect_err("the aggregate workspace bound still applies to text files");
-        assert_eq!(
-            error.fault().violation(),
-            WorkspaceIndexViolation::WorkspaceTooLarge
-        );
+        let digests =
+            capture_paths(&root, &paths, tight).expect("the per-file bound applies first");
+        assert!(digests.is_empty());
     }
 
     #[test]
@@ -3725,118 +3815,63 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_path_source_wins_when_an_extension_is_included_by_both_sets() {
-        // A source provider's extension always wins over a configured text extension when
-        // the same extension appears in both sets.
-        let inclusion = TextFileInclusion::new(vec!["rs".to_owned()], 1_024);
-        assert_eq!(
-            classify_path(Path::new("lib.rs"), &inclusion),
-            Some(PathClass::Source)
-        );
+    fn test_classify_path_provider_extension_selects_source() {
+        assert_eq!(classify_path(Path::new("lib.rs")), PathClass::Source);
     }
 
     #[test]
-    fn test_classify_path_returns_text_for_an_included_non_source_extension() {
-        let inclusion = TextFileInclusion::new(vec!["txt".to_owned()], 1_024);
-        assert_eq!(
-            classify_path(Path::new("readme.txt"), &inclusion),
-            Some(PathClass::Text)
-        );
+    fn test_classify_path_returns_text_for_a_non_source_extension() {
+        assert_eq!(classify_path(Path::new("readme.txt")), PathClass::Text);
     }
 
-    /// `md` sits in the default `[search.text]` extensions and is claimed by
-    /// the markdown provider: the provider wins, so a `.md` file is source,
-    /// never a second text representation.
     #[test]
-    fn test_classify_path_source_wins_for_markdown_over_the_default_text_extensions() {
-        let inclusion = TextFileInclusion::default();
-        assert!(inclusion.includes(Path::new("readme.md")));
-        assert_eq!(
-            classify_path(Path::new("readme.md"), &inclusion),
-            Some(PathClass::Source)
-        );
+    fn test_classify_path_provider_claims_markdown() {
+        assert_eq!(classify_path(Path::new("readme.md")), PathClass::Source);
     }
 
-    /// `json`, `yaml`, and `yml` sit outside the default `[search.text]`
-    /// extensions; when an operator lists one there anyway, the claiming
-    /// provider still wins, so the file is source, never a second text
-    /// representation.
     #[test]
-    fn test_classify_path_source_wins_for_json_and_yaml_over_configured_text_extensions() {
-        let inclusion = TextFileInclusion::new(
-            vec!["json".to_owned(), "yaml".to_owned(), "yml".to_owned()],
-            1_024,
-        );
+    fn test_classify_path_provider_claims_json_and_yaml() {
         for path in ["config.json", "deploy.yaml", "deploy.yml"] {
-            assert!(inclusion.includes(Path::new(path)));
             assert_eq!(
-                classify_path(Path::new(path), &inclusion),
-                Some(PathClass::Source),
-                "the claiming provider must win {path} over the text tier"
+                classify_path(Path::new(path)),
+                PathClass::Source,
+                "provider must claim {path}"
             );
         }
     }
 
     #[test]
-    fn test_classify_path_returns_none_for_an_extension_outside_both_sets() {
-        let inclusion = TextFileInclusion::new(vec!["txt".to_owned()], 1_024);
-        assert_eq!(classify_path(Path::new("logo.png"), &inclusion), None);
+    fn test_classify_path_returns_text_for_unknown_extension() {
+        assert_eq!(classify_path(Path::new("notes.unknown")), PathClass::Text);
     }
 
-    /// `justfile` carries no extension a configured `[search.text]` list could ever spell;
-    /// it is eligible by name alone and holds no NUL byte, so it joins the text lane.
+    /// `justfile` carries no extension. It is visible by name and joins baseline text.
     #[test]
     fn test_classify_path_returns_text_for_an_extensionless_file_with_no_nul() {
         let directory = tempfile::tempdir().expect("temporary workspace");
         let path = directory.path().join("justfile");
         fs::write(&path, "build:\n\tcargo build\n").expect("justfile");
-        let inclusion = TextFileInclusion::default();
-        assert_eq!(classify_path(&path, &inclusion), Some(PathClass::Text));
+        assert_eq!(classify_path(&path), PathClass::Text);
     }
 
-    /// A NUL byte inside the sniff bound marks an extensionless candidate a compiled
-    /// artifact, which stays unindexed. This fixture's NUL sits at byte 8, well inside
-    /// [`EXTENSIONLESS_SNIFF_BYTES_MAX`].
     #[test]
-    fn test_classify_path_excludes_an_extensionless_file_with_a_nul_within_the_sniff_bound() {
-        let directory = tempfile::tempdir().expect("temporary workspace");
-        let path = directory.path().join("artifact");
-        let mut bytes = vec![b'a'; 16];
-        bytes[8] = 0;
-        fs::write(&path, &bytes).expect("binary artifact");
-        let inclusion = TextFileInclusion::default();
-        assert_eq!(classify_path(&path, &inclusion), None);
-    }
-
-    /// A NUL byte past the sniff bound is never read, so the extensionless candidate still
-    /// joins the text lane. This fixture's only NUL sits eight bytes past
-    /// [`EXTENSIONLESS_SNIFF_BYTES_MAX`].
-    #[test]
-    fn test_classify_path_includes_an_extensionless_file_with_a_nul_past_the_sniff_bound() {
-        let directory = tempfile::tempdir().expect("temporary workspace");
-        let path = directory.path().join("scriptlike");
-        let sniff_bound = usize::try_from(EXTENSIONLESS_SNIFF_BYTES_MAX).expect("bound fits usize");
-        let mut bytes = vec![b'a'; sniff_bound + 16];
-        bytes[sniff_bound + 8] = 0;
-        fs::write(&path, &bytes).expect("late-nul file");
-        let inclusion = TextFileInclusion::default();
-        assert_eq!(classify_path(&path, &inclusion), Some(PathClass::Text));
+    fn test_classify_path_defers_binary_detection_until_bounded_read() {
+        assert_eq!(classify_path(Path::new("artifact")), PathClass::Text);
     }
 
     /// A provider claims a path by extension alone, so an extensionless file never becomes
     /// `Source`, whatever a syntax provider could parse from its content: the default
-    /// inclusion and the sniff apply to the text lane only.
+    /// binary detection applies later during bounded catalog read.
     #[test]
     fn test_classify_path_extensionless_file_never_classifies_as_source() {
         let directory = tempfile::tempdir().expect("temporary workspace");
         let path = directory.path().join("Dockerfile");
         fs::write(&path, "FROM scratch\n").expect("dockerfile");
-        let inclusion = TextFileInclusion::default();
-        assert_ne!(classify_path(&path, &inclusion), Some(PathClass::Source));
+        assert_ne!(classify_path(&path), PathClass::Source);
     }
 
     #[test]
-    fn test_build_includes_text_files_behind_gitignore_and_source_excludes() {
+    fn test_build_applies_visibility_once_to_baseline_catalog() {
         let directory = tempfile::tempdir().expect("temporary workspace");
         fs::create_dir_all(directory.path().join("docs/generated")).expect("directories");
         fs::write(directory.path().join(".gitignore"), "docs/ignored.md\n").expect("ignore file");
@@ -3863,24 +3898,15 @@ mod tests {
             .collect();
         assert_eq!(
             text_paths,
-            [".gitignore", "docs/notes.mdx"],
-            "the markdown provider claims md, so only mdx stays a text file; `.gitignore` \
-             itself carries no extension, so it joins the text lane by default"
+            [".gitignore", "docs/guide.md", "docs/notes.mdx"]
         );
         let source_paths: Vec<&str> = index.files().map(|file| file.path().as_str()).collect();
-        assert_eq!(
-            source_paths,
-            ["docs/guide.md"],
-            "the visible md file is source; gitignore and [source] excludes still hide the rest"
-        );
+        assert_eq!(source_paths, ["docs/guide.md"]);
     }
 
-    /// One representation per file: `md` sits in the default `[search.text]`
-    /// extensions, and the markdown provider claims it, so a `.md` file is
-    /// indexed as source alone - its lexical units are its heading symbols,
-    /// never a second whole-file text unit.
+    /// Provider facts enrich the baseline content unit under the same file path.
     #[test]
-    fn test_build_indexes_a_markdown_file_as_source_not_text() {
+    fn test_build_indexes_a_markdown_file_as_source_and_one_content_unit() {
         let directory = tempfile::tempdir().expect("temporary workspace");
         fs::write(
             directory.path().join("README.md"),
@@ -3894,26 +3920,38 @@ mod tests {
             &TextFileInclusion::default(),
         )
         .expect("workspace index");
-        assert_eq!(index.file_count(), 1);
-        assert!(
-            index.text_file_count() == 0,
-            "the provider-claimed extension must not double-index as text"
+
+        assert_eq!(index.file_count(), 1, "the provider must publish syntax");
+        assert_eq!(
+            index.text_file_count(),
+            1,
+            "the baseline catalog must hold the same file once"
         );
         let units = index.lexical_units();
-        assert_eq!(units.len(), 1, "one heading, one symbol unit: {units:#?}");
-        assert_eq!(units[0].kind(), LexicalUnitKind::Symbol);
         assert_eq!(
-            units[0].identity(),
-            "rift://symbol/markdown/README.md/Install"
+            units
+                .iter()
+                .filter(|unit| unit.kind() == LexicalUnitKind::TextFile)
+                .count(),
+            1,
+            "provider content must produce one whole-file unit: {units:#?}"
         );
-        assert_eq!(units[0].content(), "# Install\n\nRun the beacon.\n");
+        assert_eq!(
+            units
+                .iter()
+                .filter(|unit| unit.kind() == LexicalUnitKind::Symbol)
+                .count(),
+            1,
+            "the heading remains a syntax fact: {units:#?}"
+        );
+        assert!(
+            units.iter().all(|unit| unit.path().as_str() == "README.md"),
+            "syntax and content facts must share one file path: {units:#?}"
+        );
     }
 
-    /// A workspace `.json` or `.yml` file is source through its claiming
-    /// provider - a `package.json` is indexed like any other source file -
-    /// while `.rift`'s own files stay outside the walk.
     #[test]
-    fn test_build_indexes_json_and_yaml_files_as_source() {
+    fn test_build_indexes_json_and_yaml_as_content_and_syntax() {
         let directory = tempfile::tempdir().expect("temporary workspace");
         fs::write(
             directory.path().join("config.json"),
@@ -3935,21 +3973,18 @@ mod tests {
         )
         .expect("workspace index");
         let source_paths: Vec<&str> = index.files().map(|file| file.path().as_str()).collect();
-        assert_eq!(
-            source_paths,
-            ["config.json", "deploy.yml"],
-            "the workspace files are source and `.rift/server.json` stays outside the walk"
-        );
-        assert_eq!(index.text_file_count(), 0);
+        assert_eq!(source_paths, ["config.json", "deploy.yml"]);
+        assert_eq!(index.text_file_count(), 2);
         let units = index.lexical_units();
         let identities: Vec<&str> = units.iter().map(LexicalUnit::identity).collect();
+        assert!(identities.contains(&"rift://symbol/json/config.json/server"));
+        assert!(identities.contains(&"rift://symbol/yaml/deploy.yml/retries"));
         assert_eq!(
-            identities,
-            [
-                "rift://symbol/json/config.json/server",
-                "rift://symbol/json/config.json/server%20%3E%20port",
-                "rift://symbol/yaml/deploy.yml/retries",
-            ]
+            units
+                .iter()
+                .filter(|unit| unit.kind() == LexicalUnitKind::TextFile)
+                .count(),
+            2
         );
     }
 
@@ -3986,28 +4021,101 @@ mod tests {
     }
 
     #[test]
-    fn test_build_indexes_a_valid_utf8_file_containing_a_nul_byte() {
-        // A NUL byte is valid UTF-8 - it is the codepoint U+0000 - so `String::from_utf8`
-        // accepts it exactly as it accepts any other byte the source language never emits.
-        // This step does not change that.
+    fn test_build_skips_visible_utf8_file_containing_nul_byte() {
         let directory = tempfile::tempdir().expect("temporary workspace");
-        fs::create_dir_all(directory.path().join("src")).expect("fixture directory");
-        let mut source = b"// note: \0\n".to_vec();
-        source.extend_from_slice(b"pub fn ok() {}\n");
-        fs::write(directory.path().join("src/lib.rs"), &source).expect("source with a NUL byte");
+        fs::write(directory.path().join("artifact.unknown"), b"note\0payload")
+            .expect("binary fixture");
         let index = WorkspaceIndex::build(
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
             &TextFileInclusion::default(),
         )
-        .expect("a NUL byte does not fail UTF-8 validation");
-        assert!(index.warnings().is_empty(), "a NUL byte raises no warning");
+        .expect("binary file must not fail catalog build");
+        let path = ProjectPath::new("artifact.unknown").expect("fixture path");
+        assert!(index.text_file(&path).is_none());
+        assert_eq!(
+            index.warnings(),
+            &[WorkspaceIndexWarning::BinarySource(path)]
+        );
+    }
+
+    #[test]
+    fn test_build_skips_provider_files_that_fail_catalog_acceptance() {
+        let directory = tempfile::tempdir().expect("workspace");
+        fs::write(directory.path().join("binary.rs"), b"fn hidden() {}\0").expect("binary");
+        fs::write(directory.path().join("large.rs"), vec![b'x'; 33]).expect("oversized");
+        fs::write(directory.path().join("valid.rs"), "pub fn kept() {}\n").expect("valid");
+        let limits = WorkspaceIndexLimits::new(3, 32, 1_024, 4, 5).expect("limits");
+        let index = WorkspaceIndex::build(
+            directory.path(),
+            limits,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("invalid provider files must not hide valid file");
         assert!(
             index
-                .file(&ProjectPath::new("src/lib.rs").expect("fixture path"))
-                .is_some(),
-            "the file indexes normally"
+                .file(&ProjectPath::new("binary.rs").expect("path"))
+                .is_none()
+        );
+        assert!(
+            index
+                .file(&ProjectPath::new("large.rs").expect("path"))
+                .is_none()
+        );
+        assert!(
+            index
+                .file(&ProjectPath::new("valid.rs").expect("path"))
+                .is_some()
+        );
+        assert_eq!(
+            index.warnings(),
+            &[
+                WorkspaceIndexWarning::BinarySource(ProjectPath::new("binary.rs").expect("path")),
+                WorkspaceIndexWarning::FileTooLarge(ProjectPath::new("large.rs").expect("path")),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_permission_only_change_updates_captured_and_indexed_file_state() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("script");
+        let project_path = ProjectPath::new("script").expect("path");
+        fs::write(&path, "run\n").expect("script");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("permissions");
+        let index = indexed(directory.path(), &TextFileInclusion::default());
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("permissions");
+        let observed = capture_digests(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )
+        .expect("capture");
+        assert_ne!(
+            index.digests().get(&project_path),
+            observed.get(&project_path),
+            "executable metadata must change captured file state"
+        );
+
+        let changes = PathChanges::resolve(
+            observed
+                .iter()
+                .map(|(path, digest)| (path.clone(), Some(digest))),
+            |path| index.digests().get(path),
+        );
+        let rebuilt = index.rebuilt(&changes).expect("metadata rebuild");
+        assert!(
+            rebuilt
+                .text_file(&project_path)
+                .expect("rebuilt script")
+                .executable(),
+            "permission-only change must refresh indexed metadata"
         );
     }
 
@@ -4053,7 +4161,6 @@ mod tests {
             root,
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &TextFileInclusion::default(),
         )
         .expect("a request-time capture must not fail over the same invalid file");
         assert_eq!(
@@ -4126,7 +4233,7 @@ mod tests {
         assert_eq!(index.text_file_count(), 1);
         let text = index
             .text_file(&ProjectPath::new("readme.txt").expect("fixture path must be valid"))
-            .expect("the included text file must be indexed");
+            .expect("the baseline text file must be indexed");
         assert_eq!(text.path().as_str(), "readme.txt");
         assert_eq!(text.content(), "hello");
     }
@@ -4136,34 +4243,28 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary workspace");
         let limits = WorkspaceIndexLimits::default();
         let visibility = SourceVisibility::default();
-        let inclusion = TextFileInclusion::default();
-
-        let empty =
-            WorkspaceFingerprint::capture(directory.path(), limits, &visibility, &inclusion)
-                .expect("fingerprint of an empty workspace");
+        let empty = WorkspaceFingerprint::capture(directory.path(), limits, &visibility)
+            .expect("fingerprint of an empty workspace");
 
         fs::write(directory.path().join("readme.txt"), "first").expect("text file");
-        let appeared =
-            WorkspaceFingerprint::capture(directory.path(), limits, &visibility, &inclusion)
-                .expect("fingerprint after the text file appears");
+        let appeared = WorkspaceFingerprint::capture(directory.path(), limits, &visibility)
+            .expect("fingerprint after the text file appears");
         assert_ne!(
             empty, appeared,
             "a newly appeared text file must change the fingerprint"
         );
 
         fs::write(directory.path().join("readme.txt"), "second").expect("edited text file");
-        let edited =
-            WorkspaceFingerprint::capture(directory.path(), limits, &visibility, &inclusion)
-                .expect("fingerprint after the text file's bytes change");
+        let edited = WorkspaceFingerprint::capture(directory.path(), limits, &visibility)
+            .expect("fingerprint after the text file's bytes change");
         assert_ne!(
             appeared, edited,
             "an edited text file's bytes must change the fingerprint"
         );
 
         fs::remove_file(directory.path().join("readme.txt")).expect("remove text file");
-        let removed =
-            WorkspaceFingerprint::capture(directory.path(), limits, &visibility, &inclusion)
-                .expect("fingerprint after the text file disappears");
+        let removed = WorkspaceFingerprint::capture(directory.path(), limits, &visibility)
+            .expect("fingerprint after the text file disappears");
         assert_eq!(
             empty, removed,
             "removing the text file must restore the original fingerprint"
@@ -4225,7 +4326,7 @@ mod tests {
         // so the eight-line file below must split into several chunk units.
         let content = "aaa\nbbb\nccc\nddd\neee\nfff\nggg\nhhh\n";
         fs::write(directory.path().join("big.txt"), content).expect("oversized text file");
-        let inclusion = TextFileInclusion::new(vec!["txt".to_owned()], 10);
+        let inclusion = TextFileInclusion::new(10);
         let index = WorkspaceIndex::build(
             directory.path(),
             WorkspaceIndexLimits::default(),
@@ -4352,6 +4453,7 @@ mod tests {
             path: ProjectPath::new("").expect("an empty project path names the workspace root"),
             digest: FileDigest::of(b"hello"),
             content: "hello".to_owned(),
+            executable: false,
         };
         let mut units = Vec::new();
         push_text_lexical_units(&mut units, &file, 1_024);

@@ -30,11 +30,25 @@ pub const SERVER_TOKEN_PATTERN: &str = "^[A-Za-z0-9_-]{43}$";
 pub const SERVER_VERSION_PATTERN: &str =
     "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$";
 
+/// Exact Rift process and MCP tool identity.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductIdentity {
+    /// Package version as `MAJOR.MINOR.PATCH`.
+    #[schemars(regex(pattern = "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$"))]
+    pub version: String,
+    /// SHA-256 digest of the running executable.
+    #[schemars(regex(pattern = "^[0-9a-f]{64}$"))]
+    pub executable_digest: String,
+    /// SHA-256 digest of the canonical served tool document.
+    #[schemars(regex(pattern = "^[0-9a-f]{64}$"))]
+    pub schema_digest: String,
+}
+
 /// One workspace's serving `rift server`, as `.rift/server.json` records it.
 ///
 /// A reader that validates the file holds everything needed to issue a
-/// request: the port and the bearer token. The `pid` and `version` fields
-/// carry diagnostics - which process serves, built at which release.
+/// request: port, bearer token, process id, and exact product identity.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerLock {
@@ -48,9 +62,8 @@ pub struct ServerLock {
     /// Process id of the serving `rift server`.
     #[schemars(range(min = 1))]
     pub pid: u32,
-    /// Version of the binary that wrote the lock, as `MAJOR.MINOR.PATCH`.
-    #[schemars(regex(pattern = "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$"))]
-    pub version: String,
+    /// Exact identity of the serving process and MCP tools.
+    pub identity: ProductIdentity,
 }
 
 impl ServerLock {
@@ -67,7 +80,7 @@ impl ServerLock {
         }
     }
 
-    /// The first violated field contract, in declaration order.
+    /// First violated field contract, in declaration order.
     fn violation(&self) -> Option<ServerLockViolation> {
         match self {
             lock if lock.port < SERVER_PORT_FLOOR => Some(ServerLockViolation::PortOutOfRange {
@@ -77,9 +90,19 @@ impl ServerLock {
             }),
             lock if !token_well_formed(&lock.token) => Some(ServerLockViolation::TokenMalformed),
             lock if lock.pid == 0 => Some(ServerLockViolation::ProcessIdZero),
-            lock if !version_well_formed(&lock.version) => {
+            lock if !version_well_formed(&lock.identity.version) => {
                 Some(ServerLockViolation::VersionMalformed {
-                    version: lock.version.clone(),
+                    version: lock.identity.version.clone(),
+                })
+            }
+            lock if !digest_well_formed(&lock.identity.executable_digest) => {
+                Some(ServerLockViolation::ExecutableDigestMalformed {
+                    digest: lock.identity.executable_digest.clone(),
+                })
+            }
+            lock if !digest_well_formed(&lock.identity.schema_digest) => {
+                Some(ServerLockViolation::SchemaDigestMalformed {
+                    digest: lock.identity.schema_digest.clone(),
                 })
             }
             _ => None,
@@ -107,6 +130,14 @@ fn version_well_formed(version: &str) -> bool {
     every_component_decimal && components == 3
 }
 
+/// Whether a digest spells one SHA-256 value as lowercase hex.
+fn digest_well_formed(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// Whether one version component is a decimal integer without leading zeros.
 fn decimal_component(component: &str) -> bool {
     match component.as_bytes() {
@@ -116,35 +147,43 @@ fn decimal_component(component: &str) -> bool {
     }
 }
 
-/// The first contract a lock file breaks. A reader treats any violation as
-/// a stale lock, because the writer is gone or speaks another shape.
+/// First contract a lock file breaks. A reader treats any violation as
+/// a stale lock, because writer is gone or speaks another shape.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServerLockViolation {
-    /// The recorded port sits outside the loopback range the server binds.
+    /// Recorded port sits outside loopback range server binds.
     PortOutOfRange {
-        /// The recorded port.
+        /// Recorded port.
         port: u16,
-        /// The lowest accepted port.
+        /// Lowest accepted port.
         min: u16,
-        /// The highest accepted port.
+        /// Highest accepted port.
         max: u16,
     },
-    /// The token does not spell 32 random bytes as unpadded base64url. The
-    /// token itself never appears in evidence, because it is a credential.
+    /// Token does not spell 32 random bytes as unpadded base64url.
     TokenMalformed,
-    /// The recorded process id is zero, which no process holds.
+    /// Recorded process id is zero, which no process holds.
     ProcessIdZero,
-    /// The version does not spell `MAJOR.MINOR.PATCH`.
+    /// Version does not spell `MAJOR.MINOR.PATCH`.
     VersionMalformed {
-        /// The rejected version.
+        /// Rejected version.
         version: String,
+    },
+    /// Executable digest does not spell lowercase SHA-256.
+    ExecutableDigestMalformed {
+        /// Rejected digest.
+        digest: String,
+    },
+    /// Schema digest does not spell lowercase SHA-256.
+    SchemaDigestMalformed {
+        /// Rejected digest.
+        digest: String,
     },
 }
 
 impl ServerLockViolation {
-    /// The violation's evidence as stable key-value pairs, for error
-    /// context.
+    /// Violation evidence as stable key-value pairs.
     #[must_use]
     pub fn evidence(&self) -> Vec<(&'static str, String)> {
         match self {
@@ -158,6 +197,10 @@ impl ServerLockViolation {
             )],
             Self::ProcessIdZero => vec![("pid", "0".to_owned())],
             Self::VersionMalformed { version } => vec![("version", version.clone())],
+            Self::ExecutableDigestMalformed { digest } => {
+                vec![("executable_digest", digest.clone())]
+            }
+            Self::SchemaDigestMalformed { digest } => vec![("schema_digest", digest.clone())],
         }
     }
 }
@@ -168,16 +211,24 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        SERVER_PORT_FLOOR, SERVER_PORT_MAX, SERVER_PORT_MIN, SERVER_TOKEN_LENGTH,
+        ProductIdentity, SERVER_PORT_FLOOR, SERVER_PORT_MAX, SERVER_PORT_MIN, SERVER_TOKEN_LENGTH,
         SERVER_TOKEN_PATTERN, SERVER_VERSION_PATTERN, ServerLock, ServerLockViolation,
     };
+
+    fn valid_identity() -> ProductIdentity {
+        ProductIdentity {
+            version: "0.0.11".to_owned(),
+            executable_digest: "a".repeat(64),
+            schema_digest: "b".repeat(64),
+        }
+    }
 
     fn valid_lock() -> ServerLock {
         ServerLock {
             port: 12_345,
             token: "a".repeat(SERVER_TOKEN_LENGTH),
             pid: 4_242,
-            version: "0.0.11".to_owned(),
+            identity: valid_identity(),
         }
     }
 
@@ -247,7 +298,7 @@ mod tests {
     fn malformed_versions_are_refused() {
         for version in ["", "0.0", "v0.0.11", "00.1.2", "0.0.11-rc1", "0.0.11.4"] {
             let mut lock = valid_lock();
-            lock.version = version.to_owned();
+            lock.identity.version = version.to_owned();
             assert_eq!(
                 lock.validate(),
                 Err(ServerLockViolation::VersionMalformed {
@@ -262,13 +313,30 @@ mod tests {
     fn workspace_versions_are_accepted() {
         for version in ["0.0.11", "1.0.0", "10.20.30"] {
             let mut lock = valid_lock();
-            lock.version = version.to_owned();
+            lock.identity.version = version.to_owned();
             assert_eq!(
                 lock.validate(),
                 Ok(()),
                 "version {version} must be accepted"
             );
         }
+    }
+
+    #[test]
+    fn malformed_digests_are_refused() {
+        let mut executable = valid_lock();
+        executable.identity.executable_digest = "A".repeat(64);
+        assert!(matches!(
+            executable.validate(),
+            Err(ServerLockViolation::ExecutableDigestMalformed { .. })
+        ));
+
+        let mut schema = valid_lock();
+        schema.identity.schema_digest = "a".repeat(63);
+        assert!(matches!(
+            schema.validate(),
+            Err(ServerLockViolation::SchemaDigestMalformed { .. })
+        ));
     }
 
     #[test]
@@ -309,7 +377,7 @@ mod tests {
             "port": 12_345,
             "token": "a".repeat(SERVER_TOKEN_LENGTH),
             "pid": 4_242,
-            "version": "0.0.11",
+            "identity": valid_identity(),
             "transport": "http",
         });
         assert!(serde_json::from_value::<ServerLock>(unknown).is_err());
@@ -329,9 +397,22 @@ mod tests {
         );
         assert_eq!(properties["token"]["pattern"], json!(SERVER_TOKEN_PATTERN));
         assert_eq!(properties["pid"]["minimum"], json!(1));
+        assert!(properties.get("identity").is_some());
+
+        let identity_schema =
+            serde_json::to_value(schema_for!(ProductIdentity)).expect("schema serializes");
+        let identity_properties = &identity_schema["properties"];
         assert_eq!(
-            properties["version"]["pattern"],
+            identity_properties["version"]["pattern"],
             json!(SERVER_VERSION_PATTERN)
+        );
+        assert_eq!(
+            identity_properties["executable_digest"]["pattern"],
+            json!("^[0-9a-f]{64}$")
+        );
+        assert_eq!(
+            identity_properties["schema_digest"]["pattern"],
+            json!("^[0-9a-f]{64}$")
         );
     }
 }

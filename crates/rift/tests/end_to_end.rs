@@ -20,8 +20,7 @@ use std::fs;
 
 use harness::{
     RUST_PROJECT_ROOT, SERIAL, StopOnDrop, TestResult, arguments, laid_out_workspace, proxied_call,
-    proxy_client, require_success, run_rift, rust_engine_workspace, rust_project,
-    warmed_rust_engine, workspace,
+    proxy_client, require_success, run_rift, rust_engine_workspace, rust_project, workspace,
 };
 use raw_proxy::RawProxySession;
 use serde_json::json;
@@ -746,8 +745,6 @@ async fn rename_declined_by_engine_names_the_decline_not_a_missing_target() -> T
     let _cleanup = StopOnDrop::new(root);
 
     let client = proxy_client(root).await?;
-    warmed_rust_engine(&client).await?;
-
     let structured = proxied_call(
         &client,
         "rename_symbol",
@@ -804,7 +801,6 @@ async fn move_file_breaking_the_module_graph_carries_references_not_updated() ->
     let _cleanup = StopOnDrop::new(root);
 
     let client = proxy_client(root).await?;
-    warmed_rust_engine(&client).await?;
     let structured = proxied_call(
         &client,
         "move_file",
@@ -891,8 +887,8 @@ async fn hooks_with_an_absolute_program_or_a_dot_segment_directory_refuse() -> T
 
     let absolute_program_hook = "[[hooks]]\ntype = \"command\"\nid = \"escape\"\n\
         kind = \"other\"\nprogram = \"/bin/true\"\narguments = []\n\
-        changed_paths = \"none\"\nworking_directory = \"\"\nenvironment = {}\n\
-        timeout = \"5s\"\noutput_limit = \"4096b\"\nguarantees = []\n\
+        changed_paths = \"none\"\nwrites = \"none\"\nworking_directory = \"\"\nenvironment = {}\n\
+        timeout = \"5s\"\noutput_limit = \"4096b\"\nfailure_severity = \"error\"\nguarantees = []\n\
         determinism = \"best_effort\"\n";
     let directory =
         laid_out_workspace(&[("lib.rs", "pub fn beacon() {}\n")], absolute_program_hook)?;
@@ -926,8 +922,8 @@ async fn hooks_with_an_absolute_program_or_a_dot_segment_directory_refuse() -> T
 
     let dot_segment_directory_hook = "[[hooks]]\ntype = \"command\"\nid = \"escape\"\n\
         kind = \"other\"\nprogram = \"true\"\narguments = []\n\
-        changed_paths = \"none\"\nworking_directory = \"../outside\"\nenvironment = {}\n\
-        timeout = \"5s\"\noutput_limit = \"4096b\"\nguarantees = []\n\
+        changed_paths = \"none\"\nwrites = \"none\"\nworking_directory = \"../outside\"\nenvironment = {}\n\
+        timeout = \"5s\"\noutput_limit = \"4096b\"\nfailure_severity = \"error\"\nguarantees = []\n\
         determinism = \"best_effort\"\n";
     let directory = laid_out_workspace(
         &[("lib.rs", "pub fn beacon() {}\n")],

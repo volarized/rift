@@ -193,7 +193,14 @@ async fn planned_move(
     refused_occupied_destination(workspace_root, &to).await?;
     refused_invisible_destination(reads, workspace_root, &to)?;
     refused_oversized(&from, source.text.len(), MOVE_OPERATION)?;
-    let proposal = engine_proposal(engines, &from, &to, source.language_segment.as_deref()).await?;
+    let proposal = engine_proposal(
+        engines,
+        &from,
+        &to,
+        source.language_segment.as_deref(),
+        &source.text,
+    )
+    .await?;
     match proposal {
         EngineProposal::Nothing(reason) => Ok(unedited_plan(from, to, source.text, Some(reason))),
         EngineProposal::Answered { edit, encoding } => {
@@ -410,6 +417,7 @@ async fn engine_proposal(
     from: &CoreProjectPath,
     to: &CoreProjectPath,
     language_segment: Option<&str>,
+    source: &str,
 ) -> Result<EngineProposal, PlanEnd> {
     let Some(language_segment) = language_segment else {
         return Ok(EngineProposal::Nothing(
@@ -423,7 +431,7 @@ async fn engine_proposal(
         }));
     };
     let engine = || slot.name().to_owned();
-    match exchanged_will_rename(slot, from, to).await {
+    match exchanged_will_rename(slot, from, to, &language.name, source).await {
         Ok(MoveExchange::FilterMismatch) => Ok(EngineProposal::Nothing(
             ReferencesNotUpdated::FilterMismatch { engine: engine() },
         )),
@@ -460,38 +468,50 @@ async fn exchanged_will_rename(
     slot: &EngineSlot,
     from: &CoreProjectPath,
     to: &CoreProjectPath,
+    language_id: &str,
+    source: &str,
 ) -> Result<MoveExchange, EngineError> {
     // The boxed future may only borrow the session, so each attempt gets
     // its own owned copy of the request paths.
     let request_from = from.clone();
     let request_to = to.clone();
+    let request_language = language_id.to_owned();
+    let request_source = source.to_owned();
     slot.request(move |session: &mut EngineSession| {
         let from = request_from.clone();
         let to = request_to.clone();
-        Box::pin(async move { will_rename_on_session(session, &from, &to).await })
+        let language = request_language.clone();
+        let source = request_source.clone();
+        Box::pin(
+            async move { will_rename_on_session(session, &from, &to, &language, source).await },
+        )
     })
     .await
 }
 
-/// One will-rename conversation. `didOpen` is not required: the request
-/// names the old and new URIs alone. An engine whose filters do not cover
-/// the file is never asked; an engine without the capability refuses
-/// inside the session's own gate.
+/// One open, will-rename, close conversation. Opening source activates
+/// engines that do not load project state from file-operation URIs alone.
+/// Engine whose filters do not cover file is never asked.
 async fn will_rename_on_session(
     session: &mut EngineSession,
     from: &CoreProjectPath,
     to: &CoreProjectPath,
+    language_id: &str,
+    source: String,
 ) -> Result<MoveExchange, EngineError> {
     let capabilities = session.capabilities();
     let encoding = capabilities.position_encoding;
     if capabilities.will_rename_files() && !capabilities.will_rename_matches(from.as_str()) {
         return Ok(MoveExchange::FilterMismatch);
     }
-    let edit = session.will_rename_files(from, to).await?;
+    session.open(from, language_id, source).await?;
+    let edit = session.will_rename_files(from, to).await;
+    let readiness = session.readiness();
+    let _ = session.close(from).await;
     Ok(MoveExchange::Answered {
-        edit,
+        edit: edit?,
         encoding,
-        readiness: session.readiness(),
+        readiness,
     })
 }
 
@@ -651,6 +671,7 @@ mod tests {
                 preconditions.first().expect("a failed condition rides")
             }
             ChangeResult::Applied { .. } => panic!("expected a refusal, got an applied change"),
+            ChangeResult::Unchanged => panic!("expected a refusal, got unchanged result"),
         }
     }
 
@@ -690,8 +711,7 @@ mod tests {
     /// advertising will-rename over every path, never announces any
     /// `$/progress` work of its own, and answers the one
     /// `workspace/willRenameFiles` request the move sends with `null`. With
-    /// `retry.attempts` at 1 the slot's one empty-answer resend is never
-    /// claimed past the first attempt, so the answer reaches `plan_move`
+    /// `retry.attempts` at 1 no empty-answer resend is available, so answer reaches `plan_move`
     /// exactly as the engine gave it: nothing, from an engine that has
     /// proven nothing about its own readiness. The script never reads its
     /// stdin; it writes this fixed sequence regardless of what the session

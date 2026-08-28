@@ -27,6 +27,7 @@ generate-check:
 
 check:
     cargo metadata --locked --format-version 1 > /dev/null
+    cargo check --workspace --all-targets --all-features --locked
     uv run --script scripts/check_rust_architecture.py
 
 # The em-dash ban, over every surface a reader meets: the docs pages and
@@ -75,6 +76,7 @@ engine-test:
     RIFT_ENGINE_LIVE=1 cargo test -p rift-mcp --test live_rust_analyzer
     RIFT_ENGINE_LIVE=1 cargo test -p rift-lsp --test live_typescript
     RIFT_ENGINE_LIVE=1 cargo test -p rift-mcp --test live_typescript
+    RIFT_ENGINE_LIVE=1 cargo test -p rift-mcp --test live_toml
 
 # The live semantic-search suite alone, for iterating on it without paying for
 # the instrumented workspace run. Reaches the real model hub.

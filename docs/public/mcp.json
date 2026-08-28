@@ -92,7 +92,7 @@
             "type": "integer"
           },
           "name": {
-            "description": "The declaration name to look up - a name, not a free-text query; `search` takes\nthose. An exact symbol name ranks first, then prefix matches, then qualified-name\nsubstrings.",
+            "description": "The declaration name to look up - a name, not a full `SymbolId` or free-text\nquery; `search` takes free text. An exact symbol name ranks first, then prefix\nmatches, then qualified-name substrings.",
             "maxLength": 4096,
             "minLength": 1,
             "type": "string"
@@ -2049,7 +2049,7 @@
         "properties": {
           "anchor": {
             "$ref": "#/$defs/NodeId",
-            "description": "The node the new content lands beside, witness included."
+            "description": "The node identity returned by `nodes`, witness included."
           },
           "body": {
             "$ref": "#/$defs/BodySource",
@@ -2098,10 +2098,11 @@
                   "$ref": "#/$defs/Edit"
                 },
                 "maxItems": 256,
+                "minItems": 1,
                 "type": "array"
               },
               "guarantees": {
-                "description": "Properties the workspace's passing hooks established about this\nchange, in hook list order.",
+                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order.",
                 "items": {
                   "$ref": "#/$defs/GuaranteeEvidence"
                 },
@@ -2118,6 +2119,7 @@
                   "$ref": "#/$defs/ProjectPath"
                 },
                 "maxItems": 256,
+                "minItems": 1,
                 "type": "array"
               }
             },
@@ -2954,6 +2956,20 @@
               "reason",
               "preconditions",
               "diagnostics"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A completed transform pipeline left the targeted tree unchanged.",
+            "properties": {
+              "status": {
+                "const": "unchanged",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
             ],
             "type": "object"
           }
@@ -3071,7 +3087,7 @@
                 "type": "null"
               }
             ],
-            "description": "The existing declaration the new one lands beside."
+            "description": "The existing declaration identity returned by `get_symbol`."
           },
           "body": {
             "$ref": "#/$defs/BodySource",
@@ -3135,10 +3151,11 @@
                   "$ref": "#/$defs/Edit"
                 },
                 "maxItems": 256,
+                "minItems": 1,
                 "type": "array"
               },
               "guarantees": {
-                "description": "Properties the workspace's passing hooks established about this\nchange, in hook list order.",
+                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order.",
                 "items": {
                   "$ref": "#/$defs/GuaranteeEvidence"
                 },
@@ -3155,6 +3172,7 @@
                   "$ref": "#/$defs/ProjectPath"
                 },
                 "maxItems": 256,
+                "minItems": 1,
                 "type": "array"
               }
             },
@@ -3991,6 +4009,20 @@
               "reason",
               "preconditions",
               "diagnostics"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A completed transform pipeline left the targeted tree unchanged.",
+            "properties": {
+              "status": {
+                "const": "unchanged",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
             ],
             "type": "object"
           }
@@ -4065,10 +4097,11 @@
                   "$ref": "#/$defs/Edit"
                 },
                 "maxItems": 256,
+                "minItems": 1,
                 "type": "array"
               },
               "guarantees": {
-                "description": "Properties the workspace's passing hooks established about this\nchange, in hook list order.",
+                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order.",
                 "items": {
                   "$ref": "#/$defs/GuaranteeEvidence"
                 },
@@ -4085,6 +4118,7 @@
                   "$ref": "#/$defs/ProjectPath"
                 },
                 "maxItems": 256,
+                "minItems": 1,
                 "type": "array"
               }
             },
@@ -4921,6 +4955,20 @@
               "reason",
               "preconditions",
               "diagnostics"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A completed transform pipeline left the targeted tree unchanged.",
+            "properties": {
+              "status": {
+                "const": "unchanged",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
             ],
             "type": "object"
           }
@@ -5808,10 +5856,11 @@
                   "$ref": "#/$defs/Edit"
                 },
                 "maxItems": 256,
+                "minItems": 1,
                 "type": "array"
               },
               "guarantees": {
-                "description": "Properties the workspace's passing hooks established about this\nchange, in hook list order.",
+                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order.",
                 "items": {
                   "$ref": "#/$defs/GuaranteeEvidence"
                 },
@@ -5828,6 +5877,7 @@
                   "$ref": "#/$defs/ProjectPath"
                 },
                 "maxItems": 256,
+                "minItems": 1,
                 "type": "array"
               }
             },
@@ -6664,6 +6714,20 @@
               "reason",
               "preconditions",
               "diagnostics"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A completed transform pipeline left the targeted tree unchanged.",
+            "properties": {
+              "status": {
+                "const": "unchanged",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
             ],
             "type": "object"
           }
@@ -6701,7 +6765,7 @@
           },
           "node": {
             "$ref": "#/$defs/NodeId",
-            "description": "The node to remove, witness included."
+            "description": "The node identity returned by `nodes`, witness included."
           }
         },
         "required": [
@@ -6739,10 +6803,11 @@
                   "$ref": "#/$defs/Edit"
                 },
                 "maxItems": 256,
+                "minItems": 1,
                 "type": "array"
               },
               "guarantees": {
-                "description": "Properties the workspace's passing hooks established about this\nchange, in hook list order.",
+                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order.",
                 "items": {
                   "$ref": "#/$defs/GuaranteeEvidence"
                 },
@@ -6759,6 +6824,7 @@
                   "$ref": "#/$defs/ProjectPath"
                 },
                 "maxItems": 256,
+                "minItems": 1,
                 "type": "array"
               }
             },
@@ -7595,6 +7661,20 @@
               "reason",
               "preconditions",
               "diagnostics"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A completed transform pipeline left the targeted tree unchanged.",
+            "properties": {
+              "status": {
+                "const": "unchanged",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
             ],
             "type": "object"
           }
@@ -7632,7 +7712,7 @@
           },
           "symbol": {
             "$ref": "#/$defs/SymbolId",
-            "description": "The declaration to remove."
+            "description": "The declaration identity returned by `get_symbol`."
           }
         },
         "required": [
@@ -7670,10 +7750,11 @@
                   "$ref": "#/$defs/Edit"
                 },
                 "maxItems": 256,
+                "minItems": 1,
                 "type": "array"
               },
               "guarantees": {
-                "description": "Properties the workspace's passing hooks established about this\nchange, in hook list order.",
+                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order.",
                 "items": {
                   "$ref": "#/$defs/GuaranteeEvidence"
                 },
@@ -7690,6 +7771,7 @@
                   "$ref": "#/$defs/ProjectPath"
                 },
                 "maxItems": 256,
+                "minItems": 1,
                 "type": "array"
               }
             },
@@ -8526,6 +8608,20 @@
               "reason",
               "preconditions",
               "diagnostics"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A completed transform pipeline left the targeted tree unchanged.",
+            "properties": {
+              "status": {
+                "const": "unchanged",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
             ],
             "type": "object"
           }
@@ -8564,7 +8660,7 @@
           },
           "symbol": {
             "$ref": "#/$defs/SymbolId",
-            "description": "The declaration to rename, in the address form the read tools return."
+            "description": "The declaration identity returned by `get_symbol`."
           }
         },
         "required": [
@@ -8603,10 +8699,11 @@
                   "$ref": "#/$defs/Edit"
                 },
                 "maxItems": 256,
+                "minItems": 1,
                 "type": "array"
               },
               "guarantees": {
-                "description": "Properties the workspace's passing hooks established about this\nchange, in hook list order.",
+                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order.",
                 "items": {
                   "$ref": "#/$defs/GuaranteeEvidence"
                 },
@@ -8623,6 +8720,7 @@
                   "$ref": "#/$defs/ProjectPath"
                 },
                 "maxItems": 256,
+                "minItems": 1,
                 "type": "array"
               }
             },
@@ -9459,6 +9557,20 @@
               "reason",
               "preconditions",
               "diagnostics"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A completed transform pipeline left the targeted tree unchanged.",
+            "properties": {
+              "status": {
+                "const": "unchanged",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
             ],
             "type": "object"
           }
@@ -9559,7 +9671,7 @@
           },
           "node": {
             "$ref": "#/$defs/NodeId",
-            "description": "The node to replace, witness included."
+            "description": "The node identity returned by `nodes`, witness included."
           },
           "region": {
             "anyOf": [
@@ -9609,10 +9721,11 @@
                   "$ref": "#/$defs/Edit"
                 },
                 "maxItems": 256,
+                "minItems": 1,
                 "type": "array"
               },
               "guarantees": {
-                "description": "Properties the workspace's passing hooks established about this\nchange, in hook list order.",
+                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order.",
                 "items": {
                   "$ref": "#/$defs/GuaranteeEvidence"
                 },
@@ -9629,6 +9742,7 @@
                   "$ref": "#/$defs/ProjectPath"
                 },
                 "maxItems": 256,
+                "minItems": 1,
                 "type": "array"
               }
             },
@@ -10465,6 +10579,20 @@
               "reason",
               "preconditions",
               "diagnostics"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A completed transform pipeline left the targeted tree unchanged.",
+            "properties": {
+              "status": {
+                "const": "unchanged",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
             ],
             "type": "object"
           }
@@ -10576,7 +10704,7 @@
           },
           "symbol": {
             "$ref": "#/$defs/SymbolId",
-            "description": "The declaration to replace."
+            "description": "The declaration identity returned by `get_symbol`."
           }
         },
         "required": [
@@ -10615,10 +10743,11 @@
                   "$ref": "#/$defs/Edit"
                 },
                 "maxItems": 256,
+                "minItems": 1,
                 "type": "array"
               },
               "guarantees": {
-                "description": "Properties the workspace's passing hooks established about this\nchange, in hook list order.",
+                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order.",
                 "items": {
                   "$ref": "#/$defs/GuaranteeEvidence"
                 },
@@ -10635,6 +10764,7 @@
                   "$ref": "#/$defs/ProjectPath"
                 },
                 "maxItems": 256,
+                "minItems": 1,
                 "type": "array"
               }
             },
@@ -11471,6 +11601,20 @@
               "reason",
               "preconditions",
               "diagnostics"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A completed transform pipeline left the targeted tree unchanged.",
+            "properties": {
+              "status": {
+                "const": "unchanged",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
             ],
             "type": "object"
           }

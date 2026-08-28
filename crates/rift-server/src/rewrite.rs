@@ -5,6 +5,8 @@
 //! the file-target insert - resolves to these values first, and the change
 //! lane stages, publishes, and reports them.
 
+use std::fs;
+
 use rift_core::ProjectPath;
 use rift_syntax::ByteRange;
 
@@ -29,7 +31,7 @@ pub(crate) struct ReplacedRegion {
 }
 
 /// How one resolved rewrite changes the tree.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum RewriteKind {
     /// An existing file's content changes in place.
     ///
@@ -54,19 +56,30 @@ impl RewriteKind {
     }
 }
 
+/// Permission state one rewrite publishes.
+#[derive(Clone, Debug)]
+pub(crate) enum RewritePermissions {
+    /// Retain permissions from existing target.
+    Retain,
+    /// Retain permissions from another workspace file.
+    RetainFrom(ProjectPath),
+    /// Publish captured permissions exactly.
+    Exact(fs::Permissions),
+}
+
 /// One file-level effect a change resolved to, not yet written.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct FileRewrite {
     /// The file this rewrite lands on.
     pub(crate) path: ProjectPath,
     /// What kind of write it is, and for a modification, what it replaces.
     pub(crate) kind: RewriteKind,
-    /// The previous image's length in bytes. It is the span a create or a
-    /// delete reports, and the span a modification falls back to when one
-    /// batch's regions outnumber what a change result may carry.
-    pub(crate) previous_len: u64,
+    /// The file's whole content before this rewrite lands. Empty for a creation.
+    pub(crate) previous_source: String,
     /// The file's whole content after this rewrite lands.
     pub(crate) next_source: String,
+    /// How publication selects file permissions.
+    pub(crate) permissions: RewritePermissions,
 }
 
 impl FileRewrite {
@@ -81,29 +94,63 @@ impl FileRewrite {
         Self {
             path,
             kind: RewriteKind::Modify { replaced },
-            previous_len: previous.len() as u64,
+            previous_source: previous.to_owned(),
             next_source,
+            permissions: RewritePermissions::Retain,
         }
     }
 
-    /// Builds the creation of `path` holding `next_source`.
+    /// Builds creation of `path` holding `next_source`.
     pub(crate) const fn create(path: ProjectPath, next_source: String) -> Self {
         Self {
             path,
             kind: RewriteKind::Create,
-            previous_len: 0,
+            previous_source: String::new(),
             next_source,
+            permissions: RewritePermissions::Retain,
         }
     }
 
-    /// Builds the removal of `path`, whose previous image was `previous`.
+    /// Builds removal of `path`, whose previous image was `previous`.
     pub(crate) fn delete(path: ProjectPath, previous: &str) -> Self {
         Self {
             path,
             kind: RewriteKind::Delete,
-            previous_len: previous.len() as u64,
+            previous_source: previous.to_owned(),
             next_source: String::new(),
+            permissions: RewritePermissions::Retain,
         }
+    }
+
+    /// Builds creation of `path`, retaining permissions from `permissions_from`.
+    pub(crate) fn create_from(
+        path: ProjectPath,
+        next_source: String,
+        permissions_from: ProjectPath,
+    ) -> Self {
+        Self {
+            path,
+            kind: RewriteKind::Create,
+            previous_source: String::new(),
+            next_source,
+            permissions: RewritePermissions::RetainFrom(permissions_from),
+        }
+    }
+
+    /// Sets exact permissions the published file receives.
+    pub(crate) fn with_permissions(mut self, permissions: fs::Permissions) -> Self {
+        self.permissions = RewritePermissions::Exact(permissions);
+        self
+    }
+
+    /// Length of file before rewrite.
+    pub(crate) const fn previous_len(&self) -> u64 {
+        self.previous_source.len() as u64
+    }
+
+    /// Whether rewrite changes file bytes.
+    pub(crate) fn changes_bytes(&self) -> bool {
+        !matches!(self.kind, RewriteKind::Modify { .. }) || self.previous_source != self.next_source
     }
 }
 
@@ -130,7 +177,7 @@ mod tests {
                 text: "TWO\n".to_owned(),
             }],
         );
-        assert_eq!(rewrite.previous_len, 8);
+        assert_eq!(rewrite.previous_len(), 8);
         let RewriteKind::Modify { replaced } = &rewrite.kind else {
             panic!("a modification must carry its replaced regions");
         };
@@ -141,14 +188,14 @@ mod tests {
     #[test]
     fn test_create_starts_from_an_empty_previous_image() {
         let rewrite = FileRewrite::create(path("new.rs"), "body\n".to_owned());
-        assert_eq!(rewrite.previous_len, 0);
+        assert_eq!(rewrite.previous_len(), 0);
         assert!(matches!(rewrite.kind, RewriteKind::Create));
     }
 
     #[test]
     fn test_delete_spans_the_previous_image_and_leaves_nothing() {
         let rewrite = FileRewrite::delete(path("gone.rs"), "one\ntwo\n");
-        assert_eq!(rewrite.previous_len, 8);
+        assert_eq!(rewrite.previous_len(), 8);
         assert!(rewrite.next_source.is_empty());
         assert!(rewrite.kind.removes_file());
     }

@@ -16,6 +16,7 @@ use axum::routing::post;
 use data_encoding::BASE64URL_NOPAD;
 use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault};
 use rift_index::WorkspaceIndexLimits;
+use rift_protocol::lock::ProductIdentity;
 use rift_server::ReadError;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
@@ -162,6 +163,7 @@ pub(crate) async fn serve_http_with_storage(
     let server = RiftMcp::build_with_storage(root, WorkspaceIndexLimits::default(), storage)
         .await
         .map_err(HttpServeFault::workspace)?;
+    let identity = server.product_identity().clone();
     let server_table = server.server_configuration().await;
     let idle_timeout = Duration::from_millis(server_table.idle_timeout.milliseconds());
     let supervisor = server.index_supervisor();
@@ -186,6 +188,7 @@ pub(crate) async fn serve_http_with_storage(
     Ok(HttpServer {
         port,
         token,
+        identity,
         stop,
         serving,
         idle_watch,
@@ -199,6 +202,7 @@ pub(crate) async fn serve_http_with_storage(
 pub struct HttpServer {
     port: u16,
     token: String,
+    identity: ProductIdentity,
     stop: CancellationToken,
     serving: JoinHandle<Result<(), std::io::Error>>,
     idle_watch: JoinHandle<()>,
@@ -217,6 +221,12 @@ impl HttpServer {
     #[must_use]
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// Exact identity advertised by this server.
+    #[must_use]
+    pub(crate) fn product_identity(&self) -> &ProductIdentity {
+        &self.identity
     }
 
     /// Waits until the server stopped and its index supervisor shut down.
@@ -554,7 +564,7 @@ mod tests {
     use std::time::Duration;
 
     use axum::http::{StatusCode, header};
-    use rift_protocol::lock::{SERVER_PORT_MIN, SERVER_TOKEN_LENGTH, ServerLock};
+    use rift_protocol::lock::{ProductIdentity, SERVER_PORT_MIN, SERVER_TOKEN_LENGTH, ServerLock};
     use rift_server::ReadFault;
     use tokio_util::sync::CancellationToken;
 
@@ -579,7 +589,11 @@ mod tests {
             port: SERVER_PORT_MIN,
             token,
             pid: 1,
-            version: "0.0.9".to_owned(),
+            identity: ProductIdentity {
+                version: "0.0.9".to_owned(),
+                executable_digest: "a".repeat(64),
+                schema_digest: "b".repeat(64),
+            },
         };
         assert_eq!(lock.validate(), Ok(()));
     }

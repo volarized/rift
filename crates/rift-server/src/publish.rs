@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use rift_core::ProjectPath as CoreProjectPath;
@@ -19,7 +19,7 @@ use rift_protocol::read::{
 };
 
 use crate::read::{ReadError, ReadFault, ReadService};
-use crate::rewrite::{FileRewrite, REWRITE_FILE_BYTES_MAX, RewriteKind};
+use crate::rewrite::{FileRewrite, REWRITE_FILE_BYTES_MAX, RewriteKind, RewritePermissions};
 
 /// Whether a write should publish through a symlink's resolved target, or
 /// act on the addressed entry itself.
@@ -241,23 +241,41 @@ fn relative_project_path(relative: &Path) -> Option<CoreProjectPath> {
     CoreProjectPath::new(joined).ok()
 }
 
-/// One target's bytes before this batch's publish began: present bytes,
-/// or its absence. Rollback restores this, never the syntax index, so a
-/// visible file the index does not hold - a text-lane file, an unparsed
-/// file - still rolls back correctly.
+/// One target's bytes and permissions before batch publish, or absence.
 enum PreviousState {
     Absent,
-    Present(Vec<u8>),
+    Present {
+        bytes: Vec<u8>,
+        permissions: fs::Permissions,
+    },
 }
 
-/// Reads `absolute`'s current bytes for rollback, bytes rather than a
-/// string so a target holding what is not UTF-8 still captures.
+/// Reads target bytes and permissions for rollback.
 fn captured_previous_state(path: &str, absolute: &Path) -> Result<PreviousState, ReadError> {
-    match fs::read(absolute) {
-        Ok(bytes) => Ok(PreviousState::Present(bytes)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(PreviousState::Absent),
-        Err(error) => Err(ReadFault::storage(path, "read", &error)),
-    }
+    let mut file = match fs::File::open(absolute) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PreviousState::Absent);
+        }
+        Err(error) => return Err(ReadFault::storage(path, "read", &error)),
+    };
+    let permissions = file
+        .metadata()
+        .map_err(|error| ReadFault::storage(path, "metadata", &error))?
+        .permissions();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| ReadFault::storage(path, "read", &error))?;
+    Ok(PreviousState::Present { bytes, permissions })
+}
+
+/// Opens one source and captures permissions from that same file handle.
+fn captured_permissions(path: &str, absolute: &Path) -> Result<fs::Permissions, ReadError> {
+    let file =
+        fs::File::open(absolute).map_err(|error| ReadFault::storage(path, "read", &error))?;
+    file.metadata()
+        .map(|metadata| metadata.permissions())
+        .map_err(|error| ReadFault::storage(path, "metadata", &error))
 }
 
 /// Directories staging created while making room for a `Create` rewrite,
@@ -314,18 +332,11 @@ struct StagedMember<'batch> {
     previous: PreviousState,
     warning: Option<Diagnostic>,
     staged: Option<tempfile::NamedTempFile>,
+    /// Permissions applied after publication, because Windows persistence clears attributes.
+    permissions: Option<fs::Permissions>,
 }
 
-/// Captures `target`'s previous state and, for every kind but a deletion,
-/// stages `rewrite`'s next content into an exclusive temporary file in
-/// the same directory `persist` will publish into.
-///
-/// A `Create` target's previous state is `Absent` by construction - the
-/// caller that produced this rewrite already proved the target does not
-/// exist - so this never reads it: a directory standing where the create
-/// will land is not a fact about content to capture, and reading one
-/// would fail here instead of at the publish step that actually collides
-/// with it.
+/// Captures previous state and stages next content in target directory.
 fn stage_member<'batch>(
     root: &Path,
     rewrite: &'batch FileRewrite,
@@ -337,6 +348,17 @@ fn stage_member<'batch>(
     } else {
         captured_previous_state(rewrite.path.as_str(), &target.absolute)?
     };
+    let permissions = match (&previous, &rewrite.permissions) {
+        (_, RewritePermissions::Exact(permissions)) => Some(permissions.clone()),
+        (_, RewritePermissions::RetainFrom(source)) => Some(captured_permissions(
+            source.as_str(),
+            &root.join(source.as_str()),
+        )?),
+        (PreviousState::Present { permissions, .. }, RewritePermissions::Retain) => {
+            Some(permissions.clone())
+        }
+        (PreviousState::Absent, RewritePermissions::Retain) => None,
+    };
     let warning = target.symlink_warning();
     if rewrite.kind.removes_file() {
         return Ok(StagedMember {
@@ -345,6 +367,7 @@ fn stage_member<'batch>(
             previous,
             warning,
             staged: None,
+            permissions: None,
         });
     }
     let parent = target.absolute.parent().unwrap_or(root);
@@ -357,12 +380,44 @@ fn stage_member<'batch>(
         .map_err(|error| ReadFault::storage(rewrite.path.as_str(), "stage", &error))?;
     file.write_all(rewrite.next_source.as_bytes())
         .map_err(|error| ReadFault::storage(rewrite.path.as_str(), "stage", &error))?;
+    if let Some(permissions) = &permissions {
+        file.as_file()
+            .set_permissions(permissions.clone())
+            .map_err(|error| ReadFault::storage(rewrite.path.as_str(), "permissions", &error))?;
+    }
     Ok(StagedMember {
         rewrite,
         absolute: target.absolute.clone(),
         previous,
         warning,
         staged: Some(file),
+        permissions,
+    })
+}
+
+/// Clears the Windows read-only attribute before replacing or deleting an existing file.
+#[cfg(windows)]
+fn make_target_replaceable(path: &Path) -> std::io::Result<bool> {
+    let mut permissions = match fs::metadata(path) {
+        Ok(metadata) => metadata.permissions(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if permissions.readonly() {
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Applies captured permissions after persistence, including Windows attributes cleared by tempfile.
+fn apply_published_permissions(
+    path: &Path,
+    permissions: Option<&fs::Permissions>,
+) -> std::io::Result<()> {
+    permissions.map_or(Ok(()), |permissions| {
+        fs::set_permissions(path, permissions.clone())
     })
 }
 
@@ -371,7 +426,13 @@ fn stage_member<'batch>(
 /// target since it was resolved, and refuses instead of clobbering it
 /// otherwise; every other kind persists its staged tempfile onto the
 /// target unconditionally, through a rename within one directory.
-fn publish_member(member: &mut StagedMember<'_>) -> Result<(), ReadError> {
+fn publish_member(member: &mut StagedMember<'_>, mutated: &mut bool) -> Result<(), ReadError> {
+    #[cfg(windows)]
+    if !matches!(member.rewrite.kind, RewriteKind::Create) {
+        *mutated = make_target_replaceable(&member.absolute).map_err(|error| {
+            ReadFault::storage(member.rewrite.path.as_str(), "permissions", &error)
+        })?;
+    }
     let outcome: Result<(), std::io::Error> = match (&member.rewrite.kind, member.staged.take()) {
         (RewriteKind::Delete, _) => fs::remove_file(&member.absolute),
         (RewriteKind::Create, Some(staged)) => staged
@@ -386,6 +447,14 @@ fn publish_member(member: &mut StagedMember<'_>) -> Result<(), ReadError> {
             "staged rewrite is missing its staged file",
         )),
     };
+    let outcome = outcome.and_then(|()| {
+        *mutated = true;
+        if member.rewrite.kind.removes_file() {
+            Ok(())
+        } else {
+            apply_published_permissions(&member.absolute, member.permissions.as_ref())
+        }
+    });
     outcome.map_err(|error| ReadFault::storage(member.rewrite.path.as_str(), "publish", &error))
 }
 
@@ -394,26 +463,43 @@ fn publish_member(member: &mut StagedMember<'_>) -> Result<(), ReadError> {
 /// the publish.
 fn publish_staged(staged: &mut [StagedMember<'_>]) -> Result<(), ReadError> {
     for index in 0..staged.len() {
-        if let Err(error) = publish_member(&mut staged[index]) {
-            roll_back_published(&staged[..index]);
+        let mut mutated = false;
+        if let Err(error) = publish_member(&mut staged[index], &mut mutated) {
+            let published = if mutated {
+                &staged[..=index]
+            } else {
+                &staged[..index]
+            };
+            roll_back_published(published);
             return Err(error);
         }
     }
     Ok(())
 }
 
-/// Restores every already-published member to its captured previous
-/// state: present bytes are written back, and an absent member is
-/// removed. Best-effort: a member whose restoration itself fails stays
-/// as published, and the storage error the caller returns already names
-/// what stopped the publish.
+/// Restores every published member to captured bytes and permissions.
+/// Restoration remains best-effort because caller returns original publish error.
 fn roll_back_published(published: &[StagedMember<'_>]) {
     for member in published {
         match &member.previous {
-            PreviousState::Present(bytes) => {
-                let _ = fs::write(&member.absolute, bytes);
+            PreviousState::Present { bytes, permissions } => {
+                let parent = member.absolute.parent().unwrap_or_else(|| Path::new("."));
+                #[cfg(windows)]
+                let _ = make_target_replaceable(&member.absolute);
+                if let Ok(mut restored) = tempfile::NamedTempFile::new_in(parent)
+                    && restored.write_all(bytes).is_ok()
+                    && restored
+                        .as_file()
+                        .set_permissions(permissions.clone())
+                        .is_ok()
+                    && restored.persist(&member.absolute).is_ok()
+                {
+                    let _ = fs::set_permissions(&member.absolute, permissions.clone());
+                }
             }
             PreviousState::Absent => {
+                #[cfg(windows)]
+                let _ = make_target_replaceable(&member.absolute);
                 let _ = fs::remove_file(&member.absolute);
             }
         }
@@ -992,6 +1078,73 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn test_publish_rewrites_preserves_readonly_permissions() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let target = directory.path().join("notes.txt");
+        let source = "old notes\n";
+        fs::write(&target, source)?;
+        let mut permissions = fs::metadata(&target)?.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&target, permissions)?;
+        let reads = reads_over(directory.path(), &SourceVisibility::default())?;
+        let next = "new notes\n";
+        let rewrites = vec![FileRewrite::modify(
+            path("notes.txt"),
+            source,
+            next.to_owned(),
+            vec![ReplacedRegion {
+                range: ByteRange { start: 0, end: 3 },
+                text: "new".to_owned(),
+            }],
+        )];
+
+        publish_rewrites(&reads, directory.path(), &rewrites)?
+            .expect("a read-only rewrite must publish");
+        assert_eq!(fs::read_to_string(&target)?, next);
+        assert!(
+            fs::metadata(&target)?.permissions().readonly(),
+            "publishing new bytes must retain the read-only state"
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_publish_rewrites_rollback_restores_readonly_permissions() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let target = directory.path().join("notes.txt");
+        let source = "old notes\n";
+        fs::write(&target, source)?;
+        let mut permissions = fs::metadata(&target)?.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&target, permissions)?;
+        fs::create_dir(directory.path().join("blocked.rs"))?;
+        let reads = reads_over(directory.path(), &SourceVisibility::default())?;
+        let rewrites = vec![
+            FileRewrite::modify(
+                path("notes.txt"),
+                source,
+                "new notes\n".to_owned(),
+                vec![ReplacedRegion {
+                    range: ByteRange { start: 0, end: 3 },
+                    text: "new".to_owned(),
+                }],
+            ),
+            FileRewrite::create(path("blocked.rs"), "pub fn blocked() {}\n".to_owned()),
+        ];
+
+        publish_rewrites(&reads, directory.path(), &rewrites)
+            .expect_err("a directory standing where a file is expected must fail the publish");
+        assert_eq!(fs::read_to_string(&target)?, source);
+        assert!(
+            fs::metadata(&target)?.permissions().readonly(),
+            "rollback must restore captured read-only state with captured bytes"
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_publish_rewrites_removes_an_empty_directory_it_created_on_rollback() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -1163,8 +1316,9 @@ mod tests {
             previous: PreviousState::Absent,
             warning: None,
             staged: None,
+            permissions: None,
         };
-        let error = publish_member(&mut member)
+        let error = publish_member(&mut member, &mut false)
             .expect_err("a non-delete member with no staged file must refuse");
         assert_eq!(error.descriptor().code(), "storage_failure");
         let context = error.context();
@@ -1200,6 +1354,14 @@ mod tests {
         let error = publish_rewrites(&reads, directory.path(), &rewrites)
             .expect_err("a create whose target appeared since the check must fail the publish");
         assert_eq!(error.descriptor().code(), "storage_failure");
+        assert!(
+            directory.path().join("notes.txt").exists(),
+            "the already-published member must remain present"
+        );
+        assert!(
+            directory.path().join("new.rs").exists(),
+            "the colliding create target must remain present"
+        );
         assert_eq!(
             fs::read_to_string(directory.path().join("notes.txt"))?,
             "original notes\n",

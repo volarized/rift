@@ -14,7 +14,7 @@ pub mod constants;
 pub mod line;
 
 pub use capture::{CapturedStream, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX};
-pub use configuration::{EXTENSIONLESS_SNIFF_BYTES_MAX, SourceVisibility, TextFileInclusion};
+pub use configuration::{SourceVisibility, TextFileInclusion};
 pub use error::{
     CliCode, Error, ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, Fault, LimitEvidence,
     RetryDirective, RiftError, fault_label, render_failure,

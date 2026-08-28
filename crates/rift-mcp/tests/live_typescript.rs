@@ -24,7 +24,6 @@ mod typescript_engine;
 mod workspace_client;
 
 use std::fs;
-use std::time::{Duration, Instant};
 
 use live_engine_gate::engine_live;
 use rmcp::model::CallToolRequestParams;
@@ -72,6 +71,43 @@ fn project() -> Vec<(&'static str, &'static str)> {
         ("caller.ts", CALLER),
         ("view.tsx", VIEW),
     ]
+}
+
+#[test]
+fn fixture_runs_installed_language_server_directly() {
+    let fixture = typescript_engine::fixture();
+    assert_eq!(
+        fixture.program,
+        "node_modules/.bin/typescript-language-server"
+    );
+    assert_eq!(fixture.arguments, ["--stdio"]);
+}
+
+#[test]
+fn frozen_fixture_install_runs_in_two_isolated_roots() {
+    if !engine_live() {
+        return;
+    }
+    let first = tempfile::tempdir().expect("first fixture root");
+    let second = tempfile::tempdir().expect("second fixture root");
+    for root in [first.path(), second.path()] {
+        fs::write(root.join("package.json"), PACKAGE).expect("package manifest writes");
+        fs::write(root.join("bun.lock"), LOCKFILE).expect("lockfile writes");
+    }
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| install_typescript_engine(first.path()));
+        scope.spawn(|| install_typescript_engine(second.path()));
+    });
+
+    for root in [first.path(), second.path()] {
+        assert!(
+            root.join("node_modules/.bin/typescript-language-server")
+                .is_file(),
+            "local language server must exist in {}",
+            root.display()
+        );
+    }
 }
 
 /// One fixture tempdir with the pinned `typescript` installed beside the
@@ -136,49 +172,6 @@ fn coded_findings<'summary>(structured: &'summary Value, code: &str) -> Vec<&'su
         })
         .unwrap_or_default()
 }
-
-/// Most warm-up attempts one test makes, and the pause between them: at
-/// most a minute of waiting, then the test fails instead of hanging.
-const WARMUP_ATTEMPTS_MAX: usize = 240;
-const WARMUP_PAUSE: Duration = Duration::from_millis(250);
-
-/// Drives the rename tool until the engine has loaded the bun project.
-///
-/// The probe renames the declaration to the name it already has. Once the
-/// engine resolves it, the proposal edits every occurrence to the bytes
-/// already there, so the compiled plan holds no rewrite and the tool
-/// refuses with `proposed no edits` - the readiness signal, with the tree
-/// untouched either way.
-///
-/// One semantic server answers the rename only once its project is
-/// loaded, so the first attempt normally carries the signal: locally every
-/// run resolved the declaration inside that attempt, about 400ms in. The
-/// loop bounds the wait a cold runner can add. It never proves how far the
-/// proposal reaches - the assertions that follow do.
-///
-/// This engine reports no work-done progress at all, so the server cannot
-/// wait it out the way it waits out rust-analyzer. What it does instead is
-/// send an empty first answer's operation again once, which is enough for
-/// the renames, the patch, and the refusal below: each ran cold ten times,
-/// idle and saturated, without a failure. It is not enough for the move,
-/// which keeps this probe.
-async fn warmed_engine(client: &RunningService<RoleClient, ()>) -> TestResult {
-    let started = Instant::now();
-    for _attempt in 0..WARMUP_ATTEMPTS_MAX {
-        let structured =
-            call_retrying_acceptance(client, rename_request(BEACON_SYMBOL, "beacon")).await?;
-        if refusal_detail(&structured).contains("proposed no edits") {
-            eprintln!(
-                "typescript-language-server resolved the declaration after {:?}",
-                started.elapsed()
-            );
-            return Ok(());
-        }
-        tokio::time::sleep(WARMUP_PAUSE).await;
-    }
-    Err("typescript-language-server never resolved the declaration".into())
-}
-
 /// The engine resolves every reference itself, across both dialects: the
 /// plain importer and the tsx component are rewritten from the same
 /// proposal, without either file being opened, and the word-boundary sweep
@@ -308,20 +301,12 @@ async fn applied_rename_of_the_component_routes_the_tsx_dialect() -> TestResult 
 /// in both dialects: this engine's filters claim `ts` and `tsx` alike, and
 /// a module here is a path, so the moved file needs no declaration
 /// rewritten anywhere.
-///
-/// This is the one test here that still warms the engine. Run cold it
-/// failed all ten runs, idle and saturated alike, and it failed honestly:
-/// the server asked twice, the engine proposed nothing both times, and the
-/// move applied carrying `rift.move.references_not_updated`. The resend
-/// makes the gap visible; only a loaded engine closes it.
 #[tokio::test]
 async fn applied_move_rewrites_the_import_specifiers() -> TestResult {
     if !engine_live() {
         return Ok(());
     }
     let (directory, client, server_task) = served_project().await?;
-    warmed_engine(&client).await?;
-
     let structured = call_retrying_acceptance(
         &client,
         tool_request("move_file", &json!({ "from": "hub.ts", "to": "spoke.ts" })),
