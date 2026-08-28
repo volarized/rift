@@ -5,40 +5,25 @@ use std::path::Path;
 
 use crate::engine_fixture::EngineFixture;
 
-/// The engine program the live rust fixtures name in `program`.
-///
-/// The name resolves through `PATH`, where rustup's proxy answers it.
+/// Rustup program that selects the pinned engine toolchain.
+pub(crate) const RUSTUP_PROGRAM: &str = "rustup";
+/// Rust toolchain carrying the live fixture engine.
+pub(crate) const RUST_ANALYZER_TOOLCHAIN: &str = "1.98";
+/// Engine command rustup runs inside the pinned toolchain.
 pub(crate) const RUST_ANALYZER_PROGRAM: &str = "rust-analyzer";
+/// Arguments that select rust-analyzer 1.98 without a directory override.
+pub(crate) const RUST_ANALYZER_ARGUMENTS: [&str; 3] =
+    ["run", RUST_ANALYZER_TOOLCHAIN, RUST_ANALYZER_PROGRAM];
 
-/// The variable rustup reads before it resolves a toolchain by directory.
-pub(crate) const TOOLCHAIN_VARIABLE: &str = "RUSTUP_TOOLCHAIN";
-
-/// The environment every live rust fixture lays over the inherited one.
+/// Fails the test unless rust-analyzer 1.98 answers `--version` from the
+/// fixture tree.
 ///
-/// This repository's `rust-toolchain.toml` pins a channel whose installed
-/// component set has no `rust-analyzer`, and cargo hands every child it
-/// starts - the test binary included - that pinned channel in
-/// [`TOOLCHAIN_VARIABLE`]. An engine child inheriting it resolves the
-/// pinned channel and fails with `Unknown binary 'rust-analyzer' in
-/// official toolchain`. Cleared to the empty value, rustup ignores the
-/// variable and resolves by the child's working directory instead; every
-/// live fixture is a tempdir outside the repository, so the proxy answers
-/// with the default toolchain's component.
-pub(crate) fn rust_analyzer_environment() -> BTreeMap<String, String> {
-    BTreeMap::from([(TOOLCHAIN_VARIABLE.to_owned(), String::new())])
-}
-
-/// Fails the test unless `rust-analyzer` answers `--version` from the
-/// fixture tree under the fixture's own environment.
-///
-/// Probing from the fixture tree, and not from the repository root, asks
-/// the question the engine child asks. A default toolchain without the
-/// component fails here with the command's own words instead of failing
-/// later as an engine that would not start.
+/// The probe invokes the same explicit rustup toolchain as the engine
+/// child. A missing component fails here with the command's own words.
 pub(crate) fn require_rust_analyzer(fixture_root: &Path) {
-    let probe = std::process::Command::new(RUST_ANALYZER_PROGRAM)
+    let probe = std::process::Command::new(RUSTUP_PROGRAM)
+        .args(RUST_ANALYZER_ARGUMENTS)
         .arg("--version")
-        .envs(rust_analyzer_environment())
         .current_dir(fixture_root)
         .output();
     match probe {
@@ -49,28 +34,28 @@ pub(crate) fn require_rust_analyzer(fixture_root: &Path) {
             );
         }
         Ok(output) => panic!(
-            "`rust-analyzer --version` failed in {}: install the component on the default \
-             toolchain with `rustup component add rust-analyzer` outside this repository. {}",
+            "`rustup run 1.98 rust-analyzer --version` failed in {}: install it with \
+             `rustup toolchain install 1.98 --profile minimal --component rust-analyzer`. {}",
             fixture_root.display(),
             String::from_utf8_lossy(&output.stderr).trim(),
         ),
         Err(error) => panic!(
-            "`rust-analyzer` is not on PATH for {}: install the component on the default \
-             toolchain with `rustup component add rust-analyzer` outside this repository. \
-             {error}",
+            "`rustup` is not on PATH for {}: install rustup and then run \
+             `rustup toolchain install 1.98 --profile minimal --component rust-analyzer`. {error}",
             fixture_root.display(),
         ),
     }
 }
 
-/// The fixture data the shared harness turns into a launch: rust-analyzer,
-/// resolved through `PATH`, with the toolchain override that lets it start
-/// outside this repository's own pinned channel.
+/// The fixture data the shared harness turns into a rust-analyzer 1.98 launch.
 pub(crate) fn fixture() -> EngineFixture {
     EngineFixture {
-        program: RUST_ANALYZER_PROGRAM,
-        arguments: Vec::new(),
-        environment: rust_analyzer_environment(),
+        program: RUSTUP_PROGRAM,
+        arguments: RUST_ANALYZER_ARGUMENTS
+            .iter()
+            .map(|argument| (*argument).to_owned())
+            .collect(),
+        environment: BTreeMap::new(),
         initialization_options: None,
     }
 }

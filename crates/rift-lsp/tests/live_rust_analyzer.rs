@@ -2,9 +2,8 @@
 //!
 //! `RIFT_ENGINE_LIVE=1 cargo test -p rift-lsp --test live_rust_analyzer`
 //! runs the suite; without the variable every test skips visibly. The
-//! engine is spawned as `rust-analyzer`, resolved through the inherited
-//! `PATH` where rustup's proxy answers it, so the spawn policy, the
-//! framing, and the utf-8 negotiation are proven against a second real
+//! engine is spawned through `rustup run 1.98 rust-analyzer`, so the spawn
+//! policy, framing, and utf-8 negotiation are proven against a second real
 //! engine beside the scripted one. Every asserted shape was observed on a
 //! live rust-analyzer answer first, then pinned.
 //!

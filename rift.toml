@@ -10,7 +10,8 @@ exclude = [".claude/**", ".agents/**", "docs/public/**"]
 respect_gitignore = true
 
 [engines.rust]
-program = "rust-analyzer"
+program = "rustup"
+arguments = ["run", "1.98", "rust-analyzer"]
 languages = ["rust"]
 
 [engines.toml]

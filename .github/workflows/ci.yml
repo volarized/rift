@@ -95,9 +95,9 @@ jobs:
         with:
           persist-credentials: false
 
-      # No toolchain action on purpose: rust-toolchain.toml already pins
-      # 1.97 + rustfmt + clippy, and rustup on the runner honours it. One
-      # source of truth; a setup action here would silently override it.
+      # rust-toolchain.toml and this live-engine install select the same
+      # compiler release. Keep rustfmt, clippy, and rust-analyzer available
+      # from that release.
       - uses: Swatinem/rust-cache@v2.9.2
 
       - uses: astral-sh/setup-uv@v7.6.0
@@ -105,13 +105,11 @@ jobs:
         with:
           tool: just,cargo-audit,cargo-deny,cargo-llvm-cov
 
-      # `just test` runs the live-engine suites, so the engines are gate
-      # dependencies. The component lands on the default toolchain, the one
-      # an engine child resolves: the fixtures run outside this repository,
-      # where rust-toolchain.toml no longer applies, so the step runs
-      # outside it too. Adding an installed component again is a no-op.
-      - run: rustup component add rust-analyzer
-        working-directory: ${{ runner.temp }}
+      # `rustup help toolchain install` documents a comma-separated component
+      # list. Install every CI component from the pinned release in one step.
+      - run: >-
+          rustup toolchain install 1.98 --profile minimal
+          --component rust-analyzer,rustfmt,clippy
 
       - uses: oven-sh/setup-bun@v2.2.0
         with:
