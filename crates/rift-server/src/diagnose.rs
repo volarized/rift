@@ -620,15 +620,19 @@ mod tests {
         let references = framed(
             r#"{"jsonrpc":"2.0","id":1,"result":[{"uri":"file:///new.rs","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}]}"#,
         );
-        let retry =
-            framed(r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32802,"message":"retry pull"}}"#);
+        let progress_begin = framed(
+            r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"other","value":{"kind":"begin","title":"loading"}}}"#,
+        );
+        let progress_end = framed(
+            r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"other","value":{"kind":"end"}}}"#,
+        );
+        let empty = framed(r#"{"jsonrpc":"2.0","id":2,"result":{"kind":"full","items":[]}}"#);
         let pull = framed(
             r#"{"jsonrpc":"2.0","id":3,"result":{"kind":"full","items":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"message":"engine finding"}]}}"#,
         );
-        let pull_again = pull.replacen("\"id\":3", "\"id\":4", 1);
-        let shutdown = framed(r#"{"jsonrpc":"2.0","id":5,"result":null}"#);
+        let shutdown = framed(r#"{"jsonrpc":"2.0","id":4,"result":null}"#);
         let script = format!(
-            "printf '%s' '{capabilities}{register}{references}{retry}{pull}{pull_again}{shutdown}' & exec cat > \"$1\""
+            "printf '%s' '{capabilities}{register}{references}{progress_begin}{progress_end}{empty}{pull}{shutdown}' & exec cat > \"$1\""
         );
         let engine = rift_protocol::configuration::EngineConfiguration {
             program: "sh".to_owned(),
@@ -697,6 +701,11 @@ mod tests {
         assert!(transcript.contains("old.rs"), "{transcript}");
         assert!(transcript.contains(r#""type":1"#), "{transcript}");
         assert!(transcript.contains(r#""type":3"#), "{transcript}");
+        assert_eq!(
+            transcript.matches("textDocument/diagnostic").count(),
+            2,
+            "an empty report after unrelated progress remains retryable: {transcript}"
+        );
         assert_eq!(
             transcript
                 .matches("workspace/didChangeWatchedFiles")
