@@ -14,10 +14,11 @@ pub(crate) const RIFT_IDENTITY_META_KEY: &str = "sh.volar/rift";
 
 /// Maximum bytes hashed from current executable.
 ///
-/// Release builds keep release binary bound. Debug builds allow symbols
-/// carried by test executables while remaining explicitly bounded.
+/// Release builds keep release binary bound. Debug and coverage builds may
+/// embed debug data in the executable, so they keep a separate explicit bound.
+const DEBUG_EXECUTABLE_BYTES_MAX: u64 = RELEASE_BINARY_BYTES_MAX * 16;
 const CURRENT_EXECUTABLE_BYTES_MAX: u64 = if cfg!(debug_assertions) {
-    RELEASE_BINARY_BYTES_MAX * 2
+    DEBUG_EXECUTABLE_BYTES_MAX
 } else {
     RELEASE_BINARY_BYTES_MAX
 };
