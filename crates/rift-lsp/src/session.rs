@@ -327,10 +327,9 @@ pub type EngineError = Error<EngineFault>;
 
 /// What the engine has said about its own work over `$/progress`.
 ///
-/// Two facts ride here, and the second outlives the first: which tokens
-/// are outstanding right now, and whether the engine has ever announced
-/// any work at all. An engine that began one token and ended it has
-/// announced work with nothing outstanding.
+/// Two facts ride here: which tokens are outstanding right now, and whether
+/// engine work completed since workspace bytes last changed. Changed bytes
+/// invalidate earlier readiness without discarding outstanding tokens.
 /// What one engine has proven about its own settlement, read from its
 /// `$/progress` traffic alone and independent of what language it serves.
 ///
@@ -338,13 +337,13 @@ pub type EngineError = Error<EngineFault>;
 /// progress token the engine announced must also have ended before an
 /// answer is trusted as settled. Announcing work alone never confirms
 /// readiness - it names [`EngineReadiness::Analyzing`], not
-/// [`EngineReadiness::Ready`] - and an engine that never announces any
-/// progress at all never reaches either: it stays
+/// [`EngineReadiness::Ready`] - and an engine that announces no work after
+/// latest changed bytes reaches neither: it stays
 /// [`EngineReadiness::Unconfirmed`], a state rather than a failure, because
 /// nothing distinguishes it from one still loading.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EngineReadiness {
-    /// The engine has never announced any work of its own. Its answers may
+    /// The engine has announced no work since latest invalidation. Its answers may
     /// be the answers of a settled engine, or of one that has not started
     /// analyzing yet; nothing here tells the two apart.
     Unconfirmed,
@@ -417,7 +416,19 @@ impl WorkProgress {
 
     /// Retires one token the engine ended.
     fn ended(&mut self, token: &ProgressToken) {
+        let held = self.outstanding.len();
         self.outstanding.retain(|held| held != token);
+        if self.outstanding.len() < held {
+            self.announced = true;
+        }
+    }
+
+    /// Invalidates settlement after workspace bytes change.
+    ///
+    /// Outstanding work remains outstanding. With no outstanding token,
+    /// next answer needs fresh progress or repeated report evidence.
+    fn invalidated(&mut self) {
+        self.announced = false;
     }
 
     /// Whether any announced work is still outstanding.
@@ -425,7 +436,7 @@ impl WorkProgress {
         !self.outstanding.is_empty()
     }
 
-    /// Whether the engine has ever announced work.
+    /// Whether engine work has been announced since latest invalidation.
     fn is_announced(&self) -> bool {
         self.announced
     }
@@ -433,10 +444,10 @@ impl WorkProgress {
     /// The readiness this record proves, from the announcement and
     /// outstanding-token facts alone.
     fn readiness(&self) -> EngineReadiness {
-        if !self.is_announced() {
-            EngineReadiness::Unconfirmed
-        } else if self.is_outstanding() {
+        if self.is_outstanding() {
             EngineReadiness::Analyzing
+        } else if !self.is_announced() {
+            EngineReadiness::Unconfirmed
         } else {
             EngineReadiness::Ready
         }
@@ -1011,6 +1022,9 @@ impl EngineSession {
         &mut self,
         paths: &[(ProjectPath, FileChangeType)],
     ) -> Result<Vec<ProjectPath>, EngineError> {
+        if !paths.is_empty() {
+            self.progress.invalidated();
+        }
         let matched: Vec<(ProjectPath, FileChangeType)> = paths
             .iter()
             .filter(|(path, change)| self.matches_watched_file(path, *change))
@@ -1911,6 +1925,21 @@ mod tests {
         assert!(
             record.is_announced(),
             "the announcement outlives the work it announced"
+        );
+        record.invalidated();
+        assert_eq!(record.readiness(), EngineReadiness::Unconfirmed);
+        record.began(token(1));
+        record.invalidated();
+        assert_eq!(
+            record.readiness(),
+            EngineReadiness::Analyzing,
+            "invalidation retains outstanding work"
+        );
+        record.ended(&token(1));
+        assert_eq!(
+            record.readiness(),
+            EngineReadiness::Ready,
+            "ending retained work proves readiness after invalidation"
         );
         for index in 0..PROGRESS_TOKENS_MAX {
             record.began(token(index));

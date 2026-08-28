@@ -29,7 +29,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use exchange::{ScriptedEngine, full_capabilities, zero_range};
-use lsp_types::Position;
+use lsp_types::{FileChangeType, Position};
 use rift_core::{ErrorCode, ErrorName, ProjectPath};
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::framing::FramingFault;
@@ -1171,6 +1171,16 @@ async fn readiness_moves_from_unconfirmed_through_analyzing_to_ready() {
         session.readiness(),
         EngineReadiness::Ready,
         "the end this exchange read retires the only outstanding token"
+    );
+
+    session
+        .notify_changed_paths(&[(document.clone(), FileChangeType::CHANGED)])
+        .await
+        .expect("an unregistered path needs no notification");
+    assert_eq!(
+        session.readiness(),
+        EngineReadiness::Unconfirmed,
+        "changed workspace bytes invalidate earlier readiness"
     );
 
     session.shutdown().await;
