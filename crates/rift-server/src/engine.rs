@@ -43,6 +43,16 @@ use tokio::time::Instant;
 
 use rift_lsp::session::EngineReadiness;
 
+type SessionFuture<'session, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'session>>;
+
+fn begin_immediately(_session: &mut EngineSession) -> SessionFuture<'_, Result<(), EngineError>> {
+    Box::pin(async { Ok(()) })
+}
+
+fn finish_immediately(_session: &mut EngineSession) -> SessionFuture<'_, ()> {
+    Box::pin(async {})
+}
+
 /// The language engines one workspace serves, spawned lazily and reused.
 ///
 /// Dropping the pool without [`EnginePool::shutdown`] still kills every
@@ -284,19 +294,30 @@ impl EngineSlot {
             Box<dyn Future<Output = Result<T, EngineError>> + Send + 'session>,
         >,
     ) -> Result<T, EngineError> {
-        self.request_deciding(operation, |session, answer, _final_attempt| {
-            if session.is_analyzing() {
-                Answer::Retry(Transient::Analyzing)
-            } else if session.empty_answer_is_unconfirmed() {
-                Answer::Retry(Transient::AnsweredNothing(answer))
-            } else {
-                Answer::Ready(answer)
-            }
-        })
+        self.request_deciding(
+            begin_immediately,
+            operation,
+            finish_immediately,
+            |session, _session_generation, answer, _final_attempt| {
+                if session.is_analyzing() {
+                    Answer::Retry(Transient::Analyzing)
+                } else if session.empty_answer_is_unconfirmed() {
+                    Answer::Retry(Transient::AnsweredNothing(answer))
+                } else {
+                    Answer::Ready(answer)
+                }
+            },
+        )
         .await
     }
 
-    /// Runs one operation until progress ends or two equal full answers arrive.
+    /// Runs one document exchange until progress ends or two equal full
+    /// answers arrive.
+    ///
+    /// `begin` runs once on each live session before the first operation.
+    /// Retries repeat only `operation`. `finish` runs once before a live
+    /// session returns or exhausts its retry table. A replacement session
+    /// receives its own begin call.
     ///
     /// # Errors
     ///
@@ -304,46 +325,60 @@ impl EngineSlot {
     /// failure, or ended session.
     pub async fn request_settled<T: PartialEq>(
         &self,
+        begin: impl for<'session> FnMut(
+            &'session mut EngineSession,
+        ) -> SessionFuture<'session, Result<(), EngineError>>,
         operation: impl for<'session> FnMut(
             &'session mut EngineSession,
-        ) -> std::pin::Pin<
-            Box<dyn Future<Output = Result<T, EngineError>> + Send + 'session>,
-        >,
+        ) -> SessionFuture<'session, Result<T, EngineError>>,
+        finish: impl for<'session> FnMut(&'session mut EngineSession) -> SessionFuture<'session, ()>,
         mut is_full: impl FnMut(&T) -> bool,
     ) -> Result<T, EngineError> {
         let mut previous = None;
-        self.request_deciding(operation, |session, answer, final_attempt| {
-            let repeated = previous.as_ref().is_some_and(|prior| prior == &answer);
-            if diagnostic_settlement(
-                session.readiness(),
-                is_full(&answer),
-                repeated,
-                final_attempt,
-            ) == Settlement::Ready
-            {
-                Answer::Ready(answer)
-            } else {
-                previous = Some(answer);
-                Answer::Retry(Transient::Unready)
-            }
-        })
+        self.request_deciding(
+            begin,
+            operation,
+            finish,
+            |session, session_generation, answer, final_attempt| {
+                let repeated = previous.as_ref().is_some_and(|(prior_generation, prior)| {
+                    *prior_generation == session_generation && prior == &answer
+                });
+                if diagnostic_settlement(
+                    session.readiness(),
+                    is_full(&answer),
+                    repeated,
+                    final_attempt,
+                ) == Settlement::Ready
+                {
+                    Answer::Ready(answer)
+                } else {
+                    previous = Some((session_generation, answer));
+                    Answer::Retry(Transient::Unready)
+                }
+            },
+        )
         .await
     }
 
     /// Shared bounded request loop.
     async fn request_deciding<T>(
         &self,
+        mut begin: impl for<'session> FnMut(
+            &'session mut EngineSession,
+        ) -> SessionFuture<'session, Result<(), EngineError>>,
         mut operation: impl for<'session> FnMut(
             &'session mut EngineSession,
-        ) -> std::pin::Pin<
-            Box<dyn Future<Output = Result<T, EngineError>> + Send + 'session>,
-        >,
-        mut decide: impl FnMut(&mut EngineSession, T, bool) -> Answer<T>,
+        )
+            -> SessionFuture<'session, Result<T, EngineError>>,
+        mut finish: impl for<'session> FnMut(&'session mut EngineSession) -> SessionFuture<'session, ()>,
+        mut decide: impl FnMut(&mut EngineSession, u64, T, bool) -> Answer<T>,
     ) -> Result<T, EngineError> {
         let retry = self.configuration.retry;
         let mut held = self.state.lock().await;
         let mut attempt: u64 = 1;
         let mut reported: Option<EngineError> = None;
+        let mut exchange_started = false;
+        let mut session_generation = 0_u64;
         loop {
             let state = &mut *held;
             let session = match state.session.take() {
@@ -358,15 +393,32 @@ impl EngineSlot {
                     state.session.insert(started)
                 }
             };
+            if !exchange_started {
+                match begin(session).await {
+                    Ok(()) => {
+                        exchange_started = true;
+                        session_generation = session_generation.saturating_add(1);
+                    }
+                    Err(error) if session.is_ended() => {
+                        reported = Some(error);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             let outcome = operation(session).await;
             let ended = session.is_ended();
             let final_attempt = retry.delay_after(attempt).is_none();
             let absorbed = match outcome {
-                Ok(answer) => match decide(session, answer, final_attempt) {
-                    Answer::Ready(answer) => return Ok(answer),
+                Ok(answer) => match decide(session, session_generation, answer, final_attempt) {
+                    Answer::Ready(answer) => {
+                        finish(session).await;
+                        return Ok(answer);
+                    }
                     Answer::Retry(absorbed) => absorbed,
                 },
                 Err(error) if ended => {
+                    exchange_started = false;
                     reported = Some(error);
                     continue;
                 }
@@ -374,9 +426,13 @@ impl EngineSlot {
                     Transient::Analyzing
                 }
                 Err(error) if error.fault().is_retryable_refusal() => Transient::Refused(error),
-                Err(error) => return Err(error),
+                Err(error) => {
+                    finish(session).await;
+                    return Err(error);
+                }
             };
             let Some(wait) = retry.delay_after(attempt) else {
+                finish(session).await;
                 return self.exhausted(absorbed, retry.attempts);
             };
             tokio::time::sleep(wait).await;

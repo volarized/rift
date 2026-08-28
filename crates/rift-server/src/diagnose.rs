@@ -216,15 +216,27 @@ async fn pulled_diagnostics(
     language: &Language,
     source: &str,
 ) -> Result<(PulledDiagnostics, PositionEncoding, EngineReadiness, u64), EngineError> {
+    let open_path = path.clone();
+    let open_language = language.name.clone();
+    let open_source = source.to_owned();
     let request_path = path.clone();
-    let request_language = language.name.clone();
-    let request_source = source.to_owned();
+    let close_path = path.clone();
     slot.request_settled(
         move |session: &mut EngineSession| {
+            let path = open_path.clone();
+            let language = open_language.clone();
+            let text = open_source.clone();
+            Box::pin(async move { session.open(&path, &language, text).await })
+        },
+        move |session: &mut EngineSession| {
             let path = request_path.clone();
-            let language = request_language.clone();
-            let text = request_source.clone();
-            Box::pin(async move { pull_on_session(session, &path, &language, text).await })
+            Box::pin(async move { pull_on_session(session, &path).await })
+        },
+        move |session: &mut EngineSession| {
+            let path = close_path.clone();
+            Box::pin(async move {
+                let _ = session.close(&path).await;
+            })
         },
         |answer| answer.0.is_full(),
     )
@@ -235,8 +247,6 @@ async fn pulled_diagnostics(
 async fn pull_on_session(
     session: &mut EngineSession,
     path: &CoreProjectPath,
-    language_id: &str,
-    text: String,
 ) -> Result<(PulledDiagnostics, PositionEncoding, EngineReadiness, u64), EngineError> {
     if !session.capabilities().pull_diagnostics {
         return Err(rift_core::Error::new(EngineFault::CapabilityAbsent {
@@ -244,11 +254,9 @@ async fn pull_on_session(
         }));
     }
     let encoding = session.capabilities().position_encoding;
-    session.open(path, language_id, text).await?;
     let pulled = session.pull_diagnostics(path).await;
     let readiness = session.readiness();
     let refresh_revision = session.diagnostic_refresh_revision();
-    let _ = session.close(path).await;
     Ok((pulled?, encoding, readiness, refresh_revision))
 }
 
@@ -698,12 +706,17 @@ mod tests {
         );
         assert_eq!(
             transcript.matches("textDocument/didOpen").count(),
-            3,
+            1,
             "{transcript}"
         );
         assert_eq!(
             transcript.matches("textDocument/diagnostic").count(),
             3,
+            "{transcript}"
+        );
+        assert_eq!(
+            transcript.matches("textDocument/didClose").count(),
+            1,
             "{transcript}"
         );
     }
@@ -745,7 +758,12 @@ mod tests {
     /// what the session sends.
     fn workspace_with_unconfirmed_engine(
         files: &[(&str, &str)],
-    ) -> (tempfile::TempDir, ReadService, EnginePool, std::path::PathBuf) {
+    ) -> (
+        tempfile::TempDir,
+        ReadService,
+        EnginePool,
+        std::path::PathBuf,
+    ) {
         let directory = tempfile::tempdir().expect("fixture directory");
         let transcript = directory.path().join("engine-input.jsonrpc");
         for (name, source) in files {
