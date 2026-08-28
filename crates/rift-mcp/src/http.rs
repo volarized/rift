@@ -913,6 +913,32 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn authorized_request_defers_idle_stop_until_after_completion() {
+        let idle = Arc::new(IdleTracker::new());
+        let stop = CancellationToken::new();
+        let watch = tokio::spawn(watch_idle(
+            Arc::clone(&idle),
+            Duration::from_secs(5),
+            stop.clone(),
+        ));
+        let request = idle.begin();
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(
+            !stop.is_cancelled(),
+            "idle timeout must not stop an authorized request in progress"
+        );
+        drop(request);
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(
+            !stop.is_cancelled(),
+            "idle time starts after the last authorized request completes"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        watch.await.expect("watch task must join");
+        assert!(stop.is_cancelled(), "the later quiet span must stop the server");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn external_cancel_ends_the_idle_watch() {
         let idle = Arc::new(IdleTracker::new());
         let stop = CancellationToken::new();
