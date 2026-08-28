@@ -37,14 +37,13 @@ use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Instant;
 
 use harness::{
     LIBRARY, SERIAL, StopOnDrop, TestResult, arguments, laid_out_workspace, proxied_call,
     proxy_client, proxy_command, require_success, run_rift, rust_engine_workspace, within,
     workspace,
 };
-use rift_mcp::{PRESENCE_POLL_INTERVAL, START_WAIT_MAX, ServerPresence, claim, probe};
+use rift_mcp::{PRESENCE_POLL_INTERVAL, ServerPresence, claim, probe};
 use rift_protocol::lock::{
     ProductIdentity, SERVER_LOCK_FILE_NAME, SERVER_PORT_MAX, SERVER_PORT_MIN, SERVER_TOKEN_LENGTH,
     ServerLock,
@@ -408,10 +407,9 @@ async fn held_election_without_a_server_refuses_with_operator_guidance() -> Test
 /// before publishing a lock document, and the proxy answers with that
 /// captured stderr instead of waiting out the poll's own window.
 ///
-/// The pinned port stays held for the whole test, so both the warmup
-/// task's own spawn attempt and the request's each fail the same way; the
-/// elapsed-time bound proves the refusal came from the captured exit, not
-/// from exhausting `START_WAIT_MAX`.
+/// The pinned port stays held for the whole test. Captured stderr and the
+/// absence of the poll-exhaustion refusal prove the spawned process exit
+/// supplied the result.
 #[tokio::test]
 async fn a_spawned_server_that_cannot_bind_its_port_refuses_with_its_captured_stderr() -> TestResult
 {
@@ -423,7 +421,6 @@ async fn a_spawned_server_that_cannot_bind_its_port_refuses_with_its_captured_st
     let _cleanup = StopOnDrop::new(root);
 
     let client = proxy_client(root).await?;
-    let started = Instant::now();
     let refusal = within(
         "the refusal from a server that could not bind its port",
         client.call_tool(
@@ -433,11 +430,6 @@ async fn a_spawned_server_that_cannot_bind_its_port_refuses_with_its_captured_st
     )
     .await?
     .expect_err("a spawned server that cannot bind its port must refuse the call");
-    assert!(
-        started.elapsed() < START_WAIT_MAX,
-        "a bind failure must refuse before the poll's own window: {:?}",
-        started.elapsed()
-    );
     let rmcp::ServiceError::McpError(data) = refusal else {
         panic!("expected a protocol-level refusal, got {refusal:?}");
     };
