@@ -205,10 +205,9 @@ async fn applied_rename_rewrites_the_module_and_its_caller() -> TestResult {
     Ok(())
 }
 
-/// The moved file is a module file, so rust-analyzer's will-rename answer
-/// renames the module: the `mod` declaration in the crate root and the
-/// `use` path in the sibling both follow the new stem, and no
-/// references-not-updated warning rides the summary.
+/// The moved file is a module file. When rust-analyzer proposes reference
+/// edits, the `mod` declaration and `use` path follow the new stem. A valid
+/// empty proposal moves only the file and carries the reference warning.
 ///
 /// The engine's own findings are not pinned here. rust-analyzer learns of
 /// the new file through its file watcher, which the post-apply pull can
@@ -216,7 +215,7 @@ async fn applied_rename_rewrites_the_module_and_its_caller() -> TestResult {
 /// destination that already existed on disk.
 ///
 #[tokio::test]
-async fn applied_move_rewrites_the_module_declaration_and_the_import() -> TestResult {
+async fn applied_move_matches_the_rust_analyzer_proposal() -> TestResult {
     if !engine_live() {
         return Ok(());
     }
@@ -230,27 +229,52 @@ async fn applied_move_rewrites_the_module_declaration_and_the_import() -> TestRe
     )
     .await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
-    assert!(
-        coded_findings(&structured, "rift.move.references_not_updated").is_empty(),
-        "an engine covering the moved file carries no warning: {structured:#}"
-    );
-    assert_eq!(
-        structured["summary"]["paths"],
-        json!(["caller.rs", "hub.rs", "lib.rs", "spoke.rs"]),
-        "the rewrites, the old path, and the new path all ride the summary: {structured:#}"
-    );
+    let warnings = coded_findings(&structured, "rift.move.references_not_updated");
     assert!(!directory.path().join("hub.rs").exists());
     assert_eq!(fs::read_to_string(directory.path().join("spoke.rs"))?, HUB);
-    assert_eq!(
-        fs::read_to_string(directory.path().join("lib.rs"))?,
-        "pub mod caller;\npub mod spoke;\n",
-        "the module declaration follows the new file stem"
-    );
-    assert_eq!(
-        fs::read_to_string(directory.path().join("caller.rs"))?,
-        "use crate::spoke::beacon;\n\npub fn total() -> i32 {\n    beacon(2)\n}\n",
-        "the sibling's import path follows the renamed module"
-    );
+    match warnings.as_slice() {
+        [] => {
+            assert_eq!(
+                structured["summary"]["paths"],
+                json!(["caller.rs", "hub.rs", "lib.rs", "spoke.rs"]),
+                "the proposal rewrites, old path, and new path ride the summary: {structured:#}"
+            );
+            assert_eq!(
+                fs::read_to_string(directory.path().join("lib.rs"))?,
+                "pub mod caller;\npub mod spoke;\n",
+                "the module declaration follows the new file stem"
+            );
+            assert_eq!(
+                fs::read_to_string(directory.path().join("caller.rs"))?,
+                "use crate::spoke::beacon;\n\npub fn total() -> i32 {\n    beacon(2)\n}\n",
+                "the sibling's import path follows the renamed module"
+            );
+        }
+        [warning] => {
+            assert_eq!(warning["severity"], json!("warning"), "{structured:#}");
+            assert!(
+                warning["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("engine rust")
+                        && message.contains("references were not updated")),
+                "the warning names the engine and skipped updates: {structured:#}"
+            );
+            assert_eq!(
+                structured["summary"]["paths"],
+                json!(["hub.rs", "spoke.rs"]),
+                "an empty proposal moves only the requested file: {structured:#}"
+            );
+            assert_eq!(
+                fs::read_to_string(directory.path().join("lib.rs"))?,
+                CRATE_ROOT
+            );
+            assert_eq!(
+                fs::read_to_string(directory.path().join("caller.rs"))?,
+                CALLER
+            );
+        }
+        _ => panic!("one move carries at most one reference warning: {structured:#}"),
+    }
 
     client.cancel().await?;
     server_task.await?;

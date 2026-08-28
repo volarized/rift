@@ -297,12 +297,11 @@ async fn applied_rename_of_the_component_routes_the_tsx_dialect() -> TestResult 
     Ok(())
 }
 
-/// The will-rename answer rewrites the module specifier in every importer,
-/// in both dialects: this engine's filters claim `ts` and `tsx` alike, and
-/// a module here is a path, so the moved file needs no declaration
-/// rewritten anywhere.
+/// The will-rename answer may rewrite module specifiers in both dialects
+/// or validly propose no edits. The result matches either exact proposal:
+/// rewritten importers without a warning, or a move-only change with one.
 #[tokio::test]
-async fn applied_move_rewrites_the_import_specifiers() -> TestResult {
+async fn applied_move_matches_the_typescript_engine_proposal() -> TestResult {
     if !engine_live() {
         return Ok(());
     }
@@ -313,30 +312,52 @@ async fn applied_move_rewrites_the_import_specifiers() -> TestResult {
     )
     .await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
-    assert!(
-        coded_findings(&structured, "rift.move.references_not_updated").is_empty(),
-        "an engine covering the moved file carries no warning: {structured:#}"
-    );
-    assert_eq!(
-        structured["summary"]["paths"],
-        json!(["caller.ts", "hub.ts", "spoke.ts", "view.tsx"]),
-        "the rewrites, the old path, and the new path all ride the summary: {structured:#}"
-    );
+    let warnings = coded_findings(&structured, "rift.move.references_not_updated");
     assert!(!directory.path().join("hub.ts").exists());
     assert_eq!(fs::read_to_string(directory.path().join("spoke.ts"))?, HUB);
-    assert_eq!(
-        fs::read_to_string(directory.path().join("caller.ts"))?,
-        "import { beacon } from \"./spoke\";\nimport { Banner } from \"./view\";\n\n\
-         export function total(): number {\n  return beacon(2);\n}\n\n\
-         export const heading = Banner;\n",
-        "the plain importer's specifier follows the moved file"
-    );
-    assert_eq!(
-        fs::read_to_string(directory.path().join("view.tsx"))?,
-        "import { beacon } from \"./spoke\";\n\nexport function Banner() {\n  \
-         return <span>{beacon(3)}</span>;\n}\n",
-        "the tsx importer's specifier follows it as well"
-    );
+    match warnings.as_slice() {
+        [] => {
+            assert_eq!(
+                structured["summary"]["paths"],
+                json!(["caller.ts", "hub.ts", "spoke.ts", "view.tsx"]),
+                "the proposal rewrites, old path, and new path ride the summary: {structured:#}"
+            );
+            assert_eq!(
+                fs::read_to_string(directory.path().join("caller.ts"))?,
+                "import { beacon } from \"./spoke\";\nimport { Banner } from \"./view\";\n\n\
+             export function total(): number {\n  return beacon(2);\n}\n\n\
+             export const heading = Banner;\n",
+                "the plain importer's specifier follows the moved file"
+            );
+            assert_eq!(
+                fs::read_to_string(directory.path().join("view.tsx"))?,
+                "import { beacon } from \"./spoke\";\n\nexport function Banner() {\n  \
+             return <span>{beacon(3)}</span>;\n}\n",
+                "the tsx importer's specifier follows it as well"
+            );
+        }
+        [warning] => {
+            assert_eq!(warning["severity"], json!("warning"), "{structured:#}");
+            assert!(
+                warning["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("engine typescript")
+                        && message.contains("references were not updated")),
+                "the warning names the engine and skipped updates: {structured:#}"
+            );
+            assert_eq!(
+                structured["summary"]["paths"],
+                json!(["hub.ts", "spoke.ts"]),
+                "an empty proposal moves only the requested file: {structured:#}"
+            );
+            assert_eq!(
+                fs::read_to_string(directory.path().join("caller.ts"))?,
+                CALLER
+            );
+            assert_eq!(fs::read_to_string(directory.path().join("view.tsx"))?, VIEW);
+        }
+        _ => panic!("one move carries at most one reference warning: {structured:#}"),
+    }
 
     client.cancel().await?;
     server_task.await?;

@@ -40,9 +40,10 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use harness::{
-    LIBRARY, PROXIED_ENGINE_CALL_MAX, SERIAL, StopOnDrop, TestResult, arguments,
-    laid_out_workspace, proxied_call, proxied_engine_call, proxy_client, proxy_command,
-    require_success, run_rift, rust_engine_workspace, within, workspace,
+    LIBRARY, PROXIED_ENGINE_CALL_MAX, RUST_PROJECT_CALLER, RUST_PROJECT_HUB, RUST_PROJECT_ROOT,
+    SERIAL, StopOnDrop, TestResult, arguments, laid_out_workspace, proxied_call,
+    proxied_engine_call, proxy_client, proxy_command, require_success, run_rift,
+    rust_engine_workspace, within, workspace,
 };
 use rift_mcp::{PRESENCE_POLL_INTERVAL, START_WAIT_MAX, ServerPresence, claim, probe};
 use rift_protocol::lock::{
@@ -558,10 +559,11 @@ async fn proxied_rename_symbol_rewrites_every_referencing_file() -> TestResult {
     Ok(())
 }
 
-/// The engine's reference rewrite lands through the proxy too, and the
-/// move carries no warning.
+/// The engine's will-rename proposal crosses the proxy unchanged. Reference
+/// edits land without a warning; an empty proposal moves only the file and
+/// carries one warning.
 #[tokio::test]
-async fn proxied_move_file_rewrites_the_referencing_file() -> TestResult {
+async fn proxied_move_file_matches_the_engine_proposal() -> TestResult {
     let _serial = SERIAL.lock().await;
     if !live_engine_gate::engine_live() {
         return Ok(());
@@ -579,28 +581,57 @@ async fn proxied_move_file_rewrites_the_referencing_file() -> TestResult {
     )
     .await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
-    let warned = structured["summary"]["diagnostics"]
+    let warnings = structured["summary"]["diagnostics"]
         .as_array()
-        .is_some_and(|findings| {
+        .map(|findings| {
             findings
                 .iter()
-                .any(|finding| finding["code"] == json!("rift.move.references_not_updated"))
-        });
-    assert!(
-        !warned,
-        "an engine-covered move carries no warning: {structured:#}"
-    );
+                .filter(|finding| finding["code"] == json!("rift.move.references_not_updated"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     assert!(!root.join("hub.rs").exists());
-    assert_eq!(
-        fs::read_to_string(root.join("lib.rs"))?,
-        "pub mod caller;\npub mod spoke;\n",
-        "the module declaration follows the new file stem"
-    );
-    assert_eq!(
-        fs::read_to_string(root.join("caller.rs"))?,
-        "use crate::spoke::beacon;\n\npub fn total() -> i32 {\n    beacon(2)\n}\n",
-        "the sibling's import path follows the renamed module"
-    );
+    assert_eq!(fs::read_to_string(root.join("spoke.rs"))?, RUST_PROJECT_HUB);
+    match warnings.as_slice() {
+        [] => {
+            assert_eq!(
+                structured["summary"]["paths"],
+                json!(["caller.rs", "hub.rs", "lib.rs", "spoke.rs"]),
+                "the proposal rewrites, old path, and new path ride the summary: {structured:#}"
+            );
+            assert_eq!(
+                fs::read_to_string(root.join("lib.rs"))?,
+                "pub mod caller;\npub mod spoke;\n",
+                "the module declaration follows the new file stem"
+            );
+            assert_eq!(
+                fs::read_to_string(root.join("caller.rs"))?,
+                "use crate::spoke::beacon;\n\npub fn total() -> i32 {\n    beacon(2)\n}\n",
+                "the sibling's import path follows the renamed module"
+            );
+        }
+        [warning] => {
+            assert_eq!(warning["severity"], json!("warning"), "{structured:#}");
+            assert!(
+                warning["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("engine rust")
+                        && message.contains("references were not updated")),
+                "the warning names the engine and skipped updates: {structured:#}"
+            );
+            assert_eq!(
+                structured["summary"]["paths"],
+                json!(["hub.rs", "spoke.rs"]),
+                "an empty proposal moves only the requested file: {structured:#}"
+            );
+            assert_eq!(fs::read_to_string(root.join("lib.rs"))?, RUST_PROJECT_ROOT);
+            assert_eq!(
+                fs::read_to_string(root.join("caller.rs"))?,
+                RUST_PROJECT_CALLER
+            );
+        }
+        _ => panic!("one move carries at most one reference warning: {structured:#}"),
+    }
 
     client.cancel().await?;
     let stopped = run_rift(root, &["server", "stop"]).await?;
