@@ -446,48 +446,53 @@ async fn engine_exchange(
     indexed_source: &str,
     positions: &NamePositions,
 ) -> Result<(Vec<Location>, EngineReadiness), EngineError> {
-    // The boxed future may only borrow the session, so each attempt gets its own owned copy
-    // of the request data.
+    let open_path = path.clone();
+    let open_language = language.name.clone();
+    let open_source = indexed_source.to_owned();
     let request_path = path.clone();
-    let request_language = language.clone();
-    let request_source = indexed_source.to_owned();
     let request_positions = *positions;
-    slot.request(move |session: &mut EngineSession| {
-        let path = request_path.clone();
-        let language = request_language.clone();
-        let source = request_source.clone();
-        Box::pin(async move {
-            exchange_on_session(session, &path, &language, &source, &request_positions).await
-        })
-    })
+    let close_path = path.clone();
+    slot.request_exchange(
+        move |session: &mut EngineSession| {
+            let path = open_path.clone();
+            let language = open_language.clone();
+            let source = open_source.clone();
+            Box::pin(async move { session.open(&path, &language, source).await })
+        },
+        move |session: &mut EngineSession| {
+            let path = request_path.clone();
+            Box::pin(async move { references_on_session(session, &path, &request_positions).await })
+        },
+        move |session: &mut EngineSession| {
+            let path = close_path.clone();
+            Box::pin(async move {
+                let _ = session.close(&path).await;
+            })
+        },
+    )
     .await
 }
 
-/// One open-references-close conversation on a running session.
+/// One references request on an open document.
 ///
 /// The engine's readiness is read right after `references` answers: whatever the answer
 /// says, this is what the engine had proven about itself when it said it.
-async fn exchange_on_session(
+async fn references_on_session(
     session: &mut EngineSession,
     path: &CoreProjectPath,
-    language: &Language,
-    indexed_source: &str,
     positions: &NamePositions,
 ) -> Result<(Vec<Location>, EngineReadiness), EngineError> {
-    session
-        .open(path, &language.name, indexed_source.to_owned())
-        .await?;
     let position = positions.negotiated(session.capabilities().position_encoding);
     let locations = session.references(path, position).await?;
     let readiness = session.readiness();
-    session.close(path).await?;
     Ok((locations, readiness))
 }
 
 /// The engine's answered locations, resolved to a checked-clean, checked-found, or
-/// unconfirmed verdict. An empty answer only reads as clean when `readiness` proves the
-/// engine has confirmed it is ready or is still analyzing; an engine that has never
-/// announced any work at all gets [`ReferenceCheck::Unconfirmed`] instead.
+/// unconfirmed verdict. The slot first spends its bounded retry schedule. Its final empty
+/// answer reads as clean only when `readiness` proves the engine has confirmed it is ready
+/// or is still analyzing; an engine that has never announced any work at all gets
+/// [`ReferenceCheck::Unconfirmed`] instead.
 fn reference_check_from_locations(
     tree_root: &TreeRoot,
     locations: &[Location],

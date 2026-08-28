@@ -457,6 +457,10 @@ impl WorkProgress {
 /// One request whose empty answer says nothing a real answer would not.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum EmptyAnswer {
+    /// textDocument/prepareRename reported no range.
+    PrepareRename,
+    /// textDocument/rename proposed no edit.
+    Rename,
     /// workspace/willRenameFiles proposed no edit.
     WillRenameFiles,
     /// textDocument/references reported no location.
@@ -749,17 +753,13 @@ impl EngineSession {
         self.diagnostic_refresh_revision
     }
 
-    /// Whether latest operation answered nothing before engine announced
-    /// any work.
+    /// Whether latest operation answered nothing.
     ///
-    /// Answers `true` only when the engine has never announced work, the
-    /// request just served answered nothing. Caller retry policy bounds
-    /// resends. Once engine announces work, empty answers are its own.
+    /// Caller retry policy bounds resends. Progress describes engine work,
+    /// but does not bind that work to one semantic request, so it cannot
+    /// make an empty answer final.
     #[must_use]
-    pub fn empty_answer_is_unconfirmed(&self) -> bool {
-        if self.progress.is_announced() {
-            return false;
-        }
+    pub fn latest_answer_is_empty(&self) -> bool {
         self.empty_answers.is_empty()
     }
 
@@ -840,6 +840,8 @@ impl EngineSession {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
         let edit = self.request::<Rename>(params).await?;
+        self.empty_answers
+            .record(EmptyAnswer::Rename, proposes_no_edit(edit.as_ref()));
         Ok(edit.unwrap_or_default())
     }
 
@@ -864,7 +866,10 @@ impl EngineSession {
             PrepareRenameRequest::METHOD,
         )?;
         let params = self.position_params(path, position)?;
-        self.request::<PrepareRenameRequest>(params).await
+        let answer = self.request::<PrepareRenameRequest>(params).await?;
+        self.empty_answers
+            .record(EmptyAnswer::PrepareRename, answer.is_none());
+        Ok(answer)
     }
 
     /// The engine's workspace edit for moving one file, if it proposes one.
@@ -1230,6 +1235,7 @@ impl EngineSession {
     /// cannot stall the session.
     async fn notify<N: Notification>(&mut self, params: &N::Params) -> Result<(), EngineError> {
         self.refuse_ended()?;
+        self.empty_answers.forget();
         let value = serde_json::to_value(params).map_err(|source| {
             Error::new(EngineFault::ResultInvalid {
                 method: N::METHOD.to_owned(),

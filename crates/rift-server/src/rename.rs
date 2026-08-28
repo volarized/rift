@@ -354,43 +354,58 @@ async fn engine_exchange(
     positions: &NamePositions,
     new_name: &str,
 ) -> Result<EngineAnswer, PlanEnd> {
-    // The boxed future may only borrow the session, so each attempt gets
-    // its own owned copy of the request data.
+    let open_path = target.path.clone();
+    let open_language = target.language.name.clone();
+    let open_source = target.indexed_source.clone();
     let request_target = target.clone();
     let request_positions = *positions;
     let request_name = new_name.to_owned();
+    let close_path = target.path.clone();
     let exchanged = slot
-        .request(move |session: &mut EngineSession| {
-            let target = request_target.clone();
-            let name = request_name.clone();
-            Box::pin(async move {
-                exchange_on_session(session, &target, &request_positions, &name).await
-            })
-        })
+        .request_exchange(
+            move |session: &mut EngineSession| {
+                let path = open_path.clone();
+                let language = open_language.clone();
+                let source = open_source.clone();
+                Box::pin(async move { session.open(&path, &language, source).await })
+            },
+            move |session: &mut EngineSession| {
+                let target = request_target.clone();
+                let name = request_name.clone();
+                Box::pin(async move {
+                    rename_on_session(session, &target, &request_positions, &name).await
+                })
+            },
+            move |session: &mut EngineSession| {
+                let path = close_path.clone();
+                Box::pin(async move {
+                    let _ = session.close(&path).await;
+                })
+            },
+        )
         .await;
     match exchanged {
         Ok(answer) => Ok(answer),
-        Err(error) => {
-            if matches!(error.fault(), EngineFault::CapabilityAbsent { .. }) {
-                return Err(PlanEnd::Refused(unsupported_refusal(format!(
+        Err(error) => match error.fault() {
+            EngineFault::Refused { message, .. } => Ok(EngineAnswer::Declined {
+                detail: format!("the engine declined the rename: {message}"),
+            }),
+            EngineFault::CapabilityAbsent { .. } => {
+                Err(PlanEnd::Refused(unsupported_refusal(format!(
                     "semantic rename (engine {} does not advertise textDocument/rename)",
                     slot.name()
-                ))));
+                ))))
             }
-            Err(PlanEnd::Failed(ReadFault::engine(error)))
-        }
+            _ => Err(PlanEnd::Failed(ReadFault::engine(error))),
+        },
     }
 }
 
-/// One open-prepare-rename-close conversation on a running session.
+/// One prepare-rename conversation on an open document.
 ///
 /// An engine that answers the prepare or the rename with its verdict on
-/// the request declines it and stays serving; the document is closed
-/// before the verdict returns. Every other fault propagates and skips the
-/// close: a refusal the engine invites again goes back to the slot, which
-/// runs this conversation from its `didOpen` again, and a fault that ended
-/// the session would refuse the close anyway.
-async fn exchange_on_session(
+/// the request is retried by the slot before its latest words return.
+async fn rename_on_session(
     session: &mut EngineSession,
     target: &RenameTarget,
     positions: &NamePositions,
@@ -398,54 +413,16 @@ async fn exchange_on_session(
 ) -> Result<EngineAnswer, EngineError> {
     let encoding = session.capabilities().position_encoding;
     let position = positions.negotiated(encoding);
-    session
-        .open(
-            &target.path,
-            &target.language.name,
-            target.indexed_source.clone(),
-        )
-        .await?;
     let version = session.document_version();
     if let Some(declined) = prepare_declined(session, target, position).await? {
-        session.close(&target.path).await?;
         return Ok(declined);
     }
-    match session.rename(&target.path, position, new_name).await {
-        Ok(edit) => {
-            session.close(&target.path).await?;
-            Ok(EngineAnswer::Proposed {
-                edit,
-                encoding,
-                version,
-            })
-        }
-        Err(error) => match declined_by(&error) {
-            Some(declined) => {
-                session.close(&target.path).await?;
-                Ok(declined)
-            }
-            None => Err(error),
-        },
-    }
-}
-
-/// The engine's verdict on the request, as the decline to report.
-///
-/// Only a refusal the engine will not answer differently is a verdict.
-/// A refusal it invites again is transient, so it goes back to the slot,
-/// which sends the whole conversation again under the engine's
-/// `[engines.<name>.retry]` table; so does every fault that is not a
-/// refusal at all.
-fn declined_by(error: &EngineError) -> Option<EngineAnswer> {
-    let fault = error.fault();
-    match fault {
-        EngineFault::Refused { message, .. } if !fault.is_retryable_refusal() => {
-            Some(EngineAnswer::Declined {
-                detail: format!("the engine declined the rename: {message}"),
-            })
-        }
-        _ => None,
-    }
+    let edit = session.rename(&target.path, position, new_name).await?;
+    Ok(EngineAnswer::Proposed {
+        edit,
+        encoding,
+        version,
+    })
 }
 
 /// The engine's prepare verdict: a decline to report, or nothing when the
@@ -464,10 +441,7 @@ async fn prepare_declined(
         Ok(None) => Ok(Some(EngineAnswer::Declined {
             detail: "the engine serves no rename at this declaration".to_owned(),
         })),
-        Err(error) => match declined_by(&error) {
-            Some(declined) => Ok(Some(declined)),
-            None => Err(error),
-        },
+        Err(error) => Err(error),
     }
 }
 
@@ -1726,8 +1700,8 @@ mod tests {
 
     /// A workspace served by a canned `sh` engine that advertises a bare `renameProvider`
     /// (no prepare capability, so the flow calls `textDocument/rename` directly) and
-    /// answers that one request with a JSON-RPC error - the engine's own verdict declining
-    /// the rename, under a code no retry policy treats as transient. The script never
+    /// answers both bounded attempts with a JSON-RPC error - the engine's own verdict
+    /// declining the rename. The script never
     /// reads its stdin; it writes this fixed sequence regardless of what the session
     /// sends.
     fn workspace_with_declining_engine(
@@ -1739,7 +1713,10 @@ mod tests {
         let declined = framed(
             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"No references found at position"}}"#,
         );
-        let script = format!("printf '%s' '{capabilities}{declined}'; sleep 0.2");
+        let declined_again = framed(
+            r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"No references found at position"}}"#,
+        );
+        let script = format!("printf '%s' '{capabilities}{declined}{declined_again}'; sleep 0.2");
         let engine = rift_protocol::configuration::EngineConfiguration {
             program: "sh".to_owned(),
             arguments: vec!["-c".to_owned(), script],
@@ -1749,7 +1726,11 @@ mod tests {
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
             request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
             output_limit: rift_protocol::configuration::ByteSize::from_bytes(4_096),
-            retry: rift_protocol::retry::RetryPolicy::default(),
+            retry: rift_protocol::retry::RetryPolicy {
+                attempts: 2,
+                delay: rift_protocol::configuration::Duration::from_millis(1),
+                delay_limit: rift_protocol::configuration::Duration::from_millis(1),
+            },
             restart: rift_protocol::retry::RestartPolicy::default(),
         };
         let engines = EnginePool::new(

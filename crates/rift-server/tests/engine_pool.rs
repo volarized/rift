@@ -302,11 +302,13 @@ async fn refusal_leaves_the_engine_serving_without_a_restart() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let responses = vec![
         refused_response(1, -32602, "new name is not an identifier"),
-        null_response(2),
+        refused_response(2, -32602, "new name is not an identifier"),
+        null_response(3),
+        null_response(4),
     ];
     let pool = pool_of(
         workspace.path(),
-        vec![("fake", answers(&responses, &["rust"]))],
+        vec![("fake", retrying(answers(&responses, &["rust"]), 2))],
     );
     let refusal = rename_through(&pool, "rust", "1nvalid")
         .await

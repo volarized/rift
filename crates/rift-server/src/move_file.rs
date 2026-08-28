@@ -471,45 +471,50 @@ async fn exchanged_will_rename(
     language_id: &str,
     source: &str,
 ) -> Result<MoveExchange, EngineError> {
-    // The boxed future may only borrow the session, so each attempt gets
-    // its own owned copy of the request paths.
+    let open_path = from.clone();
+    let open_language = language_id.to_owned();
+    let open_source = source.to_owned();
     let request_from = from.clone();
     let request_to = to.clone();
-    let request_language = language_id.to_owned();
-    let request_source = source.to_owned();
-    slot.request(move |session: &mut EngineSession| {
-        let from = request_from.clone();
-        let to = request_to.clone();
-        let language = request_language.clone();
-        let source = request_source.clone();
-        Box::pin(
-            async move { will_rename_on_session(session, &from, &to, &language, source).await },
-        )
-    })
+    let close_path = from.clone();
+    slot.request_exchange(
+        move |session: &mut EngineSession| {
+            let path = open_path.clone();
+            let language = open_language.clone();
+            let source = open_source.clone();
+            Box::pin(async move { session.open(&path, &language, source).await })
+        },
+        move |session: &mut EngineSession| {
+            let from = request_from.clone();
+            let to = request_to.clone();
+            Box::pin(async move { will_rename_on_session(session, &from, &to).await })
+        },
+        move |session: &mut EngineSession| {
+            let path = close_path.clone();
+            Box::pin(async move {
+                let _ = session.close(&path).await;
+            })
+        },
+    )
     .await
 }
 
-/// One open, will-rename, close conversation. Opening source activates
-/// engines that do not load project state from file-operation URIs alone.
+/// One will-rename request on an open document.
 /// Engine whose filters do not cover file is never asked.
 async fn will_rename_on_session(
     session: &mut EngineSession,
     from: &CoreProjectPath,
     to: &CoreProjectPath,
-    language_id: &str,
-    source: String,
 ) -> Result<MoveExchange, EngineError> {
     let capabilities = session.capabilities();
     let encoding = capabilities.position_encoding;
     if capabilities.will_rename_files() && !capabilities.will_rename_matches(from.as_str()) {
         return Ok(MoveExchange::FilterMismatch);
     }
-    session.open(from, language_id, source).await?;
-    let edit = session.will_rename_files(from, to).await;
+    let edit = session.will_rename_files(from, to).await?;
     let readiness = session.readiness();
-    let _ = session.close(from).await;
     Ok(MoveExchange::Answered {
-        edit: edit?,
+        edit,
         encoding,
         readiness,
     })
@@ -643,8 +648,9 @@ mod tests {
             r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"warm","value":{"kind":"end"}}}"#,
         );
         let no_edit = framed(r#"{"jsonrpc":"2.0","id":1,"result":null}"#);
+        let no_edit_again = framed(r#"{"jsonrpc":"2.0","id":2,"result":null}"#);
         let script = format!(
-            "printf '%s' '{capabilities}{progress_begin}{progress_end}{no_edit}'; sleep 0.2"
+            "printf '%s' '{capabilities}{progress_begin}{progress_end}{no_edit}{no_edit_again}'; sleep 0.2"
         );
         let engine = rift_protocol::configuration::EngineConfiguration {
             program: "sh".to_owned(),
@@ -655,7 +661,11 @@ mod tests {
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
             request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
             output_limit: rift_protocol::configuration::ByteSize::from_bytes(4_096),
-            retry: rift_protocol::retry::RetryPolicy::default(),
+            retry: rift_protocol::retry::RetryPolicy {
+                attempts: 2,
+                delay: rift_protocol::configuration::Duration::from_millis(1),
+                delay_limit: rift_protocol::configuration::Duration::from_millis(1),
+            },
             restart: rift_protocol::retry::RestartPolicy::default(),
         };
         let engines = EnginePool::new(

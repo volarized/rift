@@ -906,6 +906,10 @@ async fn prepare_behaviors_decline_and_refuse_with_typed_answers() {
         .await
         .expect("prepare answers");
     assert!(declined.is_none(), "a null prepare answer declines");
+    assert!(
+        session.latest_answer_is_empty(),
+        "a null prepare answer remains retryable"
+    );
     session.shutdown().await;
     join(engine_task).await;
 
@@ -1009,7 +1013,7 @@ async fn an_empty_proposal_from_an_unannounced_engine_stays_unconfirmed() {
         "the answer is an edit set, not a null: {proposal:#?}"
     );
     assert!(
-        session.empty_answer_is_unconfirmed(),
+        session.latest_answer_is_empty(),
         "edit set holding no edit remains unconfirmed"
     );
 
@@ -1018,7 +1022,7 @@ async fn an_empty_proposal_from_an_unannounced_engine_stays_unconfirmed() {
         .await
         .expect("willRenameFiles answers again");
     assert!(
-        session.empty_answer_is_unconfirmed(),
+        session.latest_answer_is_empty(),
         "configured retry policy, not session state, bounds resends"
     );
 
@@ -1032,18 +1036,17 @@ async fn an_empty_proposal_from_an_unannounced_engine_stays_unconfirmed() {
         .expect("the pull answers");
     assert_eq!(pulled.len(), 1, "this engine reports one finding");
     assert!(
-        !session.empty_answer_is_unconfirmed(),
+        !session.latest_answer_is_empty(),
         "answer that said something is confirmed"
     );
     session.shutdown().await;
     join(engine_task).await;
 }
 
-/// An engine that has announced work keeps its empty answers: it has shown
-/// it reports what it is doing, so nothing it says while it reports nothing
-/// outstanding needs asking again.
+/// Diagnostic reports use their own settlement record. They do not set
+/// the semantic empty-answer state.
 #[tokio::test]
-async fn an_announced_engine_keeps_its_empty_answer() {
+async fn an_announced_engine_diagnostic_does_not_set_semantic_empty_answer() {
     let (_workspace, mut session, engine_task) = started(|mut engine| async move {
         engine.handshake(full_capabilities()).await;
         engine.begin_progress().await;
@@ -1068,8 +1071,8 @@ async fn an_announced_engine_keeps_its_empty_answer() {
         "the begin the pull consumed announces work still outstanding"
     );
     assert!(
-        !session.empty_answer_is_unconfirmed(),
-        "an announced engine's empty answer is its own"
+        !session.latest_answer_is_empty(),
+        "diagnostic settlement owns this empty report"
     );
     session.shutdown().await;
     join(engine_task).await;
@@ -1107,7 +1110,7 @@ async fn an_empty_references_answer_from_an_unannounced_engine_stays_unconfirmed
         .expect("references answers");
     assert!(first.is_empty(), "the engine names nothing");
     assert!(
-        session.empty_answer_is_unconfirmed(),
+        session.latest_answer_is_empty(),
         "empty answer from unconfirmed engine remains provisional"
     );
 
@@ -1117,7 +1120,7 @@ async fn an_empty_references_answer_from_an_unannounced_engine_stays_unconfirmed
         .expect("references answers again");
     assert!(second.is_empty());
     assert!(
-        session.empty_answer_is_unconfirmed(),
+        session.latest_answer_is_empty(),
         "configured retry policy, not session state, bounds resends"
     );
     session.shutdown().await;

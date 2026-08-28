@@ -10,12 +10,12 @@
 //!
 //! The slot is also where every transient condition between Rift and one
 //! engine is absorbed. [`EngineSlot::request`] runs the caller's operation
-//! again while the engine answers provisionally or refuses retryably, under
+//! again while the engine answers provisionally, with nothing, or with a refusal, under
 //! that engine's `[engines.<name>.retry]` table, and starts a replacement
 //! engine under its `[engines.<name>.restart]` table when the one it has
 //! dies. It also sends an operation again under configured retry policy
-//! when an engine that has never announced work answers nothing, because
-//! until first announcement arrives an empty answer is provisional.
+//! when an engine answers nothing. Progress does not bind announced work
+//! to one semantic request, so an empty answer stays provisional.
 //! Callers hold no retry loop of their own: an operation returns
 //! either the engine's settled answer or the failure that outlasted the
 //! whole budget.
@@ -236,10 +236,11 @@ enum Transient<T> {
     /// outstanding, so what it answered - a result or a refusal - is
     /// provisional.
     Analyzing,
-    /// The engine refused with a code that invites the same request again.
+    /// The engine refused the request. A refusal can precede its settled
+    /// verdict, so every refusal receives the same bounded retry schedule.
     Refused(EngineError),
-    /// The engine has never announced any work and answered nothing where
-    /// something was expected, so its silence proves nothing.
+    /// The engine answered nothing where something was expected, so its
+    /// silence proves nothing about semantic settlement.
     ///
     /// Answer rides along: once retry table ends, this is only answer.
     AnsweredNothing(T),
@@ -279,8 +280,7 @@ impl EngineSlot {
 
     /// Runs one operation against this engine under configured restart and retry bounds.
     ///
-    /// Empty answers from an engine that announced no progress receive
-    /// requests through configured retry table.
+    /// Empty answers receive requests through configured retry table.
     ///
     /// # Errors
     ///
@@ -301,7 +301,44 @@ impl EngineSlot {
             |session, _session_generation, answer, _final_attempt| {
                 if session.is_analyzing() {
                     Answer::Retry(Transient::Analyzing)
-                } else if session.empty_answer_is_unconfirmed() {
+                } else if session.latest_answer_is_empty() {
+                    Answer::Retry(Transient::AnsweredNothing(answer))
+                } else {
+                    Answer::Ready(answer)
+                }
+            },
+        )
+        .await
+    }
+
+    /// Runs one document exchange under configured restart and retry bounds.
+    ///
+    /// `begin` runs once for each live session, retries repeat only
+    /// `operation`, and `finish` runs once before that session returns or
+    /// exhausts its retry table.
+    ///
+    /// # Errors
+    ///
+    /// Returns operation failure, exhausted refusal, analyzing exhaustion,
+    /// start failure, or ended session.
+    pub async fn request_exchange<T>(
+        &self,
+        begin: impl for<'session> FnMut(
+            &'session mut EngineSession,
+        ) -> SessionFuture<'session, Result<(), EngineError>>,
+        operation: impl for<'session> FnMut(
+            &'session mut EngineSession,
+        ) -> SessionFuture<'session, Result<T, EngineError>>,
+        finish: impl for<'session> FnMut(&'session mut EngineSession) -> SessionFuture<'session, ()>,
+    ) -> Result<T, EngineError> {
+        self.request_deciding(
+            begin,
+            operation,
+            finish,
+            |session, _session_generation, answer, _final_attempt| {
+                if session.is_analyzing() {
+                    Answer::Retry(Transient::Analyzing)
+                } else if session.latest_answer_is_empty() {
                     Answer::Retry(Transient::AnsweredNothing(answer))
                 } else {
                     Answer::Ready(answer)
@@ -422,10 +459,7 @@ impl EngineSlot {
                     reported = Some(error);
                     continue;
                 }
-                Err(error) if session.is_analyzing() && error.fault().is_refusal() => {
-                    Transient::Analyzing
-                }
-                Err(error) if error.fault().is_retryable_refusal() => Transient::Refused(error),
+                Err(error) if error.fault().is_refusal() => Transient::Refused(error),
                 Err(error) => {
                     finish(session).await;
                     return Err(error);
@@ -457,7 +491,7 @@ impl EngineSlot {
                     component = "engine",
                     engine = %self.name,
                     attempts,
-                    "language engine refused every attempt retryably"
+                    "language engine refused every configured attempt"
                 );
                 Err(refusal)
             }
