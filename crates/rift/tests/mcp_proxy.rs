@@ -37,13 +37,14 @@ use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use harness::{
-    LIBRARY, SERIAL, StopOnDrop, TestResult, arguments, laid_out_workspace, proxied_call,
-    proxy_client, proxy_command, require_success, run_rift, rust_engine_workspace, within,
-    workspace,
+    LIBRARY, PROXIED_ENGINE_CALL_MAX, SERIAL, StopOnDrop, TestResult, arguments,
+    laid_out_workspace, proxied_call, proxy_client, proxy_command, require_success, run_rift,
+    rust_engine_workspace, within, workspace,
 };
-use rift_mcp::{PRESENCE_POLL_INTERVAL, ServerPresence, claim, probe};
+use rift_mcp::{PRESENCE_POLL_INTERVAL, START_WAIT_MAX, ServerPresence, claim, probe};
 use rift_protocol::lock::{
     ProductIdentity, SERVER_LOCK_FILE_NAME, SERVER_PORT_MAX, SERVER_PORT_MIN, SERVER_TOKEN_LENGTH,
     ServerLock,
@@ -71,6 +72,13 @@ const SERVED_TOOL_NAMES: [&str; 12] = [
 ];
 
 const RUST_PROJECT_BEACON_SYMBOL: &str = "rift://symbol/rust/hub.rs/beacon";
+
+#[test]
+fn proxied_engine_bound_covers_two_retry_sequences_and_election() {
+    let required = rust_engine::retry_wait_max() * 2 + START_WAIT_MAX;
+    assert!(PROXIED_ENGINE_CALL_MAX >= Duration::from_secs(120));
+    assert!(PROXIED_ENGINE_CALL_MAX > required);
+}
 
 fn rift_binary_identity() -> TestResult<ProductIdentity> {
     let executable = fs::read(env!("CARGO_BIN_EXE_rift"))?;
