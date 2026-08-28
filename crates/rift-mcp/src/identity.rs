@@ -107,4 +107,13 @@ mod tests {
             super::executable_digest(&oversized).expect_err("oversized file must not hash");
         assert!(oversized_error.to_string().contains("outside"));
     }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_executable_bound_covers_instrumented_builds() {
+        assert_eq!(
+            super::CURRENT_EXECUTABLE_BYTES_MAX,
+            rift_core::constants::RELEASE_BINARY_BYTES_MAX * 16
+        );
+    }
 }
