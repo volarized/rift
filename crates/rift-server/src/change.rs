@@ -4102,6 +4102,11 @@ mod tests {
                 dialect: None,
             })
         );
+        assert_eq!(
+            diagnostics[0].code.as_deref(),
+            Some("rift.syntax.error"),
+            "provider parse findings carry one shared Rift code"
+        );
         Ok(())
     }
 

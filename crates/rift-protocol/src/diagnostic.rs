@@ -199,6 +199,7 @@ mod tests {
 
     #[test]
     fn test_diagnostic_codes_serialize_to_their_documented_spellings() {
+        assert_eq!(DiagnosticCode::SyntaxError.code(), "rift.syntax.error");
         assert_eq!(DiagnosticCode::HookFailed.code(), "rift.hook.failed");
         assert_eq!(DiagnosticCode::SnapshotStale.code(), "rift.snapshot.stale");
         assert_eq!(

@@ -283,17 +283,17 @@ async fn applied_move_matches_the_rust_analyzer_proposal() -> TestResult {
 
 /// A patch removing call's closing delimiter.
 const SYNTAX_PATCH: &str =
-    "--- a/caller.rs\n+++ b/caller.rs\n@@ -4 +4 @@\n-    beacon(2)\n+    beacon(2;\n";
+    "--- a/caller.rs\n+++ b/caller.rs\n@@ -3 +3 @@\n-pub fn total() -> i32 {\n+pub fn total( {\n";
 
 /// Adds one module declaration and its file in the same change.
 const ADD_MODULE_PATCH: &str = "--- a/lib.rs\n+++ b/lib.rs\n@@ -1,2 +1,3 @@\n pub mod caller;\n+pub mod fresh;\n pub mod hub;\n--- /dev/null\n+++ b/fresh.rs\n@@ -0,0 +1 @@\n+pub fn ready() {}\n";
 
-/// The applied change carries rust-analyzer's own finding for the file it
-/// changed: the pull runs on the document Rift just wrote, so the answer
-/// is the engine's reading of the landed bytes.
+/// The applied change carries Rift's provider finding for the file it
+/// changed. Settled engine findings may join it, but engine scheduling
+/// cannot erase the synchronous provider result.
 ///
 #[tokio::test]
-async fn applied_patch_carries_the_engine_diagnostic() -> TestResult {
+async fn applied_patch_carries_the_provider_diagnostic() -> TestResult {
     if !engine_live() {
         return Ok(());
     }
@@ -308,23 +308,25 @@ async fn applied_patch_carries_the_engine_diagnostic() -> TestResult {
     .await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
     assert_eq!(structured["summary"]["paths"], json!(["caller.rs"]));
-    let findings = coded_findings(&structured, "syntax-error");
-    assert_eq!(
-        findings.len(),
-        1,
-        "syntax finding rides applied change: {structured:#}"
-    );
-    let finding = findings[0];
+    let findings = coded_findings(&structured, "rift.syntax.error");
+    let finding = findings
+        .first()
+        .ok_or("provider syntax finding must ride applied change")?;
     assert_eq!(finding["severity"], json!("error"));
+    assert_eq!(finding["reliability"], json!("recovered"));
     assert_eq!(
         finding["language"],
         json!({ "name": "rust" }),
-        "the engine's language stamps the finding: {finding:#}"
+        "the provider language stamps the finding: {finding:#}"
     );
     assert_eq!(finding["span"]["unit"], json!("rift://file/caller.rs"));
+    assert!(
+        coded_findings(&structured, "rift.engine.failed").is_empty(),
+        "an addressed engine never degrades to a failure warning: {structured:#}"
+    );
     assert_eq!(
         fs::read_to_string(directory.path().join("caller.rs"))?,
-        "use crate::hub::beacon;\n\npub fn total() -> i32 {\n    beacon(2;\n}\n",
+        "use crate::hub::beacon;\n\npub fn total( {\n    beacon(2)\n}\n",
         "the change stays applied with its finding attached"
     );
 

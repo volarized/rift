@@ -641,7 +641,7 @@ async fn proxied_move_file_matches_the_engine_proposal() -> TestResult {
 
 /// A patch removing call's closing delimiter.
 const RUST_PROJECT_SYNTAX_PATCH: &str =
-    "--- a/caller.rs\n+++ b/caller.rs\n@@ -4 +4 @@\n-    beacon(2)\n+    beacon(2;\n";
+    "--- a/caller.rs\n+++ b/caller.rs\n@@ -3 +3 @@\n-pub fn total() -> i32 {\n+pub fn total( {\n";
 
 /// A change applied through the whole real chain carries diagnostics for
 /// the file it changed and never the warning an unreachable engine degrades
@@ -674,9 +674,10 @@ async fn proxied_change_carries_diagnostics() -> TestResult {
         .ok_or("the summary must carry findings")?;
     let finding = findings
         .iter()
-        .find(|finding| finding["code"] == json!("syntax-error"))
-        .ok_or("syntax finding must be among findings")?;
+        .find(|finding| finding["code"] == json!("rift.syntax.error"))
+        .ok_or("provider syntax finding must be among findings")?;
     assert_eq!(finding["severity"], json!("error"));
+    assert_eq!(finding["reliability"], json!("recovered"));
     let degraded = findings
         .iter()
         .any(|finding| finding["code"] == json!("rift.engine.failed"));
@@ -686,7 +687,7 @@ async fn proxied_change_carries_diagnostics() -> TestResult {
     );
     assert_eq!(
         fs::read_to_string(root.join("caller.rs"))?,
-        "use crate::hub::beacon;\n\npub fn total() -> i32 {\n    beacon(2;\n}\n",
+        "use crate::hub::beacon;\n\npub fn total( {\n    beacon(2)\n}\n",
         "the change stays applied with its finding attached"
     );
 
