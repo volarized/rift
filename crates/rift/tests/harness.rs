@@ -28,6 +28,8 @@ pub(crate) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 /// refusal can wait out two start windows - the warmup's and the request's
 /// own - before it surfaces.
 pub(crate) const PROXIED_CALL_MAX: Duration = Duration::from_mins(1);
+/// Bound on one proxied call that starts and settles a language engine.
+pub(crate) const PROXIED_ENGINE_CALL_MAX: Duration = Duration::from_mins(2);
 
 /// Serializes the tests: the served port range is machine-global.
 pub(crate) static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -215,9 +217,31 @@ pub(crate) async fn proxied_call(
     name: &'static str,
     call_arguments: &serde_json::Value,
 ) -> TestResult<serde_json::Value> {
+    proxied_call_within(client, name, call_arguments, PROXIED_CALL_MAX).await
+}
+
+/// One proxied live-engine call under [`PROXIED_ENGINE_CALL_MAX`].
+pub(crate) async fn proxied_engine_call(
+    client: &RunningService<RoleClient, ()>,
+    name: &'static str,
+    call_arguments: &serde_json::Value,
+) -> TestResult<serde_json::Value> {
+    proxied_call_within(client, name, call_arguments, PROXIED_ENGINE_CALL_MAX).await
+}
+
+/// One retrying proxied call under its caller-owned wall-clock bound.
+async fn proxied_call_within(
+    client: &RunningService<RoleClient, ()>,
+    name: &'static str,
+    call_arguments: &serde_json::Value,
+    timeout: Duration,
+) -> TestResult<serde_json::Value> {
     for _attempt in 0..ACCEPTANCE_ATTEMPTS_MAX {
         let params = CallToolRequestParams::new(name).with_arguments(arguments(call_arguments)?);
-        match within(name, client.call_tool(params)).await? {
+        match tokio::time::timeout(timeout, client.call_tool(params))
+            .await
+            .map_err(|_elapsed| format!("timed out waiting for {name}"))?
+        {
             Ok(called) => {
                 return called
                     .structured_content

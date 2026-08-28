@@ -20,7 +20,8 @@ use std::fs;
 
 use harness::{
     RUST_PROJECT_ROOT, SERIAL, StopOnDrop, TestResult, arguments, laid_out_workspace, proxied_call,
-    proxy_client, require_success, run_rift, rust_engine_workspace, rust_project, workspace,
+    proxied_engine_call, proxy_client, require_success, run_rift, rust_engine_workspace,
+    rust_project, workspace,
 };
 use raw_proxy::RawProxySession;
 use serde_json::json;
@@ -745,7 +746,7 @@ async fn rename_declined_by_engine_names_the_decline_not_a_missing_target() -> T
     let _cleanup = StopOnDrop::new(root);
 
     let client = proxy_client(root).await?;
-    let structured = proxied_call(
+    let structured = proxied_engine_call(
         &client,
         "rename_symbol",
         &json!({ "symbol": "rift://symbol/rust/orphan.rs/orphan_fn", "new_name": "renamed" }),
@@ -801,7 +802,7 @@ async fn move_file_breaking_the_module_graph_carries_references_not_updated() ->
     let _cleanup = StopOnDrop::new(root);
 
     let client = proxy_client(root).await?;
-    let structured = proxied_call(
+    let structured = proxied_engine_call(
         &client,
         "move_file",
         &json!({ "from": "hub.rs", "to": "deep/nested/dir/hub.rs" }),

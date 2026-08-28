@@ -41,14 +41,15 @@ use std::time::Duration;
 
 use harness::{
     LIBRARY, PROXIED_ENGINE_CALL_MAX, SERIAL, StopOnDrop, TestResult, arguments,
-    laid_out_workspace, proxied_call, proxy_client, proxy_command, require_success, run_rift,
-    rust_engine_workspace, within, workspace,
+    laid_out_workspace, proxied_call, proxied_engine_call, proxy_client, proxy_command,
+    require_success, run_rift, rust_engine_workspace, within, workspace,
 };
 use rift_mcp::{PRESENCE_POLL_INTERVAL, START_WAIT_MAX, ServerPresence, claim, probe};
 use rift_protocol::lock::{
     ProductIdentity, SERVER_LOCK_FILE_NAME, SERVER_PORT_MAX, SERVER_PORT_MIN, SERVER_TOKEN_LENGTH,
     ServerLock,
 };
+use rift_protocol::retry::RetryPolicy;
 use rmcp::ServiceExt as _;
 use rmcp::model::CallToolRequestParams;
 use serde_json::json;
@@ -75,7 +76,14 @@ const RUST_PROJECT_BEACON_SYMBOL: &str = "rift://symbol/rust/hub.rs/beacon";
 
 #[test]
 fn proxied_engine_bound_covers_two_retry_sequences_and_election() {
-    let required = rust_engine::retry_wait_max() * 2 + START_WAIT_MAX;
+    let retry = RetryPolicy {
+        attempts: rust_engine::RUST_ENGINE_RETRY_ATTEMPTS,
+        ..RetryPolicy::default()
+    };
+    let retry_wait: Duration = (1..retry.attempts)
+        .filter_map(|attempt| retry.delay_after(attempt))
+        .sum();
+    let required = retry_wait * 2 + START_WAIT_MAX;
     assert!(PROXIED_ENGINE_CALL_MAX >= Duration::from_secs(120));
     assert!(PROXIED_ENGINE_CALL_MAX > required);
 }
@@ -522,7 +530,7 @@ async fn proxied_rename_symbol_rewrites_every_referencing_file() -> TestResult {
     let _cleanup = StopOnDrop::new(root);
 
     let client = proxy_client(root).await?;
-    let structured = proxied_call(
+    let structured = proxied_engine_call(
         &client,
         "rename_symbol",
         &json!({ "symbol": RUST_PROJECT_BEACON_SYMBOL, "new_name": "flare" }),
@@ -564,7 +572,7 @@ async fn proxied_move_file_rewrites_the_referencing_file() -> TestResult {
     let _cleanup = StopOnDrop::new(root);
 
     let client = proxy_client(root).await?;
-    let structured = proxied_call(
+    let structured = proxied_engine_call(
         &client,
         "move_file",
         &json!({ "from": "hub.rs", "to": "spoke.rs" }),
@@ -623,7 +631,7 @@ async fn proxied_change_carries_diagnostics() -> TestResult {
     let _cleanup = StopOnDrop::new(root);
 
     let client = proxy_client(root).await?;
-    let structured = proxied_call(
+    let structured = proxied_engine_call(
         &client,
         "patch",
         &json!({ "patch": RUST_PROJECT_SYNTAX_PATCH }),

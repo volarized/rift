@@ -18,6 +18,8 @@ pub(crate) const RUST_ANALYZER_PROGRAM: &str = "rust-analyzer";
 /// Arguments that select rust-analyzer 1.98 without a directory override.
 pub(crate) const RUST_ANALYZER_ARGUMENTS: [&str; 3] =
     ["run", RUST_ANALYZER_TOOLCHAIN, RUST_ANALYZER_PROGRAM];
+/// Attempts one live fixture engine operation may take.
+pub(crate) const RUST_ENGINE_RETRY_ATTEMPTS: u64 = 16;
 
 /// Fails the test unless rust-analyzer 1.98 answers `--version` from the
 /// fixture tree.
@@ -69,6 +71,6 @@ pub(crate) fn fixture() -> EngineFixture {
         program: RUSTUP_PROGRAM,
         arguments: RUST_ANALYZER_ARGUMENTS.to_vec(),
         languages: vec!["rust"],
-        extra_toml: "\n[engines.rust.retry]\nattempts = 16\n".to_owned(),
+        extra_toml: format!("\n[engines.rust.retry]\nattempts = {RUST_ENGINE_RETRY_ATTEMPTS}\n"),
     }
 }
