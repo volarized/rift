@@ -745,8 +745,9 @@ mod tests {
     /// what the session sends.
     fn workspace_with_unconfirmed_engine(
         files: &[(&str, &str)],
-    ) -> (tempfile::TempDir, ReadService, EnginePool) {
+    ) -> (tempfile::TempDir, ReadService, EnginePool, std::path::PathBuf) {
         let directory = tempfile::tempdir().expect("fixture directory");
+        let transcript = directory.path().join("engine-input.jsonrpc");
         for (name, source) in files {
             std::fs::write(directory.path().join(name), source).expect("fixture file writes");
         }
@@ -766,14 +767,20 @@ mod tests {
                 r#"{{"jsonrpc":"2.0","id":{id},"result":{{"kind":"full","items":[]}}}}"#
             ))
         };
+        let shutdown = framed(r#"{"jsonrpc":"2.0","id":3,"result":null}"#);
         let script = format!(
-            "printf '%s' '{capabilities}{}{}'; sleep 0.2",
+            "printf '%s' '{capabilities}{}{}{shutdown}' & exec cat > \"$1\"",
             empty_pull(1),
             empty_pull(2),
         );
         let engine = rift_protocol::configuration::EngineConfiguration {
             program: "sh".to_owned(),
-            arguments: vec!["-c".to_owned(), script],
+            arguments: vec![
+                "-c".to_owned(),
+                script,
+                "rift-engine".to_owned(),
+                transcript.display().to_string(),
+            ],
             environment: BTreeMap::new(),
             languages: vec!["rust".to_owned()],
             initialization_options: None,
@@ -791,13 +798,13 @@ mod tests {
             directory.path(),
             BTreeMap::from([("fake".to_owned(), engine)]),
         );
-        (directory, reads, engines)
+        (directory, reads, engines, transcript)
     }
 
     /// Two equal full empty reports from an engine without progress settle as clean.
     #[tokio::test]
     async fn an_unconfirmed_engines_stable_empty_report_is_clean() {
-        let (directory, reads, engines) =
+        let (directory, reads, engines, transcript) =
             workspace_with_unconfirmed_engine(&[("lib.rs", "pub fn beacon() {}\n")]);
         let paths = vec![ProjectPath("lib.rs".to_owned())];
         let changes = added_changes(&reads, &paths);
@@ -805,6 +812,22 @@ mod tests {
             classified_engine_change_diagnostics(&engines, &reads, &reads, &changes).await;
         assert!(findings.is_empty(), "{findings:#?}");
         engines.shutdown().await;
+        let transcript = std::fs::read_to_string(transcript).expect("transcript reads");
+        assert_eq!(
+            transcript.matches("textDocument/didOpen").count(),
+            1,
+            "one settled exchange opens its document once: {transcript}"
+        );
+        assert_eq!(
+            transcript.matches("textDocument/diagnostic").count(),
+            2,
+            "settlement repeats only the pull: {transcript}"
+        );
+        assert_eq!(
+            transcript.matches("textDocument/didClose").count(),
+            1,
+            "one settled exchange closes its document once: {transcript}"
+        );
         drop(directory);
     }
 
