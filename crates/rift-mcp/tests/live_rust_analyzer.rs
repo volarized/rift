@@ -281,9 +281,8 @@ async fn applied_move_matches_the_rust_analyzer_proposal() -> TestResult {
     Ok(())
 }
 
-/// A patch removing call's closing delimiter.
-const SYNTAX_PATCH: &str =
-    "--- a/caller.rs\n+++ b/caller.rs\n@@ -3 +3 @@\n-pub fn total() -> i32 {\n+pub fn total( {\n";
+/// A patch replacing one file with a malformed declaration.
+const SYNTAX_PATCH: &str = "--- a/caller.rs\n+++ b/caller.rs\n@@ -1,5 +1 @@\n-use crate::hub::beacon;\n-\n-pub fn total() -> i32 {\n-    beacon(2)\n-}\n+fn broken( {\n";
 
 /// Adds one module declaration and its file in the same change.
 const ADD_MODULE_PATCH: &str = "--- a/lib.rs\n+++ b/lib.rs\n@@ -1,2 +1,3 @@\n pub mod caller;\n+pub mod fresh;\n pub mod hub;\n--- /dev/null\n+++ b/fresh.rs\n@@ -0,0 +1 @@\n+pub fn ready() {}\n";
@@ -309,9 +308,9 @@ async fn applied_patch_carries_the_provider_diagnostic() -> TestResult {
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
     assert_eq!(structured["summary"]["paths"], json!(["caller.rs"]));
     let findings = coded_findings(&structured, "rift.syntax.error");
-    let finding = findings
-        .first()
-        .ok_or("provider syntax finding must ride applied change")?;
+    let finding = findings.first().unwrap_or_else(|| {
+        panic!("provider syntax finding must ride applied change: {structured:#}")
+    });
     assert_eq!(finding["severity"], json!("error"));
     assert_eq!(finding["reliability"], json!("recovered"));
     assert_eq!(
@@ -326,7 +325,7 @@ async fn applied_patch_carries_the_provider_diagnostic() -> TestResult {
     );
     assert_eq!(
         fs::read_to_string(directory.path().join("caller.rs"))?,
-        "use crate::hub::beacon;\n\npub fn total( {\n    beacon(2)\n}\n",
+        "fn broken( {\n",
         "the change stays applied with its finding attached"
     );
 

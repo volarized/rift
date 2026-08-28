@@ -22,8 +22,8 @@ use rift_protocol::change::{
     PreconditionValue, RefusalReason, ReplaceNodeParams, ReplaceSymbolParams,
 };
 use rift_protocol::read::{
-    Diagnostic, DiagnosticContinuation, DiagnosticReliability, Extensions, FileId, Language,
-    Severity, SourceSpan, TextRange,
+    Diagnostic, DiagnosticCode, DiagnosticContinuation, DiagnosticReliability, Extensions, FileId,
+    Language, Severity, SourceSpan, TextRange,
 };
 use rift_syntax::{ByteRange, SyntaxDocument, SyntaxSource, registry};
 use sha2::{Digest as _, Sha256};
@@ -1479,7 +1479,7 @@ fn change_diagnostic(
 ) -> Diagnostic {
     Diagnostic {
         severity: Severity::Error,
-        code: None,
+        code: Some(DiagnosticCode::SyntaxError.code()),
         message,
         span: range.map(|range| SourceSpan {
             unit,

@@ -639,9 +639,8 @@ async fn proxied_move_file_matches_the_engine_proposal() -> TestResult {
     Ok(())
 }
 
-/// A patch removing call's closing delimiter.
-const RUST_PROJECT_SYNTAX_PATCH: &str =
-    "--- a/caller.rs\n+++ b/caller.rs\n@@ -3 +3 @@\n-pub fn total() -> i32 {\n+pub fn total( {\n";
+/// A patch replacing one file with a malformed declaration.
+const RUST_PROJECT_SYNTAX_PATCH: &str = "--- a/caller.rs\n+++ b/caller.rs\n@@ -1,5 +1 @@\n-use crate::hub::beacon;\n-\n-pub fn total() -> i32 {\n-    beacon(2)\n-}\n+fn broken( {\n";
 
 /// A change applied through the whole real chain carries diagnostics for
 /// the file it changed and never the warning an unreachable engine degrades
@@ -687,7 +686,7 @@ async fn proxied_change_carries_diagnostics() -> TestResult {
     );
     assert_eq!(
         fs::read_to_string(root.join("caller.rs"))?,
-        "use crate::hub::beacon;\n\npub fn total( {\n    beacon(2)\n}\n",
+        "fn broken( {\n",
         "the change stays applied with its finding attached"
     );
 
