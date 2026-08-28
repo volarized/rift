@@ -88,3 +88,6 @@ large_futures = "warn"
 missing_errors_doc = "warn"
 missing_panics_doc = "warn"
 must_use_candidate = "warn"
+
+[profile.test]
+debug = "line-tables-only"
