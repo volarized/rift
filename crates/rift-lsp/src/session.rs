@@ -22,6 +22,7 @@ use lsp_types::notification::{
 use lsp_types::request::{
     DocumentDiagnosticRequest, Initialize, PrepareRenameRequest, References, RegisterCapability,
     Rename, Request, Shutdown, WillRenameFiles, WorkDoneProgressCreate, WorkspaceConfiguration,
+    WorkspaceDiagnosticRefresh,
 };
 use lsp_types::{
     ConfigurationParams, Diagnostic, DidChangeWatchedFilesParams,
@@ -511,6 +512,7 @@ pub struct EngineSession {
     request_timeout: Duration,
     published: BTreeMap<ProjectPath, Vec<Diagnostic>>,
     progress: WorkProgress,
+    diagnostic_refresh_revision: u64,
     empty_answers: EmptyAnswers,
     watched_file_watchers: Vec<FileSystemWatcher>,
     document_version: i32,
@@ -653,6 +655,7 @@ impl EngineSession {
             request_timeout,
             published: BTreeMap::new(),
             progress: WorkProgress::default(),
+            diagnostic_refresh_revision: 0,
             empty_answers: EmptyAnswers::default(),
             watched_file_watchers: Vec::new(),
             document_version: 0,
@@ -724,6 +727,15 @@ impl EngineSession {
     #[must_use]
     pub fn readiness(&self) -> EngineReadiness {
         self.progress.readiness()
+    }
+
+    /// Revision of diagnostic refresh requests received from engine.
+    ///
+    /// A changed revision invalidates an earlier pull even when both reports
+    /// carry equal findings.
+    #[must_use]
+    pub fn diagnostic_refresh_revision(&self) -> u64 {
+        self.diagnostic_refresh_revision
     }
 
     /// Whether latest operation answered nothing before engine announced
@@ -1326,6 +1338,10 @@ impl EngineSession {
                 };
                 self.progress.began(created.token);
             }
+            WorkspaceDiagnosticRefresh::METHOD => {
+                self.diagnostic_refresh_revision =
+                    self.diagnostic_refresh_revision.saturating_add(1);
+            }
             _ => {}
         }
     }
@@ -1520,9 +1536,9 @@ fn answer_server_request(method: &str, id: &Value, params: Option<Value>) -> Vec
                 .min(CONFIGURATION_ITEMS_MAX);
             correlation::response(id, &Value::Array(vec![Value::Null; items]))
         }
-        RegisterCapability::METHOD | WorkDoneProgressCreate::METHOD => {
-            correlation::response(id, &Value::Null)
-        }
+        RegisterCapability::METHOD
+        | WorkDoneProgressCreate::METHOD
+        | WorkspaceDiagnosticRefresh::METHOD => correlation::response(id, &Value::Null),
         _ => correlation::error_response(id, METHOD_NOT_FOUND_CODE, "method not served"),
     }
 }

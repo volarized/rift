@@ -162,7 +162,7 @@ pub async fn classified_engine_change_diagnostics(
         {
             let source = document.source.as_deref().unwrap_or_default();
             match pulled_diagnostics(slot, &document.path, &document.language, source).await {
-                Ok((items, encoding, _readiness)) => {
+                Ok((items, encoding, _readiness, _refresh_revision)) => {
                     let unit = file_id(&document.path);
                     let index = LineIndex::new(source);
                     let remaining = ENGINE_DIAGNOSTICS_PER_CHANGE_MAX - findings.len();
@@ -215,7 +215,7 @@ async fn pulled_diagnostics(
     path: &CoreProjectPath,
     language: &Language,
     source: &str,
-) -> Result<(PulledDiagnostics, PositionEncoding, EngineReadiness), EngineError> {
+) -> Result<(PulledDiagnostics, PositionEncoding, EngineReadiness, u64), EngineError> {
     let request_path = path.clone();
     let request_language = language.name.clone();
     let request_source = source.to_owned();
@@ -237,7 +237,7 @@ async fn pull_on_session(
     path: &CoreProjectPath,
     language_id: &str,
     text: String,
-) -> Result<(PulledDiagnostics, PositionEncoding, EngineReadiness), EngineError> {
+) -> Result<(PulledDiagnostics, PositionEncoding, EngineReadiness, u64), EngineError> {
     if !session.capabilities().pull_diagnostics {
         return Err(rift_core::Error::new(EngineFault::CapabilityAbsent {
             capability: DocumentDiagnosticRequest::METHOD.to_owned(),
@@ -247,8 +247,9 @@ async fn pull_on_session(
     session.open(path, language_id, text).await?;
     let pulled = session.pull_diagnostics(path).await;
     let readiness = session.readiness();
+    let refresh_revision = session.diagnostic_refresh_revision();
     let _ = session.close(path).await;
-    Ok((pulled?, encoding, readiness))
+    Ok((pulled?, encoding, readiness, refresh_revision))
 }
 
 async fn notify_engine_changes(
@@ -803,6 +804,66 @@ mod tests {
         let findings =
             classified_engine_change_diagnostics(&engines, &reads, &reads, &changes).await;
         assert!(findings.is_empty(), "{findings:#?}");
+        engines.shutdown().await;
+        drop(directory);
+    }
+
+    /// A diagnostic refresh between equal full reports invalidates first
+    /// report. At retry bound, second report therefore remains unready.
+    #[tokio::test]
+    async fn a_diagnostic_refresh_invalidates_an_equal_earlier_report() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        std::fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")
+            .expect("fixture file writes");
+        let reads = ReadService::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )
+        .expect("fixture workspace indexes");
+        let capabilities = framed(
+            r#"{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"diagnosticProvider":{"identifier":"fake","interFileDependencies":false,"workspaceDiagnostics":false}}}}"#,
+        );
+        let empty = |id: u64| {
+            framed(&format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"kind":"full","items":[]}}}}"#
+            ))
+        };
+        let refresh = framed(
+            r#"{"jsonrpc":"2.0","id":90,"method":"workspace/diagnostic/refresh","params":null}"#,
+        );
+        let script = format!(
+            "printf '%s' '{capabilities}{}{refresh}{}'; sleep 0.2",
+            empty(1),
+            empty(2),
+        );
+        let engine = rift_protocol::configuration::EngineConfiguration {
+            program: "sh".to_owned(),
+            arguments: vec!["-c".to_owned(), script],
+            environment: BTreeMap::new(),
+            languages: vec!["rust".to_owned()],
+            initialization_options: None,
+            startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            output_limit: rift_protocol::configuration::ByteSize::from_bytes(4_096),
+            retry: rift_protocol::retry::RetryPolicy {
+                attempts: 2,
+                delay: rift_protocol::configuration::Duration::from_millis(1),
+                delay_limit: rift_protocol::configuration::Duration::from_millis(1),
+            },
+            restart: rift_protocol::retry::RestartPolicy::default(),
+        };
+        let engines = EnginePool::new(
+            directory.path(),
+            BTreeMap::from([("fake".to_owned(), engine)]),
+        );
+        let changes = added_changes(&reads, &[ProjectPath("lib.rs".to_owned())]);
+        let findings =
+            classified_engine_change_diagnostics(&engines, &reads, &reads, &changes).await;
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert_eq!(findings[0].code.as_deref(), Some("rift.engine.unready"));
         engines.shutdown().await;
         drop(directory);
     }

@@ -653,8 +653,8 @@ async fn cancelled_request_response_is_discarded_by_the_next_call() {
     join(engine_task).await;
 }
 
-/// Four server-initiated requests, each answered per the routing policy:
-/// configuration, registration, progress creation, and an unserved probe.
+/// Five server-initiated requests, each answered per the routing policy:
+/// configuration, registration, progress creation, diagnostic refresh, and an unserved probe.
 /// The rename answers only after every one of them settles.
 #[tokio::test]
 async fn server_initiated_requests_are_routed_before_the_response() {
@@ -693,7 +693,15 @@ async fn server_initiated_requests_are_routed_before_the_response() {
         let progress = engine.next_raw_message().await;
         assert_eq!(progress["result"], Value::Null);
         engine
-            .send(&json!({"jsonrpc": "2.0", "id": 93, "method": "engine/probe", "params": null}))
+            .send(&json!({
+                "jsonrpc": "2.0", "id": 93, "method": "workspace/diagnostic/refresh",
+                "params": null,
+            }))
+            .await;
+        let refresh = engine.next_raw_message().await;
+        assert_eq!(refresh["result"], Value::Null);
+        engine
+            .send(&json!({"jsonrpc": "2.0", "id": 94, "method": "engine/probe", "params": null}))
             .await;
         let unserved = engine.next_raw_message().await;
         assert_eq!(unserved["error"]["code"], json!(-32601));
@@ -721,7 +729,7 @@ async fn server_initiated_requests_are_routed_before_the_response() {
         .await
         .expect("didOpen is sent");
     // The scripted engine dies unless configuration, registration,
-    // progress, and the unserved probe are each answered per the routing
+    // progress, refresh, and the unserved probe are each answered per the routing
     // policy before the rename itself answers.
     let edit = session
         .rename(
@@ -735,6 +743,11 @@ async fn server_initiated_requests_are_routed_before_the_response() {
         .await
         .expect("the rename answers after the server requests");
     assert_eq!(edit.changes.expect("changes come back").len(), 2);
+    assert_eq!(
+        session.diagnostic_refresh_revision(),
+        1,
+        "diagnostic refresh invalidates earlier pull evidence"
+    );
     let unchanged = session
         .pull_diagnostics(&document)
         .await
