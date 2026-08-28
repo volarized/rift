@@ -78,10 +78,11 @@ Startup runs one cycle:
 4. Start the native filesystem watcher.
 5. Schedule the initial scan and parse on a Tokio-managed blocking task, so traversal and
    parsing never occupy an async MCP worker.
-6. Serve until no request arrives for the [`idle_timeout`](/docs/configuration#server) span
-   `rift.toml` sets, then stop.
+6. Serve until no request remains active and the [`idle_timeout`](/docs/configuration#server)
+   span passes after the last response completes, then stop.
 
 `rift server start` runs that cycle detached and waits for `.rift/server.json` to appear;
+detached startup and `rift mcp` each allow 30 seconds for publication.
 `rift server stop` sends the authorized stop request and waits for the election to release;
 `rift server restart` chains the two. `rift server status` reports the workspace's current
 state - a serving server with its port, pid, and version, a stale `.rift/server.json` with the

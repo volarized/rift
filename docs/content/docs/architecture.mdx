@@ -125,9 +125,10 @@ configuration allows you to describe:
 An edit to the file takes effect for later requests once the server accepts it again. An
 invalid file keeps the workspace unusable until you fix it.
 
-The server stops itself once no request arrives for the
-[`idle_timeout`](/docs/configuration#server) span, and `rift server stop` ends it sooner. It
-removes its lock file on the way out, and the next `rift mcp` starts a fresh one. Projections,
+The server stops itself once no request remains active and the
+[`idle_timeout`](/docs/configuration#server) span passes after the last response completes.
+`rift server stop` ends it sooner. The server removes its lock file on the way out, and the next
+`rift mcp` starts a fresh one. Projections,
 changesets, and execution copies live under `.rift` and survive the exit.
 
 `rift server status` reports which of these states the workspace is in - a serving server with

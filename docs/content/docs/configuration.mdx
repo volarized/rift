@@ -42,8 +42,8 @@ readiness_timeout = "30s"
 - `worker_queue_timeout` bounds one request's wait for a free worker, 1ms to 1h - when it
   expires, the request fails with `temporarily_unavailable` and the client can retry without
   stacking another waiter
-- `idle_timeout` stops the server after that long with no served request, 1s to 1d; the next
-  `rift mcp` or `rift server start` brings it back
+- `idle_timeout` stops the server once no request remains active and that span has passed after
+  the last response completed, 1s to 1d; the next `rift mcp` or `rift server start` brings it back
 - `readiness_timeout` bounds one request's whole wait for the workspace's index and its language
   engines to prove they're ready to answer, 1s to 1h - index validation starts the clock, and
   once the request has resolved which engines it needs, waiting on them spends whatever time is
