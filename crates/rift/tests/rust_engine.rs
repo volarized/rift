@@ -75,5 +75,9 @@ mod tests {
         let fixture = super::fixture();
         assert_eq!(fixture.program, "rustup");
         assert_eq!(fixture.arguments, ["run", "1.98", "rust-analyzer"]);
+        assert_eq!(
+            fixture.extra_toml,
+            "\n[engines.rust.retry]\nattempts = 16\n"
+        );
     }
 }
