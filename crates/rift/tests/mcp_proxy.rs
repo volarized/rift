@@ -389,7 +389,7 @@ async fn held_election_without_a_server_refuses_with_operator_guidance() -> Test
         panic!("expected a protocol-level refusal, got {refusal:?}");
     };
     assert!(
-        data.message.contains("15s"),
+        data.message.contains(&format!("{START_WAIT_MAX:?}")),
         "the refusal must name the window the caller waited out: {}",
         data.message
     );

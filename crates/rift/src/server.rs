@@ -788,7 +788,10 @@ mod tests {
         assert!(unpublished.contains("has not published"), "{unpublished}");
 
         let timed_out = Error::new(ServerCommandFault::StartTimedOut).to_string();
-        assert!(timed_out.contains("30s"), "{timed_out}");
+        assert!(
+            timed_out.contains(&format!("{START_WAIT_MAX:?}")),
+            "{timed_out}"
+        );
         assert!(timed_out.contains("--foreground"), "{timed_out}");
 
         let unauthorized = Error::new(ServerCommandFault::StopRefused {
