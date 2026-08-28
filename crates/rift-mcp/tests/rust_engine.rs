@@ -78,11 +78,10 @@ pub(crate) fn rust_engine_configuration() -> String {
 /// keeps indexing afterwards, so the bounds are generous - and still
 /// bounds: a wedged engine fails the suite instead of hanging it.
 ///
-/// No `[engines.rust.retry]` table: the suite runs on the shipped
-/// defaults, which is what makes it a proof. rust-analyzer announces its
-/// project load over `$/progress` and ends that announcement about 830ms
-/// in on this fixture, then cancels requests until it settles around
-/// 2.3s; the eight default attempts reach past 9.75s.
+/// Coverage starts several cold rust-analyzer processes in parallel. Its
+/// fixture retry table keeps shipped pacing but extends attempts to 16, a
+/// 25.75s wait bound, so instrumented process contention cannot turn this
+/// engine test into a machine-speed test.
 pub(crate) fn fixture() -> EngineFixture {
     let mut environment = String::new();
     for (key, value) in rust_analyzer_environment() {
@@ -93,6 +92,8 @@ pub(crate) fn fixture() -> EngineFixture {
         program: RUST_ANALYZER_PROGRAM,
         arguments: Vec::new(),
         languages: vec!["rust"],
-        extra_toml: format!("\n[engines.rust.environment]\n{environment}"),
+        extra_toml: format!(
+            "\n[engines.rust.environment]\n{environment}\n[engines.rust.retry]\nattempts = 16\n"
+        ),
     }
 }
