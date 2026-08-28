@@ -1199,14 +1199,19 @@ mod tests {
         (directory, reads, engines)
     }
 
-    /// The same fixture, except the engine announces and ends one work-done progress token
-    /// before it answers the references request: its readiness has settled to
-    /// [`rift_lsp::session::EngineReadiness::Ready`] by the time that answer lands, so no
-    /// resend is needed and default retry policy is unused.
-    fn workspace_with_confirmed_ready_references_engine(
+    /// The engine announces and ends unrelated work, then answers no references before its
+    /// settled reference arrives. The transcript records whether retries kept one document
+    /// exchange open.
+    fn workspace_with_delayed_references_engine(
         files: &[(&str, &str)],
-    ) -> (tempfile::TempDir, ReadService, EnginePool) {
+    ) -> (
+        tempfile::TempDir,
+        ReadService,
+        EnginePool,
+        std::path::PathBuf,
+    ) {
         let (directory, reads, _unused_engines) = workspace(files);
+        let transcript = directory.path().join("engine-transcript");
         let capabilities = framed(
             r#"{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"referencesProvider":true}}}"#,
         );
@@ -1217,17 +1222,30 @@ mod tests {
             r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"warm","value":{"kind":"end"}}}"#,
         );
         let no_references = framed(r#"{"jsonrpc":"2.0","id":1,"result":null}"#);
+        let caller_uri = format!("file://{}/caller.rs", directory.path().display());
+        let reference = framed(&format!(
+            r#"{{"jsonrpc":"2.0","id":2,"result":[{{"uri":"{caller_uri}","range":{{"start":{{"line":0,"character":0}},"end":{{"line":0,"character":1}}}}}}]}}"#
+        ));
+        let shutdown = framed(r#"{"jsonrpc":"2.0","id":3,"result":null}"#);
         let script = format!(
-            "printf '%s' '{capabilities}{progress_begin}{progress_end}{no_references}'; sleep 0.2"
+            "printf '%s' '{capabilities}{progress_begin}{progress_end}{no_references}{reference}{shutdown}' & exec cat > \"$1\""
         );
+        let mut engine = references_engine(
+            script,
+            rift_protocol::retry::RetryPolicy {
+                attempts: 2,
+                delay: rift_protocol::configuration::Duration::from_millis(1),
+                delay_limit: rift_protocol::configuration::Duration::from_millis(1),
+            },
+        );
+        engine
+            .arguments
+            .extend(["rift-engine".to_owned(), transcript.display().to_string()]);
         let engines = EnginePool::new(
             directory.path(),
-            std::collections::BTreeMap::from([(
-                "fake".to_owned(),
-                references_engine(script, rift_protocol::retry::RetryPolicy::default()),
-            )]),
+            std::collections::BTreeMap::from([("fake".to_owned(), engine)]),
         );
-        (directory, reads, engines)
+        (directory, reads, engines, transcript)
     }
 
     /// Reproduces the defect an unread readiness would leave behind: an unconfirmed
@@ -1295,14 +1313,13 @@ mod tests {
         engines.shutdown().await;
     }
 
-    /// The new `Unconfirmed` arm must not swallow the settled case: an engine that has
-    /// confirmed its own readiness and then answers empty still applies clean, with no
-    /// warning at all.
+    /// Progress from unrelated work cannot make an empty semantic answer final. Retry keeps
+    /// one open document until the engine returns its standing reference.
     #[tokio::test]
-    async fn plan_remove_symbol_against_a_confirmed_ready_engines_empty_answer_applies_clean() {
+    async fn plan_remove_symbol_retries_a_ready_empty_answer_in_one_document_exchange() {
         let source = "pub fn beacon() {}\n";
-        let (directory, reads, engines) =
-            workspace_with_confirmed_ready_references_engine(&[("lib.rs", source)]);
+        let (directory, reads, engines, transcript) =
+            workspace_with_delayed_references_engine(&[("lib.rs", source)]);
         let resolution = plan_remove_symbol(
             &reads,
             &engines,
@@ -1313,16 +1330,21 @@ mod tests {
             },
         )
         .await
-        .expect("a settled engine's empty answer must apply clean");
-        let RemoveResolution::Planned(plan) = resolution else {
-            panic!("a clean check must plan the removal: {resolution:?}");
+        .expect("the engine answers the reference check");
+        let RemoveResolution::Refused(result) = resolution else {
+            panic!("the settled standing reference must refuse: {resolution:?}");
         };
-        assert!(
-            plan.diagnostic.is_none(),
-            "a settled clean check carries no warning: {:?}",
-            plan.diagnostic
+        let ChangeResult::Refused { preconditions, .. } = result else {
+            panic!("standing reference carries failed condition");
+        };
+        assert_eq!(
+            preconditions[0].paths,
+            vec![rift_protocol::read::ProjectPath("caller.rs".to_owned())]
         );
         engines.shutdown().await;
+        let transcript = std::fs::read_to_string(transcript).expect("transcript reads");
+        assert_eq!(transcript.matches("textDocument/didOpen").count(), 1);
+        assert_eq!(transcript.matches("textDocument/didClose").count(), 1);
     }
 
     #[test]

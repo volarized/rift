@@ -427,21 +427,32 @@ async fn a_retryable_refusal_is_absorbed_and_the_resend_answers() {
     pool.shutdown().await;
 }
 
-/// A refusal that is the engine's verdict on the request surfaces at once:
-/// resending it would change nothing and cost the caller its latency.
+/// A refusal can precede the engine's settled verdict. The slot retries it
+/// under the same bound as an empty answer and returns the latest engine
+/// words when every attempt refuses.
 #[tokio::test]
-async fn a_verdict_refusal_surfaces_without_a_resend() {
+async fn a_verdict_refusal_retries_and_returns_the_latest_engine_words() {
     let workspace = tempfile::tempdir().expect("tempdir");
-    let responses = vec![refused_response(1, -32602, "new name is not an identifier")];
+    let responses = vec![
+        refused_response(1, -32602, "engine is still loading"),
+        refused_response(2, -32602, "new name is not an identifier"),
+    ];
     let pool = pool_of(
         workspace.path(),
-        vec![("fake", answers(&responses, &["rust"]))],
+        vec![("fake", retrying(answers(&responses, &["rust"]), 2))],
     );
     let error = rename_through(&pool, "rust", "1nvalid")
         .await
         .expect_err("the engine refuses the name");
     assert!(
-        matches!(error.fault(), EngineFault::Refused { code: -32602, .. }),
+        matches!(
+            error.fault(),
+            EngineFault::Refused {
+                code: -32602,
+                message,
+                ..
+            } if message == "new name is not an identifier"
+        ),
         "unexpected fault {:?}",
         error.fault()
     );
