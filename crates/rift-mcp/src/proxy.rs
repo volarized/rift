@@ -1051,7 +1051,7 @@ mod tests {
     fn unavailable_refusal_names_the_window_without_a_shell_command_the_caller_cannot_run() {
         let refusal = upstream_unavailable();
         assert_eq!(refusal.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
-        assert!(refusal.message.contains("15s"), "{}", refusal.message);
+        assert!(refusal.message.contains("30s"), "{}", refusal.message);
         assert!(
             refusal.message.contains("operator action"),
             "{}",

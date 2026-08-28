@@ -215,6 +215,7 @@ fn drain_until_closed(mut stream: impl Read, capture_bytes: usize) -> CapturedSt
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
+    use std::time::Duration;
 
     use super::{
         CapturedStream, PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX,
@@ -223,6 +224,10 @@ mod tests {
 
     #[test]
     fn start_poll_attempt_count_derives_from_its_window() {
+        assert!(
+            START_WAIT_MAX >= Duration::from_secs(30),
+            "startup includes identity, watch setup, initial catalog, and lexical publication"
+        );
         assert_eq!(
             PRESENCE_POLL_INTERVAL * START_POLL_ATTEMPT_COUNT,
             START_WAIT_MAX
