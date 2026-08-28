@@ -750,9 +750,10 @@ mod tests {
 
     use super::{
         ConnectAttemptFailure, ProxyFault, RiftProxy, SpawnPollOutcome, StartupCapture, Upstream,
-        adopt_serving, connect_recorded, fallback_info, forwarded_error, lost_start_election,
-        mirrored_info, quit_reason_result, require_identity_match, reuse_current, serve_connection,
-        server_start_failed, spawn_poll_outcome, transport_failed, upstream_unavailable,
+        UpstreamSlot, adopt_serving, connect_recorded, fallback_info, forwarded_error,
+        lost_start_election, mirrored_info, quit_reason_result, require_identity_match,
+        reuse_current, serve_connection, server_start_failed, spawn_poll_outcome, transport_failed,
+        upstream_unavailable,
     };
     use crate::election::claim;
     use rift_core::{CapturedStream, Error};
@@ -803,6 +804,29 @@ mod tests {
         let (kept_alive, transport) = tokio::io::duplex(1024);
         let running: RunningService<RoleClient, ()> = serve_directly((), transport, None);
         (running, kept_alive)
+    }
+
+    #[tokio::test]
+    async fn warmup_and_request_share_one_terminal_connection_attempt() {
+        let mut slot = UpstreamSlot::empty();
+        let (warmup, warmup_starts) = slot.begin_connection();
+        let (request, request_starts) = slot.begin_connection();
+        assert!(warmup_starts);
+        assert!(!request_starts);
+        assert!(std::sync::Arc::ptr_eq(&warmup, &request));
+
+        let refusal = ErrorData::new(
+            rmcp::model::ErrorCode(-32000),
+            "server failed to bind",
+            None,
+        );
+        warmup.complete(Err(refusal.clone()));
+        let (warmup_result, request_result) = tokio::join!(warmup.outcome(), request.outcome());
+        for result in [warmup_result, request_result] {
+            let received = result.expect_err("terminal connection result must be shared");
+            assert_eq!(received.code, refusal.code);
+            assert_eq!(received.message, refusal.message);
+        }
     }
 
     #[test]
