@@ -193,7 +193,75 @@ struct RiftProxy {
 #[derive(Debug)]
 struct UpstreamSlot {
     connected: Option<Upstream>,
+    connecting: Option<Arc<ConnectAttempt>>,
     generation_next: u64,
+}
+
+/// One connection result shared by callers that arrived while it ran.
+#[derive(Debug)]
+struct ConnectAttempt {
+    result: std::sync::Mutex<Option<Result<(), ErrorData>>>,
+    finished: tokio::sync::Notify,
+}
+
+impl ConnectAttempt {
+    fn pending() -> Self {
+        Self {
+            result: std::sync::Mutex::new(None),
+            finished: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn complete(&self, result: Result<(), ErrorData>) {
+        *self.lock_result() = Some(result);
+        self.finished.notify_waiters();
+    }
+
+    async fn outcome(&self) -> Result<(), ErrorData> {
+        loop {
+            let notified = self.finished.notified();
+            if let Some(result) = self.lock_result().clone() {
+                return result;
+            }
+            notified.await;
+        }
+    }
+
+    fn lock_result(&self) -> std::sync::MutexGuard<'_, Option<Result<(), ErrorData>>> {
+        match self.result.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+impl UpstreamSlot {
+    fn empty() -> Self {
+        Self {
+            connected: None,
+            connecting: None,
+            generation_next: 0,
+        }
+    }
+
+    fn begin_connection(&mut self) -> (Arc<ConnectAttempt>, bool) {
+        if let Some(attempt) = &self.connecting {
+            return (Arc::clone(attempt), false);
+        }
+        let attempt = Arc::new(ConnectAttempt::pending());
+        self.connecting = Some(Arc::clone(&attempt));
+        (attempt, true)
+    }
+
+    fn finish_connection(&mut self, attempt: &Arc<ConnectAttempt>) {
+        if self
+            .connecting
+            .as_ref()
+            .is_some_and(|running| Arc::ptr_eq(running, attempt))
+        {
+            self.connecting = None;
+        }
+    }
 }
 
 /// One live upstream connection. Dropping it cancels the connection's
@@ -209,10 +277,7 @@ impl RiftProxy {
         Self {
             root: Arc::from(root),
             identity: Arc::new(identity),
-            upstream: Arc::new(tokio::sync::Mutex::new(UpstreamSlot {
-                connected: None,
-                generation_next: 0,
-            })),
+            upstream: Arc::new(tokio::sync::Mutex::new(UpstreamSlot::empty())),
             advertised: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -221,40 +286,64 @@ impl RiftProxy {
     ///
     /// `observed` is the generation whose connection failed the caller's
     /// previous attempt, or `None` on a first attempt. The slot's mutex is
-    /// held only to clone the peer out or to connect - never across a
-    /// forward. Connecting under the mutex is the single-flight guarantee:
-    /// concurrent requests that lost the same upstream wait here instead of
-    /// each starting a server, and the double check under the lock reuses a
-    /// reconnect another request already finished.
+    /// held only to clone the peer or join one shared connection attempt -
+    /// never across a connect or forward. Concurrent callers receive the
+    /// same terminal connection result, including a refusal.
     ///
     /// # Cancel safety
     ///
-    /// Dropping this future releases the slot; a partially connected
-    /// upstream is dropped and the next caller connects again.
+    /// Dropping this future leaves its bounded shared connection attempt
+    /// running for other callers.
     async fn leased_peer(
         &self,
         observed: Option<u64>,
     ) -> Result<(Peer<RoleClient>, u64), ErrorData> {
-        let mut slot = self.upstream.lock().await;
-        if let Some(current) = &slot.connected
-            && reuse_current(current.generation, observed)
-        {
-            return Ok((current.running.peer().clone(), current.generation));
+        loop {
+            let (attempt, starts) = {
+                let mut slot = self.upstream.lock().await;
+                if let Some(current) = &slot.connected
+                    && reuse_current(current.generation, observed)
+                {
+                    return Ok((current.running.peer().clone(), current.generation));
+                }
+                // A connection matching `observed` failed the caller. Drop
+                // it before joining or starting its replacement.
+                drop(slot.connected.take());
+                slot.begin_connection()
+            };
+            if starts {
+                self.start_connection(Arc::clone(&attempt));
+            }
+            attempt.outcome().await?;
         }
-        // The replaced connection is dead; dropping it cancels its
-        // transport tasks before the replacement connects.
-        let replaced = slot.connected.take();
-        drop(replaced);
-        let running = connect_upstream(&self.root, &self.identity).await?;
-        self.mirror_advertised(&running);
-        let generation = slot.generation_next;
-        slot.generation_next += 1;
-        let peer = running.peer().clone();
-        slot.connected = Some(Upstream {
-            running,
-            generation,
+    }
+
+    /// Starts one bounded connection attempt and publishes its result to
+    /// every caller that joined it.
+    fn start_connection(&self, attempt: Arc<ConnectAttempt>) {
+        let proxy = self.clone();
+        tokio::spawn(async move {
+            let connected = connect_upstream(&proxy.root, &proxy.identity).await;
+            let result = match connected {
+                Ok(running) => {
+                    proxy.mirror_advertised(&running);
+                    let mut slot = proxy.upstream.lock().await;
+                    let generation = slot.generation_next;
+                    slot.generation_next += 1;
+                    slot.connected = Some(Upstream {
+                        running,
+                        generation,
+                    });
+                    slot.finish_connection(&attempt);
+                    Ok(())
+                }
+                Err(refusal) => {
+                    proxy.upstream.lock().await.finish_connection(&attempt);
+                    Err(refusal)
+                }
+            };
+            attempt.complete(result);
         });
-        Ok((peer, generation))
     }
 
     /// Forwards one request to the upstream with a single reconnect retry.
