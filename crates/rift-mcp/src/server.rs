@@ -1914,24 +1914,42 @@ impl RiftMcp {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RiftMcp {
-    async fn list_resources(
+    fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListResourcesResult, ErrorData> {
-        Ok(ListResourcesResult::with_all_items(
-            resource::declared_resources(),
-        ))
+        context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<rmcp::model::ListToolsResult, ErrorData>> {
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        std::future::ready(Ok(rmcp::model::ListToolsResult {
+            result_type: Some(rmcp::model::ResultType::COMPLETE),
+            tools: self.tool_router.list_all(),
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Public),
+        }))
     }
 
-    async fn list_resource_templates(
+    fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ListResourceTemplatesResult, ErrorData> {
-        Ok(ListResourceTemplatesResult::with_all_items(
+    ) -> impl std::future::Future<Output = Result<ListResourcesResult, ErrorData>> {
+        std::future::ready(Ok(ListResourcesResult::with_all_items(
+            resource::declared_resources(),
+        )))
+    }
+
+    fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListResourceTemplatesResult, ErrorData>> {
+        std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(
             resource::declared_templates(),
-        ))
+        )))
     }
 
     async fn read_resource(

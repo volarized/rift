@@ -209,8 +209,7 @@ pub(crate) fn glob_matches(glob: &str, ignore_case: bool, path: &str) -> bool {
         .literal_separator(true)
         .case_insensitive(ignore_case)
         .build()
-        .ok()
-        .is_some_and(|compiled| compiled.compile_matcher().is_match(path))
+        .is_ok_and(|compiled| compiled.compile_matcher().is_match(path))
 }
 
 /// What the session offers every engine.
