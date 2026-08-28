@@ -23,11 +23,11 @@ const STARTUP_STDERR_CAPTURE_BYTES: usize = 8 << 10;
 pub const PRESENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Longest wait for a spawned server to publish its lock document.
 ///
-/// A start poll runs `START_WAIT_MAX / PRESENCE_POLL_INTERVAL` = 150
+/// A start poll runs `START_WAIT_MAX / PRESENCE_POLL_INTERVAL` = 300
 /// bounded iterations.
-pub const START_WAIT_MAX: Duration = Duration::from_secs(15);
+pub const START_WAIT_MAX: Duration = Duration::from_secs(30);
 /// Probe attempts one start waits: [`START_WAIT_MAX`] over the interval.
-pub const START_POLL_ATTEMPT_COUNT: u32 = 150;
+pub const START_POLL_ATTEMPT_COUNT: u32 = 300;
 
 /// Keeps a detached child completely off this process's terminal and
 /// process group (unix half).

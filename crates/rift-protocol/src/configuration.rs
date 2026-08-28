@@ -24,11 +24,11 @@ use serde::{Deserialize, Serialize};
 pub const SERVER_NUM_WORKERS_MAX: u64 = 64;
 /// Milliseconds one request may wait for a free worker, at most: one hour.
 pub const SERVER_QUEUE_TIMEOUT_MS_MAX: u64 = 3_600_000;
-/// Milliseconds the server serves with no request before it stops, at
-/// least: one second.
+/// Milliseconds the server serves after the last request completes before
+/// it stops, at least: one second.
 pub const SERVER_IDLE_TIMEOUT_MS_MIN: u64 = 1_000;
-/// Milliseconds the server serves with no request before it stops, at
-/// most: one day.
+/// Milliseconds the server serves after the last request completes before
+/// it stops, at most: one day.
 pub const SERVER_IDLE_TIMEOUT_MS_MAX: u64 = 86_400_000;
 /// Milliseconds a request waits for the workspace and its engines to
 /// prove they are ready to answer, at least: one second.
@@ -426,7 +426,8 @@ pub struct ServerConfiguration {
     pub num_workers: u64,
     /// Wall-clock bound one request waits for a free worker, 1ms to 1h.
     pub worker_queue_timeout: Duration,
-    /// Wall-clock span with no served request that stops the server, 1s to 1d.
+    /// Wall-clock span after the last served request completes that stops
+    /// the server while no request remains active, 1s to 1d.
     pub idle_timeout: Duration,
     /// Wall-clock bound one request waits for the workspace's index and
     /// its language engines to prove they are ready to answer, 1s to 1h.

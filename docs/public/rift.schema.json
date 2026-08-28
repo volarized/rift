@@ -882,7 +882,7 @@
         "idle_timeout": {
           "$ref": "#/$defs/Duration",
           "default": "30m",
-          "description": "Wall-clock span with no served request that stops the server, 1s to 1d.",
+          "description": "Wall-clock span after the last served request completes that stops\nthe server while no request remains active, 1s to 1d.",
           "rift:range": {
             "max": "1d",
             "min": "1s"
