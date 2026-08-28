@@ -53,7 +53,10 @@ agent over the stdio transport and forwards each request to the workspace's `rif
 Streamable HTTP; the process holds no state of its own - state lives in the `rift server`. To
 reach the workspace's server it checks the server lock file -
 [`ServerLock`](/docs/protocol/reference#ServerLock) at `.rift/server.json` - and starts a
-server when no live one stands behind it.
+server when no live one stands behind it. Before it adopts a live server, the proxy compares
+package version, executable SHA-256, and canonical MCP schema SHA-256 from the lock with its own
+identity. A mismatch starts a matching server rather than forwarding across different binaries or
+tool documents.
 
 ### rift server
 
@@ -255,8 +258,10 @@ APIs never leave the syntax crate.
 
 An LSP-backed language engine is a child process the server spawns in stdio mode - one per
 language and targeted tree, rooted at that tree's directory. Semantic facts and edit plans
-return through the provider contract, and the server notifies the engine of writes itself,
-because no filesystem watcher sees inside a served tree.
+return through the provider contract. After a change, the server sends one classified path batch
+to each affected engine before it opens final document bytes and pulls diagnostics. That batch
+invalidates readiness from earlier work. Fresh progress tokens, diagnostic refresh requests, and
+repeated full reports decide when those answers are settled.
 
 ## Hooks and configuration
 
@@ -267,8 +272,10 @@ is exported beside the MCP surface as [`rift.schema.json`](https://volar.sh/rift
 so editors validate the file as it is written. A quantity value carries its unit:
 `timeout = "120s"`.
 
-A hook is a configured command the server runs inside the changed tree after a change lands,
-with a declared environment, bounded output, and a timeout. Its verdict attaches to the change
-as [`GuaranteeEvidence`](/docs/protocol/reference#GuaranteeEvidence) or an advisory, and a hook
-that fails or does not finish gates publication in a projection. The
-[configuration](/docs/configuration) page states the keys and defaults.
+A hook is a configured command the server runs inside the changed tree after direct edits land,
+with a declared environment, bounded output, and a timeout. A transform may retain successful
+source writes in its declared scope; Rift recomputes the result from original bytes to final bytes.
+Validation runs afterwards, may retain no source write, and attaches
+[`GuaranteeEvidence`](/docs/protocol/reference#GuaranteeEvidence) or a diagnostic without
+refusing the landed change. A hook that fails or does not finish still gates publication in a
+projection. The [configuration](/docs/configuration) page states the keys and defaults.

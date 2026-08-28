@@ -191,8 +191,9 @@ hit. The ranked lane placed it, so the hit is tagged `matched_by: ["ranked"]`, n
 }
 ```
 
-Every file [`[search.text]`](/docs/configuration#search) includes joins the same index. A hit on
-one of those files returns as a `file` hit, tagged `matched_by: ["ranked"]` the same way:
+Every visible bounded UTF-8 file without a NUL byte joins the same index, independent of language
+or extension. A hit on one of those files returns as a `file` hit, tagged
+`matched_by: ["ranked"]` the same way:
 
 **Request:**
 
@@ -225,8 +226,7 @@ one of those files returns as a `file` hit, tagged `matched_by: ["ranked"]` the 
 }
 ```
 
-A visible file with no extension - `justfile`, `Dockerfile` - joins the same index by default,
-since no configured [`[search.text]`](/docs/configuration#search) extension could ever match it:
+A visible file with no extension - `justfile`, `Dockerfile` - follows the same rule:
 
 ```json
 { "query": "cargo fmt --all --check" }
@@ -432,7 +432,7 @@ The change tools return the same `ChangeResult`. A request whose shape is wrong 
 absolute path, a malformed patch header - fails as `invalid_request` before the server resolves
 anything.
 Otherwise the server resolves the whole operation before writing anything, and the result is one
-of two things.
+of three things.
 
 **Refused**, when resolution produced no edits. The targeted tree is untouched and
 [`RefusalReason`](/docs/protocol/reference#RefusalReason) says what stopped it: the
@@ -471,13 +471,18 @@ still standing. A `replace_node` whose listing went stale shows the shape:
 }
 ```
 
-**Applied**, when it produced edits. The change lands in the targeted tree, and the result's
-`summary` carries the change `id`, the changed `paths`, the concrete `edits`, resolution
-`diagnostics`, and the `guarantees` the workspace's passing hooks established.
+**Applied**, when final bytes differ from original bytes after transform hooks. At least one path
+changed. The result's `summary` carries change `id`, final changed `paths`, concrete `edits`,
+diagnostics, and guarantees passing validation hooks established. Paths and edits are sorted by
+project path; transform writes are part of same summary.
 
 Each entry in `edits` names the bytes it replaced: one entry per hunk for `patch`, one per
 engine-proposed edit for `rename_symbol` and `move_file`, and one spanning the whole file for a
 file the change created or removed.
+
+**Unchanged**, when direct edits landed but successful transform hooks restored original tree
+bytes. Response is `{ "status": "unchanged" }`: no change id, path, edit, index rebuild, or engine
+diagnostic is reported for bytes that did not remain changed.
 
 ## Projections
 
