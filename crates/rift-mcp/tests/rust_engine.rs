@@ -97,3 +97,13 @@ pub(crate) fn fixture() -> EngineFixture {
         ),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fixture_pins_rust_analyzer_1_98() {
+        let fixture = super::fixture();
+        assert_eq!(fixture.program, "rustup");
+        assert_eq!(fixture.arguments, ["run", "1.98", "rust-analyzer"]);
+    }
+}
