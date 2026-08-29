@@ -16,9 +16,11 @@ use axum::routing::post;
 use data_encoding::BASE64URL_NOPAD;
 use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault};
 use rift_index::WorkspaceIndexLimits;
+use rift_protocol::lock::ProductIdentity;
 use rift_server::ReadError;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -130,7 +132,8 @@ impl HttpServeFault {
 /// serving range.
 /// The returned handle's listener is already accepting. Serving ends when
 /// `shutdown` cancels, an authorized `POST /api/stop` arrives, or the
-/// accepted `server.idle_timeout` passes without an authorized request.
+/// accepted `server.idle_timeout` passes after the last authorized request
+/// completes while no request remains active.
 ///
 /// # Errors
 ///
@@ -162,6 +165,7 @@ pub(crate) async fn serve_http_with_storage(
     let server = RiftMcp::build_with_storage(root, WorkspaceIndexLimits::default(), storage)
         .await
         .map_err(HttpServeFault::workspace)?;
+    let identity = server.product_identity().clone();
     let server_table = server.server_configuration().await;
     let idle_timeout = Duration::from_millis(server_table.idle_timeout.milliseconds());
     let supervisor = server.index_supervisor();
@@ -186,6 +190,7 @@ pub(crate) async fn serve_http_with_storage(
     Ok(HttpServer {
         port,
         token,
+        identity,
         stop,
         serving,
         idle_watch,
@@ -199,6 +204,7 @@ pub(crate) async fn serve_http_with_storage(
 pub struct HttpServer {
     port: u16,
     token: String,
+    identity: ProductIdentity,
     stop: CancellationToken,
     serving: JoinHandle<Result<(), std::io::Error>>,
     idle_watch: JoinHandle<()>,
@@ -217,6 +223,12 @@ impl HttpServer {
     #[must_use]
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// Exact identity advertised by this server.
+    #[must_use]
+    pub(crate) fn product_identity(&self) -> &ProductIdentity {
+        &self.identity
     }
 
     /// Waits until the server stopped and its index supervisor shut down.
@@ -434,8 +446,8 @@ struct RequestGate {
     idle: Arc<IdleTracker>,
 }
 
-/// Refuses requests without the exact bearer token, touching the idle
-/// tracker for every request that passes.
+/// Refuses requests without the exact bearer token, tracking every request
+/// that passes until its response completes.
 ///
 /// The token separates OS users sharing the machine; the loopback bind is
 /// the network boundary.
@@ -451,8 +463,10 @@ async fn authorize_request(
     if !bearer_authorized(authorization, &gate.token) {
         return unauthorized();
     }
-    gate.idle.touch();
-    next.run(request).await
+    let activity = gate.idle.begin();
+    let response = next.run(request).await;
+    drop(activity);
+    response
 }
 
 /// Whether an `Authorization` value presents exactly `Bearer` plus `token`.
@@ -492,56 +506,115 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
-/// The instant of the most recent authorized request.
+/// Authorized-request state used by the idle watcher.
+#[derive(Debug)]
+struct IdleState {
+    /// Instant when server started or last authorized request completed.
+    last_activity: Instant,
+    /// Authorized requests that started but have not completed.
+    active_requests: usize,
+}
+
+/// Tracks active authorized requests and the last completed activity.
 #[derive(Debug)]
 struct IdleTracker {
-    last_activity: Mutex<Instant>,
+    state: Mutex<IdleState>,
+    changed: Notify,
 }
 
 impl IdleTracker {
     fn new() -> Self {
         Self {
-            last_activity: Mutex::new(Instant::now()),
+            state: Mutex::new(IdleState {
+                last_activity: Instant::now(),
+                active_requests: 0,
+            }),
+            changed: Notify::new(),
         }
     }
 
-    /// Records an authorized request at the current instant.
-    fn touch(&self) {
-        *self.lock_last_activity() = Instant::now();
+    /// Starts one authorized request. Dropping returned guard records completion.
+    fn begin(&self) -> ActiveRequest<'_> {
+        let mut state = self.lock_state();
+        state.active_requests = state
+            .active_requests
+            .checked_add(1)
+            .expect("active authorized request count must fit usize");
+        drop(state);
+        self.changed.notify_waiters();
+        ActiveRequest { idle: self }
     }
 
-    /// The instant the server has been quiet for `idle_timeout`.
-    fn idle_deadline(&self, idle_timeout: Duration) -> Instant {
-        *self.lock_last_activity() + idle_timeout
+    /// Records one authorized request completion.
+    fn finish(&self) {
+        let mut state = self.lock_state();
+        state.active_requests = state
+            .active_requests
+            .checked_sub(1)
+            .expect("an active authorized request must complete once");
+        if state.active_requests == 0 {
+            state.last_activity = Instant::now();
+        }
+        drop(state);
+        self.changed.notify_waiters();
     }
 
-    /// The tracked instant, recovered from a poisoned lock: the stored
+    /// The instant the server becomes idle, absent while an authorized request remains active.
+    fn idle_deadline(&self, idle_timeout: Duration) -> Option<Instant> {
+        let state = self.lock_state();
+        (state.active_requests == 0).then_some(state.last_activity + idle_timeout)
+    }
+
+    /// The tracked state, recovered from a poisoned lock: the stored
     /// value is plain data, valid regardless of a panicked writer.
-    fn lock_last_activity(&self) -> MutexGuard<'_, Instant> {
-        match self.last_activity.lock() {
+    fn lock_state(&self) -> MutexGuard<'_, IdleState> {
+        match self.state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
     }
 }
 
-/// Cancels `stop` once `idle_timeout` passes with no authorized request.
+/// One active authorized request. Completion is cancellation-safe.
+struct ActiveRequest<'a> {
+    idle: &'a IdleTracker,
+}
+
+impl Drop for ActiveRequest<'_> {
+    fn drop(&mut self) {
+        self.idle.finish();
+    }
+}
+
+/// Cancels `stop` once `idle_timeout` passes after the last authorized request
+/// completes while no request remains active.
 ///
-/// Each turn sleeps to the currently tracked deadline; a touch during the
-/// sleep moves the deadline, and the next turn waits out the remainder, so
-/// turns recur only as often as requests arrive.
+/// Each turn waits for shutdown, activity state change, or current idle deadline.
+/// Active requests have no idle deadline; last completion starts one.
 ///
 /// # Cancel safety
 ///
 /// Dropping this future ends the watch without cancelling `stop`.
 async fn watch_idle(idle: Arc<IdleTracker>, idle_timeout: Duration, stop: CancellationToken) {
     loop {
-        let deadline = idle.idle_deadline(idle_timeout);
-        tokio::select! {
-            () = stop.cancelled() => return,
-            () = tokio::time::sleep_until(deadline) => {}
+        let changed = idle.changed.notified();
+        tokio::pin!(changed);
+        if let Some(deadline) = idle.idle_deadline(idle_timeout) {
+            tokio::select! {
+                () = stop.cancelled() => return,
+                () = &mut changed => continue,
+                () = tokio::time::sleep_until(deadline) => {}
+            }
+        } else {
+            tokio::select! {
+                () = stop.cancelled() => return,
+                () = &mut changed => continue,
+            }
         }
-        if Instant::now() >= idle.idle_deadline(idle_timeout) {
+        if idle
+            .idle_deadline(idle_timeout)
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
             stop.cancel();
             return;
         }
@@ -554,7 +627,7 @@ mod tests {
     use std::time::Duration;
 
     use axum::http::{StatusCode, header};
-    use rift_protocol::lock::{SERVER_PORT_MIN, SERVER_TOKEN_LENGTH, ServerLock};
+    use rift_protocol::lock::{ProductIdentity, SERVER_PORT_MIN, SERVER_TOKEN_LENGTH, ServerLock};
     use rift_server::ReadFault;
     use tokio_util::sync::CancellationToken;
 
@@ -579,7 +652,11 @@ mod tests {
             port: SERVER_PORT_MIN,
             token,
             pid: 1,
-            version: "0.0.9".to_owned(),
+            identity: ProductIdentity {
+                version: "0.0.9".to_owned(),
+                executable_digest: "a".repeat(64),
+                schema_digest: "b".repeat(64),
+            },
         };
         assert_eq!(lock.validate(), Ok(()));
     }
@@ -717,7 +794,7 @@ mod tests {
         let poisoner = Arc::clone(&idle);
         std::thread::spawn(move || {
             let _guard = poisoner
-                .last_activity
+                .state
                 .lock()
                 .expect("the first lock of a fresh tracker must succeed");
             panic!("poison the activity lock");
@@ -725,15 +802,17 @@ mod tests {
         .join()
         .expect_err("the poisoning thread must end by panic");
         assert!(
-            idle.last_activity.lock().is_err(),
+            idle.state.lock().is_err(),
             "the lock must be poisoned for the recovery arm to matter"
         );
         let before = Instant::now();
-        idle.touch();
-        let deadline = idle.idle_deadline(Duration::from_secs(5));
+        drop(idle.begin());
+        let deadline = idle
+            .idle_deadline(Duration::from_secs(5))
+            .expect("completed activity must have an idle deadline");
         assert!(
             deadline >= before + Duration::from_secs(5),
-            "a recovered tracker must keep tracking touches"
+            "a recovered tracker must keep tracking completed activity"
         );
     }
 
@@ -875,7 +954,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn touched_activity_defers_the_idle_stop() {
+    async fn completed_activity_defers_the_idle_stop() {
         let idle = Arc::new(IdleTracker::new());
         let stop = CancellationToken::new();
         let watch = tokio::spawn(watch_idle(
@@ -884,17 +963,72 @@ mod tests {
             stop.clone(),
         ));
         tokio::time::sleep(Duration::from_secs(3)).await;
-        idle.touch();
+        drop(idle.begin());
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(
             !stop.is_cancelled(),
-            "a touch inside the span must defer the stop"
+            "completed activity inside the span must defer the stop"
         );
         tokio::time::sleep(Duration::from_secs(3)).await;
         watch.await.expect("watch task must join");
         assert!(
             stop.is_cancelled(),
             "the deferred deadline must still stop the server"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn authorized_request_defers_idle_stop_until_after_completion() {
+        let idle = Arc::new(IdleTracker::new());
+        let stop = CancellationToken::new();
+        let watch = tokio::spawn(watch_idle(
+            Arc::clone(&idle),
+            Duration::from_secs(5),
+            stop.clone(),
+        ));
+        let request = idle.begin();
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(
+            !stop.is_cancelled(),
+            "idle timeout must not stop an authorized request in progress"
+        );
+        drop(request);
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(
+            !stop.is_cancelled(),
+            "idle time starts after the last authorized request completes"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        watch.await.expect("watch task must join");
+        assert!(
+            stop.is_cancelled(),
+            "the later quiet span must stop the server"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_active_request_must_complete_before_idle_time_starts() {
+        let idle = Arc::new(IdleTracker::new());
+        let stop = CancellationToken::new();
+        let watch = tokio::spawn(watch_idle(
+            Arc::clone(&idle),
+            Duration::from_secs(5),
+            stop.clone(),
+        ));
+        let first = idle.begin();
+        let second = idle.begin();
+        drop(first);
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(
+            !stop.is_cancelled(),
+            "one remaining authorized request must keep the server active"
+        );
+        drop(second);
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        watch.await.expect("watch task must join");
+        assert!(
+            stop.is_cancelled(),
+            "idle time starts after final completion"
         );
     }
 

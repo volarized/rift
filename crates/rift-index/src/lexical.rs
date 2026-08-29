@@ -1,4 +1,4 @@
-//! Full-text search over lexical units: code symbols and non-source text
+//! Full-text search over lexical units: code symbols and visible text files
 //! files.
 //!
 //! Unit granularity is the symbol or the text file, chosen so a later
@@ -127,7 +127,7 @@ pub(crate) const MIGRATIONS: MigrationSet = MigrationSet::new(MIGRATION_FILES);
 pub enum LexicalUnitKind {
     /// A code symbol: one declaration extracted from source.
     Symbol,
-    /// A non-source text file indexed as one whole unit.
+    /// A visible text file indexed as one whole unit.
     TextFile,
 }
 

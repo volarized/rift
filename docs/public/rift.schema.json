@@ -22,7 +22,41 @@
     },
     "CommandHook": {
       "additionalProperties": false,
-      "description": "One `[[hooks]]` block: an executable Rift starts directly - no shell -\ninside the changed tree each time a change applies. Every key is\nrequired; the schema carries no defaults.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "writes": {
+                "const": "changed_paths"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "guarantees": {
+                "maxItems": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "writes": {
+                "const": "workspace"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "guarantees": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      ],
+      "description": "One `[[hooks]]` command the server runs inside the changed tree.\nEvery key is required; the schema carries no defaults.",
       "properties": {
         "arguments": {
           "description": "The program's literal arguments, in order. May be empty.",
@@ -34,21 +68,25 @@
         },
         "changed_paths": {
           "$ref": "#/$defs/ChangedPaths",
-          "description": "Whether the changed project paths are appended after `arguments` in\nbyte order."
+          "description": "Whether the server appends changed project paths after `arguments`, in byte order."
         },
         "determinism": {
           "$ref": "#/$defs/Determinism",
-          "description": "Whether an identical tree and environment are expected to reproduce\nthe result."
+          "description": "Whether an identical tree and environment are expected to reproduce the result."
         },
         "environment": {
           "additionalProperties": {
             "type": "string"
           },
-          "description": "Environment values added on top of the environment the server\ninherited.",
+          "description": "Environment values added to the environment the server inherited.",
           "type": "object"
         },
+        "failure_severity": {
+          "$ref": "#/$defs/HookFailureSeverity",
+          "description": "Severity the server reports when the hook does not pass."
+        },
         "guarantees": {
-          "description": "What a passing run establishes. Each entry becomes evidence on the\nchange the hook checked.",
+          "description": "What a passing validation establishes. Transform hooks cannot declare guarantees.",
           "items": {
             "$ref": "#/$defs/HookGuarantee"
           },
@@ -63,24 +101,24 @@
         },
         "kind": {
           "$ref": "#/$defs/HookKind",
-          "description": "What the hook is: a test suite, a linter, a build, or something else."
+          "description": "What the hook is: a formatter, test suite, linter, build, or another command."
         },
         "output_limit": {
           "$ref": "#/$defs/ByteSize",
-          "description": "Bytes of each output stream Rift keeps, 256b to 4kb. The full size\nis still reported.",
+          "description": "Bytes of each output stream the server keeps, 256b to 4kb. The full size is still reported.",
           "rift:range": {
             "max": "4kb",
             "min": "256b"
           }
         },
         "program": {
-          "description": "The executable Rift starts. A bare name resolves through `PATH`; a\npath resolves below `working_directory`. An absolute path or a `.`\nor `..` segment is refused.",
+          "description": "The executable the server starts. A bare name resolves through `PATH`; a path resolves\nbelow `working_directory`. Absolute paths and `.` or `..` segments are refused.",
           "minLength": 1,
           "type": "string"
         },
         "timeout": {
           "$ref": "#/$defs/Duration",
-          "description": "Wall-clock bound before Rift kills the process, 1ms to 1h.",
+          "description": "Wall-clock bound before the server kills the process, 1ms to 1h.",
           "rift:range": {
             "max": "1h",
             "min": "1ms"
@@ -88,11 +126,15 @@
         },
         "type": {
           "$ref": "#/$defs/HookType",
-          "description": "How the hook runs; `command` is the only type."
+          "description": "How the server runs the hook; `command` is the only type."
         },
         "working_directory": {
           "$ref": "#/$defs/ProjectPath",
-          "description": "Directory the process starts in, relative to the changed tree's\nroot. Empty selects the root. An absolute path or a `.` or `..`\nsegment is refused."
+          "description": "Directory the process starts in, relative to the changed tree's root. Empty selects the\nroot. Absolute paths and `.` or `..` segments are refused."
+        },
+        "writes": {
+          "$ref": "#/$defs/HookWrites",
+          "description": "Source files the server permits the hook to change."
         }
       },
       "required": [
@@ -102,10 +144,12 @@
         "program",
         "arguments",
         "changed_paths",
+        "writes",
         "working_directory",
         "environment",
         "timeout",
         "output_limit",
+        "failure_severity",
         "guarantees",
         "determinism"
       ],
@@ -394,6 +438,21 @@
       },
       "type": "object"
     },
+    "HookFailureSeverity": {
+      "description": "Severity the server reports when a hook does not pass.",
+      "oneOf": [
+        {
+          "const": "warning",
+          "description": "The hook result reports a warning.",
+          "type": "string"
+        },
+        {
+          "const": "error",
+          "description": "The hook result reports an error.",
+          "type": "string"
+        }
+      ]
+    },
     "HookGuarantee": {
       "additionalProperties": false,
       "description": "What a passing run of one hook establishes about the change it checked.",
@@ -424,6 +483,11 @@
       "description": "What a hook is, as workspace configuration presents it.",
       "oneOf": [
         {
+          "const": "format",
+          "description": "A source formatter.",
+          "type": "string"
+        },
+        {
           "const": "test",
           "description": "A test suite.",
           "type": "string"
@@ -451,6 +515,26 @@
         {
           "const": "command",
           "description": "An executable Rift starts directly inside the changed tree.",
+          "type": "string"
+        }
+      ]
+    },
+    "HookWrites": {
+      "description": "Source writes the server may retain from one hook.",
+      "oneOf": [
+        {
+          "const": "none",
+          "description": "A validation hook that may not change source files.",
+          "type": "string"
+        },
+        {
+          "const": "changed_paths",
+          "description": "A transform hook that may change only paths changed before hooks ran.",
+          "type": "string"
+        },
+        {
+          "const": "workspace",
+          "description": "A transform hook that may change any source file in the workspace.",
           "type": "string"
         }
       ]
@@ -615,7 +699,7 @@
     },
     "SearchConfiguration": {
       "additionalProperties": false,
-      "description": "The `[search]` table. Search fuses a lexical ranking with a semantic one:\n`lexical` and `semantic` weigh the two against each other, `fusion_k` sets\nhow sharply a top rank counts, `pool_slots` and `busy_timeout` bound the\nshared `SQLite` connections behind search and logs, and `text` includes\nnon-source text files in the lexical index.",
+      "description": "The `[search]` table. Search fuses a lexical ranking with a semantic one:\n`lexical` and `semantic` weigh the two against each other, `fusion_k` sets\nhow sharply a top rank counts, `pool_slots` and `busy_timeout` bound the\nshared `SQLite` connections behind search and logs, and `text` bounds\nlexical chunks derived from visible text files.",
       "properties": {
         "busy_timeout": {
           "$ref": "#/$defs/Duration",
@@ -669,14 +753,9 @@
         "text": {
           "$ref": "#/$defs/TextSearchConfiguration",
           "default": {
-            "extensions": [
-              "md",
-              "mdx",
-              "txt"
-            ],
             "max_chunk": "1mb"
           },
-          "description": "Which non-source text files join the lexical index alongside code\nsymbols."
+          "description": "Chunking policy for visible text files in lexical search."
         }
       },
       "type": "object"
@@ -803,7 +882,7 @@
         "idle_timeout": {
           "$ref": "#/$defs/Duration",
           "default": "30m",
-          "description": "Wall-clock span with no served request that stops the server, 1s to 1d.",
+          "description": "Wall-clock span after the last served request completes that stops\nthe server while no request remains active, 1s to 1d.",
           "rift:range": {
             "max": "1d",
             "min": "1s"
@@ -893,25 +972,12 @@
     },
     "TextSearchConfiguration": {
       "additionalProperties": false,
-      "description": "The `[search.text]` table: which non-source text files join the lexical index, as one\nunit each, or as several size-bounded chunks when a file exceeds `max_chunk`.",
+      "description": "The `[search.text]` table. `max_chunk` bounds lexical units derived from\nvisible text files.",
       "properties": {
-        "extensions": {
-          "default": [
-            "md",
-            "mdx",
-            "txt"
-          ],
-          "description": "File extensions, without the leading dot, included as text-file lexical units:\nlowercase ASCII alphanumeric only (so a leading dot is already excluded), at most\n16 bytes each, at most 32 entries, no duplicates.",
-          "items": {
-            "type": "string"
-          },
-          "maxItems": 32,
-          "type": "array"
-        },
         "max_chunk": {
           "$ref": "#/$defs/ByteSize",
           "default": "1mb",
-          "description": "Bytes one lexical chunk may hold, 1kb to 16mb. A text file larger than this is\nindexed as several chunks of at most this size; an operator who wants a file out of\nthe index excludes it in `[source]` or drops its extension from `extensions`.",
+          "description": "Bytes one lexical chunk may hold, 1kb to 16mb. Larger files are indexed as\nseveral chunks of at most this size.",
           "rift:range": {
             "max": "16mb",
             "min": "1kb"
@@ -995,15 +1061,10 @@
           "weight": 0.3
         },
         "text": {
-          "extensions": [
-            "md",
-            "mdx",
-            "txt"
-          ],
           "max_chunk": "1mb"
         }
       },
-      "description": "The lexical search index: which non-source files join it, the `SQLite` bounds behind\nit, and the embedding model that adds dense ranking on top."
+      "description": "Search ranking, visible text chunking, and storage bounds."
     },
     "server": {
       "$ref": "#/$defs/ServerConfiguration",

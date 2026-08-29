@@ -1043,15 +1043,15 @@ mod tests {
     struct RefusingTransport;
 
     impl FileTransport for RefusingTransport {
-        async fn fetch(
+        fn fetch(
             &self,
             url: &str,
             _destination: &Path,
             _bytes_max: u64,
-        ) -> Result<FetchedFile, SearchError> {
-            Err(download_refused(format!(
+        ) -> impl std::future::Future<Output = Result<FetchedFile, SearchError>> {
+            std::future::ready(Err(download_refused(format!(
                 "`{url}`: the cache was expected to answer"
-            )))
+            ))))
         }
     }
 
@@ -1089,16 +1089,16 @@ mod tests {
     }
 
     impl FileTransport for RecordingTransport {
-        async fn fetch(
+        fn fetch(
             &self,
             url: &str,
             _destination: &Path,
             _bytes_max: u64,
-        ) -> Result<FetchedFile, SearchError> {
+        ) -> impl std::future::Future<Output = Result<FetchedFile, SearchError>> {
             if let Ok(mut urls) = self.urls.lock() {
                 urls.push(url.to_owned());
             }
-            Err(download_refused(format!("`{url}`: recorded")))
+            std::future::ready(Err(download_refused(format!("`{url}`: recorded"))))
         }
     }
 

@@ -2,6 +2,7 @@
   "name": "rift-live-fixture",
   "private": true,
   "devDependencies": {
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "typescript-language-server": "6.0.0"
   }
 }

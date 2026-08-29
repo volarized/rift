@@ -363,12 +363,16 @@ pub fn read_serving(root: &Path) -> Option<ServerLock> {
 }
 
 /// The lock document this process publishes for one bound server.
-fn served_document(port: u16, token: &str) -> ServerLock {
+fn served_document(
+    port: u16,
+    token: &str,
+    identity: rift_protocol::lock::ProductIdentity,
+) -> ServerLock {
     ServerLock {
         port,
         token: token.to_owned(),
         pid: std::process::id(),
-        version: env!("CARGO_PKG_VERSION").to_owned(),
+        identity,
     }
 }
 
@@ -418,7 +422,11 @@ pub async fn serve_elected_with_storage(
     let server = serve_http_with_storage(root, serving_stop.clone(), storage)
         .await
         .map_err(ElectionFault::serve)?;
-    let document = served_document(server.port(), server.token());
+    let document = served_document(
+        server.port(),
+        server.token(),
+        server.product_identity().clone(),
+    );
     match guard.publish(&document) {
         Ok(()) => Ok(ElectedServer { server, guard }),
         Err(error) => Err(shut_down_unpublished(server, &serving_stop, error).await),
@@ -517,7 +525,11 @@ mod tests {
             port: SERVER_PORT_MIN,
             token: "a".repeat(SERVER_TOKEN_LENGTH),
             pid: 4_242,
-            version: "0.0.11".to_owned(),
+            identity: rift_protocol::lock::ProductIdentity {
+                version: "0.0.11".to_owned(),
+                executable_digest: "a".repeat(64),
+                schema_digest: "b".repeat(64),
+            },
         }
     }
 
@@ -757,9 +769,10 @@ mod tests {
     #[test]
     fn served_document_records_this_process_and_release() {
         let token = "a".repeat(SERVER_TOKEN_LENGTH);
-        let document = served_document(SERVER_PORT_MIN, &token);
+        let identity = valid_document().identity;
+        let document = served_document(SERVER_PORT_MIN, &token, identity.clone());
         assert_eq!(document.pid, std::process::id());
-        assert_eq!(document.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(document.identity, identity);
         assert_eq!(document.port, SERVER_PORT_MIN);
         assert_eq!(document.token, token);
         assert_eq!(document.validate(), Ok(()));

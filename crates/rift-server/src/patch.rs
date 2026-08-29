@@ -86,7 +86,10 @@ pub(crate) fn split_file_segments(patch: &str) -> Result<Vec<String>, ReadError>
         ));
     }
     if raw_segments.is_empty() {
-        return Err(ReadFault::invalid("patch", "carries no `---` file header"));
+        return Err(ReadFault::invalid(
+            "patch",
+            "carries no file headers; start a unified diff with `--- a/path` and `+++ b/path`",
+        ));
     }
     Ok(raw_segments
         .iter()
@@ -403,9 +406,8 @@ fn drift_checked_base(
     }
 }
 
-/// Reads `path` fresh from disk through the `[source]` policy alone: the route for a
-/// visible file no syntax provider parses and no text extension includes, such as
-/// `justfile` or `.gitignore`. A path the policy excludes refuses `unsupported`,
+/// Reads `path` fresh from disk through the `[source]` policy alone when current index
+/// does not hold it. A path the policy excludes refuses `unsupported`,
 /// naming the policy; a visible path absent from the filesystem refuses
 /// `target_exists` the way an unindexed path already does; a directory refuses
 /// `target_is_file` instead of reaching the read that would otherwise fail unclassified.
@@ -1014,6 +1016,7 @@ mod tests {
             ChangeResult::Refused { reason, .. } => {
                 panic!("change must land, got refusal {reason:?}")
             }
+            ChangeResult::Unchanged => panic!("change must land, got unchanged result"),
         }
     }
 
@@ -1310,12 +1313,8 @@ mod tests {
             .removes_file()
         );
         assert!(RewriteKind::Delete.removes_file());
-        let _ = FileRewrite {
-            path: rift_core::ProjectPath::new("f.rs")?,
-            kind: RewriteKind::Delete,
-            previous_len: 0,
-            next_source: String::new(),
-        };
+        let path = rift_core::ProjectPath::new("f.rs")?;
+        let _ = FileRewrite::delete(path, "");
         Ok(())
     }
 
@@ -1989,8 +1988,7 @@ mod tests {
         Ok(())
     }
 
-    /// Builds a workspace with `lib.rs`, a text-indexed `.mdx` file, and two files no
-    /// extension gate admits at all: `justfile` and `.gitignore` itself.
+    /// Builds workspace with provider source and baseline text files.
     fn visible_file_fixture() -> TestResult<(tempfile::TempDir, ReadService, ChangeService)> {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
@@ -2028,12 +2026,9 @@ mod tests {
         Ok(())
     }
 
-    /// A visible file no extension gate admits at all - no syntax provider claims it
-    /// and no `[search.text]` extension includes it - still resolves as a patch
-    /// target through the `[source]` policy alone. `justfile` and `.gitignore` both
-    /// prove it, in one change.
+    /// Baseline files no syntax provider claims still resolve as patch targets.
     #[test]
-    fn patch_applies_against_files_no_extension_gate_admits() -> TestResult {
+    fn patch_applies_against_baseline_files_without_syntax_providers() -> TestResult {
         let (directory, reads, changes) = visible_file_fixture()?;
         let patch = [
             "--- a/justfile",
@@ -2532,9 +2527,8 @@ mod tests {
         Ok(())
     }
 
-    /// A file `resolve_base_image` finds unindexed - no syntax provider claims `.lock`,
-    /// and it carries no `[search.text]` extension - reads through the `[source]` policy
-    /// directly, and a stat failure on that read surfaces as `storage_failure` rather
+    /// A file `resolve_base_image` finds absent from index reads through `[source]` policy
+    /// directly, and stat failure on that read surfaces as `storage_failure` rather
     /// than reaching the mismatch path.
     #[cfg(unix)]
     #[test]

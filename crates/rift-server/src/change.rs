@@ -6,6 +6,7 @@
 //! untouched. Application is serialized per service, so two concurrent
 //! changes collide as one clean refusal rather than as interleaved bytes.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -21,8 +22,8 @@ use rift_protocol::change::{
     PreconditionValue, RefusalReason, ReplaceNodeParams, ReplaceSymbolParams,
 };
 use rift_protocol::read::{
-    Diagnostic, DiagnosticContinuation, DiagnosticReliability, Extensions, FileId, Language,
-    Severity, SourceSpan, TextRange,
+    Diagnostic, DiagnosticCode, DiagnosticContinuation, DiagnosticReliability, Extensions, FileId,
+    Language, Severity, SourceSpan, TextRange,
 };
 use rift_syntax::{ByteRange, SyntaxDocument, SyntaxSource, registry};
 use sha2::{Digest as _, Sha256};
@@ -53,6 +54,82 @@ const CHANGE_EDITS_MAX: usize = 256;
 pub struct ChangeService {
     root: PathBuf,
     application: Mutex<()>,
+}
+
+/// Visible source state captured around one hook run.
+#[derive(Clone, Debug, Default)]
+pub struct HookSnapshot {
+    sources: BTreeMap<CoreProjectPath, HookSource>,
+}
+
+/// One visible source file's bytes and supported permissions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HookSource {
+    bytes: String,
+    permissions: fs::Permissions,
+}
+
+impl HookSnapshot {
+    /// Returns paths whose source state differs between snapshots.
+    #[must_use]
+    pub fn changed_paths(&self, after: &Self) -> Vec<rift_protocol::read::ProjectPath> {
+        source_paths(self, after)
+            .filter(|path| self.sources.get(*path) != after.sources.get(*path))
+            .map(|path| rift_protocol::read::ProjectPath(path.as_str().to_owned()))
+            .collect()
+    }
+
+    /// Returns whether an existing source file's permissions changed.
+    #[must_use]
+    pub fn permissions_changed(&self, after: &Self) -> bool {
+        source_paths(self, after).any(|path| {
+            matches!(
+                (self.sources.get(path), after.sources.get(path)),
+                (Some(before), Some(after)) if before.permissions != after.permissions
+            )
+        })
+    }
+
+    /// Returns whether snapshots carry identical source state.
+    #[must_use]
+    pub fn is_unchanged(&self, after: &Self) -> bool {
+        self.sources == after.sources
+    }
+}
+
+/// Iterates union of two snapshot path sets in byte order.
+fn source_paths<'a>(
+    before: &'a HookSnapshot,
+    after: &'a HookSnapshot,
+) -> impl Iterator<Item = &'a CoreProjectPath> {
+    let paths: BTreeSet<&CoreProjectPath> =
+        before.sources.keys().chain(after.sources.keys()).collect();
+    paths.into_iter()
+}
+
+/// Builds whole-file rewrites from one hook snapshot to another.
+fn snapshot_rewrites(before: &HookSnapshot, after: &HookSnapshot) -> Vec<FileRewrite> {
+    source_paths(before, after)
+        .filter_map(
+            |path| match (before.sources.get(path), after.sources.get(path)) {
+                (Some(previous), Some(next)) if previous != next => Some(
+                    FileRewrite::modify(
+                        path.clone(),
+                        &previous.bytes,
+                        next.bytes.clone(),
+                        Vec::new(),
+                    )
+                    .with_permissions(next.permissions.clone()),
+                ),
+                (Some(previous), None) => Some(FileRewrite::delete(path.clone(), &previous.bytes)),
+                (None, Some(next)) => Some(
+                    FileRewrite::create(path.clone(), next.bytes.clone())
+                        .with_permissions(next.permissions.clone()),
+                ),
+                _ => None,
+            },
+        )
+        .collect()
 }
 
 /// One resolved operation: the file it rewrites and the bytes that replace
@@ -214,6 +291,94 @@ impl ChangeService {
             root: root.to_path_buf(),
             application: Mutex::new(()),
         }
+    }
+
+    /// Captures indexed visible source state for hook checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when filesystem permissions cannot be captured.
+    pub fn hook_snapshot(&self, reads: &ReadService) -> Result<HookSnapshot, ReadError> {
+        let indexed_sources = reads
+            .index()
+            .files()
+            .map(|file| (file.path().clone(), file.source().to_owned()))
+            .chain(
+                reads
+                    .index()
+                    .text_files()
+                    .map(|file| (file.path().clone(), file.content().to_owned())),
+            );
+        let sources = indexed_sources
+            .map(|(path, bytes)| {
+                let permissions = fs::metadata(self.root.join(path.as_str()))
+                    .map_err(|error| ReadFault::storage(path.as_str(), "metadata", &error))?
+                    .permissions();
+                Ok((path, HookSource { bytes, permissions }))
+            })
+            .collect::<Result<BTreeMap<_, _>, ReadError>>()?;
+        Ok(HookSnapshot { sources })
+    }
+
+    /// Restores source bytes changed during one rejected hook run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when shared publication cannot restore source state.
+    pub fn restore_hook_snapshot(
+        &self,
+        reads: &ReadService,
+        before: &HookSnapshot,
+        after: &HookSnapshot,
+    ) -> Result<(), ReadError> {
+        let _application = self
+            .application
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rewrites = snapshot_rewrites(after, before);
+        if rewrites.is_empty() {
+            return Ok(());
+        }
+        match crate::publish::publish_rewrites(reads, &self.root, &rewrites)? {
+            Ok(_) => Ok(()),
+            Err(refusal) => Err(ReadFault::task(
+                "hook source restore",
+                format!("{refusal:?}"),
+            )),
+        }
+    }
+
+    /// Replaces direct summary identity and edits with final hook bytes.
+    #[must_use]
+    pub fn finalize_hook_result(
+        &self,
+        before: &HookSnapshot,
+        after: &HookSnapshot,
+        mut summary: ChangeSummary,
+    ) -> ChangeResult {
+        let rewrites: Vec<FileRewrite> = snapshot_rewrites(before, after)
+            .into_iter()
+            .filter(FileRewrite::changes_bytes)
+            .collect();
+        if rewrites.is_empty() {
+            return ChangeResult::Unchanged;
+        }
+        let mut identity = Sha256::new();
+        summary.paths.clear();
+        summary.edits.clear();
+        for rewrite in &rewrites {
+            identity.update(rewrite.path.as_str().as_bytes());
+            identity.update([0]);
+            identity.update(rewrite.next_source.as_bytes());
+            summary.paths.push(rift_protocol::read::ProjectPath(
+                rewrite.path.as_str().to_owned(),
+            ));
+            let unit = file_id(&rewrite.path);
+            summary.edits.extend(rewrite_edits(rewrite, &unit, false));
+        }
+        let digest = identity.finalize();
+        summary.id = ChangeId(crate::read::digest_wire_hex(&digest));
+        ChangeResult::Applied { summary }
     }
 
     /// Replaces one declaration addressed by symbol.
@@ -483,20 +648,12 @@ impl ChangeService {
         Ok(result)
     }
 
-    /// Verifies and writes one move plan atomically: every reference
-    /// rewrite, the destination's new file, and the source's removal land
-    /// or roll back together.
-    ///
-    /// The plan's bases are re-proven against the disk first - the same
-    /// proof `apply_rename` runs - plus the move's own conditions: the
-    /// source still served, its bytes unchanged, the destination still
-    /// absent. An applied move whose engine was skipped carries the
-    /// references-not-updated warning on its summary.
+    /// Verifies and writes one move plan atomically.
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] for a filesystem failure; a condition that no
-    /// longer holds returns a refused [`ChangeResult`] instead.
+    /// Returns `ReadError` for filesystem failure; failed conditions
+    /// return refused `ChangeResult`.
     pub fn apply_move(
         &self,
         reads: &ReadService,
@@ -528,9 +685,10 @@ impl ChangeService {
             ));
         }
         let mut rewrites: Vec<FileRewrite> = plan.rewrites.iter().map(modify_rewrite).collect();
-        rewrites.push(FileRewrite::create(
+        rewrites.push(FileRewrite::create_from(
             plan.to.clone(),
             plan.moved_next.clone(),
+            plan.from.clone(),
         ));
         rewrites.push(FileRewrite::delete(plan.from.clone(), &plan.moved_source));
         rewrites.sort_by(|first, second| first.path.as_str().cmp(second.path.as_str()));
@@ -668,25 +826,52 @@ impl ChangeService {
         self.apply_rewrites(reads, &rewrites)
     }
 
-    /// Stages and publishes whole-file rewrites, all or none, through
-    /// [`crate::publish::publish_rewrites`], then builds the result: only
-    /// the filesystem transaction lives there, this keeps building the
-    /// [`ChangeResult`].
+    /// Publishes byte-changing rewrites as one filesystem transaction, then
+    /// builds result from members that changed.
     fn apply_rewrites(
         &self,
         reads: &ReadService,
         rewrites: &[FileRewrite],
     ) -> Result<ChangeResult, ReadError> {
-        let warnings = match crate::publish::publish_rewrites(reads, &self.root, rewrites)? {
+        let mut effective: Vec<FileRewrite> = rewrites
+            .iter()
+            .filter(|rewrite| rewrite.changes_bytes())
+            .cloned()
+            .collect();
+        effective.sort_by(|first, second| first.path.as_str().cmp(second.path.as_str()));
+        if effective.is_empty() {
+            let paths = rewrites
+                .iter()
+                .map(|rewrite| rewrite.path.as_str().to_owned())
+                .collect();
+            let source = rewrites
+                .first()
+                .map_or("", |rewrite| rewrite.previous_source.as_str());
+            let digest = digest_hex8(source);
+            return Ok(ChangeResult::refused(
+                RefusalReason::UnmetPrecondition,
+                vec![OperationPrecondition::new(
+                    OperationPreconditionKind::SourceUnchanged,
+                    OperationPreconditionStatus::Failed,
+                    Vec::new(),
+                    paths,
+                    PreconditionValue::Text {
+                        value: digest.clone(),
+                    },
+                    PreconditionValue::Text { value: digest },
+                )],
+            ));
+        }
+        let warnings = match crate::publish::publish_rewrites(reads, &self.root, &effective)? {
             Ok(warnings) => warnings,
             Err(refusal) => return Ok(refusal),
         };
-        let ranged = regions_fit_the_edit_bound(rewrites);
+        let ranged = regions_fit_the_edit_bound(&effective);
         let mut identity = Sha256::new();
-        let mut paths = Vec::with_capacity(rewrites.len());
-        let mut edits = Vec::with_capacity(rewrites.len());
+        let mut paths = Vec::with_capacity(effective.len());
+        let mut edits = Vec::with_capacity(effective.len());
         let mut diagnostics = warnings;
-        for rewrite in rewrites {
+        for rewrite in &effective {
             identity.update(rewrite.path.as_str().as_bytes());
             identity.update([0]);
             identity.update(rewrite.next_source.as_bytes());
@@ -854,11 +1039,9 @@ fn regions_fit_the_edit_bound(rewrites: &[FileRewrite]) -> bool {
         <= CHANGE_EDITS_MAX
 }
 
-/// The edits one rewrite contributes to a change result: one per replaced
-/// region for a modification, and the whole file for a create or a delete,
-/// where the whole file is the change. A batch whose regions did not fit
-/// the edit bound passes `ranged` as false and reports whole files
-/// throughout.
+/// Edits one rewrite contributes to change result: one per replaced
+/// region for modification, and whole file for create or delete.
+/// Batch whose regions exceed edit bound reports whole files.
 fn rewrite_edits(rewrite: &FileRewrite, unit: &FileId, ranged: bool) -> Vec<Edit> {
     match &rewrite.kind {
         RewriteKind::Modify { replaced } if ranged => replaced
@@ -875,7 +1058,7 @@ fn rewrite_edits(rewrite: &FileRewrite, unit: &FileId, ranged: bool) -> Vec<Edit
         _ => vec![replace_edit(
             unit,
             0,
-            rewrite.previous_len,
+            rewrite.previous_len(),
             rewrite.next_source.clone(),
         )],
     }
@@ -923,43 +1106,45 @@ fn spliced_at_file_edge(
     )
 }
 
-/// Splices `body` beside `anchor` at `position`. The caller writes a zero-width edit at the
-/// returned byte offset with the returned text; the separator between `body` and what already
-/// stood there is one blank line using `source`'s own line ending.
+/// Returns line endings needed for one blank line between adjacent source.
+fn blank_line_separator(left: &str, right: &str, ending: LineEnding) -> String {
+    let ending = ending.as_str();
+    let trailing_count = left
+        .strip_suffix(ending)
+        .map_or(0, |rest| 1 + usize::from(rest.ends_with(ending)));
+    let leading_count = right
+        .strip_prefix(ending)
+        .map_or(0, |rest| 1 + usize::from(rest.starts_with(ending)));
+    ending.repeat(2_usize.saturating_sub(trailing_count + leading_count))
+}
+
+/// Splices `body` beside declaration at `position`.
 ///
-/// `Before` reads the bytes between the anchor's line start and `anchor.start`: when they
-/// hold only spaces or tabs, that prefix stays attached to `body`'s first line - the
-/// splice point is unchanged, so the existing prefix is never touched - and a second copy
-/// follows the separator, so the anchor keeps its original column. A prefix holding source
-/// text is never copied. `After` always starts `body` on a fresh line at column zero, past
-/// the same separator.
-///
-/// Holds no language, extension, or grammar case: every line-ending and blank-content
-/// decision routes through `rift_core::line`.
+/// First body line inherits declaration column when bytes before declaration
+/// on its line contain only spaces or tabs. Later body lines remain verbatim.
 fn spliced_beside_anchor(
     source: &str,
     anchor: ByteRange,
     position: InsertPosition,
     body: &str,
 ) -> (u64, String) {
-    let ending = source_line_ending(source).as_str();
-    let separator = format!("{ending}{ending}");
+    let ending = source_line_ending(source);
+    let start = usize::try_from(anchor.start).expect("anchor start fits this platform's usize");
+    let end = usize::try_from(anchor.end).expect("anchor end fits this platform's usize");
+    let line_start = source[..start]
+        .rfind(char::from(line::LINE_FEED))
+        .map_or(0, |index| index + 1);
+    let prefix = &source[line_start..start];
+    let column = if is_blank_content(prefix) { prefix } else { "" };
     match position {
         InsertPosition::Before => {
-            let start =
-                usize::try_from(anchor.start).expect("anchor start fits this platform's usize");
-            let line_start = source[..start]
-                .rfind(char::from(line::LINE_FEED))
-                .map_or(0, |index| index + 1);
-            let prefix = &source[line_start..start];
-            let text = if is_blank_content(prefix) {
-                format!("{body}{separator}{prefix}")
-            } else {
-                format!("{body}{separator}")
-            };
-            (anchor.start, text)
+            let separator = blank_line_separator(body, &source[start..], ending);
+            (anchor.start, format!("{body}{separator}{column}"))
         }
-        InsertPosition::After => (anchor.end, format!("{separator}{body}")),
+        InsertPosition::After => {
+            let separator = blank_line_separator(&source[..end], body, ending);
+            (anchor.end, format!("{separator}{column}{body}"))
+        }
     }
 }
 
@@ -1294,7 +1479,7 @@ fn change_diagnostic(
 ) -> Diagnostic {
     Diagnostic {
         severity: Severity::Error,
-        code: None,
+        code: Some(DiagnosticCode::SyntaxError.code()),
         message,
         span: range.map(|range| SourceSpan {
             unit,
@@ -1492,13 +1677,466 @@ mod tests {
         ]
     }
 
+    #[derive(Clone, Copy)]
+    struct DeclarationWriteCase {
+        language_segment: &'static str,
+        file_name: &'static str,
+        name: &'static str,
+        source: &'static str,
+        declaration: &'static str,
+        replacement: &'static str,
+        inserted_before: &'static str,
+        inserted_after: &'static str,
+        replaced_source: &'static str,
+        before_source: &'static str,
+        after_source: &'static str,
+        removed_source: &'static str,
+    }
+
+    const DECLARATION_WRITE_CASES: [DeclarationWriteCase; 8] = [
+        DeclarationWriteCase {
+            language_segment: "rust",
+            file_name: "lib.rs",
+            name: "target",
+            source: "fn target() {}\nfn right() {}\n",
+            declaration: "fn target() {}",
+            replacement: "fn target() { let _changed = 1; }",
+            inserted_before: "fn before() {}",
+            inserted_after: "fn after() {}",
+            replaced_source: "fn target() { let _changed = 1; }\nfn right() {}\n",
+            before_source: "fn before() {}\n\nfn target() {}\nfn right() {}\n",
+            after_source: "fn target() {}\n\nfn after() {}\nfn right() {}\n",
+            removed_source: "fn right() {}\n",
+        },
+        DeclarationWriteCase {
+            language_segment: "javascript",
+            file_name: "index.js",
+            name: "target",
+            source: "function target() {}\nfunction right() {}\n",
+            declaration: "function target() {}",
+            replacement: "function target() { return 1; }",
+            inserted_before: "function before() {}",
+            inserted_after: "function after() {}",
+            replaced_source: "function target() { return 1; }\nfunction right() {}\n",
+            before_source: "function before() {}\n\nfunction target() {}\nfunction right() {}\n",
+            after_source: "function target() {}\n\nfunction after() {}\nfunction right() {}\n",
+            removed_source: "function right() {}\n",
+        },
+        DeclarationWriteCase {
+            language_segment: "typescript",
+            file_name: "index.ts",
+            name: "target",
+            source: "function target(): number { return 1; }\nfunction right(): void {}\n",
+            declaration: "function target(): number { return 1; }",
+            replacement: "function target(): number { return 2; }",
+            inserted_before: "function before(): void {}",
+            inserted_after: "function after(): void {}",
+            replaced_source: "function target(): number { return 2; }\nfunction right(): void {}\n",
+            before_source: "function before(): void {}\n\nfunction target(): number { return 1; }\nfunction right(): void {}\n",
+            after_source: "function target(): number { return 1; }\n\nfunction after(): void {}\nfunction right(): void {}\n",
+            removed_source: "function right(): void {}\n",
+        },
+        DeclarationWriteCase {
+            language_segment: "typescript:tsx",
+            file_name: "index.tsx",
+            name: "Target",
+            source: "function Target() { return <main />; }\nfunction Right() { return <aside />; }\n",
+            declaration: "function Target() { return <main />; }",
+            replacement: "function Target() { return <section />; }",
+            inserted_before: "function Before() { return <header />; }",
+            inserted_after: "function After() { return <footer />; }",
+            replaced_source: "function Target() { return <section />; }\nfunction Right() { return <aside />; }\n",
+            before_source: "function Before() { return <header />; }\n\nfunction Target() { return <main />; }\nfunction Right() { return <aside />; }\n",
+            after_source: "function Target() { return <main />; }\n\nfunction After() { return <footer />; }\nfunction Right() { return <aside />; }\n",
+            removed_source: "function Right() { return <aside />; }\n",
+        },
+        DeclarationWriteCase {
+            language_segment: "markdown",
+            file_name: "README.md",
+            name: "Target",
+            source: "# Target\n\ntarget body.\n\n# Right\n\nright body.\n",
+            declaration: "# Target\n\ntarget body.\n\n",
+            replacement: "# Target\n\nchanged body.\n\n",
+            inserted_before: "# Before\n\nbefore body.",
+            inserted_after: "# After\n\nafter body.\n\n",
+            replaced_source: "# Target\n\nchanged body.\n\n# Right\n\nright body.\n",
+            before_source: "# Before\n\nbefore body.\n\n# Target\n\ntarget body.\n\n# Right\n\nright body.\n",
+            after_source: "# Target\n\ntarget body.\n\n# After\n\nafter body.\n\n# Right\n\nright body.\n",
+            removed_source: "# Right\n\nright body.\n",
+        },
+        DeclarationWriteCase {
+            language_segment: "json",
+            file_name: "settings.json",
+            name: "target",
+            source: "{\n  \"target\": 1,\n  \"right\": 2\n}\n",
+            declaration: "\"target\": 1",
+            replacement: "\"target\": 3",
+            inserted_before: "\"before\": 0,",
+            inserted_after: ",\"after\": 0",
+            replaced_source: "{\n  \"target\": 3,\n  \"right\": 2\n}\n",
+            before_source: "{\n  \"before\": 0,\n\n  \"target\": 1,\n  \"right\": 2\n}\n",
+            after_source: "{\n  \"target\": 1\n\n  ,\"after\": 0,\n  \"right\": 2\n}\n",
+            removed_source: "{\n  \"right\": 2\n}\n",
+        },
+        DeclarationWriteCase {
+            language_segment: "yaml",
+            file_name: "settings.yaml",
+            name: "target",
+            source: "target: 1\nright: 2\n",
+            declaration: "target: 1",
+            replacement: "target: 3",
+            inserted_before: "before: 0",
+            inserted_after: "after: 0",
+            replaced_source: "target: 3\nright: 2\n",
+            before_source: "before: 0\n\ntarget: 1\nright: 2\n",
+            after_source: "target: 1\n\nafter: 0\nright: 2\n",
+            removed_source: "right: 2\n",
+        },
+        DeclarationWriteCase {
+            language_segment: "toml",
+            file_name: "settings.toml",
+            name: "target",
+            source: "target = 1\nright = 2\n",
+            declaration: "target = 1",
+            replacement: "target = 3",
+            inserted_before: "before = 0",
+            inserted_after: "after = 0",
+            replaced_source: "target = 3\nright = 2\n",
+            before_source: "before = 0\n\ntarget = 1\nright = 2\n",
+            after_source: "target = 1\n\nafter = 0\nright = 2\n",
+            removed_source: "right = 2\n",
+        },
+    ];
+
+    fn declaration_write_case(language_segment: &str) -> DeclarationWriteCase {
+        DECLARATION_WRITE_CASES
+            .iter()
+            .copied()
+            .find(|case| case.language_segment == language_segment)
+            .expect("declaration write case exists")
+    }
+
+    fn addressed_declaration(
+        reads: &ReadService,
+        case: DeclarationWriteCase,
+    ) -> TestResult<SymbolId> {
+        let params: GetSymbolParams = serde_json::from_value(serde_json::json!({
+            "name": case.name,
+            "include_body": true
+        }))?;
+        let hits = reads.get_symbol(&params)?.hits;
+        assert_eq!(
+            hits.len(),
+            1,
+            "{} must emit one addressed declaration",
+            case.language_segment
+        );
+        let hit = &hits[0];
+        assert_eq!(
+            hit.source.as_ref().map(|source| source.text.as_str()),
+            Some(case.declaration),
+            "{} must emit its exact declaration bytes",
+            case.language_segment
+        );
+        let minted = hit
+            .symbol
+            .id
+            .clone()
+            .expect("syntax declaration has an established address");
+        assert_eq!(
+            minted,
+            language_symbol(case.language_segment, case.file_name, case.name),
+            "{} must mint its language address",
+            case.language_segment
+        );
+        Ok(minted)
+    }
+
+    async fn assert_declaration_writes(case: DeclarationWriteCase) -> TestResult {
+        let mut failures = Vec::new();
+
+        let (directory, reads, changes) = fixture_with_name(case.file_name, case.source)?;
+        let target = addressed_declaration(&reads, case)?;
+        applied_summary(changes.replace_symbol(
+            &reads,
+            &ReplaceSymbolParams {
+                symbol: target,
+                region: None,
+                body: case.replacement.into(),
+            },
+        )?);
+        let written = fs::read_to_string(directory.path().join(case.file_name))?;
+        if written != case.replaced_source {
+            failures.push(format!(
+                "replace expected {:?}, observed {written:?}",
+                case.replaced_source
+            ));
+        }
+
+        let (directory, reads, changes) = fixture_with_name(case.file_name, case.source)?;
+        let target = addressed_declaration(&reads, case)?;
+        applied_summary(changes.insert_symbol(
+            &reads,
+            &InsertSymbolParams {
+                anchor: Some(target),
+                file: None,
+                position: InsertPosition::Before,
+                body: case.inserted_before.into(),
+                create_missing: false,
+            },
+        )?);
+        let written = fs::read_to_string(directory.path().join(case.file_name))?;
+        if written != case.before_source {
+            failures.push(format!(
+                "insert before expected {:?}, observed {written:?}",
+                case.before_source
+            ));
+        }
+
+        let (directory, reads, changes) = fixture_with_name(case.file_name, case.source)?;
+        let target = addressed_declaration(&reads, case)?;
+        applied_summary(changes.insert_symbol(
+            &reads,
+            &InsertSymbolParams {
+                anchor: Some(target),
+                file: None,
+                position: InsertPosition::After,
+                body: case.inserted_after.into(),
+                create_missing: false,
+            },
+        )?);
+        let written = fs::read_to_string(directory.path().join(case.file_name))?;
+        if written != case.after_source {
+            failures.push(format!(
+                "insert after expected {:?}, observed {written:?}",
+                case.after_source
+            ));
+        }
+
+        let (directory, reads, changes) = fixture_with_name(case.file_name, case.source)?;
+        let target = addressed_declaration(&reads, case)?;
+        let engines =
+            crate::engine::EnginePool::new(directory.path(), std::collections::BTreeMap::new());
+        let resolution = crate::remove::plan_remove_symbol(
+            &reads,
+            &engines,
+            directory.path(),
+            &rift_protocol::change::RemoveSymbolParams {
+                symbol: target,
+                force: false,
+            },
+        )
+        .await?;
+        let crate::remove::RemoveResolution::Planned(plan) = resolution else {
+            panic!(
+                "{} declaration removal must produce a plan",
+                case.language_segment
+            );
+        };
+        applied_summary(changes.apply_remove(&reads, &plan)?);
+        engines.shutdown().await;
+        let written = fs::read_to_string(directory.path().join(case.file_name))?;
+        if written != case.removed_source {
+            failures.push(format!(
+                "remove expected {:?}, observed {written:?}",
+                case.removed_source
+            ));
+        }
+
+        assert!(
+            failures.is_empty(),
+            "{} declaration writes failed:\n{}",
+            case.language_segment,
+            failures.join("\n")
+        );
+        Ok(())
+    }
+
+    macro_rules! declaration_write_test {
+        ($name:ident, $language_segment:literal) => {
+            #[tokio::test]
+            async fn $name() -> TestResult {
+                assert_declaration_writes(declaration_write_case($language_segment)).await
+            }
+        };
+    }
+
+    declaration_write_test!(declaration_writes_rust, "rust");
+    declaration_write_test!(declaration_writes_javascript, "javascript");
+    declaration_write_test!(declaration_writes_typescript, "typescript");
+    declaration_write_test!(declaration_writes_tsx, "typescript:tsx");
+    declaration_write_test!(declaration_writes_markdown, "markdown");
+    declaration_write_test!(declaration_writes_json, "json");
+    declaration_write_test!(declaration_writes_yaml, "yaml");
+    declaration_write_test!(declaration_writes_toml, "toml");
+
     fn applied_summary(result: ChangeResult) -> rift_protocol::change::ChangeSummary {
         match result {
             ChangeResult::Applied { summary } => summary,
             ChangeResult::Refused { reason, .. } => {
                 panic!("change must land, got refusal {reason:?}")
             }
+            ChangeResult::Unchanged => panic!("change must land, got unchanged result"),
         }
+    }
+
+    fn assert_source_unchanged_refusal(result: ChangeResult) {
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("a change with no byte difference must refuse, got {result:?}");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(preconditions.len(), 1);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::SourceUnchanged
+        );
+    }
+
+    #[test]
+    fn test_apply_rewrites_refuses_an_empty_batch_as_source_unchanged() -> TestResult {
+        let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let result = changes.apply_rewrites(&reads, &[])?;
+        assert_source_unchanged_refusal(result);
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_rewrites_refuses_a_byte_equal_replacement_as_source_unchanged() -> TestResult {
+        let source = "pub fn beacon() {}\n";
+        let (directory, reads, changes) = fixture(source)?;
+        let rewrites = vec![FileRewrite::modify(
+            CoreProjectPath::new("lib.rs")?,
+            source,
+            source.to_owned(),
+            vec![ReplacedRegion {
+                range: ByteRange {
+                    start: 0,
+                    end: source.len() as u64,
+                },
+                text: source.to_owned(),
+            }],
+        )];
+        let result = changes.apply_rewrites(&reads, &rewrites)?;
+        assert_source_unchanged_refusal(result);
+        assert_eq!(fs::read_to_string(directory.path().join("lib.rs"))?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_rewrites_rejects_duplicate_paths_before_publication() -> TestResult {
+        let source = "pub fn beacon() {}\n";
+        let (directory, reads, changes) = fixture(source)?;
+        let path = CoreProjectPath::new("lib.rs")?;
+        let rewrites = vec![
+            FileRewrite::modify(
+                path.clone(),
+                source,
+                "pub fn first() {}\n".to_owned(),
+                Vec::new(),
+            ),
+            FileRewrite::modify(path, source, "pub fn second() {}\n".to_owned(), Vec::new()),
+        ];
+
+        let result = changes.apply_rewrites(&reads, &rewrites)?;
+        let ChangeResult::Refused {
+            reason,
+            diagnostics,
+            ..
+        } = result
+        else {
+            panic!("duplicate rewrite paths must refuse before publication");
+        };
+        assert_eq!(reason, RefusalReason::Unsupported);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("addressed by more than one member")
+        }));
+        assert_eq!(fs::read_to_string(directory.path().join("lib.rs"))?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_rewrites_omits_unchanged_members_from_an_applied_batch() -> TestResult {
+        let changed_source = "pub fn changed() {}\n";
+        let unchanged_source = "pub fn steady() {}\n";
+        let (directory, reads, changes) = multi_file_fixture(&[
+            ("changed.rs", changed_source),
+            ("steady.rs", unchanged_source),
+        ])?;
+        let changed_next = "pub fn renamed() {}\n";
+        let rewrites = vec![
+            FileRewrite::modify(
+                CoreProjectPath::new("changed.rs")?,
+                changed_source,
+                changed_next.to_owned(),
+                vec![ReplacedRegion {
+                    range: ByteRange { start: 7, end: 14 },
+                    text: "renamed".to_owned(),
+                }],
+            ),
+            FileRewrite::modify(
+                CoreProjectPath::new("steady.rs")?,
+                unchanged_source,
+                unchanged_source.to_owned(),
+                vec![ReplacedRegion {
+                    range: ByteRange {
+                        start: 0,
+                        end: unchanged_source.len() as u64,
+                    },
+                    text: unchanged_source.to_owned(),
+                }],
+            ),
+        ];
+        let summary = applied_summary(changes.apply_rewrites(&reads, &rewrites)?);
+        assert_eq!(summary.paths, vec![ProjectPath("changed.rs".to_owned())]);
+        assert_eq!(summary.edits.len(), 1);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("changed.rs"))?,
+            changed_next
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("steady.rs"))?,
+            unchanged_source
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_rewrites_orders_effective_members_by_path() -> TestResult {
+        let first_source = "pub fn first() {}\n";
+        let second_source = "pub fn second() {}\n";
+        let (_directory, reads, changes) =
+            multi_file_fixture(&[("a.rs", first_source), ("z.rs", second_source)])?;
+        let rewrites = vec![
+            FileRewrite::modify(
+                CoreProjectPath::new("z.rs")?,
+                second_source,
+                "pub fn changed_second() {}\n".to_owned(),
+                Vec::new(),
+            ),
+            FileRewrite::modify(
+                CoreProjectPath::new("a.rs")?,
+                first_source,
+                "pub fn changed_first() {}\n".to_owned(),
+                Vec::new(),
+            ),
+        ];
+
+        let summary = applied_summary(changes.apply_rewrites(&reads, &rewrites)?);
+        assert_eq!(
+            summary.paths,
+            [
+                ProjectPath("a.rs".to_owned()),
+                ProjectPath("z.rs".to_owned()),
+            ]
+        );
+        Ok(())
     }
 
     #[test]
@@ -2343,6 +2981,114 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn replace_symbol_inside_an_indented_wrapper_replaces_attached_source_and_keeps_column()
+    -> TestResult {
+        for case in language_cases() {
+            for (layout, column, ending) in [
+                ("spaces", case.indented_column, "\n"),
+                ("tabs", "\t", "\n"),
+                ("crlf", case.indented_column, "\r\n"),
+            ] {
+                let open = case.indented_open.trim_end_matches('\n');
+                let close = case.indented_close.trim_end_matches('\n');
+                let documented = if case.language_segment == "rust" {
+                    format!("/// Docs.{ending}{column}#[test]{ending}{column}fn b() {{}}")
+                } else {
+                    format!("/** Docs. */{ending}{column}b() {{}}")
+                };
+                let source = format!(
+                    "{open}{ending}{column}{a}{ending}{column}{documented}{ending}{close}",
+                    a = case.indented_member_declaration("a"),
+                );
+                let (directory, reads, changes) = fixture_with_name(case.file_name, &source)?;
+                let body = if case.language_segment == "rust" {
+                    format!(
+                        "#[test]{ending}{column}fn b() {{{ending}{column}{column}// body{ending}{column}}}"
+                    )
+                } else {
+                    format!("b() {{{ending}{column}{column}// body{ending}{column}}}")
+                };
+                let result = changes.replace_symbol(
+                    &reads,
+                    &ReplaceSymbolParams {
+                        symbol: language_symbol(
+                            case.language_segment,
+                            case.file_name,
+                            &case.indented_member("b"),
+                        ),
+                        region: None,
+                        body: body.clone().into(),
+                    },
+                )?;
+                applied_summary(result);
+                let written = fs::read_to_string(directory.path().join(case.file_name))?;
+                let expected = format!(
+                    "{open}{ending}{column}{a}{ending}{column}{body}{ending}{close}",
+                    a = case.indented_member_declaration("a"),
+                );
+                assert_eq!(
+                    written, expected,
+                    "{} {layout}: replacement must remove attached source, keep the declaration column, and leave later body lines unchanged",
+                    case.language_segment
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn insert_symbol_after_an_indented_anchor_keeps_the_anchor_column() -> TestResult {
+        for case in language_cases() {
+            for (layout, column, ending) in [
+                ("spaces", case.indented_column, "\n"),
+                ("tabs", "\t", "\n"),
+                ("crlf", case.indented_column, "\r\n"),
+            ] {
+                let open = case.indented_open.trim_end_matches('\n');
+                let close = case.indented_close.trim_end_matches('\n');
+                let source = format!(
+                    "{open}{ending}{column}{a}{ending}{column}{b}{ending}{close}",
+                    a = case.indented_member_declaration("a"),
+                    b = case.indented_member_declaration("b"),
+                );
+                let (directory, reads, changes) = fixture_with_name(case.file_name, &source)?;
+                let body = if case.language_segment == "rust" {
+                    format!("fn c(&self) {{{ending}{column}{column}// body{ending}{column}}}")
+                } else {
+                    format!("c() {{{ending}{column}{column}// body{ending}{column}}}")
+                };
+                let result = changes.insert_symbol(
+                    &reads,
+                    &InsertSymbolParams {
+                        anchor: Some(language_symbol(
+                            case.language_segment,
+                            case.file_name,
+                            &case.indented_member("a"),
+                        )),
+                        file: None,
+                        position: InsertPosition::After,
+                        body: body.clone().into(),
+                        create_missing: false,
+                    },
+                )?;
+                applied_summary(result);
+                let written = fs::read_to_string(directory.path().join(case.file_name))?;
+                let expected = format!(
+                    "{open}{ending}{column}{a}{ending}{ending}{column}{body}{ending}{column}{b}{ending}{close}",
+                    a = case.indented_member_declaration("a"),
+                    b = case.indented_member_declaration("b"),
+                );
+                assert_eq!(
+                    written, expected,
+                    "{} {layout}: inserted declaration must keep the anchor column and later body lines",
+                    case.language_segment
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Insert `after` a declaration in a CRLF file: the blank-line separator uses CRLF
     /// throughout, and no bare LF is introduced.
     #[test]
@@ -2487,7 +3233,7 @@ mod tests {
         let written = fs::read_to_string(directory.path().join("lib.rs"))?;
         assert_eq!(
             written,
-            "//! Module docs.\n\npub fn beacon() {}\n\n\npub fn tail() {}"
+            "//! Module docs.\n\npub fn beacon() {}\n\npub fn tail() {}"
         );
         Ok(())
     }
@@ -2589,7 +3335,7 @@ mod tests {
         )?;
         applied_summary(result);
         let written = fs::read_to_string(directory.path().join("lib.rs"))?;
-        assert_eq!(written, "pub fn beacon() {}\n\n\npub fn late() {}");
+        assert_eq!(written, "pub fn beacon() {}\n\npub fn late() {}");
         Ok(())
     }
 
@@ -3356,6 +4102,11 @@ mod tests {
                 dialect: None,
             })
         );
+        assert_eq!(
+            diagnostics[0].code.as_deref(),
+            Some("rift.syntax.error"),
+            "provider parse findings carry one shared Rift code"
+        );
         Ok(())
     }
 
@@ -3691,6 +4442,55 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_hook_snapshot_detects_and_restores_permission_only_writes() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = "pub fn beacon() {}\n";
+        let (directory, reads, changes) = fixture(source)?;
+        let target = directory.path().join("lib.rs");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640))?;
+        let before = changes.hook_snapshot(&reads)?;
+
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+        let after = changes.hook_snapshot(&reads)?;
+        assert!(before.permissions_changed(&after));
+        assert_eq!(
+            before.changed_paths(&after),
+            [ProjectPath("lib.rs".to_owned())]
+        );
+
+        changes.restore_hook_snapshot(&reads, &before, &after)?;
+        assert_eq!(fs::metadata(&target)?.permissions().mode() & 0o777, 0o640);
+        let restored = changes.hook_snapshot(&reads)?;
+        assert!(before.is_unchanged(&restored));
+        assert_eq!(fs::read_to_string(target)?, source);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_apply_move_preserves_executable_permissions() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = "pub fn run() {}\n";
+        let (directory, reads, changes) = multi_file_fixture(&[("run.rs", source)])?;
+        let from = directory.path().join("run.rs");
+        fs::set_permissions(&from, fs::Permissions::from_mode(0o751))?;
+        let plan = move_plan("run.rs", "moved.rs", (source, source), vec![], None);
+        applied_summary(changes.apply_move(&reads, &plan)?);
+        let to = directory.path().join("moved.rs");
+        assert!(!from.exists());
+        assert_eq!(fs::read_to_string(&to)?, source);
+        assert_eq!(
+            fs::metadata(&to)?.permissions().mode() & 0o777,
+            0o751,
+            "moving a file must retain its executable permissions"
+        );
+        Ok(())
+    }
+
     #[test]
     fn apply_move_refuses_when_the_destination_appeared_after_planning() -> TestResult {
         let hub = "pub fn hub() {}\n";
@@ -3998,7 +4798,7 @@ mod tests {
             (end, end),
             "an `after` insert at a file target lands at the empty range at the file's own end"
         );
-        assert_eq!(text, "\n\npub fn late() {}");
+        assert_eq!(text, "\npub fn late() {}");
         Ok(())
     }
 

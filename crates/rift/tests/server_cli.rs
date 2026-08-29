@@ -15,16 +15,15 @@ use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use rift_mcp::{ServerPresence, probe};
-use rift_protocol::lock::{SERVER_LOCK_FILE_NAME, SERVER_TOKEN_LENGTH, ServerLock};
+use rift_mcp::{START_POLL_ATTEMPT_COUNT, ServerPresence, probe};
+use rift_protocol::lock::{
+    ProductIdentity, SERVER_LOCK_FILE_NAME, SERVER_TOKEN_LENGTH, ServerLock,
+};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 /// Pause between polls of any awaited condition.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// Poll attempts while waiting on a server to appear: 15 seconds, matching
-/// the CLI's own start window.
-const SERVING_POLL_ATTEMPT_COUNT: u32 = 150;
 /// Poll attempts while waiting on a server to disappear, a child to exit,
 /// or a port to refuse again: 10 seconds.
 const GONE_POLL_ATTEMPT_COUNT: u32 = 100;
@@ -35,6 +34,14 @@ const CONCURRENT_START_COUNT: usize = 4;
 
 /// Serializes the tests: the served port range is machine-global.
 static SERIAL: Mutex<()> = Mutex::new(());
+
+fn stale_identity() -> ProductIdentity {
+    ProductIdentity {
+        version: "0.0.1".to_owned(),
+        executable_digest: "a".repeat(64),
+        schema_digest: "b".repeat(64),
+    }
+}
 
 /// The `[search.semantic]` table every fixture here declares.
 ///
@@ -247,7 +254,7 @@ fn foreground_start_serves_until_stopped_and_exits_cleanly() -> TestResult {
         .stderr(Stdio::null())
         .spawn()?;
 
-    let serving = wait_for(SERVING_POLL_ATTEMPT_COUNT, "the foreground server", || {
+    let serving = wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
         serving_document(root)
     })?;
     assert_eq!(serving.pid, child.id(), "the child itself must serve");
@@ -328,7 +335,7 @@ fn stale_document_is_replaced_by_a_fresh_election() -> TestResult {
         port: 12_345,
         token: "a".repeat(SERVER_TOKEN_LENGTH),
         pid: 1,
-        version: "0.0.1".to_owned(),
+        identity: stale_identity(),
     };
     fs::write(document_path(root), serde_json::to_vec(&stale)?)?;
     assert!(
@@ -433,7 +440,7 @@ fn status_reports_absent_stale_and_serving_states() -> TestResult {
         port: 12_345,
         token: "a".repeat(SERVER_TOKEN_LENGTH),
         pid: 1,
-        version: "0.0.1".to_owned(),
+        identity: stale_identity(),
     };
     fs::write(document_path(root), serde_json::to_vec(&stale)?)?;
     let stale_status = rift(root, &["server", "status"])?;
@@ -462,7 +469,7 @@ fn status_reports_absent_stale_and_serving_states() -> TestResult {
     assert!(
         serving_stdout.contains(&format!(
             "rift server listening on 127.0.0.1:{port} (pid {pid}, v{version})",
-            version = document.version
+            version = document.identity.version
         )),
         "{serving_stdout:?}"
     );

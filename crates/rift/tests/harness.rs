@@ -28,6 +28,8 @@ pub(crate) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 /// refusal can wait out two start windows - the warmup's and the request's
 /// own - before it surfaces.
 pub(crate) const PROXIED_CALL_MAX: Duration = Duration::from_mins(1);
+/// Bound on one proxied call that starts and settles a language engine.
+pub(crate) const PROXIED_ENGINE_CALL_MAX: Duration = Duration::from_mins(2);
 
 /// Serializes the tests: the served port range is machine-global.
 pub(crate) static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -57,8 +59,6 @@ pub(crate) const RUST_PROJECT_ROOT: &str = "pub mod caller;\npub mod hub;\n";
 pub(crate) const RUST_PROJECT_HUB: &str = "pub fn beacon(value: i32) -> i32 {\n    value\n}\n";
 pub(crate) const RUST_PROJECT_CALLER: &str =
     "use crate::hub::beacon;\n\npub fn total() -> i32 {\n    beacon(2)\n}\n";
-pub(crate) const RUST_PROJECT_BEACON_SYMBOL: &str = "rift://symbol/rust/hub.rs/beacon";
-
 pub(crate) fn rust_project() -> Vec<(&'static str, &'static str)> {
     vec![
         ("Cargo.toml", RUST_PROJECT_MANIFEST),
@@ -217,9 +217,31 @@ pub(crate) async fn proxied_call(
     name: &'static str,
     call_arguments: &serde_json::Value,
 ) -> TestResult<serde_json::Value> {
+    proxied_call_within(client, name, call_arguments, PROXIED_CALL_MAX).await
+}
+
+/// One proxied live-engine call under [`PROXIED_ENGINE_CALL_MAX`].
+pub(crate) async fn proxied_engine_call(
+    client: &RunningService<RoleClient, ()>,
+    name: &'static str,
+    call_arguments: &serde_json::Value,
+) -> TestResult<serde_json::Value> {
+    proxied_call_within(client, name, call_arguments, PROXIED_ENGINE_CALL_MAX).await
+}
+
+/// One retrying proxied call under its caller-owned wall-clock bound.
+async fn proxied_call_within(
+    client: &RunningService<RoleClient, ()>,
+    name: &'static str,
+    call_arguments: &serde_json::Value,
+    timeout: Duration,
+) -> TestResult<serde_json::Value> {
     for _attempt in 0..ACCEPTANCE_ATTEMPTS_MAX {
         let params = CallToolRequestParams::new(name).with_arguments(arguments(call_arguments)?);
-        match within(name, client.call_tool(params)).await? {
+        match tokio::time::timeout(timeout, client.call_tool(params))
+            .await
+            .map_err(|_elapsed| format!("timed out waiting for {name}"))?
+        {
             Ok(called) => {
                 return called
                     .structured_content
@@ -234,40 +256,4 @@ pub(crate) async fn proxied_call(
         }
     }
     Err(format!("the server kept refusing {name}").into())
-}
-
-/// Most attempts the warm-up loop below spends waiting for rust-analyzer
-/// to finish loading the cargo project, and the pause between them: at
-/// most a minute of waiting, on top of the per-call [`PROXIED_CALL_MAX`]
-/// bound, then the caller fails instead of hanging.
-pub(crate) const WARMUP_ATTEMPTS_MAX: usize = 240;
-pub(crate) const WARMUP_PAUSE: Duration = Duration::from_millis(250);
-
-/// Drives the rename tool, through the real proxy, until rust-analyzer has
-/// loaded the cargo project.
-///
-/// The probe renames the declaration to the name it already has. Once
-/// rust-analyzer resolves it, the proposal edits every occurrence to the
-/// bytes already there, so the compiled plan holds no rewrite and the tool
-/// refuses with `proposed no edits` - the readiness signal, with the tree
-/// untouched either way. `rift-mcp`'s own `live_rust_analyzer.rs` states
-/// the full reasoning for this probe; the proxy adds only its own latency
-/// on top.
-pub(crate) async fn warmed_rust_engine(client: &RunningService<RoleClient, ()>) -> TestResult {
-    for _attempt in 0..WARMUP_ATTEMPTS_MAX {
-        let structured = proxied_call(
-            client,
-            "rename_symbol",
-            &json!({ "symbol": RUST_PROJECT_BEACON_SYMBOL, "new_name": "beacon" }),
-        )
-        .await?;
-        let refused = structured["diagnostics"][0]["message"]
-            .as_str()
-            .unwrap_or_default();
-        if refused.contains("proposed no edits") {
-            return Ok(());
-        }
-        tokio::time::sleep(WARMUP_PAUSE).await;
-    }
-    Err("rust-analyzer never resolved the declaration through the proxy".into())
 }

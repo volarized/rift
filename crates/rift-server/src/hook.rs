@@ -68,6 +68,14 @@ pub fn run_hooks(
         .collect()
 }
 
+/// Runs one configured hook inside changed tree.
+#[must_use]
+pub fn run_hook(hook: &CommandHook, tree_root: &Path, changed_paths: &[ProjectPath]) -> HookRun {
+    let mut ordered: Vec<&str> = changed_paths.iter().map(|path| path.0.as_str()).collect();
+    ordered.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    run_one(hook, tree_root, &ordered)
+}
+
 /// Runs one hook to completion, killing it at `timeout`.
 fn run_one(hook: &CommandHook, tree_root: &Path, ordered_paths: &[&str]) -> HookRun {
     let error = |message: String| HookRun {
@@ -258,10 +266,12 @@ mod tests {
                 .map(|argument| (*argument).to_owned())
                 .collect(),
             changed_paths: ChangedPaths::None,
+            writes: hook_configuration::HookWrites::None,
             working_directory: ProjectPath(String::new()),
             environment: BTreeMap::new(),
             timeout: hook_configuration::Duration::from_millis(10_000),
             output_limit: hook_configuration::ByteSize::from_bytes(4_096),
+            failure_severity: hook_configuration::HookFailureSeverity::Error,
             guarantees: Vec::new(),
             determinism: Determinism::Deterministic,
         }
@@ -287,9 +297,7 @@ mod tests {
         let mut echo = hook("echo", &["hello"]);
         echo.changed_paths = ChangedPaths::Append;
         let changed = paths(&["pkg/b.rs", "a.rs", "pkg/a.rs"]);
-        let runs = run_hooks(&[echo], directory.path(), &changed);
-        assert_eq!(runs.len(), 1);
-        let run = &runs[0];
+        let run = run_hook(&echo, directory.path(), &changed);
         assert_eq!(run.status, HookStatus::Passed);
         assert_eq!(run.exit_code, Some(0));
         assert_eq!(run.stdout.text, "hello a.rs pkg/a.rs pkg/b.rs\n");

@@ -2,8 +2,7 @@
 //!
 //! A new language joins the workspace by adding its provider module, its
 //! grammar dependency, and one entry in this module's shipped provider
-//! list; the walk's extension gate and the default per-file byte bound
-//! derive from the registry, so nothing else changes.
+//! list. Registry extensions select syntax facts after baseline file discovery.
 
 use std::sync::OnceLock;
 

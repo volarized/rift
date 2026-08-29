@@ -152,7 +152,8 @@ fn accept_configuration(raw: &str) -> Result<WorkspaceConfiguration, Configurati
 mod tests {
     use super::*;
     use rift_protocol::configuration::{
-        ByteSize, ChangedPaths, Determinism, HookKind, SemanticSource,
+        ByteSize, ChangedPaths, Determinism, HookFailureSeverity, HookKind, HookWrites,
+        SemanticSource,
     };
 
     /// The `[[hooks]]` example the configuration docs show, keys complete.
@@ -164,10 +165,12 @@ kind = "test"
 program = "cargo"
 arguments = ["test"]
 changed_paths = "none"
+writes = "none"
 working_directory = ""
 environment = {}
 timeout = "120s"
 output_limit = "4kb"
+failure_severity = "error"
 guarantees = []
 determinism = "deterministic"
 "#;
@@ -266,11 +269,23 @@ download_timeout = "5m"
         assert!(configuration.source.respect_gitignore);
         assert_eq!(configuration.hooks.len(), 2);
         assert_eq!(configuration.hooks[0].id, "format");
-        assert_eq!(configuration.hooks[0].program, "just");
-        assert_eq!(configuration.hooks[0].arguments, ["format"]);
+        assert_eq!(configuration.hooks[0].kind, HookKind::Format);
+        assert_eq!(configuration.hooks[0].program, "cargo");
+        assert_eq!(configuration.hooks[0].arguments, ["fmt", "--all"]);
+        assert_eq!(configuration.hooks[0].writes, HookWrites::Workspace);
+        assert_eq!(
+            configuration.hooks[0].failure_severity,
+            HookFailureSeverity::Warning
+        );
+        assert!(configuration.hooks[0].guarantees.is_empty());
         assert_eq!(configuration.hooks[1].id, "check");
         assert_eq!(configuration.hooks[1].program, "just");
         assert_eq!(configuration.hooks[1].arguments, ["check"]);
+        assert_eq!(configuration.hooks[1].writes, HookWrites::None);
+        assert_eq!(
+            configuration.hooks[1].failure_severity,
+            HookFailureSeverity::Error
+        );
     }
 
     #[test]

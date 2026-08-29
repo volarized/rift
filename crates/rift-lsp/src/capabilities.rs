@@ -6,10 +6,10 @@
 
 use lsp_types::{
     ClientCapabilities, DiagnosticClientCapabilities, DiagnosticServerCapabilities,
-    DidChangeWatchedFilesClientCapabilities, FileOperationFilter, GeneralClientCapabilities,
-    InitializeResult, OneOf, PositionEncodingKind, ReferenceClientCapabilities,
-    RenameClientCapabilities, TextDocumentClientCapabilities, WindowClientCapabilities,
-    WorkspaceClientCapabilities, WorkspaceEditClientCapabilities,
+    DiagnosticWorkspaceClientCapabilities, DidChangeWatchedFilesClientCapabilities,
+    FileOperationFilter, GeneralClientCapabilities, InitializeResult, OneOf, PositionEncodingKind,
+    ReferenceClientCapabilities, RenameClientCapabilities, TextDocumentClientCapabilities,
+    WindowClientCapabilities, WorkspaceClientCapabilities, WorkspaceEditClientCapabilities,
     WorkspaceFileOperationsClientCapabilities,
 };
 use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, fault_label};
@@ -209,8 +209,7 @@ pub(crate) fn glob_matches(glob: &str, ignore_case: bool, path: &str) -> bool {
         .literal_separator(true)
         .case_insensitive(ignore_case)
         .build()
-        .ok()
-        .is_some_and(|compiled| compiled.compile_matcher().is_match(path))
+        .is_ok_and(|compiled| compiled.compile_matcher().is_match(path))
 }
 
 /// What the session offers every engine.
@@ -247,6 +246,9 @@ pub fn offered() -> ClientCapabilities {
             ..GeneralClientCapabilities::default()
         }),
         workspace: Some(WorkspaceClientCapabilities {
+            diagnostic: Some(DiagnosticWorkspaceClientCapabilities {
+                refresh_support: Some(true),
+            }),
             workspace_edit: Some(WorkspaceEditClientCapabilities {
                 document_changes: Some(true),
                 ..WorkspaceEditClientCapabilities::default()
@@ -529,6 +531,14 @@ mod tests {
         let workspace = offered
             .workspace
             .expect("workspace capabilities are offered");
+        assert_eq!(
+            workspace
+                .diagnostic
+                .expect("workspace diagnostic capabilities are offered")
+                .refresh_support,
+            Some(true),
+            "diagnostic refresh requests can invalidate an earlier pull"
+        );
         let operations = workspace
             .file_operations
             .expect("file operations are offered");

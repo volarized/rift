@@ -22,6 +22,7 @@ use lsp_types::notification::{
 use lsp_types::request::{
     DocumentDiagnosticRequest, Initialize, PrepareRenameRequest, References, RegisterCapability,
     Rename, Request, Shutdown, WillRenameFiles, WorkDoneProgressCreate, WorkspaceConfiguration,
+    WorkspaceDiagnosticRefresh,
 };
 use lsp_types::{
     ConfigurationParams, Diagnostic, DidChangeWatchedFilesParams,
@@ -32,8 +33,8 @@ use lsp_types::{
     PartialResultParams, Position, PrepareRenameResponse, ProgressParams, ProgressParamsValue,
     ProgressToken, PublishDiagnosticsParams, ReferenceContext, ReferenceParams, RegistrationParams,
     RenameFilesParams, RenameParams, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, WatchKind, WorkDoneProgress, WorkDoneProgressParams, WorkspaceEdit,
-    WorkspaceFolder,
+    TextDocumentPositionParams, WatchKind, WorkDoneProgress, WorkDoneProgressCreateParams,
+    WorkDoneProgressParams, WorkspaceEdit, WorkspaceFolder,
 };
 use rift_core::{
     CapturedStream, Error, ErrorCode, ErrorContext, ErrorName, Fault, ProjectPath,
@@ -68,15 +69,6 @@ const CONFIGURATION_ITEMS_MAX: usize = 256;
 /// the bound is dropped: the record is already non-empty, and the session
 /// already reads as analyzing.
 const PROGRESS_TOKENS_MAX: usize = 64;
-
-/// Resends one operation whose empty answer says nothing gets per
-/// session.
-///
-/// The resend closes the one window the engine cannot report: the first
-/// request of a session, answered before the engine has announced any
-/// work. One resend closes it; a second would wait on an engine that may
-/// simply have nothing to say.
-const EMPTY_ANSWER_RESENDS_MAX: u32 = 1;
 
 /// Maximum watched-file glob patterns retained across every
 /// `client/registerCapability` call for `workspace/didChangeWatchedFiles`.
@@ -335,10 +327,9 @@ pub type EngineError = Error<EngineFault>;
 
 /// What the engine has said about its own work over `$/progress`.
 ///
-/// Two facts ride here, and the second outlives the first: which tokens
-/// are outstanding right now, and whether the engine has ever announced
-/// any work at all. An engine that began one token and ended it has
-/// announced work with nothing outstanding.
+/// Two facts ride here: which tokens are outstanding right now, and whether
+/// engine work completed since workspace bytes last changed. Changed bytes
+/// invalidate earlier readiness without discarding outstanding tokens.
 /// What one engine has proven about its own settlement, read from its
 /// `$/progress` traffic alone and independent of what language it serves.
 ///
@@ -346,13 +337,13 @@ pub type EngineError = Error<EngineFault>;
 /// progress token the engine announced must also have ended before an
 /// answer is trusted as settled. Announcing work alone never confirms
 /// readiness - it names [`EngineReadiness::Analyzing`], not
-/// [`EngineReadiness::Ready`] - and an engine that never announces any
-/// progress at all never reaches either: it stays
+/// [`EngineReadiness::Ready`] - and an engine that announces no work after
+/// latest changed bytes reaches neither: it stays
 /// [`EngineReadiness::Unconfirmed`], a state rather than a failure, because
 /// nothing distinguishes it from one still loading.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EngineReadiness {
-    /// The engine has never announced any work of its own. Its answers may
+    /// The engine has announced no work since latest invalidation. Its answers may
     /// be the answers of a settled engine, or of one that has not started
     /// analyzing yet; nothing here tells the two apart.
     Unconfirmed,
@@ -361,6 +352,44 @@ pub enum EngineReadiness {
     Analyzing,
     /// The engine announced work and every token it began has since ended.
     Ready,
+}
+
+/// One bounded document diagnostic report from a language engine.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PulledDiagnostics {
+    items: Vec<Diagnostic>,
+    result_id: Option<String>,
+    full: bool,
+}
+
+impl PulledDiagnostics {
+    /// Findings carried by this report.
+    #[must_use]
+    pub fn items(&self) -> &[Diagnostic] {
+        &self.items
+    }
+
+    /// Result id carried by this report, when the engine supplied one.
+    #[must_use]
+    pub fn result_id(&self) -> Option<&str> {
+        self.result_id.as_deref()
+    }
+
+    /// Whether this answer carries a full report.
+    #[must_use]
+    pub const fn is_full(&self) -> bool {
+        self.full
+    }
+}
+
+/// Maps an LSP file event to its registered watcher flag.
+fn watch_kind(change: FileChangeType) -> Option<WatchKind> {
+    match change {
+        value if value == FileChangeType::CREATED => Some(WatchKind::Create),
+        value if value == FileChangeType::CHANGED => Some(WatchKind::Change),
+        value if value == FileChangeType::DELETED => Some(WatchKind::Delete),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -387,7 +416,19 @@ impl WorkProgress {
 
     /// Retires one token the engine ended.
     fn ended(&mut self, token: &ProgressToken) {
+        let held = self.outstanding.len();
         self.outstanding.retain(|held| held != token);
+        if self.outstanding.len() < held {
+            self.announced = true;
+        }
+    }
+
+    /// Invalidates settlement after workspace bytes change.
+    ///
+    /// Outstanding work remains outstanding. With no outstanding token,
+    /// next answer needs fresh progress or repeated report evidence.
+    fn invalidated(&mut self) {
+        self.announced = false;
     }
 
     /// Whether any announced work is still outstanding.
@@ -395,7 +436,7 @@ impl WorkProgress {
         !self.outstanding.is_empty()
     }
 
-    /// Whether the engine has ever announced work.
+    /// Whether engine work has been announced since latest invalidation.
     fn is_announced(&self) -> bool {
         self.announced
     }
@@ -403,10 +444,10 @@ impl WorkProgress {
     /// The readiness this record proves, from the announcement and
     /// outstanding-token facts alone.
     fn readiness(&self) -> EngineReadiness {
-        if !self.is_announced() {
-            EngineReadiness::Unconfirmed
-        } else if self.is_outstanding() {
+        if self.is_outstanding() {
             EngineReadiness::Analyzing
+        } else if !self.is_announced() {
+            EngineReadiness::Unconfirmed
         } else {
             EngineReadiness::Ready
         }
@@ -414,33 +455,25 @@ impl WorkProgress {
 }
 
 /// One request whose empty answer says nothing a real answer would not.
-///
-/// An engine that has not indexed the tree yet answers
-/// `workspace/willRenameFiles` with no edit and `textDocument/diagnostic`
-/// with no item - the same answers a settled engine gives for a move that
-/// needs no import rewritten and for a file that is clean.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum EmptyAnswer {
-    /// `workspace/willRenameFiles` proposed no edit.
+    /// textDocument/prepareRename reported no range.
+    PrepareRename,
+    /// textDocument/rename proposed no edit.
+    Rename,
+    /// workspace/willRenameFiles proposed no edit.
     WillRenameFiles,
-    /// `textDocument/diagnostic` reported no item.
-    Diagnostics,
-    /// `textDocument/references` reported no location.
+    /// textDocument/references reported no location.
     References,
 }
 
-/// What the session's most recent answer said, and the resends already
-/// spent on each operation.
+/// What the session's most recent answer said.
 ///
 /// Every request clears `latest` before it is sent, so a verdict cannot
-/// outlive the answer that set it, and only the two operations above ever
-/// set one. `resends` holds one counter per variant, so it is bounded by
-/// the enum, and each operation is sent again at most
-/// [`EMPTY_ANSWER_RESENDS_MAX`] times per session.
+/// outlive the answer that set it. Only two bounded operations set one.
 #[derive(Debug, Default)]
 struct EmptyAnswers {
     latest: Option<EmptyAnswer>,
-    resends: BTreeMap<EmptyAnswer, u32>,
 }
 
 impl EmptyAnswers {
@@ -454,20 +487,9 @@ impl EmptyAnswers {
         self.latest = empty.then_some(operation);
     }
 
-    /// Claims one resend for the answer just given.
-    ///
-    /// Answers `false` when that answer said something, or when this
-    /// operation's resend is already spent.
-    fn claim(&mut self) -> bool {
-        let Some(operation) = self.latest else {
-            return false;
-        };
-        let spent = self.resends.entry(operation).or_default();
-        if *spent >= EMPTY_ANSWER_RESENDS_MAX {
-            return false;
-        }
-        *spent += 1;
-        true
+    /// Whether latest operation answered nothing.
+    fn is_empty(&self) -> bool {
+        self.latest.is_some()
     }
 }
 
@@ -478,6 +500,14 @@ type EngineWriter = Box<dyn AsyncWrite + Send + Unpin>;
 /// The engine's readable half: a real child's stdout, or a test transport's
 /// own read half.
 type EngineReader = Box<dyn AsyncRead + Send + Unpin>;
+
+impl std::ops::Deref for PulledDiagnostics {
+    type Target = [Diagnostic];
+
+    fn deref(&self) -> &Self::Target {
+        &self.items
+    }
+}
 
 /// One running engine and the conversation state around it.
 ///
@@ -497,6 +527,7 @@ pub struct EngineSession {
     request_timeout: Duration,
     published: BTreeMap<ProjectPath, Vec<Diagnostic>>,
     progress: WorkProgress,
+    diagnostic_refresh_revision: u64,
     empty_answers: EmptyAnswers,
     watched_file_watchers: Vec<FileSystemWatcher>,
     document_version: i32,
@@ -639,6 +670,7 @@ impl EngineSession {
             request_timeout,
             published: BTreeMap::new(),
             progress: WorkProgress::default(),
+            diagnostic_refresh_revision: 0,
             empty_answers: EmptyAnswers::default(),
             watched_file_watchers: Vec::new(),
             document_version: 0,
@@ -712,24 +744,23 @@ impl EngineSession {
         self.progress.readiness()
     }
 
-    /// Claims one resend for an answer that said nothing where something
-    /// was expected.
+    /// Revision of diagnostic refresh requests received from engine.
     ///
-    /// Answers `true` only when the engine has never announced work, the
-    /// request just served answered nothing
-    /// (`workspace/willRenameFiles` with no edit,
-    /// `textDocument/diagnostic` with no item), and this session has not
-    /// already sent that operation again. Each operation claims at most
-    /// `EMPTY_ANSWER_RESENDS_MAX` resends per session, so the holder
-    /// cannot loop on an engine that has nothing to say. Once the engine
-    /// has announced work even once, its empty answers are its own and
-    /// this claim is refused.
+    /// A changed revision invalidates an earlier pull even when both reports
+    /// carry equal findings.
     #[must_use]
-    pub fn claim_empty_answer_resend(&mut self) -> bool {
-        if self.progress.is_announced() {
-            return false;
-        }
-        self.empty_answers.claim()
+    pub fn diagnostic_refresh_revision(&self) -> u64 {
+        self.diagnostic_refresh_revision
+    }
+
+    /// Whether latest operation answered nothing.
+    ///
+    /// Caller retry policy bounds resends. Progress describes engine work,
+    /// but does not bind that work to one semantic request, so it cannot
+    /// make an empty answer final.
+    #[must_use]
+    pub fn latest_answer_is_empty(&self) -> bool {
+        self.empty_answers.is_empty()
     }
 
     /// Opens one document with the text the caller hands in.
@@ -809,6 +840,8 @@ impl EngineSession {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
         let edit = self.request::<Rename>(params).await?;
+        self.empty_answers
+            .record(EmptyAnswer::Rename, proposes_no_edit(edit.as_ref()));
         Ok(edit.unwrap_or_default())
     }
 
@@ -833,7 +866,10 @@ impl EngineSession {
             PrepareRenameRequest::METHOD,
         )?;
         let params = self.position_params(path, position)?;
-        self.request::<PrepareRenameRequest>(params).await
+        let answer = self.request::<PrepareRenameRequest>(params).await?;
+        self.empty_answers
+            .record(EmptyAnswer::PrepareRename, answer.is_none());
+        Ok(answer)
     }
 
     /// The engine's workspace edit for moving one file, if it proposes one.
@@ -907,9 +943,9 @@ impl EngineSession {
 
     /// Pulls the engine's current diagnostics for one document.
     ///
-    /// An unchanged or partial report answers no items; the session never
-    /// sends a previous result id, so a full report is the served shape.
-    /// At most `DOCUMENT_DIAGNOSTICS_MAX` items come back.
+    /// Full reports keep their result id and bounded findings. Findings are
+    /// sorted before the bound so equivalent reports compare equal when an
+    /// engine changes only their order.
     ///
     /// # Errors
     ///
@@ -923,7 +959,7 @@ impl EngineSession {
     pub async fn pull_diagnostics(
         &mut self,
         path: &ProjectPath,
-    ) -> Result<Vec<Diagnostic>, EngineError> {
+    ) -> Result<PulledDiagnostics, EngineError> {
         require(
             self.capabilities.pull_diagnostics,
             DocumentDiagnosticRequest::METHOD,
@@ -938,16 +974,31 @@ impl EngineSession {
             partial_result_params: PartialResultParams::default(),
         };
         let answer = self.request::<DocumentDiagnosticRequest>(params).await?;
-        let mut items = match answer {
+        let report = match answer {
             DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(report)) => {
-                report.full_document_diagnostic_report.items
+                let mut items = report.full_document_diagnostic_report.items;
+                items.sort_by_cached_key(|item| format!("{item:?}"));
+                items.truncate(DOCUMENT_DIAGNOSTICS_MAX);
+                PulledDiagnostics {
+                    items,
+                    result_id: report.full_document_diagnostic_report.result_id,
+                    full: true,
+                }
             }
-            _ => Vec::new(),
+            DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Unchanged(report)) => {
+                PulledDiagnostics {
+                    items: Vec::new(),
+                    result_id: Some(report.unchanged_document_diagnostic_report.result_id),
+                    full: false,
+                }
+            }
+            DocumentDiagnosticReportResult::Partial(_) => PulledDiagnostics {
+                items: Vec::new(),
+                result_id: None,
+                full: false,
+            },
         };
-        items.truncate(DOCUMENT_DIAGNOSTICS_MAX);
-        self.empty_answers
-            .record(EmptyAnswer::Diagnostics, items.is_empty());
-        Ok(items)
+        Ok(report)
     }
 
     /// Diagnostics the engine published for one document, if any arrived.
@@ -956,24 +1007,16 @@ impl EngineSession {
         self.published.get(path).map(Vec::as_slice)
     }
 
-    /// Sends `workspace/didChangeWatchedFiles` naming every path in
-    /// `paths` that matches a glob the engine registered through
-    /// `client/registerCapability`, and returns the matched paths in the
-    /// order given.
+    /// Sends one classified `workspace/didChangeWatchedFiles` batch.
     ///
-    /// A path outside every watcher the engine registered - or one this
-    /// session read no registration for at all - is left out: the
-    /// notification only ever names what the engine itself asked to hear
-    /// about, so a caller reads an empty return as "nothing to wait on"
-    /// rather than as a failure. Every matched path is reported as
-    /// [`FileChangeType::CHANGED`]: the caller already knows the path
-    /// changed on disk, and LSP does not require the finer create or
-    /// delete distinction for an engine to reload it.
+    /// Each path retains its create, change, or delete classification. The
+    /// session includes it only when one registered watcher matches both
+    /// path and classification, preserving caller order in one notification.
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError`] when the session ended or the engine's side
-    /// of the connection broke.
+    /// Returns [`EngineError`] when the session ended, a path cannot form
+    /// a document URI, or the engine's connection broke.
     ///
     /// # Cancel safety
     ///
@@ -982,35 +1025,38 @@ impl EngineSession {
     /// still runs.
     pub async fn notify_changed_paths(
         &mut self,
-        paths: &[ProjectPath],
+        paths: &[(ProjectPath, FileChangeType)],
     ) -> Result<Vec<ProjectPath>, EngineError> {
-        let matched: Vec<ProjectPath> = paths
+        if !paths.is_empty() {
+            self.progress.invalidated();
+        }
+        let matched: Vec<(ProjectPath, FileChangeType)> = paths
             .iter()
-            .filter(|path| self.matches_watched_file(path))
+            .filter(|(path, change)| self.matches_watched_file(path, *change))
             .cloned()
             .collect();
         if matched.is_empty() {
-            return Ok(matched);
+            return Ok(Vec::new());
         }
         let mut changes = Vec::with_capacity(matched.len());
-        for path in &matched {
+        for (path, change) in &matched {
             changes.push(FileEvent {
                 uri: self.document_uri(path)?,
-                typ: FileChangeType::CHANGED,
+                typ: *change,
             });
         }
         self.notify::<DidChangeWatchedFiles>(&DidChangeWatchedFilesParams { changes })
             .await?;
-        Ok(matched)
+        Ok(matched.into_iter().map(|(path, _change)| path).collect())
     }
 
-    /// Whether one path matches a watcher the engine registered, and that
-    /// watcher's interest covers a change event.
-    fn matches_watched_file(&self, path: &ProjectPath) -> bool {
+    /// Whether one watcher matches both path and classified event.
+    fn matches_watched_file(&self, path: &ProjectPath, change: FileChangeType) -> bool {
+        let Some(kind) = watch_kind(change) else {
+            return false;
+        };
         self.watched_file_watchers.iter().any(|watcher| {
-            watcher
-                .kind
-                .is_none_or(|kind| kind.contains(WatchKind::Change))
+            watcher.kind.is_none_or(|watched| watched.contains(kind))
                 && glob_pattern_matches(&watcher.glob_pattern, path.as_str())
         })
     }
@@ -1189,6 +1235,7 @@ impl EngineSession {
     /// cannot stall the session.
     async fn notify<N: Notification>(&mut self, params: &N::Params) -> Result<(), EngineError> {
         self.refuse_ended()?;
+        self.empty_answers.forget();
         let value = serde_json::to_value(params).map_err(|source| {
             Error::new(EngineFault::ResultInvalid {
                 method: N::METHOD.to_owned(),
@@ -1297,12 +1344,25 @@ impl EngineSession {
     /// Records what one server-initiated request reveals about the
     /// engine's own subscriptions.
     ///
-    /// Only `client/registerCapability` carries anything this session
-    /// keeps beyond its answer; every other server-initiated request is
-    /// answered without further record.
+    /// Capability registration retains watched-file subscriptions. Work
+    /// progress creation marks its token outstanding before the engine can
+    /// send the matching begin notification.
     fn record_server_request(&mut self, method: &str, params: Option<Value>) {
-        if method == RegisterCapability::METHOD {
-            self.record_watched_file_registration(params);
+        match method {
+            RegisterCapability::METHOD => self.record_watched_file_registration(params),
+            WorkDoneProgressCreate::METHOD => {
+                let Ok(created) = serde_json::from_value::<WorkDoneProgressCreateParams>(
+                    params.unwrap_or(Value::Null),
+                ) else {
+                    return;
+                };
+                self.progress.began(created.token);
+            }
+            WorkspaceDiagnosticRefresh::METHOD => {
+                self.diagnostic_refresh_revision =
+                    self.diagnostic_refresh_revision.saturating_add(1);
+            }
+            _ => {}
         }
     }
 
@@ -1496,9 +1556,9 @@ fn answer_server_request(method: &str, id: &Value, params: Option<Value>) -> Vec
                 .min(CONFIGURATION_ITEMS_MAX);
             correlation::response(id, &Value::Array(vec![Value::Null; items]))
         }
-        RegisterCapability::METHOD | WorkDoneProgressCreate::METHOD => {
-            correlation::response(id, &Value::Null)
-        }
+        RegisterCapability::METHOD
+        | WorkDoneProgressCreate::METHOD
+        | WorkspaceDiagnosticRefresh::METHOD => correlation::response(id, &Value::Null),
         _ => correlation::error_response(id, METHOD_NOT_FOUND_CODE, "method not served"),
     }
 }
@@ -1872,6 +1932,21 @@ mod tests {
             record.is_announced(),
             "the announcement outlives the work it announced"
         );
+        record.invalidated();
+        assert_eq!(record.readiness(), EngineReadiness::Unconfirmed);
+        record.began(token(1));
+        record.invalidated();
+        assert_eq!(
+            record.readiness(),
+            EngineReadiness::Analyzing,
+            "invalidation retains outstanding work"
+        );
+        record.ended(&token(1));
+        assert_eq!(
+            record.readiness(),
+            EngineReadiness::Ready,
+            "ending retained work proves readiness after invalidation"
+        );
         for index in 0..PROGRESS_TOKENS_MAX {
             record.began(token(index));
         }
@@ -1884,32 +1959,18 @@ mod tests {
     }
 
     #[test]
-    fn empty_answers_claim_one_resend_per_operation_and_forget_between_requests() {
+    fn empty_answers_record_latest_operation_and_forget_between_requests() {
         let mut record = EmptyAnswers::default();
-        assert!(
-            !record.claim(),
-            "a session that answered nothing yet claims nothing"
-        );
+        assert!(!record.is_empty(), "session has no empty answer yet");
         record.record(EmptyAnswer::WillRenameFiles, true);
-        assert!(record.claim(), "the first empty answer claims its resend");
-        record.record(EmptyAnswer::WillRenameFiles, true);
-        assert!(
-            !record.claim(),
-            "the operation's one resend per session is spent"
-        );
-        record.record(EmptyAnswer::Diagnostics, true);
-        assert!(record.claim(), "each operation carries its own resend");
-        record.record(EmptyAnswer::Diagnostics, false);
-        assert!(
-            !record.claim(),
-            "an answer that said something claims nothing"
-        );
+        assert!(record.is_empty(), "empty edit is recorded");
+        record.record(EmptyAnswer::References, true);
+        assert!(record.is_empty(), "empty references are recorded");
+        record.record(EmptyAnswer::References, false);
+        assert!(!record.is_empty(), "nonempty answer clears verdict");
         record.record(EmptyAnswer::WillRenameFiles, true);
         record.forget();
-        assert!(
-            !record.claim(),
-            "a request forgets the verdict the previous answer left"
-        );
+        assert!(!record.is_empty(), "next request forgets old verdict");
     }
 
     /// One will-rename answer per proposal shape, and whether it proposes

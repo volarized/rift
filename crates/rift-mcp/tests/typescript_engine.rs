@@ -16,26 +16,15 @@ use crate::engine_fixture::EngineFixture;
 /// The package manager that installs the fixture's pinned `typescript`.
 pub(crate) const BUN_PROGRAM: &str = "bun";
 
-/// The runner that resolves and starts the language server package.
-pub(crate) const BUNX_PROGRAM: &str = "bunx";
+/// Fixture-local language server executable installed from the lockfile.
+pub(crate) const LANGUAGE_SERVER_PROGRAM: &str = "node_modules/.bin/typescript-language-server";
 
-/// The language server, pinned: an unpinned `bunx` argument would float
-/// to whatever the registry publishes next.
-pub(crate) const LANGUAGE_SERVER_PACKAGE: &str = "typescript-language-server@6.0.0";
-
-/// Runs fixture installation and executable probes one at a time.
-static TYPESCRIPT_INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Installs the fixture's pinned `typescript` and proves the language
-/// server runs, or fails the test with the command's own words.
+/// Installs pinned fixture packages and checks the local language server.
 ///
-/// Both halves run from the fixture tree, the directory the engine child
-/// resolves from. The install reads the committed lockfile, so it resolves
-/// nothing and answers from bun's cache when the package is already there.
+/// Commands run from isolated fixture tree. Frozen install accepts only
+/// committed lockfile. Version check invokes local executable directly,
+/// so tests do not depend on a package runner cache or PATH lookup.
 pub(crate) fn install_typescript_engine(fixture_root: &Path) {
-    let _exclusive = TYPESCRIPT_INSTALL_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let started = Instant::now();
     let install = std::process::Command::new(BUN_PROGRAM)
         .args(["install", "--frozen-lockfile"])
@@ -46,19 +35,17 @@ pub(crate) fn install_typescript_engine(fixture_root: &Path) {
             eprintln!("bun install: {:?}", started.elapsed());
         }
         Ok(output) => panic!(
-            "`bun install --frozen-lockfile` failed in {}: the fixture's lockfile must resolve \
-             the pinned typescript. {}",
+            "`bun install --frozen-lockfile` failed in {}: fixture lockfile must install pinned packages. {}",
             fixture_root.display(),
             String::from_utf8_lossy(&output.stderr).trim(),
         ),
         Err(error) => panic!(
-            "`{BUN_PROGRAM}` is not on PATH for {}: install bun to run the live typescript \
-             suite. {error}",
+            "`{BUN_PROGRAM}` is not on PATH for {}: install bun to run live typescript tests. {error}",
             fixture_root.display(),
         ),
     }
-    let probe = std::process::Command::new(BUNX_PROGRAM)
-        .args([LANGUAGE_SERVER_PACKAGE, "--version"])
+    let probe = std::process::Command::new(LANGUAGE_SERVER_PROGRAM)
+        .arg("--version")
         .current_dir(fixture_root)
         .output();
     match probe {
@@ -69,13 +56,12 @@ pub(crate) fn install_typescript_engine(fixture_root: &Path) {
             );
         }
         Ok(output) => panic!(
-            "`{BUNX_PROGRAM} {LANGUAGE_SERVER_PACKAGE} --version` failed in {}: {}",
+            "`{LANGUAGE_SERVER_PROGRAM} --version` failed in {}: {}",
             fixture_root.display(),
             String::from_utf8_lossy(&output.stderr).trim(),
         ),
         Err(error) => panic!(
-            "`{BUNX_PROGRAM}` is not on PATH for {}: install bun to run the live typescript \
-             suite. {error}",
+            "`{LANGUAGE_SERVER_PROGRAM}` is not installed in {}: run frozen fixture install first. {error}",
             fixture_root.display(),
         ),
     }
@@ -90,27 +76,12 @@ pub(crate) fn typescript_engine_configuration() -> String {
     )
 }
 
-/// The fixture data the shared harness turns into the `[engines.typescript]`
-/// table: typescript-language-server over the fixture's bun project,
-/// serving both TypeScript dialects.
-///
-/// `tsserver.useSyntaxServer = "never"` keeps the engine to one semantic
-/// server. Under the default `auto` the language server also runs a
-/// syntax-only server, and that one answers the first rename from the open
-/// file alone: the observed cold answer rewrote the declaration and left
-/// both importers standing. With one semantic server the rename waits for
-/// the loaded project and spans every file.
-///
-/// `[source] exclude` keeps the installed package out of the index. It is
-/// not decoration: without it the walk reaches `typescript`'s own 23mb of
-/// sources and the first change refuses with `violation file_too_large,
-/// path .../node_modules/typescript/lib/_tsc.js`. Any workspace serving a
-/// bun project needs the same entry.
+/// The fixture data used for the local TypeScript engine.
 pub(crate) fn fixture() -> EngineFixture {
     EngineFixture {
         name: "typescript",
-        program: BUNX_PROGRAM,
-        arguments: vec![LANGUAGE_SERVER_PACKAGE, "--stdio"],
+        program: LANGUAGE_SERVER_PROGRAM,
+        arguments: vec!["--stdio"],
         languages: vec!["typescript", "typescript:tsx"],
         extra_toml: "\n[engines.typescript.initialization_options.tsserver]\n\
                      useSyntaxServer = \"never\"\n"

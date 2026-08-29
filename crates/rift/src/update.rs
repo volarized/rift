@@ -1021,22 +1021,24 @@ mod tests {
     }
 
     impl UpdateSource for FakeSource {
-        async fn latest_version(
+        fn latest_version(
             &self,
             _directory: &std::path::Path,
-        ) -> Result<Version, UpdateError> {
-            Ok(self.version.clone())
+        ) -> impl std::future::Future<Output = Result<Version, UpdateError>> {
+            std::future::ready(Ok(self.version.clone()))
         }
 
-        async fn stage(
+        fn stage(
             &self,
             directory: &std::path::Path,
             _version: Version,
-        ) -> Result<std::path::PathBuf, UpdateError> {
+        ) -> impl std::future::Future<Output = Result<std::path::PathBuf, UpdateError>> {
             self.stage_calls.set(self.stage_calls.get() + 1);
             let path = directory.join("rift");
-            fs::write(&path, b"candidate").map_err(super::archive_error)?;
-            Ok(path)
+            let result = fs::write(&path, b"candidate")
+                .map_err(super::archive_error)
+                .map(|()| path);
+            std::future::ready(result)
         }
     }
 
@@ -1045,13 +1047,13 @@ mod tests {
     }
 
     impl Publisher for FakePublisher {
-        async fn publish(
+        fn publish(
             &self,
             _current: &std::path::Path,
             _candidate: &std::path::Path,
-        ) -> Result<OldBinaryCleanup, UpdateError> {
+        ) -> impl std::future::Future<Output = Result<OldBinaryCleanup, UpdateError>> {
             self.calls.set(self.calls.get() + 1);
-            Ok(OldBinaryCleanup::Unnecessary)
+            std::future::ready(Ok(OldBinaryCleanup::Unnecessary))
         }
     }
 
@@ -1528,12 +1530,12 @@ mod tests {
     }
 
     impl super::DownloadTransport for FixtureTransport {
-        async fn download(
+        fn download(
             &self,
             url: &str,
             destination: &std::path::Path,
             _bytes_max: u64,
-        ) -> Result<(), UpdateError> {
+        ) -> impl std::future::Future<Output = Result<(), UpdateError>> {
             let bytes = if url == rift_core::constants::RELEASE_API_URL {
                 &self.metadata
             } else if url.ends_with(".sha256") {
@@ -1541,12 +1543,14 @@ mod tests {
             } else {
                 &self.archive
             };
-            if bytes.is_empty() {
-                return Err(super::download_error(std::io::Error::other(
+            let result = if bytes.is_empty() {
+                Err(super::download_error(std::io::Error::other(
                     "fixture download unavailable",
-                )));
-            }
-            fs::write(destination, bytes).map_err(super::download_error)
+                )))
+            } else {
+                fs::write(destination, bytes).map_err(super::download_error)
+            };
+            std::future::ready(result)
         }
     }
 

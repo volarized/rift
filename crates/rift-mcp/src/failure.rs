@@ -58,7 +58,14 @@ pub(crate) fn hook_failure_diagnostic(
         );
     }
     rift_protocol::read::Diagnostic {
-        severity: rift_protocol::read::Severity::Error,
+        severity: match hook.failure_severity {
+            rift_protocol::configuration::HookFailureSeverity::Warning => {
+                rift_protocol::read::Severity::Warning
+            }
+            rift_protocol::configuration::HookFailureSeverity::Error => {
+                rift_protocol::read::Severity::Error
+            }
+        },
         code: Some(DiagnosticCode::HookFailed.code()),
         message,
         span: None,
@@ -250,7 +257,9 @@ mod tests {
     }
 
     fn probe_hook() -> rift_protocol::configuration::CommandHook {
-        use rift_protocol::configuration::{ChangedPaths, Determinism, HookKind, HookType};
+        use rift_protocol::configuration::{
+            ChangedPaths, Determinism, HookFailureSeverity, HookKind, HookType, HookWrites,
+        };
         rift_protocol::configuration::CommandHook {
             r#type: HookType::Command,
             id: "tests".to_owned(),
@@ -258,10 +267,12 @@ mod tests {
             program: "cargo".to_owned(),
             arguments: vec!["test".to_owned()],
             changed_paths: ChangedPaths::None,
+            writes: HookWrites::None,
             working_directory: rift_protocol::read::ProjectPath(String::new()),
             environment: std::collections::BTreeMap::new(),
             timeout: rift_protocol::configuration::Duration::from_millis(120_000),
             output_limit: rift_protocol::configuration::ByteSize::from_bytes(4_096),
+            failure_severity: HookFailureSeverity::Error,
             guarantees: Vec::new(),
             determinism: Determinism::Deterministic,
         }

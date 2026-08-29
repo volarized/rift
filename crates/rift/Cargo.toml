@@ -56,6 +56,10 @@ name = "end_to_end"
 path = "tests/end_to_end.rs"
 
 [[test]]
+name = "feedback_manifest"
+path = "tests/feedback_manifest.rs"
+
+[[test]]
 name = "logs_resource"
 path = "tests/logs_resource.rs"
 

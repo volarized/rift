@@ -403,6 +403,16 @@ impl ConfigurationState {
             .map(|configuration| configuration.engines.clone())
             .unwrap_or_default()
     }
+
+    /// Whether accepted configuration runs any source-read-only hook.
+    pub(crate) fn has_validation_hooks(&self) -> bool {
+        self.accepted.as_ref().is_ok_and(|configuration| {
+            configuration
+                .hooks
+                .iter()
+                .any(|hook| hook.writes.is_validation())
+        })
+    }
 }
 
 /// Exact bounded identity of the configuration policy source.
@@ -826,20 +836,32 @@ pub(crate) fn watch_path_impact(
     let directory_event = matches!(
         kind,
         EventKind::Create(CreateKind::Folder) | EventKind::Remove(RemoveKind::Folder)
-    ) && validation.source_directory_is_relevant(path);
-    let possible_directory =
-        path.extension().is_none() && validation.source_directory_is_relevant(path);
-    let reshapes_tree = match kind {
-        EventKind::Create(_) | EventKind::Remove(_) => directory_event,
-        EventKind::Modify(ModifyKind::Name(_)) | EventKind::Any | EventKind::Other => {
-            possible_directory
-        }
-        EventKind::Modify(_) | EventKind::Access(_) => false,
-    };
+    );
     if matches!(kind, EventKind::Access(_)) {
         return WatchImpact::None;
     }
-    if policy_file || reshapes_tree {
+    if policy_file {
+        return WatchImpact::WholeWorkspace;
+    }
+    if directory_event {
+        return if validation.source_directory_is_relevant(path) {
+            WatchImpact::WholeWorkspace
+        } else {
+            WatchImpact::None
+        };
+    }
+    let possible_directory =
+        path.extension().is_none() && validation.source_directory_is_relevant(path);
+    let reshapes_tree = match kind {
+        EventKind::Modify(ModifyKind::Name(_)) | EventKind::Any | EventKind::Other => {
+            possible_directory
+        }
+        EventKind::Create(_)
+        | EventKind::Remove(_)
+        | EventKind::Modify(_)
+        | EventKind::Access(_) => false,
+    };
+    if reshapes_tree {
         return WatchImpact::WholeWorkspace;
     }
     if !validation.source_path_is_relevant(path) {
@@ -1111,8 +1133,8 @@ pub(crate) async fn populate_search(
             operation = "search.populate",
             path = %path.as_str(),
             chunks,
-            "a [search.text] file exceeds max_chunk and was indexed in chunks; exclude it in \
-             [source], or drop its extension from [search.text].extensions, to avoid this"
+            "a visible file exceeds search.text.max_chunk and was indexed in chunks; exclude it \
+             in [source], or increase search.text.max_chunk, to avoid this"
         );
     }
     let units = published.reads.lexical_units();
@@ -1794,11 +1816,21 @@ mod tests {
             "[engines.ty]\nprogram = \"uvx\"\nlanguages = [\"python\"]\n",
         )?;
         let with_engines = ConfigurationState::accept(directory.path());
+        assert!(!with_engines.has_validation_hooks());
         let engines = with_engines.engines_configuration();
         assert_eq!(
             engines.get("ty").map(|engine| engine.program.as_str()),
             Some("uvx"),
             "an accepted [engines] table is served"
+        );
+
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[[hooks]]\ntype = \"command\"\nid = \"check\"\nkind = \"build\"\nprogram = \"cargo\"\narguments = [\"check\"]\nchanged_paths = \"none\"\nwrites = \"none\"\nworking_directory = \"\"\nenvironment = {}\ntimeout = \"30s\"\noutput_limit = \"4kb\"\nfailure_severity = \"error\"\nguarantees = []\ndeterminism = \"deterministic\"\n",
+        )?;
+        assert!(
+            ConfigurationState::accept(directory.path()).has_validation_hooks(),
+            "accepted source-read-only hook must invalidate engine state"
         );
 
         fs::write(
@@ -1908,7 +1940,7 @@ mod tests {
                 EventKind::Modify(ModifyKind::Any),
                 "src/guide.txt",
                 source_path("src/guide.txt")?,
-                "an included [search.text] extension is read again like a source file",
+                "a visible baseline text file is read again like provider source",
             ),
             (
                 EventKind::Modify(ModifyKind::Any),

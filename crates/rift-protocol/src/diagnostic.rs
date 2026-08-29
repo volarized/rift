@@ -49,6 +49,9 @@ pub struct Diagnostic {
 /// change it applied. The code strings are owned by serde, the same way error codes are.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum DiagnosticCode {
+    /// A syntax provider marked source erroneous after an applied change.
+    #[serde(rename = "rift.syntax.error")]
+    SyntaxError,
     /// A configured hook did not pass over an applied change.
     #[serde(rename = "rift.hook.failed")]
     HookFailed,
@@ -199,6 +202,7 @@ mod tests {
 
     #[test]
     fn test_diagnostic_codes_serialize_to_their_documented_spellings() {
+        assert_eq!(DiagnosticCode::SyntaxError.code(), "rift.syntax.error");
         assert_eq!(DiagnosticCode::HookFailed.code(), "rift.hook.failed");
         assert_eq!(DiagnosticCode::SnapshotStale.code(), "rift.snapshot.stale");
         assert_eq!(

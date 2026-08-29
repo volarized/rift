@@ -10,13 +10,13 @@
 //!
 //! The slot is also where every transient condition between Rift and one
 //! engine is absorbed. [`EngineSlot::request`] runs the caller's operation
-//! again while the engine answers provisionally or refuses retryably, under
+//! again while the engine answers provisionally, with nothing, or with a refusal, under
 //! that engine's `[engines.<name>.retry]` table, and starts a replacement
 //! engine under its `[engines.<name>.restart]` table when the one it has
-//! dies. It also sends the operation again once when an engine that has
-//! never announced any work answers nothing, because until the first
-//! announcement arrives an empty answer is indistinguishable from a real
-//! one. Callers hold no retry loop of their own: an operation returns
+//! dies. It also sends an operation again under configured retry policy
+//! when an engine answers nothing. Progress does not bind announced work
+//! to one semantic request, so an empty answer stays provisional.
+//! Callers hold no retry loop of their own: an operation returns
 //! either the engine's settled answer or the failure that outlasted the
 //! whole budget.
 //!
@@ -40,6 +40,18 @@ use rift_protocol::read::Language;
 use rift_protocol::retry::RestartPolicy;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
+
+use rift_lsp::session::EngineReadiness;
+
+type SessionFuture<'session, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'session>>;
+
+fn begin_immediately(_session: &mut EngineSession) -> SessionFuture<'_, Result<(), EngineError>> {
+    Box::pin(async { Ok(()) })
+}
+
+fn finish_immediately(_session: &mut EngineSession) -> SessionFuture<'_, ()> {
+    Box::pin(async {})
+}
 
 /// The language engines one workspace serves, spawned lazily and reused.
 ///
@@ -185,6 +197,60 @@ impl RestartBudget {
     }
 }
 
+/// Whether one diagnostic report can be returned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Settlement {
+    /// Report can be returned.
+    Ready,
+    /// Report must be requested again.
+    Retry,
+}
+
+/// Shape of one diagnostic report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReportShape {
+    /// Report carries only a partial result.
+    Partial,
+    /// Full report carries no finding.
+    FullEmpty,
+    /// Full report carries at least one finding.
+    FullNonempty,
+}
+
+impl ReportShape {
+    fn from_report(full: bool, empty: bool) -> Self {
+        if !full {
+            Self::Partial
+        } else if empty {
+            Self::FullEmpty
+        } else {
+            Self::FullNonempty
+        }
+    }
+}
+
+/// Evidence around one diagnostic report attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DiagnosticEvidence {
+    shape: ReportShape,
+    repeated: bool,
+    final_attempt: bool,
+}
+
+/// Decides whether one diagnostic report is ready to return.
+fn diagnostic_settlement(readiness: EngineReadiness, evidence: DiagnosticEvidence) -> Settlement {
+    if evidence.shape == ReportShape::Partial || readiness == EngineReadiness::Analyzing {
+        return Settlement::Retry;
+    }
+    if (readiness == EngineReadiness::Ready && evidence.shape == ReportShape::FullNonempty)
+        || (evidence.repeated && evidence.final_attempt)
+    {
+        Settlement::Ready
+    } else {
+        Settlement::Retry
+    }
+}
+
 /// One condition the slot absorbs: the engine may answer the same request
 /// differently, so the operation is worth sending again.
 ///
@@ -196,15 +262,24 @@ enum Transient<T> {
     /// outstanding, so what it answered - a result or a refusal - is
     /// provisional.
     Analyzing,
-    /// The engine refused with a code that invites the same request again.
+    /// The engine refused the request. A refusal can precede its settled
+    /// verdict, so every refusal receives the same bounded retry schedule.
     Refused(EngineError),
-    /// The engine has never announced any work and answered nothing where
-    /// something was expected, so its silence proves nothing.
+    /// The engine answered nothing where something was expected, so its
+    /// silence proves nothing about semantic settlement.
     ///
-    /// The answer rides along: the engine did answer, so a `retry` table
-    /// too narrow to carry the one resend leaves this as the only answer
-    /// there is.
+    /// Answer rides along: once retry table ends, this is only answer.
     AnsweredNothing(T),
+    /// A full diagnostic report has not yet repeated without progress.
+    Unready,
+}
+
+/// What the retry loop does with one answer.
+enum Answer<T> {
+    /// Return this answer.
+    Ready(T),
+    /// Request same operation again.
+    Retry(Transient<T>),
 }
 
 /// Whether restarting the engine could change this failure's answer.
@@ -229,77 +304,147 @@ impl EngineSlot {
         &self.configuration
     }
 
-    /// Runs one operation against this engine, absorbing every transient
-    /// condition between Rift and it.
+    /// Runs one operation against this engine under configured restart and retry bounds.
     ///
-    /// The operation runs again, unchanged, for every attempt: one that
-    /// opens a document opens it again on the next attempt.
-    ///
-    /// The operation returns a boxed future borrowing the session, the one
-    /// shape that lets callers state the future's `Send` bound.
-    ///
-    /// The slot's lock is held for the whole call, so operations against
-    /// one engine serialize. Three outcomes send the operation back:
-    ///
-    /// - The engine answered while it was still analyzing. That answer is
-    ///   provisional, so it is discarded and the operation is sent again
-    ///   after the `[engines.<name>.retry]` wait. A refusal it answered
-    ///   mid-analysis is provisional for the same reason: rust-analyzer
-    ///   refuses a rename with `No references found at position` for a
-    ///   declaration it has not indexed yet, which is not its verdict on
-    ///   the request.
-    /// - The engine refused with a code that invites the same request
-    ///   again ([`EngineFault::is_retryable_refusal`]). Same treatment.
-    /// - The engine has never announced any work and answered nothing
-    ///   where something was expected. Announcing is what makes the wait
-    ///   above possible, so until the engine has announced once, an empty
-    ///   answer is indistinguishable from a real one: the session claims
-    ///   one resend for it
-    ///   ([`EngineSession::claim_empty_answer_resend`]) and the operation
-    ///   goes back after the same wait. The claim is spent per operation
-    ///   per session, so an engine that announces nothing ever pays this
-    ///   once and answers at once from then on.
-    /// - The session found or left the engine dead. A replacement starts
-    ///   while the `[engines.<name>.restart]` budget allows, and the
-    ///   operation runs on it.
-    ///
-    /// Every other failure - a verdict the settled engine reached, an
-    /// absent capability, a broken exchange - returns at once, because
-    /// sending it again changes nothing. So does a settled answer that
-    /// said something, and so does the second empty answer: what the
-    /// engine says twice is what it has to say.
-    ///
-    /// Both tables bound the loop. Each pass either returns, spends one of
-    /// `retry.attempts`, or claims one of `restart.attempts` inside its
-    /// window, so the loop runs at most their sum plus one.
+    /// Empty answers receive requests through configured retry table.
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError`]: the operation's own failure when the
-    /// engine keeps serving, the last retryable refusal once the retry
-    /// budget is spent, [`EngineFault::Analyzing`] when every attempt was
-    /// answered mid-analysis, the start failure when no engine could be
-    /// started, and [`EngineFault::Ended`] when the restart budget was
-    /// already spent before this call asked anything.
-    ///
-    /// # Cancel safety
-    ///
-    /// Dropping the future releases the slot lock. A session already
-    /// spawned stays in the slot for the next request; an operation
-    /// cancelled mid-exchange leaves its stale engine response for the
-    /// session to discard later, as the session documents.
+    /// Returns operation failure, retry refusal, analyzing exhaustion, start
+    /// failure, or ended session.
     pub async fn request<T>(
         &self,
-        mut operation: impl for<'session> FnMut(
+        operation: impl for<'session> FnMut(
             &'session mut EngineSession,
         ) -> std::pin::Pin<
             Box<dyn Future<Output = Result<T, EngineError>> + Send + 'session>,
         >,
     ) -> Result<T, EngineError> {
+        self.request_deciding(
+            begin_immediately,
+            operation,
+            finish_immediately,
+            |session, _session_generation, answer, _final_attempt| {
+                if session.is_analyzing() {
+                    Answer::Retry(Transient::Analyzing)
+                } else if session.latest_answer_is_empty() {
+                    Answer::Retry(Transient::AnsweredNothing(answer))
+                } else {
+                    Answer::Ready(answer)
+                }
+            },
+        )
+        .await
+    }
+
+    /// Runs one document exchange under configured restart and retry bounds.
+    ///
+    /// `begin` runs once for each live session, retries repeat only
+    /// `operation`, and `finish` runs once before that session returns or
+    /// exhausts its retry table.
+    ///
+    /// # Errors
+    ///
+    /// Returns operation failure, exhausted refusal, analyzing exhaustion,
+    /// start failure, or ended session.
+    pub async fn request_exchange<T>(
+        &self,
+        begin: impl for<'session> FnMut(
+            &'session mut EngineSession,
+        ) -> SessionFuture<'session, Result<(), EngineError>>,
+        operation: impl for<'session> FnMut(
+            &'session mut EngineSession,
+        ) -> SessionFuture<'session, Result<T, EngineError>>,
+        finish: impl for<'session> FnMut(&'session mut EngineSession) -> SessionFuture<'session, ()>,
+    ) -> Result<T, EngineError> {
+        self.request_deciding(
+            begin,
+            operation,
+            finish,
+            |session, _session_generation, answer, _final_attempt| {
+                if session.is_analyzing() {
+                    Answer::Retry(Transient::Analyzing)
+                } else if session.latest_answer_is_empty() {
+                    Answer::Retry(Transient::AnsweredNothing(answer))
+                } else {
+                    Answer::Ready(answer)
+                }
+            },
+        )
+        .await
+    }
+
+    /// Runs one document exchange until a nonempty report follows completed
+    /// progress or two equal full reports reach the configured bound.
+    ///
+    /// `begin` runs once on each live session before the first operation.
+    /// Retries repeat only `operation`. `finish` runs once before a live
+    /// session returns or exhausts its retry table. A replacement session
+    /// receives its own begin call.
+    ///
+    /// # Errors
+    ///
+    /// Returns operation failure, retry refusal, unready exhaustion, start
+    /// failure, or ended session.
+    pub async fn request_settled<T: PartialEq>(
+        &self,
+        begin: impl for<'session> FnMut(
+            &'session mut EngineSession,
+        ) -> SessionFuture<'session, Result<(), EngineError>>,
+        operation: impl for<'session> FnMut(
+            &'session mut EngineSession,
+        ) -> SessionFuture<'session, Result<T, EngineError>>,
+        finish: impl for<'session> FnMut(&'session mut EngineSession) -> SessionFuture<'session, ()>,
+        mut report_state: impl FnMut(&T) -> (bool, bool),
+    ) -> Result<T, EngineError> {
+        let mut previous = None;
+        self.request_deciding(
+            begin,
+            operation,
+            finish,
+            |session, session_generation, answer, final_attempt| {
+                let repeated = previous.as_ref().is_some_and(|(prior_generation, prior)| {
+                    *prior_generation == session_generation && prior == &answer
+                });
+                let (full, empty) = report_state(&answer);
+                if diagnostic_settlement(
+                    session.readiness(),
+                    DiagnosticEvidence {
+                        shape: ReportShape::from_report(full, empty),
+                        repeated,
+                        final_attempt,
+                    },
+                ) == Settlement::Ready
+                {
+                    Answer::Ready(answer)
+                } else {
+                    previous = Some((session_generation, answer));
+                    Answer::Retry(Transient::Unready)
+                }
+            },
+        )
+        .await
+    }
+
+    /// Shared bounded request loop.
+    async fn request_deciding<T>(
+        &self,
+        mut begin: impl for<'session> FnMut(
+            &'session mut EngineSession,
+        ) -> SessionFuture<'session, Result<(), EngineError>>,
+        mut operation: impl for<'session> FnMut(
+            &'session mut EngineSession,
+        )
+            -> SessionFuture<'session, Result<T, EngineError>>,
+        mut finish: impl for<'session> FnMut(&'session mut EngineSession) -> SessionFuture<'session, ()>,
+        mut decide: impl FnMut(&mut EngineSession, u64, T, bool) -> Answer<T>,
+    ) -> Result<T, EngineError> {
         let retry = self.configuration.retry;
         let mut held = self.state.lock().await;
         let mut attempt: u64 = 1;
         let mut reported: Option<EngineError> = None;
+        let mut exchange_started = false;
+        let mut session_generation = 0_u64;
         loop {
             let state = &mut *held;
             let session = match state.session.take() {
@@ -314,26 +459,43 @@ impl EngineSlot {
                     state.session.insert(started)
                 }
             };
+            if !exchange_started {
+                match begin(session).await {
+                    Ok(()) => {
+                        exchange_started = true;
+                        session_generation = session_generation.saturating_add(1);
+                    }
+                    Err(error) if session.is_ended() => {
+                        reported = Some(error);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             let outcome = operation(session).await;
-            let analyzing = session.is_analyzing();
             let ended = session.is_ended();
+            let final_attempt = retry.delay_after(attempt).is_none();
             let absorbed = match outcome {
-                Ok(answer) if !analyzing => {
-                    if !session.claim_empty_answer_resend() {
+                Ok(answer) => match decide(session, session_generation, answer, final_attempt) {
+                    Answer::Ready(answer) => {
+                        finish(session).await;
                         return Ok(answer);
                     }
-                    Transient::AnsweredNothing(answer)
-                }
-                Ok(_provisional) => Transient::Analyzing,
+                    Answer::Retry(absorbed) => absorbed,
+                },
                 Err(error) if ended => {
+                    exchange_started = false;
                     reported = Some(error);
                     continue;
                 }
-                Err(error) if analyzing && error.fault().is_refusal() => Transient::Analyzing,
-                Err(error) if error.fault().is_retryable_refusal() => Transient::Refused(error),
-                Err(error) => return Err(error),
+                Err(error) if error.fault().is_refusal() => Transient::Refused(error),
+                Err(error) => {
+                    finish(session).await;
+                    return Err(error);
+                }
             };
             let Some(wait) = retry.delay_after(attempt) else {
+                finish(session).await;
                 return self.exhausted(absorbed, retry.attempts);
             };
             tokio::time::sleep(wait).await;
@@ -341,21 +503,15 @@ impl EngineSlot {
         }
     }
 
-    /// What one absorbed condition surfaces once the attempt bound is
-    /// spent, logged as the boundary a caller is about to see.
-    ///
-    /// Two of the three end the call with a failure. The third does not:
-    /// an engine that answered nothing did answer, and a `retry` table
-    /// with no second attempt in it leaves that answer as the only one
-    /// there is.
+    /// What one absorbed condition surfaces once attempt bound is spent.
     fn exhausted<T>(&self, absorbed: Transient<T>, attempts: u64) -> Result<T, EngineError> {
         match absorbed {
-            Transient::Analyzing => {
+            Transient::Analyzing | Transient::Unready => {
                 tracing::warn!(
                     component = "engine",
                     engine = %self.name,
                     attempts,
-                    "language engine was still analyzing on every attempt"
+                    "language engine was not ready on every attempt"
                 );
                 Err(Error::new(EngineFault::Analyzing { attempts }))
             }
@@ -364,7 +520,7 @@ impl EngineSlot {
                     component = "engine",
                     engine = %self.name,
                     attempts,
-                    "language engine refused every attempt retryably"
+                    "language engine refused every configured attempt"
                 );
                 Err(refusal)
             }
@@ -373,7 +529,7 @@ impl EngineSlot {
                     component = "engine",
                     engine = %self.name,
                     attempts,
-                    "language engine answered nothing and the attempts allow no resend"
+                    "language engine answered nothing through every configured attempt"
                 );
                 Ok(answer)
             }
@@ -615,6 +771,107 @@ mod tests {
             method: "textDocument/rename".to_owned(),
             timeout_ms: 1_000,
         })));
+    }
+
+    #[test]
+    fn diagnostic_settlement_covers_progress_and_stable_full_reports() {
+        let rows = [
+            (
+                "stale nonempty",
+                EngineReadiness::Unconfirmed,
+                true,
+                false,
+                false,
+                false,
+                Settlement::Retry,
+            ),
+            (
+                "stale empty",
+                EngineReadiness::Unconfirmed,
+                true,
+                true,
+                false,
+                true,
+                Settlement::Retry,
+            ),
+            (
+                "progress start",
+                EngineReadiness::Analyzing,
+                true,
+                false,
+                true,
+                true,
+                Settlement::Retry,
+            ),
+            (
+                "progress end",
+                EngineReadiness::Ready,
+                true,
+                false,
+                false,
+                false,
+                Settlement::Ready,
+            ),
+            (
+                "progress end empty",
+                EngineReadiness::Ready,
+                true,
+                true,
+                false,
+                false,
+                Settlement::Retry,
+            ),
+            (
+                "oscillating",
+                EngineReadiness::Unconfirmed,
+                true,
+                false,
+                false,
+                true,
+                Settlement::Retry,
+            ),
+            (
+                "stable before bound",
+                EngineReadiness::Unconfirmed,
+                true,
+                false,
+                true,
+                false,
+                Settlement::Retry,
+            ),
+            (
+                "stable at bound",
+                EngineReadiness::Unconfirmed,
+                true,
+                false,
+                true,
+                true,
+                Settlement::Ready,
+            ),
+            (
+                "partial",
+                EngineReadiness::Unconfirmed,
+                false,
+                false,
+                true,
+                true,
+                Settlement::Retry,
+            ),
+        ];
+        for (name, readiness, full, empty, repeated, final_attempt, expected) in rows {
+            assert_eq!(
+                diagnostic_settlement(
+                    readiness,
+                    DiagnosticEvidence {
+                        shape: ReportShape::from_report(full, empty),
+                        repeated,
+                        final_attempt,
+                    },
+                ),
+                expected,
+                "{name}"
+            );
+        }
     }
 
     #[test]

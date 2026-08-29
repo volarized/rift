@@ -29,7 +29,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use exchange::{ScriptedEngine, full_capabilities, zero_range};
-use lsp_types::Position;
+use lsp_types::{FileChangeType, Position};
 use rift_core::{ErrorCode, ErrorName, ProjectPath};
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::framing::FramingFault;
@@ -653,8 +653,8 @@ async fn cancelled_request_response_is_discarded_by_the_next_call() {
     join(engine_task).await;
 }
 
-/// Four server-initiated requests, each answered per the routing policy:
-/// configuration, registration, progress creation, and an unserved probe.
+/// Five server-initiated requests, each answered per the routing policy:
+/// configuration, registration, progress creation, diagnostic refresh, and an unserved probe.
 /// The rename answers only after every one of them settles.
 #[tokio::test]
 async fn server_initiated_requests_are_routed_before_the_response() {
@@ -693,7 +693,15 @@ async fn server_initiated_requests_are_routed_before_the_response() {
         let progress = engine.next_raw_message().await;
         assert_eq!(progress["result"], Value::Null);
         engine
-            .send(&json!({"jsonrpc": "2.0", "id": 93, "method": "engine/probe", "params": null}))
+            .send(&json!({
+                "jsonrpc": "2.0", "id": 93, "method": "workspace/diagnostic/refresh",
+                "params": null,
+            }))
+            .await;
+        let refresh = engine.next_raw_message().await;
+        assert_eq!(refresh["result"], Value::Null);
+        engine
+            .send(&json!({"jsonrpc": "2.0", "id": 94, "method": "engine/probe", "params": null}))
             .await;
         let unserved = engine.next_raw_message().await;
         assert_eq!(unserved["error"]["code"], json!(-32601));
@@ -721,7 +729,7 @@ async fn server_initiated_requests_are_routed_before_the_response() {
         .await
         .expect("didOpen is sent");
     // The scripted engine dies unless configuration, registration,
-    // progress, and the unserved probe are each answered per the routing
+    // progress, refresh, and the unserved probe are each answered per the routing
     // policy before the rename itself answers.
     let edit = session
         .rename(
@@ -735,6 +743,11 @@ async fn server_initiated_requests_are_routed_before_the_response() {
         .await
         .expect("the rename answers after the server requests");
     assert_eq!(edit.changes.expect("changes come back").len(), 2);
+    assert_eq!(
+        session.diagnostic_refresh_revision(),
+        1,
+        "diagnostic refresh invalidates earlier pull evidence"
+    );
     let unchanged = session
         .pull_diagnostics(&document)
         .await
@@ -893,6 +906,10 @@ async fn prepare_behaviors_decline_and_refuse_with_typed_answers() {
         .await
         .expect("prepare answers");
     assert!(declined.is_none(), "a null prepare answer declines");
+    assert!(
+        session.latest_answer_is_empty(),
+        "a null prepare answer remains retryable"
+    );
     session.shutdown().await;
     join(engine_task).await;
 
@@ -952,11 +969,10 @@ async fn progress_that_never_ends_keeps_the_engine_analyzing() {
 /// with an edit set holding no edit - the answer of an engine that has
 /// nothing to update, and of one that has not indexed the file yet.
 ///
-/// The session claims one resend for it, and exactly one: the second answer
-/// to the same operation is the engine's own, however empty. An answer that
-/// proposed something claims nothing at all.
+/// Every empty answer remains unconfirmed until engine announces work.
+/// Answer that proposed something is never unconfirmed.
 #[tokio::test]
-async fn an_empty_proposal_from_an_unannounced_engine_claims_one_resend() {
+async fn an_empty_proposal_from_an_unannounced_engine_stays_unconfirmed() {
     let (_workspace, mut session, engine_task) = started(|mut engine| async move {
         engine.handshake(full_capabilities()).await;
         for _attempt in 0..2 {
@@ -997,8 +1013,8 @@ async fn an_empty_proposal_from_an_unannounced_engine_claims_one_resend() {
         "the answer is an edit set, not a null: {proposal:#?}"
     );
     assert!(
-        session.claim_empty_answer_resend(),
-        "an edit set holding no edit is worth asking again once"
+        session.latest_answer_is_empty(),
+        "edit set holding no edit remains unconfirmed"
     );
 
     session
@@ -1006,8 +1022,8 @@ async fn an_empty_proposal_from_an_unannounced_engine_claims_one_resend() {
         .await
         .expect("willRenameFiles answers again");
     assert!(
-        !session.claim_empty_answer_resend(),
-        "the operation's one resend per session is spent"
+        session.latest_answer_is_empty(),
+        "configured retry policy, not session state, bounds resends"
     );
 
     session
@@ -1020,18 +1036,17 @@ async fn an_empty_proposal_from_an_unannounced_engine_claims_one_resend() {
         .expect("the pull answers");
     assert_eq!(pulled.len(), 1, "this engine reports one finding");
     assert!(
-        !session.claim_empty_answer_resend(),
-        "an answer that said something is never asked again"
+        !session.latest_answer_is_empty(),
+        "answer that said something is confirmed"
     );
     session.shutdown().await;
     join(engine_task).await;
 }
 
-/// An engine that has announced work keeps its empty answers: it has shown
-/// it reports what it is doing, so nothing it says while it reports nothing
-/// outstanding needs asking again.
+/// Diagnostic reports use their own settlement record. They do not set
+/// the semantic empty-answer state.
 #[tokio::test]
-async fn an_announced_engine_keeps_its_empty_answer() {
+async fn an_announced_engine_diagnostic_does_not_set_semantic_empty_answer() {
     let (_workspace, mut session, engine_task) = started(|mut engine| async move {
         engine.handshake(full_capabilities()).await;
         engine.begin_progress().await;
@@ -1056,8 +1071,8 @@ async fn an_announced_engine_keeps_its_empty_answer() {
         "the begin the pull consumed announces work still outstanding"
     );
     assert!(
-        !session.claim_empty_answer_resend(),
-        "an announced engine's empty answer is its own"
+        !session.latest_answer_is_empty(),
+        "diagnostic settlement owns this empty report"
     );
     session.shutdown().await;
     join(engine_task).await;
@@ -1067,12 +1082,10 @@ async fn an_announced_engine_keeps_its_empty_answer() {
 /// with an empty list - the answer of an engine with nothing pointing at
 /// the declaration, and of one that has not indexed the file yet.
 ///
-/// The session claims one resend for it, and exactly one: the second empty
-/// answer is the engine's own, however empty. `references` records its own
-/// empty answer under the same policy `willRenameFiles` and diagnostic
-/// pulls already followed.
+/// Every empty references answer remains unconfirmed until engine
+/// announces work. Engine slot retry policy supplies bound.
 #[tokio::test]
-async fn an_empty_references_answer_from_an_unannounced_engine_claims_one_resend() {
+async fn an_empty_references_answer_from_an_unannounced_engine_stays_unconfirmed() {
     let (_workspace, mut session, engine_task) = started(|mut engine| async move {
         engine.handshake(full_capabilities()).await;
         for _attempt in 0..2 {
@@ -1097,8 +1110,8 @@ async fn an_empty_references_answer_from_an_unannounced_engine_claims_one_resend
         .expect("references answers");
     assert!(first.is_empty(), "the engine names nothing");
     assert!(
-        session.claim_empty_answer_resend(),
-        "an empty answer from an unconfirmed engine is worth asking again once"
+        session.latest_answer_is_empty(),
+        "empty answer from unconfirmed engine remains provisional"
     );
 
     let second = session
@@ -1107,8 +1120,8 @@ async fn an_empty_references_answer_from_an_unannounced_engine_claims_one_resend
         .expect("references answers again");
     assert!(second.is_empty());
     assert!(
-        !session.claim_empty_answer_resend(),
-        "the operation's one resend per session is spent"
+        session.latest_answer_is_empty(),
+        "configured retry policy, not session state, bounds resends"
     );
     session.shutdown().await;
     join(engine_task).await;
@@ -1161,6 +1174,16 @@ async fn readiness_moves_from_unconfirmed_through_analyzing_to_ready() {
         session.readiness(),
         EngineReadiness::Ready,
         "the end this exchange read retires the only outstanding token"
+    );
+
+    session
+        .notify_changed_paths(&[(document.clone(), FileChangeType::CHANGED)])
+        .await
+        .expect("an unregistered path needs no notification");
+    assert_eq!(
+        session.readiness(),
+        EngineReadiness::Unconfirmed,
+        "changed workspace bytes invalidate earlier readiness"
     );
 
     session.shutdown().await;
@@ -1274,11 +1297,7 @@ async fn an_engine_that_never_settles_lets_a_caller_report_its_spent_budget() {
     join(engine_task).await;
 }
 
-/// The engine's own `client/registerCapability` call for
-/// `workspace/didChangeWatchedFiles` is what `notify_changed_paths` matches
-/// against: a path a registered glob covers is named in the notification
-/// the engine reads, and a path outside every registered glob is left out
-/// of both the return value and the wire.
+/// Each registered watcher receives its requested create, change, or delete event.
 #[tokio::test]
 async fn notify_changed_paths_matches_only_the_engines_registered_watchers() {
     let (_workspace, mut session, engine_task) = started(|mut engine| async move {
@@ -1293,10 +1312,14 @@ async fn notify_changed_paths_matches_only_the_engines_registered_watchers() {
                         "id": "watch-rust",
                         "method": "workspace/didChangeWatchedFiles",
                         "registerOptions": {
-                            "watchers": [{"globPattern": "**/*.rs"}],
-                        },
-                    }],
-                },
+                            "watchers": [
+                                {"globPattern": "**/*.rs", "kind": 1},
+                                {"globPattern": "**/*.rs", "kind": 2},
+                                {"globPattern": "**/*.rs", "kind": 4}
+                            ]
+                        }
+                    }]
+                }
             }))
             .await;
         let (id, _params) = engine.expect_request("textDocument/references").await;
@@ -1310,45 +1333,53 @@ async fn notify_changed_paths_matches_only_the_engines_registered_watchers() {
         let changes = notified["params"]["changes"]
             .as_array()
             .expect("changes is an array");
-        assert_eq!(changes.len(), 1, "{notified:#}");
+        assert_eq!(changes.len(), 3, "{notified:#}");
+        assert_eq!(changes[0]["type"], json!(1), "created: {notified:#}");
+        assert_eq!(changes[1]["type"], json!(2), "changed: {notified:#}");
+        assert_eq!(changes[2]["type"], json!(3), "deleted: {notified:#}");
         assert!(
             changes[0]["uri"]
                 .as_str()
                 .unwrap_or_default()
-                .ends_with("lib.rs"),
+                .ends_with("new.rs")
+                && changes[1]["uri"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .ends_with("lib.rs")
+                && changes[2]["uri"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .ends_with("old.rs"),
             "{notified:#}"
-        );
-        assert_eq!(
-            changes[0]["type"],
-            json!(2),
-            "type 2 is Changed: {notified:#}"
         );
         let (id, _params) = engine.expect_request("shutdown").await;
         engine.respond(&id, Value::Null).await;
         engine.next_message().await;
     })
     .await;
-    let document = path("src/lib.rs");
     let position = Position {
         line: 0,
         character: 3,
     };
-    // Any request pumps the exchange loop that reads the engine's
-    // unprompted registration; references answering is enough to prove it
-    // landed before the notification below is sent.
     session
-        .references(&document, position)
+        .references(&path("src/lib.rs"), position)
         .await
         .expect("references answers");
 
+    let changed = [
+        (path("src/new.rs"), lsp_types::FileChangeType::CREATED),
+        (path("src/lib.rs"), lsp_types::FileChangeType::CHANGED),
+        (path("src/old.rs"), lsp_types::FileChangeType::DELETED),
+        (path("README.md"), lsp_types::FileChangeType::CREATED),
+    ];
     let matched = session
-        .notify_changed_paths(&[document.clone(), path("README.md")])
+        .notify_changed_paths(&changed)
         .await
         .expect("the notification sends");
     assert_eq!(
         matched,
-        vec![document],
-        "only the path the registered glob covers is matched"
+        vec![path("src/new.rs"), path("src/lib.rs"), path("src/old.rs")],
+        "the engine receives one ordered batch filtered by path and event kind"
     );
 
     session.shutdown().await;
@@ -1438,7 +1469,10 @@ async fn malformed_watched_file_registrations_are_skipped_without_losing_the_val
         .expect("references answers");
 
     let matched = session
-        .notify_changed_paths(&[document.clone(), path("src/notes.md")])
+        .notify_changed_paths(&[
+            (document.clone(), lsp_types::FileChangeType::CHANGED),
+            (path("src/notes.md"), lsp_types::FileChangeType::CHANGED),
+        ])
         .await
         .expect("the notification sends");
     assert_eq!(
@@ -1504,9 +1538,9 @@ async fn watched_file_watchers_past_the_bound_are_dropped() {
 
     let matched = session
         .notify_changed_paths(&[
-            document.clone(),
-            path("src/notes.md"),
-            path("src/readme.txt"),
+            (document.clone(), lsp_types::FileChangeType::CHANGED),
+            (path("src/notes.md"), lsp_types::FileChangeType::CHANGED),
+            (path("src/readme.txt"), lsp_types::FileChangeType::CHANGED),
         ])
         .await
         .expect("the notification sends");

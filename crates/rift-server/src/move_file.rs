@@ -193,7 +193,14 @@ async fn planned_move(
     refused_occupied_destination(workspace_root, &to).await?;
     refused_invisible_destination(reads, workspace_root, &to)?;
     refused_oversized(&from, source.text.len(), MOVE_OPERATION)?;
-    let proposal = engine_proposal(engines, &from, &to, source.language_segment.as_deref()).await?;
+    let proposal = engine_proposal(
+        engines,
+        &from,
+        &to,
+        source.language_segment.as_deref(),
+        &source.text,
+    )
+    .await?;
     match proposal {
         EngineProposal::Nothing(reason) => Ok(unedited_plan(from, to, source.text, Some(reason))),
         EngineProposal::Answered { edit, encoding } => {
@@ -410,6 +417,7 @@ async fn engine_proposal(
     from: &CoreProjectPath,
     to: &CoreProjectPath,
     language_segment: Option<&str>,
+    source: &str,
 ) -> Result<EngineProposal, PlanEnd> {
     let Some(language_segment) = language_segment else {
         return Ok(EngineProposal::Nothing(
@@ -423,7 +431,7 @@ async fn engine_proposal(
         }));
     };
     let engine = || slot.name().to_owned();
-    match exchanged_will_rename(slot, from, to).await {
+    match exchanged_will_rename(slot, from, to, &language.name, source).await {
         Ok(MoveExchange::FilterMismatch) => Ok(EngineProposal::Nothing(
             ReferencesNotUpdated::FilterMismatch { engine: engine() },
         )),
@@ -460,23 +468,39 @@ async fn exchanged_will_rename(
     slot: &EngineSlot,
     from: &CoreProjectPath,
     to: &CoreProjectPath,
+    language_id: &str,
+    source: &str,
 ) -> Result<MoveExchange, EngineError> {
-    // The boxed future may only borrow the session, so each attempt gets
-    // its own owned copy of the request paths.
+    let open_path = from.clone();
+    let open_language = language_id.to_owned();
+    let open_source = source.to_owned();
     let request_from = from.clone();
     let request_to = to.clone();
-    slot.request(move |session: &mut EngineSession| {
-        let from = request_from.clone();
-        let to = request_to.clone();
-        Box::pin(async move { will_rename_on_session(session, &from, &to).await })
-    })
+    let close_path = from.clone();
+    slot.request_exchange(
+        move |session: &mut EngineSession| {
+            let path = open_path.clone();
+            let language = open_language.clone();
+            let source = open_source.clone();
+            Box::pin(async move { session.open(&path, &language, source).await })
+        },
+        move |session: &mut EngineSession| {
+            let from = request_from.clone();
+            let to = request_to.clone();
+            Box::pin(async move { will_rename_on_session(session, &from, &to).await })
+        },
+        move |session: &mut EngineSession| {
+            let path = close_path.clone();
+            Box::pin(async move {
+                let _ = session.close(&path).await;
+            })
+        },
+    )
     .await
 }
 
-/// One will-rename conversation. `didOpen` is not required: the request
-/// names the old and new URIs alone. An engine whose filters do not cover
-/// the file is never asked; an engine without the capability refuses
-/// inside the session's own gate.
+/// One will-rename request on an open document.
+/// Engine whose filters do not cover file is never asked.
 async fn will_rename_on_session(
     session: &mut EngineSession,
     from: &CoreProjectPath,
@@ -488,10 +512,11 @@ async fn will_rename_on_session(
         return Ok(MoveExchange::FilterMismatch);
     }
     let edit = session.will_rename_files(from, to).await?;
+    let readiness = session.readiness();
     Ok(MoveExchange::Answered {
         edit,
         encoding,
-        readiness: session.readiness(),
+        readiness,
     })
 }
 
@@ -623,8 +648,9 @@ mod tests {
             r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"warm","value":{"kind":"end"}}}"#,
         );
         let no_edit = framed(r#"{"jsonrpc":"2.0","id":1,"result":null}"#);
+        let no_edit_again = framed(r#"{"jsonrpc":"2.0","id":2,"result":null}"#);
         let script = format!(
-            "printf '%s' '{capabilities}{progress_begin}{progress_end}{no_edit}'; sleep 0.2"
+            "printf '%s' '{capabilities}{progress_begin}{progress_end}{no_edit}{no_edit_again}'; sleep 0.2"
         );
         let engine = rift_protocol::configuration::EngineConfiguration {
             program: "sh".to_owned(),
@@ -635,7 +661,11 @@ mod tests {
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
             request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
             output_limit: rift_protocol::configuration::ByteSize::from_bytes(4_096),
-            retry: rift_protocol::retry::RetryPolicy::default(),
+            retry: rift_protocol::retry::RetryPolicy {
+                attempts: 2,
+                delay: rift_protocol::configuration::Duration::from_millis(1),
+                delay_limit: rift_protocol::configuration::Duration::from_millis(1),
+            },
             restart: rift_protocol::retry::RestartPolicy::default(),
         };
         let engines = EnginePool::new(
@@ -651,6 +681,7 @@ mod tests {
                 preconditions.first().expect("a failed condition rides")
             }
             ChangeResult::Applied { .. } => panic!("expected a refusal, got an applied change"),
+            ChangeResult::Unchanged => panic!("expected a refusal, got unchanged result"),
         }
     }
 
@@ -690,8 +721,7 @@ mod tests {
     /// advertising will-rename over every path, never announces any
     /// `$/progress` work of its own, and answers the one
     /// `workspace/willRenameFiles` request the move sends with `null`. With
-    /// `retry.attempts` at 1 the slot's one empty-answer resend is never
-    /// claimed past the first attempt, so the answer reaches `plan_move`
+    /// `retry.attempts` at 1 no empty-answer resend is available, so answer reaches `plan_move`
     /// exactly as the engine gave it: nothing, from an engine that has
     /// proven nothing about its own readiness. The script never reads its
     /// stdin; it writes this fixed sequence regardless of what the session

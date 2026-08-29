@@ -7,36 +7,33 @@
 //! answers. A future language joins revision reads the same way it joins
 //! the scan - by its provider's declared extensions and a syntax step.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use rift_core::constants::WORKSPACE_IGNORED_DIRECTORIES;
 use rift_core::{CompositionId, ProjectPath, SourceVisibility};
-use rift_history::{REVISION_TREE_ENTRIES_MAX, Repository, ResolvedRevision, TreeFile};
+use rift_history::{REVISION_TREE_ENTRIES_MAX, Repository, ResolvedRevision};
 use rift_provider::CompositionBuilder;
 use rift_provider::ProviderComposition;
 
 use crate::glob::PathMatcher;
 use crate::workspace::{
     ReadIndex, RustFacts, WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits,
-    WorkspaceIndexViolation, component, composition_error, has_source_extension, included_file,
-    index_error_at, index_error_caused_by, syntax_provider_for,
+    WorkspaceIndexViolation, component, composition_error, has_source_extension, index_error_at,
+    index_error_caused_by, syntax_provider_for,
 };
 
 #[derive(Debug)]
 pub(crate) struct RevisionFiles;
 
 impl WorkspaceIndex {
-    /// Builds a read index over `revision`'s committed files, applying the
-    /// same `[source]` include/exclude policy, provider-declared extension
-    /// inclusion, hard floor, and bounds as the workspace scan. The
-    /// `.gitignore` chain is not consulted: every listed file is tracked,
-    /// which is what ignoring would have prevented.
+    /// Builds read index over one committed tree.
+    ///
+    /// Hard floor and source policy apply to every path. Registered providers add
+    /// syntax facts; every accepted UTF-8 file also enters baseline content catalog.
     ///
     /// # Errors
     ///
-    /// Returns [`WorkspaceIndexError`] for an invalid `[source]` pattern, a
-    /// tree or file over a bound, an unreadable object store, or a committed
-    /// path or file the index cannot represent.
+    /// Returns `WorkspaceIndexError` for invalid paths, bounds, history reads, or syntax.
     pub fn at_revision(
         repository: &Repository,
         revision: &ResolvedRevision,
@@ -46,16 +43,13 @@ impl WorkspaceIndex {
         let root = repository.root().to_path_buf();
         let composition = revision_composition()?;
         let matcher = PathMatcher::build(&root, visibility.include(), visibility.exclude())?;
-        let includes = |path: &str| {
-            has_source_extension(Path::new(path))
-                && hard_floor_includes(path)
-                && matcher.includes(&root.join(path))
-        };
+        let includes = |path: &str| hard_floor_includes(path) && matcher.includes(&root.join(path));
         let listed = repository
             .tree_files(revision, &includes, REVISION_TREE_ENTRIES_MAX)
             .map_err(history_error)?;
-        let mut workspace_bytes = 0_usize;
+        let mut catalog_bytes = 0_usize;
         let mut files = Vec::with_capacity(listed.len().min(limits.files_max()));
+        let mut text_files = Vec::with_capacity(listed.len().min(limits.files_max()));
         for tree_file in &listed {
             let context_path = PathBuf::from(tree_file.path());
             if directory_depth(tree_file.path()) > limits.directory_depth_max() {
@@ -64,7 +58,22 @@ impl WorkspaceIndex {
                     &context_path,
                 ));
             }
-            if files.len() >= limits.files_max() {
+            let bytes = match repository.blob_bytes(tree_file, limits.file_bytes_max()) {
+                Ok(bytes) => bytes,
+                Err(error)
+                    if matches!(
+                        error.fault(),
+                        rift_history::HistoryFault::BlobTooLarge { .. }
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(history_error(error)),
+            };
+            if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
+                continue;
+            }
+            if text_files.len() >= limits.files_max() {
                 return Err(index_error_at(
                     WorkspaceIndexViolation::TooManyFiles,
                     &context_path,
@@ -77,39 +86,31 @@ impl WorkspaceIndex {
                     error,
                 )
             })?;
-            let bytes = blob_bytes(repository, tree_file, limits)?;
-            files.push(included_file(
+            let text_file = super::workspace::included_text_file(
                 project_path,
                 bytes,
                 &context_path,
-                syntax_provider_for(&context_path),
                 limits,
-                &mut workspace_bytes,
-            )?);
+                &mut catalog_bytes,
+            )?;
+            if has_source_extension(&context_path) {
+                files.push(super::workspace::indexed_file_from_catalog(
+                    &text_file,
+                    &context_path,
+                    syntax_provider_for(&context_path),
+                )?);
+            }
+            text_files.push(text_file);
         }
-        // Revision reads serve committed source only: text files join the workspace scan,
-        // not a revision tree, so this list stays empty and the chunk bound is unused.
         Self::from_parts(
             root,
             files,
-            Vec::new(),
+            text_files,
             composition,
             limits,
             rift_core::TextFileInclusion::default(),
         )
     }
-}
-
-/// One committed file's bytes, with the per-file byte bound enforced before
-/// the blob is loaded.
-fn blob_bytes(
-    repository: &Repository,
-    file: &TreeFile,
-    limits: WorkspaceIndexLimits,
-) -> Result<Vec<u8>, WorkspaceIndexError> {
-    repository
-        .blob_bytes(file, limits.file_bytes_max())
-        .map_err(history_error)
 }
 
 /// Wraps one version-control failure, which keeps its own registry identity
@@ -151,6 +152,7 @@ mod tests {
     use super::*;
     use rift_history::fixture::{commit_all, init};
     use std::fs;
+    use std::path::Path;
 
     fn committed_workspace() -> tempfile::TempDir {
         let directory = tempfile::tempdir().expect("temp dir");
@@ -345,23 +347,25 @@ mod tests {
     }
 
     #[test]
-    fn test_at_revision_refuses_an_oversized_committed_blob() {
+    fn test_at_revision_skips_oversized_blob_without_hiding_valid_text() {
         let directory = committed_workspace();
         let tight = WorkspaceIndexLimits::new(5, 8, 2_000, 4, 5).expect("limits");
-        let error = revision_index(directory.path(), tight, &SourceVisibility::default())
-            .expect_err("a committed source over the byte bound must refuse");
-        assert_eq!(error.fault().violation(), WorkspaceIndexViolation::History);
-        assert_eq!(
-            error.descriptor().code(),
-            "limit_exceeded",
-            "the blob bound keeps the version-control failure's classification"
-        );
-        let context = error.context();
+        let index = revision_index(directory.path(), tight, &SourceVisibility::default())
+            .expect("oversized blob must not hide valid revision text");
         assert!(
-            context
-                .iter()
-                .any(|entry| entry.key() == "path" && entry.value() == "src/lib.rs"),
-            "the refusal names the oversized committed file: {context:?}"
+            index
+                .text_file(&ProjectPath::new("README.txt").expect("path"))
+                .is_some()
+        );
+        assert!(
+            index
+                .file(&ProjectPath::new("src/lib.rs").expect("path"))
+                .is_none()
+        );
+        assert!(
+            index
+                .text_file(&ProjectPath::new("src/lib.rs").expect("path"))
+                .is_none()
         );
     }
 
@@ -388,19 +392,30 @@ mod tests {
     }
 
     #[test]
-    fn test_at_revision_refuses_a_non_utf8_committed_blob() {
+    fn test_at_revision_skips_non_utf8_blob_without_hiding_valid_source() {
         let directory = committed_workspace();
         fs::write(directory.path().join("evil.rs"), [0xff, 0xfe]).expect("binary blob");
         commit_all(directory.path(), "commit a binary rust path");
-        let error = revision_index(
+        let index = revision_index(
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
         )
-        .expect_err("a non-UTF-8 committed source must refuse");
-        assert_eq!(
-            error.fault().violation(),
-            WorkspaceIndexViolation::InvalidSource
+        .expect("invalid blob must not hide valid revision source");
+        assert!(
+            index
+                .file(&ProjectPath::new("src/lib.rs").expect("path"))
+                .is_some()
+        );
+        assert!(
+            index
+                .file(&ProjectPath::new("evil.rs").expect("path"))
+                .is_none()
+        );
+        assert!(
+            index
+                .text_file(&ProjectPath::new("evil.rs").expect("path"))
+                .is_none()
         );
     }
 }

@@ -41,7 +41,7 @@ pub(super) type ServerCommandError = Error<ServerCommandFault>;
 pub(super) enum ServerCommandFault {
     /// A rift server already serves this workspace, refusing a foreground
     /// start. Carries the holder's document when the probe could read one.
-    AlreadyServing { holder: Option<ServerLock> },
+    AlreadyServing { holder: Option<Box<ServerLock>> },
     /// The detached server process could not be spawned.
     SpawnFailed { source: io::Error },
     /// The spawned server did not publish within [`START_WAIT_MAX`].
@@ -53,9 +53,9 @@ pub(super) enum ServerCommandFault {
     StopRefused { status: reqwest::StatusCode },
     /// The server accepted the stop but kept serving past
     /// [`STOP_WAIT_MAX`]. Carries the still-serving holder's document.
-    StopTimedOut { holder: ServerLock },
+    StopTimedOut { holder: Box<ServerLock> },
     /// The election refused or failed while serving in the foreground.
-    Election(ElectionError),
+    Election(Box<ElectionError>),
 }
 
 impl Fault for ServerCommandFault {
@@ -73,7 +73,7 @@ impl Fault for ServerCommandFault {
 
     fn context(&self) -> Vec<ErrorContext> {
         match self {
-            Self::AlreadyServing { holder } => holder_evidence(holder.as_ref()),
+            Self::AlreadyServing { holder } => holder_evidence(holder.as_deref()),
             Self::SpawnFailed { .. } => {
                 vec![ErrorContext::new("operation", "spawn detached server")]
             }
@@ -84,7 +84,7 @@ impl Fault for ServerCommandFault {
             Self::StopRefused { status } => stop_refusal_evidence(*status),
             Self::StopTimedOut { holder } => {
                 let mut evidence = vec![ErrorContext::new("waited", format!("{STOP_WAIT_MAX:?}"))];
-                evidence.extend(holder_evidence(Some(holder)));
+                evidence.extend(holder_evidence(Some(holder.as_ref())));
                 evidence
             }
             Self::Election(source) => source.context(),
@@ -254,7 +254,7 @@ fn status(root: &Path) -> ServerOutcome {
         ServerPresence::Serving(lock) => ServerOutcome::Serving {
             port: lock.port,
             pid: lock.pid,
-            version: lock.version,
+            version: lock.identity.version,
         },
         ServerPresence::Stale(reason) => ServerOutcome::Stale {
             reason: stale_reason_phrase(&reason),
@@ -368,7 +368,7 @@ async fn serve_foreground(
     let stopped = server
         .stopped()
         .await
-        .map_err(|error| Error::new(ServerCommandFault::Election(error)));
+        .map_err(|error| Error::new(ServerCommandFault::Election(Box::new(error))));
     shutdown.cancel();
     interrupt.abort();
     let _ = interrupt.await;
@@ -413,10 +413,10 @@ async fn cancel_on_interrupt(shutdown: CancellationToken) {
 fn foreground_refused(root: &Path, error: ElectionError) -> ServerCommandError {
     if matches!(error.fault(), ElectionFault::AlreadyServing) {
         return Error::new(ServerCommandFault::AlreadyServing {
-            holder: read_serving(root),
+            holder: read_serving(root).map(Box::new),
         });
     }
-    Error::new(ServerCommandFault::Election(error))
+    Error::new(ServerCommandFault::Election(Box::new(error)))
 }
 
 /// Stops the serving server, treating a workspace without one as done.
@@ -490,7 +490,9 @@ async fn await_stopped(
         }
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
     }
-    Err(Error::new(ServerCommandFault::StopTimedOut { holder }))
+    Err(Error::new(ServerCommandFault::StopTimedOut {
+        holder: Box::new(holder),
+    }))
 }
 
 /// Removes a stale lock document, best effort.
@@ -538,7 +540,7 @@ mod tests {
         stale_reason_phrase, start_mode, status, stop, stop_log_drain,
     };
     use rift_core::Error;
-    use rift_protocol::lock::{ServerLock, ServerLockViolation};
+    use rift_protocol::lock::{ProductIdentity, ServerLock, ServerLockViolation};
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -547,7 +549,11 @@ mod tests {
             port: 12_345,
             token: "a".repeat(rift_protocol::lock::SERVER_TOKEN_LENGTH),
             pid: 4_242,
-            version: "0.0.11".to_owned(),
+            identity: ProductIdentity {
+                version: "0.0.11".to_owned(),
+                executable_digest: "a".repeat(64),
+                schema_digest: "b".repeat(64),
+            },
         }
     }
 
@@ -735,7 +741,7 @@ mod tests {
         let cases: Vec<(super::ServerCommandError, &str)> = vec![
             (
                 Error::new(ServerCommandFault::AlreadyServing {
-                    holder: Some(holder()),
+                    holder: Some(Box::new(holder())),
                 }),
                 "server_already_serving",
             ),
@@ -756,7 +762,9 @@ mod tests {
                 "server_stop_failed",
             ),
             (
-                Error::new(ServerCommandFault::StopTimedOut { holder: holder() }),
+                Error::new(ServerCommandFault::StopTimedOut {
+                    holder: Box::new(holder()),
+                }),
                 "server_stop_failed",
             ),
         ];
@@ -768,7 +776,7 @@ mod tests {
     #[test]
     fn failure_text_names_evidence_and_next_steps() {
         let already = Error::new(ServerCommandFault::AlreadyServing {
-            holder: Some(holder()),
+            holder: Some(Box::new(holder())),
         })
         .to_string();
         assert!(already.contains("127.0.0.1:12345"), "{already}");
@@ -780,7 +788,10 @@ mod tests {
         assert!(unpublished.contains("has not published"), "{unpublished}");
 
         let timed_out = Error::new(ServerCommandFault::StartTimedOut).to_string();
-        assert!(timed_out.contains("15s"), "{timed_out}");
+        assert!(
+            timed_out.contains(&format!("{START_WAIT_MAX:?}")),
+            "{timed_out}"
+        );
         assert!(timed_out.contains("--foreground"), "{timed_out}");
 
         let unauthorized = Error::new(ServerCommandFault::StopRefused {
@@ -797,8 +808,10 @@ mod tests {
         assert!(refused.contains("status 500"), "{refused}");
         assert!(!refused.contains("stale"), "{refused}");
 
-        let stop_timed_out =
-            Error::new(ServerCommandFault::StopTimedOut { holder: holder() }).to_string();
+        let stop_timed_out = Error::new(ServerCommandFault::StopTimedOut {
+            holder: Box::new(holder()),
+        })
+        .to_string();
         assert!(stop_timed_out.contains("10s"), "{stop_timed_out}");
         assert!(stop_timed_out.contains("pid 4242"), "{stop_timed_out}");
     }
@@ -829,7 +842,7 @@ mod tests {
         let election = Error::new(rift_mcp::ElectionFault::AlreadyServing);
         let expected_code = election.descriptor().code();
         let expected_context = election.context();
-        let error = Error::new(ServerCommandFault::Election(election));
+        let error = Error::new(ServerCommandFault::Election(Box::new(election)));
         assert_eq!(error.descriptor().code(), expected_code);
         assert_eq!(error.context(), expected_context);
         assert!(

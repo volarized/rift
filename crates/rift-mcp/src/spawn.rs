@@ -23,11 +23,11 @@ const STARTUP_STDERR_CAPTURE_BYTES: usize = 8 << 10;
 pub const PRESENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Longest wait for a spawned server to publish its lock document.
 ///
-/// A start poll runs `START_WAIT_MAX / PRESENCE_POLL_INTERVAL` = 150
+/// A start poll runs `START_WAIT_MAX / PRESENCE_POLL_INTERVAL` = 300
 /// bounded iterations.
-pub const START_WAIT_MAX: Duration = Duration::from_secs(15);
+pub const START_WAIT_MAX: Duration = Duration::from_secs(30);
 /// Probe attempts one start waits: [`START_WAIT_MAX`] over the interval.
-pub const START_POLL_ATTEMPT_COUNT: u32 = 150;
+pub const START_POLL_ATTEMPT_COUNT: u32 = 300;
 
 /// Keeps a detached child completely off this process's terminal and
 /// process group (unix half).
@@ -215,6 +215,7 @@ fn drain_until_closed(mut stream: impl Read, capture_bytes: usize) -> CapturedSt
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
+    use std::time::Duration;
 
     use super::{
         CapturedStream, PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX,
@@ -223,6 +224,10 @@ mod tests {
 
     #[test]
     fn start_poll_attempt_count_derives_from_its_window() {
+        assert!(
+            START_WAIT_MAX >= Duration::from_secs(30),
+            "startup includes identity, watch setup, initial catalog, and lexical publication"
+        );
         assert_eq!(
             PRESENCE_POLL_INTERVAL * START_POLL_ATTEMPT_COUNT,
             START_WAIT_MAX

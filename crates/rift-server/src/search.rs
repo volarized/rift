@@ -141,8 +141,7 @@ impl ReadService {
             .collect()
     }
 
-    /// How many files this snapshot indexes: visible source files and included text files
-    /// alike, which together are what [`ReadService::described_units`] derives from.
+    /// How many visible files this snapshot indexes across syntax and baseline text.
     ///
     /// A caller estimates the semantic tier's preparation work from this count.
     #[must_use]
@@ -296,11 +295,9 @@ fn collect_indexed_hits(
     Ok(())
 }
 
-/// Source-line and text-lane content-line hits for `query`, filtered by `matcher` and
-/// appended to `results` up to `fetch_limit`. A syntax-indexed file's line answers with
-/// `semantic: true`; a `[search.text]` file's line answers with `semantic: false`, the field
-/// whose description already reads "where no provider claims the path" - both lanes run the
-/// same lexical search, over the two file classes the index holds.
+/// Content-line hits from baseline catalog, filtered by `matcher` and appended to
+/// `results` up to `fetch_limit`. A path with syntax facts answers through its
+/// provider-backed file; every other path answers through baseline text file.
 fn collect_indexed_content_hits(
     index: &WorkspaceIndex,
     matcher: Option<&PathMatcher>,
@@ -311,25 +308,17 @@ fn collect_indexed_content_hits(
     results: &mut Vec<SearchHit>,
 ) -> Result<(), ReadError> {
     for (file, line, text) in index
-        .source_matches(query, fetch_limit)
-        .map_err(ReadFault::index)?
-    {
-        if !includes(matcher, root, file.path()) {
-            continue;
-        }
-        results.push(file_search_hit(file, line, text, payloads));
-        if results.len() >= fetch_limit {
-            return Ok(());
-        }
-    }
-    for (file, line, text) in index
         .text_matches(query, fetch_limit)
         .map_err(ReadFault::index)?
     {
         if !includes(matcher, root, file.path()) {
             continue;
         }
-        results.push(text_search_hit(file, line, text, payloads));
+        if let Some(provider_file) = index.file(file.path()) {
+            results.push(file_search_hit(provider_file, line, text, payloads));
+        } else {
+            results.push(text_search_hit(file, line, text, payloads));
+        }
         if results.len() >= fetch_limit {
             break;
         }
@@ -337,12 +326,7 @@ fn collect_indexed_content_hits(
     Ok(())
 }
 
-/// Reaches files `selector.force_include` names outside the index - bypassing `[source]`
-/// policy and `.gitignore`, never the hard floor - parses and publishes them on demand,
-/// then searches them with the same scoring pipeline as indexed hits, appending up to
-/// `fetch_limit` total results: the full collection bound the pool pages under, never one
-/// page's size. Bounded to [`FORCE_INCLUDE_FILES_MAX`] matched files; a crossed bound
-/// refuses the search.
+/// Reaches request-selected files outside persistent index.
 fn collect_force_include_hits(
     index: &WorkspaceIndex,
     selector: &PathSelector,
@@ -379,6 +363,18 @@ fn collect_force_include_hits(
             rift_index::source_line_matches(extra.files(), query, fetch_limit - results.len())
         {
             results.push(file_search_hit(file, line, text, payloads));
+        }
+    }
+    if results.len() < fetch_limit
+        && matches!(target, SearchParamsTarget::All | SearchParamsTarget::File)
+    {
+        for (file, line, text) in extra
+            .text_matches(query, fetch_limit - results.len())
+            .map_err(ReadFault::index)?
+        {
+            if extra.file(file.path()).is_none() {
+                results.push(text_search_hit(file, line, text, payloads));
+            }
         }
     }
     Ok(())
@@ -424,9 +420,7 @@ fn build_symbol_hit(
     })
 }
 
-/// Builds one file hit's wire shape. `text` is still needed to size `range` whether or not
-/// `payloads` asked for `source`, so only the field assignment - never the byte count - is
-/// conditional.
+/// Builds one file hit wire value.
 fn file_search_hit(
     file: &IndexedFile,
     line_index: usize,
@@ -442,7 +436,7 @@ fn file_search_hit(
                 id: file_id(file.path()),
                 content: FileContent::Regular {
                     size: u64::try_from(file.source().len()).unwrap_or(u64::MAX),
-                    executable: false,
+                    executable: file.executable(),
                 },
                 languages: vec![file.syntax().language().clone()],
                 regions: Vec::new(),
@@ -460,16 +454,13 @@ fn file_search_hit(
     }
 }
 
-/// Builds one text-lane file's wire value: no provider claims a text-lane path, so it carries
-/// no language and `semantic: false` - the field whose description already reads "where no
-/// provider claims the path". Shared by every hit a text-lane file produces, identifier-
-/// matched or ranked alike.
+/// Builds one baseline content file wire value.
 fn text_file_wire(file: &TextSourceFile) -> File {
     File {
         id: file_id(file.path()),
         content: FileContent::Regular {
             size: u64::try_from(file.content().len()).unwrap_or(u64::MAX),
-            executable: false,
+            executable: file.executable(),
         },
         languages: Vec::new(),
         regions: Vec::new(),
@@ -667,7 +658,7 @@ fn merge_symbol_hit(
     Ok(())
 }
 
-/// Merges one ranked text-file unit: an identifier-matched hit at the same path and line
+/// Merges one ranked text-file unit: an identifier-matched hit at the same path
 /// keeps its place and absorbs `score`; otherwise the ranked hit joins `results` new.
 fn merge_file_hit(
     results: &mut Vec<SearchHit>,
@@ -680,9 +671,7 @@ fn merge_file_hit(
 ) {
     let path = project_path(file.path());
     let existing = results.iter_mut().find(|hit| {
-        matches!(&hit.hit, SearchHitTarget::File { .. })
-            && hit.path.as_ref() == Some(&path)
-            && hit.line == Some(line_number)
+        matches!(&hit.hit, SearchHitTarget::File { .. }) && hit.path.as_ref() == Some(&path)
     });
     if let Some(existing) = existing {
         absorb_ranked_match(existing, score);
@@ -1079,11 +1068,9 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    /// Once the source lane alone fills `results_max`, `collect_indexed_content_hits`
-    /// returns before the text lane runs at all: a `[search.text]` file matching the same
-    /// query never joins the pool once the syntax-indexed source lane already spent it.
+    /// Baseline catalog stops once `results_max` is reached.
     #[test]
-    fn search_source_lane_hitting_fetch_limit_skips_the_text_lane() -> TestResult {
+    fn search_baseline_catalog_stops_at_fetch_limit() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::create_dir(directory.path().join("src"))?;
         let source = "// Beacon marker\npub fn foo() {}\n";
@@ -1106,23 +1093,19 @@ pub fn compute() -> i32 {
         assert_eq!(
             results.len(),
             1,
-            "the source lane alone fills results_max, so no other candidate joins the pool: \
+            "baseline catalog fills results_max with one candidate: \
              {results:#?}"
         );
-        assert_eq!(results[0]["hit"]["file"]["semantic"], json!(true));
-        assert!(
-            results.iter().all(|hit| hit["path"] != json!("README.txt")),
-            "the text lane never runs once the source lane already filled results_max: \
-             {results:#?}"
-        );
+        assert_eq!(results[0]["hit"]["file"]["semantic"], json!(false));
+        assert_eq!(results[0]["path"], json!("README.txt"));
         Ok(())
     }
 
-    /// The text lane breaks the moment `results_max` is reached, leaving a later matching
+    /// Baseline catalog breaks the moment `results_max` is reached, leaving a later matching
     /// candidate out of the pool - the pool never overshoots `results_max` even though
     /// `text_matches` itself is called with the full bound rather than the room left.
     #[test]
-    fn search_text_lane_stops_at_fetch_limit_leaving_a_later_candidate_out() -> TestResult {
+    fn search_baseline_catalog_leaves_later_candidate_out() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::create_dir(directory.path().join("src"))?;
         let source = "// Beacon marker\npub fn foo() {}\n";
@@ -1146,14 +1129,14 @@ pub fn compute() -> i32 {
         assert_eq!(
             results.len(),
             2,
-            "the text lane stops the moment results_max is reached: {results:#?}"
+            "baseline catalog stops the moment results_max is reached: {results:#?}"
         );
         let paths: Vec<_> = results.iter().map(|hit| hit["path"].clone()).collect();
-        assert!(paths.contains(&json!("src/lib.rs")));
         assert!(paths.contains(&json!("README.txt")));
+        assert!(paths.contains(&json!("notes.txt")));
         assert!(
-            !paths.contains(&json!("notes.txt")),
-            "the text lane never reaches notes.txt once results_max is already spent: \
+            !paths.contains(&json!("src/lib.rs")),
+            "baseline catalog never reaches src/lib.rs once results_max is already spent: \
              {results:#?}"
         );
         Ok(())
@@ -2021,6 +2004,190 @@ pub fn compute() -> i32 {
     }
 
     #[test]
+    fn search_finds_every_visible_utf8_file_without_an_extension_gate() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let files = [
+            ("history.py", "python_catalog_marker"),
+            ("worker.go", "go_catalog_marker"),
+            ("notes.unknown", "unknown_catalog_marker"),
+            ("buildfile", "extensionless_catalog_marker"),
+        ];
+        for (path, marker) in files {
+            fs::write(directory.path().join(path), marker)?;
+        }
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+
+        for (path, marker) in files {
+            let params: SearchParams = serde_json::from_value(json!({
+                "query": marker,
+                "target": "file",
+                "paths": { "include": [path] },
+                "limit": 10
+            }))?;
+            let value = serde_json::to_value(service.search(&params, &[])?)?;
+            assert_eq!(
+                value["results"].as_array().map(Vec::len),
+                Some(1),
+                "one exact visible file must match: path={path}, value={value:#}"
+            );
+            assert_eq!(value["results"][0]["path"], json!(path));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ranked_search_indexes_provider_file_content_once() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("calls.rs"),
+            "fn caller() { wire_symbol(alpha, beta); }\n",
+        )?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let database = directory.path().join("search.db");
+        let ranked = ranked_units(&database, &service, "wire symbol beta").await?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "wire symbol beta",
+            "target": "file",
+            "limit": 10
+        }))?;
+        let value = serde_json::to_value(service.search(&params, &ranked)?)?;
+        let results = value["results"].as_array().ok_or("results array")?;
+        assert_eq!(
+            results.len(),
+            1,
+            "provider content must have one file identity: {results:#?}"
+        );
+        assert_eq!(results[0]["path"], json!("calls.rs"));
+        assert!(
+            ranked.iter().any(|unit| {
+                unit.kind() == LexicalUnitKind::TextFile && unit.path().as_str() == "calls.rs"
+            }),
+            "provider content must join the baseline lexical units: {ranked:#?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn revision_search_finds_visible_text_without_a_provider() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        rift_history::fixture::init(directory.path());
+        fs::write(
+            directory.path().join("rift_history.py"),
+            "RIFT_HISTORY_PYTHON_MARKER\n",
+        )?;
+        rift_history::fixture::commit_all(directory.path(), "add history fixture");
+        let service = ReadService::at_revision(
+            directory.path(),
+            &rift_protocol::read::RevisionId("main".to_owned()),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "RIFT_HISTORY_PYTHON_MARKER",
+            "target": "file",
+            "paths": { "include": ["rift_history.py"] }
+        }))?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        assert_eq!(value["results"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["results"][0]["path"], json!("rift_history.py"));
+        Ok(())
+    }
+
+    #[test]
+    fn force_include_reaches_excluded_visible_text_without_a_provider() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join(".gitignore"), "hidden.py\n")?;
+        fs::write(directory.path().join("hidden.py"), "FORCED_PYTHON_MARKER\n")?;
+        fs::write(directory.path().join("visible.go"), "VISIBLE_GO_MARKER\n")?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "FORCED_PYTHON_MARKER",
+            "target": "file",
+            "paths": {
+                "include": ["*.py"],
+                "exclude": ["visible.go"],
+                "force_include": ["hidden.py"]
+            }
+        }))?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        assert_eq!(value["results"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["results"][0]["path"], json!("hidden.py"));
+        Ok(())
+    }
+
+    #[test]
+    fn binary_invalid_and_oversized_unknown_files_do_not_hide_valid_text() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("visible.py"), "VISIBLE_TEXT_MARKER\n")?;
+        fs::write(directory.path().join("binary.unknown"), b"binary\0payload")?;
+        fs::write(directory.path().join("invalid.unknown"), [0xff, 0xfe])?;
+        fs::write(directory.path().join("oversized.unknown"), vec![b'x'; 33])?;
+        let limits = WorkspaceIndexLimits::new(10, 32, 1_024, 8, 10)?;
+        let service = ReadService::build(
+            directory.path(),
+            limits,
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "VISIBLE_TEXT_MARKER",
+            "target": "file"
+        }))?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        assert_eq!(value["results"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["results"][0]["path"], json!("visible.py"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_file_result_reports_captured_executable_state() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir()?;
+        let script = directory.path().join("tool.py");
+        fs::write(&script, "EXECUTABLE_SEARCH_MARKER\n")?;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "EXECUTABLE_SEARCH_MARKER",
+            "target": "file"
+        }))?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        assert_eq!(
+            value["results"][0]["hit"]["file"]["content"]["executable"],
+            json!(true)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn search_at_a_revision_refuses_force_include() -> TestResult {
         let (_directory, service) = committed_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
@@ -2265,7 +2432,7 @@ pub fn compute() -> i32 {
         fs::write(directory.path().join("guide.txt"), "word ".repeat(1000))?;
         // The smallest accepted chunk bound against a several-kilobyte guide forces the file
         // into more than one lexical unit, each of which the query matches.
-        let text_inclusion = rift_core::TextFileInclusion::new(vec!["txt".to_owned()], 1_024);
+        let text_inclusion = rift_core::TextFileInclusion::new(1_024);
         let service = ReadService::build(
             directory.path(),
             WorkspaceIndexLimits::default(),

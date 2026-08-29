@@ -329,14 +329,14 @@ pub fn declare_text_ranges(schema: &mut Schema) {
     );
 }
 
-/// A [`CommandHook`](crate::configuration::CommandHook) states its `Duration`
-/// and `ByteSize` ceilings as `rift:range` on their keys: schema validation
-/// alone cannot compare `"120s"` or `"4kb"` against a ceiling, so the server
-/// enforces the bound at load and the schema carries it for readers.
-pub fn declare_hook_ranges(schema: &mut Schema) {
+/// Declares [`CommandHook`](crate::configuration::CommandHook) schema rules.
+///
+/// Duration and byte-size ceilings use `rift:range`; server enforces them
+/// during configuration loading. Transform hooks cannot carry guarantees.
+pub fn declare_hook_contract(schema: &mut Schema) {
     use crate::configuration::{
         ByteSize, CommandHook, Duration, HOOK_OUTPUT_BYTES_MAX, HOOK_OUTPUT_BYTES_MIN,
-        HOOK_TIMEOUT_MS_MAX,
+        HOOK_TIMEOUT_MS_MAX, HookWrites,
     };
     let ranges = [
         (
@@ -356,6 +356,15 @@ pub fn declare_hook_ranges(schema: &mut Schema) {
     ];
     for (name, accepted) in ranges {
         annotate_property(schema, name, RIFT_RANGE, accepted);
+    }
+    for writes in [HookWrites::ChangedPaths, HookWrites::Workspace] {
+        append(
+            schema,
+            when(
+                properties(vec![(property!(CommandHook, writes), constant(&writes))]),
+                properties(vec![(property!(CommandHook, guarantees), max_items(0))]),
+            ),
+        );
     }
 }
 
@@ -787,7 +796,13 @@ mod tests {
     /// proves serde serves it under the same name, closing the rename gap.
     #[test]
     fn rule_properties_exist_in_model_schemas() {
-        let cases: [(&str, Value, &[&str]); 7] = [
+        let cases: [(&str, Value, &[&str]); 8] = [
+            (
+                "CommandHook",
+                serde_json::to_value(schema_for!(crate::configuration::CommandHook))
+                    .expect("schema"),
+                &["timeout", "output_limit", "writes", "guarantees"],
+            ),
             (
                 "EngineConfiguration",
                 serde_json::to_value(schema_for!(crate::configuration::EngineConfiguration))

@@ -29,11 +29,10 @@ fn framed(body: &str) -> String {
     format!("Content-Length: {}\r\n\r\n{body}", body.len())
 }
 
-/// A success answer to request `id`, an edit map touching nothing - enough
-/// to prove the engine served the request.
+/// A success answer to request `id`, carrying one text edit.
 pub(crate) fn ok_response(id: u64) -> String {
     framed(&format!(
-        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"changes":{{}}}}}}"#
+        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"changes":{{"file:///src/lib.rs":[{{"range":{{"start":{{"line":0,"character":3}},"end":{{"line":0,"character":9}}}},"newText":"renamed"}}]}}}}}}"#
     ))
 }
 

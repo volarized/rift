@@ -14,11 +14,12 @@ use rift_protocol::change::{
     ReplaceNodeParams, ReplaceSymbolParams,
 };
 use rift_protocol::configuration::{
-    CommandHook, Duration as WireDuration, EngineConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX,
+    Duration as WireDuration, EngineConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX,
     SEARCH_POOL_SLOTS_MAX, SERVER_NUM_WORKERS_MAX, SearchConfiguration,
     SemanticSearchConfiguration, SemanticSource, ServerConfiguration, WorkspaceConfiguration,
 };
 use rift_protocol::error as wire;
+use rift_protocol::lock::ProductIdentity;
 use rift_protocol::read::{
     DiagnosticCode, GetSymbolParams, GetSymbolResult, NodesParams, NodesResult, ReadWarning,
     SearchParams, SearchResult,
@@ -29,8 +30,8 @@ use rift_search::{
 };
 use rift_server::{
     ChangeService, EnginePool, HookStatus, MoveResolution, ReadError, ReadFault, ReadService,
-    RemoveResolution, RenameResolution, engine_change_diagnostics, plan_move, plan_remove_node,
-    plan_remove_symbol, plan_rename, run_hooks,
+    RemoveResolution, RenameResolution, plan_move, plan_remove_node, plan_remove_symbol,
+    plan_rename,
 };
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{
@@ -678,6 +679,7 @@ pub(crate) fn hermetic_workspace(root: &Path, configuration: &str) -> std::io::R
 #[derive(Clone, Debug)]
 pub struct RiftMcp {
     root: PathBuf,
+    identity: ProductIdentity,
     limits: WorkspaceIndexLimits,
     published: Arc<RwLock<IndexState>>,
     validation: Arc<IndexValidation>,
@@ -727,16 +729,20 @@ impl SerializedChange {
     }
 }
 
-/// The candidate one landed change built, waiting for its lexical commit and its
-/// publication.
-///
-/// The change lane is released before the commit awaits, so this carries everything the
-/// publication check needs rather than reading shared state again.
+/// Candidate one landed change built for publication and diagnostics.
 struct AppliedCandidate {
+    previous: Arc<PublishedWorkspace>,
     published: Arc<PublishedWorkspace>,
+    change_set: rift_index::ChangeSet,
     write: LexicalWrite,
     work: PendingWork,
     epoch: u64,
+}
+
+struct AppliedPublication {
+    previous: Arc<PublishedWorkspace>,
+    published: Option<Arc<PublishedWorkspace>>,
+    change_set: rift_index::ChangeSet,
 }
 
 #[tool_router(router = tool_router, vis = "pub(crate)")]
@@ -776,17 +782,24 @@ impl RiftMcp {
         }
     }
 
+    /// Accepts startup configuration without blocking the serving runtime.
+    async fn startup_configuration(root: &Path) -> Result<ConfigurationState, ReadError> {
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || ConfigurationState::accept(&root))
+            .await
+            .map_err(|error| ReadFault::task("configuration acceptance", error.to_string()))
+    }
+
     /// Builds from one resolved root and its process-owned storage.
     async fn build_at(
         root: PathBuf,
         limits: WorkspaceIndexLimits,
         storage: Option<WorkspaceStorage>,
     ) -> Result<Self, ReadError> {
-        let configuration_root = root.clone();
-        let startup_configuration =
-            tokio::task::spawn_blocking(move || ConfigurationState::accept(&configuration_root))
-                .await
-                .map_err(|error| ReadFault::task("configuration acceptance", error.to_string()))?;
+        let identity = crate::identity::product_identity()
+            .await
+            .map_err(|error| ReadFault::task("product identity", error.to_string()))?;
+        let startup_configuration = Self::startup_configuration(&root).await?;
         let blocking =
             BlockingExecutor::for_configuration(&startup_configuration.server_configuration());
         let (validation, invalidations) = IndexValidation::new(limits.files_max());
@@ -882,6 +895,7 @@ impl RiftMcp {
         ));
         Ok(Self {
             root: root.clone(),
+            identity,
             limits,
             published,
             validation,
@@ -896,6 +910,12 @@ impl RiftMcp {
             engines,
             tool_router: Self::tool_router(),
         })
+    }
+
+    /// Exact identity advertised by this server.
+    #[must_use]
+    pub(crate) fn product_identity(&self) -> &ProductIdentity {
+        &self.identity
     }
 
     /// The engine pool serving the currently published `[engines]` tables.
@@ -1404,11 +1424,10 @@ impl RiftMcp {
             let root = self.root.clone();
             let limits = self.limits;
             let visibility = current.configuration.source_visibility();
-            let text_inclusion = current.configuration.text_inclusion();
             let capture = self
                 .blocking
                 .run("workspace fingerprint", move || {
-                    let digests = capture_digests(&root, limits, &visibility, &text_inclusion)
+                    let digests = capture_digests(&root, limits, &visibility)
                         .map_err(|error| ReadError::from(ReadFault::Index(error)))?;
                     Ok((digests, configuration_fingerprint(&root)))
                 })
@@ -1501,35 +1520,7 @@ impl RiftMcp {
         }
     }
 
-    /// Runs one change against the current snapshot and, when it lands,
-    /// runs the workspace's hooks in the changed tree and swaps in a
-    /// snapshot of the changed workspace.
-    ///
-    /// Hooks observe an already-applied change: their verdicts ride the
-    /// result and never roll the change back. The snapshot is rebuilt after
-    /// they ran, so reads also serve whatever a hook wrote into the tree,
-    /// under the `[source]` policy this call already accepted. A rebuild
-    /// failure after a landed change rides the result as a diagnostic
-    /// rather than failing the call: the write happened, and the caller
-    /// must not be told otherwise.
-    ///
-    /// Engine diagnostics attach here too, beside the hook verdicts' place
-    /// in the post-apply flow: once the changed workspace published, each
-    /// changed path whose engine advertises diagnostic pulls is pulled
-    /// against the published bytes, and the findings ride the summary. An
-    /// engine failure at this point is a warning on the summary, never a
-    /// failed call - the change already applied.
-    ///
-    /// Search index population does not run here. The change hands its
-    /// publication to the population lane and returns; awaiting that pass made
-    /// every edit pay a whole lexical replacement plus the embedding of each
-    /// new declaration before the caller heard that the write landed. A search
-    /// issued before the pass lands is ranked by identifier matching alone and
-    /// names the two tree revisions that disagree.
-    ///
-    /// Dropping this future after blocking work starts does not cancel that
-    /// work. The serialized operation finishes through snapshot publication
-    /// before releasing its lane.
+    /// Runs one change, publishes its snapshot, then pulls engine diagnostics.
     async fn change(
         &self,
         operation: impl FnOnce(&ReadService, &ChangeService) -> Result<ChangeResult, ReadError>
@@ -1560,45 +1551,49 @@ impl RiftMcp {
             .await
             .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
         let mut result = outcome.result?;
-        let published_next = match (&mut result, outcome.candidate) {
+        let publication = match (&mut result, outcome.candidate) {
             (Json(ChangeResult::Applied { summary }), Some(candidate)) => {
                 self.publish_applied_change(candidate, summary).await
             }
             _ => None,
         };
-        if let (Some(lane), Some(next)) = (self.population.as_ref(), published_next.as_ref()) {
+        let published_next = publication
+            .as_ref()
+            .and_then(|publication| publication.published.as_ref());
+        if let (Some(lane), Some(next)) = (self.population.as_ref(), published_next) {
             lane.request(Arc::clone(next));
         }
         if let Json(ChangeResult::Applied { summary }) = &mut result
-            && let Some(snapshot) = self
-                .diagnostics_snapshot(published_next.as_ref(), summary)
-                .await
+            && let Some(publication) = publication.as_ref()
+            && let Some(snapshot) = self.diagnostics_snapshot(published_next, summary).await
         {
+            if publication.previous.configuration.has_validation_hooks() {
+                self.engines.shutdown().await;
+            }
             let engines = self.engine_pool().await;
-            summary
-                .diagnostics
-                .extend(engine_change_diagnostics(&engines, &snapshot.reads, &summary.paths).await);
+            summary.diagnostics.extend(
+                rift_server::engine_change_set_diagnostics(
+                    &engines,
+                    &publication.previous.reads,
+                    &snapshot.reads,
+                    &publication.change_set,
+                )
+                .await,
+            );
         }
         Ok(result)
     }
 
-    /// Commits one landed change's lexical rows and publishes its snapshot, in that order.
-    ///
-    /// A request that captures this publication has to find the store already holding its
-    /// tree, so the commit runs before the swap. The change lane is released by now, which
-    /// is what lets the commit await; the publication check takes the observation lane
-    /// again, so a candidate superseded while the transaction ran cannot become current.
-    ///
-    /// Every failure rides `summary` as a diagnostic rather than failing the call: the
-    /// write already landed, and the caller must not be told otherwise. Current-tree reads
-    /// then meet the recorded freshness failure until a later observation publishes.
+    /// Commits one landed change and returns its diagnostic snapshots.
     async fn publish_applied_change(
         &self,
         candidate: AppliedCandidate,
         summary: &mut ChangeSummary,
-    ) -> Option<Arc<PublishedWorkspace>> {
+    ) -> Option<AppliedPublication> {
         let AppliedCandidate {
+            previous,
             published,
+            change_set,
             write,
             work,
             epoch,
@@ -1628,9 +1623,17 @@ impl RiftMcp {
                     epoch,
                     "index snapshot published"
                 );
-                Some(published)
+                Some(AppliedPublication {
+                    previous,
+                    published: Some(published),
+                    change_set,
+                })
             }
-            Ok(RebuildOutcome::Superseded) => None,
+            Ok(RebuildOutcome::Superseded) => Some(AppliedPublication {
+                previous,
+                published: None,
+                change_set,
+            }),
             Err(error) => {
                 summary.diagnostics.push(stale_snapshot_diagnostic(&error));
                 None
@@ -1665,9 +1668,7 @@ impl RiftMcp {
         Some(Arc::clone(&self.published.read().await.current))
     }
 
-    /// One already-serialized change's outcome: the wire result, and the freshly published
-    /// workspace exactly when this change's own rebuild published a new snapshot - absent
-    /// for a refusal, and for a landed change whose rebuild only appended a diagnostic.
+    /// One serialized change result and its new workspace snapshot.
     fn change_serialized(
         root: &Path,
         limits: WorkspaceIndexLimits,
@@ -1690,7 +1691,9 @@ impl RiftMcp {
             Ok(configuration) => configuration,
             Err(error) => return Ok(SerializedChange::wire(Err(error))),
         };
-        let mut result = operation(&current.reads, changes)?;
+        let result = operation(&current.reads, changes)?;
+        let mut result =
+            Self::apply_hook_pipeline(root, limits, &configuration, changes, &current, result)?;
         let candidate = if let ChangeResult::Applied { summary } = &mut result {
             Self::rebuild_after_applied_change(
                 root,
@@ -1709,14 +1712,7 @@ impl RiftMcp {
         })
     }
 
-    /// Rebuilds the snapshot after one landed change, running its hooks first, and returns
-    /// the candidate for the caller to commit and publish. Every failure rides `summary` as
-    /// a diagnostic instead of failing the call, since the write already landed.
-    ///
-    /// The change names the paths it wrote, so an ordinary change reparses exactly those
-    /// files. A workspace that declares hooks reads every visible file instead: a hook runs
-    /// after the change lands and may write anything, and the snapshot this call publishes
-    /// has to carry whatever it wrote.
+    /// Rebuilds snapshot after one landed change and returns publication candidate.
     fn rebuild_after_applied_change(
         root: &Path,
         limits: WorkspaceIndexLimits,
@@ -1733,7 +1729,6 @@ impl RiftMcp {
             summary.diagnostics.push(stale_snapshot_diagnostic(&error));
             return None;
         }
-        Self::attach_hook_verdicts(root, &configuration.hooks, summary);
         if current.configuration.fingerprint != configuration_fingerprint(root) {
             let error = ReadFault::unavailable(
                 "workspace change",
@@ -1753,7 +1748,9 @@ impl RiftMcp {
             }) => {
                 let write = lexical_write(&published, &change_set);
                 AppliedCandidate {
+                    previous: Arc::clone(current),
                     published,
+                    change_set,
                     write,
                     work: request.work,
                     epoch,
@@ -1777,16 +1774,94 @@ impl RiftMcp {
         Some(candidate)
     }
 
-    /// Runs the configured hooks over one applied change and attaches what
-    /// they established: a passing hook's configured guarantees become
-    /// evidence, and every other outcome becomes an error finding.
-    fn attach_hook_verdicts(root: &Path, hooks: &[CommandHook], summary: &mut ChangeSummary) {
-        if hooks.is_empty() {
-            return;
+    /// Runs transforms, restores rejected writes, then runs validations.
+    fn apply_hook_pipeline(
+        root: &Path,
+        limits: WorkspaceIndexLimits,
+        configuration: &WorkspaceConfiguration,
+        changes: &ChangeService,
+        current: &PublishedWorkspace,
+        result: ChangeResult,
+    ) -> Result<ChangeResult, ReadError> {
+        let ChangeResult::Applied { mut summary } = result else {
+            return Ok(result);
+        };
+        if configuration.hooks.is_empty() {
+            return Ok(ChangeResult::Applied { summary });
         }
-        let runs = run_hooks(hooks, root, &summary.paths);
-        for (hook, run) in hooks.iter().zip(&runs) {
-            if run.status == HookStatus::Passed {
+        let build_reads = || {
+            ReadService::build(
+                root,
+                limits,
+                &SourceVisibility::from(&configuration.source),
+                &rift_core::TextFileInclusion::from(&configuration.search),
+                configuration.providers.history.clone(),
+            )
+        };
+        let original = changes.hook_snapshot(&current.reads)?;
+        let direct_paths: std::collections::BTreeSet<&str> =
+            summary.paths.iter().map(|path| path.0.as_str()).collect();
+        let mut accepted_reads = build_reads()?;
+
+        for hook in configuration
+            .hooks
+            .iter()
+            .filter(|hook| hook.writes.is_transform())
+        {
+            let before = changes.hook_snapshot(&accepted_reads)?;
+            let run = rift_server::run_hook(hook, root, &summary.paths);
+            let observed_reads = build_reads()?;
+            let after = changes.hook_snapshot(&observed_reads)?;
+            let hook_paths = before.changed_paths(&after);
+            let in_scope = hook.writes == rift_protocol::configuration::HookWrites::Workspace
+                || hook_paths
+                    .iter()
+                    .all(|path| direct_paths.contains(path.0.as_str()));
+            let permissions_changed = before.permissions_changed(&after);
+            if run.status == HookStatus::Passed && in_scope && !permissions_changed {
+                accepted_reads = observed_reads;
+                continue;
+            }
+            changes.restore_hook_snapshot(&observed_reads, &before, &after)?;
+            let mut reported = run;
+            if reported.status == HookStatus::Passed {
+                let detail = if permissions_changed {
+                    "hook changed source permissions"
+                } else {
+                    "hook changed source outside declared write scope"
+                };
+                reported.status = HookStatus::Error(detail.to_owned());
+            }
+            summary
+                .diagnostics
+                .push(hook_failure_diagnostic(hook, &reported));
+        }
+
+        let final_snapshot = changes.hook_snapshot(&accepted_reads)?;
+        let ChangeResult::Applied { mut summary } =
+            changes.finalize_hook_result(&original, &final_snapshot, summary)
+        else {
+            return Ok(ChangeResult::Unchanged);
+        };
+
+        for hook in configuration
+            .hooks
+            .iter()
+            .filter(|hook| hook.writes.is_validation())
+        {
+            let before = changes.hook_snapshot(&accepted_reads)?;
+            let run = rift_server::run_hook(hook, root, &summary.paths);
+            let observed_reads = build_reads()?;
+            let after = changes.hook_snapshot(&observed_reads)?;
+            if !before.is_unchanged(&after) {
+                changes.restore_hook_snapshot(&observed_reads, &before, &after)?;
+                let mut reported = run;
+                reported.status =
+                    HookStatus::Error("validation hook changed source files".to_owned());
+                summary
+                    .diagnostics
+                    .push(hook_failure_diagnostic(hook, &reported));
+            } else if run.status == HookStatus::Passed {
                 summary
                     .guarantees
                     .extend(hook.guarantees.iter().map(|guarantee| GuaranteeEvidence {
@@ -1796,9 +1871,13 @@ impl RiftMcp {
                         detail: guarantee.detail.clone(),
                     }));
             } else {
-                summary.diagnostics.push(hook_failure_diagnostic(hook, run));
+                summary
+                    .diagnostics
+                    .push(hook_failure_diagnostic(hook, &run));
             }
         }
+
+        Ok(ChangeResult::Applied { summary })
     }
 }
 
@@ -1835,24 +1914,42 @@ impl RiftMcp {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RiftMcp {
-    async fn list_resources(
+    fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListResourcesResult, ErrorData> {
-        Ok(ListResourcesResult::with_all_items(
-            resource::declared_resources(),
-        ))
+        context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<rmcp::model::ListToolsResult, ErrorData>> {
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        std::future::ready(Ok(rmcp::model::ListToolsResult {
+            result_type: Some(rmcp::model::ResultType::COMPLETE),
+            tools: self.tool_router.list_all(),
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Public),
+        }))
     }
 
-    async fn list_resource_templates(
+    fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ListResourceTemplatesResult, ErrorData> {
-        Ok(ListResourceTemplatesResult::with_all_items(
+    ) -> impl std::future::Future<Output = Result<ListResourcesResult, ErrorData>> {
+        std::future::ready(Ok(ListResourcesResult::with_all_items(
+            resource::declared_resources(),
+        )))
+    }
+
+    fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListResourceTemplatesResult, ErrorData>> {
+        std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(
             resource::declared_templates(),
-        ))
+        )))
     }
 
     async fn read_resource(
@@ -1864,7 +1961,7 @@ impl ServerHandler for RiftMcp {
     }
 
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+        let mut info = ServerInfo::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
@@ -1878,7 +1975,9 @@ impl ServerHandler for RiftMcp {
                  move_file, and patch change code atomically behind verified \
                  preconditions. The rift://logs resource reads the server's own \
                  diagnostics back, including while a tool refuses.",
-        )
+        );
+        info.meta = Some(crate::identity::identity_meta(&self.identity));
+        info
     }
 }
 
@@ -1895,6 +1994,7 @@ mod tests {
     use rift_protocol::configuration::{
         Duration as WireDuration, SearchConfiguration, SemanticSearchConfiguration, SemanticSource,
     };
+    use rift_protocol::lock::ProductIdentity;
     use rift_protocol::read::{GetSymbolResult, ReadWarning, SearchParams, SearchResult};
     use rift_search::{ModelSource, RevisionScoped, SemanticReadiness};
     use rift_server::{ChangeService, ConfigurationFault, ReadError, ReadFault};
@@ -1903,6 +2003,7 @@ mod tests {
     use rmcp::ServiceExt as _;
     use rmcp::model::{CallToolRequestParams, ErrorCode};
     use serde_json::json;
+    use sha2::{Digest as _, Sha256};
 
     use crate::validation::RebuildRequest;
 
@@ -2043,16 +2144,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_propagates_workspace_index_failure() {
-        let directory = tempfile::tempdir().expect("fixture must exist");
-        fs::write(directory.path().join("wide.rs"), "pub fn wide() {}\n")
-            .expect("source fixture must write");
+    async fn build_skips_one_oversized_file_and_serves_its_warning() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("wide.rs"), "pub fn wide() {}\n")?;
         let limits =
-            WorkspaceIndexLimits::new(8, 1, 4096, 8, 32).expect("test bounds must be positive");
-        let error = RiftMcp::build(directory.path(), limits)
-            .await
-            .expect_err("a file past the per-file byte bound must fail the build");
-        assert!(matches!(error.fault(), ReadFault::Index(_)));
+            WorkspaceIndexLimits::new(8, 1, 4096, 8, 32).map_err(|error| error.to_string())?;
+        let server = RiftMcp::build(directory.path(), limits).await?;
+        let result = get_symbol(&server, "wide").await?;
+
+        assert!(result.hits.is_empty());
+        assert!(result.warnings.iter().any(|warning| matches!(
+            warning,
+            ReadWarning::SourceUnavailable { unit, detail }
+                if unit.0.ends_with("/wide.rs") && detail.contains("file byte limit")
+        )));
+        Ok(())
     }
 
     #[tokio::test]
@@ -2137,7 +2243,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_rebuild_failure_recovers_after_tree_is_valid() -> TestResult {
+    async fn external_oversized_file_is_skipped_then_recovers_when_bounded() -> TestResult {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("lib.rs");
         fs::write(&path, "pub fn beacon() {}\n")?;
@@ -2148,15 +2254,13 @@ mod tests {
 
         let oversized = format!("pub fn oversized() {{}}\n{}", " ".repeat(80));
         fs::write(&path, oversized)?;
-        let error = get_symbol(&server, "oversized")
-            .await
-            .expect_err("oversized external edit must refuse a current answer");
-        let code = error
-            .data
-            .as_ref()
-            .and_then(|data| data.get("code"))
-            .and_then(serde_json::Value::as_str);
-        assert_eq!(code, Some("limit_exceeded"));
+        let skipped = get_symbol(&server, "oversized").await?;
+        assert!(skipped.hits.is_empty());
+        assert!(skipped.warnings.iter().any(|warning| matches!(
+            warning,
+            ReadWarning::SourceUnavailable { unit, detail }
+                if unit.0.ends_with("/lib.rs") && detail.contains("file byte limit")
+        )));
 
         fs::write(&path, "pub fn recovered() {}\n")?;
         let mut recovered = false;
@@ -2170,7 +2274,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(recovered, "valid external edit must recover failed rebuild");
+        assert!(
+            recovered,
+            "bounded external edit must restore indexed content"
+        );
         Ok(())
     }
 
@@ -2641,7 +2748,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exported_schema_document_matches_served_tools() -> TestResult {
+    async fn initialize_schema_digest_matches_the_canonical_served_tool_list() -> TestResult {
         let (_directory, server) = fixture().await?;
         let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
         let server_task = tokio::spawn(async move {
@@ -2655,7 +2762,20 @@ mod tests {
         let mut advertised = client.list_all_tools().await?;
         advertised.sort_by(|left, right| left.name.cmp(&right.name));
 
-        let document: serde_json::Value = serde_json::from_str(&crate::schema::schema_document())?;
+        let schema_document = crate::schema::schema_document();
+        let schema_digest = format!("{:x}", Sha256::digest(schema_document.as_bytes()));
+        let peer_info = client
+            .peer_info()
+            .ok_or("initialize must advertise server information")?;
+        let initialize = serde_json::to_value(peer_info)?;
+        let identity: ProductIdentity =
+            serde_json::from_value(initialize["_meta"]["sh.volar/rift"].clone())?;
+        assert_eq!(
+            identity.schema_digest, schema_digest,
+            "initialize must name the digest of the canonical served tool document"
+        );
+
+        let document: serde_json::Value = serde_json::from_str(&schema_document)?;
         let exported = document["tools"]
             .as_array()
             .ok_or("exported document must carry a tools array")?;
@@ -2962,13 +3082,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn applied_change_reports_failed_snapshot_rebuild_as_warning() -> TestResult {
+    async fn applied_change_skips_oversized_content_without_false_rebuild_failure() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         super::hermetic_workspace(directory.path(), "")?;
         let tight = rift_index::WorkspaceIndexLimits::new(4, 60, 60, 4, 100)
             .map_err(|error| error.to_string())?;
         let server = RiftMcp::build(directory.path(), tight).await?;
+        let reads = server.clone();
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
         let server_task = tokio::spawn(async move {
             let service = server
@@ -2995,19 +3116,15 @@ pub fn beacon() -> u64 {
             .structured_content
             .ok_or("replace_symbol must return structured content")?;
         assert_eq!(structured["status"], json!("applied"));
-        let findings = structured["summary"]["diagnostics"]
-            .as_array()
-            .ok_or("summary must carry diagnostics")?;
-        assert!(
-            findings.iter().any(|finding| {
-                finding["severity"] == json!("warning")
-                    && finding["message"]
-                        .as_str()
-                        .is_some_and(|message| message.contains("could not refresh"))
-            }),
-            "a failed rebuild after a landed change must ride the result as a \
-             warning: {structured:#}"
-        );
+        assert_eq!(structured["summary"]["diagnostics"], json!([]));
+
+        let skipped = get_symbol(&reads, "beacon").await?;
+        assert!(skipped.hits.is_empty());
+        assert!(skipped.warnings.iter().any(|warning| matches!(
+            warning,
+            ReadWarning::SourceUnavailable { unit, detail }
+                if unit.0.ends_with("/lib.rs") && detail.contains("file byte limit")
+        )));
 
         client.cancel().await?;
         server_task.await?;

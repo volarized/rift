@@ -158,6 +158,31 @@ async fn failing_wire_error(
 }
 
 #[tokio::test]
+async fn raw_patch_without_headers_names_the_minimal_envelope() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+    fs::write(
+        directory.path().join("rift.toml"),
+        hermetic_search::SEMANTIC_DISABLED,
+    )?;
+
+    let wire =
+        failing_wire_error(directory.path(), "patch", json!({ "patch": "not a diff" })).await?;
+    let parsed: ErrorData = serde_json::from_value(wire)?;
+    assert!(
+        parsed.message.contains("--- a/path"),
+        "patch error must show the minimal original header: {}",
+        parsed.message
+    );
+    assert!(
+        parsed.message.contains("+++ b/path"),
+        "patch error must show the minimal replacement header: {}",
+        parsed.message
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn revision_read_without_a_repository_names_the_remedy() -> TestResult {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;

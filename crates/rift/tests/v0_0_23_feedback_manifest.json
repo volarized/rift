@@ -1,0 +1,328 @@
+{
+  "required_record_fields": [
+    "request_frame",
+    "pre_tree",
+    "post_tree",
+    "result",
+    "hook_runs",
+    "tree_revision",
+    "engine_trace",
+    "package_version",
+    "executable_digest",
+    "schema_digest"
+  ],
+  "reports": [
+    {
+      "heading": "`patch` rejects `apply_patch` envelope",
+      "mapping": "raw unified diff",
+      "disposition": "retention",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Applied `patch` reports failed post-edit hooks",
+      "mapping": "hook protocol and change orchestration",
+      "disposition": "test",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Rift diff orchestration rejects unescaped Rustdoc code spans",
+      "mapping": "caller orchestration",
+      "disposition": "external",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Contribution model compile probe catches false APIs",
+      "mapping": "delivery mistakes",
+      "disposition": "external",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Rift diagnostic reports present module missing",
+      "mapping": "lsp batch invalidation and readiness",
+      "disposition": "test",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Provider publication test imports undeclared crate",
+      "mapping": "delivery mistakes",
+      "disposition": "configuration",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Clippy rejects Rustdoc workaround",
+      "mapping": "delivery mistakes",
+      "disposition": "external",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Clippy rejects publication field names and Rustdoc links",
+      "mapping": "delivery mistakes",
+      "disposition": "external",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Rift publication cleanup patch refuses stale hunk",
+      "mapping": "optimistic validation",
+      "disposition": "retention",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Rift get_symbol parameter refused",
+      "mapping": "strong typing",
+      "disposition": "retention",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Rift publication cleanup retry refuses stale hunk",
+      "mapping": "optimistic validation",
+      "disposition": "retention",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Full test gate live TypeScript package failure",
+      "mapping": "test setup plus production readiness",
+      "disposition": "test",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Full test gate live TOML stale diagnostic",
+      "mapping": "lsp batch invalidation and readiness",
+      "disposition": "test",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Full test gate concurrent Bun link failure",
+      "mapping": "test setup plus production readiness",
+      "disposition": "test",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Rift normalization patch source parse failure",
+      "mapping": "delivery mistakes",
+      "disposition": "external",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Normalization compile probe catches borrowed Arc move",
+      "mapping": "delivery mistakes",
+      "disposition": "external",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Clippy rejects initial normalization structure",
+      "mapping": "delivery mistakes",
+      "disposition": "external",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Syntax source constructor assumption fails",
+      "mapping": "delivery mistakes",
+      "disposition": "external",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Source location export conflicts with private import",
+      "mapping": "delivery mistakes",
+      "disposition": "external",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Rift post-edit hooks report formatting findings",
+      "mapping": "hook protocol and change orchestration",
+      "disposition": "test",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Rift assembly export patch refuses matching context",
+      "mapping": "optimistic validation",
+      "disposition": "retention",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Rift index integration patch parser refuses hunk set",
+      "mapping": "optimistic validation",
+      "disposition": "retention",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Rift reports new module missing after file creation",
+      "mapping": "lsp batch invalidation and readiness",
+      "disposition": "test",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Assembly fixture assumes documentation format is text",
+      "mapping": "delivery mistakes",
+      "disposition": "external",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Syntax Contribution kind used dialect identity segment",
+      "mapping": "delivery mistakes",
+      "disposition": "external",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Workspace graph size crosses large-future test bound",
+      "mapping": "delivery mistakes",
+      "disposition": "configuration",
+      "evidence": "missing"
+    },
+    {
+      "heading": "GitHub stack link flag is unsupported",
+      "mapping": "delivery mistakes",
+      "disposition": "external",
+      "evidence": "missing"
+    },
+    {
+      "heading": "PR 4: malformed character literal repair",
+      "mapping": "delivery mistakes",
+      "disposition": "external",
+      "evidence": "missing"
+    },
+    {
+      "heading": "PR 4: Rift request validation and format hooks",
+      "mapping": "hook protocol and change orchestration",
+      "disposition": "test",
+      "evidence": "missing"
+    },
+    {
+      "heading": "PR 4: live Tombi test transient failure",
+      "mapping": "lsp batch invalidation and readiness",
+      "disposition": "test",
+      "evidence": "missing"
+    },
+    {
+      "heading": "PR 4: live TypeScript fixture setup failure",
+      "mapping": "test setup plus production readiness",
+      "disposition": "test",
+      "evidence": "missing"
+    },
+    {
+      "heading": "PR 4: parallel live fixture setup failures",
+      "mapping": "test setup plus production readiness",
+      "disposition": "test",
+      "evidence": "missing"
+    },
+    {
+      "heading": "PR 4: Rift patch changed executable mode",
+      "mapping": "shared publication implementation",
+      "disposition": "test",
+      "evidence": "missing"
+    },
+    {
+      "heading": "2026-08-27 - Applied patch reported without workspace changes",
+      "mapping": "protocol invariant plus change implementation",
+      "disposition": "test",
+      "evidence": "missing"
+    },
+    {
+      "heading": "2026-08-27 - Manifest patch check cannot update lock file",
+      "mapping": "repository configuration",
+      "disposition": "configuration",
+      "evidence": "missing"
+    },
+    {
+      "heading": "2026-08-27 - Stack Graph module export format hook",
+      "mapping": "delivery mistakes",
+      "disposition": "external",
+      "evidence": "missing"
+    },
+    {
+      "heading": "2026-08-27 - Stack Graph export check false positive",
+      "mapping": "delivery mistakes",
+      "disposition": "external",
+      "evidence": "missing"
+    },
+    {
+      "heading": "2026-08-27 - Stack Graph compiler repair patch refused",
+      "mapping": "optimistic validation",
+      "disposition": "retention",
+      "evidence": "missing"
+    },
+    {
+      "heading": "2026-08-27 - Stack Graph test insertion indentation",
+      "mapping": "shared declaration boundary",
+      "disposition": "test",
+      "evidence": "missing"
+    },
+    {
+      "heading": "2026-08-27 - Search misses present architecture dependency",
+      "mapping": "source-catalog and search architecture",
+      "disposition": "test",
+      "evidence": "missing"
+    },
+    {
+      "heading": "2026-08-27 - Short symbol name rejected",
+      "mapping": "strong typing",
+      "disposition": "retention",
+      "evidence": "missing"
+    },
+    {
+      "heading": "2026-08-27 - Test replacement loses module indentation",
+      "mapping": "shared declaration boundary",
+      "disposition": "test",
+      "evidence": "missing"
+    },
+    {
+      "heading": "2026-08-27 - Ignored semantic fallback plan unavailable",
+      "mapping": "source visibility",
+      "disposition": "retention",
+      "evidence": "missing"
+    },
+    {
+      "heading": "2026-08-27 - Search misses present read-path calls",
+      "mapping": "source-catalog and search architecture",
+      "disposition": "test",
+      "evidence": "missing"
+    },
+    {
+      "heading": "2026-08-27 - Patch staging failed on full filesystem",
+      "mapping": "bounded storage failure",
+      "disposition": "retention",
+      "evidence": "missing"
+    },
+    {
+      "heading": "2026-08-27 - Method insertion lost implementation indentation",
+      "mapping": "shared declaration boundary",
+      "disposition": "test",
+      "evidence": "missing"
+    },
+    {
+      "heading": "2026-08-27 - Language diagnostics retained removed proc-macro artifacts",
+      "mapping": "lsp batch invalidation and readiness",
+      "disposition": "test",
+      "evidence": "missing"
+    },
+    {
+      "heading": "2026-08-27 - Header-free patch reports applied without edits",
+      "mapping": "protocol invariant plus change implementation",
+      "disposition": "test",
+      "evidence": "missing"
+    },
+    {
+      "heading": "2026-08-27 - Cross-file diagnostics use stale protocol shape",
+      "mapping": "protocol invariant plus change implementation",
+      "disposition": "test",
+      "evidence": "missing"
+    },
+    {
+      "heading": "2026-08-27 - Version edit cannot update lock under Rift hook",
+      "mapping": "repository configuration",
+      "disposition": "configuration",
+      "evidence": "missing"
+    },
+    {
+      "heading": "2026-08-27 - `insert_symbol` rejects structured anchor",
+      "mapping": "strong typing",
+      "disposition": "retention",
+      "evidence": "missing"
+    },
+    {
+      "heading": "Coverage revision value",
+      "mapping": "closed in v0.0.23",
+      "disposition": "retention",
+      "evidence": "missing"
+    }
+  ]
+}

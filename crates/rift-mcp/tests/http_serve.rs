@@ -8,13 +8,15 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use rift_mcp::{HttpServer, serve_http};
+use rift_mcp::{HttpServer, schema, serve_http};
+use rift_protocol::lock::ProductIdentity;
 use rmcp::ServiceExt as _;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -31,10 +33,12 @@ kind = "test"
 program = "cargo"
 arguments = ["test"]
 changed_paths = "none"
+writes = "none"
 working_directory = ""
 environment = {}
 timeout = "0ms"
 output_limit = "4kb"
+failure_severity = "error"
 guarantees = []
 determinism = "deterministic"
 "#;
@@ -111,6 +115,16 @@ async fn beacon_lookup(client: &RunningService<RoleClient, ()>) -> TestResult<se
         .ok_or_else(|| "structured content must be served".into())
 }
 
+fn advertised_identity(client: &RunningService<RoleClient, ()>) -> TestResult<ProductIdentity> {
+    let peer_info = client
+        .peer_info()
+        .ok_or("initialize must advertise server information")?;
+    let initialize = serde_json::to_value(peer_info)?;
+    Ok(serde_json::from_value(
+        initialize["_meta"]["sh.volar/rift"].clone(),
+    )?)
+}
+
 async fn stopped_within_deadline(server: HttpServer) -> TestResult {
     tokio::time::timeout(STOP_DEADLINE, server.stopped())
         .await
@@ -123,6 +137,10 @@ async fn serves_tools_and_stops_on_external_cancel() -> TestResult {
     let directory = workspace_with(None)?;
     let (shutdown, server) = served(directory.path()).await?;
     let client = connected_client(&server).await?;
+
+    let identity = advertised_identity(&client)?;
+    let expected_schema_digest = format!("{:x}", Sha256::digest(schema::schema_document()));
+    assert_eq!(identity.schema_digest, expected_schema_digest);
 
     let listing = client.list_tools(None).await?;
     let names: Vec<&str> = listing
@@ -147,6 +165,29 @@ async fn serves_tools_and_stops_on_external_cancel() -> TestResult {
 
     let lookup = beacon_lookup(&client).await?;
     assert_eq!(lookup["hits"][0]["symbol"]["name"], json!("beacon"));
+
+    let inserted = client
+        .call_tool(
+            CallToolRequestParams::new("insert_symbol").with_arguments(arguments(&json!({
+                "anchor": "rift://symbol/rust/lib.rs/beacon",
+                "position": "after",
+                "body": "pub fn lantern() {}"
+            }))?),
+        )
+        .await?
+        .structured_content
+        .ok_or("insert_symbol must return structured content")?;
+    assert_eq!(inserted["status"], json!("applied"), "{inserted:#}");
+
+    let lantern = client
+        .call_tool(
+            CallToolRequestParams::new("get_symbol")
+                .with_arguments(arguments(&json!({"name": "lantern"}))?),
+        )
+        .await?
+        .structured_content
+        .ok_or("get_symbol must return structured content")?;
+    assert_eq!(lantern["hits"][0]["symbol"]["name"], json!("lantern"));
 
     client.cancel().await?;
     shutdown.cancel();

@@ -2,13 +2,11 @@
 //!
 //! `RIFT_ENGINE_LIVE=1 cargo test -p rift-lsp --test live_typescript` runs
 //! the suite; without the variable every test skips visibly. The engine is
-//! started as `bunx`, resolved through the inherited `PATH`, so the spawn
-//! policy, the framing, and the encoding negotiation are proven against a
-//! second real engine beside rust-analyzer - and against the opposite arm
-//! of every capability gate. Every asserted shape was observed on a live
+//! started from its fixture-local executable after a frozen install, so
+//! package resolution cannot read a shared runner cache. Spawn policy,
+//! framing, and encoding negotiation are checked against another engine
 //! typescript-language-server answer first, then pinned.
 //!
-//! The tool-level proof - rename across both dialects, the move's import
 //! rewrites, and the engine's silence on an applied change - lives in
 //! rift-mcp's `live_typescript` suite. This suite keeps the session
 //! contract pinned: the capability grid those tools stand on, and a clean
@@ -44,6 +42,16 @@ fn bun_project() -> tempfile::TempDir {
     }
     install_typescript_engine(workspace.path());
     workspace
+}
+
+#[test]
+fn fixture_runs_installed_language_server_directly() {
+    let fixture = typescript_engine::fixture();
+    assert_eq!(
+        fixture.program,
+        "node_modules/.bin/typescript-language-server"
+    );
+    assert_eq!(fixture.arguments, ["--stdio"]);
 }
 
 #[tokio::test]

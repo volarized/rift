@@ -24,11 +24,11 @@ use serde::{Deserialize, Serialize};
 pub const SERVER_NUM_WORKERS_MAX: u64 = 64;
 /// Milliseconds one request may wait for a free worker, at most: one hour.
 pub const SERVER_QUEUE_TIMEOUT_MS_MAX: u64 = 3_600_000;
-/// Milliseconds the server serves with no request before it stops, at
-/// least: one second.
+/// Milliseconds the server serves after the last request completes before
+/// it stops, at least: one second.
 pub const SERVER_IDLE_TIMEOUT_MS_MIN: u64 = 1_000;
-/// Milliseconds the server serves with no request before it stops, at
-/// most: one day.
+/// Milliseconds the server serves after the last request completes before
+/// it stops, at most: one day.
 pub const SERVER_IDLE_TIMEOUT_MS_MAX: u64 = 86_400_000;
 /// Milliseconds a request waits for the workspace and its engines to
 /// prove they are ready to answer, at least: one second.
@@ -368,8 +368,7 @@ pub struct WorkspaceConfiguration {
     pub providers: ProvidersConfiguration,
     /// Enablement and limits for caller-provided code.
     pub execution: ExecutionConfiguration,
-    /// The lexical search index: which non-source files join it, the `SQLite` bounds behind
-    /// it, and the embedding model that adds dense ranking on top.
+    /// Search ranking, visible text chunking, and storage bounds.
     pub search: SearchConfiguration,
     /// Which files below the workspace root the index and reads consider visible.
     pub source: SourceConfiguration,
@@ -427,7 +426,8 @@ pub struct ServerConfiguration {
     pub num_workers: u64,
     /// Wall-clock bound one request waits for a free worker, 1ms to 1h.
     pub worker_queue_timeout: Duration,
-    /// Wall-clock span with no served request that stops the server, 1s to 1d.
+    /// Wall-clock span after the last served request completes that stops
+    /// the server while no request remains active, 1s to 1d.
     pub idle_timeout: Duration,
     /// Wall-clock bound one request waits for the workspace's index and
     /// its language engines to prove they are ready to answer, 1s to 1h.
@@ -742,14 +742,13 @@ impl ExecutionConfiguration {
 /// The `[search]` table. Search fuses a lexical ranking with a semantic one:
 /// `lexical` and `semantic` weigh the two against each other, `fusion_k` sets
 /// how sharply a top rank counts, `pool_slots` and `busy_timeout` bound the
-/// shared `SQLite` connections behind search and logs, and `text` includes
-/// non-source text files in the lexical index.
+/// shared `SQLite` connections behind search and logs, and `text` bounds
+/// lexical chunks derived from visible text files.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_search_ranges)]
 pub struct SearchConfiguration {
-    /// Which non-source text files join the lexical index alongside code
-    /// symbols.
+    /// Chunking policy for visible text files in lexical search.
     pub text: TextSearchConfiguration,
     /// The lexical ranking's share of a fused score.
     pub lexical: LexicalSearchConfiguration,
@@ -1211,11 +1210,6 @@ fn default_semantic_candidates_per_file() -> u64 {
 fn default_semantic_max_vectors() -> u64 {
     SEMANTIC_MAX_VECTORS_DEFAULT
 }
-
-/// `search.text.extensions` entries accepted, at most.
-pub const TEXT_EXTENSIONS_MAX: usize = 32;
-/// Bytes one `search.text.extensions` entry may hold, at most.
-pub const TEXT_EXTENSION_BYTES_MAX: usize = 16;
 /// Bytes one lexical chunk from a `search.text` file may hold, at least.
 pub const TEXT_CHUNK_BYTES_MIN: u64 = 1 << 10;
 /// Bytes one lexical chunk from a `search.text` file may hold, at most.
@@ -1223,138 +1217,76 @@ pub const TEXT_CHUNK_BYTES_MAX: u64 = 16 << 20;
 /// Bytes one lexical chunk from a `search.text` file may hold, by default.
 pub const TEXT_CHUNK_BYTES_DEFAULT: u64 = 1 << 20;
 
-/// `search.text.extensions` included by default: prose formats with no dedicated syntax
-/// provider.
-const TEXT_EXTENSIONS_DEFAULT: [&str; 3] = ["md", "mdx", "txt"];
-
-fn default_text_extensions() -> Vec<String> {
-    TEXT_EXTENSIONS_DEFAULT
-        .iter()
-        .copied()
-        .map(str::to_owned)
-        .collect()
-}
-
-/// The `[search.text]` table: which non-source text files join the lexical index, as one
-/// unit each, or as several size-bounded chunks when a file exceeds `max_chunk`.
+/// The `[search.text]` table. `max_chunk` bounds lexical units derived from
+/// visible text files.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_text_ranges)]
 pub struct TextSearchConfiguration {
-    /// File extensions, without the leading dot, included as text-file lexical units:
-    /// lowercase ASCII alphanumeric only (so a leading dot is already excluded), at most
-    /// 16 bytes each, at most 32 entries, no duplicates.
-    #[serde(default = "default_text_extensions")]
-    #[schemars(length(max = 32))]
-    pub extensions: Vec<String>,
-    /// Bytes one lexical chunk may hold, 1kb to 16mb. A text file larger than this is
-    /// indexed as several chunks of at most this size; an operator who wants a file out of
-    /// the index excludes it in `[source]` or drops its extension from `extensions`.
+    /// Bytes one lexical chunk may hold, 1kb to 16mb. Larger files are indexed as
+    /// several chunks of at most this size.
     pub max_chunk: ByteSize,
 }
 
 impl Default for TextSearchConfiguration {
     fn default() -> Self {
         Self {
-            extensions: default_text_extensions(),
             max_chunk: ByteSize::from_bytes(TEXT_CHUNK_BYTES_DEFAULT),
         }
     }
 }
 
 impl TextSearchConfiguration {
-    /// The table's numeric bounds, then the extension-list rules, in key order.
+    /// Table numeric bounds.
     fn violation(&self) -> Option<ConfigurationViolation> {
-        first_out_of_range([
-            (
-                "search.text.extensions",
-                self.extensions.len() as u64,
-                0,
-                TEXT_EXTENSIONS_MAX as u64,
-            ),
-            (
-                "search.text.max_chunk",
-                self.max_chunk.bytes(),
-                TEXT_CHUNK_BYTES_MIN,
-                TEXT_CHUNK_BYTES_MAX,
-            ),
-        ])
-        .or_else(|| text_extensions_violation(&self.extensions))
+        first_out_of_range([(
+            "search.text.max_chunk",
+            self.max_chunk.bytes(),
+            TEXT_CHUNK_BYTES_MIN,
+            TEXT_CHUNK_BYTES_MAX,
+        )])
     }
 }
 
-/// Whether `extension` matches `search.text.extensions`'s accepted spelling: nonempty,
-/// lowercase ASCII alphanumeric only, at most [`TEXT_EXTENSION_BYTES_MAX`] bytes.
-fn is_text_extension(extension: &str) -> bool {
-    !extension.is_empty()
-        && extension.len() <= TEXT_EXTENSION_BYTES_MAX
-        && extension
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-}
-
-/// The first `search.text.extensions` entry breaking its charset/length contract, or the
-/// first duplicate, entries in list order.
-fn text_extensions_violation(extensions: &[String]) -> Option<ConfigurationViolation> {
-    let mut seen = std::collections::BTreeSet::new();
-    for extension in extensions {
-        if !is_text_extension(extension) {
-            return Some(ConfigurationViolation::TextExtensionInvalid {
-                extension: extension.clone(),
-            });
-        }
-        if !seen.insert(extension.as_str()) {
-            return Some(ConfigurationViolation::TextExtensionDuplicate {
-                extension: extension.clone(),
-            });
-        }
-    }
-    None
-}
-
-/// One `[[hooks]]` block: an executable Rift starts directly - no shell -
-/// inside the changed tree each time a change applies. Every key is
-/// required; the schema carries no defaults.
+/// One `[[hooks]]` command the server runs inside the changed tree.
+/// Every key is required; the schema carries no defaults.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(transform = crate::schema::declare_hook_ranges)]
+#[schemars(transform = crate::schema::declare_hook_contract)]
 pub struct CommandHook {
-    /// How the hook runs; `command` is the only type.
+    /// How the server runs the hook; `command` is the only type.
     pub r#type: HookType,
     /// Label for this hook's results, unique within the list.
     #[schemars(length(min = 1, max = 64))]
     pub id: String,
-    /// What the hook is: a test suite, a linter, a build, or something else.
+    /// What the hook is: a formatter, test suite, linter, build, or another command.
     pub kind: HookKind,
-    /// The executable Rift starts. A bare name resolves through `PATH`; a
-    /// path resolves below `working_directory`. An absolute path or a `.`
-    /// or `..` segment is refused.
+    /// The executable the server starts. A bare name resolves through `PATH`; a path resolves
+    /// below `working_directory`. Absolute paths and `.` or `..` segments are refused.
     #[schemars(length(min = 1))]
     pub program: String,
     /// The program's literal arguments, in order. May be empty.
     #[schemars(length(max = 64))]
     pub arguments: Vec<String>,
-    /// Whether the changed project paths are appended after `arguments` in
-    /// byte order.
+    /// Whether the server appends changed project paths after `arguments`, in byte order.
     pub changed_paths: ChangedPaths,
-    /// Directory the process starts in, relative to the changed tree's
-    /// root. Empty selects the root. An absolute path or a `.` or `..`
-    /// segment is refused.
+    /// Source files the server permits the hook to change.
+    pub writes: HookWrites,
+    /// Directory the process starts in, relative to the changed tree's root. Empty selects the
+    /// root. Absolute paths and `.` or `..` segments are refused.
     pub working_directory: ProjectPath,
-    /// Environment values added on top of the environment the server
-    /// inherited.
+    /// Environment values added to the environment the server inherited.
     pub environment: BTreeMap<String, String>,
-    /// Wall-clock bound before Rift kills the process, 1ms to 1h.
+    /// Wall-clock bound before the server kills the process, 1ms to 1h.
     pub timeout: Duration,
-    /// Bytes of each output stream Rift keeps, 256b to 4kb. The full size
-    /// is still reported.
+    /// Bytes of each output stream the server keeps, 256b to 4kb. The full size is still reported.
     pub output_limit: ByteSize,
-    /// What a passing run establishes. Each entry becomes evidence on the
-    /// change the hook checked.
+    /// Severity the server reports when the hook does not pass.
+    pub failure_severity: HookFailureSeverity,
+    /// What a passing validation establishes. Transform hooks cannot declare guarantees.
     #[schemars(length(max = 16))]
     pub guarantees: Vec<HookGuarantee>,
-    /// Whether an identical tree and environment are expected to reproduce
-    /// the result.
+    /// Whether an identical tree and environment are expected to reproduce the result.
     pub determinism: Determinism,
 }
 
@@ -1375,6 +1307,8 @@ pub enum HookType {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum HookKind {
+    /// A source formatter.
+    Format,
     /// A test suite.
     Test,
     /// A linter.
@@ -1396,6 +1330,46 @@ pub enum ChangedPaths {
     /// The changed project paths follow the configured `arguments`, in byte
     /// order, for a tool that takes files.
     Append,
+}
+
+/// Source writes the server may retain from one hook.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum HookWrites {
+    /// A validation hook that may not change source files.
+    None,
+    /// A transform hook that may change only paths changed before hooks ran.
+    ChangedPaths,
+    /// A transform hook that may change any source file in the workspace.
+    Workspace,
+}
+
+impl HookWrites {
+    /// Returns whether hook changes source files.
+    #[must_use]
+    pub const fn is_transform(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Returns whether hook only validates source files.
+    #[must_use]
+    pub const fn is_validation(self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+/// Severity the server reports when a hook does not pass.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum HookFailureSeverity {
+    /// The hook result reports a warning.
+    Warning,
+    /// The hook result reports an error.
+    Error,
 }
 
 /// Whether an identical tree and environment are expected to reproduce a
@@ -1545,16 +1519,17 @@ pub enum ConfigurationViolation {
         /// The configured semantic weight.
         semantic: f64,
     },
-    /// A `search.text.extensions` entry is empty, uses forbidden characters, or exceeds
-    /// [`TEXT_EXTENSION_BYTES_MAX`] bytes.
-    TextExtensionInvalid {
-        /// The rejected entry.
-        extension: String,
+    /// Transform hook follows validation hook.
+    HookTransformAfterValidation {
+        /// Transform hook appearing too late.
+        transform: String,
+        /// Earlier validation hook.
+        validation: String,
     },
-    /// Two `search.text.extensions` entries name the same extension.
-    TextExtensionDuplicate {
-        /// The extension both entries claim.
-        extension: String,
+    /// Transform hook declares guarantees reserved for validation hooks.
+    HookTransformGuarantees {
+        /// Transform hook declaring guarantees.
+        id: String,
     },
     /// Two hooks share one id, so their results could not be told apart.
     HookIdDuplicate {
@@ -1715,10 +1690,20 @@ impl ConfigurationViolation {
                 ("lexical_weight", lexical.to_string()),
                 ("semantic_weight", semantic.to_string()),
             ],
-            Self::TextExtensionInvalid { extension }
-            | Self::TextExtensionDuplicate { extension } => {
-                vec![("extension", extension.clone())]
-            }
+            Self::HookTransformAfterValidation {
+                transform,
+                validation,
+            } => vec![
+                ("transform", transform.clone()),
+                ("validation", validation.clone()),
+            ],
+            Self::HookTransformGuarantees { id } => vec![
+                ("id", id.clone()),
+                (
+                    "rule",
+                    "guarantees belong only to validation hooks".to_owned(),
+                ),
+            ],
             Self::HookIdDuplicate { id } | Self::HookIdInvalid { id } => {
                 vec![("id", id.clone())]
             }
@@ -1826,12 +1811,13 @@ fn is_language_word(word: &str) -> bool {
         })
 }
 
-/// The first violated hook bound, hooks in list order.
+/// Returns first hook violation in list order.
 fn hooks_violation(hooks: &[CommandHook]) -> Option<ConfigurationViolation> {
     if hooks.len() > HOOKS_MAX {
         return out_of_range("hooks", hooks.len() as u64, 0, HOOKS_MAX as u64);
     }
     let mut seen = std::collections::BTreeSet::new();
+    let mut first_validation = None;
     for hook in hooks {
         if let Some(violation) = hook_violation(hook) {
             return Some(violation);
@@ -1841,16 +1827,31 @@ fn hooks_violation(hooks: &[CommandHook]) -> Option<ConfigurationViolation> {
                 id: hook.id.clone(),
             });
         }
+        if hook.writes.is_validation() {
+            first_validation.get_or_insert(hook.id.as_str());
+        } else if let Some(validation) = first_validation {
+            return Some(ConfigurationViolation::HookTransformAfterValidation {
+                transform: hook.id.clone(),
+                validation: validation.to_owned(),
+            });
+        }
     }
     None
 }
 
-/// The first bound one hook breaks, rules in key order.
+/// Returns first violation one hook carries.
 fn hook_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
     identity_violation(hook)
         .or_else(|| command_violation(hook))
         .or_else(|| working_directory_violation(hook))
         .or_else(|| environment_violation(hook))
+        .or_else(|| {
+            (hook.writes.is_transform() && !hook.guarantees.is_empty()).then(|| {
+                ConfigurationViolation::HookTransformGuarantees {
+                    id: hook.id.clone(),
+                }
+            })
+        })
         .or_else(|| guarantee_violation(hook))
         .or_else(|| hook_bounds_violation(hook))
 }
@@ -2222,10 +2223,12 @@ mod tests {
             program: "cargo".to_owned(),
             arguments: vec!["test".to_owned()],
             changed_paths: ChangedPaths::None,
+            writes: HookWrites::None,
             working_directory: ProjectPath(String::new()),
             environment: BTreeMap::new(),
             timeout: Duration::from_millis(120_000),
             output_limit: ByteSize::from_bytes(4_096),
+            failure_severity: HookFailureSeverity::Error,
             guarantees: Vec::new(),
             determinism: Determinism::Deterministic,
         }
@@ -3103,74 +3106,18 @@ mod tests {
     }
 
     #[test]
-    fn test_search_text_defaults_include_markdown_and_text_extensions() {
-        let configuration = WorkspaceConfiguration::default();
-        assert_eq!(
-            configuration.search.text.extensions,
-            vec!["md".to_owned(), "mdx".to_owned(), "txt".to_owned()]
+    fn test_search_text_rejects_unknown_keys_and_schema_has_only_max_chunk() {
+        let unknown = json!({ "search": { "text": { "extensions": ["md"] } } });
+        assert!(
+            serde_json::from_value::<WorkspaceConfiguration>(unknown).is_err(),
+            "unknown search.text key must be refused"
         );
-        assert_eq!(
-            configuration.search.text.max_chunk,
-            ByteSize::from_bytes(TEXT_CHUNK_BYTES_DEFAULT)
-        );
-        assert_eq!(configuration.validate(), Ok(()));
-    }
 
-    #[test]
-    fn test_search_text_extension_charset_and_length_are_checked() {
-        let mut configuration = WorkspaceConfiguration::default();
-        for entry in ["", ".md", "MD", "md-x", "m d", "n".repeat(17).as_str()] {
-            configuration.search.text.extensions = vec![entry.to_owned()];
-            let violation = configuration
-                .validate()
-                .expect_err(&format!("{entry:?} must be refused"));
-            assert_eq!(
-                violation,
-                ConfigurationViolation::TextExtensionInvalid {
-                    extension: entry.to_owned(),
-                }
-            );
-        }
-        configuration.search.text.extensions = vec!["n".repeat(16)];
-        assert_eq!(
-            configuration.validate(),
-            Ok(()),
-            "an extension at the exact byte bound must be accepted"
-        );
-    }
-
-    #[test]
-    fn test_search_text_extension_duplicates_are_refused() {
-        let mut configuration = WorkspaceConfiguration::default();
-        configuration.search.text.extensions = vec!["md".to_owned(), "md".to_owned()];
-        assert_eq!(
-            configuration.validate(),
-            Err(ConfigurationViolation::TextExtensionDuplicate {
-                extension: "md".to_owned(),
-            })
-        );
-    }
-
-    #[test]
-    fn test_search_text_extensions_accept_the_cap_and_refuse_above_it() {
-        let mut configuration = WorkspaceConfiguration::default();
-        configuration.search.text.extensions = (0..TEXT_EXTENSIONS_MAX)
-            .map(|index| format!("e{index}"))
-            .collect();
-        assert_eq!(configuration.validate(), Ok(()));
-
-        configuration
-            .search
-            .text
-            .extensions
-            .push("overflow".to_owned());
-        assert!(matches!(
-            configuration.validate(),
-            Err(ConfigurationViolation::LimitOutOfRange {
-                field: "search.text.extensions",
-                ..
-            })
-        ));
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let properties = &schema["$defs"]["TextSearchConfiguration"]["properties"];
+        assert_eq!(properties.as_object().expect("properties").len(), 1);
+        assert!(properties.get("max_chunk").is_some());
     }
 
     #[test]
@@ -3200,26 +3147,19 @@ mod tests {
     }
 
     #[test]
-    fn test_search_table_parses_text_keys_from_a_full_configuration() {
+    fn test_search_table_parses_text_chunk_from_full_configuration() {
         let configuration: WorkspaceConfiguration = serde_json::from_value(json!({
             "search": {
                 "lexical": { "weight": 0.8 },
                 "semantic": {
                     "weight": 0.2,
                     "download_timeout": "5m",
-                    "max_vectors": 50000,
+                    "max_vectors": 50000
                 },
-                "text": {
-                    "extensions": ["md", "rst"],
-                    "max_chunk": "2mb",
-                },
+                "text": { "max_chunk": "2mb" }
             }
         }))
-        .expect("a full [search] table with text keys must parse");
-        assert_eq!(
-            configuration.search.text.extensions,
-            vec!["md".to_owned(), "rst".to_owned()]
-        );
+        .expect("full search table must parse");
         assert_eq!(
             configuration.search.text.max_chunk,
             ByteSize::from_bytes(2 << 20)
@@ -3230,10 +3170,6 @@ mod tests {
         assert_eq!(
             configuration.search.semantic.download_timeout,
             Duration::from_millis(300_000)
-        );
-        assert_eq!(
-            configuration.search.semantic.model, SEMANTIC_MODEL_DEFAULT,
-            "an omitted key keeps its default while its siblings are set"
         );
         assert_eq!(configuration.validate(), Ok(()));
     }
@@ -3502,6 +3438,70 @@ mod tests {
     }
 
     #[test]
+    fn test_hook_write_classification_is_exact() {
+        assert!(HookWrites::None.is_validation());
+        assert!(!HookWrites::None.is_transform());
+        for writes in [HookWrites::ChangedPaths, HookWrites::Workspace] {
+            assert!(writes.is_transform());
+            assert!(!writes.is_validation());
+        }
+    }
+
+    #[test]
+    fn test_transform_hooks_must_precede_validation_hooks() {
+        let mut transform = hook();
+        transform.id = "format".to_owned();
+        transform.kind = HookKind::Format;
+        transform.writes = HookWrites::Workspace;
+        let mut validation = hook();
+        validation.id = "check".to_owned();
+
+        let accepted = WorkspaceConfiguration {
+            hooks: vec![transform.clone(), validation.clone()],
+            ..WorkspaceConfiguration::default()
+        };
+        assert_eq!(accepted.validate(), Ok(()));
+
+        let refused = WorkspaceConfiguration {
+            hooks: vec![validation, transform],
+            ..WorkspaceConfiguration::default()
+        };
+        assert_eq!(
+            refused.validate(),
+            Err(ConfigurationViolation::HookTransformAfterValidation {
+                transform: "format".to_owned(),
+                validation: "check".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_transform_hooks_cannot_declare_guarantees() {
+        let mut transform = hook();
+        transform.id = "format".to_owned();
+        transform.kind = HookKind::Format;
+        transform.writes = HookWrites::ChangedPaths;
+        transform.guarantees.push(
+            serde_json::from_value(json!({
+                "kind": "syntax_validated",
+                "scope": { "kind": "reach", "reach": "project" },
+                "detail": "formatted source parses"
+            }))
+            .expect("guarantee"),
+        );
+        let configuration = WorkspaceConfiguration {
+            hooks: vec![transform],
+            ..WorkspaceConfiguration::default()
+        };
+        assert_eq!(
+            configuration.validate(),
+            Err(ConfigurationViolation::HookTransformGuarantees {
+                id: "format".to_owned(),
+            })
+        );
+    }
+
+    #[test]
     fn test_hook_environment_keys_are_checked() {
         let mut broken = hook();
         broken
@@ -3615,18 +3615,6 @@ mod tests {
                     ("field", "source.include".to_owned()),
                     ("pattern", "src\\lib.rs".to_owned()),
                 ],
-            ),
-            (
-                ConfigurationViolation::TextExtensionInvalid {
-                    extension: ".md".to_owned(),
-                },
-                vec![("extension", ".md".to_owned())],
-            ),
-            (
-                ConfigurationViolation::TextExtensionDuplicate {
-                    extension: "md".to_owned(),
-                },
-                vec![("extension", "md".to_owned())],
             ),
             (
                 ConfigurationViolation::LogCaptureInvalid {
@@ -4281,9 +4269,20 @@ mod tests {
         let value = serde_json::to_value(hook()).expect("serialize");
         assert_eq!(value["type"], json!("command"));
         assert_eq!(value["changed_paths"], json!("none"));
+        assert_eq!(value["writes"], json!("none"));
+        assert_eq!(value["failure_severity"], json!("error"));
         assert_eq!(value["determinism"], json!("deterministic"));
         let round_tripped: CommandHook = serde_json::from_value(value).expect("deserialize");
         assert_eq!(round_tripped, hook());
+
+        let format: HookKind = serde_json::from_value(json!("format")).expect("format kind");
+        assert_eq!(format, HookKind::Format);
+        let workspace: HookWrites =
+            serde_json::from_value(json!("workspace")).expect("workspace writes");
+        assert_eq!(workspace, HookWrites::Workspace);
+        let warning: HookFailureSeverity =
+            serde_json::from_value(json!("warning")).expect("warning severity");
+        assert_eq!(warning, HookFailureSeverity::Warning);
     }
 
     #[test]
@@ -4457,7 +4456,6 @@ mod tests {
         let history = &definitions["HistoryConfiguration"]["properties"];
         let search = &definitions["SearchConfiguration"]["properties"];
         let source = &definitions["SourceConfiguration"]["properties"];
-        let text = &definitions["TextSearchConfiguration"]["properties"];
         let cases = [
             (
                 "hooks max",
@@ -4528,16 +4526,6 @@ mod tests {
                 "source exclude max",
                 &source["exclude"]["maxItems"],
                 json!(SOURCE_PATTERNS_MAX),
-            ),
-            (
-                "text extensions max",
-                &text["extensions"]["maxItems"],
-                json!(TEXT_EXTENSIONS_MAX),
-            ),
-            (
-                "text extensions default",
-                &text["extensions"]["default"],
-                json!(["md", "mdx", "txt"]),
             ),
         ];
         assert_schema_bounds(&cases);

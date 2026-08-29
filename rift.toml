@@ -10,7 +10,8 @@ exclude = [".claude/**", ".agents/**", "docs/public/**"]
 respect_gitignore = true
 
 [engines.rust]
-program = "rust-analyzer"
+program = "rustup"
+arguments = ["run", "1.98", "rust-analyzer"]
 languages = ["rust"]
 
 [engines.toml]
@@ -21,17 +22,17 @@ languages = ["toml"]
 [[hooks]]
 type = "command"
 id = "format"
-kind = "lint"
-program = "just"
-arguments = ["format"]
+kind = "format"
+program = "cargo"
+arguments = ["fmt", "--all"]
 changed_paths = "none"
+writes = "workspace"
 working_directory = ""
 environment = {}
 timeout = "120s"
 output_limit = "4kb"
-guarantees = [
-  { kind = "syntax_validated", scope = { kind = "reach", reach = "project" }, detail = "cargo fmt --all --check passes" },
-]
+failure_severity = "warning"
+guarantees = []
 determinism = "deterministic"
 
 [[hooks]]
@@ -41,10 +42,12 @@ kind = "build"
 program = "just"
 arguments = ["check"]
 changed_paths = "none"
+writes = "none"
 working_directory = ""
 environment = {}
 timeout = "600s"
 output_limit = "4kb"
+failure_severity = "error"
 guarantees = [
   { kind = "syntax_validated", scope = { kind = "reach", reach = "project" }, detail = "cargo check and the architecture gate pass" },
 ]
