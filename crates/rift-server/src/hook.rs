@@ -4,6 +4,7 @@
 //! changed tree, its streams captured up to the configured prefix, its
 //! wall-clock bounded by `timeout`. A command starts from the environment
 //! the server inherited, with the hook's `environment` entries laid on top.
+//! [`run_hooks`] selects commands against the initially changed project paths.
 //! Hooks observe an already-applied change: a failing hook rides the result
 //! as evidence and never rolls the change back.
 
@@ -15,6 +16,7 @@ use std::time::{Duration, Instant};
 use rift_core::{
     CapturedStream, ProjectPath as CoreProjectPath, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX,
 };
+use rift_index::{PathMatcher, WorkspaceIndexError};
 use rift_protocol::configuration::{ChangedPaths, CommandHook};
 use rift_protocol::read::ProjectPath;
 
@@ -51,9 +53,12 @@ pub enum HookStatus {
     Error(String),
 }
 
-/// Runs every configured hook inside the changed tree, in list order, over
-/// the byte-ordered changed paths. The work is bounded by configuration:
-/// at most the configured hook count, each killed at its `timeout`.
+/// Runs each selected hook inside the changed tree, in list order.
+///
+/// Selection uses the initially changed paths. Each selected hook runs once
+/// over the same byte-ordered path list. An invalid pattern produces an error
+/// run for its hook. Work is bounded by the configured hook count and each
+/// hook's `timeout`.
 #[must_use]
 pub fn run_hooks(
     hooks: &[CommandHook],
@@ -64,8 +69,50 @@ pub fn run_hooks(
     ordered.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
     hooks
         .iter()
-        .map(|hook| run_one(hook, tree_root, &ordered))
+        .filter_map(
+            |hook| match hook_matches_paths(hook, tree_root, changed_paths) {
+                Ok(true) => Some(run_one(hook, tree_root, &ordered)),
+                Ok(false) => None,
+                Err(error) => Some(error_run(
+                    hook,
+                    format!("hook path selection failed: {error}"),
+                )),
+            },
+        )
         .collect()
+}
+
+/// Returns whether one hook selects any initially changed project path.
+///
+/// An empty include and exclude pair selects every change. Otherwise, the
+/// include patterns select candidates and the exclude patterns remove them.
+///
+/// # Errors
+///
+/// Returns [`WorkspaceIndexError`] when an include or exclude pattern is not
+/// a valid glob.
+pub fn hook_matches_paths(
+    hook: &CommandHook,
+    tree_root: &Path,
+    changed_paths: &[ProjectPath],
+) -> Result<bool, WorkspaceIndexError> {
+    if hook.include.is_empty() && hook.exclude.is_empty() {
+        return Ok(true);
+    }
+    let include: Vec<String> = hook
+        .include
+        .iter()
+        .map(|pattern| pattern.0.clone())
+        .collect();
+    let exclude: Vec<String> = hook
+        .exclude
+        .iter()
+        .map(|pattern| pattern.0.clone())
+        .collect();
+    let matcher = PathMatcher::build(tree_root, &include, &exclude)?;
+    Ok(changed_paths
+        .iter()
+        .any(|path| matcher.includes(&tree_root.join(&path.0))))
 }
 
 /// Runs one configured hook inside changed tree.
@@ -78,41 +125,35 @@ pub fn run_hook(hook: &CommandHook, tree_root: &Path, changed_paths: &[ProjectPa
 
 /// Runs one hook to completion, killing it at `timeout`.
 fn run_one(hook: &CommandHook, tree_root: &Path, ordered_paths: &[&str]) -> HookRun {
-    let error = |message: String| HookRun {
-        id: hook.id.clone(),
-        status: HookStatus::Error(message),
-        exit_code: None,
-        stdout: CapturedStream::default(),
-        stderr: CapturedStream::default(),
-    };
-    if hook.program.is_empty() {
-        return error("empty program".to_owned());
+    let program = hook.command.program();
+    if program.is_empty() {
+        return error_run(hook, "empty program".to_owned());
     }
-    if Path::new(&hook.program).is_absolute() {
-        return error(format!(
-            "absolute executable path refused: {}",
-            hook.program
-        ));
+    if Path::new(program).is_absolute() {
+        return error_run(hook, format!("absolute executable path refused: {program}"));
     }
-    if has_dot_segment(&hook.program) {
-        return error(format!(
-            "executable path segment escapes the workspace: {}",
-            hook.program
-        ));
+    if has_dot_segment(program) {
+        return error_run(
+            hook,
+            format!("executable path segment escapes the workspace: {program}"),
+        );
     }
     let Ok(working_directory) = CoreProjectPath::new(hook.working_directory.0.clone()) else {
-        return error(format!(
-            "working directory escapes the workspace: {}",
-            hook.working_directory.0
-        ));
+        return error_run(
+            hook,
+            format!(
+                "working directory escapes the workspace: {}",
+                hook.working_directory.0
+            ),
+        );
     };
     let working_directory = if working_directory.as_str().is_empty() {
         tree_root.to_path_buf()
     } else {
         tree_root.join(working_directory.as_str())
     };
-    let mut command = Command::new(&hook.program);
-    command.args(&hook.arguments);
+    let mut command = Command::new(program);
+    command.args(hook.command.arguments());
     if hook.changed_paths == ChangedPaths::Append {
         command.args(ordered_paths);
     }
@@ -125,7 +166,7 @@ fn run_one(hook: &CommandHook, tree_root: &Path, ordered_paths: &[&str]) -> Hook
 
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(io) => return error(format!("failed to launch: {io}")),
+        Err(io) => return error_run(hook, format!("failed to launch: {io}")),
     };
     #[expect(
         clippy::cast_possible_truncation,
@@ -150,6 +191,17 @@ fn run_one(hook: &CommandHook, tree_root: &Path, ordered_paths: &[&str]) -> Hook
         exit_code,
         stdout,
         stderr,
+    }
+}
+
+/// Builds one hook run that ended before process execution.
+fn error_run(hook: &CommandHook, message: String) -> HookRun {
+    HookRun {
+        id: hook.id.clone(),
+        status: HookStatus::Error(message),
+        exit_code: None,
+        stdout: CapturedStream::default(),
+        stderr: CapturedStream::default(),
     }
 }
 
@@ -252,19 +304,19 @@ fn drain(mut stream: impl Read, capture_bytes: usize) -> CapturedStream {
 mod tests {
     use super::*;
     use rift_protocol::configuration as hook_configuration;
-    use rift_protocol::configuration::{Determinism, HookKind, HookType};
+    use rift_protocol::configuration::{CommandInput, Determinism, HookKind};
+    use rift_protocol::read::PathPattern;
     use std::collections::BTreeMap;
 
     fn hook(program: &str, arguments: &[&str]) -> CommandHook {
+        let command = std::iter::once(program)
+            .chain(arguments.iter().copied())
+            .map(str::to_owned)
+            .collect();
         CommandHook {
-            r#type: HookType::Command,
             id: "probe".to_owned(),
             kind: HookKind::Other,
-            program: program.to_owned(),
-            arguments: arguments
-                .iter()
-                .map(|argument| (*argument).to_owned())
-                .collect(),
+            command: CommandInput::ProgramAndArguments(command),
             changed_paths: ChangedPaths::None,
             writes: hook_configuration::HookWrites::None,
             working_directory: ProjectPath(String::new()),
@@ -274,7 +326,13 @@ mod tests {
             failure_severity: hook_configuration::HookFailureSeverity::Error,
             guarantees: Vec::new(),
             determinism: Determinism::Deterministic,
+            include: Vec::new(),
+            exclude: Vec::new(),
         }
+    }
+
+    fn pattern(value: &str) -> PathPattern {
+        PathPattern(value.to_owned())
     }
 
     /// The message of an error status, empty for any other.
@@ -303,6 +361,92 @@ mod tests {
         assert_eq!(run.stdout.text, "hello a.rs pkg/a.rs pkg/b.rs\n");
         assert!(!run.stdout.truncated);
         assert_eq!(run.stdout.total_bytes, run.stdout.captured_bytes);
+    }
+
+    #[test]
+    fn test_string_and_list_commands_run_directly() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut string = hook("true", &[]);
+        string.command = CommandInput::Program("true".to_owned());
+        let list = hook("true", &[]);
+        let runs = run_hooks(&[string, list], directory.path(), &[]);
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().all(|run| run.status == HookStatus::Passed));
+    }
+
+    #[test]
+    fn test_command_argument_is_literal_shell_text() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let marker = directory.path().join("shell-ran");
+        let literal = format!("$HOME; touch {}", marker.display());
+        let run = run_hook(&hook("printf", &["%s", &literal]), directory.path(), &[]);
+        assert_eq!(run.status, HookStatus::Passed);
+        assert_eq!(run.stdout.text, literal);
+        assert!(!marker.exists(), "the command must not start a shell");
+    }
+
+    #[test]
+    fn test_hook_include_selects_matching_path() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut selected = hook("true", &[]);
+        selected.include = vec![pattern("src/**")];
+        let runs = run_hooks(&[selected], directory.path(), &paths(&["src/lib.rs"]));
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, HookStatus::Passed);
+    }
+
+    #[test]
+    fn test_hook_exclude_removes_matching_paths() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut excluded = hook("true", &[]);
+        excluded.exclude = vec![pattern("generated/**")];
+        let runs = run_hooks(&[excluded], directory.path(), &paths(&["generated/lib.rs"]));
+        assert!(runs.is_empty());
+    }
+
+    #[test]
+    fn test_hook_with_unrelated_include_is_skipped() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut rust = hook("true", &[]);
+        rust.include = vec![pattern("**/*.rs")];
+        let runs = run_hooks(&[rust], directory.path(), &paths(&["Cargo.toml"]));
+        assert!(runs.is_empty());
+    }
+
+    #[test]
+    fn test_multi_file_change_runs_selected_hook_once() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut rust = hook("true", &[]);
+        rust.include = vec![pattern("src/**")];
+        let changed = paths(&["src/lib.rs", "src/main.rs", "README.md"]);
+        let runs = run_hooks(&[rust], directory.path(), &changed);
+        assert_eq!(runs.len(), 1);
+    }
+
+    #[test]
+    fn test_empty_include_selects_every_change() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let runs = run_hooks(
+            &[hook("true", &[])],
+            directory.path(),
+            &paths(&["notes.unknown"]),
+        );
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, HookStatus::Passed);
+    }
+
+    #[test]
+    fn test_invalid_hook_pattern_returns_error_without_panicking() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut invalid = hook("true", &[]);
+        invalid.include = vec![pattern("[")];
+        let runs = run_hooks(&[invalid], directory.path(), &paths(&["src/lib.rs"]));
+        assert_eq!(runs.len(), 1);
+        let status = &runs[0].status;
+        assert!(
+            error_text(status).contains("path selection failed"),
+            "{status:?}"
+        );
     }
 
     #[test]

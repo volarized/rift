@@ -1032,6 +1032,18 @@ mod tests {
 
     use super::*;
 
+    fn engine_pool(
+        root: &Path,
+        configuration: rift_protocol::configuration::LspConfiguration,
+    ) -> EnginePool {
+        let key = crate::engine::LspProcessKey::named("fake");
+        EnginePool::new(
+            root,
+            BTreeMap::from([(key.clone(), configuration)]),
+            BTreeMap::from([("rust".to_owned(), key)]),
+        )
+    }
+
     fn project_path(value: &str) -> CoreProjectPath {
         CoreProjectPath::new(value).expect("fixture path is valid")
     }
@@ -1717,11 +1729,13 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"No references found at position"}}"#,
         );
         let script = format!("printf '%s' '{capabilities}{declined}{declined_again}'; sleep 0.2");
-        let engine = rift_protocol::configuration::EngineConfiguration {
-            program: "sh".to_owned(),
-            arguments: vec!["-c".to_owned(), script],
+        let engine = rift_protocol::configuration::LspConfiguration {
+            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                script,
+            ]),
             environment: BTreeMap::new(),
-            languages: vec!["rust".to_owned()],
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
             request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
@@ -1733,10 +1747,7 @@ mod tests {
             },
             restart: rift_protocol::retry::RestartPolicy::default(),
         };
-        let engines = EnginePool::new(
-            directory.path(),
-            BTreeMap::from([("fake".to_owned(), engine)]),
-        );
+        let engines = engine_pool(directory.path(), engine);
         (directory, reads, engines)
     }
 

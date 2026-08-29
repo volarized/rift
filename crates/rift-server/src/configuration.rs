@@ -159,11 +159,9 @@ mod tests {
     /// The `[[hooks]]` example the configuration docs show, keys complete.
     const DOCUMENTED_HOOK: &str = r#"
 [[hooks]]
-type = "command"
 id = "tests"
 kind = "test"
-program = "cargo"
-arguments = ["test"]
+command = ["cargo", "test"]
 changed_paths = "none"
 writes = "none"
 working_directory = ""
@@ -173,6 +171,8 @@ output_limit = "4kb"
 failure_severity = "error"
 guarantees = []
 determinism = "deterministic"
+include = []
+exclude = []
 "#;
 
     fn write_configuration(directory: &tempfile::TempDir, contents: &str) {
@@ -197,7 +197,6 @@ determinism = "deterministic"
         let contents = format!(
             r#"
 [execution]
-allow = ["python"]
 max_code = "16kb"
 max_timeout = "30s"
 max_output = "8kb"
@@ -221,7 +220,6 @@ download_timeout = "5m"
         write_configuration(&directory, &contents);
         let configuration =
             load_configuration(directory.path()).expect("the documented example must be accepted");
-        assert_eq!(configuration.execution.allow, ["python"]);
         assert_eq!(
             configuration.execution.max_code,
             ByteSize::from_bytes(16 << 10)
@@ -236,8 +234,8 @@ download_timeout = "5m"
         let hook = &configuration.hooks[0];
         assert_eq!(hook.id, "tests");
         assert_eq!(hook.kind, HookKind::Test);
-        assert_eq!(hook.program, "cargo");
-        assert_eq!(hook.arguments, ["test"]);
+        assert_eq!(hook.command.program(), "cargo");
+        assert_eq!(hook.command.arguments(), ["test"]);
         assert_eq!(hook.changed_paths, ChangedPaths::None);
         assert_eq!(hook.determinism, Determinism::Deterministic);
     }
@@ -270,8 +268,8 @@ download_timeout = "5m"
         assert_eq!(configuration.hooks.len(), 2);
         assert_eq!(configuration.hooks[0].id, "format");
         assert_eq!(configuration.hooks[0].kind, HookKind::Format);
-        assert_eq!(configuration.hooks[0].program, "cargo");
-        assert_eq!(configuration.hooks[0].arguments, ["fmt", "--all"]);
+        assert_eq!(configuration.hooks[0].command.program(), "cargo");
+        assert_eq!(configuration.hooks[0].command.arguments(), ["fmt", "--all"]);
         assert_eq!(configuration.hooks[0].writes, HookWrites::Workspace);
         assert_eq!(
             configuration.hooks[0].failure_severity,
@@ -279,8 +277,8 @@ download_timeout = "5m"
         );
         assert!(configuration.hooks[0].guarantees.is_empty());
         assert_eq!(configuration.hooks[1].id, "check");
-        assert_eq!(configuration.hooks[1].program, "just");
-        assert_eq!(configuration.hooks[1].arguments, ["check"]);
+        assert_eq!(configuration.hooks[1].command.program(), "just");
+        assert_eq!(configuration.hooks[1].command.arguments(), ["check"]);
         assert_eq!(configuration.hooks[1].writes, HookWrites::None);
         assert_eq!(
             configuration.hooks[1].failure_severity,
@@ -317,14 +315,11 @@ download_timeout = "5m"
     }
 
     #[test]
-    fn test_hook_missing_required_key_is_refused() {
+    fn test_hook_missing_environment_uses_default() {
         let trimmed = DOCUMENTED_HOOK.replace("environment = {}\n", "");
-        let error = accept_configuration(&trimmed)
-            .expect_err("a hook without environment must refuse the file");
-        assert!(
-            error.to_string().contains("environment"),
-            "the refusal must name the missing key: {error}"
-        );
+        let configuration =
+            accept_configuration(&trimmed).expect("a hook without environment must use default");
+        assert!(configuration.hooks[0].environment.is_empty());
     }
 
     #[test]
@@ -342,7 +337,10 @@ download_timeout = "5m"
 
     #[test]
     fn test_absolute_hook_executable_is_refused() {
-        let broken = DOCUMENTED_HOOK.replace("program = \"cargo\"", "program = \"/bin/cargo\"");
+        let broken = DOCUMENTED_HOOK.replace(
+            "command = [\"cargo\", \"test\"]",
+            "command = [\"/bin/cargo\", \"test\"]",
+        );
         let error = accept_configuration(&broken)
             .expect_err("an absolute executable path must refuse the file");
         assert!(

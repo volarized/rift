@@ -31,6 +31,7 @@ EXPECTED_EDGES = {
     "rift-history -> rift-core",
     "rift-index -> rift-core",
     "rift-index -> rift-history",
+    "rift-index -> rift-protocol",
     "rift-index -> rift-provider",
     "rift-index -> rift-syntax",
     "rift-lsp -> rift-core",

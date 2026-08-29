@@ -11,8 +11,8 @@
 //! The engine slot absorbs every transient condition first - a refusal the
 //! engine invites again, an engine still analyzing, an engine that died,
 //! an engine that reported nothing before it had announced any work of its
-//! own - under that engine's `[engines.<name>.retry]` and
-//! `[engines.<name>.restart]` tables. What reaches this module is either
+//! own - under that process's `[lsp.<name>.retry]` and
+//! `[lsp.<name>.restart]` tables. What reaches this module is either
 //! the engine's settled findings or the condition that outlasted the whole
 //! budget. An engine still analyzing on every attempt, and one whose pull
 //! answered empty while its own readiness stayed unconfirmed, both
@@ -394,6 +394,18 @@ mod tests {
 
     use super::*;
 
+    fn engine_pool(
+        root: &std::path::Path,
+        configuration: rift_protocol::configuration::LspConfiguration,
+    ) -> EnginePool {
+        let key = crate::engine::LspProcessKey::named("fake");
+        EnginePool::new(
+            root,
+            BTreeMap::from([(key.clone(), configuration)]),
+            BTreeMap::from([("rust".to_owned(), key)]),
+        )
+    }
+
     fn item(range: Range) -> LspDiagnostic {
         LspDiagnostic {
             range,
@@ -634,16 +646,15 @@ mod tests {
         let script = format!(
             "printf '%s' '{capabilities}{register}{references}{progress_begin}{progress_end}{empty}{pull}{shutdown}' & exec cat > \"$1\""
         );
-        let engine = rift_protocol::configuration::EngineConfiguration {
-            program: "sh".to_owned(),
-            arguments: vec![
+        let engine = rift_protocol::configuration::LspConfiguration {
+            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                "sh".to_owned(),
                 "-c".to_owned(),
                 script,
                 "rift-engine".to_owned(),
                 transcript.display().to_string(),
-            ],
+            ]),
             environment: BTreeMap::new(),
-            languages: vec!["rust".to_owned()],
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
             request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
@@ -655,10 +666,7 @@ mod tests {
             },
             restart: rift_protocol::retry::RestartPolicy::default(),
         };
-        let engines = EnginePool::new(
-            directory.path(),
-            BTreeMap::from([("fake".to_owned(), engine)]),
-        );
+        let engines = engine_pool(directory.path(), engine);
 
         let language = Language {
             name: "rust".to_owned(),
@@ -738,7 +746,7 @@ mod tests {
             rift_protocol::configuration::HistoryConfiguration::default(),
         )
         .expect("fixture workspace indexes");
-        let engines = EnginePool::new(directory.path(), BTreeMap::new());
+        let engines = EnginePool::new(directory.path(), BTreeMap::new(), BTreeMap::new());
         let paths = vec![
             ProjectPath("lib.rs".to_owned()),
             ProjectPath("vanished.rs".to_owned()),
@@ -795,16 +803,15 @@ mod tests {
             empty_pull(1),
             empty_pull(2),
         );
-        let engine = rift_protocol::configuration::EngineConfiguration {
-            program: "sh".to_owned(),
-            arguments: vec![
+        let engine = rift_protocol::configuration::LspConfiguration {
+            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                "sh".to_owned(),
                 "-c".to_owned(),
                 script,
                 "rift-engine".to_owned(),
                 transcript.display().to_string(),
-            ],
+            ]),
             environment: BTreeMap::new(),
-            languages: vec!["rust".to_owned()],
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
             request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
@@ -816,10 +823,7 @@ mod tests {
             },
             restart: rift_protocol::retry::RestartPolicy::default(),
         };
-        let engines = EnginePool::new(
-            directory.path(),
-            BTreeMap::from([("fake".to_owned(), engine)]),
-        );
+        let engines = engine_pool(directory.path(), engine);
         (directory, reads, engines, transcript)
     }
 
@@ -884,11 +888,13 @@ mod tests {
             empty(1),
             empty(2),
         );
-        let engine = rift_protocol::configuration::EngineConfiguration {
-            program: "sh".to_owned(),
-            arguments: vec!["-c".to_owned(), script],
+        let engine = rift_protocol::configuration::LspConfiguration {
+            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                script,
+            ]),
             environment: BTreeMap::new(),
-            languages: vec!["rust".to_owned()],
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
             request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
@@ -900,10 +906,7 @@ mod tests {
             },
             restart: rift_protocol::retry::RestartPolicy::default(),
         };
-        let engines = EnginePool::new(
-            directory.path(),
-            BTreeMap::from([("fake".to_owned(), engine)]),
-        );
+        let engines = engine_pool(directory.path(), engine);
         let changes = added_changes(&reads, &[ProjectPath("lib.rs".to_owned())]);
         let findings =
             classified_engine_change_diagnostics(&engines, &reads, &reads, &changes).await;
@@ -945,11 +948,13 @@ mod tests {
             "printf '%s' '{capabilities}{}{finding}{finding_again}'; sleep 0.2",
             empty(1) + &empty(2),
         );
-        let engine = rift_protocol::configuration::EngineConfiguration {
-            program: "sh".to_owned(),
-            arguments: vec!["-c".to_owned(), script],
+        let engine = rift_protocol::configuration::LspConfiguration {
+            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                script,
+            ]),
             environment: BTreeMap::new(),
-            languages: vec!["rust".to_owned()],
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
             request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
@@ -961,10 +966,7 @@ mod tests {
             },
             restart: rift_protocol::retry::RestartPolicy::default(),
         };
-        let engines = EnginePool::new(
-            directory.path(),
-            BTreeMap::from([("fake".to_owned(), engine)]),
-        );
+        let engines = engine_pool(directory.path(), engine);
         let changes = added_changes(&reads, &[ProjectPath("lib.rs".to_owned())]);
         let findings =
             classified_engine_change_diagnostics(&engines, &reads, &reads, &changes).await;
@@ -1006,11 +1008,13 @@ mod tests {
         );
         let empty_pull = framed(r#"{"jsonrpc":"2.0","id":1,"result":{"kind":"full","items":[]}}"#);
         let script = format!("printf '%s' '{capabilities}{progress_begin}{empty_pull}'; sleep 0.2");
-        let engine = rift_protocol::configuration::EngineConfiguration {
-            program: "sh".to_owned(),
-            arguments: vec!["-c".to_owned(), script],
+        let engine = rift_protocol::configuration::LspConfiguration {
+            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                script,
+            ]),
             environment: BTreeMap::new(),
-            languages: vec!["rust".to_owned()],
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
             request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
@@ -1022,10 +1026,7 @@ mod tests {
             },
             restart: rift_protocol::retry::RestartPolicy::default(),
         };
-        let engines = EnginePool::new(
-            directory.path(),
-            BTreeMap::from([("fake".to_owned(), engine)]),
-        );
+        let engines = engine_pool(directory.path(), engine);
         (directory, reads, engines)
     }
 
@@ -1101,11 +1102,13 @@ mod tests {
             empty_pull(1),
             empty_pull(2),
         );
-        let engine = rift_protocol::configuration::EngineConfiguration {
-            program: "sh".to_owned(),
-            arguments: vec!["-c".to_owned(), script],
+        let engine = rift_protocol::configuration::LspConfiguration {
+            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                script,
+            ]),
             environment: BTreeMap::new(),
-            languages: vec!["rust".to_owned()],
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
             request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
@@ -1117,10 +1120,7 @@ mod tests {
             },
             restart: rift_protocol::retry::RestartPolicy::default(),
         };
-        let engines = EnginePool::new(
-            directory.path(),
-            BTreeMap::from([("fake".to_owned(), engine)]),
-        );
+        let engines = engine_pool(directory.path(), engine);
         (directory, reads, engines)
     }
 

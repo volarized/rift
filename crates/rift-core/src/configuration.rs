@@ -9,7 +9,10 @@
 //! `rift-protocol`, so the workspace's `[source]` table is translated into
 //! this plain value here, beside the wire type it comes from.
 
-use rift_protocol::configuration::{ConfigurationViolation, SearchConfiguration, UnitParseError};
+use rift_protocol::configuration::{
+    ConfigurationViolation, LanguageConfiguration, SearchConfiguration, UnitParseError,
+    WorkspaceConfiguration,
+};
 use rift_protocol::source::SourceConfiguration;
 
 use crate::error::{ErrorContext, ErrorName, Fault, fault_label};
@@ -74,17 +77,109 @@ impl From<&SourceConfiguration> for SourceVisibility {
     }
 }
 
-/// Resolved `[search.text]` chunk bound.
+/// One exact language's resolved path selection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LanguageFileSelection {
+    identity: String,
+    enabled: bool,
+    include: Option<Vec<String>>,
+    exclude: Vec<String>,
+}
+
+impl LanguageFileSelection {
+    /// Language identity in `name` or `name:dialect` form.
+    #[must_use]
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    /// Whether matched files receive language service.
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Replacement patterns, or absence when shipped patterns apply.
+    #[must_use]
+    pub fn include(&self) -> Option<&[String]> {
+        self.include.as_deref()
+    }
+
+    /// Patterns removed from this language's effective matches.
+    #[must_use]
+    pub fn exclude(&self) -> &[String] {
+        &self.exclude
+    }
+
+    fn from_entry(identity: &str, configuration: &LanguageConfiguration) -> Self {
+        let patterns = |list: &[rift_protocol::read::PathPattern]| {
+            list.iter().map(|pattern| pattern.0.clone()).collect()
+        };
+        Self {
+            identity: identity.to_owned(),
+            enabled: configuration.enabled,
+            include: configuration.include.as_deref().map(patterns),
+            exclude: patterns(&configuration.exclude),
+        }
+    }
+}
+
+/// Resolved language path selections in identity order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LanguageFileSelections {
+    entries: Vec<LanguageFileSelection>,
+}
+
+impl LanguageFileSelections {
+    /// Exact language entries in identity order.
+    #[must_use]
+    pub fn entries(&self) -> &[LanguageFileSelection] {
+        &self.entries
+    }
+}
+
+impl From<&WorkspaceConfiguration> for LanguageFileSelections {
+    fn from(configuration: &WorkspaceConfiguration) -> Self {
+        Self {
+            entries: configuration
+                .languages
+                .iter()
+                .map(|(identity, entry)| LanguageFileSelection::from_entry(identity, entry))
+                .collect(),
+        }
+    }
+}
+
+/// Resolved `[search.text]` path selection and chunk bound.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextFileInclusion {
+    include: Vec<String>,
     chunk_bytes_max: u64,
 }
 
 impl TextFileInclusion {
     /// Builds one text-file policy from its chunk bound.
     #[must_use]
-    pub const fn new(chunk_bytes_max: u64) -> Self {
-        Self { chunk_bytes_max }
+    pub fn new(chunk_bytes_max: u64) -> Self {
+        Self {
+            include: vec!["**".to_owned()],
+            chunk_bytes_max,
+        }
+    }
+
+    /// Builds one text-file policy from its patterns and chunk bound.
+    #[must_use]
+    pub const fn with_include(include: Vec<String>, chunk_bytes_max: u64) -> Self {
+        Self {
+            include,
+            chunk_bytes_max,
+        }
+    }
+
+    /// Patterns selecting plain text when no language claims a path.
+    #[must_use]
+    pub fn include(&self) -> &[String] {
+        &self.include
     }
 
     /// Bytes one lexical chunk derived from baseline text may hold.
@@ -103,7 +198,15 @@ impl Default for TextFileInclusion {
 
 impl From<&SearchConfiguration> for TextFileInclusion {
     fn from(search: &SearchConfiguration) -> Self {
-        Self::new(search.text.max_chunk.bytes())
+        Self::with_include(
+            search
+                .text
+                .include
+                .iter()
+                .map(|pattern| pattern.0.clone())
+                .collect(),
+            search.text.max_chunk.bytes(),
+        )
     }
 }
 
@@ -202,8 +305,8 @@ mod tests {
 
     #[test]
     fn test_configuration_violation_renders_through_the_registry() {
-        let violation = ConfigurationViolation::HookExecutableAbsolute {
-            id: "tests".to_owned(),
+        let violation = ConfigurationViolation::CommandProgramAbsolute {
+            field: "hooks.command",
             program: "/bin/cargo".to_owned(),
         };
         let error = Error::from(violation);
@@ -213,8 +316,8 @@ mod tests {
         );
         let message = error.to_string();
         assert!(
-            message.contains("violation hook_executable_absolute")
-                && message.contains("id tests")
+            message.contains("violation command_program_absolute")
+                && message.contains("field hooks.command")
                 && message.contains("program /bin/cargo")
                 && message.contains("correct the reported configuration field"),
             "the render must carry the serde label, the evidence, and the action: {message}"

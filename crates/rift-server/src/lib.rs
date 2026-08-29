@@ -23,8 +23,8 @@ pub use diagnose::{
     ENGINE_DIAGNOSTICS_PER_CHANGE_MAX, classified_engine_change_diagnostics,
     engine_change_set_diagnostics,
 };
-pub use engine::{EnginePool, EngineSlot};
-pub use hook::{HookRun, HookStatus, run_hook, run_hooks};
+pub use engine::{EnginePool, EngineSlot, LspProcessKey};
+pub use hook::{HookRun, HookStatus, hook_matches_paths, run_hook, run_hooks};
 pub use move_file::{MovePlan, MoveResolution, plan_move};
 pub use read::{ReadError, ReadFault, ReadService};
 pub use remove::{

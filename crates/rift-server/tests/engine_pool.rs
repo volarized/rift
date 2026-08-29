@@ -26,19 +26,27 @@ use process_lifecycle::{
 };
 use rift_core::ProjectPath;
 use rift_lsp::session::{EngineFault, EngineSession};
-use rift_protocol::configuration::{Duration, EngineConfiguration};
+use rift_protocol::configuration::Duration;
 use rift_protocol::read::Language;
 use rift_protocol::retry::RestartPolicy;
-use rift_server::EnginePool;
+use rift_server::{EnginePool, LspProcessKey};
 
 mod process_lifecycle;
 
-fn pool_of(workspace: &Path, entries: Vec<(&str, EngineConfiguration)>) -> EnginePool {
-    let engines = entries
-        .into_iter()
-        .map(|(name, engine)| (name.to_owned(), engine))
-        .collect();
-    EnginePool::new(workspace, engines)
+fn pool_of(
+    workspace: &Path,
+    entries: Vec<(&str, process_lifecycle::ProcessFixture)>,
+) -> EnginePool {
+    let mut definitions = std::collections::BTreeMap::new();
+    let mut bindings = std::collections::BTreeMap::new();
+    for (name, fixture) in entries {
+        let key = LspProcessKey::named(name);
+        definitions.insert(key.clone(), fixture.configuration);
+        for language in fixture.languages {
+            bindings.insert(language, key.clone());
+        }
+    }
+    EnginePool::new(workspace, definitions, bindings)
 }
 
 fn language(name: &str) -> Language {

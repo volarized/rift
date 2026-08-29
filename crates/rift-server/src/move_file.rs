@@ -590,6 +590,18 @@ mod tests {
 
     use super::*;
 
+    fn engine_pool(
+        root: &Path,
+        configuration: rift_protocol::configuration::LspConfiguration,
+    ) -> EnginePool {
+        let key = crate::engine::LspProcessKey::named("fake");
+        EnginePool::new(
+            root,
+            BTreeMap::from([(key.clone(), configuration)]),
+            BTreeMap::from([("rust".to_owned(), key)]),
+        )
+    }
+
     fn params(from: &str, to: &str) -> MoveFileParams {
         MoveFileParams {
             from: ProjectPath(from.to_owned()),
@@ -610,7 +622,7 @@ mod tests {
             HistoryConfiguration::default(),
         )
         .expect("fixture workspace indexes");
-        let engines = EnginePool::new(directory.path(), BTreeMap::new());
+        let engines = EnginePool::new(directory.path(), BTreeMap::new(), BTreeMap::new());
         (directory, reads, engines)
     }
 
@@ -652,11 +664,13 @@ mod tests {
         let script = format!(
             "printf '%s' '{capabilities}{progress_begin}{progress_end}{no_edit}{no_edit_again}'; sleep 0.2"
         );
-        let engine = rift_protocol::configuration::EngineConfiguration {
-            program: "sh".to_owned(),
-            arguments: vec!["-c".to_owned(), script],
+        let engine = rift_protocol::configuration::LspConfiguration {
+            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                script,
+            ]),
             environment: BTreeMap::new(),
-            languages: vec!["rust".to_owned()],
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
             request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
@@ -668,10 +682,7 @@ mod tests {
             },
             restart: rift_protocol::retry::RestartPolicy::default(),
         };
-        let engines = EnginePool::new(
-            directory.path(),
-            BTreeMap::from([("fake".to_owned(), engine)]),
-        );
+        let engines = engine_pool(directory.path(), engine);
         (directory, reads, engines)
     }
 
@@ -735,11 +746,13 @@ mod tests {
         );
         let no_edit = framed(r#"{"jsonrpc":"2.0","id":1,"result":null}"#);
         let script = format!("printf '%s' '{capabilities}{no_edit}'; sleep 0.2");
-        let engine = rift_protocol::configuration::EngineConfiguration {
-            program: "sh".to_owned(),
-            arguments: vec!["-c".to_owned(), script],
+        let engine = rift_protocol::configuration::LspConfiguration {
+            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                script,
+            ]),
             environment: BTreeMap::new(),
-            languages: vec!["rust".to_owned()],
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
             request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
@@ -751,10 +764,7 @@ mod tests {
             },
             restart: rift_protocol::retry::RestartPolicy::default(),
         };
-        let engines = EnginePool::new(
-            directory.path(),
-            BTreeMap::from([("fake".to_owned(), engine)]),
-        );
+        let engines = engine_pool(directory.path(), engine);
         (directory, reads, engines)
     }
 
@@ -912,7 +922,7 @@ mod tests {
             HistoryConfiguration::default(),
         )
         .expect("fixture workspace indexes");
-        let engines = EnginePool::new(directory.path(), BTreeMap::new());
+        let engines = EnginePool::new(directory.path(), BTreeMap::new(), BTreeMap::new());
         let result = refused(
             plan_move(
                 &reads,
@@ -981,7 +991,7 @@ mod tests {
             HistoryConfiguration::default(),
         )
         .expect("fixture workspace indexes");
-        let engines = EnginePool::new(directory.path(), BTreeMap::new());
+        let engines = EnginePool::new(directory.path(), BTreeMap::new(), BTreeMap::new());
         let result = refused(
             plan_move(
                 &reads,
@@ -1082,7 +1092,7 @@ mod tests {
             HistoryConfiguration::default(),
         )
         .expect("fixture workspace indexes");
-        let engines = EnginePool::new(directory.path(), BTreeMap::new());
+        let engines = EnginePool::new(directory.path(), BTreeMap::new(), BTreeMap::new());
         fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000))
             .expect("fixture permissions set");
         let result = plan_move(

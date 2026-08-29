@@ -20,11 +20,9 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 /// A `[[hooks]]` block whose `timeout` breaks its documented bound.
 const INVALID_CONFIGURATION: &str = r#"
 [[hooks]]
-type = "command"
 id = "tests"
 kind = "test"
-program = "cargo"
-arguments = ["test"]
+command = ["cargo", "test"]
 changed_paths = "none"
 writes = "none"
 working_directory = ""
@@ -39,11 +37,9 @@ determinism = "deterministic"
 /// The same block with its timeout inside the bound.
 const VALID_CONFIGURATION: &str = r#"
 [[hooks]]
-type = "command"
 id = "tests"
 kind = "test"
-program = "cargo"
-arguments = ["test"]
+command = ["cargo", "test"]
 changed_paths = "none"
 writes = "none"
 working_directory = ""

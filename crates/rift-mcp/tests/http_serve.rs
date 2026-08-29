@@ -27,11 +27,9 @@ const STOP_DEADLINE: Duration = Duration::from_secs(10);
 /// A `[[hooks]]` block whose `timeout` breaks its documented bound.
 const INVALID_CONFIGURATION: &str = r#"
 [[hooks]]
-type = "command"
 id = "tests"
 kind = "test"
-program = "cargo"
-arguments = ["test"]
+command = ["cargo", "test"]
 changed_paths = "none"
 writes = "none"
 working_directory = ""

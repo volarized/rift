@@ -1,10 +1,10 @@
-//! The tombi probe and the real `[engines.toml]` table.
+//! Tombi probe and real TOML language LSP configuration.
 
 use std::path::Path;
 
 use crate::engine_fixture::EngineFixture;
 
-/// The engine program the live TOML fixture names in `program`.
+/// Program the live TOML fixture places first in `command`.
 ///
 /// The name resolves through `PATH`; the CI job installs it with
 /// `uv tool install tombi`, and a local run expects the same.
@@ -36,13 +36,13 @@ pub(crate) fn require_tombi(fixture_root: &Path) {
     }
 }
 
-/// The real `[engines.toml]` table, built from [`fixture`].
+/// Real TOML language LSP configuration, built from [`fixture`].
 pub(crate) fn toml_engine_configuration() -> String {
     fixture().configuration_toml()
 }
 
-/// The fixture data the shared harness turns into the `[engines.toml]`
-/// table: tombi's language server over the fixture tree.
+/// Fixture data the shared harness turns into a TOML language binding and
+/// tombi language server over the fixture tree.
 ///
 /// tombi answers `initialize` and a first `textDocument/diagnostic` pull
 /// immediately - it has no background project load to announce over

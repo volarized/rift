@@ -43,11 +43,9 @@ fn configuration(hooks: &[Hook<'_>]) -> String {
             configuration,
             r#"
 [[hooks]]
-type = "command"
 id = "{id}"
 kind = "{kind}"
-program = "sh"
-arguments = ["{script}"]
+command = ["sh", "{script}"]
 changed_paths = "none"
 writes = "{writes}"
 working_directory = ""

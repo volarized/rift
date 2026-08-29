@@ -4,6 +4,7 @@ mod change_set;
 mod chunk;
 mod database;
 mod glob;
+mod language;
 mod lexical;
 mod log;
 mod semantic;
@@ -15,6 +16,7 @@ mod workspace;
 pub use change_set::{ChangeSet, FileDigest, PathChange, PathChanges, WorkspaceDigests};
 pub use database::{DatabasePool, WorkspaceDatabase};
 pub use glob::PathMatcher;
+pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
 pub use lexical::{
     LexicalChange, LexicalIndexError, LexicalIndexFault, LexicalIndexLimits, LexicalIndexViolation,
     LexicalMatch, LexicalSearchIndex, LexicalUnit, LexicalUnitKind, RevisionScoped,
@@ -28,7 +30,8 @@ pub use workspace::{
     IndexedFile, ReadableSymbol, SymbolMatch, SymbolMatchRank, TextSourceFile,
     WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexFault,
     WorkspaceIndexLimits, WorkspaceIndexViolation, WorkspaceIndexWarning, WorkspaceSourcePolicy,
-    capture_digests, source_line_matches, symbol_matches, text_line_matches,
+    capture_digests, capture_digests_with_languages, source_line_matches, symbol_matches,
+    text_line_matches,
 };
 
 /// Compile-time marker for index-layer ownership.

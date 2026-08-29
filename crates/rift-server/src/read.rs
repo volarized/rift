@@ -6,7 +6,8 @@ use std::sync::Arc;
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::constants::DIGEST_WIRE_CHARS;
 use rift_core::{
-    Error, ErrorCode, ErrorContext, ErrorName, Fault, SourceVisibility, TextFileInclusion,
+    Error, ErrorCode, ErrorContext, ErrorName, Fault, LanguageFileSelections, SourceVisibility,
+    TextFileInclusion,
 };
 use rift_history::{HistoryError, Repository};
 use rift_index::{
@@ -235,7 +236,9 @@ impl ReadFault {
         })
     }
 
-    pub(crate) fn index(source: WorkspaceIndexError) -> ReadError {
+    /// Keeps an indexing failure's registry identity in one read failure.
+    #[must_use]
+    pub fn index(source: WorkspaceIndexError) -> ReadError {
         Error::new(Self::Index(source))
     }
 
@@ -310,6 +313,30 @@ impl ReadService {
         text_inclusion: &TextFileInclusion,
         history: HistoryConfiguration,
     ) -> Result<Self, ReadError> {
+        Self::build_with_languages(
+            root,
+            limits,
+            visibility,
+            text_inclusion,
+            &LanguageFileSelections::default(),
+            history,
+        )
+    }
+
+    /// Builds one current-tree snapshot with configured language entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when configuration or root cannot be indexed
+    /// within bounds.
+    pub fn build_with_languages(
+        root: &Path,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+        text_inclusion: &TextFileInclusion,
+        languages: &LanguageFileSelections,
+        history: HistoryConfiguration,
+    ) -> Result<Self, ReadError> {
         let span = tracing::info_span!(
             "index.build",
             component = "index",
@@ -318,16 +345,28 @@ impl ReadService {
             outcome = tracing::field::Empty,
         );
         let _entered = span.enter();
-        let index =
-            WorkspaceIndex::build(root, limits, visibility, text_inclusion).map_err(|source| {
-                span.record("outcome", "error");
-                ReadFault::index(source)
-            })?;
-        let source_policy = WorkspaceSourcePolicy::build(root, limits, visibility, text_inclusion)
-            .map_err(|source| {
-                span.record("outcome", "error");
-                ReadFault::index(source)
-            })?;
+        let index = WorkspaceIndex::build_with_languages(
+            root,
+            limits,
+            visibility,
+            text_inclusion,
+            languages,
+        )
+        .map_err(|source| {
+            span.record("outcome", "error");
+            ReadFault::index(source)
+        })?;
+        let source_policy = WorkspaceSourcePolicy::build_with_languages(
+            root,
+            limits,
+            visibility,
+            text_inclusion,
+            languages,
+        )
+        .map_err(|source| {
+            span.record("outcome", "error");
+            ReadFault::index(source)
+        })?;
         let revisions = captured_revisions(&index);
         span.record("files_count", index.file_count());
         span.record("tree_revision", revisions.wire_tree_revision());
@@ -416,13 +455,45 @@ impl ReadService {
         visibility: &SourceVisibility,
         history: HistoryConfiguration,
     ) -> Result<Self, ReadError> {
+        Self::at_revision_with_languages(
+            root,
+            rev,
+            limits,
+            visibility,
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+            history,
+        )
+    }
+
+    /// Builds one revision snapshot with configured language entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when revision or configuration cannot be served.
+    pub fn at_revision_with_languages(
+        root: &Path,
+        rev: &RevisionId,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+        text_inclusion: &TextFileInclusion,
+        languages: &LanguageFileSelections,
+        history: HistoryConfiguration,
+    ) -> Result<Self, ReadError> {
         if let Some(violation) = rev.violation() {
             return Err(ReadFault::invalid("rev", violation.as_str()));
         }
         let repository = Repository::open(root).map_err(ReadFault::history)?;
         let resolved = repository.resolve(&rev.0).map_err(ReadFault::history)?;
-        let index = WorkspaceIndex::at_revision(&repository, &resolved, limits, visibility)
-            .map_err(ReadFault::index)?;
+        let index = WorkspaceIndex::at_revision_with_languages(
+            &repository,
+            &resolved,
+            limits,
+            visibility,
+            text_inclusion,
+            languages,
+        )
+        .map_err(ReadFault::index)?;
         let revisions = captured_revisions(&index);
         Ok(Self {
             index,

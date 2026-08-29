@@ -68,7 +68,7 @@ pub(crate) fn rust_project() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-/// The cargo project fixture with a real `[engines.rust]` table appended,
+/// Cargo project fixture with real Rust language LSP configuration appended,
 /// serving `rust` through rust-analyzer.
 pub(crate) fn rust_engine_workspace() -> TestResult<tempfile::TempDir> {
     laid_out_workspace(
@@ -89,7 +89,7 @@ const SEMANTIC_DISABLED: &str = "[search.semantic]\ndisabled = true\n";
 
 /// One fixture workspace holding `files` and a `rift.toml` carrying the disabled
 /// semantic tier, the orphan-safety idle timeout, and `extra_toml` - an
-/// `[engines.*]` table, a `[source]` policy, `[[hooks]]` entries, or any other
+/// LSP configuration, a `[source]` policy, `[[hooks]]` entries, or any other
 /// table a case needs beyond the two every fixture already carries.
 pub(crate) fn laid_out_workspace(
     files: &[(&str, &str)],

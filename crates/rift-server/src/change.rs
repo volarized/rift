@@ -25,7 +25,7 @@ use rift_protocol::read::{
     Diagnostic, DiagnosticCode, DiagnosticContinuation, DiagnosticReliability, Extensions, FileId,
     Language, Severity, SourceSpan, TextRange,
 };
-use rift_syntax::{ByteRange, SyntaxDocument, SyntaxSource, registry};
+use rift_syntax::{ByteRange, SyntaxDocument, SyntaxSource};
 use sha2::{Digest as _, Sha256};
 
 use crate::move_file::MovePlan;
@@ -886,7 +886,7 @@ impl ChangeService {
                 )),
             };
             edits.extend(rewrite_edits(rewrite, &unit, ranged));
-            fold_and_bound_diagnostics(&mut diagnostics, rewrite, unit);
+            fold_and_bound_diagnostics(reads, &mut diagnostics, rewrite, unit);
         }
         let digest = identity.finalize();
         Ok(ChangeResult::Applied {
@@ -1415,8 +1415,18 @@ fn decoded(encoded: &str) -> Option<String> {
 /// for a file a patch just created. The registry selects the parsing
 /// provider by the path's extension; a path no provider claims has no
 /// grammar to check against and contributes no findings.
-fn reparse_diagnostics(unit: FileId, path: &CoreProjectPath, source: &str) -> Vec<Diagnostic> {
-    let Some(provider) = path_extension(path).and_then(registry::provider_for_extension) else {
+fn reparse_diagnostics(
+    reads: &ReadService,
+    unit: FileId,
+    path: &CoreProjectPath,
+    source: &str,
+) -> Vec<Diagnostic> {
+    let absolute = reads.index().root().join(path.as_str());
+    let Some(provider) = reads
+        .source_policy()
+        .and_then(|policy| policy.language_for_path(&absolute).ok().flatten())
+        .and_then(rift_index::EffectiveLanguage::syntax_provider)
+    else {
         return Vec::new();
     };
     let language = provider.language();
@@ -1450,25 +1460,20 @@ fn reparse_diagnostics(unit: FileId, path: &CoreProjectPath, source: &str) -> Ve
 /// still applies to it, so warnings carried in from earlier in the batch
 /// cannot outlive a batch made only of deletions.
 fn fold_and_bound_diagnostics(
+    reads: &ReadService,
     diagnostics: &mut Vec<Diagnostic>,
     rewrite: &FileRewrite,
     unit: FileId,
 ) {
     if !rewrite.kind.removes_file() {
         diagnostics.extend(reparse_diagnostics(
+            reads,
             unit,
             &rewrite.path,
             &rewrite.next_source,
         ));
     }
     diagnostics.truncate(CHANGE_DIAGNOSTICS_MAX);
-}
-
-/// The extension of `path`'s final segment, without its leading dot.
-fn path_extension(path: &CoreProjectPath) -> Option<&str> {
-    Path::new(path.as_str())
-        .extension()
-        .and_then(std::ffi::OsStr::to_str)
 }
 
 fn change_diagnostic(
@@ -1915,8 +1920,11 @@ mod tests {
 
         let (directory, reads, changes) = fixture_with_name(case.file_name, case.source)?;
         let target = addressed_declaration(&reads, case)?;
-        let engines =
-            crate::engine::EnginePool::new(directory.path(), std::collections::BTreeMap::new());
+        let engines = crate::engine::EnginePool::new(
+            directory.path(),
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+        );
         let resolution = crate::remove::plan_remove_symbol(
             &reads,
             &engines,
@@ -2877,8 +2885,11 @@ mod tests {
                 &rift_core::TextFileInclusion::default(),
                 HistoryConfiguration::default(),
             )?;
-            let engines =
-                crate::engine::EnginePool::new(directory.path(), std::collections::BTreeMap::new());
+            let engines = crate::engine::EnginePool::new(
+                directory.path(),
+                std::collections::BTreeMap::new(),
+                std::collections::BTreeMap::new(),
+            );
             let resolution = crate::remove::plan_remove_symbol(
                 &reads_after_insert,
                 &engines,
@@ -3895,14 +3906,15 @@ mod tests {
     /// `replace_symbol`'s wire surface at all; this proves `reparse_diagnostics`
     /// directly instead of steering an unreachable integration path.
     #[test]
-    fn reparse_diagnostics_reports_a_source_past_the_parser_bound() {
+    fn reparse_diagnostics_reports_a_source_past_the_parser_bound() -> TestResult {
+        let (_directory, reads, _changes) = fixture("pub fn beacon() {}\n")?;
         let source = format!(
             "pub fn beacon() {{}}\n// {}",
             "x".repeat(rift_syntax::RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT)
         );
         let path = CoreProjectPath::new("lib.rs").expect("fixture path is valid");
         let unit = FileId("rift://file/lib.rs".to_owned());
-        let diagnostics = super::reparse_diagnostics(unit, &path, &source);
+        let diagnostics = super::reparse_diagnostics(&reads, unit, &path, &source);
         assert_eq!(diagnostics.len(), 1);
         assert!(
             diagnostics[0]
@@ -3911,6 +3923,7 @@ mod tests {
             "diagnostic must name the crossed bound: {}",
             diagnostics[0].message
         );
+        Ok(())
     }
 
     #[test]
@@ -4079,9 +4092,10 @@ mod tests {
 
     #[test]
     fn reparse_skips_a_path_no_provider_claims() -> TestResult {
+        let (_directory, reads, _changes) = fixture("pub fn beacon() {}\n")?;
         let path = CoreProjectPath::new("notes/TODO.txt")?;
         let unit = FileId("rift://file/notes/TODO.txt".to_owned());
-        let diagnostics = super::reparse_diagnostics(unit, &path, "fn broken( {");
+        let diagnostics = super::reparse_diagnostics(&reads, unit, &path, "fn broken( {");
         assert!(
             diagnostics.is_empty(),
             "an unclaimed extension has no grammar, so no findings"
@@ -4091,9 +4105,10 @@ mod tests {
 
     #[test]
     fn reparse_stamps_findings_with_the_claiming_provider_language() -> TestResult {
+        let (_directory, reads, _changes) = fixture("pub fn beacon() {}\n")?;
         let path = CoreProjectPath::new("lib.rs")?;
         let unit = FileId("rift://file/lib.rs".to_owned());
-        let diagnostics = super::reparse_diagnostics(unit, &path, "fn broken( {");
+        let diagnostics = super::reparse_diagnostics(&reads, unit, &path, "fn broken( {");
         assert!(!diagnostics.is_empty(), "broken rust must report findings");
         assert_eq!(
             diagnostics[0].language,
@@ -4907,12 +4922,13 @@ mod tests {
     /// must not outlive a batch made only of deletions.
     #[test]
     fn test_fold_and_bound_diagnostics_bounds_a_deletions_carried_over_warnings() -> TestResult {
+        let (_directory, reads, _changes) = fixture("pub fn beacon() {}\n")?;
         let mut diagnostics: Vec<Diagnostic> = (0..super::CHANGE_DIAGNOSTICS_MAX + 4)
             .map(|index| warning(&format!("carried warning {index}")))
             .collect();
         let rewrite = FileRewrite::delete(CoreProjectPath::new("gone.rs")?, "");
         let unit = FileId("rift://file/gone.rs".to_owned());
-        super::fold_and_bound_diagnostics(&mut diagnostics, &rewrite, unit);
+        super::fold_and_bound_diagnostics(&reads, &mut diagnostics, &rewrite, unit);
         assert_eq!(
             diagnostics.len(),
             super::CHANGE_DIAGNOSTICS_MAX,

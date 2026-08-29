@@ -258,14 +258,12 @@ mod tests {
 
     fn probe_hook() -> rift_protocol::configuration::CommandHook {
         use rift_protocol::configuration::{
-            ChangedPaths, Determinism, HookFailureSeverity, HookKind, HookType, HookWrites,
+            ChangedPaths, CommandInput, Determinism, HookFailureSeverity, HookKind, HookWrites,
         };
         rift_protocol::configuration::CommandHook {
-            r#type: HookType::Command,
             id: "tests".to_owned(),
             kind: HookKind::Test,
-            program: "cargo".to_owned(),
-            arguments: vec!["test".to_owned()],
+            command: CommandInput::ProgramAndArguments(vec!["cargo".to_owned(), "test".to_owned()]),
             changed_paths: ChangedPaths::None,
             writes: HookWrites::None,
             working_directory: rift_protocol::read::ProjectPath(String::new()),
@@ -275,6 +273,8 @@ mod tests {
             failure_severity: HookFailureSeverity::Error,
             guarantees: Vec::new(),
             determinism: Determinism::Deterministic,
+            include: Vec::new(),
+            exclude: Vec::new(),
         }
     }
 

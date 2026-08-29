@@ -6,7 +6,7 @@
 //! whole chain with no code change of their own: once a `.toml` file
 //! carries a `Language`, `engine_change_diagnostics`
 //! (`crates/rift-server/src/diagnose.rs`) already resolves the configured
-//! `[engines.toml]` entry for it, the same way it resolves `[engines.rust]`
+//! TOML language LSP binding, the same way it resolves the Rust binding
 //! for a `.rs` file.
 //!
 //! tombi announces no `$/progress` work, so the server settles diagnostics

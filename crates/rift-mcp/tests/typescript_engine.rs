@@ -1,5 +1,4 @@
-//! The typescript-language-server probe and the real
-//! `[engines.typescript]` table.
+//! Typescript-language-server probe and real TypeScript language LSP configuration.
 //!
 //! The engine refuses to initialize without a `typescript` package it can
 //! resolve from the workspace root (`-32603 Could not find a valid
@@ -67,7 +66,7 @@ pub(crate) fn install_typescript_engine(fixture_root: &Path) {
     }
 }
 
-/// The real `[engines.typescript]` table, built from [`fixture`], beside
+/// Real TypeScript language LSP configuration, built from [`fixture`], beside
 /// the `[source]` policy the fixture always needs.
 pub(crate) fn typescript_engine_configuration() -> String {
     format!(
@@ -83,14 +82,14 @@ pub(crate) fn fixture() -> EngineFixture {
         program: LANGUAGE_SERVER_PROGRAM,
         arguments: vec!["--stdio"],
         languages: vec!["typescript", "typescript:tsx"],
-        extra_toml: "\n[engines.typescript.initialization_options.tsserver]\n\
+        extra_toml: "\n[lsp.typescript.initialization_options.tsserver]\n\
                      useSyntaxServer = \"never\"\n"
             .to_owned(),
     }
 }
 
 /// The `[source]` policy this engine's fixture always needs beside its
-/// `[engines.typescript]` table: without it the walk reaches
+/// TypeScript LSP configuration: without it the walk reaches
 /// `typescript`'s own 23mb of installed sources and the first change
 /// refuses with `violation file_too_large`.
 pub(crate) const SOURCE_EXCLUDES_NODE_MODULES: &str = "[source]\nexclude = [\"node_modules/**\"]\n";

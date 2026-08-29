@@ -1,7 +1,7 @@
 //! Real-process fixtures for `EnginePool` tests: canned response
 //! sequences over a real `sh` process, with no scripted engine binary.
 //!
-//! `EnginePool` always spawns a real process through `EngineConfiguration`;
+//! `EnginePool` always spawns a real process through `LspConfiguration`;
 //! there is no transport to substitute in-process the way `rift-lsp`'s own
 //! session tests do. Every fixture here is a plain `sh -c` script answering
 //! a fixed sequence of framed JSON-RPC responses without ever reading or
@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use rift_protocol::configuration::{ByteSize, Duration, EngineConfiguration};
+use rift_protocol::configuration::{ByteSize, CommandInput, Duration, LspConfiguration};
 use rift_protocol::retry::{RestartPolicy, RetryPolicy};
 
 /// The shell every fixture runs under, resolved through `PATH`.
@@ -48,22 +48,48 @@ pub(crate) fn refused_response(id: u64, code: i64, message: &str) -> String {
     ))
 }
 
-/// The engine table resolving `sh -c script`, claiming `languages`.
-fn table(script: String, languages: &[&str]) -> EngineConfiguration {
-    EngineConfiguration {
-        program: SHELL_PROGRAM.to_owned(),
-        arguments: vec!["-c".to_owned(), script],
+/// One process configuration and its exact language bindings.
+pub(crate) struct ProcessFixture {
+    pub(crate) configuration: LspConfiguration,
+    pub(crate) languages: Vec<String>,
+}
+
+impl std::ops::Deref for ProcessFixture {
+    type Target = LspConfiguration;
+
+    fn deref(&self) -> &Self::Target {
+        &self.configuration
+    }
+}
+
+impl std::ops::DerefMut for ProcessFixture {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.configuration
+    }
+}
+
+/// Process fixture resolving `sh -c script`, bound to `languages`.
+fn table(script: String, languages: &[&str]) -> ProcessFixture {
+    let configuration = LspConfiguration {
+        command: CommandInput::ProgramAndArguments(vec![
+            SHELL_PROGRAM.to_owned(),
+            "-c".to_owned(),
+            script,
+        ]),
         environment: BTreeMap::new(),
-        languages: languages
-            .iter()
-            .map(|&language| language.to_owned())
-            .collect(),
         initialization_options: None,
         startup_timeout: Duration::from_millis(10_000),
         request_timeout: Duration::from_millis(10_000),
         output_limit: ByteSize::from_bytes(4_096),
         retry: RetryPolicy::default(),
         restart: RestartPolicy::default(),
+    };
+    ProcessFixture {
+        configuration,
+        languages: languages
+            .iter()
+            .map(|&language| language.to_owned())
+            .collect(),
     }
 }
 
@@ -71,7 +97,7 @@ fn table(script: String, languages: &[&str]) -> EngineConfiguration {
 /// lingering delay after the last response lets the handshake's own
 /// `initialized` notification, and every notification the client sends
 /// between requests, land before the process closes its side.
-pub(crate) fn answers(responses: &[String], languages: &[&str]) -> EngineConfiguration {
+pub(crate) fn answers(responses: &[String], languages: &[&str]) -> ProcessFixture {
     let mut script = format!("printf '%s' '{}", framed(INITIALIZE_BODY));
     for response in responses {
         script.push_str(response);
@@ -83,7 +109,7 @@ pub(crate) fn answers(responses: &[String], languages: &[&str]) -> EngineConfigu
 /// Answers `initialize`, lingers briefly for the same reason [`answers`]
 /// does, then exits without answering anything further: every later
 /// request meets a closed connection.
-pub(crate) fn answers_initialize_then_exits(languages: &[&str]) -> EngineConfiguration {
+pub(crate) fn answers_initialize_then_exits(languages: &[&str]) -> ProcessFixture {
     answers(&[], languages)
 }
 
@@ -94,7 +120,7 @@ pub(crate) fn answers_initialize_then_exits(languages: &[&str]) -> EngineConfigu
 /// forking it as a child, so the pid a test kills is the one actually
 /// holding the pipes; see `rift-lsp`'s own `process_lifecycle.rs` for the
 /// orphaned-child hazard a plain trailing `sleep` carries.
-pub(crate) fn answers_initialize_then_hangs(languages: &[&str]) -> EngineConfiguration {
+pub(crate) fn answers_initialize_then_hangs(languages: &[&str]) -> ProcessFixture {
     table(
         format!(
             "printf '%s' '{}'; exec sleep 999999",
@@ -111,7 +137,7 @@ pub(crate) fn dies_once_then_answers(
     marker: &Path,
     responses: &[String],
     languages: &[&str],
-) -> EngineConfiguration {
+) -> ProcessFixture {
     let mut served = format!("printf '%s' '{}", framed(INITIALIZE_BODY));
     for response in responses {
         served.push_str(response);
@@ -129,10 +155,7 @@ pub(crate) fn dies_once_then_answers(
 /// `configuration` with its retry budget narrowed to `attempts`, delayed by
 /// one millisecond so the suite spends no time on the wait; the shape of
 /// the growing wait is proven by the policy's own unit tests.
-pub(crate) fn retrying(
-    mut configuration: EngineConfiguration,
-    attempts: u64,
-) -> EngineConfiguration {
+pub(crate) fn retrying(mut configuration: ProcessFixture, attempts: u64) -> ProcessFixture {
     configuration.retry = RetryPolicy {
         attempts,
         delay: Duration::from_millis(1),
@@ -143,19 +166,17 @@ pub(crate) fn retrying(
 
 /// A launch resolving a program no `PATH` entry can ever find: every start
 /// fails before a process exists.
-pub(crate) fn absent_program(languages: &[&str]) -> EngineConfiguration {
+pub(crate) fn absent_program(languages: &[&str]) -> ProcessFixture {
     let mut absent = table(String::new(), languages);
-    "rift_absent_engine".clone_into(&mut absent.program);
-    absent.arguments = Vec::new();
+    absent.command = CommandInput::Program("rift_absent_engine".to_owned());
     absent
 }
 
 /// A launch naming an absolute executable path: refused before any process
 /// exists, and refused the same way every time.
-pub(crate) fn absolute_program(languages: &[&str]) -> EngineConfiguration {
+pub(crate) fn absolute_program(languages: &[&str]) -> ProcessFixture {
     let mut absolute = table(String::new(), languages);
-    "/usr/bin/rift_absent_engine".clone_into(&mut absolute.program);
-    absolute.arguments = Vec::new();
+    absolute.command = CommandInput::Program("/usr/bin/rift_absent_engine".to_owned());
     absolute
 }
 
@@ -167,7 +188,7 @@ pub(crate) fn gated_then_answers(
     gate: &Path,
     responses: &[String],
     languages: &[&str],
-) -> EngineConfiguration {
+) -> ProcessFixture {
     let mut served = format!("printf '%s' '{}", framed(INITIALIZE_BODY));
     for response in responses {
         served.push_str(response);

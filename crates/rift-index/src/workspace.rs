@@ -14,9 +14,9 @@ use rift_core::constants::{
     WORKSPACE_FILES_MAX_DEFAULT, WORKSPACE_IGNORED_DIRECTORIES,
 };
 use rift_core::{
-    CompositionId, Error, ErrorCode, ErrorContext, ErrorName, Fault, PortableSymbolFacts,
-    ProjectPath, ProviderId, SourceVisibility, SymbolId, TextFileInclusion, fault_label,
-    symbol_identity,
+    CompositionId, Error, ErrorCode, ErrorContext, ErrorName, Fault, LanguageFileSelections,
+    PortableSymbolFacts, ProjectPath, ProviderId, SourceVisibility, SymbolId, TextFileInclusion,
+    fault_label, symbol_identity,
 };
 use rift_provider::{
     AssembledSymbol, Component, CompositionBuilder, NormalizedGraph, ProviderComposition,
@@ -30,6 +30,7 @@ use sha2::{Digest as _, Sha256};
 use crate::change_set::{FileDigest, PathChanges, WorkspaceDigests};
 use crate::chunk::text_chunks;
 use crate::glob::PathMatcher;
+use crate::language::{ClassifiedPath, LanguagePolicyError, WorkspaceLanguagePolicy};
 use crate::lexical::{LexicalUnit, LexicalUnitKind};
 use crate::semantic::WorkspaceSemantics;
 
@@ -160,6 +161,10 @@ pub enum WorkspaceIndexViolation {
     ResultLimit,
     /// A `source.include` or `source.exclude` entry is not a valid glob.
     SourcePatternInvalid,
+    /// An unshipped language has no nonempty include list.
+    LanguageIncludeRequired,
+    /// One visible path matches two language entries.
+    LanguageMatchConflict,
     /// The workspace's version-control repository could not serve the tree.
     History,
 }
@@ -206,7 +211,9 @@ impl Fault for WorkspaceIndexFault {
             WorkspaceIndexViolation::ZeroLimit
             | WorkspaceIndexViolation::InvalidRoot
             | WorkspaceIndexViolation::Composition
-            | WorkspaceIndexViolation::SourcePatternInvalid => {
+            | WorkspaceIndexViolation::SourcePatternInvalid
+            | WorkspaceIndexViolation::LanguageIncludeRequired
+            | WorkspaceIndexViolation::LanguageMatchConflict => {
                 ErrorName::Wire(ErrorCode::ConfigurationInvalid)
             }
             WorkspaceIndexViolation::TooDeep
@@ -242,6 +249,18 @@ impl Fault for WorkspaceIndexFault {
         }
         if let Some(error) = self.history_source() {
             context.extend(error.context());
+        }
+        if let Some(error) = self
+            .source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<LanguagePolicyError>())
+        {
+            context.extend(
+                error
+                    .evidence()
+                    .into_iter()
+                    .map(|(key, value)| ErrorContext::new(key, value)),
+            );
         }
         context
     }
@@ -459,6 +478,7 @@ pub struct WorkspaceSourcePolicy {
     watched_root: PathBuf,
     matcher: PathMatcher,
     gitignore: Option<GitignoreChain>,
+    language: WorkspaceLanguagePolicy,
 }
 
 /// Separates one path from its content digest in workspace identity material.
@@ -529,11 +549,34 @@ impl WorkspaceSourcePolicy {
         root: &Path,
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
-        _text_inclusion: &TextFileInclusion,
+        text_inclusion: &TextFileInclusion,
+    ) -> Result<Self, WorkspaceIndexError> {
+        Self::build_with_languages(
+            root,
+            limits,
+            visibility,
+            text_inclusion,
+            &LanguageFileSelections::default(),
+        )
+    }
+
+    /// Compiles path policy with configured language entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] for invalid roots, patterns, ignore files,
+    /// or configured-bound failures.
+    pub fn build_with_languages(
+        root: &Path,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+        text_inclusion: &TextFileInclusion,
+        languages: &LanguageFileSelections,
     ) -> Result<Self, WorkspaceIndexError> {
         let watched_root = root.to_path_buf();
         let root = canonical_root(root)?;
         let matcher = PathMatcher::build(&root, visibility.include(), visibility.exclude())?;
+        let language = WorkspaceLanguagePolicy::build(&root, languages, text_inclusion)?;
         let gitignore = visibility
             .respect_gitignore()
             .then(|| GitignoreChain::build(&root, limits))
@@ -543,6 +586,7 @@ impl WorkspaceSourcePolicy {
             watched_root,
             matcher,
             gitignore,
+            language,
         })
     }
 
@@ -565,6 +609,34 @@ impl WorkspaceSourcePolicy {
             return false;
         };
         self.visible_normalized(path.as_ref())
+            && self
+                .language
+                .classifies(path.as_ref())
+                .map_or(true, |selection| selection.is_some())
+    }
+
+    /// Effective language entry matching one path after visibility accepts it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] when two language entries match.
+    pub fn language_for_path(
+        &self,
+        path: &Path,
+    ) -> Result<Option<&crate::EffectiveLanguage>, WorkspaceIndexError> {
+        let Some(path) = self.normalized_path(path) else {
+            return Ok(None);
+        };
+        if !self.visible_normalized(path.as_ref()) {
+            return Ok(None);
+        }
+        self.language.language_for_path(path.as_ref())
+    }
+
+    /// Effective language entries and text selection used by this policy.
+    #[must_use]
+    pub const fn language_policy(&self) -> &WorkspaceLanguagePolicy {
+        &self.language
     }
 
     /// Carries the checks [`Self::visible`] and [`Self::includes`] share, against a path
@@ -691,6 +763,7 @@ pub struct WorkspaceIndex {
     text_files: BTreeMap<ProjectPath, Arc<TextSourceFile>>,
     composition: ProviderComposition,
     limits: WorkspaceIndexLimits,
+    language: Arc<WorkspaceLanguagePolicy>,
     text_inclusion: TextFileInclusion,
     fingerprint: WorkspaceFingerprint,
     semantics: WorkspaceSemantics,
@@ -714,18 +787,47 @@ impl WorkspaceIndex {
         visibility: &SourceVisibility,
         text_inclusion: &TextFileInclusion,
     ) -> Result<Self, WorkspaceIndexError> {
+        Self::build_with_languages(
+            root,
+            limits,
+            visibility,
+            text_inclusion,
+            &LanguageFileSelections::default(),
+        )
+    }
+
+    /// Scans visible regular files using configured language entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] for invalid configuration, I/O, syntax,
+    /// or exceeded workspace bounds.
+    pub fn build_with_languages(
+        root: &Path,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+        text_inclusion: &TextFileInclusion,
+        languages: &LanguageFileSelections,
+    ) -> Result<Self, WorkspaceIndexError> {
         let root = canonical_root(root)?;
         let composition = composition()?;
-        let classified = discover(&root, limits, visibility)?;
+        let language = Arc::new(WorkspaceLanguagePolicy::build(
+            &root,
+            languages,
+            text_inclusion,
+        )?);
+        let classified = discover(&root, limits, visibility, &language)?;
         let mut workspace_bytes = 0_usize;
         let mut warnings = Vec::new();
         let mut files = BTreeMap::new();
         let mut text_files = BTreeMap::new();
         for path in classified.source {
+            let Some(ClassifiedPath::Source(provider)) = language.classifies(&path)? else {
+                continue;
+            };
             match read_catalog_file(&root, &path, limits, &mut workspace_bytes)? {
                 CatalogRead::Included(text_file) => {
-                    let file =
-                        indexed_file_from_catalog(&text_file, &path, syntax_provider_for(&path))?;
+                    let file = indexed_file_from_catalog(&text_file, &path, provider)?;
                     files.insert(file.path().clone(), Arc::new(file));
                     text_files.insert(text_file.path().clone(), Arc::new(text_file));
                 }
@@ -754,6 +856,7 @@ impl WorkspaceIndex {
             text_files,
             composition,
             limits,
+            language,
             text_inclusion: text_inclusion.clone(),
             fingerprint,
             semantics,
@@ -816,6 +919,7 @@ impl WorkspaceIndex {
             text_files,
             composition: composition()?,
             limits: self.limits,
+            language: Arc::clone(&self.language),
             text_inclusion: self.text_inclusion.clone(),
             fingerprint,
             semantics,
@@ -833,18 +937,16 @@ impl WorkspaceIndex {
         warnings: &mut Vec<WorkspaceIndexWarning>,
     ) -> Result<(), WorkspaceIndexError> {
         let absolute = self.root.join(path.as_str());
-        let class = classify_path(&absolute);
         if !absolute.is_file() {
             return Ok(());
         }
+        let Some(class) = self.language.classifies(&absolute)? else {
+            return Ok(());
+        };
         match read_catalog_file(&self.root, &absolute, self.limits, workspace_bytes)? {
             CatalogRead::Included(text_file) => {
-                if class == PathClass::Source {
-                    let indexed_file = indexed_file_from_catalog(
-                        &text_file,
-                        &absolute,
-                        syntax_provider_for(&absolute),
-                    )?;
+                if let ClassifiedPath::Source(provider) = class {
+                    let indexed_file = indexed_file_from_catalog(&text_file, &absolute, provider)?;
                     files.insert(indexed_file.path().clone(), Arc::new(indexed_file));
                 }
                 text_files.insert(text_file.path().clone(), Arc::new(text_file));
@@ -878,6 +980,7 @@ impl WorkspaceIndex {
         text_files: Vec<TextSourceFile>,
         composition: ProviderComposition,
         limits: WorkspaceIndexLimits,
+        language: Arc<WorkspaceLanguagePolicy>,
         text_inclusion: TextFileInclusion,
     ) -> Result<Self, WorkspaceIndexError> {
         let files = keyed_by_path(files, IndexedFile::path);
@@ -895,6 +998,7 @@ impl WorkspaceIndex {
             text_files,
             composition,
             limits,
+            language,
             text_inclusion,
             fingerprint,
             semantics,
@@ -906,6 +1010,12 @@ impl WorkspaceIndex {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Effective language path policy used by this publication.
+    #[must_use]
+    pub fn language_policy(&self) -> &WorkspaceLanguagePolicy {
+        &self.language
     }
 
     /// Returns the indexed source files in project-path order.
@@ -1295,6 +1405,7 @@ impl WorkspaceIndex {
             text_files,
             self.composition.clone(),
             self.limits,
+            Arc::clone(&self.language),
             self.text_inclusion.clone(),
         )
     }
@@ -1433,6 +1544,7 @@ fn provider_error(source: impl std::error::Error + Send + Sync + 'static) -> Wor
 }
 
 /// Whether a visible path receives provider syntax facts or baseline text only.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PathClass {
     /// Parsed for symbols by a syntax provider.
@@ -1450,6 +1562,7 @@ struct DiscoveredPaths {
 
 /// Classifies every regular file for the baseline catalog. A provider-declared
 /// extension adds syntax facts without removing file content from the catalog.
+#[cfg(test)]
 fn classify_path(path: &Path) -> PathClass {
     if has_source_extension(path) {
         PathClass::Source
@@ -1471,6 +1584,7 @@ fn discover(
     root: &Path,
     limits: WorkspaceIndexLimits,
     visibility: &SourceVisibility,
+    language: &WorkspaceLanguagePolicy,
 ) -> Result<DiscoveredPaths, WorkspaceIndexError> {
     let matcher = PathMatcher::build(root, visibility.include(), visibility.exclude())?;
     let gitignore = GitignorePolicy::from_respecting(visibility.respect_gitignore());
@@ -1491,17 +1605,19 @@ fn discover(
             continue;
         }
         let path = entry.path();
-        let class = classify_path(path);
         if !matcher.includes(path) {
             continue;
         }
+        let Some(class) = language.classifies(path)? else {
+            continue;
+        };
         let total = discovered.source.len() + discovered.text.len();
         if total >= limits.files_max {
             return Err(index_error_at(WorkspaceIndexViolation::TooManyFiles, path));
         }
         match class {
-            PathClass::Source => discovered.source.push(path.to_path_buf()),
-            PathClass::Text => discovered.text.push(path.to_path_buf()),
+            ClassifiedPath::Source(_) => discovered.source.push(path.to_path_buf()),
+            ClassifiedPath::Text => discovered.text.push(path.to_path_buf()),
         }
     }
     discovered.source.sort();
@@ -1604,7 +1720,6 @@ fn capture_paths(
         root,
         &paths.source,
         limits,
-        PathClass::Source,
     )?;
     capture_path_class(
         &mut digests,
@@ -1612,7 +1727,6 @@ fn capture_paths(
         root,
         &paths.text,
         limits,
-        PathClass::Text,
     )?;
     Ok(WorkspaceDigests::new(digests))
 }
@@ -1632,8 +1746,31 @@ pub fn capture_digests(
     limits: WorkspaceIndexLimits,
     visibility: &SourceVisibility,
 ) -> Result<WorkspaceDigests, WorkspaceIndexError> {
+    capture_digests_with_languages(
+        root,
+        limits,
+        visibility,
+        &TextFileInclusion::default(),
+        &LanguageFileSelections::default(),
+    )
+}
+
+/// Reads one effective language and text selection's digests below `root`.
+///
+/// # Errors
+///
+/// Returns [`WorkspaceIndexError`] for configuration, discovery, read, or
+/// configured-bound failures.
+pub fn capture_digests_with_languages(
+    root: &Path,
+    limits: WorkspaceIndexLimits,
+    visibility: &SourceVisibility,
+    text_inclusion: &TextFileInclusion,
+    languages: &LanguageFileSelections,
+) -> Result<WorkspaceDigests, WorkspaceIndexError> {
     let root = canonical_root(root)?;
-    let classified = discover(&root, limits, visibility)?;
+    let language = WorkspaceLanguagePolicy::build(&root, languages, text_inclusion)?;
+    let classified = discover(&root, limits, visibility, &language)?;
     capture_paths(&root, &classified, limits)
 }
 
@@ -1644,7 +1781,6 @@ fn capture_path_class(
     root: &Path,
     paths: &[PathBuf],
     limits: WorkspaceIndexLimits,
-    _class: PathClass,
 ) -> Result<(), WorkspaceIndexError> {
     for path in paths {
         let mut handle = fs::File::open(path).map_err(|error| {
@@ -2702,9 +2838,10 @@ mod tests {
         assert!(!policy.includes(&directory.path().join("src/generated/code.rs")));
         assert!(!policy.includes(&directory.path().join("target/code.rs")));
         assert!(
-            policy.includes(&directory.path().join("src/logo.png")),
+            policy.visible(&directory.path().join("src/logo.png")),
             "visibility does not depend on a file extension"
         );
+        assert!(!policy.includes(&directory.path().join("src/logo.png")));
         assert!(!policy.includes(Path::new("outside.rs")));
         assert!(policy.may_include_descendant(&directory.path().join("src")));
         assert!(!policy.may_include_descendant(&directory.path().join("examples")));
@@ -2747,9 +2884,10 @@ mod tests {
             "[source] exclude must hide a text candidate exactly as it would a source one"
         );
         assert!(
-            policy.includes(&directory.path().join("logo.png")),
+            policy.visible(&directory.path().join("logo.png")),
             "visibility does not depend on a file extension"
         );
+        assert!(!policy.includes(&directory.path().join("logo.png")));
     }
 
     #[test]
@@ -2782,21 +2920,22 @@ mod tests {
             "a tracked extensionless file is visible - patch reaches it"
         );
         assert!(
-            policy.includes(&directory.path().join("justfile")),
-            "an extensionless file with no NUL byte joins the text lane by default"
+            !policy.includes(&directory.path().join("justfile")),
+            "an extensionless file needs an explicit text pattern"
         );
         assert!(
             policy.visible(&directory.path().join("notes.ini")),
             "a tracked file no provider or text policy claims is still visible"
         );
         assert!(
-            policy.includes(&directory.path().join("notes.ini")),
-            "a visible file joins the baseline catalog without an extension gate"
+            !policy.includes(&directory.path().join("notes.ini")),
+            "a visible file joins lexical search only through the text pattern"
         );
         assert!(
             policy.visible(&directory.path().join("guide.mdx")),
             "a tracked file no syntax provider parses is visible"
         );
+        assert!(policy.includes(&directory.path().join("guide.mdx")));
         assert!(
             !policy.visible(&directory.path().join("target/build.log")),
             "the hard floor refuses visibility below it, the same as inclusion"
@@ -3896,10 +4035,7 @@ mod tests {
             .text_files()
             .map(|file| file.path().as_str())
             .collect();
-        assert_eq!(
-            text_paths,
-            [".gitignore", "docs/guide.md", "docs/notes.mdx"]
-        );
+        assert_eq!(text_paths, ["docs/guide.md", "docs/notes.mdx"]);
         let source_paths: Vec<&str> = index.files().map(|file| file.path().as_str()).collect();
         assert_eq!(source_paths, ["docs/guide.md"]);
     }
@@ -4023,8 +4159,7 @@ mod tests {
     #[test]
     fn test_build_skips_visible_utf8_file_containing_nul_byte() {
         let directory = tempfile::tempdir().expect("temporary workspace");
-        fs::write(directory.path().join("artifact.unknown"), b"note\0payload")
-            .expect("binary fixture");
+        fs::write(directory.path().join("artifact.txt"), b"note\0payload").expect("binary fixture");
         let index = WorkspaceIndex::build(
             directory.path(),
             WorkspaceIndexLimits::default(),
@@ -4032,7 +4167,7 @@ mod tests {
             &TextFileInclusion::default(),
         )
         .expect("binary file must not fail catalog build");
-        let path = ProjectPath::new("artifact.unknown").expect("fixture path");
+        let path = ProjectPath::new("artifact.txt").expect("fixture path");
         assert!(index.text_file(&path).is_none());
         assert_eq!(
             index.warnings(),
@@ -4084,8 +4219,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = tempfile::tempdir().expect("workspace");
-        let path = directory.path().join("script");
-        let project_path = ProjectPath::new("script").expect("path");
+        let path = directory.path().join("script.txt");
+        let project_path = ProjectPath::new("script.txt").expect("path");
         fs::write(&path, "run\n").expect("script");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("permissions");
         let index = indexed(directory.path(), &TextFileInclusion::default());

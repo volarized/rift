@@ -81,6 +81,10 @@ fn fixture_runs_installed_language_server_directly() {
         "node_modules/.bin/typescript-language-server"
     );
     assert_eq!(fixture.arguments, ["--stdio"]);
+    assert_eq!(
+        fixture.extra_toml,
+        "\n[lsp.typescript.initialization_options.tsserver]\nuseSyntaxServer = \"never\"\n"
+    );
 }
 
 #[test]

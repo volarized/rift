@@ -14,20 +14,20 @@ use rift_core::ProjectPath;
 use rift_core::constants::{
     VCS_IGNORE_FILE, WORKSPACE_CONFIGURATION_FILE, WORKSPACE_IGNORED_DIRECTORIES,
 };
-use rift_core::{SourceVisibility, TextFileInclusion};
+use rift_core::{LanguageFileSelections, SourceVisibility, TextFileInclusion};
 use rift_index::{
     ChangeSet, FileDigest, LexicalChange, LexicalUnit, PathChanges, WorkspaceFingerprint,
     WorkspaceIndexLimits, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::{
-    EngineConfiguration, HistoryConfiguration, LogsConfiguration, SearchConfiguration,
-    ServerConfiguration, WorkspaceConfiguration,
+    HistoryConfiguration, LanguageLspConfiguration, LogsConfiguration, LspConfiguration,
+    SearchConfiguration, ServerConfiguration, WorkspaceConfiguration,
 };
 use rift_protocol::error as wire;
 use rift_search::{Embedding, SearchError, SearchIndex};
 use rift_server::{
-    CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, ReadError, ReadFault, ReadService,
-    load_configuration,
+    CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, LspProcessKey, ReadError, ReadFault,
+    ReadService, load_configuration,
 };
 use rmcp::ErrorData;
 use sha2::{Digest as _, Sha256};
@@ -52,9 +52,10 @@ pub(crate) const INDEX_CAPTURE_ATTEMPTS_MAX: usize = 3;
 ///
 /// A watcher event and a change tool both name paths, so an ordinary rebuild reads only
 /// what moved. An observation that names no trustworthy path set - a watch failure, a
-/// `.gitignore` or `rift.toml` write, a directory appearing or disappearing, or more
-/// retained paths than the workspace's own file bound allows - asks for the whole
-/// workspace instead, and no later path narrows that back down.
+/// `.gitignore` write, a directory appearing or disappearing, or more retained paths than
+/// the workspace's own file bound allows - asks for the whole workspace instead, and no
+/// later path narrows that back down. A `rift.toml` write keeps its exact path so acceptance
+/// can decide whether index-owned configuration changed.
 #[derive(Debug, Default)]
 pub(crate) struct PendingWork {
     paths: BTreeSet<ProjectPath>,
@@ -143,19 +144,26 @@ impl RebuildRequest {
 
     /// Resolves this observation into the change set the candidate builds from.
     ///
-    /// A publication accepted under other configuration bytes cannot lend its files: the
-    /// `[source]` policy that selected them may itself have changed, so that rebuild reads
-    /// the whole workspace. A path whose bytes cannot be read for any reason other than
-    /// its absence does the same, because a whole scan is what decides whether that path
-    /// is a refusal or a removal.
+    /// Changed source, language, or text-search configuration reads the whole workspace.
+    /// Other accepted configuration carries forward the same source files under an empty
+    /// incremental change. A path whose bytes cannot be read for any reason other than its
+    /// absence asks for a whole scan, because that scan decides whether the path is a
+    /// refusal or a removal.
     fn change_set(&self, root: &Path, configuration: &ConfigurationState) -> ChangeSet {
         let Some(previous) = self.previous.as_ref() else {
             return ChangeSet::Full;
         };
-        if self.work.whole_workspace
-            || previous.configuration.fingerprint != configuration.fingerprint
-        {
+        if self.work.whole_workspace {
             return ChangeSet::Full;
+        }
+        if previous.configuration.fingerprint != configuration.fingerprint {
+            if previous
+                .configuration
+                .index_configuration_differs(configuration)
+            {
+                return ChangeSet::Full;
+            }
+            return ChangeSet::Incremental(PathChanges::default());
         }
         let Some(observed) = observed_digests(root, &self.work.paths, &previous.source_policy)
         else {
@@ -366,6 +374,21 @@ impl ConfigurationState {
         )
     }
 
+    /// Effective language file entries from the last acceptance.
+    pub(crate) fn language_file_selections(&self) -> LanguageFileSelections {
+        self.accepted.as_ref().map_or_else(
+            |_| LanguageFileSelections::default(),
+            LanguageFileSelections::from,
+        )
+    }
+
+    /// Whether index-owned configuration differs from another acceptance.
+    fn index_configuration_differs(&self, other: &Self) -> bool {
+        self.source_visibility() != other.source_visibility()
+            || self.text_inclusion() != other.text_inclusion()
+            || self.language_file_selections() != other.language_file_selections()
+    }
+
     /// The `[providers.history]` table from the last acceptance, or the
     /// default table while `rift.toml` is invalid.
     pub(crate) fn history_configuration(&self) -> HistoryConfiguration {
@@ -395,13 +418,39 @@ impl ConfigurationState {
             .unwrap_or_default()
     }
 
-    /// The `[engines]` tables from the last acceptance, or no engines while
-    /// `rift.toml` is invalid.
-    pub(crate) fn engines_configuration(&self) -> BTreeMap<String, EngineConfiguration> {
-        self.accepted
-            .as_ref()
-            .map(|configuration| configuration.engines.clone())
-            .unwrap_or_default()
+    /// LSP process definitions and exact language bindings from the last acceptance.
+    pub(crate) fn lsp_runtime_configuration(
+        &self,
+    ) -> (
+        BTreeMap<LspProcessKey, LspConfiguration>,
+        BTreeMap<String, LspProcessKey>,
+    ) {
+        let Ok(configuration) = &self.accepted else {
+            return (BTreeMap::new(), BTreeMap::new());
+        };
+        let mut definitions = configuration
+            .lsp
+            .iter()
+            .map(|(name, lsp)| (LspProcessKey::Named(name.clone()), lsp.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut bindings = BTreeMap::new();
+        for (identity, language) in &configuration.languages {
+            let Some(lsp) = &language.lsp else {
+                continue;
+            };
+            let key = match lsp {
+                LanguageLspConfiguration::Named(name) => LspProcessKey::Named(name.clone()),
+                LanguageLspConfiguration::Inline(lsp) => {
+                    let key = LspProcessKey::Inline(identity.clone());
+                    definitions.insert(key.clone(), lsp.clone());
+                    key
+                }
+            };
+            if language.enabled {
+                bindings.insert(identity.clone(), key);
+            }
+        }
+        (definitions, bindings)
     }
 
     /// Whether accepted configuration runs any source-read-only hook.
@@ -424,6 +473,23 @@ pub(crate) enum ConfigurationFingerprint {
     Content([u8; 32]),
     /// File is already invalid by size; its contents cannot change policy.
     Oversized(u64),
+}
+
+impl ConfigurationFingerprint {
+    /// Eight-hex-character resource revision for this file state.
+    pub(crate) fn wire_revision(self) -> String {
+        let bytes = match self {
+            Self::Content(bytes) => bytes,
+            Self::MissingOrUnreadable => Sha256::digest(b"missing").into(),
+            Self::Oversized(length) => Sha256::digest(length.to_be_bytes()).into(),
+        };
+        let mut revision = String::with_capacity(8);
+        for byte in &bytes[..4] {
+            use std::fmt::Write as _;
+            let _ = write!(revision, "{byte:02x}");
+        }
+        revision
+    }
 }
 
 /// The current `rift.toml` file state, or null when the file is absent or
@@ -832,6 +898,12 @@ pub(crate) fn watch_path_impact(
     kind: EventKind,
     path: &Path,
 ) -> WatchImpact {
+    if path == root.join(WORKSPACE_CONFIGURATION_FILE) {
+        return ProjectPath::new(WORKSPACE_CONFIGURATION_FILE.to_owned())
+            .map_or(WatchImpact::WholeWorkspace, |path| {
+                WatchImpact::Paths(vec![path])
+            });
+    }
     let policy_file = validation.decides_inclusion(root, path);
     let directory_event = matches!(
         kind,
@@ -1013,7 +1085,7 @@ pub(crate) fn build_workspace_candidate(
                 .previous
                 .as_ref()
                 .unwrap_or_else(|| unreachable!("an incremental change set names a publication"));
-            shared_workspace_candidate(previous, changes, request.epoch)?
+            shared_workspace_candidate(previous, changes, configuration, request.epoch)?
         }
     };
     if candidate.configuration.fingerprint != configuration_fingerprint(root) {
@@ -1053,11 +1125,13 @@ fn whole_workspace_candidate(
 ) -> Result<PublishedWorkspace, ReadError> {
     let visibility = configuration.source_visibility();
     let text_inclusion = configuration.text_inclusion();
-    let reads = ReadService::build(
+    let languages = configuration.language_file_selections();
+    let reads = ReadService::build_with_languages(
         root,
         limits,
         &visibility,
         &text_inclusion,
+        &languages,
         configuration.history_configuration(),
     )?;
     let source_policy = reads.source_policy_handle().unwrap_or_else(|| {
@@ -1074,20 +1148,19 @@ fn whole_workspace_candidate(
 
 /// Replaces the files `changes` names and shares every other file with `previous`.
 ///
-/// The acceptance and the compiled `[source]` policy carry over unchanged: an incremental
-/// change set is only resolved when `rift.toml` still holds the bytes `previous` was
-/// accepted under, and a `.gitignore` write asks for the whole workspace instead. An empty
-/// change set still produces a candidate, because the observation that resolved to it has
-/// an epoch that current-tree requests are waiting on.
+/// Index-owned configuration and the compiled source policy carry over unchanged. Other
+/// accepted configuration may change without rebuilding source files. An empty change set
+/// still produces a candidate because current-tree requests wait for its observation epoch.
 fn shared_workspace_candidate(
     previous: &PublishedWorkspace,
     changes: &PathChanges,
+    configuration: ConfigurationState,
     epoch: u64,
 ) -> Result<PublishedWorkspace, ReadError> {
     if changes.is_empty() {
         return Ok(PublishedWorkspace {
             reads: Arc::clone(&previous.reads),
-            configuration: previous.configuration.clone(),
+            configuration,
             fingerprint: previous.fingerprint.clone(),
             source_policy: Arc::clone(&previous.source_policy),
             epoch,
@@ -1097,7 +1170,7 @@ fn shared_workspace_candidate(
     Ok(PublishedWorkspace {
         fingerprint: reads.workspace_fingerprint().clone(),
         reads: Arc::new(reads),
-        configuration: previous.configuration.clone(),
+        configuration,
         source_policy: Arc::clone(&previous.source_policy),
         epoch,
     })
@@ -1764,7 +1837,7 @@ mod tests {
     use rift_index::{LexicalIndexLimits, WorkspaceIndexLimits, WorkspaceSourcePolicy};
     use rift_protocol::configuration::ServerConfiguration;
     use rift_search::{RevisionScoped, SearchIndex, SearchIndexLimits, SemanticReadiness};
-    use rift_server::ReadFault;
+    use rift_server::{LspProcessKey, ReadFault};
     use tokio::sync::{Barrier as AsyncBarrier, RwLock};
     use tokio_util::sync::CancellationToken;
 
@@ -1806,31 +1879,36 @@ mod tests {
         let invalid = ConfigurationState::accept(directory.path());
         assert!(invalid.accepted.is_err());
         assert_eq!(invalid.source_visibility(), SourceVisibility::default());
+        let (definitions, bindings) = invalid.lsp_runtime_configuration();
         assert!(
-            invalid.engines_configuration().is_empty(),
-            "an invalid file serves no engines"
+            definitions.is_empty() && bindings.is_empty(),
+            "an invalid file serves no LSP configuration"
         );
 
         fs::write(
             directory.path().join("rift.toml"),
-            "[engines.ty]\nprogram = \"uvx\"\nlanguages = [\"python\"]\n",
+            "[lsp.ty]\ncommand = \"uvx\"\n[languages.python]\ninclude = [\"**/*.py\"]\nlsp = \"ty\"\n",
         )?;
-        let with_engines = ConfigurationState::accept(directory.path());
-        assert!(!with_engines.has_validation_hooks());
-        let engines = with_engines.engines_configuration();
+        let with_lsp = ConfigurationState::accept(directory.path());
+        assert!(!with_lsp.has_validation_hooks());
+        let (definitions, bindings) = with_lsp.lsp_runtime_configuration();
+        let key = LspProcessKey::named("ty");
         assert_eq!(
-            engines.get("ty").map(|engine| engine.program.as_str()),
+            definitions
+                .get(&key)
+                .map(|configuration| configuration.command.program()),
             Some("uvx"),
-            "an accepted [engines] table is served"
+            "an accepted LSP definition is served"
         );
+        assert_eq!(bindings.get("python"), Some(&key));
 
         fs::write(
             directory.path().join("rift.toml"),
-            "[[hooks]]\ntype = \"command\"\nid = \"check\"\nkind = \"build\"\nprogram = \"cargo\"\narguments = [\"check\"]\nchanged_paths = \"none\"\nwrites = \"none\"\nworking_directory = \"\"\nenvironment = {}\ntimeout = \"30s\"\noutput_limit = \"4kb\"\nfailure_severity = \"error\"\nguarantees = []\ndeterminism = \"deterministic\"\n",
+            "[[hooks]]\nid = \"check\"\nkind = \"build\"\ncommand = [\"cargo\", \"check\"]\nchanged_paths = \"none\"\nwrites = \"none\"\nworking_directory = \"\"\nenvironment = {}\ntimeout = \"30s\"\noutput_limit = \"4kb\"\nfailure_severity = \"error\"\nguarantees = []\ndeterminism = \"deterministic\"\n",
         )?;
         assert!(
             ConfigurationState::accept(directory.path()).has_validation_hooks(),
-            "accepted source-read-only hook must invalidate engine state"
+            "accepted source-read-only hook must be reported"
         );
 
         fs::write(
@@ -2482,6 +2560,99 @@ mod tests {
             candidate.reads.tree_revision(),
             "the replaced file changes the tree revision the answer carries"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn non_index_configuration_changes_reuse_the_published_tree() -> TestResult {
+        let configurations = [
+            "[execution]\nmax_code = \"1kb\"\n",
+            "[lsp.rust]\ncommand = \"rust-analyzer\"\n",
+            "[[hooks]]\nid = \"check\"\nkind = \"build\"\ncommand = [\"cargo\", \"check\"]\nchanged_paths = \"none\"\nwrites = \"none\"\nfailure_severity = \"error\"\ndeterminism = \"deterministic\"\n",
+        ];
+        for configuration in configurations {
+            let directory = tempfile::tempdir()?;
+            fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+            let previous = stable_candidate(directory.path(), 0)?;
+            fs::write(directory.path().join("rift.toml"), configuration)?;
+            let request = RebuildRequest {
+                epoch: 1,
+                work: super::PendingWork::naming([rift_core::ProjectPath::new("rift.toml")?]),
+                previous: Some(Arc::clone(&previous)),
+            };
+
+            let WorkspaceCandidate::Stable {
+                published: candidate,
+                change_set,
+            } = build_workspace_candidate(
+                directory.path(),
+                WorkspaceIndexLimits::default(),
+                &request,
+            )?
+            else {
+                return Err("a stable configuration change must build a candidate".into());
+            };
+            assert!(
+                matches!(change_set, ChangeSet::Incremental(ref paths) if paths.is_empty()),
+                "non-index configuration must produce an empty incremental change: {configuration}"
+            );
+            assert!(
+                Arc::ptr_eq(&previous.reads, &candidate.reads),
+                "non-index configuration must reuse the published tree: {configuration}"
+            );
+            assert_eq!(
+                previous.reads.tree_revision(),
+                candidate.reads.tree_revision(),
+                "non-index configuration must retain the tree revision: {configuration}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn index_configuration_changes_rebuild_the_published_tree() -> TestResult {
+        let configurations = [
+            "[source]\nexclude = [\"lib.rs\"]\n",
+            "[languages.rust]\ninclude = []\n",
+            "[search.text]\ninclude = [\"**/*.log\"]\n",
+        ];
+        for configuration in configurations {
+            let directory = tempfile::tempdir()?;
+            fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+            fs::write(directory.path().join("notes.log"), "text marker\n")?;
+            let previous = stable_candidate(directory.path(), 0)?;
+            fs::write(directory.path().join("rift.toml"), configuration)?;
+            let request = RebuildRequest {
+                epoch: 1,
+                work: super::PendingWork::naming([rift_core::ProjectPath::new("rift.toml")?]),
+                previous: Some(Arc::clone(&previous)),
+            };
+
+            let WorkspaceCandidate::Stable {
+                published: candidate,
+                change_set,
+            } = build_workspace_candidate(
+                directory.path(),
+                WorkspaceIndexLimits::default(),
+                &request,
+            )?
+            else {
+                return Err("a stable configuration change must build a candidate".into());
+            };
+            assert!(
+                matches!(change_set, ChangeSet::Full),
+                "index configuration must produce a full change: {configuration}"
+            );
+            assert!(
+                !Arc::ptr_eq(&previous.reads, &candidate.reads),
+                "index configuration must replace the published tree: {configuration}"
+            );
+            assert_ne!(
+                previous.reads.tree_revision(),
+                candidate.reads.tree_revision(),
+                "index configuration must change this fixture's tree revision: {configuration}"
+            );
+        }
         Ok(())
     }
 

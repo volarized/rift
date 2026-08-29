@@ -9,22 +9,22 @@ include = []
 exclude = [".claude/**", ".agents/**", "docs/public/**"]
 respect_gitignore = true
 
-[engines.rust]
-program = "rustup"
-arguments = ["run", "1.98", "rust-analyzer"]
-languages = ["rust"]
+[languages.rust]
+lsp = "rust"
 
-[engines.toml]
-program = "tombi"
-arguments = ["lsp"]
-languages = ["toml"]
+[languages.toml]
+lsp = "toml"
+
+[lsp.rust]
+command = ["rustup", "run", "1.98", "rust-analyzer"]
+
+[lsp.toml]
+command = ["tombi", "lsp"]
 
 [[hooks]]
-type = "command"
 id = "format"
 kind = "format"
-program = "cargo"
-arguments = ["fmt", "--all"]
+command = ["cargo", "fmt", "--all"]
 changed_paths = "none"
 writes = "workspace"
 working_directory = ""
@@ -36,11 +36,9 @@ guarantees = []
 determinism = "deterministic"
 
 [[hooks]]
-type = "command"
 id = "check"
 kind = "build"
-program = "just"
-arguments = ["check"]
+command = ["just", "check"]
 changed_paths = "none"
 writes = "none"
 working_directory = ""

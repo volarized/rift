@@ -1,4 +1,4 @@
-//! The rust-analyzer probe and the real `[engines.rust]` table.
+//! Rust-analyzer probe and real Rust language LSP configuration.
 
 use std::path::Path;
 
@@ -46,13 +46,13 @@ pub(crate) fn require_rust_analyzer(fixture_root: &Path) {
     }
 }
 
-/// The real `[engines.rust]` table, built from [`fixture`].
+/// Real Rust language LSP configuration, built from [`fixture`].
 pub(crate) fn rust_engine_configuration() -> String {
     fixture().configuration_toml()
 }
 
-/// The fixture data the shared harness turns into the `[engines.rust]`
-/// table: rust-analyzer 1.98 over the fixture's cargo project.
+/// Fixture data the shared harness turns into a Rust language binding and
+/// rust-analyzer 1.98 process over the fixture's cargo project.
 ///
 /// rust-analyzer answers initialize before it has loaded the project and
 /// keeps indexing afterwards, so the bounds are generous - and still
@@ -68,6 +68,6 @@ pub(crate) fn fixture() -> EngineFixture {
         program: RUSTUP_PROGRAM,
         arguments: RUST_ANALYZER_ARGUMENTS.to_vec(),
         languages: vec!["rust"],
-        extra_toml: "\n[engines.rust.retry]\nattempts = 16\n".to_owned(),
+        extra_toml: "\n[lsp.rust.retry]\nattempts = 16\n".to_owned(),
     }
 }

@@ -1,0 +1,389 @@
+//! Effective language and plain-text path selection.
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+use rift_core::{LanguageFileSelection, LanguageFileSelections, TextFileInclusion};
+use rift_syntax::{SyntaxProvider, registry};
+
+use crate::PathMatcher;
+use crate::workspace::{WorkspaceIndexError, WorkspaceIndexViolation, index_error_caused_by};
+
+/// One accepted language entry with expanded path patterns.
+#[derive(Debug)]
+pub struct EffectiveLanguage {
+    identity: String,
+    enabled: bool,
+    include: Vec<String>,
+    exclude: Vec<String>,
+    provider: Option<&'static dyn SyntaxProvider>,
+    matcher: Option<PathMatcher>,
+}
+
+impl EffectiveLanguage {
+    /// Exact language identity.
+    #[must_use]
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    /// Whether matched paths receive language service.
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Effective include patterns after shipped defaults expand.
+    #[must_use]
+    pub fn include(&self) -> &[String] {
+        &self.include
+    }
+
+    /// Effective exclude patterns.
+    #[must_use]
+    pub fn exclude(&self) -> &[String] {
+        &self.exclude
+    }
+
+    /// Whether this build ships syntax analysis for the language.
+    #[must_use]
+    pub const fn has_syntax(&self) -> bool {
+        self.provider.is_some()
+    }
+
+    /// Shipped syntax provider, when this build serves one.
+    #[must_use]
+    pub fn syntax_provider(&self) -> Option<&'static dyn SyntaxProvider> {
+        self.provider
+    }
+
+    fn matches(&self, path: &Path) -> bool {
+        self.matcher
+            .as_ref()
+            .is_some_and(|matcher| matcher.includes(path))
+    }
+}
+
+/// Effective language and plain-text path selection.
+#[derive(Debug)]
+pub struct WorkspaceLanguagePolicy {
+    root: PathBuf,
+    languages: Vec<EffectiveLanguage>,
+    text: Option<PathMatcher>,
+}
+
+impl WorkspaceLanguagePolicy {
+    /// Expands shipped defaults and compiles every configured pattern.
+    ///
+    /// # Errors
+    ///
+    /// Returns `WorkspaceIndexError` for invalid patterns or an unshipped
+    /// language without a nonempty include list.
+    pub fn build(
+        root: &Path,
+        selections: &LanguageFileSelections,
+        text: &TextFileInclusion,
+    ) -> Result<Self, WorkspaceIndexError> {
+        let mut languages = Vec::new();
+        let mut shipped = BTreeSet::new();
+        for provider in registry::providers() {
+            let identity = provider.language().identity_segment();
+            shipped.insert(identity.clone());
+            let configured = selections
+                .entries()
+                .iter()
+                .find(|selection| selection.identity() == identity);
+            let enabled = configured.is_none_or(LanguageFileSelection::enabled);
+            let include = configured
+                .and_then(LanguageFileSelection::include)
+                .map_or_else(
+                    || {
+                        provider
+                            .extensions()
+                            .iter()
+                            .map(|extension| format!("**/*.{extension}"))
+                            .collect()
+                    },
+                    <[String]>::to_vec,
+                );
+            let exclude = configured
+                .map(LanguageFileSelection::exclude)
+                .map_or_else(Vec::new, <[String]>::to_vec);
+            languages.push(Self::entry(
+                root,
+                identity,
+                enabled,
+                include,
+                exclude,
+                Some(provider),
+            )?);
+        }
+        for selection in selections.entries() {
+            if shipped.contains(selection.identity()) {
+                continue;
+            }
+            let include = selection
+                .include()
+                .filter(|include| !include.is_empty())
+                .ok_or_else(|| {
+                    index_error_caused_by(
+                        WorkspaceIndexViolation::LanguageIncludeRequired,
+                        None,
+                        LanguagePolicyError::IncludeRequired {
+                            language: selection.identity().to_owned(),
+                        },
+                    )
+                })?
+                .to_vec();
+            languages.push(Self::entry(
+                root,
+                selection.identity().to_owned(),
+                selection.enabled(),
+                include,
+                selection.exclude().to_vec(),
+                None,
+            )?);
+        }
+        languages.sort_by(|left, right| left.identity.cmp(&right.identity));
+        let text = (!text.include().is_empty())
+            .then(|| PathMatcher::build(root, text.include(), &[]))
+            .transpose()?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            languages,
+            text,
+        })
+    }
+
+    fn entry(
+        root: &Path,
+        identity: String,
+        enabled: bool,
+        include: Vec<String>,
+        exclude: Vec<String>,
+        provider: Option<&'static dyn SyntaxProvider>,
+    ) -> Result<EffectiveLanguage, WorkspaceIndexError> {
+        let matcher = (!include.is_empty())
+            .then(|| PathMatcher::build(root, &include, &exclude))
+            .transpose()?;
+        Ok(EffectiveLanguage {
+            identity,
+            enabled,
+            include,
+            exclude,
+            provider,
+            matcher,
+        })
+    }
+
+    /// Effective entries in exact identity order.
+    #[must_use]
+    pub fn languages(&self) -> &[EffectiveLanguage] {
+        &self.languages
+    }
+
+    /// Selects one exact language for a path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `WorkspaceIndexError` when two language entries match.
+    pub fn language_for_path(
+        &self,
+        path: &Path,
+    ) -> Result<Option<&EffectiveLanguage>, WorkspaceIndexError> {
+        let path = self.absolute(path);
+        let mut matched = self
+            .languages
+            .iter()
+            .filter(|language| language.matches(&path));
+        let first = matched.next();
+        if let (Some(first), Some(second)) = (first, matched.next()) {
+            return Err(index_error_caused_by(
+                WorkspaceIndexViolation::LanguageMatchConflict,
+                Some(&path),
+                LanguagePolicyError::MatchConflict {
+                    first: first.identity.clone(),
+                    second: second.identity.clone(),
+                },
+            ));
+        }
+        Ok(first)
+    }
+
+    pub(crate) fn classifies(
+        &self,
+        path: &Path,
+    ) -> Result<Option<ClassifiedPath>, WorkspaceIndexError> {
+        let path = self.absolute(path);
+        if let Some(language) = self.language_for_path(&path)? {
+            return Ok(match (language.enabled, language.provider) {
+                (true, Some(provider)) => Some(ClassifiedPath::Source(provider)),
+                _ => None,
+            });
+        }
+        Ok(self
+            .text
+            .as_ref()
+            .is_some_and(|matcher| matcher.includes(&path))
+            .then_some(ClassifiedPath::Text))
+    }
+
+    fn absolute(&self, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root.join(path)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ClassifiedPath {
+    Source(&'static dyn SyntaxProvider),
+    Text,
+}
+
+#[derive(Debug)]
+pub(crate) enum LanguagePolicyError {
+    IncludeRequired { language: String },
+    MatchConflict { first: String, second: String },
+}
+
+impl LanguagePolicyError {
+    pub(crate) fn evidence(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::IncludeRequired { language } => vec![("language", language.clone())],
+            Self::MatchConflict { first, second } => {
+                vec![("first", first.clone()), ("second", second.clone())]
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for LanguagePolicyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IncludeRequired { language } => write!(
+                formatter,
+                "unshipped language {language:?} requires a nonempty include list"
+            ),
+            Self::MatchConflict { first, second } => write!(
+                formatter,
+                "one path matches language entries {first:?} and {second:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LanguagePolicyError {}
+
+#[cfg(test)]
+mod tests {
+    use rift_core::LanguageFileSelections;
+    use rift_protocol::configuration::{LanguageConfiguration, WorkspaceConfiguration};
+
+    use super::*;
+
+    fn policy(configuration: &WorkspaceConfiguration) -> WorkspaceLanguagePolicy {
+        WorkspaceLanguagePolicy::build(
+            Path::new("/workspace"),
+            &LanguageFileSelections::from(configuration),
+            &TextFileInclusion::from(&configuration.search),
+        )
+        .expect("language policy")
+    }
+
+    #[test]
+    fn test_shipped_defaults_select_exact_typescript_dialects() {
+        let policy = policy(&WorkspaceConfiguration::default());
+        let typescript = policy
+            .language_for_path(Path::new("src/main.ts"))
+            .expect("selection")
+            .expect("typescript");
+        let tsx = policy
+            .language_for_path(Path::new("src/main.tsx"))
+            .expect("selection")
+            .expect("tsx");
+        assert_eq!(typescript.identity(), "typescript");
+        assert_eq!(tsx.identity(), "typescript:tsx");
+    }
+
+    #[test]
+    fn test_explicit_empty_include_removes_shipped_claim() {
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.languages.insert(
+            "rust".to_owned(),
+            rift_protocol::configuration::LanguageConfiguration {
+                include: Some(Vec::new()),
+                ..Default::default()
+            },
+        );
+        let policy = policy(&configuration);
+        assert!(
+            policy
+                .language_for_path(Path::new("src/lib.rs"))
+                .expect("selection")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_language_claim_wins_over_text_pattern() {
+        let policy = policy(&WorkspaceConfiguration::default());
+        assert!(matches!(
+            policy
+                .classifies(Path::new("README.md"))
+                .expect("selection"),
+            Some(ClassifiedPath::Source(_))
+        ));
+    }
+
+    #[test]
+    fn test_unshipped_language_requires_nonempty_include() {
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration
+            .languages
+            .insert("python".to_owned(), LanguageConfiguration::default());
+        let error = WorkspaceLanguagePolicy::build(
+            Path::new("/workspace"),
+            &LanguageFileSelections::from(&configuration),
+            &TextFileInclusion::from(&configuration.search),
+        )
+        .expect_err("missing include");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::LanguageIncludeRequired
+        );
+    }
+
+    #[test]
+    fn test_overlapping_language_patterns_report_both_entries() {
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.languages.insert(
+            "rust".to_owned(),
+            rift_protocol::configuration::LanguageConfiguration {
+                include: Some(vec![rift_protocol::read::PathPattern("src/**".to_owned())]),
+                ..Default::default()
+            },
+        );
+        configuration.languages.insert(
+            "python".to_owned(),
+            rift_protocol::configuration::LanguageConfiguration {
+                include: Some(vec![rift_protocol::read::PathPattern(
+                    "src/lib.rs".to_owned(),
+                )]),
+                ..Default::default()
+            },
+        );
+        let policy = policy(&configuration);
+        let error = policy
+            .language_for_path(Path::new("src/lib.rs"))
+            .expect_err("conflict");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::LanguageMatchConflict
+        );
+        let message = error.to_string();
+        assert!(message.contains("rust") && message.contains("python"));
+    }
+}
