@@ -26,11 +26,11 @@ The server stores searchable provider output in an embedded index under `.rift`.
 `rift.toml` selects an embedding model, a local model adds vector ranking.
 
 The server also owns edits. Its change tools resolve targets against provider facts and write the
-files. [Hooks](/docs/configuration#hooks) extend this pipeline with configured tools such as
-formatters, linters, and test runners, which check each change after it lands.
+files. [Hooks](/docs/configuration#hooks) extend this pipeline: transforms such as formatters may
+change landed source, then validations such as linters and test runners report on final bytes.
 
 <FlatDiagram
-  alt="An agent talks to rift mcp over stdio, which forwards MCP to one rift server per workspace on a localhost HTTP port named by a lock file; an HTTP-capable agent connects directly. Source resolvers catalog project and dependency source, providers publish Contributions, normalization builds the SymbolRecord graph, and readable Symbols feed an embedded search index. Semantic providers delegate resolution to language engines - an embedded library, a language server, or a SCIP index - which read the targeted tree and answer with facts and edit plans. Hooks check each change. Changes land in the workspace by default; an opt-in projection collects them for publication."
+  alt="An agent talks to rift mcp over stdio, which forwards MCP to one rift server per workspace on a localhost HTTP port named by a lock file; an HTTP-capable agent connects directly. Source resolvers catalog project and dependency source, providers publish Contributions, normalization builds the SymbolRecord graph, and readable Symbols feed an embedded search index. Semantic providers delegate resolution to language engines - an embedded library, a language server, or a SCIP index - which read the targeted tree and answer with facts and edit plans. Transform hooks update landed source before validation hooks check it. Changes land in the workspace by default; an opt-in projection collects them for publication."
   chart={`
     flowchart LR
       agent["agent"]:::agent -- "MCP over stdio" --> mcp["rift mcp"]:::rift
@@ -70,13 +70,21 @@ process the port and token it needs to reach that server. For example:
   "port": 12345,
   "token": "Zk3mQ8xW1vY5uT9rN2bH7cJ4dL6fP0sA8gE5iK2oM7q",
   "pid": 4242,
-  "version": "0.0.11"
+  "identity": {
+    "version": "0.0.24",
+    "executable_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "schema_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
 }
 ```
 
 When no live server stands behind the file, `rift mcp` starts one. An exclusive file lock
 elects one starter if several processes race; the winner binds a port and publishes the file,
 and the rest connect to it.
+
+The proxy adopts that server only when package version, executable SHA-256, and served MCP schema
+SHA-256 match its own identity. A mismatch is stale state, even when the recorded process and port
+are live, so requests never cross between binaries or tool schemas that interpret them differently.
 
 A reader that cannot reach the recorded port treats the file as stale. The election lock
 releases with its holder, so a stale file never has a live server behind it, and the next
@@ -117,9 +125,10 @@ configuration allows you to describe:
 An edit to the file takes effect for later requests once the server accepts it again. An
 invalid file keeps the workspace unusable until you fix it.
 
-The server stops itself once no request arrives for the
-[`idle_timeout`](/docs/configuration#server) span, and `rift server stop` ends it sooner. It
-removes its lock file on the way out, and the next `rift mcp` starts a fresh one. Projections,
+The server stops itself once no request remains active and the
+[`idle_timeout`](/docs/configuration#server) span passes after the last response completes.
+`rift server stop` ends it sooner. The server removes its lock file on the way out, and the next
+`rift mcp` starts a fresh one. Projections,
 changesets, and execution copies live under `.rift` and survive the exit.
 
 `rift server status` reports which of these states the workspace is in - a serving server with
@@ -324,9 +333,10 @@ the read captured, so the caller knows the answer may miss the newest writes.
 />
 
 Each rebuild also derives lexical units for [`search`](/docs/protocol/mcp#tool-search): one per
-indexed symbol, and one per file [`[search.text]`](/docs/configuration#search) includes. The units
-persist in the workspace database at `.rift/db`, stamped with the tree revision that published
-them.
+indexed symbol, and chunks from every visible bounded UTF-8 file without a NUL byte. Syntax
+providers enrich files they recognize; unknown languages and extensionless files still join the
+text catalog. The units persist in the workspace database at `.rift/db`, stamped with the tree
+revision that published them.
 
 Those units are written before the rebuilt index becomes current, in one transaction with the
 stamp. A read that captures a tree therefore finds the database already holding it, and a rebuild
@@ -357,8 +367,8 @@ as a declaration. Facts a semantic provider resolved join the same Symbol only a
 establishes their association, so a richer engine deepens results without changing the tool.
 
 Matching serves two query shapes. An identifier-shaped query - `ReadService`,
-`num_workers` - matches the declaration names it resembles. A prose query - `source
-extensions included` - ranks by [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) term relevance
+`num_workers` - matches the declaration names it resembles. A prose query - `visible source
+included` - ranks by [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) term relevance
 over names, signatures, documentation, and content together.
 
 The server indexes names both as spelled and split into words on case and separator boundaries,
@@ -430,19 +440,39 @@ the witness before splicing, so an address read before the file changed refuses 
 change application per tree, so two agents editing at once collide as one clean refusal rather
 than as interleaved bytes.
 
+Declaration tools resolve provider-published declaration and attachment ranges from the addressed
+Symbol. One planner therefore serves Rust, JavaScript, TypeScript, TSX, Markdown, JSON, YAML, and
+TOML; adding another syntax provider does not add another write path.
+
 A change through MCP - [`replace_symbol`](/docs/protocol/mcp#tool-replace_symbol),
 [`replace_node`](/docs/protocol/mcp#tool-replace_node),
 [`patch`](/docs/protocol/mcp#tool-patch), any of them - is resolved before Rift writes
-anything. If resolution produced no bytes to write, that's a refusal and the tree is untouched:
-the address named nothing, the witness failed. If it produced edits, the change lands, is
-recorded in the tree's changeset, and comes back carrying everything Rift learned about it.
+anything. Empty and byte-equal edit sets refuse as `source_unchanged`; `applied` always means at
+least one path changed bytes. Duplicate paths refuse before publication, and every multi-file
+transaction writes in project-path order. If it produced effective edits, the change lands and
+comes back carrying everything Rift learned about it.
+
+Transform hooks run after direct edits, in configured order. A passing transform may keep source
+writes inside its declared `writes` scope. Rift restores a failed transform, a write outside that
+scope, or any source permission change. It then computes `paths`, `edits`, and change `id` from
+the difference between original tree and final transformed tree. A transform that restores every
+direct difference returns `unchanged`, not `applied`.
+
+Validation hooks run after transforms and may not retain source writes. Their failures attach
+warnings or errors at configured severity, while successful validation claims attach guarantees.
+Neither outcome rolls back final source: validation reports what landed, like an editor check
+after save.
+
+A validation command may replace build artifacts outside visible source even when `writes` is
+`none`. Rift therefore ends existing language-engine sessions after validation and starts fresh
+sessions for post-change diagnostics, so an engine cannot retain paths to removed artifacts.
 
 What rides on the result is the part that changes agent behavior. Each applied change carries:
 
 - its diagnostics - the syntax provider re-parses what changed, and the
   [language engine](#diagnostics-on-a-change) serving a changed path reports what it makes of the
-  new bytes
-- the verdicts of the workspace's [hooks](/docs/configuration#hooks), run inside the changed tree
+  final bytes
+- the verdicts of the workspace's [hooks](/docs/configuration#hooks), run in transform-then-validation order
 - its [`Advisory`](/docs/protocol/reference#Advisory) list: concerns a provider or hook attached
   to exactly this change
 
@@ -599,27 +629,30 @@ A language server answers from the moment it initializes, and answers wrongly un
 loaded the project: rust-analyzer refuses a rename with `No references found at position` for a
 declaration it has not indexed yet. It announces that load over LSP's `$/progress`, and while
 the work is outstanding the server discards what came back and asks the engine again, under that
-engine's [`retry`](/docs/configuration#engines) table. It does the same for a refusal LSP marks
-as re-askable, and it replaces an engine that died mid-request under `restart`. Whatever tool
-asked, nothing below this point sees an answer the engine gave while it was still working.
+engine's [`retry`](/docs/configuration#engines) table. Every engine refusal receives that same
+bounded schedule: a refusal can be the engine's final verdict, or an early answer from an engine
+that has not loaded the declaration yet. If every attempt refuses, Rift returns the latest engine
+words. An engine that died mid-request is replaced under `restart`.
 
-That wait needs something announced to wait on, and the first request of a session can arrive
-before the first announcement does. An engine that has announced nothing and answers nothing
+Progress does not say which request the announced work settles. An engine that answers nothing
 looks exactly like one that has finished and has nothing to report:
-`workspace/willRenameFiles` comes back with no edit, `textDocument/diagnostic` with no item, and
-those are the answers a loaded engine gives for a move with no import to rewrite and for a file
-that is clean. So an engine that has never announced any work is asked once more when it answers
-one of those with nothing, after the same `retry` wait. Once per operation, once per engine
-process: an engine that announces nothing at all - typescript-language-server is one - pays that
-resend on its first such answer and nothing afterwards.
+`workspace/willRenameFiles` comes back with no edit, `textDocument/references` with no location,
+and `textDocument/diagnostic` with no item. Rift therefore asks every empty semantic answer through
+the configured retry schedule, whether progress completed or never appeared. The document remains
+open across those attempts. Each classified workspace change invalidates earlier readiness. The
+retry table, not one remembered answer from an earlier operation, bounds every check.
 
-The second answer is the engine's answer, empty or not. A move whose engine proposed nothing
-twice applies carrying the `rift.move.references_not_updated` warning that [moving a
-file](#move-a-file) describes, and a pull that reported nothing twice contributes nothing, as it
-does for a file that is clean.
+When a move or reference check spends that table, Rift keeps the final empty answer. A move carries
+its operation-specific warning. A reference check is clean when readiness is confirmed; an
+unconfirmed final answer warns or refuses. A diagnostic pull has a stronger rule: a nonempty full
+report can settle after announced work ends, while an empty full report must repeat at the end of
+the retry schedule. A
+`workspace/diagnostic/refresh` request invalidates earlier pull evidence. An answer that still
+changes at the bound is unready, never proof of clean bytes.
 
-When the whole budget is spent, a rename or a move fails `temporarily_unavailable` with the tree
-untouched, so the caller can send the same request again once the engine has loaded.
+When the whole budget is spent while announced work remains outstanding, a rename or a move fails
+`temporarily_unavailable` with the tree untouched, so the caller can send the same request again
+once the engine has loaded.
 
 ### Rename a declaration
 
@@ -661,39 +694,42 @@ the result carries a warning under `rift.move.references_not_updated` saying ref
 updated. Refusing the move instead would trade a gap the caller can see and repair for an error
 it cannot act on.
 
-The same warning names an engine that was asked and proposed nothing twice while it had announced
-no work of its own. A loaded engine that proposes nothing is telling you there is nothing to
-update, and its move carries no warning; one that has never said what it is doing is not, and the
-warning names it so the caller can check the imports itself.
+The same warning names an engine that spent its retry schedule proposing nothing while it had
+announced no work of its own. A loaded engine that proposes nothing is telling you there is
+nothing to update, and its move carries no warning; one that has never said what it is doing is
+not, and the warning names it so the caller can check the imports itself.
 
 ### Diagnostics on a change
 
 After any change applies - a rename, a move, a [`patch`](/docs/protocol/mcp#tool-patch) - the
-server asks each changed path's engine what it now makes of the file. It opens the document with
-the bytes just written, pulls the engine's diagnostics, closes it, and maps the findings onto the
-change summary beside the syntax provider's own.
+server groups changed paths by engine. Each engine first receives one ordered
+`workspace/didChangeWatchedFiles` notification with added, modified, and removed classifications.
+Rift then opens each surviving document with final bytes, pulls diagnostics through the bounded
+retry schedule, closes it once, and maps findings onto the change summary beside the syntax
+provider's own.
 
-The pull reads the landed bytes, so what comes back is the engine's reading of the change rather
-than of the tree before it. rust-analyzer answers a broken call this way: `expected 1 argument,
-found 2`, under its own code `E0107`.
+The pull reads landed bytes, so what comes back is the engine's reading of the change rather than
+of the tree before it. One batch lets a parent declaration and its new module arrive together,
+and lets a removed diagnostic disappear before any post-change pull.
 
 A pull the engine answers while it is still loading the project comes back empty, and so does a
 pull over code that is genuinely clean. The server tells the two apart from the engine's own
-`$/progress` traffic: while the engine has work outstanding its answer is provisional, and the
-server pulls again under that engine's [`retry`](/docs/configuration#engines) table. Clean bytes
-cost nothing extra, because an engine with no work outstanding has already settled - except for
-the one empty report an engine gives before it has announced any work at all, which the server
-pulls a second time.
+`$/progress` traffic and repeated report evidence: `window/workDoneProgress/create` and the
+matching progress token mark work outstanding before the begin notification can race a request.
+While work remains, its answer is provisional and the server pulls again under that engine's
+[`retry`](/docs/configuration#engines) table. Once work ends, a nonempty full report settles. An
+empty full report still requires equal reports at the end of that schedule, because progress does
+not bind its completed work to this document.
 
 An engine that advertises no pull contributes nothing and says nothing about it, because a
 capability the engine never advertised is not a failure. typescript-language-server is that case:
 it publishes diagnostics instead of serving pulls, so an applied change carries its silence.
 
-An engine that fails the pull degrades to one warning naming it, under `rift.engine.failed`, and
-one that never stopped analyzing inside its retry budget degrades to a warning under
-`rift.engine.analyzing` saying its findings may be incomplete. The change has already landed by
-then, so nothing at this step can refuse it - and neither warning is ever replaced by an empty
-finding list, which would tell the caller the file is clean.
+An engine that fails the pull degrades to one warning naming it under `rift.engine.failed`. One
+that never reaches settled evidence inside its retry budget degrades under `rift.engine.unready`,
+with changed paths grouped by engine and language. The change has already landed by then, so
+nothing at this step can refuse it - and neither warning is replaced by an empty finding list,
+which would tell the caller the file is clean.
 
 ### Edit plans
 
