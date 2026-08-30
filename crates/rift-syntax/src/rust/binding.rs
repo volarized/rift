@@ -2180,4 +2180,182 @@ mod tests {
         let targets = lib_targets(text, offset(text, "f();"));
         assert_eq!(targets, [target("f", offset(text, "pub fn f"))]);
     }
+
+    #[test]
+    fn test_binding_turbofish_value_reference_resolves() {
+        let text = "fn probe() {}\nfn h() { let f = probe::<u8>; }\n";
+        let targets = lib_targets(text, offset(text, "probe::<"));
+        assert_eq!(targets, [target("probe", 0)]);
+    }
+
+    #[test]
+    fn test_binding_method_turbofish_receiver_reads() {
+        let text = "fn h() { let receiver = 1; receiver.take::<u8>(); }\n";
+        let targets = lib_targets(text, offset(text, "receiver.take"));
+        assert_eq!(targets, [target("receiver", offset(text, "receiver ="))]);
+    }
+
+    #[test]
+    fn test_binding_closure_pattern_parameters_bind() {
+        let text = "fn h() { let f = |(left, right)| touch(left, right); }\n";
+        let document = analyze("src/lib.rs", text);
+        let (graph, set) = resolved(&[("src/lib.rs", &document)]);
+        let bound = targets_at(&graph, &set, "src/lib.rs", offset(text, "left, right);"));
+        assert_eq!(bound, [target("left", offset(text, "left, right)|"))]);
+    }
+
+    #[test]
+    fn test_binding_const_lifetime_and_attributed_generic_parameters() {
+        let text = "fn f<'life, const COUNT: usize, #[cfg(test)] Item>(value: [Item; COUNT]) -> Item { loop {} }\n";
+        let document = analyze("src/lib.rs", text);
+        let facts = document.binding().expect("binding facts extracted");
+        let names: Vec<&str> = facts
+            .definitions()
+            .iter()
+            .map(|definition| definition.name().as_str())
+            .collect();
+        assert!(names.contains(&"'life"), "lifetime parameter defined");
+        let (graph, set) = resolved(&[("src/lib.rs", &document)]);
+        let count = targets_at(&graph, &set, "src/lib.rs", offset(text, "COUNT])"));
+        assert_eq!(count, [target("COUNT", offset(text, "COUNT: usize"))]);
+    }
+
+    #[test]
+    fn test_binding_overlong_names_drop_facts_not_unit() {
+        let long = "a".repeat(300);
+        let text = format!(
+            "fn f<{long}>() {{}}\nfn h() {{ let {long} = 1; }}\nuse m::f as {long};\nmod {long};\n"
+        );
+        let document = analyze("src/lib.rs", &text);
+        let facts = document.binding().expect("binding facts extracted");
+        assert!(
+            facts
+                .definitions()
+                .iter()
+                .all(|definition| definition.name().as_str().len() <= 256),
+            "a name past the byte bound emits no definition"
+        );
+        assert!(
+            facts.imports().is_empty(),
+            "an overlong alias emits no import"
+        );
+        assert!(
+            facts.module_declarations().is_empty(),
+            "an overlong module name emits no declaration"
+        );
+    }
+
+    #[test]
+    fn test_binding_if_let_else_alternative_reads_outer_scope() {
+        let text = "fn fallback() {}\nfn h() { if let Some(x) = probe() { touch(x); } else { fallback(); } }\n";
+        let targets = lib_targets(text, offset(text, "fallback();"));
+        assert_eq!(targets, [target("fallback", 0)]);
+    }
+
+    #[test]
+    fn test_binding_while_plain_condition_reads_outer_scope() {
+        let text = "fn running() {}\nfn h() { while running() { step(); } }\n";
+        let targets = lib_targets(text, offset(text, "running() { step"));
+        assert_eq!(targets, [target("running", 0)]);
+    }
+
+    #[test]
+    fn test_binding_let_chain_plain_operand_reads_outer_scope() {
+        let text = "fn ready() {}\nfn h() { if let Some(x) = probe() && ready() { touch(x); } }\n";
+        let targets = lib_targets(text, offset(text, "ready() { touch"));
+        assert_eq!(targets, [target("ready", 0)]);
+    }
+
+    #[test]
+    fn test_binding_scoped_arm_pattern_emits_no_facts() {
+        let text = "enum Direction { Up }\nfn h(d: Direction) { match d { Direction::Up => (), _ => () } }\n";
+        let document = analyze("src/lib.rs", text);
+        let facts = document.binding().expect("binding facts extracted");
+        let at = offset(text, "Direction::Up =>");
+        assert!(
+            facts
+                .references()
+                .iter()
+                .all(|reference| reference.range().start() != at),
+            "a scoped arm pattern names an item and binds nothing"
+        );
+    }
+
+    #[test]
+    fn test_binding_use_edge_shapes_emit_expected_import_counts() {
+        let cases = [
+            ("use a::{super::b};", 0),
+            ("use self;", 0),
+            ("use crate;", 0),
+            ("use a::{super::b as c};", 0),
+            ("use a::{super::{b}};", 0),
+            ("use *;", 0),
+            ("use a::{super::*};", 0),
+            ("use crate::*;", 0),
+            ("use ::{f};", 1),
+        ];
+        for (source, expected) in cases {
+            let document = analyze("src/lib.rs", source);
+            let facts = document.binding().expect("binding facts extracted");
+            assert_eq!(facts.imports().len(), expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn test_binding_impl_for_tuple_type_reads_trait_only() {
+        let text = "trait Probe {}\nimpl Probe for (u8, u8) {}\n";
+        let document = analyze("src/lib.rs", text);
+        let facts = document.binding().expect("binding facts extracted");
+        let tuple_at = offset(text, "(u8, u8)");
+        assert!(
+            facts
+                .references()
+                .iter()
+                .all(|reference| reference.range().start() != tuple_at),
+            "a tuple type forms no reference path"
+        );
+        let (graph, set) = resolved(&[("src/lib.rs", &document)]);
+        let trait_targets = targets_at(&graph, &set, "src/lib.rs", offset(text, "Probe for"));
+        assert_eq!(trait_targets, [target("Probe", 0)]);
+    }
+
+    #[test]
+    fn test_binding_path_chain_beyond_bound_skips_reference() {
+        let segments = vec!["seg"; 70].join("::");
+        let text = format!("fn h() {{ {segments}; }}\n");
+        let document = analyze("src/lib.rs", &text);
+        let facts = document.binding().expect("binding facts extracted");
+        let at = offset(&text, "seg");
+        assert!(
+            facts
+                .references()
+                .iter()
+                .all(|reference| reference.range().start() != at),
+            "a chain past the walk bound forms no reference"
+        );
+    }
+
+    #[test]
+    fn test_binding_anchor_keyword_after_front_skips_reference() {
+        let text = "fn h() { self::super::x; }\n";
+        let document = analyze("src/lib.rs", text);
+        let facts = document.binding().expect("binding facts extracted");
+        let at = offset(text, "self::super");
+        assert!(
+            facts
+                .references()
+                .iter()
+                .all(|reference| reference.range().start() != at),
+            "an anchor keyword after the front forms no reference"
+        );
+    }
+
+    #[test]
+    fn test_binding_pub_self_visibility_narrows_to_private() {
+        let text = "mod outer { pub(self) fn hidden() {} }\nfn h() { outer::hidden(); }\n";
+        let document = analyze("src/lib.rs", text);
+        let (graph, set) = resolved(&[("src/lib.rs", &document)]);
+        let hidden = targets_at(&graph, &set, "src/lib.rs", offset(text, "outer::hidden"));
+        assert!(hidden.is_empty(), "pub(self) narrows to private");
+    }
 }
