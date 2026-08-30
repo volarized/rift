@@ -5,9 +5,7 @@
 //! request and response schemas from these definitions.
 
 use crate::configuration::GuaranteeKind;
-use crate::read::{
-    CoverageScope, Diagnostic, NodeId, ProjectPath, RegionRole, SourceSpan, SymbolId,
-};
+use crate::read::{CoverageScope, Diagnostic, NodeId, ProjectPath, RegionRole, SymbolId};
 use crate::schema;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -52,20 +50,36 @@ pub enum RefusalReason {
     UnmetPrecondition,
 }
 
-/// A filesystem effect described before Rift performs it. Edits in one set share one input
-/// state, cannot overlap, and apply atomically.
+/// One file a change wrote, and what the write did to it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "kind", deny_unknown_fields)]
-pub enum Edit {
-    #[serde(rename = "replace")]
-    /// One byte range of one file and what replaces it.
-    Replace {
-        /// The file, and the byte range being replaced.
-        span: SourceSpan,
-        /// What the range becomes. Empty deletes it.
-        #[schemars(length(max = 1_048_576))]
-        text: String,
-    },
+#[serde(deny_unknown_fields)]
+pub struct FileChange {
+    /// The file, project-relative.
+    pub path: ProjectPath,
+    /// Whether the change created, modified, or deleted the file.
+    pub kind: FileChangeKind,
+    /// The file's size in bytes after the change; zero for a deleted file.
+    pub size_bytes: u64,
+    /// Lines the file holds after the change, counting a final unterminated line;
+    /// zero for a deleted file.
+    pub line_count: u64,
+    /// Lines the change added. A line whose content changed counts here and in
+    /// `lines_removed`.
+    pub lines_added: u64,
+    /// Lines the change removed.
+    pub lines_removed: u64,
+}
+
+/// What a change did to one file.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChangeKind {
+    /// The file did not exist before the change.
+    Created,
+    /// The file existed and its bytes changed.
+    Modified,
+    /// The file existed and the change removed it.
+    Deleted,
 }
 
 /// A typed value compared by an operation precondition.
@@ -224,14 +238,9 @@ pub struct GuaranteeEvidence {
 pub struct ChangeSummary {
     /// Identity of this applied change.
     pub id: ChangeId,
-    /// Paths whose entries differ because of this change, sorted bytewise.
+    /// Files this change wrote, sorted bytewise by path.
     #[schemars(length(min = 1, max = 256))]
-    pub paths: Vec<ProjectPath>,
-    /// Concrete edits in canonical file-and-range order. A modification carries one
-    /// edit per replaced range; a file the change created or removed carries one edit
-    /// spanning the whole file.
-    #[schemars(length(min = 1, max = 256))]
-    pub edits: Vec<Edit>,
+    pub files: Vec<FileChange>,
     /// Resolution findings in source order, then one finding per hook that
     /// did not pass.
     #[schemars(length(max = 256))]
@@ -240,6 +249,14 @@ pub struct ChangeSummary {
     /// change, in hook list order.
     #[schemars(length(max = 512))]
     pub guarantees: Vec<GuaranteeEvidence>,
+}
+
+impl ChangeSummary {
+    /// The paths this change wrote, in `files` order.
+    #[must_use]
+    pub fn paths(&self) -> Vec<ProjectPath> {
+        self.files.iter().map(|file| file.path.clone()).collect()
+    }
 }
 
 /// An applied change or semantic refusal. For every refusal the targeted tree is
@@ -251,20 +268,14 @@ pub struct ChangeSummary {
         "status": "applied",
         "summary": {
             "id": "d54ffb22",
-            "paths": [
-                "src/config.rs"
-            ],
-            "edits": [
+            "files": [
                 {
-                    "kind": "replace",
-                    "span": {
-                        "unit": "rift://file/src/config.rs",
-                        "range": {
-                            "start": 162,
-                            "end": 355
-                        }
-                    },
-                    "text": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)\n        .map_err(|error| ConfigError::read(path, error))?;\n    parse_config(&text)\n}"
+                    "path": "src/config.rs",
+                    "kind": "modified",
+                    "size_bytes": 1148,
+                    "line_count": 42,
+                    "lines_added": 6,
+                    "lines_removed": 4
                 }
             ],
             "diagnostics": [
@@ -690,7 +701,7 @@ pub struct PatchParams {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::read::{Digest, FileId, TextRange};
+    use crate::read::Digest;
     use schemars::schema_for;
     use serde_json::json;
 
@@ -705,10 +716,10 @@ mod tests {
     }
 
     #[test]
-    fn test_change_summary_schema_requires_paths_and_edits() {
+    fn test_change_summary_schema_requires_files() {
         let schema = serde_json::to_value(schema_for!(ChangeSummary)).expect("change schema");
-        assert_eq!(schema["properties"]["paths"]["minItems"], json!(1));
-        assert_eq!(schema["properties"]["edits"]["minItems"], json!(1));
+        assert_eq!(schema["properties"]["files"]["minItems"], json!(1));
+        assert_eq!(schema["properties"]["files"]["maxItems"], json!(256));
     }
 
     #[test]
@@ -716,13 +727,13 @@ mod tests {
         let result = ChangeResult::Applied {
             summary: ChangeSummary {
                 id: ChangeId("0123abcd".to_owned()),
-                paths: vec![ProjectPath("src/lib.rs".to_owned())],
-                edits: vec![Edit::Replace {
-                    span: SourceSpan {
-                        unit: FileId("rift://file/src%2Flib.rs".to_owned()),
-                        range: TextRange { start: 0, end: 4 },
-                    },
-                    text: "fn f() {}".to_owned(),
+                files: vec![FileChange {
+                    path: ProjectPath("src/lib.rs".to_owned()),
+                    kind: FileChangeKind::Modified,
+                    size_bytes: 10,
+                    line_count: 1,
+                    lines_added: 1,
+                    lines_removed: 1,
                 }],
                 diagnostics: Vec::new(),
                 guarantees: vec![GuaranteeEvidence {
@@ -762,16 +773,15 @@ mod tests {
     }
 
     #[test]
-    fn edit_kind_serializes_to_exact_wire_string() {
-        let edit = Edit::Replace {
-            span: SourceSpan {
-                unit: FileId("rift://file/src%2Flib.rs".to_owned()),
-                range: TextRange { start: 0, end: 0 },
-            },
-            text: String::new(),
-        };
-        let value = serde_json::to_value(&edit).expect("serialize");
-        assert_eq!(value["kind"], json!("replace"));
+    fn file_change_kind_serializes_to_exact_wire_strings() {
+        for (kind, wire) in [
+            (FileChangeKind::Created, "created"),
+            (FileChangeKind::Modified, "modified"),
+            (FileChangeKind::Deleted, "deleted"),
+        ] {
+            let value = serde_json::to_value(kind).expect("serialize");
+            assert_eq!(value, json!(wire));
+        }
     }
 
     #[test]

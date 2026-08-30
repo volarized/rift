@@ -16,7 +16,7 @@ use percent_encoding::percent_decode_str;
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::line::{self, LineEnding};
 use rift_protocol::change::{
-    BODY_BYTES_MAX, BodySource, ChangeId, ChangeResult, ChangeSummary, Edit, InsertNodeParams,
+    BODY_BYTES_MAX, BodySource, ChangeId, ChangeResult, ChangeSummary, InsertNodeParams,
     InsertPosition, InsertSymbolParams, OperationPrecondition, OperationPreconditionKind,
     OperationPreconditionStatus, PATCH_BYTES_MAX, PatchParams, PreconditionAddress,
     PreconditionValue, RefusalReason, ReplaceNodeParams, ReplaceSymbolParams,
@@ -36,18 +36,11 @@ use crate::read::{
 };
 use crate::remove::{RemovePlan, is_blank_content};
 use crate::rename::{PlannedRewrite, RenamePlan, survivor_findings};
-use crate::rewrite::{ByteFileRewrite, FileRewrite, ReplacedRegion, RewriteKind};
+use crate::rewrite::{ByteFileRewrite, FileRewrite};
 
 /// Most findings one applied change reports: reparse findings and, for a
 /// rewrite that published through a symlink, the warning naming it.
 const CHANGE_DIAGNOSTICS_MAX: usize = 16;
-
-/// Most edits one applied change reports, mirroring the bound the
-/// `ChangeSummary.edits` field advertises. A batch whose replaced regions
-/// outnumber it reports one whole-file edit per rewrite instead of one
-/// edit per region, which every writing lane's own file bound keeps under
-/// the same ceiling.
-const CHANGE_EDITS_MAX: usize = 256;
 
 /// Serialized change application against one workspace tree.
 #[derive(Debug)]
@@ -173,7 +166,7 @@ fn snapshot_rewrites(
                 (Some(previous), Some(next)) if previous != next => {
                     Some(text(previous, path).and_then(|previous_text| {
                         text(next, path).map(|next_text| {
-                            FileRewrite::modify(path.clone(), &previous_text, next_text, Vec::new())
+                            FileRewrite::modify(path.clone(), &previous_text, next_text)
                                 .with_permissions(next.permissions.clone())
                         })
                     }))
@@ -447,17 +440,12 @@ impl ChangeService {
             return Ok(ChangeResult::Unchanged);
         }
         let mut identity = Sha256::new();
-        summary.paths.clear();
-        summary.edits.clear();
+        summary.files.clear();
         for rewrite in &rewrites {
             identity.update(rewrite.path.as_str().as_bytes());
             identity.update([0]);
             identity.update(rewrite.next_source.as_bytes());
-            summary.paths.push(rift_protocol::read::ProjectPath(
-                rewrite.path.as_str().to_owned(),
-            ));
-            let unit = file_id(&rewrite.path);
-            summary.edits.extend(rewrite_edits(rewrite, &unit, false));
+            summary.files.push(rewrite.change());
         }
         let digest = identity.finalize();
         summary.id = ChangeId(crate::read::digest_wire_hex(&digest));
@@ -584,8 +572,8 @@ impl ChangeService {
         };
         let rewrite = match existing {
             Some(content) => {
-                let (next_source, region) = spliced_at_file_edge(&content, position, body);
-                FileRewrite::modify(path, &content, next_source, vec![region])
+                let next_source = spliced_at_file_edge(&content, position, body);
+                FileRewrite::modify(path, &content, next_source)
             }
             None if create_missing => FileRewrite::create(path, body.to_owned()),
             None => {
@@ -813,7 +801,6 @@ impl ChangeService {
             plan.path.clone(),
             &plan.base_source,
             plan.next_source.clone(),
-            vec![plan.replaced.clone()],
         );
         let mut result = self.apply_rewrites(reads, std::slice::from_ref(&rewrite))?;
         if let ChangeResult::Applied { summary } = &mut result
@@ -949,18 +936,14 @@ impl ChangeService {
             Ok(warnings) => warnings,
             Err(refusal) => return Ok(refusal),
         };
-        let ranged = regions_fit_the_edit_bound(&effective);
         let mut identity = Sha256::new();
-        let mut paths = Vec::with_capacity(effective.len());
-        let mut edits = Vec::with_capacity(effective.len());
+        let mut files = Vec::with_capacity(effective.len());
         let mut diagnostics = warnings;
         for rewrite in &effective {
             identity.update(rewrite.path.as_str().as_bytes());
             identity.update([0]);
             identity.update(rewrite.next_source.as_bytes());
-            paths.push(rift_protocol::read::ProjectPath(
-                rewrite.path.as_str().to_owned(),
-            ));
+            files.push(rewrite.change());
             let unit = match reads.index().file(&rewrite.path) {
                 Some(file) => file_id(file.path()),
                 None => FileId(format!(
@@ -968,15 +951,13 @@ impl ChangeService {
                     rift_core::encode_path(rewrite.path.as_str())
                 )),
             };
-            edits.extend(rewrite_edits(rewrite, &unit, ranged));
             fold_and_bound_diagnostics(reads, &mut diagnostics, rewrite, unit);
         }
         let digest = identity.finalize();
         Ok(ChangeResult::Applied {
             summary: ChangeSummary {
                 id: ChangeId(crate::read::digest_wire_hex(&digest)),
-                paths,
-                edits,
+                files,
                 diagnostics,
                 guarantees: Vec::new(),
             },
@@ -1084,89 +1065,24 @@ impl ChangeService {
         next_source.push_str(&source[..start]);
         next_source.push_str(&plan.text);
         next_source.push_str(&source[end..]);
-        let region = ReplacedRegion {
-            range: ByteRange {
-                start: plan.range.start,
-                end: plan.range.end,
-            },
-            text: plan.text,
-        };
-        let rewrite = FileRewrite::modify(plan.path, source, next_source, vec![region]);
+        let rewrite = FileRewrite::modify(plan.path, source, next_source);
         self.apply_rewrites(reads, std::slice::from_ref(&rewrite))
     }
 }
 
 /// One planned rewrite as the in-place modification of its file, carrying
-/// the regions the engine's own edits named.
+/// both images the engine's own edits produced.
 fn modify_rewrite(rewrite: &PlannedRewrite) -> FileRewrite {
     FileRewrite::modify(
         rewrite.path.clone(),
         &rewrite.base_source,
         rewrite.next_source.clone(),
-        rewrite.replaced.clone(),
     )
-}
-
-/// Whether this batch's replaced regions fit the bound a change result
-/// carries. Past it every rewrite reports its whole file instead, which
-/// the file bound each writing lane enforces keeps within the same
-/// ceiling.
-fn regions_fit_the_edit_bound(rewrites: &[FileRewrite]) -> bool {
-    rewrites
-        .iter()
-        .map(|rewrite| match &rewrite.kind {
-            RewriteKind::Modify { replaced } => replaced.len(),
-            RewriteKind::Create | RewriteKind::Delete => 1,
-        })
-        .sum::<usize>()
-        <= CHANGE_EDITS_MAX
-}
-
-/// Edits one rewrite contributes to change result: one per replaced
-/// region for modification, and whole file for create or delete.
-/// Batch whose regions exceed edit bound reports whole files.
-fn rewrite_edits(rewrite: &FileRewrite, unit: &FileId, ranged: bool) -> Vec<Edit> {
-    match &rewrite.kind {
-        RewriteKind::Modify { replaced } if ranged => replaced
-            .iter()
-            .map(|region| {
-                replace_edit(
-                    unit,
-                    region.range.start,
-                    region.range.end,
-                    region.text.clone(),
-                )
-            })
-            .collect(),
-        _ => vec![replace_edit(
-            unit,
-            0,
-            rewrite.previous_len(),
-            rewrite.next_source.clone(),
-        )],
-    }
-}
-
-/// One replacement of `unit`'s bytes from `start` to `end` by `text`.
-fn replace_edit(unit: &FileId, start: u64, end: u64, text: String) -> Edit {
-    Edit::Replace {
-        span: SourceSpan {
-            unit: unit.clone(),
-            range: TextRange { start, end },
-        },
-        text,
-    }
 }
 
 /// Splices new content at a file boundary, matching the anchor-insert spacing
 /// policy: one blank line separates the new content from what was already there.
-/// The region names where the splice lands in the existing bytes, so the
-/// result reports the insert rather than the whole file.
-fn spliced_at_file_edge(
-    existing: &str,
-    position: InsertPosition,
-    body: &str,
-) -> (String, ReplacedRegion) {
+fn spliced_at_file_edge(existing: &str, position: InsertPosition, body: &str) -> String {
     let boundary = match position {
         InsertPosition::Before => ByteRange { start: 0, end: 0 },
         InsertPosition::After => {
@@ -1180,13 +1096,7 @@ fn spliced_at_file_edge(
         usize::try_from(at).expect("file boundary offset fits this platform's usize"),
         &text,
     );
-    (
-        next_source,
-        ReplacedRegion {
-            range: ByteRange { start: at, end: at },
-            text,
-        },
-    )
+    next_source
 }
 
 /// Returns line endings needed for one blank line between adjacent source.
@@ -1595,9 +1505,9 @@ mod tests {
     use rift_core::{LanguageFileSelections, ProjectPath as CoreProjectPath, SourceVisibility};
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::change::{
-        BODY_BYTES_MAX, BodySource, ChangeResult, Edit, InsertPosition, InsertSymbolParams,
-        OperationPreconditionKind, PatchParams, PreconditionAddress, PreconditionValue,
-        RefusalReason, ReplaceNodeParams, ReplaceSymbolParams,
+        BODY_BYTES_MAX, BodySource, ChangeResult, FileChangeKind, InsertPosition,
+        InsertSymbolParams, OperationPreconditionKind, PatchParams, PreconditionAddress,
+        PreconditionValue, RefusalReason, ReplaceNodeParams, ReplaceSymbolParams,
     };
     use rift_protocol::configuration::{
         HistoryConfiguration, LanguageConfiguration, WorkspaceConfiguration,
@@ -1606,11 +1516,10 @@ mod tests {
         Diagnostic, DiagnosticContinuation, DiagnosticReliability, Extensions, FileId,
         GetSymbolParams, Language, NodeId, NodesParams, ProjectPath, Severity, SymbolId,
     };
-    use rift_syntax::ByteRange;
 
     use super::ChangeService;
     use crate::read::{ReadFault, ReadService, digest_hex8};
-    use crate::rewrite::{FileRewrite, REWRITE_FILE_BYTES_MAX, ReplacedRegion};
+    use crate::rewrite::{FileRewrite, REWRITE_FILE_BYTES_MAX};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -2151,13 +2060,6 @@ mod tests {
             CoreProjectPath::new("lib.rs")?,
             source,
             source.to_owned(),
-            vec![ReplacedRegion {
-                range: ByteRange {
-                    start: 0,
-                    end: source.len() as u64,
-                },
-                text: source.to_owned(),
-            }],
         )];
         let result = changes.apply_rewrites(&reads, &rewrites)?;
         assert_source_unchanged_refusal(result);
@@ -2171,13 +2073,8 @@ mod tests {
         let (directory, reads, changes) = fixture(source)?;
         let path = CoreProjectPath::new("lib.rs")?;
         let rewrites = vec![
-            FileRewrite::modify(
-                path.clone(),
-                source,
-                "pub fn first() {}\n".to_owned(),
-                Vec::new(),
-            ),
-            FileRewrite::modify(path, source, "pub fn second() {}\n".to_owned(), Vec::new()),
+            FileRewrite::modify(path.clone(), source, "pub fn first() {}\n".to_owned()),
+            FileRewrite::modify(path, source, "pub fn second() {}\n".to_owned()),
         ];
 
         let result = changes.apply_rewrites(&reads, &rewrites)?;
@@ -2213,27 +2110,21 @@ mod tests {
                 CoreProjectPath::new("changed.rs")?,
                 changed_source,
                 changed_next.to_owned(),
-                vec![ReplacedRegion {
-                    range: ByteRange { start: 7, end: 14 },
-                    text: "renamed".to_owned(),
-                }],
             ),
             FileRewrite::modify(
                 CoreProjectPath::new("steady.rs")?,
                 unchanged_source,
                 unchanged_source.to_owned(),
-                vec![ReplacedRegion {
-                    range: ByteRange {
-                        start: 0,
-                        end: unchanged_source.len() as u64,
-                    },
-                    text: unchanged_source.to_owned(),
-                }],
             ),
         ];
         let summary = applied_summary(changes.apply_rewrites(&reads, &rewrites)?);
-        assert_eq!(summary.paths, vec![ProjectPath("changed.rs".to_owned())]);
-        assert_eq!(summary.edits.len(), 1);
+        assert_eq!(summary.paths(), vec![ProjectPath("changed.rs".to_owned())]);
+        assert_eq!(summary.files.len(), 1);
+        assert_eq!(summary.files[0].kind, FileChangeKind::Modified);
+        assert_eq!(
+            (summary.files[0].lines_added, summary.files[0].lines_removed),
+            (1, 1)
+        );
         assert_eq!(
             fs::read_to_string(directory.path().join("changed.rs"))?,
             changed_next
@@ -2256,19 +2147,17 @@ mod tests {
                 CoreProjectPath::new("z.rs")?,
                 second_source,
                 "pub fn changed_second() {}\n".to_owned(),
-                Vec::new(),
             ),
             FileRewrite::modify(
                 CoreProjectPath::new("a.rs")?,
                 first_source,
                 "pub fn changed_first() {}\n".to_owned(),
-                Vec::new(),
             ),
         ];
 
         let summary = applied_summary(changes.apply_rewrites(&reads, &rewrites)?);
         assert_eq!(
-            summary.paths,
+            summary.paths(),
             [
                 ProjectPath("a.rs".to_owned()),
                 ProjectPath("z.rs".to_owned()),
@@ -2289,8 +2178,8 @@ mod tests {
             },
         )?;
         let summary = applied_summary(result);
-        assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
-        assert_eq!(summary.edits.len(), 1);
+        assert_eq!(summary.paths(), vec![ProjectPath("lib.rs".to_owned())]);
+        assert_eq!(summary.files.len(), 1);
         assert!(summary.diagnostics.is_empty(), "clean body parses cleanly");
         assert!(
             summary.id.0.len() == 8
@@ -2894,7 +2783,7 @@ mod tests {
             };
             let summary = applied_summary(changes.replace_symbol(&reads, &params)?);
             assert_eq!(
-                summary.edits.len(),
+                summary.files.len(),
                 1,
                 "{suffixed} rewrites one declaration"
             );
@@ -4358,30 +4247,6 @@ mod tests {
         Ok((directory, reads, changes))
     }
 
-    /// The single region two images differ over, standing in for the engine
-    /// edits a real plan carries. Fixture sources are ASCII, so the byte
-    /// scan lands on character boundaries.
-    fn differing_region(base: &str, next: &str) -> ReplacedRegion {
-        let prefix = base
-            .bytes()
-            .zip(next.bytes())
-            .take_while(|(left, right)| left == right)
-            .count();
-        let suffix = base[prefix..]
-            .bytes()
-            .rev()
-            .zip(next[prefix..].bytes().rev())
-            .take_while(|(left, right)| left == right)
-            .count();
-        ReplacedRegion {
-            range: ByteRange {
-                start: prefix as u64,
-                end: (base.len() - suffix) as u64,
-            },
-            text: next[prefix..next.len() - suffix].to_owned(),
-        }
-    }
-
     fn rename_plan(rewrites: Vec<(&str, &str, &str)>) -> crate::rename::RenamePlan {
         crate::rename::RenamePlan {
             symbol: SymbolId("rift://symbol/rust/lib.rs/beacon".to_owned()),
@@ -4393,7 +4258,6 @@ mod tests {
                         path: CoreProjectPath::new(path).expect("fixture path is valid"),
                         base_source: base_source.to_owned(),
                         next_source: next_source.to_owned(),
-                        replaced: vec![differing_region(base_source, next_source)],
                     },
                 )
                 .collect(),
@@ -4411,15 +4275,14 @@ mod tests {
             ("main.rs", caller, "pub fn caller() { flare(); }\n"),
         ]);
         let summary = applied_summary(changes.apply_rename(&reads, &plan)?);
-        assert_eq!(summary.paths.len(), 2);
-        assert_eq!(summary.edits.len(), 2, "one edit per replaced region");
-        let Edit::Replace { span, text } = &summary.edits[0];
+        assert_eq!(summary.files.len(), 2);
+        assert_eq!(summary.files[0].kind, FileChangeKind::Modified);
         assert_eq!(
-            (span.range.start, span.range.end),
-            (7, 13),
-            "the edit names the renamed identifier, not the whole file"
+            (summary.files[0].lines_added, summary.files[0].lines_removed),
+            (1, 1),
+            "the rename rewrites the one line the declaration stands on"
         );
-        assert_eq!(text, "flare");
+        assert_eq!(summary.files[0].line_count, 1);
         assert!(
             summary
                 .diagnostics
@@ -4529,7 +4392,6 @@ mod tests {
                         path: CoreProjectPath::new(path).expect("fixture path is valid"),
                         base_source: base_source.to_owned(),
                         next_source: next_source.to_owned(),
-                        replaced: vec![differing_region(base_source, next_source)],
                     },
                 )
                 .collect(),
@@ -4552,7 +4414,7 @@ mod tests {
         );
         let summary = applied_summary(changes.apply_move(&reads, &plan)?);
         assert_eq!(
-            summary.paths,
+            summary.paths(),
             vec![
                 ProjectPath("hub.rs".to_owned()),
                 ProjectPath("main.rs".to_owned()),
@@ -4560,7 +4422,19 @@ mod tests {
             ],
             "the summary carries the old path, the rewrite, and the new path, sorted"
         );
-        assert_eq!(summary.edits.len(), 3);
+        assert_eq!(
+            summary
+                .files
+                .iter()
+                .map(|file| file.kind)
+                .collect::<Vec<_>>(),
+            [
+                FileChangeKind::Deleted,
+                FileChangeKind::Modified,
+                FileChangeKind::Created,
+            ],
+            "the move deletes the old path, rewrites the caller, and creates the new path"
+        );
         assert!(
             summary
                 .diagnostics
@@ -4707,22 +4581,24 @@ mod tests {
         let finalized = applied_summary(changes.finalize_hook_result(&before, &after, summary)?);
 
         assert_eq!(
-            finalized.paths,
+            finalized.paths(),
             [
                 ProjectPath("lib.rs".to_owned()),
                 ProjectPath("split.rs".to_owned()),
             ],
             "a hook that deletes one file and writes another reports both"
         );
-        let texts: Vec<&str> = finalized
-            .edits
-            .iter()
-            .map(|Edit::Replace { text, .. }| text.as_str())
-            .collect();
         assert_eq!(
-            texts,
-            ["", split],
-            "a deleted file's edit empties it and a created file's edit carries its whole source"
+            finalized
+                .files
+                .iter()
+                .map(|file| (file.kind, file.size_bytes, file.line_count))
+                .collect::<Vec<_>>(),
+            [
+                (FileChangeKind::Deleted, 0, 0),
+                (FileChangeKind::Created, split.len() as u64, 1),
+            ],
+            "a deleted file reports no bytes and a created file reports its own"
         );
         Ok(())
     }
@@ -4919,7 +4795,7 @@ mod tests {
     }
 
     #[test]
-    fn patch_against_a_multi_hunk_file_reports_one_edit_per_hunk_at_its_own_span() -> TestResult {
+    fn patch_against_a_multi_hunk_file_counts_every_hunk_it_landed() -> TestResult {
         let filler = "// pad\n".repeat(50);
         let source = format!("one();\ntwo();\nthree();\nfour();\nfive();\n{filler}");
         let (_directory, reads, changes) = fixture(&source)?;
@@ -4932,46 +4808,24 @@ mod tests {
                 patch: patch.into(),
             },
         )?);
+        assert_eq!(summary.files.len(), 1, "both hunks land in one file");
+        let file = &summary.files[0];
+        assert_eq!(file.kind, FileChangeKind::Modified);
         assert_eq!(
-            summary.edits.len(),
-            2,
-            "one edit per hunk, not one edit for the whole file"
+            (file.lines_added, file.lines_removed),
+            (2, 2),
+            "each hunk rewrites one line, counted once added and once removed"
         );
-        let Edit::Replace {
-            span: first_span,
-            text: first_text,
-        } = &summary.edits[0];
         assert_eq!(
-            (first_span.range.start, first_span.range.end),
-            (7, 14),
-            "the first hunk's span is its own `two();\\n` line, not the file"
-        );
-        assert_eq!(first_text, "TWO();\n");
-        let Edit::Replace {
-            span: second_span,
-            text: second_text,
-        } = &summary.edits[1];
-        assert_eq!((second_span.range.start, second_span.range.end), (23, 31));
-        assert_eq!(second_text, "FOUR();\n");
-        let total_edit_bytes: usize = summary
-            .edits
-            .iter()
-            .map(|edit| {
-                let Edit::Replace { text, .. } = edit;
-                text.len()
-            })
-            .sum();
-        assert!(
-            total_edit_bytes < source.len() / 10,
-            "edits ({total_edit_bytes} bytes) must be far smaller than the file they patch \
-             ({} bytes)",
-            source.len()
+            (file.size_bytes, file.line_count),
+            (source.len() as u64, 55),
+            "the counts describe the file the patch left behind"
         );
         Ok(())
     }
 
     #[test]
-    fn patch_creates_a_file_and_reports_one_edit_at_the_empty_range() -> TestResult {
+    fn patch_creates_a_file_and_reports_it_created() -> TestResult {
         let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
         let patch = "--- /dev/null\n+++ b/new.rs\n@@ -0,0 +1 @@\n+pub fn fresh() {}\n".to_owned();
         let summary = applied_summary(changes.patch(
@@ -4980,19 +4834,16 @@ mod tests {
                 patch: patch.into(),
             },
         )?);
-        assert_eq!(summary.edits.len(), 1);
-        let Edit::Replace { span, text } = &summary.edits[0];
-        assert_eq!(
-            (span.range.start, span.range.end),
-            (0, 0),
-            "a created file has no previous image, so its edit spans the empty range"
-        );
-        assert_eq!(text, "pub fn fresh() {}\n");
+        assert_eq!(summary.files.len(), 1);
+        let file = &summary.files[0];
+        assert_eq!(file.kind, FileChangeKind::Created);
+        assert_eq!((file.size_bytes, file.line_count), (18, 1));
+        assert_eq!((file.lines_added, file.lines_removed), (1, 0));
         Ok(())
     }
 
     #[test]
-    fn patch_deletes_a_file_and_reports_one_edit_across_the_whole_previous_image() -> TestResult {
+    fn patch_deletes_a_file_and_reports_it_deleted() -> TestResult {
         let source = "pub fn beacon() {}\npub fn steady() {}\n";
         let (_directory, reads, changes) = fixture(source)?;
         let patch = [
@@ -5010,14 +4861,11 @@ mod tests {
                 patch: patch.into(),
             },
         )?);
-        assert_eq!(summary.edits.len(), 1);
-        let Edit::Replace { span, text } = &summary.edits[0];
-        assert_eq!(
-            (span.range.start, span.range.end),
-            (0, source.len() as u64),
-            "a deleted file's edit spans its whole previous image"
-        );
-        assert_eq!(text, "");
+        assert_eq!(summary.files.len(), 1);
+        let file = &summary.files[0];
+        assert_eq!(file.kind, FileChangeKind::Deleted);
+        assert_eq!((file.size_bytes, file.line_count), (0, 0));
+        assert_eq!((file.lines_added, file.lines_removed), (0, 2));
         Ok(())
     }
 
@@ -5061,7 +4909,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_symbol_file_target_before_reports_a_zero_width_edit_at_the_start() -> TestResult {
+    fn insert_symbol_file_target_before_counts_the_lines_it_added() -> TestResult {
         let (_directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
         let params = InsertSymbolParams {
             anchor: None,
@@ -5071,23 +4919,20 @@ mod tests {
             create_missing: false,
         };
         let summary = applied_summary(changes.insert_symbol(&reads, &params)?);
+        assert_eq!(summary.files.len(), 1);
+        let file = &summary.files[0];
+        assert_eq!(file.kind, FileChangeKind::Modified);
         assert_eq!(
-            summary.edits.len(),
-            1,
-            "a file-target insert reports one edit, not the whole file"
+            (file.lines_added, file.lines_removed),
+            (2, 0),
+            "the doc line and the blank line after it are what a `before` insert adds"
         );
-        let Edit::Replace { span, text } = &summary.edits[0];
-        assert_eq!(
-            (span.range.start, span.range.end),
-            (0, 0),
-            "a `before` insert at a file target lands at the empty range at byte 0"
-        );
-        assert_eq!(text, "//! Module docs.\n\n");
+        assert_eq!(file.line_count, 3);
         Ok(())
     }
 
     #[test]
-    fn insert_symbol_file_target_after_reports_a_zero_width_edit_at_the_end() -> TestResult {
+    fn insert_symbol_file_target_after_counts_the_lines_it_added() -> TestResult {
         let source = "pub fn beacon() {}\n";
         let (_directory, reads, changes) = fixture(source)?;
         let params = InsertSymbolParams {
@@ -5098,98 +4943,15 @@ mod tests {
             create_missing: false,
         };
         let summary = applied_summary(changes.insert_symbol(&reads, &params)?);
-        assert_eq!(summary.edits.len(), 1);
-        let Edit::Replace { span, text } = &summary.edits[0];
-        let end = source.len() as u64;
+        assert_eq!(summary.files.len(), 1);
+        let file = &summary.files[0];
+        assert_eq!(file.kind, FileChangeKind::Modified);
         assert_eq!(
-            (span.range.start, span.range.end),
-            (end, end),
-            "an `after` insert at a file target lands at the empty range at the file's own end"
+            (file.lines_added, file.lines_removed),
+            (2, 0),
+            "the blank separator and the declaration are what an `after` insert adds"
         );
-        assert_eq!(text, "\npub fn late() {}");
-        Ok(())
-    }
-
-    #[test]
-    fn apply_rename_batch_past_the_edit_bound_falls_back_to_one_whole_file_edit() -> TestResult {
-        let region_count = super::CHANGE_EDITS_MAX + 1;
-        let base_source = "x\n".repeat(region_count);
-        let next_source = "y\n".repeat(region_count);
-        let (directory, reads, changes) = multi_file_fixture(&[("lib.rs", base_source.as_str())])?;
-        let replaced: Vec<ReplacedRegion> = (0..region_count)
-            .map(|index| {
-                let start = (index * 2) as u64;
-                ReplacedRegion {
-                    range: ByteRange {
-                        start,
-                        end: start + 2,
-                    },
-                    text: "y\n".to_owned(),
-                }
-            })
-            .collect();
-        let rewrite = crate::rename::PlannedRewrite {
-            path: CoreProjectPath::new("lib.rs")?,
-            base_source: base_source.clone(),
-            next_source: next_source.clone(),
-            replaced,
-        };
-        let plan = crate::rename::RenamePlan {
-            symbol: SymbolId("rift://symbol/rust/lib.rs/beacon".to_owned()),
-            old_name: "beacon".to_owned(),
-            rewrites: vec![rewrite],
-        };
-        let summary = applied_summary(changes.apply_rename(&reads, &plan)?);
-        assert_eq!(
-            summary.edits.len(),
-            1,
-            "{region_count} regions exceed CHANGE_EDITS_MAX, so the batch must fall back to one \
-             whole-file edit"
-        );
-        let Edit::Replace { span, text } = &summary.edits[0];
-        assert_eq!(
-            (span.range.start, span.range.end),
-            (0, base_source.len() as u64),
-            "the fallback edit spans the whole previous image"
-        );
-        assert_eq!(text, &next_source);
-        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
-        assert_eq!(written, next_source);
-        Ok(())
-    }
-
-    /// A `Modify` rewrite of `lib.rs` carrying `count` non-overlapping,
-    /// single-byte regions, standing in for a batch whose region count alone
-    /// decides whether it fits the edit bound.
-    fn rewrite_with_region_count(count: usize) -> TestResult<FileRewrite> {
-        let replaced: Vec<ReplacedRegion> = (0..count)
-            .map(|index| ReplacedRegion {
-                range: ByteRange {
-                    start: index as u64,
-                    end: index as u64 + 1,
-                },
-                text: "x".to_owned(),
-            })
-            .collect();
-        let path = CoreProjectPath::new("lib.rs")?;
-        Ok(FileRewrite::modify(path, "", String::new(), replaced))
-    }
-
-    #[test]
-    fn regions_fit_the_edit_bound_is_true_at_the_cap_and_false_one_past_it() -> TestResult {
-        let at_cap = vec![rewrite_with_region_count(super::CHANGE_EDITS_MAX)?];
-        assert!(
-            super::regions_fit_the_edit_bound(&at_cap),
-            "exactly {} regions must still fit the edit bound",
-            super::CHANGE_EDITS_MAX
-        );
-        let over_cap = vec![rewrite_with_region_count(super::CHANGE_EDITS_MAX + 1)?];
-        assert!(
-            !super::regions_fit_the_edit_bound(&over_cap),
-            "{} regions must exceed the edit bound of {}",
-            super::CHANGE_EDITS_MAX + 1,
-            super::CHANGE_EDITS_MAX
-        );
+        assert_eq!(file.line_count, 3);
         Ok(())
     }
 

@@ -968,9 +968,9 @@ async fn rename_symbol_schema_rejects_invalid_requests() -> TestResult {
 }
 
 /// A hunk whose header counts disagree with its body applies, and the
-/// applied summary names the hunk's own region rather than the whole file.
+/// applied summary reports the file it wrote and the lines it counted.
 #[tokio::test]
-async fn miscounted_hunk_header_applies_and_reports_its_own_region() -> TestResult {
+async fn miscounted_hunk_header_applies_and_reports_the_file_it_wrote() -> TestResult {
     let (_directory, client, server_task) = served_fixture().await?;
 
     // The body carries one old and one new line under a header claiming 9
@@ -990,17 +990,21 @@ async fn miscounted_hunk_header_applies_and_reports_its_own_region() -> TestResu
         "a miscounted header must apply on its context alone: {applied:#}"
     );
 
-    let edits = applied["summary"]["edits"]
+    let files = applied["summary"]["files"]
         .as_array()
-        .ok_or("an applied patch must carry its edits")?;
-    assert_eq!(edits.len(), 1, "one hunk mints one edit: {applied:#}");
-    let span = &edits[0]["span"]["range"];
+        .ok_or("an applied patch must carry its files")?;
+    assert_eq!(files.len(), 1, "one hunk writes one file: {applied:#}");
+    assert_eq!(files[0]["path"], json!("lib.rs"));
+    assert_eq!(files[0]["kind"], json!("modified"));
     assert_eq!(
-        (span["start"].as_u64(), span["end"].as_u64()),
-        (Some(23), Some(46)),
-        "the edit names the second declaration's own line: {applied:#}"
+        (
+            files[0]["lines_added"].as_u64(),
+            files[0]["lines_removed"].as_u64()
+        ),
+        (Some(1), Some(1)),
+        "the body's one old and one new line are what the change counted, whatever the \
+         header claimed: {applied:#}"
     );
-    assert_eq!(edits[0]["text"], json!("pub fn beacon_two() -> u8 { 2 }\n"));
 
     client.cancel().await?;
     server_task.await?;

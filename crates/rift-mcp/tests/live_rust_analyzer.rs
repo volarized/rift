@@ -134,10 +134,22 @@ fn coded_findings<'summary>(structured: &'summary Value, code: &str) -> Vec<&'su
         .unwrap_or_default()
 }
 
+/// The project paths one applied change reports, in the order it carries them.
+fn changed_paths(structured: &Value) -> Vec<&str> {
+    structured["summary"]["files"]
+        .as_array()
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|file| file["path"].as_str())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The engine resolves every reference itself, so the rewrite covers both
-/// files and the word-boundary sweep finds no survivor to report. Each of
-/// the engine's own edits reaches the result as its own replacement, so
-/// three identifier-sized edits stand where two whole files once did.
+/// files and the word-boundary sweep finds no survivor to report. Each
+/// rewritten file reports the lines the engine's own edits changed.
 ///
 /// The workspace is served under a root spelled relative to the process
 /// working directory, the spelling `rift mcp` and `rift server start` hand
@@ -156,31 +168,27 @@ async fn applied_rename_rewrites_the_module_and_its_caller() -> TestResult {
     let structured = call_retrying_acceptance(&client, rename_request("flare")).await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
     assert_eq!(
-        structured["summary"]["paths"],
-        json!(["caller.rs", "hub.rs"]),
+        changed_paths(&structured),
+        ["caller.rs", "hub.rs"],
         "the declaration and its cross-file reference both carry the rename: {structured:#}"
     );
+    let files = structured["summary"]["files"]
+        .as_array()
+        .ok_or("an applied rename must carry its files")?;
+    assert_eq!(files[0]["kind"], json!("modified"));
     assert_eq!(
-        structured["summary"]["edits"],
-        json!([
-            {
-                "kind": "replace",
-                "span": { "unit": "rift://file/caller.rs", "range": { "start": 16, "end": 22 } },
-                "text": "flare"
-            },
-            {
-                "kind": "replace",
-                "span": { "unit": "rift://file/caller.rs", "range": { "start": 53, "end": 59 } },
-                "text": "flare"
-            },
-            {
-                "kind": "replace",
-                "span": { "unit": "rift://file/hub.rs", "range": { "start": 7, "end": 13 } },
-                "text": "flare"
-            }
-        ]),
-        "each edit names the identifier the engine resolved, not the file it stood in: \
-         {structured:#}"
+        files[0]["lines_added"]
+            .as_u64()
+            .zip(files[0]["lines_removed"].as_u64()),
+        Some((2, 2)),
+        "the caller carries the import and the call, one line each: {structured:#}"
+    );
+    assert_eq!(
+        files[1]["lines_added"]
+            .as_u64()
+            .zip(files[1]["lines_removed"].as_u64()),
+        Some((1, 1)),
+        "the declaring file carries the declaration line alone: {structured:#}"
     );
     assert!(
         coded_findings(&structured, "rift.rename.survivor").is_empty(),
@@ -235,8 +243,8 @@ async fn applied_move_matches_the_rust_analyzer_proposal() -> TestResult {
     match warnings.as_slice() {
         [] => {
             assert_eq!(
-                structured["summary"]["paths"],
-                json!(["caller.rs", "hub.rs", "lib.rs", "spoke.rs"]),
+                changed_paths(&structured),
+                ["caller.rs", "hub.rs", "lib.rs", "spoke.rs"],
                 "the proposal rewrites, old path, and new path ride the summary: {structured:#}"
             );
             assert_eq!(
@@ -260,8 +268,8 @@ async fn applied_move_matches_the_rust_analyzer_proposal() -> TestResult {
                 "the warning names the engine and skipped updates: {structured:#}"
             );
             assert_eq!(
-                structured["summary"]["paths"],
-                json!(["hub.rs", "spoke.rs"]),
+                changed_paths(&structured),
+                ["hub.rs", "spoke.rs"],
                 "an empty proposal moves only the requested file: {structured:#}"
             );
             assert_eq!(
@@ -306,7 +314,7 @@ async fn applied_patch_carries_the_provider_diagnostic() -> TestResult {
     )
     .await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
-    assert_eq!(structured["summary"]["paths"], json!(["caller.rs"]));
+    assert_eq!(changed_paths(&structured), ["caller.rs"]);
     let findings = coded_findings(&structured, "rift.syntax.error");
     let finding = findings.first().unwrap_or_else(|| {
         panic!("provider syntax finding must ride applied change: {structured:#}")
@@ -352,10 +360,7 @@ async fn cold_parent_and_new_module_arrive_as_one_engine_batch() -> TestResult {
     )
     .await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
-    assert_eq!(
-        structured["summary"]["paths"],
-        json!(["fresh.rs", "lib.rs"])
-    );
+    assert_eq!(changed_paths(&structured), ["fresh.rs", "lib.rs"]);
     assert!(
         coded_findings(&structured, "E0583").is_empty(),
         "the parent must observe the new module in the same batch: {structured:#}"

@@ -723,14 +723,13 @@ mod tests {
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::change::{ChangeResult, RefusalReason};
     use rift_protocol::configuration::HistoryConfiguration;
-    use rift_syntax::ByteRange;
 
     use super::{
         CreatedDirectories, PreviousState, StagedMember, SymlinkResolution, publish_member,
         publish_rewrites, resolve_write_target, resolved_symlink_target,
     };
     use crate::read::ReadService;
-    use crate::rewrite::{FileRewrite, REWRITE_FILE_BYTES_MAX, ReplacedRegion};
+    use crate::rewrite::{FileRewrite, REWRITE_FILE_BYTES_MAX};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -894,19 +893,11 @@ mod tests {
                 path("lib.rs"),
                 "pub fn beacon() {}\n",
                 "pub fn one() {}\n".to_owned(),
-                vec![ReplacedRegion {
-                    range: ByteRange { start: 0, end: 20 },
-                    text: "pub fn one() {}\n".to_owned(),
-                }],
             ),
             FileRewrite::modify(
                 path("lib.rs"),
                 "pub fn beacon() {}\n",
                 "pub fn two() {}\n".to_owned(),
-                vec![ReplacedRegion {
-                    range: ByteRange { start: 0, end: 20 },
-                    text: "pub fn two() {}\n".to_owned(),
-                }],
             ),
         ];
         let refusal = publish_rewrites(&reads, directory.path(), &rewrites)?
@@ -941,10 +932,6 @@ mod tests {
                 path("small.rs"),
                 "pub fn beacon() {}\n",
                 "pub fn beacon() -> u8 { 1 }\n".to_owned(),
-                vec![ReplacedRegion {
-                    range: ByteRange { start: 0, end: 20 },
-                    text: "pub fn beacon() -> u8 { 1 }\n".to_owned(),
-                }],
             ),
             FileRewrite::create(path("huge.rs"), oversized_source),
         ];
@@ -1010,10 +997,6 @@ mod tests {
                 path("notes.txt"),
                 "original notes\n",
                 "changed notes\n".to_owned(),
-                vec![ReplacedRegion {
-                    range: ByteRange { start: 0, end: 15 },
-                    text: "changed notes\n".to_owned(),
-                }],
             ),
             FileRewrite::create(path("blocked.rs"), "pub fn blocked() {}\n".to_owned()),
         ];
@@ -1047,15 +1030,7 @@ mod tests {
         fs::set_permissions(&target, fs::Permissions::from_mode(0o751))?;
         let reads = reads_over(directory.path(), &SourceVisibility::default())?;
         let next = "#!/bin/sh\necho new\n";
-        let rewrites = vec![FileRewrite::modify(
-            path("run.sh"),
-            source,
-            next.to_owned(),
-            vec![ReplacedRegion {
-                range: ByteRange { start: 15, end: 18 },
-                text: "new".to_owned(),
-            }],
-        )];
+        let rewrites = vec![FileRewrite::modify(path("run.sh"), source, next.to_owned())];
         publish_rewrites(&reads, directory.path(), &rewrites)?
             .expect("an executable rewrite must publish");
         assert_eq!(fs::read_to_string(&target)?, next);
@@ -1081,10 +1056,6 @@ mod tests {
             path("notes.txt"),
             source,
             next.to_owned(),
-            vec![ReplacedRegion {
-                range: ByteRange { start: 0, end: 3 },
-                text: "new".to_owned(),
-            }],
         )];
         publish_rewrites(&reads, directory.path(), &rewrites)?
             .expect("a non-executable rewrite must publish");
@@ -1108,15 +1079,7 @@ mod tests {
         fs::create_dir(directory.path().join("blocked.rs"))?;
         let reads = reads_over(directory.path(), &SourceVisibility::default())?;
         let rewrites = vec![
-            FileRewrite::modify(
-                path("run.sh"),
-                source,
-                "#!/bin/sh\necho new\n".to_owned(),
-                vec![ReplacedRegion {
-                    range: ByteRange { start: 15, end: 18 },
-                    text: "new".to_owned(),
-                }],
-            ),
+            FileRewrite::modify(path("run.sh"), source, "#!/bin/sh\necho new\n".to_owned()),
             FileRewrite::create(path("blocked.rs"), "pub fn blocked() {}\n".to_owned()),
         ];
         let error = publish_rewrites(&reads, directory.path(), &rewrites)
@@ -1173,10 +1136,6 @@ mod tests {
             path("notes.txt"),
             source,
             next.to_owned(),
-            vec![ReplacedRegion {
-                range: ByteRange { start: 0, end: 3 },
-                text: "new".to_owned(),
-            }],
         )];
 
         publish_rewrites(&reads, directory.path(), &rewrites)?
@@ -1202,15 +1161,7 @@ mod tests {
         fs::create_dir(directory.path().join("blocked.rs"))?;
         let reads = reads_over(directory.path(), &SourceVisibility::default())?;
         let rewrites = vec![
-            FileRewrite::modify(
-                path("notes.txt"),
-                source,
-                "new notes\n".to_owned(),
-                vec![ReplacedRegion {
-                    range: ByteRange { start: 0, end: 3 },
-                    text: "new".to_owned(),
-                }],
-            ),
+            FileRewrite::modify(path("notes.txt"), source, "new notes\n".to_owned()),
             FileRewrite::create(path("blocked.rs"), "pub fn blocked() {}\n".to_owned()),
         ];
 
@@ -1337,15 +1288,7 @@ mod tests {
         fs::create_dir(directory.path().join("blocked.rs"))?;
         let reads = reads_over(directory.path(), &SourceVisibility::default())?;
         let rewrites = vec![
-            FileRewrite::modify(
-                path("phantom.rs"),
-                "",
-                "pub fn phantom() {}\n".to_owned(),
-                vec![ReplacedRegion {
-                    range: ByteRange { start: 0, end: 0 },
-                    text: "pub fn phantom() {}\n".to_owned(),
-                }],
-            ),
+            FileRewrite::modify(path("phantom.rs"), "", "pub fn phantom() {}\n".to_owned()),
             FileRewrite::create(path("blocked.rs"), "pub fn blocked() {}\n".to_owned()),
         ];
         let error = publish_rewrites(&reads, directory.path(), &rewrites)
@@ -1367,10 +1310,6 @@ mod tests {
             path("blocked.rs"),
             "",
             "pub fn blocked() {}\n".to_owned(),
-            vec![ReplacedRegion {
-                range: ByteRange { start: 0, end: 0 },
-                text: "pub fn blocked() {}\n".to_owned(),
-            }],
         )];
         let error = publish_rewrites(&reads, directory.path(), &rewrites)
             .expect_err("a modify target that is a directory must fail before staging");
@@ -1423,10 +1362,6 @@ mod tests {
                 path("notes.txt"),
                 "original notes\n",
                 "changed notes\n".to_owned(),
-                vec![ReplacedRegion {
-                    range: ByteRange { start: 0, end: 15 },
-                    text: "changed notes\n".to_owned(),
-                }],
             ),
             FileRewrite::create(path("new.rs"), "pub fn fresh() {}\n".to_owned()),
         ];
@@ -1497,19 +1432,11 @@ mod tests {
                 path("link.rs"),
                 "pub fn real() {}\n",
                 "pub fn one() {}\n".to_owned(),
-                vec![ReplacedRegion {
-                    range: ByteRange { start: 0, end: 17 },
-                    text: "pub fn one() {}\n".to_owned(),
-                }],
             ),
             FileRewrite::modify(
                 path("real.rs"),
                 "pub fn real() {}\n",
                 "pub fn two() {}\n".to_owned(),
-                vec![ReplacedRegion {
-                    range: ByteRange { start: 0, end: 17 },
-                    text: "pub fn two() {}\n".to_owned(),
-                }],
             ),
         ];
         let refusal = publish_rewrites(&reads, directory.path(), &rewrites)?

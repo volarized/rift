@@ -321,7 +321,7 @@ async fn transform_guarantees_are_refused_as_validation_only() -> TestResult {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn successful_transform_defines_final_edits_id_and_index_source() -> TestResult {
+async fn successful_transform_defines_final_files_id_and_index_source() -> TestResult {
     let hooks = [Hook {
         id: "format",
         kind: "format",
@@ -339,15 +339,15 @@ async fn successful_transform_defines_final_edits_id_and_index_source() -> TestR
         served_workspace(&hooks, &scripts, &[]).await?;
     let first = replace(&first_client, "pub fn beacon() -> u8 { 1 }").await?;
     assert_eq!(first["status"], json!("applied"));
-    assert_eq!(first["summary"]["paths"], json!(["lib.rs"]));
-    let edits = first["summary"]["edits"]
+    let files = first["summary"]["files"]
         .as_array()
-        .ok_or("applied result must carry edits")?;
-    assert!(
-        edits
-            .iter()
-            .any(|edit| edit["text"] == json!(FORMATTED_SOURCE)),
-        "final edits must carry formatter bytes: {first:#}"
+        .ok_or("applied result must carry files")?;
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["path"], json!("lib.rs"));
+    assert_eq!(
+        files[0]["size_bytes"],
+        json!(FORMATTED_SOURCE.len()),
+        "the reported size must be the formatter's own bytes: {first:#}"
     );
     assert_eq!(
         fs::read_to_string(first_directory.path().join("lib.rs"))?,
@@ -373,7 +373,7 @@ async fn successful_transform_defines_final_edits_id_and_index_source() -> TestR
 
 #[cfg(unix)]
 #[tokio::test]
-async fn workspace_transform_reports_every_final_path_and_edit() -> TestResult {
+async fn workspace_transform_reports_every_final_file() -> TestResult {
     let hooks = [Hook {
         id: "format",
         kind: "format",
@@ -393,13 +393,16 @@ async fn workspace_transform_reports_every_final_path_and_edit() -> TestResult {
     let (directory, client, server_task) = served_workspace(&hooks, &scripts, &files).await?;
     let result = replace(&client, "pub fn beacon() -> u8 { 1 }").await?;
     assert_eq!(result["status"], json!("applied"));
-    assert_eq!(result["summary"]["paths"], json!(["lib.rs", "notes.txt"]));
+    let files = result["summary"]["files"]
+        .as_array()
+        .ok_or("applied result must carry files")?;
     assert_eq!(
-        result["summary"]["edits"]
-            .as_array()
-            .ok_or("applied result must carry edits")?
-            .len(),
-        2
+        files
+            .iter()
+            .map(|file| file["path"].clone())
+            .collect::<Vec<_>>(),
+        [json!("lib.rs"), json!("notes.txt")],
+        "a workspace transform reports every file it left changed"
     );
     assert_eq!(
         fs::read_to_string(directory.path().join("notes.txt"))?,
@@ -493,7 +496,7 @@ async fn failed_transform_keeps_an_unclassified_direct_edit() -> TestResult {
     .await?;
 
     assert_eq!(result["status"], json!("applied"));
-    assert_eq!(result["summary"]["paths"], json!(["Cargo.lock"]));
+    assert_eq!(result["summary"]["files"][0]["path"], json!("Cargo.lock"));
     assert_eq!(
         fs::read_to_string(directory.path().join("Cargo.lock"))?,
         "version = 3\n",
@@ -789,7 +792,7 @@ async fn transform_that_erases_direct_difference_returns_unchanged() -> TestResu
 
 #[cfg(unix)]
 #[tokio::test]
-async fn hook_permission_writes_are_restored_and_never_reported_as_byte_edits() -> TestResult {
+async fn hook_permission_writes_are_restored_and_never_reported_as_changed_files() -> TestResult {
     use std::os::unix::fs::PermissionsExt;
 
     let cases = [
@@ -823,12 +826,12 @@ async fn hook_permission_writes_are_restored_and_never_reported_as_byte_edits() 
             "hook permission write must be restored for {id}"
         );
         assert_eq!(
-            result["summary"]["edits"]
+            result["summary"]["files"]
                 .as_array()
-                .ok_or("applied result must carry edits")?
+                .ok_or("applied result must carry files")?
                 .len(),
             1,
-            "permission state must not produce a byte edit for {id}"
+            "permission state must not report a second changed file for {id}"
         );
         assert_eq!(diagnostic(&result, id)?["severity"], json!("warning"));
         assert!(

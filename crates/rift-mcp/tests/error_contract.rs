@@ -170,13 +170,38 @@ async fn raw_patch_without_headers_names_the_minimal_envelope() -> TestResult {
         failing_wire_error(directory.path(), "patch", json!({ "patch": "not a diff" })).await?;
     let parsed: ErrorData = serde_json::from_value(wire)?;
     assert!(
-        parsed.message.contains("--- a/path"),
+        parsed.message.contains("--- a/src/lib.rs"),
         "patch error must show the minimal original header: {}",
         parsed.message
     );
     assert!(
-        parsed.message.contains("+++ b/path"),
+        parsed.message.contains("+++ b/src/lib.rs"),
         "patch error must show the minimal replacement header: {}",
+        parsed.message
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn apply_patch_envelope_is_refused_naming_the_unified_diff_form() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+    fs::write(
+        directory.path().join("rift.toml"),
+        hermetic_search::SEMANTIC_DISABLED,
+    )?;
+
+    let envelope = "*** Begin Patch\n*** Update File: lib.rs\n@@\n-pub fn beacon() {}\n+pub fn beacon() { }\n*** End Patch\n";
+    let wire = failing_wire_error(directory.path(), "patch", json!({ "patch": envelope })).await?;
+    let parsed: ErrorData = serde_json::from_value(wire)?;
+    assert!(
+        parsed.message.contains("*** Begin Patch"),
+        "patch error must name the envelope that arrived: {}",
+        parsed.message
+    );
+    assert!(
+        parsed.message.contains("--- a/"),
+        "patch error must name the unified-diff form to send: {}",
         parsed.message
     );
     Ok(())

@@ -468,7 +468,7 @@ own writes cannot pull a later hook into the run.
 
 Transform hooks run after direct edits, in configured order. A passing transform may keep source
 writes inside its declared `writes` scope. Rift restores a failed transform, a write outside that
-scope, or any source permission change. It then computes `paths`, `edits`, and change `id` from
+scope, or any source permission change. It then computes the changed `files` and change `id` from
 the difference between original tree and final transformed tree. A transform that restores every
 direct difference returns `unchanged`, not `applied`.
 

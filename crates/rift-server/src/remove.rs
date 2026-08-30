@@ -1,7 +1,7 @@
 //! Declaration and node removal, checked against a configured language engine's references.
 //!
 //! Each removal resolves the span its `replace_` neighbour resolves, widens it over the
-//! separator that followed, and applies one `Edit::Replace` with empty text. Before it
+//! separator that followed, and rewrites the file without those bytes. Before it
 //! writes, the server asks the language engine configured for the declaration what still
 //! references it: a standing reference refuses unless `force` overrides the refusal, and an
 //! engine that cannot answer the question at all is not the same as one that answered it
@@ -34,7 +34,6 @@ use crate::rename::{
     NamePositions, PlanEnd, declaration_name_offset, failed_precondition, name_positions,
     plan_diagnostic, workspace_tree_root,
 };
-use crate::rewrite::ReplacedRegion;
 
 /// Most reference paths a removal's checked-reference finding names, deduplicated and
 /// sorted. A removal touching more references than this still refuses, or still applies
@@ -48,7 +47,6 @@ pub struct RemovePlan {
     pub(crate) path: CoreProjectPath,
     pub(crate) base_source: String,
     pub(crate) next_source: String,
-    pub(crate) replaced: ReplacedRegion,
     pub(crate) addresses: Vec<PreconditionAddress>,
     pub(crate) diagnostic: Option<Diagnostic>,
 }
@@ -325,10 +323,6 @@ fn built_plan(
         path: target.path,
         base_source: target.indexed_source,
         next_source,
-        replaced: ReplacedRegion {
-            range: widened,
-            text: String::new(),
-        },
         addresses,
         diagnostic,
     }
