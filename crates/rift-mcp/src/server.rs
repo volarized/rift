@@ -1269,7 +1269,9 @@ impl RiftMcp {
     /// file the workspace's `[source]` policy makes visible, parsed or not. Hunk
     /// context guards the change: a header's line numbers are hints and
     /// its line counts are read from the hunk's own body, as with
-    /// `git apply`. A `/dev/null` header creates or deletes the file. The
+    /// `git apply`. A `/dev/null` header creates or deletes the file. A body
+    /// that is not a unified diff, such as an `*** Begin Patch` envelope, is
+    /// refused naming the form to send. The
     /// result carries one edit per hunk, spanning the bytes it replaced.
     #[tool]
     async fn patch(

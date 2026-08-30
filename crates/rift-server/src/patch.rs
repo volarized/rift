@@ -67,6 +67,87 @@ const HUNK_HEADER_PREFIX: &str = "@@";
 /// instead of editing an existing one.
 const NULL_TARGET: &str = "/dev/null";
 
+/// Opens the `apply_patch` envelope some agents emit; not a unified diff.
+const APPLY_PATCH_ENVELOPE_OPENING: &str = "*** Begin Patch";
+
+/// The unified-diff form every shape refusal names.
+const UNIFIED_DIFF_EXPECTED_FORM: &str = "send a unified diff that opens each file with `--- a/src/lib.rs` and `+++ b/src/lib.rs` headers followed by `@@ -1,3 +1,4 @@` hunks, where context lines start with a space, removed lines with `-`, and added lines with `+`";
+
+/// Why a patch body is not a unified diff `patch` reads.
+#[derive(Debug, PartialEq, Eq)]
+enum PatchShapeViolation {
+    /// The body opens with the `apply_patch` envelope instead of a file header.
+    ApplyPatchEnvelope,
+    /// The body carries no file header at all.
+    NoFileHeaders,
+    /// The body carries a file header no hunk follows, and no `NULL_TARGET`
+    /// header, which creates or deletes its file without one.
+    NoHunks,
+    /// The body addresses more files than one diff may carry.
+    TooManyFiles { file_count: usize },
+}
+
+impl std::fmt::Display for PatchShapeViolation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApplyPatchEnvelope => write!(
+                formatter,
+                "is an `{APPLY_PATCH_ENVELOPE_OPENING}` envelope, which `patch` does not read: {UNIFIED_DIFF_EXPECTED_FORM}"
+            ),
+            Self::NoFileHeaders => {
+                write!(
+                    formatter,
+                    "carries no file headers: {UNIFIED_DIFF_EXPECTED_FORM}"
+                )
+            }
+            Self::NoHunks => write!(
+                formatter,
+                "carries a `{ORIGINAL_HEADER_PREFIX}a/path` file header with no `{HUNK_HEADER_PREFIX}` hunk after it: {UNIFIED_DIFF_EXPECTED_FORM}"
+            ),
+            Self::TooManyFiles { file_count } => write!(
+                formatter,
+                "addresses {file_count} files, more than {PATCH_FILES_MAX} files one diff may carry: {UNIFIED_DIFF_EXPECTED_FORM}"
+            ),
+        }
+    }
+}
+
+/// Whether `text` is a file header naming [`NULL_TARGET`] in place of a path.
+fn names_null_target(text: &str) -> bool {
+    text.strip_prefix(ORIGINAL_HEADER_PREFIX)
+        .or_else(|| text.strip_prefix(MODIFIED_HEADER_PREFIX))
+        == Some(NULL_TARGET)
+}
+
+/// Classifies why `patch` is not a unified diff `patch` reads, in precedence
+/// order: an `apply_patch` envelope, then a body carrying no file header, then
+/// more files than the bound, then a file header no hunk follows. A creation or
+/// deletion carries no hunk of its own, so a [`NULL_TARGET`] header excuses the
+/// last arm.
+fn patch_shape_violation(patch: &str) -> Option<PatchShapeViolation> {
+    let opening = line::lines_inclusive(patch)
+        .map(line::without_ending)
+        .find(|text| !text.trim().is_empty())
+        .unwrap_or_default();
+    let (_, segments) = split_at_marker(patch, |text| text.starts_with(ORIGINAL_HEADER_PREFIX));
+    let carries_hunk =
+        line::lines_inclusive(patch).any(|text| text.starts_with(HUNK_HEADER_PREFIX));
+    let carries_null_target = line::lines_inclusive(patch)
+        .map(line::without_ending)
+        .any(names_null_target);
+    match segments.len() {
+        _ if opening.starts_with(APPLY_PATCH_ENVELOPE_OPENING) => {
+            Some(PatchShapeViolation::ApplyPatchEnvelope)
+        }
+        0 => Some(PatchShapeViolation::NoFileHeaders),
+        file_count if file_count > PATCH_FILES_MAX => {
+            Some(PatchShapeViolation::TooManyFiles { file_count })
+        }
+        _ if !carries_hunk && !carries_null_target => Some(PatchShapeViolation::NoHunks),
+        _ => None,
+    }
+}
+
 /// Splits one unified diff into its per-file segments. Only a header line
 /// opens a segment: hunk body lines never start with `---` at column zero,
 /// because context lines carry a leading space and removals a single `-`.
@@ -77,20 +158,16 @@ const NULL_TARGET: &str = "/dev/null";
 /// change: they shed a CRLF ending, because the diff parser rejects `\r`
 /// in headers, and a hunk header's counts are replaced by the counts its
 /// own body carries.
+///
+/// # Errors
+///
+/// Returns [`ReadError`] naming the [`PatchShapeViolation`] when `patch` is
+/// not a unified diff this function can split.
 pub(crate) fn split_file_segments(patch: &str) -> Result<Vec<String>, ReadError> {
-    let (_, raw_segments) = split_at_marker(patch, |line| line.starts_with(ORIGINAL_HEADER_PREFIX));
-    if raw_segments.len() > PATCH_FILES_MAX {
-        return Err(ReadFault::invalid(
-            "patch",
-            format!("addresses more than {PATCH_FILES_MAX} files"),
-        ));
+    if let Some(violation) = patch_shape_violation(patch) {
+        return Err(ReadFault::invalid("patch", violation.to_string()));
     }
-    if raw_segments.is_empty() {
-        return Err(ReadFault::invalid(
-            "patch",
-            "carries no file headers; start a unified diff with `--- a/path` and `+++ b/path`",
-        ));
-    }
+    let (_, raw_segments) = split_at_marker(patch, |text| text.starts_with(ORIGINAL_HEADER_PREFIX));
     Ok(raw_segments
         .iter()
         .map(|raw| recounted_headers(&normalize_segment(raw)))
@@ -1899,6 +1976,80 @@ mod tests {
             "message must name the bound: {error}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn patch_shape_violation_names_an_apply_patch_envelope() {
+        assert_eq!(
+            super::patch_shape_violation(
+                "*** Begin Patch\n*** Update File: lib.rs\n@@\n-pub fn beacon() {}\n+pub fn beacon() { }\n*** End Patch\n"
+            ),
+            Some(super::PatchShapeViolation::ApplyPatchEnvelope),
+            "an envelope opening must outrank every other shape violation"
+        );
+    }
+
+    #[test]
+    fn patch_shape_violation_names_a_crlf_apply_patch_envelope() {
+        assert_eq!(
+            super::patch_shape_violation(
+                "*** Begin Patch\r\n*** Update File: lib.rs\r\n@@\r\n-a\r\n+b\r\n*** End Patch\r\n"
+            ),
+            Some(super::PatchShapeViolation::ApplyPatchEnvelope),
+            "a CRLF envelope opening must classify as the envelope it is"
+        );
+    }
+
+    #[test]
+    fn patch_shape_violation_names_a_body_carrying_no_file_header() {
+        assert_eq!(
+            super::patch_shape_violation("not a diff\n"),
+            Some(super::PatchShapeViolation::NoFileHeaders),
+            "a body with no `--- ` line carries no file header"
+        );
+    }
+
+    #[test]
+    fn patch_shape_violation_names_a_file_header_no_hunk_follows() {
+        assert_eq!(
+            super::patch_shape_violation("--- a/lib.rs\n+++ b/lib.rs\n"),
+            Some(super::PatchShapeViolation::NoHunks),
+            "headers without a `@@` line carry no hunk"
+        );
+    }
+
+    #[test]
+    fn patch_shape_violation_counts_the_files_past_the_bound() {
+        use std::fmt::Write as _;
+
+        let mut patch = String::new();
+        for index in 0..=super::PATCH_FILES_MAX {
+            let _ = writeln!(
+                patch,
+                "--- a/f{index}.rs\n+++ b/f{index}.rs\n@@ -1 +1 @@\n-x\n+y"
+            );
+        }
+        assert_eq!(
+            super::patch_shape_violation(&patch),
+            Some(super::PatchShapeViolation::TooManyFiles {
+                file_count: super::PATCH_FILES_MAX + 1
+            }),
+            "the violation must carry the file count that crossed the bound"
+        );
+    }
+
+    #[test]
+    fn patch_shape_violation_accepts_a_unified_diff() {
+        assert_eq!(
+            super::patch_shape_violation("--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-x\n+y\n"),
+            None,
+            "a diff with headers and a hunk carries no shape violation"
+        );
+        assert_eq!(
+            super::patch_shape_violation("--- /dev/null\n+++ b/empty.rs\n"),
+            None,
+            "a creation carries no hunk of its own"
+        );
     }
 
     #[test]

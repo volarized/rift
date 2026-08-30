@@ -5779,7 +5779,7 @@
       }
     },
     {
-      "description": "Applies unified-diff hunks to workspace files atomically. The target is any\nfile the workspace's `[source]` policy makes visible, parsed or not. Hunk\ncontext guards the change: a header's line numbers are hints and\nits line counts are read from the hunk's own body, as with\n`git apply`. A `/dev/null` header creates or deletes the file. The\nresult carries one edit per hunk, spanning the bytes it replaced.",
+      "description": "Applies unified-diff hunks to workspace files atomically. The target is any\nfile the workspace's `[source]` policy makes visible, parsed or not. Hunk\ncontext guards the change: a header's line numbers are hints and\nits line counts are read from the hunk's own body, as with\n`git apply`. A `/dev/null` header creates or deletes the file. A body\nthat is not a unified diff, such as an `*** Begin Patch` envelope, is\nrefused naming the form to send. The\nresult carries one edit per hunk, spanning the bytes it replaced.",
       "input_schema": {
         "$defs": {
           "BodySource": {
