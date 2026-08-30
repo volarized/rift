@@ -3921,6 +3921,46 @@ pub fn beacon() -> u64 {
         Ok(())
     }
 
+    /// Each configured hook is reported with its own path selection, beside the
+    /// language entries rather than inside one.
+    #[tokio::test]
+    async fn workspace_resource_reports_each_hook_with_its_path_selection() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(
+            directory.path(),
+            "[[hooks]]\nid = \"tests\"\nkind = \"test\"\ncommand = [\"true\"]\n\
+             determinism = \"deterministic\"\ninclude = [\"crates/**\"]\n\
+             exclude = [\"crates/generated/**\"]\n",
+        )?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+
+        let answer = server.read_workspace("rift://workspace").await?;
+        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = answer
+            .contents
+            .first()
+            .expect("a workspace read answers with one content")
+        else {
+            unreachable!("a workspace read answers with text");
+        };
+        let body: serde_json::Value = serde_json::from_str(text)?;
+        let hooks = body["hooks"].as_array().expect("hooks are an array");
+        assert_eq!(hooks.len(), 1, "{text}");
+        assert_eq!(hooks[0]["id"], serde_json::json!("tests"));
+        assert_eq!(hooks[0]["kind"], serde_json::json!("test"));
+        assert_eq!(hooks[0]["include"], serde_json::json!(["crates/**"]));
+        assert_eq!(
+            hooks[0]["exclude"],
+            serde_json::json!(["crates/generated/**"])
+        );
+        assert_eq!(
+            body["pagination"]["total_pages"],
+            serde_json::json!(1),
+            "one page holds the whole catalog: {text}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn workspace_resource_includes_an_unclassified_visible_file() -> TestResult {
         let directory = tempfile::tempdir()?;

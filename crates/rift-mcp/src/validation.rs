@@ -2694,6 +2694,34 @@ mod tests {
         Ok(())
     }
 
+    /// Every fingerprint answers one eight-character revision, and the three
+    /// states answer different ones: an absent file, an oversized one, and one
+    /// whose bytes were read must never share a revision.
+    #[test]
+    fn every_configuration_fingerprint_answers_its_own_wire_revision() {
+        let content = ConfigurationFingerprint::Content([7_u8; 32]);
+        let revisions = [
+            content.wire_revision(),
+            ConfigurationFingerprint::MissingOrUnreadable.wire_revision(),
+            ConfigurationFingerprint::Oversized(1 << 20).wire_revision(),
+        ];
+        for revision in &revisions {
+            assert_eq!(revision.len(), 8, "{revision}");
+            assert!(
+                revision
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+            );
+        }
+        let unique: std::collections::BTreeSet<&String> = revisions.iter().collect();
+        assert_eq!(unique.len(), revisions.len(), "{revisions:?}");
+        assert_ne!(
+            ConfigurationFingerprint::Oversized(1 << 20).wire_revision(),
+            ConfigurationFingerprint::Oversized(1 << 21).wire_revision(),
+            "two oversized files of different length answer different revisions"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn unreadable_configuration_bytes_fingerprint_as_missing() -> TestResult {

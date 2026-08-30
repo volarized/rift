@@ -3618,6 +3618,19 @@ mod tests {
         ] {
             assert!(refused.violation("command").is_some());
         }
+        assert!(matches!(
+            CommandInput::Program("/usr/bin/cargo".to_owned()).violation("command"),
+            Some(ConfigurationViolation::CommandProgramAbsolute { .. })
+        ));
+        for escaping in ["../evil", "bin/../evil", "./evil"] {
+            assert!(
+                matches!(
+                    CommandInput::Program(escaping.to_owned()).violation("command"),
+                    Some(ConfigurationViolation::CommandProgramDotSegment { .. })
+                ),
+                "a program path leaving the workspace is refused: {escaping}"
+            );
+        }
         let too_many = CommandInput::ProgramAndArguments(
             std::iter::once("tool".to_owned())
                 .chain((0..=COMMAND_ARGUMENTS_MAX).map(|_| "x".to_owned()))
@@ -3661,6 +3674,31 @@ mod tests {
             .resolve_language_lsp("python")
             .expect("named LSP must resolve");
         assert_eq!(resolved.name, Some("ty"));
+
+        configuration.languages.insert(
+            "rust".to_owned(),
+            LanguageConfiguration {
+                lsp: Some(LanguageLspConfiguration::Inline(lsp())),
+                ..LanguageConfiguration::default()
+            },
+        );
+        let inline = configuration
+            .resolve_language_lsp("rust")
+            .expect("an inline LSP must resolve");
+        assert_eq!(
+            inline.name, None,
+            "an inline process belongs to its own entry and carries no shared name"
+        );
+        assert_eq!(inline.configuration, &lsp());
+        assert!(
+            configuration.resolve_language_lsp("javascript").is_none(),
+            "a language with no entry resolves no process"
+        );
+        assert!(
+            configuration.resolve_language_lsp("python:stub").is_none()
+                || configuration.languages.contains_key("python:stub"),
+            "an entry with no lsp key resolves no process"
+        );
 
         configuration.languages.insert(
             "python:stub".to_owned(),

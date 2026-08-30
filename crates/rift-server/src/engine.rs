@@ -213,9 +213,10 @@ impl EnginePool {
             if let Some(session) = held.session.take() {
                 let stderr = session.shutdown().await;
                 slot.report_state(LspState::Stopped);
+                let engine = slot.name();
                 tracing::debug!(
                     component = "engine",
-                    engine = %slot.name(),
+                    engine,
                     stderr_bytes = stderr.total_bytes,
                     "language engine shut down"
                 );
@@ -635,11 +636,12 @@ impl EngineSlot {
 
     /// What one absorbed condition surfaces once attempt bound is spent.
     fn exhausted<T>(&self, absorbed: Transient<T>, attempts: u64) -> Result<T, EngineError> {
+        let engine = self.name();
         match absorbed {
             Transient::Analyzing | Transient::Unready => {
                 tracing::warn!(
                     component = "engine",
-                    engine = %self.name(),
+                    engine,
                     attempts,
                     "language engine was not ready on every attempt"
                 );
@@ -648,7 +650,7 @@ impl EngineSlot {
             Transient::Refused(refusal) => {
                 tracing::warn!(
                     component = "engine",
-                    engine = %self.name(),
+                    engine,
                     attempts,
                     "language engine refused every configured attempt"
                 );
@@ -657,7 +659,7 @@ impl EngineSlot {
             Transient::AnsweredNothing(answer) => {
                 tracing::debug!(
                     component = "engine",
-                    engine = %self.name(),
+                    engine,
                     attempts,
                     "language engine answered nothing through every configured attempt"
                 );
@@ -683,9 +685,10 @@ impl EngineSlot {
         loop {
             if !budget.claim(&self.configuration.restart, Instant::now()) {
                 self.report_state(LspState::Failed);
+                let engine = self.name();
                 tracing::warn!(
                     component = "engine",
-                    engine = %self.name(),
+                    engine,
                     attempts = self.configuration.restart.attempts,
                     "language engine restart budget is spent for this window"
                 );
@@ -728,9 +731,10 @@ impl EngineSlot {
     /// visible in the log.
     async fn reap(&self, dead: EngineSession) {
         let stderr = dead.shutdown().await;
+        let engine = self.name();
         tracing::warn!(
             component = "engine",
-            engine = %self.name(),
+            engine,
             stderr = %stderr.text,
             "language engine ended and was reaped"
         );
@@ -815,7 +819,10 @@ mod tests {
             (named.clone(), table("shared")),
             (inline.clone(), table("inline")),
         ]);
-        let bindings = BTreeMap::from([("python".to_owned(), named), ("rust".to_owned(), inline)]);
+        let bindings = BTreeMap::from([
+            ("python".to_owned(), named.clone()),
+            ("rust".to_owned(), inline.clone()),
+        ]);
         let built = EnginePool::new(Path::new("/rift-test-root"), definitions, bindings);
         assert_eq!(
             built
@@ -834,6 +841,22 @@ mod tests {
                 .command
                 .program(),
             "inline"
+        );
+        assert_eq!(
+            built
+                .engine_for(&language("python", None))
+                .expect("python binding")
+                .process_key(),
+            &named,
+            "a named definition keeps the name it was configured under"
+        );
+        assert_eq!(
+            built
+                .engine_for(&language("rust", None))
+                .expect("rust binding")
+                .process_key(),
+            &inline,
+            "an inline definition is keyed by the exact language identity owning it"
         );
     }
 

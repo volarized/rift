@@ -1348,7 +1348,8 @@ mod tests {
     use std::error::Error;
     use std::fs;
 
-    use rift_core::SourceVisibility;
+    use rift_core::{LanguageFileSelections, SourceVisibility};
+    use rift_protocol::configuration::{LanguageConfiguration, WorkspaceConfiguration};
     use rift_protocol::read::{
         GetSymbolParams, Language, NodeFacet, NodesParams, NodesResult, ProjectPath, ReadWarning,
         RevisionId,
@@ -1360,6 +1361,88 @@ mod tests {
     use super::{HistoryConfiguration, ReadFault, ReadService, WorkspaceIndexLimits, file_id};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+    /// A read snapshot over `root` under `limits` and `languages`, built through the
+    /// same entry point the server itself uses.
+    fn reads_with(
+        root: &std::path::Path,
+        limits: WorkspaceIndexLimits,
+        text_inclusion: &rift_core::TextFileInclusion,
+        languages: &LanguageFileSelections,
+    ) -> Result<ReadService, super::ReadError> {
+        ReadService::build_with_languages(
+            root,
+            limits,
+            &SourceVisibility::default(),
+            text_inclusion,
+            languages,
+            HistoryConfiguration::default(),
+        )
+    }
+
+    /// One workspace whose `rust` entry is turned off: `lib.rs` stays a real visible
+    /// file that no shipped grammar reaches.
+    fn disabled_rust_fixture() -> TestResult<(TempDir, ReadService)> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.languages.insert(
+            "rust".to_owned(),
+            LanguageConfiguration {
+                enabled: false,
+                ..LanguageConfiguration::default()
+            },
+        );
+        let languages = LanguageFileSelections::from(&configuration);
+        let limits = WorkspaceIndexLimits::default();
+        let text_inclusion = rift_core::TextFileInclusion::default();
+        let service = reads_with(directory.path(), limits, &text_inclusion, &languages)?;
+        Ok((directory, service))
+    }
+
+    #[test]
+    fn nodes_on_a_path_a_disabled_language_claims_name_the_configurable_capability() -> TestResult {
+        let (_directory, service) = disabled_rust_fixture()?;
+
+        let error = service
+            .nodes(NodesParams {
+                path: ProjectPath("lib.rs".to_owned()),
+                position: 0,
+                rev: None,
+            })
+            .expect_err("a language entry that is turned off serves no syntax");
+
+        let fault = error.fault();
+        assert!(
+            matches!(fault, ReadFault::Unsupported { capability } if capability == "rust files"),
+            "an entry the workspace can turn back on refuses as a capability, not as an \
+             unclaimed extension: {fault:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_gitignore_chain_past_the_file_bound_refuses_the_snapshot() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join(".gitignore"), "build\n")?;
+        fs::create_dir(directory.path().join("nested"))?;
+        fs::write(directory.path().join("nested/.gitignore"), "out\n")?;
+        let limits = WorkspaceIndexLimits::new(1, 1_024, 1_048_576, 16, 64)?;
+        // No text pattern selects the ignore files themselves, so the index reads none of
+        // them and the file bound is spent on the chain the source policy compiles.
+        let text_inclusion = rift_core::TextFileInclusion::new(Vec::new(), 1_024);
+        let languages = LanguageFileSelections::default();
+
+        let error = reads_with(directory.path(), limits, &text_inclusion, &languages)
+            .expect_err("an ignore chain past the file bound cannot be compiled");
+
+        let fault = error.fault();
+        assert!(
+            matches!(fault, ReadFault::Index(_)),
+            "unexpected fault {fault:?}"
+        );
+        Ok(())
+    }
 
     fn fixture() -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
@@ -3003,6 +3086,37 @@ pub fn compute() -> i32 {
             &SourceVisibility::default(),
             HistoryConfiguration::default(),
         )
+    }
+
+    #[test]
+    fn a_revision_snapshot_names_the_capture_it_refuses() -> TestResult {
+        let directory = committed_fixture()?;
+        let service = revision_service(directory.path(), "main")?;
+
+        let entries = service
+            .capture_visible_workspace_entries()
+            .expect_err("a revision snapshot has no filesystem tree to walk");
+        let digests = service
+            .visible_workspace_digests()
+            .expect_err("a revision snapshot has no filesystem tree to digest");
+
+        let entries_fault = entries.fault();
+        assert!(
+            matches!(
+                entries_fault,
+                ReadFault::Task { operation, .. } if *operation == "capture visible workspace entries"
+            ),
+            "unexpected fault {entries_fault:?}"
+        );
+        let digests_fault = digests.fault();
+        assert!(
+            matches!(
+                digests_fault,
+                ReadFault::Task { operation, .. } if *operation == "capture visible workspace digests"
+            ),
+            "unexpected fault {digests_fault:?}"
+        );
+        Ok(())
     }
 
     #[test]

@@ -1013,10 +1013,7 @@ impl WorkspaceIndex {
         let mut warnings = Vec::new();
         let mut files = BTreeMap::new();
         let mut text_files = BTreeMap::new();
-        for path in classified.source {
-            let Some(ClassifiedPath::Source(provider)) = language.classifies(&path)? else {
-                continue;
-            };
+        for (path, provider) in classified.source {
             match read_catalog_file(&root, &path, limits, &mut workspace_bytes)? {
                 CatalogRead::Included(text_file) => {
                     let file = indexed_file_from_catalog(&text_file, &path, provider)?;
@@ -1734,7 +1731,9 @@ fn provider_error(source: impl std::error::Error + Send + Sync + 'static) -> Wor
 /// Source and text paths [`discover`] found below one root, each list sorted by path.
 #[derive(Debug, Default)]
 struct DiscoveredPaths {
-    source: Vec<PathBuf>,
+    /// Each source path with the provider that claimed it, so the caller
+    /// never asks the language table the same question twice.
+    source: Vec<(PathBuf, &'static dyn SyntaxProvider)>,
     text: Vec<PathBuf>,
 }
 
@@ -1783,11 +1782,15 @@ fn discover(
             return Err(index_error_at(WorkspaceIndexViolation::TooManyFiles, path));
         }
         match class {
-            ClassifiedPath::Source(_) => discovered.source.push(path.to_path_buf()),
+            ClassifiedPath::Source(provider) => {
+                discovered.source.push((path.to_path_buf(), provider));
+            }
             ClassifiedPath::Text => discovered.text.push(path.to_path_buf()),
         }
     }
-    discovered.source.sort();
+    discovered
+        .source
+        .sort_by(|left, right| left.0.cmp(&right.0));
     discovered.text.sort();
     Ok(discovered)
 }
@@ -1881,13 +1884,8 @@ fn capture_paths(
 ) -> Result<WorkspaceDigests, WorkspaceIndexError> {
     let mut digests = BTreeMap::new();
     let mut workspace_bytes = 0_usize;
-    capture_path_class(
-        &mut digests,
-        &mut workspace_bytes,
-        root,
-        &paths.source,
-        limits,
-    )?;
+    let source: Vec<PathBuf> = paths.source.iter().map(|(path, _)| path.clone()).collect();
+    capture_path_class(&mut digests, &mut workspace_bytes, root, &source, limits)?;
     capture_path_class(
         &mut digests,
         &mut workspace_bytes,
@@ -3130,6 +3128,177 @@ mod tests {
         assert!(entries.iter().all(|entry| entry.bytes().is_none()));
     }
 
+    /// A file the workspace holds but the process cannot read refuses both
+    /// capture paths, and the refusal names the file to fix.
+    #[cfg(unix)]
+    #[test]
+    fn test_visible_capture_refuses_an_unreadable_file_and_names_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let root = fs::canonicalize(directory.path()).expect("canonical root");
+        let sealed = root.join("sealed.txt");
+        fs::write(&sealed, "secret\n").expect("sealed file");
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000)).expect("revoke read");
+        let policy = WorkspaceSourcePolicy::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("source policy");
+
+        let capture_error = policy
+            .visible_entries()
+            .expect_err("an unreadable file refuses capture");
+        let digest_error = policy
+            .visible_digest(&sealed)
+            .expect_err("an unreadable file refuses a digest read");
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o644)).expect("restore read");
+
+        assert_eq!(
+            capture_error.fault().violation(),
+            WorkspaceIndexViolation::Filesystem
+        );
+        assert_eq!(capture_error.fault().path(), Some(sealed.as_path()));
+        assert_eq!(
+            digest_error.fault().violation(),
+            WorkspaceIndexViolation::Filesystem
+        );
+        assert_eq!(digest_error.fault().path(), Some(sealed.as_path()));
+    }
+
+    /// Language selection answers only for a path visibility already accepted:
+    /// one that does not normalize under the watched root, and one `[source]`
+    /// excludes, both select nothing rather than reaching the language table.
+    #[test]
+    fn test_language_for_path_answers_none_outside_the_root_and_for_an_excluded_path() {
+        let directory = fixture();
+        fs::write(
+            directory.path().join("excluded.rs"),
+            "pub fn excluded() {}\n",
+        )
+        .expect("excluded source");
+        let visibility = SourceVisibility::new(Vec::new(), vec!["excluded.rs".to_owned()], true);
+        let policy = WorkspaceSourcePolicy::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &visibility,
+            &TextFileInclusion::default(),
+        )
+        .expect("source policy");
+        let selected = policy
+            .language_for_path(&directory.path().join("src/lib.rs"))
+            .expect("lookup")
+            .expect("a visible Rust path selects the shipped entry");
+        assert_eq!(selected.identity(), "rust");
+        assert!(
+            policy
+                .language_for_path(Path::new("outside.rs"))
+                .expect("lookup")
+                .is_none(),
+            "a path that does not normalize under the watched root selects nothing"
+        );
+        assert!(
+            policy
+                .language_for_path(&directory.path().join("excluded.rs"))
+                .expect("lookup")
+                .is_none(),
+            "a [source] exclude match selects nothing"
+        );
+    }
+
+    /// A digest read answers for what the policy shows and stays silent for what
+    /// it hides, so a hidden file never contributes workspace state.
+    #[test]
+    fn test_visible_digest_answers_none_for_a_path_the_policy_hides() {
+        let directory = fixture();
+        fs::write(
+            directory.path().join("excluded.rs"),
+            "pub fn excluded() {}\n",
+        )
+        .expect("excluded source");
+        let visibility = SourceVisibility::new(Vec::new(), vec!["excluded.rs".to_owned()], true);
+        let policy = WorkspaceSourcePolicy::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &visibility,
+            &TextFileInclusion::default(),
+        )
+        .expect("source policy");
+        assert!(
+            policy
+                .visible_digest(&directory.path().join("src/lib.rs"))
+                .expect("digest read")
+                .is_some(),
+            "a visible file answers with its digest"
+        );
+        assert!(
+            policy
+                .visible_digest(&directory.path().join("excluded.rs"))
+                .expect("digest read")
+                .is_none(),
+            "a hidden file answers with nothing"
+        );
+    }
+
+    /// Capture walks the same bounded tree the index does: a directory below the
+    /// configured depth refuses rather than truncating the capture silently.
+    #[test]
+    fn test_visible_entries_refuse_a_directory_below_the_configured_depth_bound() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        fs::create_dir_all(directory.path().join("outer/inner")).expect("nested directories");
+        fs::write(directory.path().join("outer/inner/deep.txt"), "deep\n").expect("nested file");
+        let shallow = WorkspaceIndexLimits::new(8, 64, 128, 1, 8).expect("bounds");
+        let policy = WorkspaceSourcePolicy::build(
+            directory.path(),
+            shallow,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("source policy");
+        let error = policy
+            .visible_entries()
+            .expect_err("a second directory level crosses a one-level depth bound");
+        assert_eq!(error.fault().violation(), WorkspaceIndexViolation::TooDeep);
+    }
+
+    /// Once retained content crosses the aggregate workspace bound, every later
+    /// file keeps its path and permissions and loses its bytes: the capture stays
+    /// complete as a path list while the read stays bounded.
+    #[test]
+    fn test_visible_entries_leave_bytes_absent_once_the_workspace_bound_is_crossed() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(directory.path().join(name), "0123456789\n").expect("fixture file");
+        }
+        let limits = WorkspaceIndexLimits::new(8, 64, 11, 8, 8).expect("bounds");
+        let policy = WorkspaceSourcePolicy::build(
+            directory.path(),
+            limits,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("source policy");
+        let entries = policy.visible_entries().expect("bounded visible entries");
+        let paths: Vec<&str> = entries.iter().map(|entry| entry.path().as_str()).collect();
+        assert_eq!(
+            paths,
+            ["a.txt", "b.txt", "c.txt"],
+            "every visible path stays in the capture"
+        );
+        let captured: Vec<&str> = entries
+            .iter()
+            .filter(|entry| entry.bytes().is_some())
+            .map(|entry| entry.path().as_str())
+            .collect();
+        assert_eq!(
+            captured,
+            ["a.txt"],
+            "the file that crosses the aggregate bound and every file after it lose their bytes"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_index_skips_symlinks_and_state_directories() {
@@ -3299,6 +3468,23 @@ mod tests {
             .force_include_files(&["outer/**".to_owned()], 10)
             .expect_err("a directory past the depth bound must refuse");
         assert_eq!(error.fault().violation(), WorkspaceIndexViolation::TooDeep);
+    }
+
+    /// The force-include walk carries syntax facts only. A matched path the text
+    /// lane claims is skipped there, so provider parsing stays separate from file
+    /// content.
+    #[test]
+    fn test_force_include_skips_a_matched_path_the_text_lane_claims() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        fs::write(directory.path().join("notes.txt"), "prose\n").expect("prose");
+        let index = build_index(&directory, &SourceVisibility::default()).expect("index");
+        let extra = index
+            .force_include_files(&["notes.txt".to_owned()], 10)
+            .expect("force_include walk");
+        assert!(
+            extra.is_empty(),
+            "a text-lane path carries no syntax facts to force-include"
+        );
     }
 
     #[test]
@@ -3964,8 +4150,13 @@ mod tests {
     /// Builds a [`DiscoveredPaths`] with `source` classified as source and no text paths, for
     /// tests exercising [`capture_paths`] directly.
     fn source_only(source: Vec<PathBuf>) -> DiscoveredPaths {
+        let provider = registry::provider_for_language(&rift_protocol::read::Language {
+            name: "rust".to_owned(),
+            dialect: None,
+        })
+        .expect("the shipped Rust provider");
         DiscoveredPaths {
-            source,
+            source: source.into_iter().map(|path| (path, provider)).collect(),
             text: Vec::new(),
         }
     }
@@ -4537,6 +4728,64 @@ mod tests {
                 .expect("rebuilt script")
                 .executable(),
             "permission-only change must refresh indexed metadata"
+        );
+    }
+
+    /// The effective language table compiles before any file is read, so an
+    /// invalid `[search.text].include` pattern refuses the whole scan.
+    #[test]
+    fn test_build_refuses_an_invalid_text_include_pattern() {
+        let directory = fixture();
+        let error = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::new(vec!["[".to_owned()], 1_024),
+        )
+        .expect_err("an unclosed character class must refuse");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::SourcePatternInvalid
+        );
+    }
+
+    /// An empty `[search.text].include` selects no plain text, so a path no
+    /// language claims joins neither lane - on the whole scan and on the
+    /// incremental rebuild that follows it.
+    #[test]
+    fn test_an_empty_text_selection_leaves_an_unclaimed_path_out_of_both_lanes() {
+        let directory = fixture();
+        fs::write(directory.path().join("notes.ini"), "[section]\nkey = 1\n")
+            .expect("an extension no language claims");
+        let source = ProjectPath::new("src/lib.rs").expect("project path");
+        let notes = ProjectPath::new("notes.ini").expect("project path");
+        let prose = ProjectPath::new("README.txt").expect("project path");
+        let index = indexed(directory.path(), &TextFileInclusion::new(Vec::new(), 1_024));
+        assert!(
+            index.file(&source).is_some(),
+            "a shipped language still claims its own path"
+        );
+        assert!(
+            index.text_file(&notes).is_none(),
+            "no text pattern selects the unclaimed path"
+        );
+        assert!(
+            index.text_file(&prose).is_none(),
+            "no text pattern selects prose either"
+        );
+
+        fs::write(directory.path().join("notes.ini"), "[section]\nkey = 2\n")
+            .expect("unclaimed rewrite");
+        let changes = resolved(&index, directory.path(), &["notes.ini"]);
+        assert_eq!(changes.len(), 1, "the rewrite is one named change");
+        let rebuilt = index.rebuilt(&changes).expect("incremental rebuild");
+        assert!(
+            rebuilt.text_file(&notes).is_none(),
+            "the rebuild drops the unclaimed path the same way the scan did"
+        );
+        assert!(
+            rebuilt.file(&source).is_some(),
+            "the rebuild keeps every claimed path it shares with the previous index"
         );
     }
 

@@ -1798,6 +1798,22 @@ mod tests {
     use schemars::schema_for;
     use serde_json::json;
 
+    /// A refused identity segment renders with the segment it read and the two
+    /// forms it accepts, so an operator fixing `rift.toml` sees both.
+    #[test]
+    fn a_refused_language_identity_names_the_segment_and_the_accepted_forms() {
+        let error =
+            Language::from_identity_segment("Rust").expect_err("an uppercase word is refused");
+        assert_eq!(error.segment(), "Rust");
+        let rendered = error.to_string();
+        assert!(rendered.contains("\"Rust\""), "{rendered}");
+        assert!(rendered.contains("name:dialect"), "{rendered}");
+        assert!(
+            std::error::Error::source(&error).is_none(),
+            "the refusal carries no source"
+        );
+    }
+
     /// Attribute arguments and `#[serde(default = ...)]` functions are both compiled apart
     /// from the schema; this pins the advertised default to the constant the field's
     /// default function returns.

@@ -101,3 +101,7 @@ path = "tests/source_exclusion.rs"
 [[test]]
 name = "surface_validation"
 path = "tests/surface_validation.rs"
+
+[[test]]
+name = "workspace_resource"
+path = "tests/workspace_resource.rs"

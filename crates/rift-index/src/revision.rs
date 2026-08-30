@@ -328,6 +328,56 @@ mod tests {
         assert!(!has_symbol(&index, "floor"), "the hard floor applies");
     }
 
+    /// The effective language table compiles before any blob is read, so an
+    /// invalid `[search.text].include` pattern refuses the whole revision read.
+    #[test]
+    fn test_at_revision_refuses_an_invalid_text_include_pattern() {
+        let directory = committed_workspace();
+        let (repository, head) = open_head(directory.path());
+        let error = WorkspaceIndex::at_revision_with_languages(
+            &repository,
+            &head,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::new(vec!["[".to_owned()], 1_024),
+            &rift_core::LanguageFileSelections::default(),
+        )
+        .expect_err("an unclosed character class must refuse");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::SourcePatternInvalid
+        );
+    }
+
+    /// An empty `[search.text].include` selects no plain text, so a committed
+    /// path no language claims joins neither lane of the revision index.
+    #[test]
+    fn test_at_revision_with_an_empty_text_selection_drops_a_path_no_language_claims() {
+        let directory = committed_workspace();
+        let (repository, head) = open_head(directory.path());
+        let index = WorkspaceIndex::at_revision_with_languages(
+            &repository,
+            &head,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::new(Vec::new(), 1_024),
+            &rift_core::LanguageFileSelections::default(),
+        )
+        .expect("revision index");
+        assert!(
+            index
+                .file(&ProjectPath::new("src/lib.rs").expect("path"))
+                .is_some(),
+            "a shipped language still claims its own committed path"
+        );
+        assert!(
+            index
+                .text_file(&ProjectPath::new("README.txt").expect("path"))
+                .is_none(),
+            "no text pattern selects the committed prose file"
+        );
+    }
+
     #[test]
     fn test_at_revision_composition_names_the_history_source_step() {
         let directory = committed_workspace();

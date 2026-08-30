@@ -26,17 +26,21 @@ use process_lifecycle::{
 };
 use rift_core::ProjectPath;
 use rift_lsp::session::{EngineFault, EngineSession};
-use rift_protocol::configuration::Duration;
+use rift_protocol::configuration::{Duration, LspConfiguration};
 use rift_protocol::read::Language;
 use rift_protocol::retry::RestartPolicy;
+use rift_protocol::workspace::LspState;
 use rift_server::{EnginePool, LspProcessKey};
 
 mod process_lifecycle;
 
-fn pool_of(
-    workspace: &Path,
-    entries: Vec<(&str, process_lifecycle::ProcessFixture)>,
-) -> EnginePool {
+type ProcessTables = (
+    std::collections::BTreeMap<LspProcessKey, LspConfiguration>,
+    std::collections::BTreeMap<String, LspProcessKey>,
+);
+
+/// The accepted process definitions and language bindings `entries` name.
+fn tables_of(entries: Vec<(&str, process_lifecycle::ProcessFixture)>) -> ProcessTables {
     let mut definitions = std::collections::BTreeMap::new();
     let mut bindings = std::collections::BTreeMap::new();
     for (name, fixture) in entries {
@@ -46,6 +50,14 @@ fn pool_of(
             bindings.insert(language, key.clone());
         }
     }
+    (definitions, bindings)
+}
+
+fn pool_of(
+    workspace: &Path,
+    entries: Vec<(&str, process_lifecycle::ProcessFixture)>,
+) -> EnginePool {
+    let (definitions, bindings) = tables_of(entries);
     EnginePool::new(workspace, definitions, bindings)
 }
 
@@ -486,4 +498,49 @@ async fn an_engine_that_dies_mid_request_is_replaced_before_the_caller_sees_it()
         .await
         .expect("the replacement answers the same operation");
     pool.shutdown().await;
+}
+
+/// A replacement pool that reuses one slot leaves that engine running, and
+/// the slot it does not reuse is ended and reports `stopped`.
+#[tokio::test]
+async fn shutdown_replaced_by_ends_only_the_engines_the_replacement_drops() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let (definitions, bindings) = tables_of(vec![
+        (
+            "kept",
+            answers(&[ok_response(1), ok_response(2)], &["rust"]),
+        ),
+        ("dropped", answers(&[ok_response(1)], &["python"])),
+    ]);
+    let pool = EnginePool::new(workspace.path(), definitions.clone(), bindings.clone());
+    rename_through(&pool, "rust", "renamed")
+        .await
+        .expect("the reused engine serves");
+    rename_through(&pool, "python", "renamed")
+        .await
+        .expect("the dropped engine serves");
+
+    let dropped = LspProcessKey::named("dropped");
+    let mut retimed = definitions;
+    retimed
+        .get_mut(&dropped)
+        .expect("the dropped definition")
+        .request_timeout = Duration::from_millis(5_000);
+    let replacement = pool.reconfigure(workspace.path(), retimed, bindings);
+    pool.shutdown_replaced_by(&replacement).await;
+
+    assert_eq!(
+        pool.state_for_key(&dropped),
+        Some(LspState::Stopped),
+        "an engine the replacement does not share is ended"
+    );
+    assert_ne!(
+        pool.state_for_key(&LspProcessKey::named("kept")),
+        Some(LspState::Stopped),
+        "a shared slot is one allocation, so ending it would end the replacement's engine too"
+    );
+    rename_through(&replacement, "rust", "again")
+        .await
+        .expect("the shared engine keeps serving through the replacement pool");
+    replacement.shutdown().await;
 }

@@ -449,6 +449,55 @@ mod tests {
         assert!(message.contains("rust") && message.contains("python"));
     }
 
+    /// A pattern the glob engine refuses refuses the whole policy, whether the
+    /// entry names a language this build ships or one it does not.
+    #[test]
+    fn test_an_invalid_include_pattern_refuses_for_a_shipped_and_an_unshipped_language() {
+        for identity in ["rust", "python"] {
+            let mut configuration = WorkspaceConfiguration::default();
+            configuration.languages.insert(
+                identity.to_owned(),
+                LanguageConfiguration {
+                    include: Some(vec![rift_protocol::read::PathPattern("[".to_owned())]),
+                    ..LanguageConfiguration::default()
+                },
+            );
+            let error = WorkspaceLanguagePolicy::build(
+                Path::new("/workspace"),
+                &LanguageFileSelections::from(&configuration),
+                &TextFileInclusion::from(&configuration.search),
+            )
+            .expect_err("an unclosed character class must refuse");
+            assert_eq!(
+                error.fault().violation(),
+                WorkspaceIndexViolation::SourcePatternInvalid,
+                "the {identity} entry names the pattern rule it broke"
+            );
+        }
+    }
+
+    /// Both refusals name the exact keys an operator has to reconcile: the
+    /// language whose entry carries no patterns, and the two entries one path
+    /// matched.
+    #[test]
+    fn test_language_policy_error_display_names_the_keys_to_reconcile() {
+        let include_required = LanguagePolicyError::IncludeRequired {
+            language: "python".to_owned(),
+        };
+        assert_eq!(
+            include_required.to_string(),
+            "unshipped language \"python\" requires a nonempty include list"
+        );
+        let conflict = LanguagePolicyError::MatchConflict {
+            first: "rust".to_owned(),
+            second: "python".to_owned(),
+        };
+        assert_eq!(
+            conflict.to_string(),
+            "one path matches language entries \"rust\" and \"python\""
+        );
+    }
+
     /// A `rift://workspace` page reports one entry per shipped provider plus
     /// one per configured entry the shipped set does not name, so the page's
     /// advertised bound has to cover both.

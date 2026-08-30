@@ -1609,7 +1609,7 @@ mod tests {
     use rift_syntax::ByteRange;
 
     use super::ChangeService;
-    use crate::read::{ReadService, digest_hex8};
+    use crate::read::{ReadFault, ReadService, digest_hex8};
     use crate::rewrite::{FileRewrite, REWRITE_FILE_BYTES_MAX, ReplacedRegion};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -1633,6 +1633,51 @@ mod tests {
             &rift_core::TextFileInclusion::default(),
             HistoryConfiguration::default(),
         )?;
+        let changes = ChangeService::new(directory.path());
+        Ok((directory, reads, changes))
+    }
+
+    /// A read snapshot over `root` under one workspace's configured language entries.
+    fn reads_with_languages(
+        root: &std::path::Path,
+        configuration: &WorkspaceConfiguration,
+    ) -> Result<ReadService, crate::read::ReadError> {
+        ReadService::build_with_languages(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            &LanguageFileSelections::from(configuration),
+            HistoryConfiguration::default(),
+        )
+    }
+
+    /// A read snapshot over `root` under `limits`.
+    fn reads_within(
+        root: &std::path::Path,
+        limits: WorkspaceIndexLimits,
+    ) -> Result<ReadService, crate::read::ReadError> {
+        ReadService::build(
+            root,
+            limits,
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )
+    }
+
+    /// A workspace whose per-file capture bound is `file_bytes_max`, so a file past it
+    /// is visible and carries permissions while its bytes stay uncaptured.
+    fn bounded_fixture(
+        files: &[(&str, &str)],
+        file_bytes_max: usize,
+    ) -> TestResult<(tempfile::TempDir, ReadService, ChangeService)> {
+        let directory = tempfile::tempdir()?;
+        for (name, source) in files {
+            fs::write(directory.path().join(name), source)?;
+        }
+        let limits = WorkspaceIndexLimits::new(64, file_bytes_max, 1_048_576, 16, 64)?;
+        let reads = reads_within(directory.path(), limits)?;
         let changes = ChangeService::new(directory.path());
         Ok((directory, reads, changes))
     }
@@ -4222,14 +4267,7 @@ mod tests {
                 ..LanguageConfiguration::default()
             },
         );
-        let reads = ReadService::build_with_languages(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::default(),
-            &LanguageFileSelections::from(&configuration),
-            HistoryConfiguration::default(),
-        )?;
+        let reads = reads_with_languages(directory.path(), &configuration)?;
         let path = CoreProjectPath::new("lib.rs")?;
         let unit = FileId("rift://file/lib.rs".to_owned());
 
@@ -4647,6 +4685,95 @@ mod tests {
             lock
         );
         assert!(!directory.path().join("justfile").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_hook_result_carries_the_files_a_hook_created_and_deleted() -> TestResult {
+        let (directory, reads, changes) =
+            multi_file_fixture(&[("lib.rs", "pub fn beacon() {}\n")])?;
+        let params = ReplaceSymbolParams {
+            symbol: symbol("beacon"),
+            region: None,
+            body: "pub fn beacon() -> u8 { 7 }".to_owned().into(),
+        };
+        let summary = applied_summary(changes.replace_symbol(&reads, &params)?);
+        let before = changes.capture_hook_snapshot(&reads)?;
+        let split = "pub fn split() {}\n";
+        fs::write(directory.path().join("split.rs"), split)?;
+        fs::remove_file(directory.path().join("lib.rs"))?;
+
+        let after = changes.capture_hook_snapshot(&reads)?;
+        let finalized = applied_summary(changes.finalize_hook_result(&before, &after, summary)?);
+
+        assert_eq!(
+            finalized.paths,
+            [
+                ProjectPath("lib.rs".to_owned()),
+                ProjectPath("split.rs".to_owned()),
+            ],
+            "a hook that deletes one file and writes another reports both"
+        );
+        let texts: Vec<&str> = finalized
+            .edits
+            .iter()
+            .map(|Edit::Replace { text, .. }| text.as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            ["", split],
+            "a deleted file's edit empties it and a created file's edit carries its whole source"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn restoring_a_shrunk_file_the_capture_bound_left_out_refuses() -> TestResult {
+        let oversized = "pub fn beacon() {}\n// padding past the capture bound\n";
+        let (directory, reads, changes) = bounded_fixture(&[("lib.rs", oversized)], 16)?;
+        let before = changes.capture_hook_snapshot(&reads)?;
+        let shrunk = "pub fn a() {}\n";
+        fs::write(directory.path().join("lib.rs"), shrunk)?;
+        let after = changes.capture_hook_snapshot(&reads)?;
+
+        let error = changes
+            .restore_hook_snapshot(&reads, &before, &after)
+            .expect_err("bytes the capture bound left out cannot be restored");
+
+        let fault = error.fault();
+        assert!(
+            matches!(fault, ReadFault::SourceUnavailable { path } if path == "lib.rs"),
+            "unexpected fault {fault:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("lib.rs"))?,
+            shrunk,
+            "a refused restore writes nothing"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn restoring_a_deleted_file_the_capture_bound_left_out_refuses() -> TestResult {
+        let oversized = "pub fn beacon() {}\n// padding past the capture bound\n";
+        let (directory, reads, changes) = bounded_fixture(&[("lib.rs", oversized)], 16)?;
+        let before = changes.capture_hook_snapshot(&reads)?;
+        fs::remove_file(directory.path().join("lib.rs"))?;
+        let after = changes.capture_hook_snapshot(&reads)?;
+
+        let error = changes
+            .restore_hook_snapshot(&reads, &before, &after)
+            .expect_err("a deleted file with no captured bytes cannot be written back");
+
+        let fault = error.fault();
+        assert!(
+            matches!(fault, ReadFault::SourceUnavailable { path } if path == "lib.rs"),
+            "unexpected fault {fault:?}"
+        );
+        assert!(
+            !directory.path().join("lib.rs").exists(),
+            "a refused restore creates nothing"
+        );
         Ok(())
     }
 
