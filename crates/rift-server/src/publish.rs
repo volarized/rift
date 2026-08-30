@@ -1136,10 +1136,6 @@ mod tests {
             path("notes.txt"),
             source,
             next.to_owned(),
-            vec![ReplacedRegion {
-                range: ByteRange { start: 0, end: 3 },
-                text: "new".to_owned(),
-            }],
         )];
 
         publish_rewrites(&reads, directory.path(), &rewrites)?
@@ -1165,15 +1161,7 @@ mod tests {
         fs::create_dir(directory.path().join("blocked.rs"))?;
         let reads = reads_over(directory.path(), &SourceVisibility::default())?;
         let rewrites = vec![
-            FileRewrite::modify(
-                path("notes.txt"),
-                source,
-                "new notes\n".to_owned(),
-                vec![ReplacedRegion {
-                    range: ByteRange { start: 0, end: 3 },
-                    text: "new".to_owned(),
-                }],
-            ),
+            FileRewrite::modify(path("notes.txt"), source, "new notes\n".to_owned()),
             FileRewrite::create(path("blocked.rs"), "pub fn blocked() {}\n".to_owned()),
         ];
 
