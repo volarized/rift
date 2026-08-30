@@ -330,22 +330,24 @@ impl fmt::Display for ServerOutcome {
             Self::Listening { port, pid } => {
                 write!(
                     formatter,
-                    "rift server listening on 127.0.0.1:{port} (pid {pid})"
+                    "🚀 rift server listening on 127.0.0.1:{port} (pid {pid})"
                 )
             }
             Self::AlreadyListening { port, pid } => write!(
                 formatter,
-                "rift server already listening on 127.0.0.1:{port} (pid {pid})"
+                "✅ rift server already listening on 127.0.0.1:{port} (pid {pid})"
             ),
-            Self::Stopped => formatter.write_str("rift server stopped"),
-            Self::NotRunning => formatter.write_str("no rift server is running for this workspace"),
+            Self::Stopped => formatter.write_str("🛑 rift server stopped"),
+            Self::NotRunning => {
+                formatter.write_str("💤 no rift server is running for this workspace")
+            }
             Self::Serving { port, pid, version } => write!(
                 formatter,
-                "rift server listening on 127.0.0.1:{port} (pid {pid}, v{version})"
+                "✅ rift server listening on 127.0.0.1:{port} (pid {pid}, v{version})"
             ),
             Self::Stale { reason } => write!(
                 formatter,
-                "found a stale .rift/server.json ({reason}); the next rift mcp or rift server start replaces it"
+                "🧹 found a stale .rift/server.json ({reason}); the next rift mcp or rift server start replaces it"
             ),
         }
     }
@@ -1038,7 +1040,7 @@ mod tests {
                 pid: 42
             }
             .to_string(),
-            "rift server listening on 127.0.0.1:12345 (pid 42)"
+            "🚀 rift server listening on 127.0.0.1:12345 (pid 42)"
         );
         assert_eq!(
             ServerOutcome::AlreadyListening {
@@ -1046,12 +1048,12 @@ mod tests {
                 pid: 42
             }
             .to_string(),
-            "rift server already listening on 127.0.0.1:12345 (pid 42)"
+            "✅ rift server already listening on 127.0.0.1:12345 (pid 42)"
         );
-        assert_eq!(ServerOutcome::Stopped.to_string(), "rift server stopped");
+        assert_eq!(ServerOutcome::Stopped.to_string(), "🛑 rift server stopped");
         assert_eq!(
             ServerOutcome::NotRunning.to_string(),
-            "no rift server is running for this workspace"
+            "💤 no rift server is running for this workspace"
         );
         assert_eq!(
             ServerOutcome::Serving {
@@ -1060,14 +1062,14 @@ mod tests {
                 version: "0.0.11".to_owned(),
             }
             .to_string(),
-            "rift server listening on 127.0.0.1:12345 (pid 42, v0.0.11)"
+            "✅ rift server listening on 127.0.0.1:12345 (pid 42, v0.0.11)"
         );
         assert_eq!(
             ServerOutcome::Stale {
                 reason: "no process holds the election lock"
             }
             .to_string(),
-            "found a stale .rift/server.json (no process holds the election lock); \
+            "🧹 found a stale .rift/server.json (no process holds the election lock); \
              the next rift mcp or rift server start replaces it"
         );
     }
