@@ -32,7 +32,7 @@ use crate::chunk::text_chunks;
 use crate::glob::PathMatcher;
 use crate::language::{ClassifiedPath, LanguagePolicyError, WorkspaceLanguagePolicy};
 use crate::lexical::{LexicalUnit, LexicalUnitKind};
-use crate::semantic::WorkspaceSemantics;
+use crate::semantic::{BindingPolicy, WorkspaceSemantics};
 
 #[derive(Debug)]
 pub(crate) struct WorkspaceFiles;
@@ -970,6 +970,7 @@ pub struct WorkspaceIndex {
     language: Arc<WorkspaceLanguagePolicy>,
     text_inclusion: TextFileInclusion,
     fingerprint: WorkspaceFingerprint,
+    binding: BindingPolicy,
     semantics: WorkspaceSemantics,
     warnings: Vec<WorkspaceIndexWarning>,
 }
@@ -997,10 +998,14 @@ impl WorkspaceIndex {
             visibility,
             text_inclusion,
             &LanguageFileSelections::default(),
+            BindingPolicy::default(),
         )
     }
 
     /// Scans visible regular files using configured language entries.
+    ///
+    /// `binding` decides whether the binding provider publishes beside syntax,
+    /// and under which bounds; incremental rebuilds of this index carry it over.
     ///
     /// # Errors
     ///
@@ -1012,6 +1017,7 @@ impl WorkspaceIndex {
         visibility: &SourceVisibility,
         text_inclusion: &TextFileInclusion,
         languages: &LanguageFileSelections,
+        binding: BindingPolicy,
     ) -> Result<Self, WorkspaceIndexError> {
         let root = canonical_root(root)?;
         let composition = composition()?;
@@ -1049,6 +1055,7 @@ impl WorkspaceIndex {
             files.values().map(|file| file.syntax()),
             fingerprint.revision_number(),
             None,
+            &binding,
         )
         .map_err(provider_error)?;
         Ok(Self {
@@ -1060,6 +1067,7 @@ impl WorkspaceIndex {
             language,
             text_inclusion: text_inclusion.clone(),
             fingerprint,
+            binding,
             semantics,
             warnings,
         })
@@ -1112,6 +1120,7 @@ impl WorkspaceIndex {
             files.values().map(|file| file.syntax()),
             fingerprint.revision_number(),
             Some(self.semantics.graph()),
+            &self.binding,
         )
         .map_err(provider_error)?;
         Ok(Self {
@@ -1123,6 +1132,7 @@ impl WorkspaceIndex {
             language: Arc::clone(&self.language),
             text_inclusion: self.text_inclusion.clone(),
             fingerprint,
+            binding: self.binding,
             semantics,
             warnings,
         })
@@ -1174,7 +1184,9 @@ impl WorkspaceIndex {
     /// Assembles an index from files another source already accepted - the
     /// revision build, whose bytes come from git objects instead of a
     /// directory walk. Revision reads carry no text files: `text_inclusion` is kept only
-    /// so a future revision-text feature can reuse this constructor unchanged.
+    /// so a future revision-text feature can reuse this constructor unchanged. No
+    /// configuration reaches a revision build, so the binding provider runs under
+    /// the default [`BindingPolicy`].
     pub(crate) fn from_parts(
         root: PathBuf,
         files: Vec<IndexedFile>,
@@ -1187,10 +1199,12 @@ impl WorkspaceIndex {
         let files = keyed_by_path(files, IndexedFile::path);
         let text_files = keyed_by_path(text_files, TextSourceFile::path);
         let fingerprint = WorkspaceFingerprint::from_files(&files, &text_files);
+        let binding = BindingPolicy::default();
         let semantics = WorkspaceSemantics::build(
             files.values().map(|file| file.syntax()),
             fingerprint.revision_number(),
             None,
+            &binding,
         )
         .map_err(provider_error)?;
         Ok(Self {
@@ -1202,6 +1216,7 @@ impl WorkspaceIndex {
             language,
             text_inclusion,
             fingerprint,
+            binding,
             semantics,
             warnings: Vec::new(),
         })
@@ -4401,6 +4416,7 @@ mod tests {
             &SourceVisibility::default(),
             &TextFileInclusion::from(&configuration.search),
             &LanguageFileSelections::from(&configuration),
+            BindingPolicy::default(),
         )
         .expect("workspace index");
 
@@ -4463,6 +4479,7 @@ mod tests {
             &visibility,
             &TextFileInclusion::from(&configuration.search),
             &LanguageFileSelections::from(&configuration),
+            BindingPolicy::default(),
         )
         .expect("workspace index");
 
@@ -4507,6 +4524,7 @@ mod tests {
             &SourceVisibility::default(),
             &TextFileInclusion::from(&configuration.search),
             &LanguageFileSelections::from(&configuration),
+            BindingPolicy::default(),
         )
         .expect_err("a path two entries claim must refuse the candidate");
 
@@ -5181,5 +5199,120 @@ mod tests {
         };
         let mut units = Vec::new();
         push_text_lexical_units(&mut units, &file, 1_024);
+    }
+
+    /// A workspace whose `src/lib.rs` calls a function `src/run.rs` defines.
+    fn cross_unit_fixture() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        fs::create_dir_all(directory.path().join("src")).expect("fixture directory");
+        fs::write(
+            directory.path().join("src/lib.rs"),
+            "mod run;\nuse run::helper;\npub fn beacon() {\n    helper();\n}\n",
+        )
+        .expect("fixture source");
+        fs::write(directory.path().join("src/run.rs"), "pub fn helper() {}\n")
+            .expect("fixture source");
+        directory
+    }
+
+    /// Whether any normalized reference targets the symbol spelled by `identity`.
+    fn references_target(index: &WorkspaceIndex, identity: &str) -> bool {
+        let expected = rift_provider::NormalizedTarget::Symbol(
+            rift_core::SymbolId::new(identity).expect("symbol identity"),
+        );
+        index
+            .normalized_graph()
+            .references()
+            .iter()
+            .any(|reference| reference.targets().contains(&expected))
+    }
+
+    #[test]
+    fn test_workspace_index_binding_resolves_cross_unit_reference_to_syntax_symbol() {
+        let directory = cross_unit_fixture();
+        let index = indexed(directory.path(), &TextFileInclusion::default());
+        assert!(
+            references_target(&index, "rift://symbol/rust/src/run.rs/helper"),
+            "the call in src/lib.rs must target the helper declaration in src/run.rs"
+        );
+    }
+
+    #[test]
+    fn test_workspace_index_rebuilt_after_rename_leaves_the_reference_unresolved() {
+        let directory = cross_unit_fixture();
+        let root = directory.path();
+        let index = indexed(root, &TextFileInclusion::default());
+        fs::write(root.join("src/run.rs"), "pub fn helper2() {}\n").expect("renamed source");
+        let changes = resolved(&index, root, &["src/run.rs"]);
+        let next = index.rebuilt(&changes).expect("the rebuild must land");
+        assert!(
+            !references_target(&next, "rift://symbol/rust/src/run.rs/helper"),
+            "the renamed declaration's old symbol must leave every target list"
+        );
+        assert!(
+            !references_target(&next, "rift://symbol/rust/src/run.rs/helper2"),
+            "a reference still spelling `helper` must not target `helper2`"
+        );
+    }
+
+    #[test]
+    fn test_workspace_index_disabled_binding_publishes_syntax_alone() {
+        let directory = cross_unit_fixture();
+        let policy = BindingPolicy::new(false, rift_binding::BindingLimits::default());
+        let index = WorkspaceIndex::build_with_languages(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+            policy,
+        )
+        .expect("the fixture workspace must index");
+        let binding = rift_core::ProviderId::new(rift_binding::BINDING_PROVIDER_ID)
+            .expect("provider identity");
+        assert!(
+            index
+                .normalized_graph()
+                .publications()
+                .provider(&binding)
+                .is_none(),
+            "a disabled policy must publish no binding publication"
+        );
+    }
+
+    #[test]
+    fn test_workspace_index_exhausted_binding_limit_keeps_the_build_green() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        fs::create_dir_all(directory.path().join("src")).expect("fixture directory");
+        // Two calls breach a one-reference unit bound.
+        fs::write(
+            directory.path().join("src/lib.rs"),
+            "pub fn one() {}\npub fn two() {}\npub fn beacon() {\n    one();\n    two();\n}\n",
+        )
+        .expect("fixture source");
+        let limits = rift_binding::BindingLimits::builder()
+            .unit_references_max(1)
+            .build()
+            .expect("limits");
+        let index = WorkspaceIndex::build_with_languages(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+            BindingPolicy::new(true, limits),
+        )
+        .expect("a breached binding bound must not fail the index build");
+        let binding = rift_core::ProviderId::new(rift_binding::BINDING_PROVIDER_ID)
+            .expect("provider identity");
+        assert!(
+            index
+                .normalized_graph()
+                .publications()
+                .provider(&binding)
+                .is_none(),
+            "the revision must serve the syntax publication alone"
+        );
+        assert_eq!(index.file_count(), 1, "syntax facts stay served");
     }
 }

@@ -47,6 +47,10 @@ tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true
 
 [[test]]
+name = "binding_provider"
+path = "tests/binding_provider.rs"
+
+[[test]]
 name = "configuration_admission"
 path = "tests/configuration_admission.rs"
 

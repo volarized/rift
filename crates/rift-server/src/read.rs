@@ -11,9 +11,9 @@ use rift_core::{
 };
 use rift_history::{HistoryError, Repository};
 use rift_index::{
-    FileDigest, IndexedFile, PathChanges, ReadableSymbol, SymbolMatch, WorkspaceDigests,
-    WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits,
-    WorkspaceIndexWarning, WorkspaceSourcePolicy,
+    BindingPolicy, FileDigest, IndexedFile, PathChanges, ReadableSymbol, SymbolMatch,
+    WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError,
+    WorkspaceIndexLimits, WorkspaceIndexWarning, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::HistoryConfiguration;
 use rift_protocol::read::{
@@ -319,11 +319,15 @@ impl ReadService {
             visibility,
             text_inclusion,
             &LanguageFileSelections::default(),
+            BindingPolicy::default(),
             history,
         )
     }
 
     /// Builds one current-tree snapshot with configured language entries.
+    ///
+    /// `binding` reaches the workspace index unchanged: it decides whether the
+    /// binding provider publishes beside syntax, and under which bounds.
     ///
     /// # Errors
     ///
@@ -335,6 +339,7 @@ impl ReadService {
         visibility: &SourceVisibility,
         text_inclusion: &TextFileInclusion,
         languages: &LanguageFileSelections,
+        binding: BindingPolicy,
         history: HistoryConfiguration,
     ) -> Result<Self, ReadError> {
         let span = tracing::info_span!(
@@ -351,6 +356,7 @@ impl ReadService {
             visibility,
             text_inclusion,
             languages,
+            binding,
         )
         .map_err(|source| {
             span.record("outcome", "error");
@@ -1358,7 +1364,9 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    use super::{HistoryConfiguration, ReadFault, ReadService, WorkspaceIndexLimits, file_id};
+    use super::{
+        BindingPolicy, HistoryConfiguration, ReadFault, ReadService, WorkspaceIndexLimits, file_id,
+    };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -1376,6 +1384,7 @@ mod tests {
             &SourceVisibility::default(),
             text_inclusion,
             languages,
+            BindingPolicy::default(),
             HistoryConfiguration::default(),
         )
     }

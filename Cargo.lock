@@ -3483,6 +3483,7 @@ name = "rift-index"
 version = "0.0.26"
 dependencies = [
  "ignore",
+ "rift-binding",
  "rift-core",
  "rift-history",
  "rift-protocol",
@@ -3495,6 +3496,7 @@ dependencies = [
  "toasty-core",
  "toasty-driver-sqlite",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
