@@ -3446,6 +3446,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rift-binding"
+version = "0.0.26"
+dependencies = [
+ "rift-core",
+ "serde",
+]
+
+[[package]]
 name = "rift-core"
 version = "0.0.26"
 dependencies = [
