@@ -31,6 +31,8 @@ pub const LOG_FIELDS_BYTES_MAX: usize = 8_192;
 pub const LOG_LABEL_BYTES_MAX: usize = 256;
 /// Most records one read may return, whatever page size a caller asks for.
 pub const LOG_PAGE_RECORDS_MAX: usize = 5_000;
+/// The levels a read accepts, in the spelling the store holds.
+pub const LOG_LEVELS: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
 
 /// One record on its way into the store: when it happened, how severe it was,
 /// where it came from, and what it said.
@@ -144,6 +146,8 @@ impl StoredLogRecord {
 pub struct LogQuery {
     level: Option<String>,
     component: Option<String>,
+    after: Option<i64>,
+    since_ms: Option<i64>,
     limit: usize,
 }
 
@@ -155,6 +159,8 @@ impl LogQuery {
         Self {
             level: None,
             component: None,
+            after: None,
+            since_ms: None,
             limit: limit.min(LOG_PAGE_RECORDS_MAX),
         }
     }
@@ -170,6 +176,20 @@ impl LogQuery {
     #[must_use]
     pub fn for_component(mut self, component: &str) -> Self {
         self.component = Some(bounded(component, LOG_LABEL_BYTES_MAX));
+        self
+    }
+
+    /// Restricts the read to records the store filed after `identity`.
+    #[must_use]
+    pub fn after(mut self, identity: i64) -> Self {
+        self.after = Some(identity);
+        self
+    }
+
+    /// Restricts the read to records recorded at or after `recorded_at_ms`.
+    #[must_use]
+    pub fn since_ms(mut self, recorded_at_ms: i64) -> Self {
+        self.since_ms = Some(recorded_at_ms);
         self
     }
 
@@ -279,15 +299,56 @@ impl LogStore {
         &self,
         query: &LogQuery,
     ) -> Result<Vec<StoredLogRecord>, LexicalIndexError> {
+        self.page(query, &RecordOrder::Newest).await
+    }
+
+    /// The records the query selects, oldest first.
+    ///
+    /// A caller following the store reads with [`LogQuery::after`] set to the
+    /// last identity it took, so one call returns only what landed since. The
+    /// page is bounded by the query's own limit, itself bounded by
+    /// [`LOG_PAGE_RECORDS_MAX`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LexicalIndexError`] when the query fails.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancellation performs no writes; this issues one read-only query.
+    pub async fn following(
+        &self,
+        query: &LogQuery,
+    ) -> Result<Vec<StoredLogRecord>, LexicalIndexError> {
+        self.page(query, &RecordOrder::Oldest).await
+    }
+
+    /// One page in `order`, carrying every filter the query names.
+    async fn page(
+        &self,
+        query: &LogQuery,
+        order: &RecordOrder,
+    ) -> Result<Vec<StoredLogRecord>, LexicalIndexError> {
         let mut connection = self.connection().await?;
+        let identity = LogRecordRow::fields().id();
+        let ordering = match order {
+            RecordOrder::Newest => identity.desc(),
+            RecordOrder::Oldest => identity.asc(),
+        };
         let mut rows = LogRecordRow::all()
-            .order_by(LogRecordRow::fields().id().desc())
+            .order_by(ordering)
             .limit(query.limit.min(LOG_PAGE_RECORDS_MAX));
         if let Some(level) = &query.level {
             rows = rows.filter(LogRecordRow::fields().level().eq(level.clone()));
         }
         if let Some(component) = &query.component {
             rows = rows.filter(LogRecordRow::fields().component().eq(component.clone()));
+        }
+        if let Some(after) = query.after {
+            rows = rows.filter(LogRecordRow::fields().id().gt(after));
+        }
+        if let Some(recorded_at_ms) = query.since_ms {
+            rows = rows.filter(LogRecordRow::fields().recorded_at().ge(recorded_at_ms));
         }
         let found = rows.exec(&mut connection).await.map_err(storage_error)?;
         Ok(found.into_iter().map(stored_record).collect())
@@ -315,6 +376,15 @@ impl LogStore {
     async fn connection(&self) -> Result<Connection, LexicalIndexError> {
         self.database.connection().await
     }
+}
+
+/// Which end of the store one page reads from.
+#[derive(Debug)]
+enum RecordOrder {
+    /// Highest identity first.
+    Newest,
+    /// Lowest identity first.
+    Oldest,
 }
 
 /// Drops every record outside the newest `retention_records`, and reports how
@@ -555,6 +625,108 @@ mod tests {
         let read = store.recent(&LogQuery::newest(2)).await?;
 
         assert_eq!(read.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_followed_read_returns_records_oldest_first() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory).await?;
+        store
+            .append(&[record("first"), record("second")], KEEP_EVERY)
+            .await?;
+
+        let read = store.following(&LogQuery::newest(10)).await?;
+
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[0].record().message(), "first");
+        assert_eq!(read[1].record().message(), "second");
+        assert!(read[0].identity() < read[1].identity());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_read_after_an_identity_returns_only_later_records() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory).await?;
+        let batch = [record("first"), record("second"), record("third")];
+        store.append(&batch, KEEP_EVERY).await?;
+
+        let read = store.following(&LogQuery::newest(10).after(2)).await?;
+
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].record().message(), "third");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_since_read_drops_records_recorded_earlier() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory).await?;
+        let older = LogRecord::new(
+            1,
+            "info",
+            "rift_mcp",
+            "index",
+            "index.reconcile",
+            "old",
+            "{}",
+        );
+        let newer = LogRecord::new(
+            9,
+            "info",
+            "rift_mcp",
+            "index",
+            "index.reconcile",
+            "new",
+            "{}",
+        );
+        store.append(&[older, newer], KEEP_EVERY).await?;
+
+        let followed = store.following(&LogQuery::newest(10).since_ms(9)).await?;
+        let recent = store.recent(&LogQuery::newest(10).since_ms(9)).await?;
+
+        assert_eq!(followed.len(), 1);
+        assert_eq!(followed[0].record().message(), "new");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].record().message(), "new");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_followed_read_keeps_the_level_and_component_filters() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory).await?;
+        let warning = LogRecord::new(1, "warn", "rift_mcp", "search", "search.open", "late", "{}");
+        store
+            .append(&[record("routine"), warning], KEEP_EVERY)
+            .await?;
+
+        let by_level = store
+            .following(&LogQuery::newest(10).at_level("warn"))
+            .await?;
+        let by_component = store
+            .following(&LogQuery::newest(10).for_component("search"))
+            .await?;
+
+        assert_eq!(by_level.len(), 1);
+        assert_eq!(by_level[0].record().message(), "late");
+        assert_eq!(by_component.len(), 1);
+        assert_eq!(by_component[0].record().message(), "late");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_followed_page_bounds_itself() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory).await?;
+        let batch: Vec<LogRecord> = (0..5).map(|index| record(&index.to_string())).collect();
+        store.append(&batch, KEEP_EVERY).await?;
+
+        let read = store.following(&LogQuery::newest(2)).await?;
+
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[0].record().message(), "0");
         Ok(())
     }
 

@@ -9,6 +9,8 @@ generate:
     cargo run -q -p rift -- --help >> docs/public/cli-help.txt
     printf '\n$ rift server --help\n' >> docs/public/cli-help.txt
     cargo run -q -p rift -- server --help >> docs/public/cli-help.txt
+    printf '\n$ rift server logs --help\n' >> docs/public/cli-help.txt
+    cargo run -q -p rift -- server logs --help >> docs/public/cli-help.txt
 
 generate-check:
     #!/usr/bin/env bash
@@ -20,6 +22,8 @@ generate-check:
     cargo run -q -p rift -- --help >> "$fresh"
     printf '\n$ rift server --help\n' >> "$fresh"
     cargo run -q -p rift -- server --help >> "$fresh"
+    printf '\n$ rift server logs --help\n' >> "$fresh"
+    cargo run -q -p rift -- server logs --help >> "$fresh"
     cmp -s docs/public/cli-help.txt "$fresh" || {
         echo "error: \`docs/public/cli-help.txt\` does not match the CLI help; regenerate it with \`just generate\`" >&2
         exit 1
