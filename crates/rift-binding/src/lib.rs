@@ -3,7 +3,9 @@
 //! A language rule feeds scopes, definitions, references, and links through
 //! [`GraphBuilder`]; [`LinkedGraph::link`] joins units through module links, computes the
 //! module tree, and attaches member scopes; [`resolve_all`] maps every reference to the
-//! definitions it can name under [`BindingLimits`].
+//! definitions it can name under [`BindingLimits`]. [`UnitBindingFacts`] carries one
+//! unit's facts under unit-local indices, and [`assemble`] joins many units into one
+//! graph.
 
 mod failure;
 #[cfg(test)]
@@ -12,6 +14,7 @@ mod graph;
 mod limits;
 mod link;
 mod resolve;
+mod unit;
 
 pub use failure::{BindingError, BindingFault, BindingViolation};
 pub use graph::{
@@ -29,6 +32,11 @@ pub use link::LinkedGraph;
 pub use resolve::{
     CANCELLATION_CHECK_INTERVAL, Cancellation, DEFINITION_RANK, LEXICAL_RANK, NeverCancelled,
     Resolution, ResolutionSet, resolve_all,
+};
+pub use unit::{
+    IMPORT_EXPLICIT_RANK, IMPORT_WILDCARD_RANK, UnitBindingFacts, UnitBindingFactsBuilder,
+    UnitDefinition, UnitDefinitionIndex, UnitImport, UnitMemberLink, UnitModuleDeclaration,
+    UnitReference, UnitScope, UnitScopeIndex, assemble,
 };
 
 /// Compile-time marker for binding-layer ownership.
