@@ -3,8 +3,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use rift_binding::{
-    BindingError, BindingLimits, BindingPublisher, LinkedGraph, NeverCancelled, UnitBindingFacts,
-    assemble, resolve_all,
+    BindingError, BindingLimits, BindingPublisher, LinkedGraph, ModuleLayout, NeverCancelled,
+    UnitBindingFacts, assemble, resolve_all,
 };
 use rift_core::{
     ContributionError, ContributionOrigin, ContributionReference, IndexRevision, ProviderId,
@@ -12,12 +12,13 @@ use rift_core::{
     SourceUnitId, SourceUnitIdError, TreeRevision,
 };
 use rift_protocol::configuration::BindingConfiguration;
+use rift_protocol::read::Language;
 use rift_provider::{
     AssembledSymbol, NormalizedGraph, Normalizer, PublicationError, PublicationLimits,
     PublicationSet, SymbolAssembler,
 };
 use rift_syntax::{
-    SYNTAX_PROVIDER_ID, SyntaxDocument, SyntaxPublicationBuilder, SyntaxPublicationError,
+    SYNTAX_PROVIDER_ID, SyntaxDocument, SyntaxPublicationBuilder, SyntaxPublicationError, registry,
     source_unit,
 };
 
@@ -107,12 +108,16 @@ pub(crate) struct WorkspaceSemantics {
 impl WorkspaceSemantics {
     /// Builds syntax and binding publications and one normalized graph over one file set.
     ///
-    /// The binding provider publishes beside syntax when `binding` enables it and at
-    /// least one document carries binding facts. A binding failure - an exhausted
-    /// limit, a refused publication - never fails the build: the revision publishes
-    /// with the syntax publication alone and the failure lands in the server log.
+    /// `project_paths` is every path the index holds, indexed and text files alike:
+    /// each language provider derives its module layout from that set, so manifest
+    /// files such as `Cargo.toml` reach the layout. The binding provider publishes
+    /// beside syntax when `binding` enables it and at least one document carries
+    /// binding facts. A binding failure - an exhausted limit, a refused publication,
+    /// a refused refinement - never fails the build: the revision publishes with the
+    /// syntax publication alone and the failure lands in the server log.
     pub(crate) fn build<'a>(
         documents: impl IntoIterator<Item = &'a SyntaxDocument>,
+        project_paths: &[&str],
         revision: u64,
         previous: Option<&NormalizedGraph>,
         binding: &BindingPolicy,
@@ -137,6 +142,7 @@ impl WorkspaceSemantics {
         let publications = Arc::new(with_binding(
             publications,
             &documents,
+            project_paths,
             binding,
             (provider_revision, source_revision, tree_revision),
             limits,
@@ -183,6 +189,7 @@ impl WorkspaceSemantics {
 fn with_binding(
     publications: PublicationSet,
     documents: &[&SyntaxDocument],
+    project_paths: &[&str],
     binding: &BindingPolicy,
     revisions: (ProviderRevision, SourceRevision, TreeRevision),
     publication_limits: PublicationLimits,
@@ -193,6 +200,7 @@ fn with_binding(
     match binding_replaced(
         &publications,
         documents,
+        project_paths,
         binding.limits(),
         revisions,
         publication_limits,
@@ -218,15 +226,20 @@ fn with_binding(
 fn binding_replaced(
     publications: &PublicationSet,
     documents: &[&SyntaxDocument],
+    project_paths: &[&str],
     limits: &BindingLimits,
     revisions: (ProviderRevision, SourceRevision, TreeRevision),
     publication_limits: PublicationLimits,
 ) -> Result<Option<PublicationSet>, WorkspaceSemanticError> {
-    let units = binding_units(documents)?;
+    let units = binding_units(documents, project_paths, limits)?;
     if units.is_empty() {
         return Ok(None);
     }
-    let graph = assemble(&units, limits)?;
+    let assembled: Vec<(SourceUnitId, ContributionOrigin, &UnitBindingFacts)> = units
+        .iter()
+        .map(|(unit, origin, facts)| (unit.clone(), origin.clone(), facts))
+        .collect();
+    let graph = assemble(&assembled, limits)?;
     let linked = LinkedGraph::link(&graph, limits)?;
     let resolutions = resolve_all(&linked, limits, &NeverCancelled)?;
     let (provider_revision, source_revision, tree_revision) = revisions;
@@ -241,22 +254,66 @@ fn binding_replaced(
     Ok(Some(publications.replaced(publication.into_publication())?))
 }
 
-/// Every document's binding facts under its project source-unit identity.
-fn binding_units<'documents>(
-    documents: &[&'documents SyntaxDocument],
-) -> Result<
-    Vec<(
-        SourceUnitId,
-        ContributionOrigin,
-        &'documents UnitBindingFacts,
-    )>,
-    WorkspaceSemanticError,
-> {
+/// Per-language module layouts, each resolved once from the provider registry.
+///
+/// The cache holds one entry per distinct document language, so a provider's
+/// `binding_layout` runs once per provider, never per document.
+struct ModuleLayouts<'paths> {
+    project_paths: &'paths [&'paths str],
+    layouts: Vec<(Language, Option<Box<dyn ModuleLayout + Send + Sync>>)>,
+}
+
+impl<'paths> ModuleLayouts<'paths> {
+    const fn new(project_paths: &'paths [&'paths str]) -> Self {
+        Self {
+            project_paths,
+            layouts: Vec::new(),
+        }
+    }
+
+    /// The layout for `language`, resolved through the registry on first use.
+    ///
+    /// The scan runs over one entry per language already seen, a set the shipped
+    /// provider registry bounds.
+    fn layout_for(&mut self, language: &Language) -> Option<&(dyn ModuleLayout + Send + Sync)> {
+        let held = self.layouts.iter().position(|(seen, _)| seen == language);
+        let position = held.unwrap_or_else(|| {
+            let layout = registry::provider_for_language(language)
+                .and_then(|provider| provider.binding_layout(self.project_paths));
+            self.layouts.push((language.clone(), layout));
+            self.layouts.len() - 1
+        });
+        self.layouts[position].1.as_deref()
+    }
+}
+
+/// The unit's facts under `layout`; no layout keeps the extraction-time candidates.
+fn refined_unit_facts(
+    layout: Option<&(dyn ModuleLayout + Send + Sync)>,
+    unit_path: &str,
+    facts: &UnitBindingFacts,
+    limits: &BindingLimits,
+) -> Result<UnitBindingFacts, BindingError> {
+    match layout {
+        Some(layout) => layout.refined_facts(unit_path, facts, limits),
+        None => Ok(facts.clone()),
+    }
+}
+
+/// Every document's binding facts, refined under its language's module layout.
+fn binding_units(
+    documents: &[&SyntaxDocument],
+    project_paths: &[&str],
+    limits: &BindingLimits,
+) -> Result<Vec<(SourceUnitId, ContributionOrigin, UnitBindingFacts)>, WorkspaceSemanticError> {
+    let mut layouts = ModuleLayouts::new(project_paths);
     let mut units = Vec::new();
     for document in documents {
         let Some(facts) = document.binding() else {
             continue;
         };
+        let layout = layouts.layout_for(document.language());
+        let facts = refined_unit_facts(layout, document.path().as_str(), facts, limits)?;
         let origin = ContributionOrigin::new(
             Some(SourceLocation::Project { package: None }),
             SourceKind::Authored,
@@ -359,8 +416,8 @@ mod tests {
     fn syntax_graph_assembles_existing_symbol_identity() {
         let document = document();
         let policy = BindingPolicy::new(false, rift_binding::BindingLimits::default());
-        let semantics =
-            WorkspaceSemantics::build([&document], 7, None, &policy).expect("semantics");
+        let semantics = WorkspaceSemantics::build([&document], &["src/lib.rs"], 7, None, &policy)
+            .expect("semantics");
         let identity = "rift://symbol/rust/src/lib.rs/beacon";
         let assembled = semantics.assembled(identity).expect("assembled symbol");
         assert_eq!(
@@ -374,7 +431,7 @@ mod tests {
     #[test]
     fn zero_revision_is_typed_failure() {
         let error =
-            WorkspaceSemantics::build(std::iter::empty(), 0, None, &BindingPolicy::default())
+            WorkspaceSemantics::build(std::iter::empty(), &[], 0, None, &BindingPolicy::default())
                 .expect_err("zero revision");
         assert!(matches!(error, WorkspaceSemanticError::Revision(_)));
         assert!(std::error::Error::source(&error).is_some());
@@ -490,7 +547,7 @@ mod tests {
     #[test]
     fn test_build_without_binding_facts_publishes_no_binding_publication() {
         let semantics =
-            WorkspaceSemantics::build(std::iter::empty(), 3, None, &BindingPolicy::default())
+            WorkspaceSemantics::build(std::iter::empty(), &[], 3, None, &BindingPolicy::default())
                 .expect("an empty document set publishes");
         let binding = rift_core::ProviderId::new(rift_binding::BINDING_PROVIDER_ID)
             .expect("provider identity");
@@ -514,6 +571,44 @@ mod tests {
         assert!(matches!(error, WorkspaceSemanticError::Binding(_)));
         assert!(!error.to_string().is_empty());
         assert!(std::error::Error::source(&error).is_some());
+    }
+
+    /// A document language without a provider layout keeps its extraction-time candidates.
+    #[test]
+    fn test_refined_unit_facts_without_layout_keeps_extraction_candidates() {
+        use rift_binding::{
+            BindingLimits, DefinitionOrder, Name, ScopeKind, UnitBindingFacts, UnitDefinition,
+            UnitModuleDeclaration, VisibilitySpelling,
+        };
+        use rift_core::{ExactKind, SourceRange};
+
+        let limits = BindingLimits::default();
+        let mut builder = UnitBindingFacts::builder(limits);
+        let range = SourceRange::new(0, 8).expect("fixture range");
+        let root = builder
+            .scope(ScopeKind::Module, range, None)
+            .expect("root scope accepted");
+        let name = Name::new("x").expect("fixture name");
+        let definition = UnitDefinition::new(
+            root,
+            name,
+            range,
+            ExactKind("stub.module".to_owned()),
+            DefinitionOrder::Item,
+            VisibilitySpelling::Private,
+        );
+        let definition = builder.definition(definition).expect("definition accepted");
+        let declaration = UnitModuleDeclaration::new(definition, vec!["src/x.rs".to_owned()]);
+        builder
+            .module_declaration(declaration)
+            .expect("declaration accepted");
+        let facts = builder.build();
+        let kept = super::refined_unit_facts(None, "src/lib.rs", &facts, &limits)
+            .expect("no layout keeps the facts");
+        assert_eq!(
+            kept, facts,
+            "an absent layout keeps extraction-time candidates"
+        );
     }
 
     #[test]

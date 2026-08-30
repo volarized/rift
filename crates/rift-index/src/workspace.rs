@@ -1053,6 +1053,7 @@ impl WorkspaceIndex {
         let fingerprint = WorkspaceFingerprint::from_files(&files, &text_files);
         let semantics = WorkspaceSemantics::build(
             files.values().map(|file| file.syntax()),
+            &project_path_list(&files, &text_files),
             fingerprint.revision_number(),
             None,
             &binding,
@@ -1118,6 +1119,7 @@ impl WorkspaceIndex {
         let fingerprint = WorkspaceFingerprint::from_files(&files, &text_files);
         let semantics = WorkspaceSemantics::build(
             files.values().map(|file| file.syntax()),
+            &project_path_list(&files, &text_files),
             fingerprint.revision_number(),
             Some(self.semantics.graph()),
             &self.binding,
@@ -1202,6 +1204,7 @@ impl WorkspaceIndex {
         let binding = BindingPolicy::default();
         let semantics = WorkspaceSemantics::build(
             files.values().map(|file| file.syntax()),
+            &project_path_list(&files, &text_files),
             fingerprint.revision_number(),
             None,
             &binding,
@@ -1753,6 +1756,19 @@ pub(crate) fn composition_error(
 
 fn provider_error(source: impl std::error::Error + Send + Sync + 'static) -> WorkspaceIndexError {
     index_error_caused_by(WorkspaceIndexViolation::Provider, None, source)
+}
+
+/// Every project path the index holds, indexed and text files together, sorted.
+///
+/// Language providers derive their module layouts from this set, so manifest files
+/// such as `Cargo.toml` join the indexed source paths.
+fn project_path_list<'maps>(
+    files: &'maps BTreeMap<ProjectPath, Arc<IndexedFile>>,
+    text_files: &'maps BTreeMap<ProjectPath, Arc<TextSourceFile>>,
+) -> Vec<&'maps str> {
+    let mut paths: BTreeSet<&str> = files.keys().map(ProjectPath::as_str).collect();
+    paths.extend(text_files.keys().map(ProjectPath::as_str));
+    paths.into_iter().collect()
 }
 
 /// Source and text paths [`discover`] found below one root, each list sorted by path.
@@ -5277,6 +5293,63 @@ mod tests {
                 .provider(&binding)
                 .is_none(),
             "a disabled policy must publish no binding publication"
+        );
+    }
+
+    /// A two-package workspace where both packages define `run`.
+    fn two_package_fixture() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        for package in ["a", "b"] {
+            fs::create_dir_all(directory.path().join(package).join("src"))
+                .expect("fixture directory");
+            fs::write(
+                directory.path().join(package).join("Cargo.toml"),
+                format!("[package]\nname = \"{package}\"\n"),
+            )
+            .expect("fixture manifest");
+        }
+        fs::write(
+            directory.path().join("a/src/lib.rs"),
+            "pub fn run() {}\nfn h() { run(); }\n",
+        )
+        .expect("fixture source");
+        fs::write(directory.path().join("b/src/lib.rs"), "pub fn run() {}\n")
+            .expect("fixture source");
+        directory
+    }
+
+    #[test]
+    fn test_workspace_index_two_package_workspace_isolates_same_name_definitions() {
+        let directory = two_package_fixture();
+        let index = indexed(directory.path(), &TextFileInclusion::default());
+        assert!(
+            references_target(&index, "rift://symbol/rust/a/src/lib.rs/run"),
+            "the call in a/src/lib.rs must target a's own definition"
+        );
+        assert!(
+            !references_target(&index, "rift://symbol/rust/b/src/lib.rs/run"),
+            "no reference may cross into the sibling package's definition"
+        );
+    }
+
+    #[test]
+    fn test_workspace_index_bin_crate_root_resolves_module_beside_itself() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let root = directory.path();
+        fs::create_dir_all(root.join("src/bin/x")).expect("fixture directory");
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"tool\"\n")
+            .expect("fixture manifest");
+        fs::write(
+            root.join("src/bin/tool.rs"),
+            "mod x;\nfn main() { x::run(); }\n",
+        )
+        .expect("fixture source");
+        fs::write(root.join("src/bin/x/mod.rs"), "pub fn run() {}\n").expect("fixture source");
+        let index = indexed(root, &TextFileInclusion::default());
+        assert!(
+            references_target(&index, "rift://symbol/rust/src/bin/x/mod.rs/run"),
+            "the crate-root rule reads Cargo.toml from the project path set, so \
+             mod x in src/bin/tool.rs resolves beside the binary root"
         );
     }
 

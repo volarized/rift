@@ -8,6 +8,7 @@ mod layout;
 
 pub use layout::RustCrateLayout;
 
+use rift_binding::ModuleLayout;
 use rift_core::Error;
 use rift_protocol::read::{Language, NodeFacet, SymbolFacet};
 use tree_sitter::{Node, Parser, Query as TreeSitterQuery, QueryCursor, StreamingIterator};
@@ -431,6 +432,10 @@ impl SyntaxProvider for RustSyntaxProvider {
             facets.push(NodeFacet::Comment);
         }
         facets
+    }
+
+    fn binding_layout(&self, paths: &[&str]) -> Option<Box<dyn ModuleLayout + Send + Sync>> {
+        Some(Box::new(RustCrateLayout::new(paths)))
     }
 }
 

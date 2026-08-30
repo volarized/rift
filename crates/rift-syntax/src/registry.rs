@@ -326,6 +326,20 @@ mod tests {
     }
 
     #[test]
+    fn test_stub_provider_binding_layout_defaults_to_none() {
+        let stub = StubProvider {
+            language: Language {
+                name: "stub".to_owned(),
+                dialect: None,
+            },
+        };
+        assert!(
+            stub.binding_layout(&["Cargo.toml", "src/lib.rs"]).is_none(),
+            "a provider without module layout rules serves none by default"
+        );
+    }
+
+    #[test]
     fn test_assemble_accepts_distinct_extensions_and_takes_the_larger_byte_bound() {
         let stub = StubProvider {
             language: Language {

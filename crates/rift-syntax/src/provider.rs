@@ -1,5 +1,6 @@
 //! The contract every language syntax provider serves.
 
+use rift_binding::ModuleLayout;
 use rift_core::{Error, ProjectPath};
 use rift_protocol::read::{Language, NodeFacet};
 
@@ -131,6 +132,17 @@ pub trait SyntaxProvider: std::fmt::Debug + Send + Sync {
 
     /// Portable structural facets for one grammar node kind.
     fn node_facets(&self, kind: &str) -> Vec<NodeFacet>;
+
+    /// The module layout this provider derives from the project path set.
+    ///
+    /// `paths` holds every project path the caller indexes, source and text
+    /// files alike, so manifest files reach the layout. The default answers
+    /// `None`: with no layout, every unit keeps its extraction-time
+    /// file-name-rule module candidates.
+    fn binding_layout(&self, paths: &[&str]) -> Option<Box<dyn ModuleLayout + Send + Sync>> {
+        let _ = paths;
+        None
+    }
 }
 
 #[cfg(test)]

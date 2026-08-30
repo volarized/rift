@@ -12,8 +12,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rift_binding::{
-    BindingError, BindingLimits, Name, ScopeKind, UnitBindingFacts, UnitModuleDeclaration,
-    UnitScopeIndex,
+    BindingError, BindingLimits, ModuleLayout, Name, ScopeKind, UnitBindingFacts,
+    UnitModuleDeclaration, UnitScopeIndex,
 };
 
 /// Manifest file name whose directory is a package root.
@@ -90,33 +90,6 @@ impl RustCrateLayout {
         self.package_root_of(path).is_none() && DIRECTORY_OWNING_FILE_NAMES.contains(&file)
     }
 
-    /// The unit's facts with every module declaration's candidates recomputed.
-    ///
-    /// A declaration whose scope chain leaves module scopes - a `mod` inside a block -
-    /// gains no candidates and is dropped; `rustc` refuses a file module inside a block
-    /// without a `path` attribute. A candidate that is itself a crate root is discarded,
-    /// so a stray `mod` declaration cannot adopt another crate's root; with no surviving
-    /// candidate the declaration is dropped and its module link never forms.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BindingError`] when the replaced declarations do not validate against
-    /// `limits`; the facts they derive from make any other refusal a programmer error.
-    pub fn refined_facts(
-        &self,
-        unit_path: &str,
-        facts: &UnitBindingFacts,
-        limits: &BindingLimits,
-    ) -> Result<UnitBindingFacts, BindingError> {
-        let module_names = declared_module_names(facts);
-        let mut declarations = Vec::with_capacity(facts.module_declarations().len());
-        for declaration in facts.module_declarations() {
-            let refined = self.refined_declaration(unit_path, facts, &module_names, declaration);
-            declarations.extend(refined);
-        }
-        facts.with_module_declarations(declarations, limits)
-    }
-
     /// One declaration's candidates under the layout; `None` drops the declaration.
     fn refined_declaration(
         &self,
@@ -172,6 +145,35 @@ impl RustCrateLayout {
             directory = parent_directory(current);
         }
         self.package_roots.get("").map(String::as_str)
+    }
+}
+
+impl ModuleLayout for RustCrateLayout {
+    /// The unit's facts with every module declaration's candidates recomputed.
+    ///
+    /// A declaration whose scope chain leaves module scopes - a `mod` inside a block -
+    /// gains no candidates and is dropped; `rustc` refuses a file module inside a block
+    /// without a `path` attribute. A candidate that is itself a crate root is discarded,
+    /// so a stray `mod` declaration cannot adopt another crate's root; with no surviving
+    /// candidate the declaration is dropped and its module link never forms.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BindingError`] when the replaced declarations do not validate against
+    /// `limits`; the facts they derive from make any other refusal a programmer error.
+    fn refined_facts(
+        &self,
+        unit_path: &str,
+        facts: &UnitBindingFacts,
+        limits: &BindingLimits,
+    ) -> Result<UnitBindingFacts, BindingError> {
+        let module_names = declared_module_names(facts);
+        let mut declarations = Vec::with_capacity(facts.module_declarations().len());
+        for declaration in facts.module_declarations() {
+            let refined = self.refined_declaration(unit_path, facts, &module_names, declaration);
+            declarations.extend(refined);
+        }
+        facts.with_module_declarations(declarations, limits)
     }
 }
 
@@ -285,8 +287,8 @@ fn joined(directory: &str, tail: &str) -> String {
 #[cfg(test)]
 mod tests {
     use rift_binding::{
-        BindingGraph, BindingLimits, LinkedGraph, NeverCancelled, ResolutionSet, UnitBindingFacts,
-        assemble, resolve_all,
+        BindingGraph, BindingLimits, LinkedGraph, ModuleLayout, NeverCancelled, ResolutionSet,
+        UnitBindingFacts, assemble, resolve_all,
     };
     use rift_core::{ContributionOrigin, SourceUnitId};
 
@@ -459,6 +461,25 @@ mod tests {
             refined.module_declarations(),
             &[],
             "a unit rooted in a block scope resolves no file modules"
+        );
+    }
+
+    #[test]
+    fn test_rust_provider_binding_layout_serves_the_crate_layout() {
+        use crate::provider::SyntaxProvider;
+        let provider = crate::rust::RustSyntaxProvider::default();
+        let layout = provider
+            .binding_layout(&["Cargo.toml", "src/lib.rs", "src/main.rs"])
+            .expect("the rust provider serves a module layout");
+        let document = analyze("src/lib.rs", "mod main;\n");
+        let facts = document.binding().expect("binding facts extracted");
+        let refined = layout
+            .refined_facts("src/lib.rs", facts, &BindingLimits::default())
+            .expect("facts refine");
+        assert_eq!(
+            refined.module_declarations()[0].candidates(),
+            ["src/main/mod.rs".to_owned()],
+            "the served layout is built from the supplied path set"
         );
     }
 

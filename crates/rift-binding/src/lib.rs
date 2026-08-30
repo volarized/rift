@@ -12,6 +12,7 @@ mod failure;
 #[cfg(test)]
 mod fixture;
 mod graph;
+mod layout;
 mod limits;
 mod link;
 mod publish;
@@ -24,6 +25,7 @@ pub use graph::{
     NAME_BYTES_MAX, NAME_PATH_SEGMENTS_MAX, Name, NamePath, PathAnchor, Rank, Reference,
     ReferenceId, Scope, ScopeId, ScopeKind, Unit, UnitId, Visibility, VisibilitySpelling,
 };
+pub use layout::ModuleLayout;
 pub use limits::{
     BindingLimits, BindingLimitsBuilder, ExhaustedLimit, GRAPH_LINKS_MAX_DEFAULT,
     GRAPH_NODES_MAX_DEFAULT, PATH_DEPTH_MAX_DEFAULT, PUBLICATION_WORK_MAX_DEFAULT,
