@@ -3694,9 +3694,11 @@ mod tests {
             configuration.resolve_language_lsp("javascript").is_none(),
             "a language with no entry resolves no process"
         );
+        configuration
+            .languages
+            .insert("javascript".to_owned(), LanguageConfiguration::default());
         assert!(
-            configuration.resolve_language_lsp("python:stub").is_none()
-                || configuration.languages.contains_key("python:stub"),
+            configuration.resolve_language_lsp("javascript").is_none(),
             "an entry with no lsp key resolves no process"
         );
 

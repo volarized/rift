@@ -1995,11 +1995,7 @@ impl RiftMcp {
             })
             .collect::<Vec<_>>();
         let page_size = WORKSPACE_SOURCE_UNITS_MAX;
-        let total_pages = if source.is_empty() {
-            0
-        } else {
-            source.len().div_ceil(page_size)
-        };
+        let total_pages = source.len().div_ceil(page_size);
         let start = usize::try_from(page_index)
             .ok()
             .and_then(|page| page.checked_mul(page_size))
