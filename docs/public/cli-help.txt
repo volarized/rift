@@ -23,7 +23,21 @@ Commands:
   stop     Stop this workspace's server
   restart  Stop this workspace's server, then start a fresh detached one
   status   Report whether this workspace's server is serving
+  logs     Print this workspace's recorded server diagnostics, oldest first
   help     Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+$ rift server logs --help
+Print this workspace's recorded server diagnostics, oldest first
+
+Usage: rift server logs [OPTIONS]
+
+Options:
+  -f, --follow            Keep printing records as the server writes them
+  -n, --tail <COUNT>      Print only the newest COUNT records; `all` prints every kept record [default: all]
+      --since <DURATION>  Print only records newer than DURATION ago, such as `10m` or `2h`
+      --level <LEVEL>     Print only records at this severity, as the store spells it [possible values: trace, debug, info, warn, error]
+      --component <NAME>  Print only records one component emitted, as its spans label it: index, search, engine, change, or logs
+  -h, --help              Print help

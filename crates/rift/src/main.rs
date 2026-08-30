@@ -359,6 +359,86 @@ mod tests {
     }
 
     #[test]
+    fn the_logs_command_parses_its_filters() {
+        let plain = Cli::try_parse_from(["rift", "server", "logs"]).expect("logs must parse");
+        let rendered = format!("{plain:?}");
+        let Some(CliCommand::Server {
+            command:
+                super::server::ServerCommand::Logs {
+                    follow,
+                    tail,
+                    since,
+                    level,
+                    component,
+                },
+        }) = plain.command
+        else {
+            panic!("logs must parse into the server subcommand: {rendered}");
+        };
+        assert!(!follow);
+        assert_eq!(tail, super::server::TailCount::All);
+        assert_eq!(since, None);
+        assert_eq!(level, None);
+        assert_eq!(component, None);
+    }
+
+    #[test]
+    fn a_filtered_logs_read_parses_every_option() {
+        let parsed = Cli::try_parse_from([
+            "rift",
+            "server",
+            "logs",
+            "-f",
+            "-n",
+            "20",
+            "--level",
+            "warn",
+            "--component",
+            "index",
+            "--since",
+            "10m",
+        ])
+        .expect("a filtered logs read must parse");
+        let rendered = format!("{parsed:?}");
+        let Some(CliCommand::Server {
+            command:
+                super::server::ServerCommand::Logs {
+                    follow,
+                    tail,
+                    since,
+                    level,
+                    component,
+                },
+        }) = parsed.command
+        else {
+            panic!("logs must parse into the server subcommand: {rendered}");
+        };
+        assert!(follow);
+        assert_eq!(tail, super::server::TailCount::Newest(20));
+        assert_eq!(
+            since,
+            Some(rift_protocol::configuration::Duration::from_millis(600_000))
+        );
+        assert_eq!(level, Some(super::server::LogLevel::Warn));
+        assert_eq!(component.as_deref(), Some("index"));
+    }
+
+    #[test]
+    fn a_logs_read_refuses_values_outside_their_documented_forms() {
+        for arguments in [
+            ["rift", "server", "logs", "--tail", "0"].as_slice(),
+            ["rift", "server", "logs", "--tail", "many"].as_slice(),
+            ["rift", "server", "logs", "--level", "loud"].as_slice(),
+            ["rift", "server", "logs", "--since", "10"].as_slice(),
+        ] {
+            assert!(
+                Cli::try_parse_from(arguments).is_err(),
+                "{arguments:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
     fn only_a_foreground_server_records_workspace_logs() {
         let foreground = Cli::try_parse_from(["rift", "server", "start", "--foreground"])
             .expect("foreground start must parse");
@@ -370,6 +450,7 @@ mod tests {
             ["rift", "server", "stop"].as_slice(),
             ["rift", "server", "restart"].as_slice(),
             ["rift", "server", "status"].as_slice(),
+            ["rift", "server", "logs", "--follow"].as_slice(),
             ["rift", "update"].as_slice(),
         ] {
             let command = Cli::try_parse_from(arguments).expect("command must parse");

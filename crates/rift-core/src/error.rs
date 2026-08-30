@@ -44,6 +44,8 @@ pub enum CliCode {
     ServerStartTimedOut,
     /// Running rift server could not be stopped.
     ServerStopFailed,
+    /// Recorded server logs could not be read.
+    ServerLogsUnavailable,
 }
 
 /// Stable machine-readable error identity: a wire code or a CLI-only code.
@@ -234,6 +236,11 @@ const fn cli_guidance(code: CliCode) -> (&'static str, RetryDirective, &'static 
             "the running rift server could not be stopped",
             RetryDirective::OperatorAction,
             "retry `rift server stop`; if the refusal repeats, end the reported pid manually",
+        ),
+        CliCode::ServerLogsUnavailable => (
+            "the workspace's recorded server logs could not be read",
+            RetryDirective::OperatorAction,
+            "ensure no other process holds `.rift/db` exclusively and retry",
         ),
     }
 }
@@ -544,6 +551,10 @@ mod tests {
         assert_eq!(
             ErrorName::Cli(CliCode::ServerStopFailed).code(),
             "server_stop_failed"
+        );
+        assert_eq!(
+            ErrorName::Cli(CliCode::ServerLogsUnavailable).code(),
+            "server_logs_unavailable"
         );
     }
 

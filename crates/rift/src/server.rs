@@ -9,15 +9,21 @@
 use std::fmt;
 use std::io;
 use std::path::Path;
-use std::time::Duration;
+use std::str::FromStr;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rift_core::constants::{RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME};
 use rift_core::{CliCode, Error, ErrorContext, ErrorName, Fault};
+use rift_index::{
+    LOG_PAGE_RECORDS_MAX, LexicalIndexError, LogQuery, LogRecord, LogStore, StoredLogRecord,
+};
 use rift_mcp::{
     ElectionError, ElectionFault, LogDrain, PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT,
     START_WAIT_MAX, ServerPresence, StaleReason, WorkspaceStorage, probe, read_serving,
     serve_elected_with_storage, spawn_detached_server,
 };
 use rift_protocol::lock::ServerLock;
+use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
 /// Longest wait for an asked server to leave the serving state.
@@ -31,6 +37,27 @@ const STOP_POLL_ATTEMPT_COUNT: u32 = 100;
 const STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Longest wait for queued diagnostics to reach the workspace database.
 const LOG_DRAIN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Wall-clock span between two polls of the store while following.
+const LOG_FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// The form `--tail` accepts, named in every refusal.
+const TAIL_COUNT_EXPECTED: &str = "`all`, or a positive integer such as `20`";
+/// What a workspace holding no recorded diagnostics prints on stderr.
+const NO_RECORDED_LOGS: &str = "💤 no server diagnostics recorded for this workspace yet; \
+                                start one with `rift server start`";
+/// Seconds in one minute.
+const SECONDS_PER_MINUTE: i64 = 60;
+/// Minutes in one hour.
+const MINUTES_PER_HOUR: i64 = 60;
+/// Milliseconds in one second.
+const MILLISECONDS_PER_SECOND: i64 = 1_000;
+/// Milliseconds in one minute.
+const MILLISECONDS_PER_MINUTE: i64 = 60_000;
+/// Milliseconds in one hour.
+const MILLISECONDS_PER_HOUR: i64 = 3_600_000;
+/// Milliseconds in one day, the span a rendered timestamp splits its date from.
+const MILLISECONDS_PER_DAY: i64 = 86_400_000;
+/// Days between the proleptic Gregorian era's first day and the Unix epoch.
+const EPOCH_DAY_IN_ERA: i64 = 719_468;
 
 /// Failure while running one `rift server` command.
 pub(super) type ServerCommandError = Error<ServerCommandFault>;
@@ -56,6 +83,12 @@ pub(super) enum ServerCommandFault {
     StopTimedOut { holder: Box<ServerLock> },
     /// The election refused or failed while serving in the foreground.
     Election(Box<ElectionError>),
+    /// The workspace database exists but its recorded diagnostics could not be
+    /// read. Carries the store's own failure when a query reached it; a
+    /// database that never opened leaves none, having reported on stderr.
+    LogsUnavailable {
+        source: Option<Box<LexicalIndexError>>,
+    },
 }
 
 impl Fault for ServerCommandFault {
@@ -67,6 +100,7 @@ impl Fault for ServerCommandFault {
             Self::StopRequestFailed { .. }
             | Self::StopRefused { .. }
             | Self::StopTimedOut { .. } => ErrorName::Cli(CliCode::ServerStopFailed),
+            Self::LogsUnavailable { .. } => ErrorName::Cli(CliCode::ServerLogsUnavailable),
             Self::Election(source) => source.name(),
         }
     }
@@ -87,6 +121,13 @@ impl Fault for ServerCommandFault {
                 evidence.extend(holder_evidence(Some(holder.as_ref())));
                 evidence
             }
+            Self::LogsUnavailable { source: Some(_) } => {
+                vec![ErrorContext::new("operation", "read recorded logs")]
+            }
+            Self::LogsUnavailable { source: None } => vec![ErrorContext::new(
+                "detail",
+                "the workspace database at `.rift/db` did not open",
+            )],
             Self::Election(source) => source.context(),
         }
     }
@@ -100,6 +141,9 @@ impl Fault for ServerCommandFault {
             Self::SpawnFailed { source } => Some(source),
             Self::StopRequestFailed { source } => Some(source),
             Self::Election(source) => Some(source),
+            Self::LogsUnavailable { source } => source
+                .as_deref()
+                .map(|error| error as &(dyn std::error::Error + 'static)),
         }
     }
 }
@@ -145,6 +189,97 @@ pub(super) enum ServerCommand {
     Restart,
     /// Report whether this workspace's server is serving.
     Status,
+    /// Print this workspace's recorded server diagnostics, oldest first.
+    Logs {
+        /// Keep printing records as the server writes them.
+        #[arg(short, long)]
+        follow: bool,
+        /// Print only the newest COUNT records; `all` prints every kept record.
+        #[arg(short = 'n', long, default_value = "all", value_name = "COUNT")]
+        tail: TailCount,
+        /// Print only records newer than DURATION ago, such as `10m` or `2h`.
+        #[arg(
+            long,
+            value_name = "DURATION",
+            value_parser = rift_protocol::configuration::Duration::parse
+        )]
+        since: Option<rift_protocol::configuration::Duration>,
+        /// Print only records at this severity, as the store spells it.
+        #[arg(long, value_name = "LEVEL")]
+        level: Option<LogLevel>,
+        /// Print only records one component emitted, as its spans label it:
+        /// index, search, engine, change, or logs.
+        #[arg(long, value_name = "NAME")]
+        component: Option<String>,
+    },
+}
+
+/// How many recorded records the initial print carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TailCount {
+    /// Every record the store still keeps.
+    All,
+    /// The newest `count` records.
+    Newest(u64),
+}
+
+impl FromStr for TailCount {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if text == "all" {
+            return Ok(Self::All);
+        }
+        match text.parse::<u64>() {
+            Ok(0) | Err(_) => Err(format!("expected {TAIL_COUNT_EXPECTED}, not {text:?}")),
+            Ok(count) => Ok(Self::Newest(count)),
+        }
+    }
+}
+
+/// One severity a logs read is restricted to, in the store's own spelling.
+///
+/// The variants carry no documentation of their own: clap renders a value's
+/// doc comment as per-value help, which turns the whole command's help into
+/// its long form, and the five levels need no gloss beyond their names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(super) enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    /// The store's own spelling for this severity.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Trace => "trace",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// Where a printed logs read stops.
+#[derive(Debug)]
+enum LogsMode {
+    /// Print what the store holds and return.
+    Once,
+    /// Print what the store holds, then keep printing what lands.
+    Following,
+}
+
+/// The clap `--follow` flag as the mode the read dispatches on.
+fn logs_mode(follow: bool) -> LogsMode {
+    if follow {
+        LogsMode::Following
+    } else {
+        LogsMode::Once
+    }
 }
 
 /// Where a started server runs.
@@ -219,9 +354,9 @@ impl fmt::Display for ServerOutcome {
 /// Runs one `rift server` command against the current directory's
 /// workspace.
 ///
-/// A foreground start prints its listening line itself before blocking and
-/// completes with nothing left to print; every other command completes
-/// with its outcome line.
+/// A foreground start prints its listening line itself before blocking, and
+/// `logs` prints the records it read; both complete with nothing left to
+/// print. Every other command completes with its outcome line.
 ///
 /// # Errors
 ///
@@ -242,6 +377,18 @@ pub(super) async fn run(
         ServerCommand::Stop => stop(root).await.map(Some),
         ServerCommand::Restart => restart(root).await.map(Some),
         ServerCommand::Status => Ok(Some(status(root))),
+        ServerCommand::Logs {
+            follow,
+            tail,
+            since,
+            level,
+            component,
+        } => {
+            let query = logs_query(tail, since, level, component.as_deref());
+            print_logs(root, &query, tail, &logs_mode(follow))
+                .await
+                .map(|()| None)
+        }
     }
 }
 
@@ -521,6 +668,259 @@ async fn restart(root: &Path) -> Result<ServerOutcome, ServerCommandError> {
     start_detached(root).await
 }
 
+/// The store read one `rift server logs` run issues.
+///
+/// The page is the `--tail` count, bounded by [`LOG_PAGE_RECORDS_MAX`]; `all`
+/// reads a whole page at a time. `--since` becomes an absolute floor here, so
+/// every page of one run selects the same window.
+fn logs_query(
+    tail: TailCount,
+    since: Option<rift_protocol::configuration::Duration>,
+    level: Option<LogLevel>,
+    component: Option<&str>,
+) -> LogQuery {
+    let limit = match tail {
+        TailCount::All => LOG_PAGE_RECORDS_MAX,
+        TailCount::Newest(count) => usize::try_from(count).unwrap_or(LOG_PAGE_RECORDS_MAX),
+    };
+    let mut query = LogQuery::newest(limit);
+    if let Some(level) = level {
+        query = query.at_level(level.label());
+    }
+    if let Some(component) = component {
+        query = query.for_component(component);
+    }
+    if let Some(since) = since {
+        let age_ms = i64::try_from(since.milliseconds()).unwrap_or(i64::MAX);
+        query = query.since_ms(now_ms().saturating_sub(age_ms));
+    }
+    query
+}
+
+/// Prints this workspace's recorded diagnostics, oldest first.
+///
+/// The store is read directly, so a workspace whose server has stopped still
+/// answers. A workspace holding no `.rift/db` prints nothing, says so on
+/// stderr, and creates no state directory.
+async fn print_logs(
+    root: &Path,
+    query: &LogQuery,
+    tail: TailCount,
+    mode: &LogsMode,
+) -> Result<(), ServerCommandError> {
+    let database = root
+        .join(RIFT_STATE_DIRECTORY)
+        .join(WORKSPACE_DATABASE_FILE_NAME);
+    if !database.exists() {
+        eprintln!("{NO_RECORDED_LOGS}");
+        return Ok(());
+    }
+    let Some(store) = WorkspaceStorage::open(root).await.logs() else {
+        return Err(Error::new(ServerCommandFault::LogsUnavailable {
+            source: None,
+        }));
+    };
+    let printed = match tail {
+        TailCount::All => print_records_after(&store, query, 0).await?,
+        TailCount::Newest(_) => print_newest_records(&store, query).await?,
+    };
+    match mode {
+        LogsMode::Once => Ok(()),
+        LogsMode::Following => follow_records(&store, query, printed).await,
+    }
+}
+
+/// Prints every record after `after`, oldest first, and returns the newest
+/// identity it printed.
+///
+/// One read is bounded by the query's own page, itself bounded by
+/// [`LOG_PAGE_RECORDS_MAX`]. The loop repeats only while a page comes back
+/// full, and the store's retention bounds how many full pages there can be.
+async fn print_records_after(
+    store: &LogStore,
+    query: &LogQuery,
+    after: i64,
+) -> Result<i64, ServerCommandError> {
+    let mut newest = after;
+    loop {
+        let page = store
+            .following(&query.clone().after(newest))
+            .await
+            .map_err(logs_unavailable)?;
+        for stored in &page {
+            let line = rendered_record(stored);
+            println!("{line}");
+            newest = stored.identity();
+        }
+        if page.len() < query.limit() {
+            return Ok(newest);
+        }
+    }
+}
+
+/// Prints the newest records the query selects, oldest first, and returns the
+/// newest identity it printed. The read is bounded by the query's own page.
+async fn print_newest_records(
+    store: &LogStore,
+    query: &LogQuery,
+) -> Result<i64, ServerCommandError> {
+    let mut records = store.recent(query).await.map_err(logs_unavailable)?;
+    records.reverse();
+    let mut newest = 0;
+    for stored in &records {
+        let line = rendered_record(stored);
+        println!("{line}");
+        newest = stored.identity();
+    }
+    Ok(newest)
+}
+
+/// Prints records as the server writes them, until the operator interrupts.
+async fn follow_records(
+    store: &LogStore,
+    query: &LogQuery,
+    printed: i64,
+) -> Result<(), ServerCommandError> {
+    let interrupted = CancellationToken::new();
+    let interrupt = tokio::spawn(cancel_on_interrupt(interrupted.clone()));
+    let followed = follow_until_interrupt(store, query, printed, &interrupted).await;
+    interrupt.abort();
+    let _ = interrupt.await;
+    followed
+}
+
+/// Polls the store until `interrupted` is cancelled, printing each new page.
+///
+/// The loop has no iteration bound by design: it ends on the operator's
+/// interrupt, as `docker logs -f` does. Each iteration reads one page, bounded
+/// by the query's own limit.
+async fn follow_until_interrupt(
+    store: &LogStore,
+    query: &LogQuery,
+    printed: i64,
+    interrupted: &CancellationToken,
+) -> Result<(), ServerCommandError> {
+    let mut newest = printed;
+    while !interrupted.is_cancelled() {
+        newest = print_records_after(store, query, newest).await?;
+        tokio::select! {
+            () = interrupted.cancelled() => {}
+            () = tokio::time::sleep(LOG_FOLLOW_POLL_INTERVAL) => {}
+        }
+    }
+    Ok(())
+}
+
+/// One store failure as this command's typed refusal.
+fn logs_unavailable(source: LexicalIndexError) -> ServerCommandError {
+    Error::new(ServerCommandFault::LogsUnavailable {
+        source: Some(Box::new(source)),
+    })
+}
+
+/// One stored record as one printed line.
+fn rendered_record(stored: &StoredLogRecord) -> String {
+    rendered_line(stored.record())
+}
+
+/// One record as the operator reads it: when it happened, how severe it was,
+/// where it came from, what it said, and the fields it carried.
+fn rendered_line(record: &LogRecord) -> String {
+    let timestamp = rendered_timestamp(record.recorded_at_ms());
+    let glyph = level_glyph(record.level());
+    let level = record.level().to_uppercase();
+    let component = label(record.component());
+    let operation = label(record.operation());
+    let message = record.message();
+    let fields = rendered_fields(record.fields());
+    format!("{timestamp} {glyph} {level:<5} {component:<8} {operation:<12} {message}{fields}")
+}
+
+/// The glyph one severity prints under. A level outside the five the store
+/// records prints under the least severe one.
+fn level_glyph(level: &str) -> &'static str {
+    match level {
+        "error" => "🔴",
+        "warn" => "🟡",
+        "info" => "🔵",
+        "debug" => "⚪",
+        _ => "⚫",
+    }
+}
+
+/// The label a record carried, or `-` when it carried none.
+fn label(value: &str) -> &str {
+    if value.is_empty() { "-" } else { value }
+}
+
+/// The record's remaining fields as ` key=value` pairs, or as the text the
+/// store holds when that text is not a JSON object.
+fn rendered_fields(fields: &str) -> String {
+    if fields.is_empty() {
+        return String::new();
+    }
+    let Ok(named) = serde_json::from_str::<Map<String, Value>>(fields) else {
+        return format!(" {fields}");
+    };
+    let mut rendered = String::new();
+    for (key, value) in &named {
+        rendered.push(' ');
+        rendered.push_str(key);
+        rendered.push('=');
+        rendered.push_str(&rendered_value(value));
+    }
+    rendered
+}
+
+/// One field value without the quotes JSON puts around a string.
+fn rendered_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// One recorded instant as an RFC 3339 UTC timestamp with milliseconds.
+///
+/// The arithmetic is integer and the calendar proleptic Gregorian: a printed
+/// record needs no time zone, and the workspace carries no date library.
+fn rendered_timestamp(recorded_at_ms: i64) -> String {
+    let (year, month, day) = civil_date(recorded_at_ms.div_euclid(MILLISECONDS_PER_DAY));
+    let time_of_day_ms = recorded_at_ms.rem_euclid(MILLISECONDS_PER_DAY);
+    let hour = time_of_day_ms / MILLISECONDS_PER_HOUR;
+    let minute = time_of_day_ms / MILLISECONDS_PER_MINUTE % MINUTES_PER_HOUR;
+    let second = time_of_day_ms / MILLISECONDS_PER_SECOND % SECONDS_PER_MINUTE;
+    let millisecond = time_of_day_ms % MILLISECONDS_PER_SECOND;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millisecond:03}Z")
+}
+
+/// The proleptic Gregorian year, month, and day `days` after the Unix epoch.
+///
+/// Howard Hinnant's `civil_from_days`, with floor division where the algorithm
+/// asks for it, so a day before the epoch answers as exactly as one after.
+fn civil_date(days: i64) -> (i64, i64, i64) {
+    let shifted = days + EPOCH_DAY_IN_ERA;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = shifted_month + if shifted_month < 10 { 3 } else { -9 };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
+/// Milliseconds since the Unix epoch, or zero on a clock before it.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
 #[cfg(test)]
 pub(super) fn error_for_test() -> ServerCommandError {
     Error::new(ServerCommandFault::StartTimedOut)
@@ -534,12 +934,18 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{
-        PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, STOP_POLL_ATTEMPT_COUNT,
-        STOP_WAIT_MAX, ServerCommandFault, ServerOutcome, StaleReason, StartMode, await_serving,
-        await_stopped, discard_stale_document, foreground_refused, holder_evidence,
-        stale_reason_phrase, start_mode, status, stop, stop_log_drain,
+        LogLevel, LogsMode, MILLISECONDS_PER_HOUR, PRESENCE_POLL_INTERVAL,
+        START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, STOP_POLL_ATTEMPT_COUNT, STOP_WAIT_MAX,
+        ServerCommandFault, ServerOutcome, StaleReason, StartMode, TailCount, await_serving,
+        await_stopped, civil_date, discard_stale_document, foreground_refused, holder_evidence,
+        label, level_glyph, logs_mode, logs_query, logs_unavailable, now_ms, print_logs,
+        rendered_fields, rendered_line, rendered_timestamp, stale_reason_phrase, start_mode,
+        status, stop, stop_log_drain,
     };
     use rift_core::Error;
+    use rift_index::{
+        LOG_BATCH_RECORDS_MAX, LOG_LEVELS, LOG_PAGE_RECORDS_MAX, LogRecord, LogStore,
+    };
     use rift_protocol::lock::{ProductIdentity, ServerLock, ServerLockViolation};
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -1021,5 +1427,220 @@ mod tests {
             "a directory survives the best-effort removal"
         );
         Ok(())
+    }
+
+    /// A log store on a temporary database, for the reads these cases drive.
+    async fn log_store(directory: &tempfile::TempDir) -> TestResult<LogStore> {
+        let database = rift_index::WorkspaceDatabase::open(
+            &directory.path().join("db"),
+            rift_index::DatabasePool::new(2, 1_000),
+        )
+        .await?;
+        Ok(LogStore::attached(database))
+    }
+
+    #[test]
+    fn tail_counts_parse_all_and_positive_integers() {
+        assert_eq!("all".parse::<TailCount>(), Ok(TailCount::All));
+        assert_eq!("5".parse::<TailCount>(), Ok(TailCount::Newest(5)));
+        for refused in ["0", "-1", "twenty", "", "5 ", "all "] {
+            let refusal = refused
+                .parse::<TailCount>()
+                .expect_err("only `all` and a positive integer are accepted");
+            assert!(refusal.contains("positive integer"), "{refusal}");
+            assert!(refusal.contains(refused), "{refusal}");
+        }
+    }
+
+    #[test]
+    fn every_level_label_is_a_spelling_the_store_holds() {
+        let variants = <LogLevel as clap::ValueEnum>::value_variants();
+        let labels: Vec<&str> = variants.iter().map(|level| level.label()).collect();
+
+        assert_eq!(labels, LOG_LEVELS);
+        for level in variants {
+            let value = clap::ValueEnum::to_possible_value(level)
+                .expect("every level is a selectable value");
+            assert_eq!(value.get_name(), level.label());
+        }
+    }
+
+    #[test]
+    fn the_follow_flag_selects_the_mode() {
+        assert!(matches!(logs_mode(true), LogsMode::Following));
+        assert!(matches!(logs_mode(false), LogsMode::Once));
+    }
+
+    #[test]
+    fn a_logs_query_carries_its_tail_level_and_component() {
+        let query = logs_query(
+            TailCount::Newest(20),
+            None,
+            Some(LogLevel::Warn),
+            Some("index"),
+        );
+
+        assert_eq!(query.limit(), 20);
+        assert_eq!(query.level(), Some("warn"));
+        assert_eq!(query.component(), Some("index"));
+        assert_eq!(
+            logs_query(TailCount::All, None, None, None).limit(),
+            LOG_PAGE_RECORDS_MAX
+        );
+    }
+
+    #[tokio::test]
+    async fn a_since_read_selects_only_records_inside_its_window() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let store = log_store(&directory).await?;
+        let now = now_ms();
+        let older = LogRecord::new(
+            now - MILLISECONDS_PER_HOUR,
+            "info",
+            "rift_mcp::server",
+            "index",
+            "index.build",
+            "old",
+            "{}",
+        );
+        let fresh = LogRecord::new(
+            now,
+            "info",
+            "rift_mcp::server",
+            "index",
+            "index.build",
+            "fresh",
+            "{}",
+        );
+        store.append(&[older, fresh], 1_000).await?;
+        let since = rift_protocol::configuration::Duration::parse("10m")?;
+        assert_eq!(since.milliseconds(), 600_000);
+        assert!(rift_protocol::configuration::Duration::parse("10").is_err());
+
+        let read = store
+            .following(&logs_query(TailCount::All, Some(since), None, None))
+            .await?;
+
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].record().message(), "fresh");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_workspace_without_a_database_prints_nothing_and_creates_nothing() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let query = logs_query(TailCount::All, None, None, None);
+
+        print_logs(directory.path(), &query, TailCount::All, &LogsMode::Once).await?;
+
+        assert!(
+            !directory.path().join(".rift").exists(),
+            "a logs read never creates the state directory"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_unopened_database_names_itself_in_the_refusal() {
+        let error = Error::new(ServerCommandFault::LogsUnavailable { source: None });
+
+        assert_eq!(error.descriptor().code(), "server_logs_unavailable");
+        let rendered = error.to_string();
+        assert!(rendered.contains("did not open"), "{rendered}");
+        assert!(rendered.contains(".rift/db"), "{rendered}");
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_refused_read_keeps_the_store_failure_on_its_source_chain() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let store = log_store(&directory).await?;
+        let oversized: Vec<LogRecord> = (0..=LOG_BATCH_RECORDS_MAX)
+            .map(|_| LogRecord::new(0, "info", "rift", "index", "index.build", "x", "{}"))
+            .collect();
+        let refused = store
+            .append(&oversized, 1_000)
+            .await
+            .expect_err("an oversized batch must be refused");
+
+        let error = logs_unavailable(refused);
+
+        assert_eq!(error.descriptor().code(), "server_logs_unavailable");
+        let rendered = error.to_string();
+        assert!(rendered.contains("read recorded logs"), "{rendered}");
+        assert!(
+            std::error::Error::source(&error).is_some(),
+            "the store failure must stay on the source chain"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_rendered_line_carries_every_column() {
+        let record = LogRecord::new(
+            1_756_552_944_123,
+            "info",
+            "rift_mcp::server",
+            "index",
+            "rebuild",
+            "published 412 units",
+            "{\"unit_count\":412}",
+        );
+
+        assert_eq!(
+            rendered_line(&record),
+            "2025-08-30T11:22:24.123Z 🔵 INFO  index    rebuild      \
+             published 412 units unit_count=412"
+        );
+    }
+
+    #[test]
+    fn a_record_without_labels_prints_a_dash_in_each_column() {
+        let record = LogRecord::new(0, "warn", "rift", "", "", "late", "{}");
+
+        assert_eq!(
+            rendered_line(&record),
+            "1970-01-01T00:00:00.000Z 🟡 WARN  -        -            late"
+        );
+        assert_eq!(label(""), "-");
+        assert_eq!(label("index"), "index");
+    }
+
+    #[test]
+    fn every_level_prints_its_own_glyph() {
+        for (level, glyph) in [
+            ("error", "🔴"),
+            ("warn", "🟡"),
+            ("info", "🔵"),
+            ("debug", "⚪"),
+            ("trace", "⚫"),
+            ("loud", "⚫"),
+        ] {
+            assert_eq!(level_glyph(level), glyph, "{level}");
+        }
+    }
+
+    #[test]
+    fn fields_print_as_pairs_or_as_the_text_the_store_holds() {
+        assert_eq!(rendered_fields("{}"), "");
+        assert_eq!(rendered_fields(""), "");
+        assert_eq!(
+            rendered_fields("{\"epoch\":\"4\",\"count\":7}"),
+            " count=7 epoch=4"
+        );
+        assert_eq!(rendered_fields("not json"), " not json");
+        assert_eq!(rendered_fields("[1]"), " [1]");
+    }
+
+    #[test]
+    fn timestamps_render_in_utc_with_milliseconds() {
+        assert_eq!(rendered_timestamp(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            rendered_timestamp(1_756_552_944_123),
+            "2025-08-30T11:22:24.123Z"
+        );
+        assert_eq!(rendered_timestamp(-1), "1969-12-31T23:59:59.999Z");
+        assert_eq!(civil_date(0), (1970, 1, 1));
+        assert_eq!(civil_date(-1), (1969, 12, 31));
     }
 }
