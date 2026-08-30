@@ -88,6 +88,9 @@ pub const HOOK_OUTPUT_BYTES_MAX: u64 = 4_096;
 pub const HOOK_GUARANTEES_MAX: usize = 16;
 /// Bytes one guarantee's `detail` may hold, at most.
 pub const HOOK_GUARANTEE_DETAIL_BYTES_MAX: usize = 1_024;
+/// The pattern `[search.text].include` carries when the key is absent: every
+/// visible path no language entry claimed joins the text index.
+pub const TEXT_INCLUDE_PATTERN_DEFAULT: &str = "**";
 /// Configured exact languages one workspace may declare, at most.
 pub const LANGUAGES_MAX: usize = 64;
 /// Named LSP processes one workspace may declare, at most.
@@ -1228,13 +1231,15 @@ pub const TEXT_CHUNK_BYTES_MAX: u64 = 16 << 20;
 /// Bytes one lexical chunk from a `search.text` file may hold, by default.
 pub const TEXT_CHUNK_BYTES_DEFAULT: u64 = 1 << 20;
 
-/// The `[search.text]` table. `max_chunk` bounds lexical units derived from
-/// visible text files.
+/// The `[search.text]` table. `include` selects which visible paths join the
+/// text index once every language entry has had its claim, and `max_chunk`
+/// bounds the lexical units derived from them.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_text_ranges)]
 pub struct TextSearchConfiguration {
     /// Project-relative path patterns included as plain text when no language claims them.
+    /// The default `["**"]` selects every unclaimed visible path; an empty list selects none.
     #[schemars(length(max = 64))]
     pub include: Vec<PathPattern>,
     /// Bytes one lexical chunk may hold, 1kb to 16mb. Larger files are indexed as
@@ -1245,9 +1250,7 @@ pub struct TextSearchConfiguration {
 impl Default for TextSearchConfiguration {
     fn default() -> Self {
         Self {
-            include: ["**/*.md", "**/*.mdx", "**/*.txt"]
-                .map(|pattern| PathPattern(pattern.to_owned()))
-                .into(),
+            include: vec![PathPattern(TEXT_INCLUDE_PATTERN_DEFAULT.to_owned())],
             max_chunk: ByteSize::from_bytes(TEXT_CHUNK_BYTES_DEFAULT),
         }
     }
@@ -1301,7 +1304,7 @@ impl JsonSchema for CommandInput {
                     "type": "array",
                     "minItems": 1,
                     "maxItems": 65,
-                    "prefixItems": [{"type": "string", "minLength": 1}],
+                    "prefixItems": [{"type": "string", "minLength": 1, "maxLength": 4096}],
                     "items": {"type": "string", "maxLength": 4096}
                 }
             ]
@@ -1329,28 +1332,50 @@ impl CommandInput {
     }
 
     fn violation(&self, field: &'static str) -> Option<ConfigurationViolation> {
+        self.program_violation(field)
+            .or_else(|| self.arguments_violation(field))
+    }
+
+    /// The first bound the executable element breaks.
+    ///
+    /// Whitespace refuses the string form alone: there a program carrying a
+    /// space cannot be told from a whole command line. The list form states
+    /// the split itself, so a program name holding a space is accepted.
+    fn program_violation(&self, field: &'static str) -> Option<ConfigurationViolation> {
         let program = self.program();
-        if program.is_empty() {
-            return Some(ConfigurationViolation::CommandProgramEmpty { field });
+        let string_form = matches!(self, Self::Program(_));
+        match program {
+            "" => Some(ConfigurationViolation::CommandProgramEmpty { field }),
+            _ if program.len() > COMMAND_ARGUMENT_BYTES_MAX => {
+                Some(ConfigurationViolation::CommandProgramOversized {
+                    field,
+                    bytes: program.len() as u64,
+                })
+            }
+            _ if string_form && program.chars().any(char::is_whitespace) => {
+                Some(ConfigurationViolation::CommandProgramWhitespace {
+                    field,
+                    program: program.to_owned(),
+                })
+            }
+            _ if is_absolute_program(program) => {
+                Some(ConfigurationViolation::CommandProgramAbsolute {
+                    field,
+                    program: program.to_owned(),
+                })
+            }
+            _ if program.split('/').any(is_dot_path_segment) => {
+                Some(ConfigurationViolation::CommandProgramDotSegment {
+                    field,
+                    program: program.to_owned(),
+                })
+            }
+            _ => None,
         }
-        if matches!(self, Self::Program(program) if program.chars().any(char::is_whitespace)) {
-            return Some(ConfigurationViolation::CommandProgramWhitespace {
-                field,
-                program: program.to_owned(),
-            });
-        }
-        if is_absolute_program(program) {
-            return Some(ConfigurationViolation::CommandProgramAbsolute {
-                field,
-                program: program.to_owned(),
-            });
-        }
-        if program.split('/').any(is_dot_path_segment) {
-            return Some(ConfigurationViolation::CommandProgramDotSegment {
-                field,
-                program: program.to_owned(),
-            });
-        }
+    }
+
+    /// The first bound the argument list breaks.
+    fn arguments_violation(&self, field: &'static str) -> Option<ConfigurationViolation> {
         if self.arguments().len() > COMMAND_ARGUMENTS_MAX {
             return out_of_range(
                 field,
@@ -1387,6 +1412,7 @@ pub struct CommandHook {
     #[serde(default)]
     pub changed_paths: ChangedPaths,
     /// Source files the server permits the hook to change.
+    #[serde(default)]
     pub writes: HookWrites,
     /// Directory the process starts in, relative to the changed tree's root. Empty selects the
     /// root. Absolute paths and `.` or `..` segments are refused.
@@ -1402,6 +1428,7 @@ pub struct CommandHook {
     #[serde(default = "default_hook_output_limit")]
     pub output_limit: ByteSize,
     /// Severity the server reports when the hook does not pass.
+    #[serde(default)]
     pub failure_severity: HookFailureSeverity,
     /// What a passing validation establishes. Transform hooks cannot declare guarantees.
     #[serde(default)]
@@ -1461,11 +1488,12 @@ pub enum ChangedPaths {
 
 /// Source writes the server may retain from one hook.
 #[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+    Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum HookWrites {
     /// A validation hook that may not change source files.
+    #[default]
     None,
     /// A transform hook that may change only paths changed before hooks ran.
     ChangedPaths,
@@ -1489,13 +1517,14 @@ impl HookWrites {
 
 /// Severity the server reports when a hook does not pass.
 #[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+    Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum HookFailureSeverity {
     /// The hook result reports a warning.
     Warning,
     /// The hook result reports an error.
+    #[default]
     Error,
 }
 
@@ -1741,6 +1770,13 @@ pub enum ConfigurationViolation {
         /// Rejected argument size.
         bytes: u64,
     },
+    /// A command executable exceeds 4096 bytes.
+    CommandProgramOversized {
+        /// Configuration key carrying the command.
+        field: &'static str,
+        /// Rejected executable size.
+        bytes: u64,
+    },
     /// A hook's `working_directory` is not a project-relative path: it is
     /// absolute, or carries a `.` or `..` segment.
     HookWorkingDirectoryInvalid {
@@ -1862,7 +1898,8 @@ impl ConfigurationViolation {
             | Self::CommandProgramDotSegment { field, program } => {
                 vec![("field", (*field).to_owned()), ("program", program.clone())]
             }
-            Self::CommandArgumentOversized { field, bytes } => vec![
+            Self::CommandArgumentOversized { field, bytes }
+            | Self::CommandProgramOversized { field, bytes } => vec![
                 ("field", (*field).to_owned()),
                 ("bytes", bytes.to_string()),
                 ("bytes_max", COMMAND_ARGUMENT_BYTES_MAX.to_string()),
@@ -2541,11 +2578,7 @@ mod tests {
         assert!(configuration.lsp.is_empty());
         assert_eq!(
             configuration.search.text.include,
-            vec![
-                PathPattern("**/*.md".to_owned()),
-                PathPattern("**/*.mdx".to_owned()),
-                PathPattern("**/*.txt".to_owned()),
-            ]
+            vec![PathPattern(TEXT_INCLUDE_PATTERN_DEFAULT.to_owned())]
         );
         assert_eq!(configuration.validate(), Ok(()));
     }
@@ -2575,17 +2608,10 @@ mod tests {
     }
 
     #[test]
-    fn test_hook_block_requires_every_key() {
+    fn test_hook_block_requires_non_defaulted_keys() {
         let complete = serde_json::to_value(hook()).expect("serialize");
         let object = complete.as_object().expect("hook serializes to an object");
-        for missing in [
-            "id",
-            "kind",
-            "command",
-            "writes",
-            "failure_severity",
-            "determinism",
-        ] {
+        for missing in ["id", "kind", "command", "determinism"] {
             let mut trimmed = object.clone();
             trimmed.remove(missing);
             assert!(
@@ -3609,6 +3635,13 @@ mod tests {
             oversized.violation("command"),
             Some(ConfigurationViolation::CommandArgumentOversized { .. })
         ));
+        let oversized_program = CommandInput::Program("x".repeat(COMMAND_ARGUMENT_BYTES_MAX + 1));
+        assert!(matches!(
+            oversized_program.violation("command"),
+            Some(ConfigurationViolation::CommandProgramOversized { .. })
+        ));
+        let spaced_list = CommandInput::ProgramAndArguments(vec!["my tool".to_owned()]);
+        assert_eq!(spaced_list.violation("command"), None);
     }
 
     #[test]
@@ -3675,16 +3708,16 @@ mod tests {
             "id": "tests",
             "kind": "test",
             "command": ["cargo", "test"],
-            "writes": "none",
-            "failure_severity": "error",
             "determinism": "deterministic"
         });
         let hook: CommandHook = serde_json::from_value(value).expect("hook defaults");
         assert_eq!(hook.changed_paths, ChangedPaths::None);
+        assert_eq!(hook.writes, HookWrites::None);
         assert_eq!(hook.working_directory, ProjectPath::default());
         assert!(hook.environment.is_empty());
         assert_eq!(hook.timeout, Duration::from_millis(120_000));
         assert_eq!(hook.output_limit, ByteSize::from_bytes(4_096));
+        assert_eq!(hook.failure_severity, HookFailureSeverity::Error);
         assert!(hook.guarantees.is_empty());
 
         for legacy in [
@@ -3845,6 +3878,10 @@ mod tests {
             command[1]["items"]["maxLength"],
             json!(COMMAND_ARGUMENT_BYTES_MAX)
         );
+        assert_eq!(
+            command[1]["prefixItems"][0]["maxLength"],
+            json!(COMMAND_ARGUMENT_BYTES_MAX)
+        );
         assert_eq!(schema["properties"]["hooks"]["maxItems"], json!(HOOKS_MAX));
         assert_eq!(
             schema["properties"]["languages"]["maxProperties"],
@@ -3986,6 +4023,10 @@ mod tests {
                 program: text(),
             },
             ConfigurationViolation::CommandArgumentOversized {
+                field: "x",
+                bytes: 4_097,
+            },
+            ConfigurationViolation::CommandProgramOversized {
                 field: "x",
                 bytes: 4_097,
             },

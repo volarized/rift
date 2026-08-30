@@ -9,6 +9,22 @@ use crate::search::PathPattern;
 
 /// Source units one workspace resource page may carry, at most.
 pub const WORKSPACE_SOURCE_UNITS_MAX: usize = 1_000;
+/// Effective language entries one workspace resource page may carry, at most.
+///
+/// A page reports one entry per shipped syntax provider plus one per
+/// configured `[languages.<identity>]` entry the shipped set does not
+/// already name, so the bound covers
+/// [`LANGUAGES_MAX`](crate::configuration::LANGUAGES_MAX) configured
+/// entries and every provider this build ships.
+pub const WORKSPACE_LANGUAGE_SUMMARIES_MAX: usize = 128;
+
+const _: () = assert!(
+    WORKSPACE_LANGUAGE_SUMMARIES_MAX > crate::configuration::LANGUAGES_MAX,
+    "a workspace page reports every configured language entry and every shipped one"
+);
+/// Hook summaries one workspace resource page may carry, at most: one per
+/// configured hook.
+pub const WORKSPACE_HOOK_SUMMARIES_MAX: usize = crate::configuration::HOOKS_MAX;
 /// Bytes one workspace LSP process key may hold, at most.
 pub const WORKSPACE_LSP_PROCESS_KEY_BYTES_MAX: usize = 129;
 
@@ -19,7 +35,7 @@ pub struct WorkspaceResourcePage {
     /// Digest of the accepted `rift.toml` bytes this page describes.
     pub configuration_revision: Digest,
     /// Effective exact-language entries, sorted by language identity.
-    #[schemars(length(max = 64))]
+    #[schemars(length(max = 128))]
     pub languages: Vec<WorkspaceLanguageSummary>,
     /// Configured hooks in execution order.
     #[schemars(length(max = 32))]
@@ -120,9 +136,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::configuration::{
-        CONFIGURATION_PATTERNS_MAX, HOOK_ID_BYTES_MAX, HOOKS_MAX, LANGUAGES_MAX,
-    };
+    use crate::configuration::{CONFIGURATION_PATTERNS_MAX, HOOK_ID_BYTES_MAX};
 
     fn language() -> WorkspaceLanguageSummary {
         WorkspaceLanguageSummary {
@@ -223,8 +237,14 @@ mod tests {
         let schema = serde_json::to_value(schema_for!(WorkspaceResourcePage))
             .expect("workspace schema serializes");
         let page = &schema["properties"];
-        assert_eq!(page["languages"]["maxItems"], json!(LANGUAGES_MAX));
-        assert_eq!(page["hooks"]["maxItems"], json!(HOOKS_MAX));
+        assert_eq!(
+            page["languages"]["maxItems"],
+            json!(WORKSPACE_LANGUAGE_SUMMARIES_MAX)
+        );
+        assert_eq!(
+            page["hooks"]["maxItems"],
+            json!(WORKSPACE_HOOK_SUMMARIES_MAX)
+        );
         assert_eq!(
             page["source"]["maxItems"],
             json!(WORKSPACE_SOURCE_UNITS_MAX)

@@ -30,6 +30,9 @@ mod keyword {
     pub(super) const MAX_PROPERTIES: &str = "maxProperties";
     pub(super) const MIN_LENGTH: &str = "minLength";
     pub(super) const MAX_LENGTH: &str = "maxLength";
+    pub(super) const PATTERN: &str = "pattern";
+    pub(super) const PROPERTY_NAMES: &str = "propertyNames";
+    pub(super) const TYPE: &str = "type";
 }
 
 /// The serde property name of one model field, proven against the model:
@@ -43,6 +46,21 @@ macro_rules! property {
         stringify!($field)
     }};
 }
+
+/// The form a `[languages.<identity>]` table key takes: a language name, or
+/// a name and a dialect joined by `:`. Acceptance decodes the key through
+/// [`Language::from_identity_segment`](crate::read::Language::from_identity_segment)
+/// and refuses anything else, so the schema states the same form for editors
+/// reading `rift.toml` before the server does.
+const LANGUAGE_IDENTITY_PATTERN: &str = r"^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$";
+
+/// The form an `[lsp.<name>]` table key takes: one language word, with no
+/// dialect. Acceptance refuses a name carrying `:`, because a process name
+/// is not a language identity.
+const LSP_NAME_PATTERN: &str = r"^[a-z][a-z0-9._-]*$";
+
+/// The charset a hook `id` takes: ASCII alphanumerics, `.`, `_`, and `-`.
+const HOOK_ID_PATTERN: &str = r"^[A-Za-z0-9._-]+$";
 
 /// The Rift extension keyword stating an accepted range schema validation
 /// cannot compare itself: the bounds of a string-spelled `ByteSize` or
@@ -199,6 +217,20 @@ pub fn declare_workspace_contract(schema: &mut Schema) {
         ),
     ] {
         annotate_property(schema, name, keyword::MAX_PROPERTIES, json!(accepted));
+    }
+    for (name, pattern) in [
+        (
+            property!(WorkspaceConfiguration, languages),
+            LANGUAGE_IDENTITY_PATTERN,
+        ),
+        (property!(WorkspaceConfiguration, lsp), LSP_NAME_PATTERN),
+    ] {
+        annotate_property(
+            schema,
+            name,
+            keyword::PROPERTY_NAMES,
+            json!({ keyword::PATTERN: pattern }),
+        );
     }
 }
 
@@ -381,6 +413,12 @@ pub fn declare_hook_contract(schema: &mut Schema) {
         keyword::MAX_PROPERTIES,
         json!(HOOK_ENVIRONMENT_ENTRIES_MAX),
     );
+    annotate_property(
+        schema,
+        property!(CommandHook, id),
+        keyword::PATTERN,
+        json!(HOOK_ID_PATTERN),
+    );
     for writes in [HookWrites::ChangedPaths, HookWrites::Workspace] {
         append(
             schema,
@@ -434,6 +472,12 @@ pub fn declare_lsp_ranges(schema: &mut Schema) {
         property!(LspConfiguration, environment),
         keyword::MAX_PROPERTIES,
         json!(LSP_ENVIRONMENT_ENTRIES_MAX),
+    );
+    annotate_property(
+        schema,
+        property!(LspConfiguration, initialization_options),
+        keyword::TYPE,
+        json!("object"),
     );
 }
 
@@ -646,6 +690,68 @@ mod tests {
 
     fn schema_from(value: Value) -> Schema {
         Schema::try_from(value).expect("test schema literal must be a valid schema object")
+    }
+
+    /// The advertised table-key forms and the acceptance rules they mirror
+    /// must agree on every sample: a key the schema admits is a key the
+    /// server accepts, and a key the schema refuses is one it refuses.
+    #[test]
+    fn test_table_key_patterns_match_the_forms_acceptance_enforces() {
+        use crate::configuration::WorkspaceConfiguration;
+        use crate::read::Language;
+
+        let document =
+            serde_json::to_value(schema_for!(WorkspaceConfiguration)).expect("schema document");
+        assert_eq!(
+            document["properties"]["languages"][keyword::PROPERTY_NAMES][keyword::PATTERN],
+            json!(LANGUAGE_IDENTITY_PATTERN)
+        );
+        assert_eq!(
+            document["properties"]["lsp"][keyword::PROPERTY_NAMES][keyword::PATTERN],
+            json!(LSP_NAME_PATTERN)
+        );
+        let validator = jsonschema::validator_for(&document).expect("schema compiles");
+
+        for key in [
+            "rust",
+            "typescript:tsx",
+            "Rust",
+            "rust:",
+            ":tsx",
+            "9rust",
+            "rust:tsx:jsx",
+        ] {
+            let identity_accepted = Language::from_identity_segment(key).is_ok();
+            assert_eq!(
+                validator.is_valid(&json!({ "languages": { key: {} } })),
+                identity_accepted,
+                "the languages key pattern must admit exactly what acceptance decodes: {key}"
+            );
+            let command = json!({ "lsp": { key: { "command": "tool" } } });
+            assert_eq!(
+                validator.is_valid(&command),
+                identity_accepted && !key.contains(':'),
+                "the lsp key pattern must admit one language word and no dialect: {key}"
+            );
+        }
+    }
+
+    /// A hook `id` and an LSP `initialization_options` object are refused by
+    /// acceptance, so the schema states the same two rules.
+    #[test]
+    fn test_hook_id_and_initialization_options_state_their_accepted_forms() {
+        use crate::configuration::{CommandHook, LspConfiguration};
+
+        let hook = serde_json::to_value(schema_for!(CommandHook)).expect("hook schema");
+        assert_eq!(
+            hook["properties"]["id"][keyword::PATTERN],
+            json!(HOOK_ID_PATTERN)
+        );
+        let lsp = serde_json::to_value(schema_for!(LspConfiguration)).expect("lsp schema");
+        assert_eq!(
+            lsp["properties"]["initialization_options"][keyword::TYPE],
+            json!("object")
+        );
     }
 
     #[test]
