@@ -43,10 +43,9 @@ use rift_protocol::change::{
     ChangeResult, OperationPrecondition, OperationPreconditionKind, OperationPreconditionStatus,
     PreconditionValue, RefusalReason,
 };
-use rift_syntax::ByteRange;
 
 use crate::read::{ReadError, ReadFault, ReadService, digest_hex8};
-use crate::rewrite::{FileRewrite, ReplacedRegion};
+use crate::rewrite::FileRewrite;
 
 /// Most files one unified diff may address.
 pub(crate) const PATCH_FILES_MAX: usize = 64;
@@ -451,7 +450,6 @@ fn resolve_modify(
             path.clone(),
             &base,
             applied.next_source,
-            applied.replaced,
         ))),
         Err(detail) => Ok(Err(detail.into_refusal(path))),
     }
@@ -601,20 +599,19 @@ fn resolve_delete(
 }
 
 /// One line of the file image a patch's hunks apply against: bytes still
-/// from the original file, carrying the offset they start at there, or
-/// bytes a previous hunk in this same run already wrote - context lines
-/// included, so a later hunk never matches into a `Patched` line even
-/// when its content is unchanged; that would apply on top of text this
-/// same patch just introduced.
+/// from the original file, or bytes a previous hunk in this same run
+/// already wrote - context lines included, so a later hunk never matches
+/// into a `Patched` line even when its content is unchanged; that would
+/// apply on top of text this same patch just introduced.
 enum ImageLine<'a> {
-    Original { text: &'a str, start: u64 },
+    Original(&'a str),
     Patched(String),
 }
 
 impl ImageLine<'_> {
     fn text(&self) -> &str {
         match self {
-            Self::Original { text, .. } => text,
+            Self::Original(text) => text,
             Self::Patched(text) => text,
         }
     }
@@ -622,33 +619,14 @@ impl ImageLine<'_> {
     fn is_patched(&self) -> bool {
         matches!(self, Self::Patched(_))
     }
-
-    /// Where this line starts in the original file, or `None` for a line
-    /// an earlier hunk wrote.
-    fn base_start(&self) -> Option<u64> {
-        match self {
-            Self::Original { start, .. } => Some(*start),
-            Self::Patched(_) => None,
-        }
-    }
-
-    /// Where this line ends in the original file, or `None` for a line an
-    /// earlier hunk wrote.
-    fn base_end(&self) -> Option<u64> {
-        self.base_start()
-            .map(|start| start + self.text().len() as u64)
-    }
 }
 
-/// One segment applied: the file's whole next content, and the original
-/// image's regions its hunks replaced.
+/// One segment applied: the file's whole next content.
 pub(crate) struct AppliedSegment {
     pub(crate) next_source: String,
-    pub(crate) replaced: Vec<ReplacedRegion>,
 }
 
-/// Applies every hunk in `parsed` against `starting`, in order, recording
-/// the original image's bytes each one replaced.
+/// Applies every hunk in `parsed` against `starting`, in order.
 ///
 /// Each hunk's search anchors at its header position, corrected by the
 /// drift already found while applying earlier hunks in this same segment.
@@ -657,19 +635,11 @@ pub(crate) struct AppliedSegment {
 /// position that may differ from the header. Bounded: one hunk visits at
 /// most `image.len() + 1` candidate positions, since the search distance
 /// never usefully exceeds the image's length.
-///
-/// The recorded regions are ascending and never overlap: a located run is
-/// original lines alone, and applying a hunk marks its own run as written
-/// so no later hunk can match back into it. They come back in the order
-/// their hunks landed, which a backward search can leave out of file
-/// order, so the caller sorts them into the order a result carries.
 fn apply_segment(
     starting: &str,
     parsed: &Patch<'_, str>,
 ) -> Result<AppliedSegment, MismatchDetail> {
     let mut image: Vec<ImageLine<'_>> = base_image(starting);
-    let base_len = starting.len() as u64;
-    let mut replaced = Vec::with_capacity(parsed.hunks().len());
     let mut delta: i64 = 0;
     for (index, hunk) in parsed.hunks().iter().enumerate() {
         let pre_image = pre_image_lines(hunk);
@@ -686,16 +656,10 @@ fn apply_segment(
         };
         delta = i64::try_from(found).unwrap_or(0) - i64::try_from(expected).unwrap_or(0);
         let post_lines = reconciled_post_lines(hunk, &image, found);
-        replaced.push(ReplacedRegion {
-            range: replaced_range(&image, found, pre_image.len(), base_len),
-            text: post_lines.iter().map(ImageLine::text).collect(),
-        });
         image.splice(found..found + pre_image.len(), post_lines);
     }
-    replaced.sort_by_key(|region| (region.range.start, region.range.end));
     Ok(AppliedSegment {
         next_source: image.iter().map(ImageLine::text).collect(),
-        replaced,
     })
 }
 
@@ -753,51 +717,11 @@ fn ending_reconciled(text: &str, ending: Option<line::LineEnding>) -> String {
     }
 }
 
-/// The starting image: every line of `starting`, each carrying the offset
-/// it begins at.
+/// The starting image: every line of `starting`.
 fn base_image(starting: &str) -> Vec<ImageLine<'_>> {
-    let mut start = 0u64;
     line::lines_inclusive(starting)
-        .map(|text| {
-            let line = ImageLine::Original { text, start };
-            start += text.len() as u64;
-            line
-        })
+        .map(ImageLine::Original)
         .collect()
-}
-
-/// The original bytes one hunk replaces: the run it was located at,
-/// bounded by that run's own offsets. A hunk that deletes nothing has no
-/// run to bound, so its region is the empty range at the point
-/// [`insertion_offset`] resolves.
-fn replaced_range(
-    image: &[ImageLine<'_>],
-    found: usize,
-    run_len: usize,
-    base_len: u64,
-) -> ByteRange {
-    let run = image.get(found..found + run_len).unwrap_or_default();
-    let bounds = run
-        .first()
-        .and_then(ImageLine::base_start)
-        .zip(run.last().and_then(ImageLine::base_end));
-    if let Some((start, end)) = bounds {
-        return ByteRange { start, end };
-    }
-    let at = insertion_offset(image, found, base_len);
-    ByteRange { start: at, end: at }
-}
-
-/// Where a hunk that deletes nothing inserts, in original-file bytes: the
-/// start of the first original line still standing at or after `found`,
-/// and the end of the file when every line from there on was written by an
-/// earlier hunk.
-fn insertion_offset(image: &[ImageLine<'_>], found: usize, base_len: u64) -> u64 {
-    image
-        .iter()
-        .skip(found)
-        .find_map(ImageLine::base_start)
-        .unwrap_or(base_len)
 }
 
 /// Converts a hunk's declared old-file range into a 0-based image
@@ -1211,7 +1135,7 @@ mod tests {
     fn find_hunk_position_breaks_an_equal_distance_tie_toward_the_earlier_position() {
         let image: Vec<super::ImageLine<'_>> = vec!["x", "match", "y", "match"]
             .into_iter()
-            .map(|text| super::ImageLine::Original { text, start: 0 })
+            .map(super::ImageLine::Original)
             .collect();
         let pre_image = ["match"];
         let found = find_hunk_position(&image, &pre_image, 2);
@@ -1383,12 +1307,7 @@ mod tests {
     #[test]
     fn file_rewrite_kind_distinguishes_modify_create_and_delete() -> TestResult {
         assert!(!RewriteKind::Create.removes_file());
-        assert!(
-            !RewriteKind::Modify {
-                replaced: Vec::new()
-            }
-            .removes_file()
-        );
+        assert!(!RewriteKind::Modify.removes_file());
         assert!(RewriteKind::Delete.removes_file());
         let path = rift_core::ProjectPath::new("f.rs")?;
         let _ = FileRewrite::delete(path, "");
@@ -1413,7 +1332,7 @@ mod tests {
             },
         )?;
         let summary = applied_summary(result);
-        assert_eq!(summary.paths, vec![ProjectPath("new.rs".to_owned())]);
+        assert_eq!(summary.paths(), vec![ProjectPath("new.rs".to_owned())]);
         let written = fs::read_to_string(directory.path().join("new.rs"))?;
         assert_eq!(written, "pub fn fresh() {}\n");
         Ok(())
@@ -1596,7 +1515,7 @@ mod tests {
             },
         )?;
         let summary = applied_summary(result);
-        assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
+        assert_eq!(summary.paths(), vec![ProjectPath("lib.rs".to_owned())]);
         assert!(!directory.path().join("lib.rs").exists());
         Ok(())
     }
@@ -1766,7 +1685,7 @@ mod tests {
             },
         )?;
         let summary = applied_summary(result);
-        assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
+        assert_eq!(summary.paths(), vec![ProjectPath("lib.rs".to_owned())]);
         let written = fs::read_to_string(directory.path().join("lib.rs"))?;
         assert_eq!(
             written, "a\nb\nc\npub fn beacon() -> u8 { 7 }\npub fn steady() {}\n",
@@ -1839,7 +1758,7 @@ mod tests {
             },
         )?;
         let summary = applied_summary(result);
-        assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
+        assert_eq!(summary.paths(), vec![ProjectPath("lib.rs".to_owned())]);
         let written = fs::read_to_string(directory.path().join("lib.rs"))?;
         assert_eq!(written, "pub fn beacon() -> u8 { 7 }\npub fn steady() {}\n");
         Ok(())
@@ -1915,8 +1834,7 @@ mod tests {
             },
         )?;
         let summary = applied_summary(result);
-        assert_eq!(summary.paths.len(), 2);
-        assert_eq!(summary.edits.len(), 2);
+        assert_eq!(summary.files.len(), 2);
         assert!(fs::read_to_string(directory.path().join("lib.rs"))?.contains("-> u8"));
         assert!(fs::read_to_string(directory.path().join("aid.rs"))?.contains("-> u8"));
         Ok(())
@@ -2171,7 +2089,7 @@ mod tests {
             },
         )?;
         let summary = applied_summary(result);
-        assert_eq!(summary.paths, vec![ProjectPath("notes.mdx".to_owned())]);
+        assert_eq!(summary.paths(), vec![ProjectPath("notes.mdx".to_owned())]);
         let written = fs::read_to_string(directory.path().join("notes.mdx"))?;
         assert_eq!(written, "# Notes\nUpdated line.\n");
         Ok(())
@@ -2203,7 +2121,7 @@ mod tests {
             },
         )?;
         let summary = applied_summary(result);
-        assert_eq!(summary.paths.len(), 2);
+        assert_eq!(summary.paths().len(), 2);
         assert_eq!(
             fs::read_to_string(directory.path().join("justfile"))?,
             "default:\n    echo goodbye\n"
@@ -2234,7 +2152,7 @@ mod tests {
             },
         )?;
         let summary = applied_summary(result);
-        assert_eq!(summary.paths, vec![ProjectPath("justfile".to_owned())]);
+        assert_eq!(summary.paths(), vec![ProjectPath("justfile".to_owned())]);
         assert!(!directory.path().join("justfile").exists());
         Ok(())
     }
@@ -2377,7 +2295,7 @@ mod tests {
                 patch: patch.into(),
             },
         )?);
-        assert_eq!(summary.paths.len(), 2);
+        assert_eq!(summary.paths().len(), 2);
         assert_eq!(
             fs::read_to_string(directory.path().join("report.rs"))?,
             "pub fn one() {}\n",
@@ -2417,7 +2335,7 @@ mod tests {
                 patch: patch.into(),
             },
         )?);
-        assert_eq!(summary.paths, vec![ProjectPath("link.rs".to_owned())]);
+        assert_eq!(summary.paths(), vec![ProjectPath("link.rs".to_owned())]);
         assert!(
             fs::symlink_metadata(directory.path().join("link.rs"))?
                 .file_type()
@@ -2521,7 +2439,7 @@ mod tests {
             },
         )?;
         let summary = applied_summary(result);
-        assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
+        assert_eq!(summary.paths(), vec![ProjectPath("lib.rs".to_owned())]);
         let written = fs::read_to_string(directory.path().join("lib.rs"))?;
         assert_eq!(
             written, "pub fn beacon() -> u8 { 7 }\r\npub fn steady() {}\r\n",
@@ -2551,7 +2469,7 @@ mod tests {
             },
         )?;
         let summary = applied_summary(result);
-        assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
+        assert_eq!(summary.paths(), vec![ProjectPath("lib.rs".to_owned())]);
         let written = fs::read_to_string(directory.path().join("lib.rs"))?;
         assert_eq!(written, "pub fn beacon() -> u8 { 7 }\r\n");
         Ok(())
@@ -2578,7 +2496,7 @@ mod tests {
             },
         )?;
         let summary = applied_summary(result);
-        assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
+        assert_eq!(summary.paths(), vec![ProjectPath("lib.rs".to_owned())]);
         let written = fs::read_to_string(directory.path().join("lib.rs"))?;
         assert_eq!(written, "pub fn beacon() -> u8 { 7 }\n");
         Ok(())
@@ -2598,7 +2516,7 @@ mod tests {
             },
         )?;
         let summary = applied_summary(result);
-        assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
+        assert_eq!(summary.paths(), vec![ProjectPath("lib.rs".to_owned())]);
         let written = fs::read_to_string(directory.path().join("lib.rs"))?;
         assert_eq!(
             written, "pub fn one() {}\r\npub fn TWO() {}\npub fn three() {}\r\n",
@@ -2742,7 +2660,7 @@ mod tests {
             },
         )?;
         let summary = applied_summary(result);
-        assert_eq!(summary.paths, vec![ProjectPath("lib.rs".to_owned())]);
+        assert_eq!(summary.paths(), vec![ProjectPath("lib.rs".to_owned())]);
         let written = fs::read_to_string(directory.path().join("lib.rs"))?;
         assert_eq!(written, "pub fn beacon() -> u8 { 7 }");
         Ok(())
@@ -2848,71 +2766,44 @@ mod tests {
     }
 
     #[test]
-    fn apply_segment_records_the_located_runs_original_byte_range_and_post_image_text() -> TestResult
-    {
+    fn apply_segment_replaces_the_located_run() -> TestResult {
         let diff = "--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n";
         let segments = hunks(diff)?;
         let parsed = Patch::from_str(&segments[0])?;
         let applied = apply_segment("alpha\nbeta\ngamma\n", &parsed)
             .map_err(|_| "the full context+delete run must be located")?;
-        assert_eq!(applied.replaced.len(), 1);
-        let region = &applied.replaced[0];
-        assert_eq!(
-            (region.range.start, region.range.end),
-            (0, 17),
-            "the region spans the hunk's whole located run - the leading and trailing context \
-             lines included, not just the changed line"
-        );
-        assert_eq!(region.text, "alpha\nBETA\ngamma\n");
         assert_eq!(applied.next_source, "alpha\nBETA\ngamma\n");
         Ok(())
     }
 
     #[test]
-    fn apply_segment_records_a_zero_width_region_for_an_insertion_only_hunk() -> TestResult {
+    fn apply_segment_applies_an_insertion_only_hunk() -> TestResult {
         let diff = "--- a/f\n+++ b/f\n@@ -1,0 +2,1 @@\n+NEW\n";
         let segments = hunks(diff)?;
         let parsed = Patch::from_str(&segments[0])?;
         let applied =
             apply_segment("one\ntwo\n", &parsed).map_err(|_| "a pure insertion hunk must apply")?;
-        assert_eq!(applied.replaced.len(), 1);
-        let region = &applied.replaced[0];
-        assert_eq!(
-            (region.range.start, region.range.end),
-            (4, 4),
-            "an insertion-only hunk records a zero-width region at the point it inserts, not a \
-             spanning range"
-        );
-        assert_eq!(region.text, "NEW\n");
         assert_eq!(applied.next_source, "one\nNEW\ntwo\n");
         Ok(())
     }
 
     #[test]
-    fn apply_segment_records_the_deleted_runs_range_with_empty_replacement_text() -> TestResult {
+    fn apply_segment_applies_a_deletion_only_hunk() -> TestResult {
         let diff = "--- a/f\n+++ b/f\n@@ -2 +1,0 @@\n-two\n";
         let segments = hunks(diff)?;
         let parsed = Patch::from_str(&segments[0])?;
         let applied = apply_segment("one\ntwo\nthree\n", &parsed)
             .map_err(|_| "a deletion-only hunk must apply")?;
-        assert_eq!(applied.replaced.len(), 1);
-        let region = &applied.replaced[0];
-        assert_eq!(
-            (region.range.start, region.range.end),
-            (4, 8),
-            "a deletion-only hunk records the deleted run's original range"
-        );
-        assert_eq!(region.text, "", "nothing replaces a purely deleted run");
         assert_eq!(applied.next_source, "one\nthree\n");
         Ok(())
     }
 
     #[test]
-    fn apply_segment_returns_regions_ascending_by_start_after_a_backward_drift() -> TestResult {
+    fn apply_segment_applies_a_hunk_the_backward_search_locates() -> TestResult {
         // "P" sits at line 2 and "Q" at line 9; the first hunk claims and finds
         // "Q" directly, but the second hunk's header claims line 10 while "P"
         // only exists at line 2 - the backward search that locates it lands
-        // before the first hunk's own region.
+        // before the first hunk's own run.
         let diff = "--- a/f\n+++ b/f\n\
              @@ -9,1 +9,1 @@\n-Q\n+QQ\n\
              @@ -10,1 +10,1 @@\n-P\n+PP\n";
@@ -2922,70 +2813,12 @@ mod tests {
         let applied = apply_segment(source, &parsed).map_err(
             |_| "the second hunk must still be found after searching backward past the first",
         )?;
-        assert_eq!(applied.replaced.len(), 2);
-        assert_eq!(
-            (
-                applied.replaced[0].range.start,
-                applied.replaced[0].range.end
-            ),
-            (2, 4),
-            "the second hunk (P, found earlier in the file) sorts first despite applying second"
-        );
-        assert_eq!(applied.replaced[0].text, "PP\n");
-        assert_eq!(
-            (
-                applied.replaced[1].range.start,
-                applied.replaced[1].range.end
-            ),
-            (16, 18),
-            "the first hunk (Q, found later in the file) sorts second"
-        );
-        assert_eq!(applied.replaced[1].text, "QQ\n");
+        assert_eq!(applied.next_source, "x\nPP\nx\nx\nx\nx\nx\nx\nQQ\nx\nx\n");
         Ok(())
     }
 
     #[test]
-    fn apply_segment_records_the_real_position_after_a_forward_drift_not_the_header_position()
-    -> TestResult {
-        let diff = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-target\n+TARGET\n";
-        let segments = hunks(diff)?;
-        let parsed = Patch::from_str(&segments[0])?;
-        let source = "a\nb\nc\ntarget\n";
-        let applied = apply_segment(source, &parsed)
-            .map_err(|_| "context three lines below the header must still be found")?;
-        assert_eq!(applied.replaced.len(), 1);
-        assert_eq!(
-            (
-                applied.replaced[0].range.start,
-                applied.replaced[0].range.end
-            ),
-            (6, 13),
-            "the region names the line's real position (line 4), not the header's claimed line 1"
-        );
-        assert_eq!(applied.replaced[0].text, "TARGET\n");
-        Ok(())
-    }
-
-    #[test]
-    fn image_line_offsets_answer_for_an_original_line_and_refuse_for_a_patched_one() {
-        let original = super::ImageLine::Original {
-            text: "beacon\n",
-            start: 12,
-        };
-        assert_eq!(original.base_start(), Some(12));
-        assert_eq!(original.base_end(), Some(19), "12 plus the line's 7 bytes");
-
-        let patched = super::ImageLine::Patched("beacon\n".to_owned());
-        assert_eq!(
-            patched.base_start(),
-            None,
-            "a line an earlier hunk wrote stands at no offset in the original image"
-        );
-        assert_eq!(patched.base_end(), None);
-    }
-
-    #[test]
-    fn apply_segment_insertion_offset_falls_back_to_the_original_images_end() -> TestResult {
+    fn apply_segment_applies_a_trailing_insertion_after_the_tail_was_replaced() -> TestResult {
         // The first hunk replaces both remaining lines of a 3-line file; the
         // second hunk then inserts after that point, where nothing original
         // is left standing.
@@ -2994,26 +2827,6 @@ mod tests {
         let parsed = Patch::from_str(&segments[0])?;
         let applied = apply_segment("a\nb\nc\n", &parsed)
             .map_err(|_| "a tail-replacing hunk followed by a trailing insertion must apply")?;
-        assert_eq!(applied.replaced.len(), 2);
-        assert_eq!(
-            (
-                applied.replaced[0].range.start,
-                applied.replaced[0].range.end
-            ),
-            (2, 6),
-            "the first hunk replaces the tail two lines of the 6-byte original image"
-        );
-        assert_eq!(applied.replaced[0].text, "BC\n");
-        assert_eq!(
-            (
-                applied.replaced[1].range.start,
-                applied.replaced[1].range.end
-            ),
-            (6, 6),
-            "every line from the insertion point on was already patched, so it resolves to the \
-             original image's own end, not a mid-file offset"
-        );
-        assert_eq!(applied.replaced[1].text, "TAIL\n");
         assert_eq!(applied.next_source, "a\nBC\nTAIL\n");
         Ok(())
     }
@@ -3100,26 +2913,6 @@ mod tests {
             wrong_applied.next_source,
             "line1\nNEW2\nNEW3\nline4\nline5\n"
         );
-        assert_eq!(wrong_applied.replaced.len(), 1);
-        assert_eq!(correct_applied.replaced.len(), 1);
-        assert_eq!(
-            (
-                wrong_applied.replaced[0].range.start,
-                wrong_applied.replaced[0].range.end
-            ),
-            (0, 24),
-            "the header claimed 11 old / 6 new lines; the body's real 4 and 4 still bound the \
-             replaced run"
-        );
-        assert_eq!(wrong_applied.replaced[0].text, "line1\nNEW2\nNEW3\nline4\n");
-        assert_eq!(
-            wrong_applied.replaced[0].range,
-            correct_applied.replaced[0].range
-        );
-        assert_eq!(
-            wrong_applied.replaced[0].text,
-            correct_applied.replaced[0].text
-        );
         Ok(())
     }
 
@@ -3131,14 +2924,6 @@ mod tests {
         let applied = apply_segment("one\n", &parsed)
             .map_err(|_| "a header with an omitted count must still parse and apply")?;
         assert_eq!(applied.next_source, "ONE\n");
-        assert_eq!(
-            (
-                applied.replaced[0].range.start,
-                applied.replaced[0].range.end
-            ),
-            (0, 4),
-            "the omitted count implies exactly one line, spanning the whole 4-byte source"
-        );
         Ok(())
     }
 

@@ -2092,10 +2092,10 @@
                 "maxItems": 256,
                 "type": "array"
               },
-              "edits": {
-                "description": "Concrete edits in canonical file-and-range order. A modification carries one\nedit per replaced range; a file the change created or removed carries one edit\nspanning the whole file.",
+              "files": {
+                "description": "Files this change wrote, sorted bytewise by path.",
                 "items": {
-                  "$ref": "#/$defs/Edit"
+                  "$ref": "#/$defs/FileChange"
                 },
                 "maxItems": 256,
                 "minItems": 1,
@@ -2112,21 +2112,11 @@
               "id": {
                 "$ref": "#/$defs/ChangeId",
                 "description": "Identity of this applied change."
-              },
-              "paths": {
-                "description": "Paths whose entries differ because of this change, sorted bytewise.",
-                "items": {
-                  "$ref": "#/$defs/ProjectPath"
-                },
-                "maxItems": 256,
-                "minItems": 1,
-                "type": "array"
               }
             },
             "required": [
               "id",
-              "paths",
-              "edits",
+              "files",
               "diagnostics",
               "guarantees"
             ],
@@ -2350,36 +2340,6 @@
               }
             ]
           },
-          "Edit": {
-            "description": "A filesystem effect described before Rift performs it. Edits in one set share one input\nstate, cannot overlap, and apply atomically.",
-            "oneOf": [
-              {
-                "additionalProperties": false,
-                "description": "One byte range of one file and what replaces it.",
-                "properties": {
-                  "kind": {
-                    "const": "replace",
-                    "type": "string"
-                  },
-                  "span": {
-                    "$ref": "#/$defs/SourceSpan",
-                    "description": "The file, and the byte range being replaced."
-                  },
-                  "text": {
-                    "description": "What the range becomes. Empty deletes it.",
-                    "maxLength": 1048576,
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "kind",
-                  "span",
-                  "text"
-                ],
-                "type": "object"
-              }
-            ]
-          },
           "ExtensionValue": {
             "additionalProperties": false,
             "description": "Versioned extension value. data is validated against the schema advertised for its key\nand version.",
@@ -2409,6 +2369,73 @@
               }
             },
             "type": "object"
+          },
+          "FileChange": {
+            "additionalProperties": false,
+            "description": "One file a change wrote, and what the write did to it.",
+            "properties": {
+              "kind": {
+                "$ref": "#/$defs/FileChangeKind",
+                "description": "Whether the change created, modified, or deleted the file."
+              },
+              "line_count": {
+                "description": "Lines the file holds after the change, counting a final unterminated line;\nzero for a deleted file.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "lines_added": {
+                "description": "Lines the change added. A line whose content changed counts here and in\n`lines_removed`.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "lines_removed": {
+                "description": "Lines the change removed.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "path": {
+                "$ref": "#/$defs/ProjectPath",
+                "description": "The file, project-relative."
+              },
+              "size_bytes": {
+                "description": "The file's size in bytes after the change; zero for a deleted file.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "path",
+              "kind",
+              "size_bytes",
+              "line_count",
+              "lines_added",
+              "lines_removed"
+            ],
+            "type": "object"
+          },
+          "FileChangeKind": {
+            "description": "What a change did to one file.",
+            "oneOf": [
+              {
+                "const": "created",
+                "description": "The file did not exist before the change.",
+                "type": "string"
+              },
+              {
+                "const": "modified",
+                "description": "The file existed and its bytes changed.",
+                "type": "string"
+              },
+              {
+                "const": "deleted",
+                "description": "The file existed and the change removed it.",
+                "type": "string"
+              }
+            ]
           },
           "FileId": {
             "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
@@ -2843,17 +2870,14 @@
                   "tags": []
                 }
               ],
-              "edits": [
+              "files": [
                 {
-                  "kind": "replace",
-                  "span": {
-                    "range": {
-                      "end": 355,
-                      "start": 162
-                    },
-                    "unit": "rift://file/src/config.rs"
-                  },
-                  "text": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)\n        .map_err(|error| ConfigError::read(path, error))?;\n    parse_config(&text)\n}"
+                  "kind": "modified",
+                  "line_count": 42,
+                  "lines_added": 6,
+                  "lines_removed": 4,
+                  "path": "src/config.rs",
+                  "size_bytes": 1148
                 }
               ],
               "guarantees": [
@@ -2867,10 +2891,7 @@
                   }
                 }
               ],
-              "id": "d54ffb22",
-              "paths": [
-                "src/config.rs"
-              ]
+              "id": "d54ffb22"
             }
           },
           {
@@ -3145,10 +3166,10 @@
                 "maxItems": 256,
                 "type": "array"
               },
-              "edits": {
-                "description": "Concrete edits in canonical file-and-range order. A modification carries one\nedit per replaced range; a file the change created or removed carries one edit\nspanning the whole file.",
+              "files": {
+                "description": "Files this change wrote, sorted bytewise by path.",
                 "items": {
-                  "$ref": "#/$defs/Edit"
+                  "$ref": "#/$defs/FileChange"
                 },
                 "maxItems": 256,
                 "minItems": 1,
@@ -3165,21 +3186,11 @@
               "id": {
                 "$ref": "#/$defs/ChangeId",
                 "description": "Identity of this applied change."
-              },
-              "paths": {
-                "description": "Paths whose entries differ because of this change, sorted bytewise.",
-                "items": {
-                  "$ref": "#/$defs/ProjectPath"
-                },
-                "maxItems": 256,
-                "minItems": 1,
-                "type": "array"
               }
             },
             "required": [
               "id",
-              "paths",
-              "edits",
+              "files",
               "diagnostics",
               "guarantees"
             ],
@@ -3403,36 +3414,6 @@
               }
             ]
           },
-          "Edit": {
-            "description": "A filesystem effect described before Rift performs it. Edits in one set share one input\nstate, cannot overlap, and apply atomically.",
-            "oneOf": [
-              {
-                "additionalProperties": false,
-                "description": "One byte range of one file and what replaces it.",
-                "properties": {
-                  "kind": {
-                    "const": "replace",
-                    "type": "string"
-                  },
-                  "span": {
-                    "$ref": "#/$defs/SourceSpan",
-                    "description": "The file, and the byte range being replaced."
-                  },
-                  "text": {
-                    "description": "What the range becomes. Empty deletes it.",
-                    "maxLength": 1048576,
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "kind",
-                  "span",
-                  "text"
-                ],
-                "type": "object"
-              }
-            ]
-          },
           "ExtensionValue": {
             "additionalProperties": false,
             "description": "Versioned extension value. data is validated against the schema advertised for its key\nand version.",
@@ -3462,6 +3443,73 @@
               }
             },
             "type": "object"
+          },
+          "FileChange": {
+            "additionalProperties": false,
+            "description": "One file a change wrote, and what the write did to it.",
+            "properties": {
+              "kind": {
+                "$ref": "#/$defs/FileChangeKind",
+                "description": "Whether the change created, modified, or deleted the file."
+              },
+              "line_count": {
+                "description": "Lines the file holds after the change, counting a final unterminated line;\nzero for a deleted file.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "lines_added": {
+                "description": "Lines the change added. A line whose content changed counts here and in\n`lines_removed`.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "lines_removed": {
+                "description": "Lines the change removed.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "path": {
+                "$ref": "#/$defs/ProjectPath",
+                "description": "The file, project-relative."
+              },
+              "size_bytes": {
+                "description": "The file's size in bytes after the change; zero for a deleted file.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "path",
+              "kind",
+              "size_bytes",
+              "line_count",
+              "lines_added",
+              "lines_removed"
+            ],
+            "type": "object"
+          },
+          "FileChangeKind": {
+            "description": "What a change did to one file.",
+            "oneOf": [
+              {
+                "const": "created",
+                "description": "The file did not exist before the change.",
+                "type": "string"
+              },
+              {
+                "const": "modified",
+                "description": "The file existed and its bytes changed.",
+                "type": "string"
+              },
+              {
+                "const": "deleted",
+                "description": "The file existed and the change removed it.",
+                "type": "string"
+              }
+            ]
           },
           "FileId": {
             "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
@@ -3896,17 +3944,14 @@
                   "tags": []
                 }
               ],
-              "edits": [
+              "files": [
                 {
-                  "kind": "replace",
-                  "span": {
-                    "range": {
-                      "end": 355,
-                      "start": 162
-                    },
-                    "unit": "rift://file/src/config.rs"
-                  },
-                  "text": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)\n        .map_err(|error| ConfigError::read(path, error))?;\n    parse_config(&text)\n}"
+                  "kind": "modified",
+                  "line_count": 42,
+                  "lines_added": 6,
+                  "lines_removed": 4,
+                  "path": "src/config.rs",
+                  "size_bytes": 1148
                 }
               ],
               "guarantees": [
@@ -3920,10 +3965,7 @@
                   }
                 }
               ],
-              "id": "d54ffb22",
-              "paths": [
-                "src/config.rs"
-              ]
+              "id": "d54ffb22"
             }
           },
           {
@@ -4091,10 +4133,10 @@
                 "maxItems": 256,
                 "type": "array"
               },
-              "edits": {
-                "description": "Concrete edits in canonical file-and-range order. A modification carries one\nedit per replaced range; a file the change created or removed carries one edit\nspanning the whole file.",
+              "files": {
+                "description": "Files this change wrote, sorted bytewise by path.",
                 "items": {
-                  "$ref": "#/$defs/Edit"
+                  "$ref": "#/$defs/FileChange"
                 },
                 "maxItems": 256,
                 "minItems": 1,
@@ -4111,21 +4153,11 @@
               "id": {
                 "$ref": "#/$defs/ChangeId",
                 "description": "Identity of this applied change."
-              },
-              "paths": {
-                "description": "Paths whose entries differ because of this change, sorted bytewise.",
-                "items": {
-                  "$ref": "#/$defs/ProjectPath"
-                },
-                "maxItems": 256,
-                "minItems": 1,
-                "type": "array"
               }
             },
             "required": [
               "id",
-              "paths",
-              "edits",
+              "files",
               "diagnostics",
               "guarantees"
             ],
@@ -4349,36 +4381,6 @@
               }
             ]
           },
-          "Edit": {
-            "description": "A filesystem effect described before Rift performs it. Edits in one set share one input\nstate, cannot overlap, and apply atomically.",
-            "oneOf": [
-              {
-                "additionalProperties": false,
-                "description": "One byte range of one file and what replaces it.",
-                "properties": {
-                  "kind": {
-                    "const": "replace",
-                    "type": "string"
-                  },
-                  "span": {
-                    "$ref": "#/$defs/SourceSpan",
-                    "description": "The file, and the byte range being replaced."
-                  },
-                  "text": {
-                    "description": "What the range becomes. Empty deletes it.",
-                    "maxLength": 1048576,
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "kind",
-                  "span",
-                  "text"
-                ],
-                "type": "object"
-              }
-            ]
-          },
           "ExtensionValue": {
             "additionalProperties": false,
             "description": "Versioned extension value. data is validated against the schema advertised for its key\nand version.",
@@ -4408,6 +4410,73 @@
               }
             },
             "type": "object"
+          },
+          "FileChange": {
+            "additionalProperties": false,
+            "description": "One file a change wrote, and what the write did to it.",
+            "properties": {
+              "kind": {
+                "$ref": "#/$defs/FileChangeKind",
+                "description": "Whether the change created, modified, or deleted the file."
+              },
+              "line_count": {
+                "description": "Lines the file holds after the change, counting a final unterminated line;\nzero for a deleted file.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "lines_added": {
+                "description": "Lines the change added. A line whose content changed counts here and in\n`lines_removed`.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "lines_removed": {
+                "description": "Lines the change removed.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "path": {
+                "$ref": "#/$defs/ProjectPath",
+                "description": "The file, project-relative."
+              },
+              "size_bytes": {
+                "description": "The file's size in bytes after the change; zero for a deleted file.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "path",
+              "kind",
+              "size_bytes",
+              "line_count",
+              "lines_added",
+              "lines_removed"
+            ],
+            "type": "object"
+          },
+          "FileChangeKind": {
+            "description": "What a change did to one file.",
+            "oneOf": [
+              {
+                "const": "created",
+                "description": "The file did not exist before the change.",
+                "type": "string"
+              },
+              {
+                "const": "modified",
+                "description": "The file existed and its bytes changed.",
+                "type": "string"
+              },
+              {
+                "const": "deleted",
+                "description": "The file existed and the change removed it.",
+                "type": "string"
+              }
+            ]
           },
           "FileId": {
             "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
@@ -4842,17 +4911,14 @@
                   "tags": []
                 }
               ],
-              "edits": [
+              "files": [
                 {
-                  "kind": "replace",
-                  "span": {
-                    "range": {
-                      "end": 355,
-                      "start": 162
-                    },
-                    "unit": "rift://file/src/config.rs"
-                  },
-                  "text": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)\n        .map_err(|error| ConfigError::read(path, error))?;\n    parse_config(&text)\n}"
+                  "kind": "modified",
+                  "line_count": 42,
+                  "lines_added": 6,
+                  "lines_removed": 4,
+                  "path": "src/config.rs",
+                  "size_bytes": 1148
                 }
               ],
               "guarantees": [
@@ -4866,10 +4932,7 @@
                   }
                 }
               ],
-              "id": "d54ffb22",
-              "paths": [
-                "src/config.rs"
-              ]
+              "id": "d54ffb22"
             }
           },
           {
@@ -5779,7 +5842,7 @@
       }
     },
     {
-      "description": "Applies unified-diff hunks to workspace files atomically. The target is any\nfile the workspace's `[source]` policy makes visible, parsed or not. Hunk\ncontext guards the change: a header's line numbers are hints and\nits line counts are read from the hunk's own body, as with\n`git apply`. A `/dev/null` header creates or deletes the file. A body\nthat is not a unified diff, such as an `*** Begin Patch` envelope, is\nrefused naming the form to send. The\nresult carries one edit per hunk, spanning the bytes it replaced.",
+      "description": "Applies unified-diff hunks to workspace files atomically. The target is any\nfile the workspace's `[source]` policy makes visible, parsed or not. Hunk\ncontext guards the change: a header's line numbers are hints and\nits line counts are read from the hunk's own body, as with\n`git apply`. A `/dev/null` header creates or deletes the file. A body\nthat is not a unified diff, such as an `*** Begin Patch` envelope, is\nrefused naming the form to send. The result names each file the change\nwrote with its size and line counts.",
       "input_schema": {
         "$defs": {
           "BodySource": {
@@ -5850,10 +5913,10 @@
                 "maxItems": 256,
                 "type": "array"
               },
-              "edits": {
-                "description": "Concrete edits in canonical file-and-range order. A modification carries one\nedit per replaced range; a file the change created or removed carries one edit\nspanning the whole file.",
+              "files": {
+                "description": "Files this change wrote, sorted bytewise by path.",
                 "items": {
-                  "$ref": "#/$defs/Edit"
+                  "$ref": "#/$defs/FileChange"
                 },
                 "maxItems": 256,
                 "minItems": 1,
@@ -5870,21 +5933,11 @@
               "id": {
                 "$ref": "#/$defs/ChangeId",
                 "description": "Identity of this applied change."
-              },
-              "paths": {
-                "description": "Paths whose entries differ because of this change, sorted bytewise.",
-                "items": {
-                  "$ref": "#/$defs/ProjectPath"
-                },
-                "maxItems": 256,
-                "minItems": 1,
-                "type": "array"
               }
             },
             "required": [
               "id",
-              "paths",
-              "edits",
+              "files",
               "diagnostics",
               "guarantees"
             ],
@@ -6108,36 +6161,6 @@
               }
             ]
           },
-          "Edit": {
-            "description": "A filesystem effect described before Rift performs it. Edits in one set share one input\nstate, cannot overlap, and apply atomically.",
-            "oneOf": [
-              {
-                "additionalProperties": false,
-                "description": "One byte range of one file and what replaces it.",
-                "properties": {
-                  "kind": {
-                    "const": "replace",
-                    "type": "string"
-                  },
-                  "span": {
-                    "$ref": "#/$defs/SourceSpan",
-                    "description": "The file, and the byte range being replaced."
-                  },
-                  "text": {
-                    "description": "What the range becomes. Empty deletes it.",
-                    "maxLength": 1048576,
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "kind",
-                  "span",
-                  "text"
-                ],
-                "type": "object"
-              }
-            ]
-          },
           "ExtensionValue": {
             "additionalProperties": false,
             "description": "Versioned extension value. data is validated against the schema advertised for its key\nand version.",
@@ -6167,6 +6190,73 @@
               }
             },
             "type": "object"
+          },
+          "FileChange": {
+            "additionalProperties": false,
+            "description": "One file a change wrote, and what the write did to it.",
+            "properties": {
+              "kind": {
+                "$ref": "#/$defs/FileChangeKind",
+                "description": "Whether the change created, modified, or deleted the file."
+              },
+              "line_count": {
+                "description": "Lines the file holds after the change, counting a final unterminated line;\nzero for a deleted file.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "lines_added": {
+                "description": "Lines the change added. A line whose content changed counts here and in\n`lines_removed`.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "lines_removed": {
+                "description": "Lines the change removed.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "path": {
+                "$ref": "#/$defs/ProjectPath",
+                "description": "The file, project-relative."
+              },
+              "size_bytes": {
+                "description": "The file's size in bytes after the change; zero for a deleted file.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "path",
+              "kind",
+              "size_bytes",
+              "line_count",
+              "lines_added",
+              "lines_removed"
+            ],
+            "type": "object"
+          },
+          "FileChangeKind": {
+            "description": "What a change did to one file.",
+            "oneOf": [
+              {
+                "const": "created",
+                "description": "The file did not exist before the change.",
+                "type": "string"
+              },
+              {
+                "const": "modified",
+                "description": "The file existed and its bytes changed.",
+                "type": "string"
+              },
+              {
+                "const": "deleted",
+                "description": "The file existed and the change removed it.",
+                "type": "string"
+              }
+            ]
           },
           "FileId": {
             "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
@@ -6601,17 +6691,14 @@
                   "tags": []
                 }
               ],
-              "edits": [
+              "files": [
                 {
-                  "kind": "replace",
-                  "span": {
-                    "range": {
-                      "end": 355,
-                      "start": 162
-                    },
-                    "unit": "rift://file/src/config.rs"
-                  },
-                  "text": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)\n        .map_err(|error| ConfigError::read(path, error))?;\n    parse_config(&text)\n}"
+                  "kind": "modified",
+                  "line_count": 42,
+                  "lines_added": 6,
+                  "lines_removed": 4,
+                  "path": "src/config.rs",
+                  "size_bytes": 1148
                 }
               ],
               "guarantees": [
@@ -6625,10 +6712,7 @@
                   }
                 }
               ],
-              "id": "d54ffb22",
-              "paths": [
-                "src/config.rs"
-              ]
+              "id": "d54ffb22"
             }
           },
           {
@@ -6797,10 +6881,10 @@
                 "maxItems": 256,
                 "type": "array"
               },
-              "edits": {
-                "description": "Concrete edits in canonical file-and-range order. A modification carries one\nedit per replaced range; a file the change created or removed carries one edit\nspanning the whole file.",
+              "files": {
+                "description": "Files this change wrote, sorted bytewise by path.",
                 "items": {
-                  "$ref": "#/$defs/Edit"
+                  "$ref": "#/$defs/FileChange"
                 },
                 "maxItems": 256,
                 "minItems": 1,
@@ -6817,21 +6901,11 @@
               "id": {
                 "$ref": "#/$defs/ChangeId",
                 "description": "Identity of this applied change."
-              },
-              "paths": {
-                "description": "Paths whose entries differ because of this change, sorted bytewise.",
-                "items": {
-                  "$ref": "#/$defs/ProjectPath"
-                },
-                "maxItems": 256,
-                "minItems": 1,
-                "type": "array"
               }
             },
             "required": [
               "id",
-              "paths",
-              "edits",
+              "files",
               "diagnostics",
               "guarantees"
             ],
@@ -7055,36 +7129,6 @@
               }
             ]
           },
-          "Edit": {
-            "description": "A filesystem effect described before Rift performs it. Edits in one set share one input\nstate, cannot overlap, and apply atomically.",
-            "oneOf": [
-              {
-                "additionalProperties": false,
-                "description": "One byte range of one file and what replaces it.",
-                "properties": {
-                  "kind": {
-                    "const": "replace",
-                    "type": "string"
-                  },
-                  "span": {
-                    "$ref": "#/$defs/SourceSpan",
-                    "description": "The file, and the byte range being replaced."
-                  },
-                  "text": {
-                    "description": "What the range becomes. Empty deletes it.",
-                    "maxLength": 1048576,
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "kind",
-                  "span",
-                  "text"
-                ],
-                "type": "object"
-              }
-            ]
-          },
           "ExtensionValue": {
             "additionalProperties": false,
             "description": "Versioned extension value. data is validated against the schema advertised for its key\nand version.",
@@ -7114,6 +7158,73 @@
               }
             },
             "type": "object"
+          },
+          "FileChange": {
+            "additionalProperties": false,
+            "description": "One file a change wrote, and what the write did to it.",
+            "properties": {
+              "kind": {
+                "$ref": "#/$defs/FileChangeKind",
+                "description": "Whether the change created, modified, or deleted the file."
+              },
+              "line_count": {
+                "description": "Lines the file holds after the change, counting a final unterminated line;\nzero for a deleted file.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "lines_added": {
+                "description": "Lines the change added. A line whose content changed counts here and in\n`lines_removed`.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "lines_removed": {
+                "description": "Lines the change removed.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "path": {
+                "$ref": "#/$defs/ProjectPath",
+                "description": "The file, project-relative."
+              },
+              "size_bytes": {
+                "description": "The file's size in bytes after the change; zero for a deleted file.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "path",
+              "kind",
+              "size_bytes",
+              "line_count",
+              "lines_added",
+              "lines_removed"
+            ],
+            "type": "object"
+          },
+          "FileChangeKind": {
+            "description": "What a change did to one file.",
+            "oneOf": [
+              {
+                "const": "created",
+                "description": "The file did not exist before the change.",
+                "type": "string"
+              },
+              {
+                "const": "modified",
+                "description": "The file existed and its bytes changed.",
+                "type": "string"
+              },
+              {
+                "const": "deleted",
+                "description": "The file existed and the change removed it.",
+                "type": "string"
+              }
+            ]
           },
           "FileId": {
             "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
@@ -7548,17 +7659,14 @@
                   "tags": []
                 }
               ],
-              "edits": [
+              "files": [
                 {
-                  "kind": "replace",
-                  "span": {
-                    "range": {
-                      "end": 355,
-                      "start": 162
-                    },
-                    "unit": "rift://file/src/config.rs"
-                  },
-                  "text": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)\n        .map_err(|error| ConfigError::read(path, error))?;\n    parse_config(&text)\n}"
+                  "kind": "modified",
+                  "line_count": 42,
+                  "lines_added": 6,
+                  "lines_removed": 4,
+                  "path": "src/config.rs",
+                  "size_bytes": 1148
                 }
               ],
               "guarantees": [
@@ -7572,10 +7680,7 @@
                   }
                 }
               ],
-              "id": "d54ffb22",
-              "paths": [
-                "src/config.rs"
-              ]
+              "id": "d54ffb22"
             }
           },
           {
@@ -7744,10 +7849,10 @@
                 "maxItems": 256,
                 "type": "array"
               },
-              "edits": {
-                "description": "Concrete edits in canonical file-and-range order. A modification carries one\nedit per replaced range; a file the change created or removed carries one edit\nspanning the whole file.",
+              "files": {
+                "description": "Files this change wrote, sorted bytewise by path.",
                 "items": {
-                  "$ref": "#/$defs/Edit"
+                  "$ref": "#/$defs/FileChange"
                 },
                 "maxItems": 256,
                 "minItems": 1,
@@ -7764,21 +7869,11 @@
               "id": {
                 "$ref": "#/$defs/ChangeId",
                 "description": "Identity of this applied change."
-              },
-              "paths": {
-                "description": "Paths whose entries differ because of this change, sorted bytewise.",
-                "items": {
-                  "$ref": "#/$defs/ProjectPath"
-                },
-                "maxItems": 256,
-                "minItems": 1,
-                "type": "array"
               }
             },
             "required": [
               "id",
-              "paths",
-              "edits",
+              "files",
               "diagnostics",
               "guarantees"
             ],
@@ -8002,36 +8097,6 @@
               }
             ]
           },
-          "Edit": {
-            "description": "A filesystem effect described before Rift performs it. Edits in one set share one input\nstate, cannot overlap, and apply atomically.",
-            "oneOf": [
-              {
-                "additionalProperties": false,
-                "description": "One byte range of one file and what replaces it.",
-                "properties": {
-                  "kind": {
-                    "const": "replace",
-                    "type": "string"
-                  },
-                  "span": {
-                    "$ref": "#/$defs/SourceSpan",
-                    "description": "The file, and the byte range being replaced."
-                  },
-                  "text": {
-                    "description": "What the range becomes. Empty deletes it.",
-                    "maxLength": 1048576,
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "kind",
-                  "span",
-                  "text"
-                ],
-                "type": "object"
-              }
-            ]
-          },
           "ExtensionValue": {
             "additionalProperties": false,
             "description": "Versioned extension value. data is validated against the schema advertised for its key\nand version.",
@@ -8061,6 +8126,73 @@
               }
             },
             "type": "object"
+          },
+          "FileChange": {
+            "additionalProperties": false,
+            "description": "One file a change wrote, and what the write did to it.",
+            "properties": {
+              "kind": {
+                "$ref": "#/$defs/FileChangeKind",
+                "description": "Whether the change created, modified, or deleted the file."
+              },
+              "line_count": {
+                "description": "Lines the file holds after the change, counting a final unterminated line;\nzero for a deleted file.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "lines_added": {
+                "description": "Lines the change added. A line whose content changed counts here and in\n`lines_removed`.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "lines_removed": {
+                "description": "Lines the change removed.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "path": {
+                "$ref": "#/$defs/ProjectPath",
+                "description": "The file, project-relative."
+              },
+              "size_bytes": {
+                "description": "The file's size in bytes after the change; zero for a deleted file.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "path",
+              "kind",
+              "size_bytes",
+              "line_count",
+              "lines_added",
+              "lines_removed"
+            ],
+            "type": "object"
+          },
+          "FileChangeKind": {
+            "description": "What a change did to one file.",
+            "oneOf": [
+              {
+                "const": "created",
+                "description": "The file did not exist before the change.",
+                "type": "string"
+              },
+              {
+                "const": "modified",
+                "description": "The file existed and its bytes changed.",
+                "type": "string"
+              },
+              {
+                "const": "deleted",
+                "description": "The file existed and the change removed it.",
+                "type": "string"
+              }
+            ]
           },
           "FileId": {
             "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
@@ -8495,17 +8627,14 @@
                   "tags": []
                 }
               ],
-              "edits": [
+              "files": [
                 {
-                  "kind": "replace",
-                  "span": {
-                    "range": {
-                      "end": 355,
-                      "start": 162
-                    },
-                    "unit": "rift://file/src/config.rs"
-                  },
-                  "text": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)\n        .map_err(|error| ConfigError::read(path, error))?;\n    parse_config(&text)\n}"
+                  "kind": "modified",
+                  "line_count": 42,
+                  "lines_added": 6,
+                  "lines_removed": 4,
+                  "path": "src/config.rs",
+                  "size_bytes": 1148
                 }
               ],
               "guarantees": [
@@ -8519,10 +8648,7 @@
                   }
                 }
               ],
-              "id": "d54ffb22",
-              "paths": [
-                "src/config.rs"
-              ]
+              "id": "d54ffb22"
             }
           },
           {
@@ -8693,10 +8819,10 @@
                 "maxItems": 256,
                 "type": "array"
               },
-              "edits": {
-                "description": "Concrete edits in canonical file-and-range order. A modification carries one\nedit per replaced range; a file the change created or removed carries one edit\nspanning the whole file.",
+              "files": {
+                "description": "Files this change wrote, sorted bytewise by path.",
                 "items": {
-                  "$ref": "#/$defs/Edit"
+                  "$ref": "#/$defs/FileChange"
                 },
                 "maxItems": 256,
                 "minItems": 1,
@@ -8713,21 +8839,11 @@
               "id": {
                 "$ref": "#/$defs/ChangeId",
                 "description": "Identity of this applied change."
-              },
-              "paths": {
-                "description": "Paths whose entries differ because of this change, sorted bytewise.",
-                "items": {
-                  "$ref": "#/$defs/ProjectPath"
-                },
-                "maxItems": 256,
-                "minItems": 1,
-                "type": "array"
               }
             },
             "required": [
               "id",
-              "paths",
-              "edits",
+              "files",
               "diagnostics",
               "guarantees"
             ],
@@ -8951,36 +9067,6 @@
               }
             ]
           },
-          "Edit": {
-            "description": "A filesystem effect described before Rift performs it. Edits in one set share one input\nstate, cannot overlap, and apply atomically.",
-            "oneOf": [
-              {
-                "additionalProperties": false,
-                "description": "One byte range of one file and what replaces it.",
-                "properties": {
-                  "kind": {
-                    "const": "replace",
-                    "type": "string"
-                  },
-                  "span": {
-                    "$ref": "#/$defs/SourceSpan",
-                    "description": "The file, and the byte range being replaced."
-                  },
-                  "text": {
-                    "description": "What the range becomes. Empty deletes it.",
-                    "maxLength": 1048576,
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "kind",
-                  "span",
-                  "text"
-                ],
-                "type": "object"
-              }
-            ]
-          },
           "ExtensionValue": {
             "additionalProperties": false,
             "description": "Versioned extension value. data is validated against the schema advertised for its key\nand version.",
@@ -9010,6 +9096,73 @@
               }
             },
             "type": "object"
+          },
+          "FileChange": {
+            "additionalProperties": false,
+            "description": "One file a change wrote, and what the write did to it.",
+            "properties": {
+              "kind": {
+                "$ref": "#/$defs/FileChangeKind",
+                "description": "Whether the change created, modified, or deleted the file."
+              },
+              "line_count": {
+                "description": "Lines the file holds after the change, counting a final unterminated line;\nzero for a deleted file.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "lines_added": {
+                "description": "Lines the change added. A line whose content changed counts here and in\n`lines_removed`.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "lines_removed": {
+                "description": "Lines the change removed.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "path": {
+                "$ref": "#/$defs/ProjectPath",
+                "description": "The file, project-relative."
+              },
+              "size_bytes": {
+                "description": "The file's size in bytes after the change; zero for a deleted file.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "path",
+              "kind",
+              "size_bytes",
+              "line_count",
+              "lines_added",
+              "lines_removed"
+            ],
+            "type": "object"
+          },
+          "FileChangeKind": {
+            "description": "What a change did to one file.",
+            "oneOf": [
+              {
+                "const": "created",
+                "description": "The file did not exist before the change.",
+                "type": "string"
+              },
+              {
+                "const": "modified",
+                "description": "The file existed and its bytes changed.",
+                "type": "string"
+              },
+              {
+                "const": "deleted",
+                "description": "The file existed and the change removed it.",
+                "type": "string"
+              }
+            ]
           },
           "FileId": {
             "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
@@ -9444,17 +9597,14 @@
                   "tags": []
                 }
               ],
-              "edits": [
+              "files": [
                 {
-                  "kind": "replace",
-                  "span": {
-                    "range": {
-                      "end": 355,
-                      "start": 162
-                    },
-                    "unit": "rift://file/src/config.rs"
-                  },
-                  "text": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)\n        .map_err(|error| ConfigError::read(path, error))?;\n    parse_config(&text)\n}"
+                  "kind": "modified",
+                  "line_count": 42,
+                  "lines_added": 6,
+                  "lines_removed": 4,
+                  "path": "src/config.rs",
+                  "size_bytes": 1148
                 }
               ],
               "guarantees": [
@@ -9468,10 +9618,7 @@
                   }
                 }
               ],
-              "id": "d54ffb22",
-              "paths": [
-                "src/config.rs"
-              ]
+              "id": "d54ffb22"
             }
           },
           {
@@ -9715,10 +9862,10 @@
                 "maxItems": 256,
                 "type": "array"
               },
-              "edits": {
-                "description": "Concrete edits in canonical file-and-range order. A modification carries one\nedit per replaced range; a file the change created or removed carries one edit\nspanning the whole file.",
+              "files": {
+                "description": "Files this change wrote, sorted bytewise by path.",
                 "items": {
-                  "$ref": "#/$defs/Edit"
+                  "$ref": "#/$defs/FileChange"
                 },
                 "maxItems": 256,
                 "minItems": 1,
@@ -9735,21 +9882,11 @@
               "id": {
                 "$ref": "#/$defs/ChangeId",
                 "description": "Identity of this applied change."
-              },
-              "paths": {
-                "description": "Paths whose entries differ because of this change, sorted bytewise.",
-                "items": {
-                  "$ref": "#/$defs/ProjectPath"
-                },
-                "maxItems": 256,
-                "minItems": 1,
-                "type": "array"
               }
             },
             "required": [
               "id",
-              "paths",
-              "edits",
+              "files",
               "diagnostics",
               "guarantees"
             ],
@@ -9973,36 +10110,6 @@
               }
             ]
           },
-          "Edit": {
-            "description": "A filesystem effect described before Rift performs it. Edits in one set share one input\nstate, cannot overlap, and apply atomically.",
-            "oneOf": [
-              {
-                "additionalProperties": false,
-                "description": "One byte range of one file and what replaces it.",
-                "properties": {
-                  "kind": {
-                    "const": "replace",
-                    "type": "string"
-                  },
-                  "span": {
-                    "$ref": "#/$defs/SourceSpan",
-                    "description": "The file, and the byte range being replaced."
-                  },
-                  "text": {
-                    "description": "What the range becomes. Empty deletes it.",
-                    "maxLength": 1048576,
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "kind",
-                  "span",
-                  "text"
-                ],
-                "type": "object"
-              }
-            ]
-          },
           "ExtensionValue": {
             "additionalProperties": false,
             "description": "Versioned extension value. data is validated against the schema advertised for its key\nand version.",
@@ -10032,6 +10139,73 @@
               }
             },
             "type": "object"
+          },
+          "FileChange": {
+            "additionalProperties": false,
+            "description": "One file a change wrote, and what the write did to it.",
+            "properties": {
+              "kind": {
+                "$ref": "#/$defs/FileChangeKind",
+                "description": "Whether the change created, modified, or deleted the file."
+              },
+              "line_count": {
+                "description": "Lines the file holds after the change, counting a final unterminated line;\nzero for a deleted file.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "lines_added": {
+                "description": "Lines the change added. A line whose content changed counts here and in\n`lines_removed`.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "lines_removed": {
+                "description": "Lines the change removed.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "path": {
+                "$ref": "#/$defs/ProjectPath",
+                "description": "The file, project-relative."
+              },
+              "size_bytes": {
+                "description": "The file's size in bytes after the change; zero for a deleted file.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "path",
+              "kind",
+              "size_bytes",
+              "line_count",
+              "lines_added",
+              "lines_removed"
+            ],
+            "type": "object"
+          },
+          "FileChangeKind": {
+            "description": "What a change did to one file.",
+            "oneOf": [
+              {
+                "const": "created",
+                "description": "The file did not exist before the change.",
+                "type": "string"
+              },
+              {
+                "const": "modified",
+                "description": "The file existed and its bytes changed.",
+                "type": "string"
+              },
+              {
+                "const": "deleted",
+                "description": "The file existed and the change removed it.",
+                "type": "string"
+              }
+            ]
           },
           "FileId": {
             "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
@@ -10466,17 +10640,14 @@
                   "tags": []
                 }
               ],
-              "edits": [
+              "files": [
                 {
-                  "kind": "replace",
-                  "span": {
-                    "range": {
-                      "end": 355,
-                      "start": 162
-                    },
-                    "unit": "rift://file/src/config.rs"
-                  },
-                  "text": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)\n        .map_err(|error| ConfigError::read(path, error))?;\n    parse_config(&text)\n}"
+                  "kind": "modified",
+                  "line_count": 42,
+                  "lines_added": 6,
+                  "lines_removed": 4,
+                  "path": "src/config.rs",
+                  "size_bytes": 1148
                 }
               ],
               "guarantees": [
@@ -10490,10 +10661,7 @@
                   }
                 }
               ],
-              "id": "d54ffb22",
-              "paths": [
-                "src/config.rs"
-              ]
+              "id": "d54ffb22"
             }
           },
           {
@@ -10737,10 +10905,10 @@
                 "maxItems": 256,
                 "type": "array"
               },
-              "edits": {
-                "description": "Concrete edits in canonical file-and-range order. A modification carries one\nedit per replaced range; a file the change created or removed carries one edit\nspanning the whole file.",
+              "files": {
+                "description": "Files this change wrote, sorted bytewise by path.",
                 "items": {
-                  "$ref": "#/$defs/Edit"
+                  "$ref": "#/$defs/FileChange"
                 },
                 "maxItems": 256,
                 "minItems": 1,
@@ -10757,21 +10925,11 @@
               "id": {
                 "$ref": "#/$defs/ChangeId",
                 "description": "Identity of this applied change."
-              },
-              "paths": {
-                "description": "Paths whose entries differ because of this change, sorted bytewise.",
-                "items": {
-                  "$ref": "#/$defs/ProjectPath"
-                },
-                "maxItems": 256,
-                "minItems": 1,
-                "type": "array"
               }
             },
             "required": [
               "id",
-              "paths",
-              "edits",
+              "files",
               "diagnostics",
               "guarantees"
             ],
@@ -10995,36 +11153,6 @@
               }
             ]
           },
-          "Edit": {
-            "description": "A filesystem effect described before Rift performs it. Edits in one set share one input\nstate, cannot overlap, and apply atomically.",
-            "oneOf": [
-              {
-                "additionalProperties": false,
-                "description": "One byte range of one file and what replaces it.",
-                "properties": {
-                  "kind": {
-                    "const": "replace",
-                    "type": "string"
-                  },
-                  "span": {
-                    "$ref": "#/$defs/SourceSpan",
-                    "description": "The file, and the byte range being replaced."
-                  },
-                  "text": {
-                    "description": "What the range becomes. Empty deletes it.",
-                    "maxLength": 1048576,
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "kind",
-                  "span",
-                  "text"
-                ],
-                "type": "object"
-              }
-            ]
-          },
           "ExtensionValue": {
             "additionalProperties": false,
             "description": "Versioned extension value. data is validated against the schema advertised for its key\nand version.",
@@ -11054,6 +11182,73 @@
               }
             },
             "type": "object"
+          },
+          "FileChange": {
+            "additionalProperties": false,
+            "description": "One file a change wrote, and what the write did to it.",
+            "properties": {
+              "kind": {
+                "$ref": "#/$defs/FileChangeKind",
+                "description": "Whether the change created, modified, or deleted the file."
+              },
+              "line_count": {
+                "description": "Lines the file holds after the change, counting a final unterminated line;\nzero for a deleted file.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "lines_added": {
+                "description": "Lines the change added. A line whose content changed counts here and in\n`lines_removed`.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "lines_removed": {
+                "description": "Lines the change removed.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "path": {
+                "$ref": "#/$defs/ProjectPath",
+                "description": "The file, project-relative."
+              },
+              "size_bytes": {
+                "description": "The file's size in bytes after the change; zero for a deleted file.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "path",
+              "kind",
+              "size_bytes",
+              "line_count",
+              "lines_added",
+              "lines_removed"
+            ],
+            "type": "object"
+          },
+          "FileChangeKind": {
+            "description": "What a change did to one file.",
+            "oneOf": [
+              {
+                "const": "created",
+                "description": "The file did not exist before the change.",
+                "type": "string"
+              },
+              {
+                "const": "modified",
+                "description": "The file existed and its bytes changed.",
+                "type": "string"
+              },
+              {
+                "const": "deleted",
+                "description": "The file existed and the change removed it.",
+                "type": "string"
+              }
+            ]
           },
           "FileId": {
             "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
@@ -11488,17 +11683,14 @@
                   "tags": []
                 }
               ],
-              "edits": [
+              "files": [
                 {
-                  "kind": "replace",
-                  "span": {
-                    "range": {
-                      "end": 355,
-                      "start": 162
-                    },
-                    "unit": "rift://file/src/config.rs"
-                  },
-                  "text": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)\n        .map_err(|error| ConfigError::read(path, error))?;\n    parse_config(&text)\n}"
+                  "kind": "modified",
+                  "line_count": 42,
+                  "lines_added": 6,
+                  "lines_removed": 4,
+                  "path": "src/config.rs",
+                  "size_bytes": 1148
                 }
               ],
               "guarantees": [
@@ -11512,10 +11704,7 @@
                   }
                 }
               ],
-              "id": "d54ffb22",
-              "paths": [
-                "src/config.rs"
-              ]
+              "id": "d54ffb22"
             }
           },
           {

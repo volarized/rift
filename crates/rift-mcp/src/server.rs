@@ -535,9 +535,9 @@ fn changed_paths_to_reparse(
     if !configuration.hooks.is_empty() {
         return None;
     }
-    let mut paths = Vec::with_capacity(summary.paths.len());
-    for path in &summary.paths {
-        let path = CoreProjectPath::new(&path.0).ok()?;
+    let mut paths = Vec::with_capacity(summary.files.len());
+    for file in &summary.files {
+        let path = CoreProjectPath::new(&file.path.0).ok()?;
         if current
             .source_policy
             .decides_inclusion(&root.join(path.as_str()))
@@ -1271,8 +1271,8 @@ impl RiftMcp {
     /// its line counts are read from the hunk's own body, as with
     /// `git apply`. A `/dev/null` header creates or deletes the file. A body
     /// that is not a unified diff, such as an `*** Begin Patch` envelope, is
-    /// refused naming the form to send. The
-    /// result carries one edit per hunk, spanning the bytes it replaced.
+    /// refused naming the form to send. The result names each file the change
+    /// wrote with its size and line counts.
     #[tool]
     async fn patch(
         &self,
@@ -1828,14 +1828,15 @@ impl RiftMcp {
         let ChangeResult::Applied { mut summary } = result else {
             return Ok(result);
         };
+        let changed_paths = summary.paths();
         let selected_hooks =
-            rift_server::selected_hooks(&configuration.hooks, root, &summary.paths)
+            rift_server::selected_hooks(&configuration.hooks, root, &changed_paths)
                 .map_err(ReadFault::index)?;
         if selected_hooks.is_empty() {
             return Ok(ChangeResult::Applied { summary });
         }
         let direct_paths: std::collections::BTreeSet<&str> =
-            summary.paths.iter().map(|path| path.0.as_str()).collect();
+            changed_paths.iter().map(|path| path.0.as_str()).collect();
 
         for hook in selected_hooks
             .iter()
@@ -1844,7 +1845,7 @@ impl RiftMcp {
         {
             let before = changes.capture_hook_snapshot(&current.reads)?;
             before.require_source_text()?;
-            let run = rift_server::run_hook(hook, root, &summary.paths);
+            let run = rift_server::run_hook(hook, root, &changed_paths);
             let after = changes.capture_hook_snapshot(&current.reads)?;
             let hook_paths = before.changed_paths(&after);
             let in_scope = hook.writes == rift_protocol::configuration::HookWrites::Workspace
@@ -1884,6 +1885,7 @@ impl RiftMcp {
         else {
             return Ok(ChangeResult::Unchanged);
         };
+        let validated_paths = summary.paths();
 
         for hook in selected_hooks
             .iter()
@@ -1892,7 +1894,7 @@ impl RiftMcp {
         {
             let before = changes.capture_hook_snapshot(&current.reads)?;
             before.require_source_text()?;
-            let run = rift_server::run_hook(hook, root, &summary.paths);
+            let run = rift_server::run_hook(hook, root, &validated_paths);
             let after = changes.capture_hook_snapshot(&current.reads)?;
             if !before.is_unchanged(&after) {
                 changes.restore_hook_snapshot(&current.reads, &before, &after)?;
@@ -3092,7 +3094,13 @@ mod tests {
             .structured_content
             .ok_or("replace_symbol must return structured content")?;
         assert_eq!(structured["status"], json!("applied"));
-        assert_eq!(structured["summary"]["paths"], json!(["lib.rs"]));
+        assert_eq!(
+            structured["summary"]["files"][0]["path"],
+            json!("lib.rs"),
+            "the applied summary names the file it wrote"
+        );
+        assert_eq!(structured["summary"]["files"][0]["kind"], json!("modified"));
+        assert_eq!(structured["summary"]["files"][0]["lines_added"], json!(3));
 
         let symbol = client
             .call_tool(
@@ -3547,8 +3555,7 @@ pub fn beacon() -> u64 {
                 Ok(ChangeResult::Applied {
                     summary: ChangeSummary {
                         id: ChangeId("0123abcd".to_owned()),
-                        paths: Vec::new(),
-                        edits: Vec::new(),
+                        files: Vec::new(),
                         diagnostics: Vec::new(),
                         guarantees: Vec::new(),
                     },
@@ -3596,8 +3603,7 @@ pub fn beacon() -> u64 {
                 Ok(ChangeResult::Applied {
                     summary: ChangeSummary {
                         id: ChangeId("0123abcd".to_owned()),
-                        paths: Vec::new(),
-                        edits: Vec::new(),
+                        files: Vec::new(),
                         diagnostics: Vec::new(),
                         guarantees: Vec::new(),
                     },
@@ -3621,7 +3627,9 @@ pub fn beacon() -> u64 {
 
     #[test]
     fn applied_change_that_breaks_the_source_policy_rebuild_reports_stale_snapshot() -> TestResult {
-        use rift_protocol::change::{ChangeId, ChangeResult, ChangeSummary};
+        use rift_protocol::change::{
+            ChangeId, ChangeResult, ChangeSummary, FileChange, FileChangeKind,
+        };
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let candidate = stable_candidate(directory.path(), 0)?;
@@ -3659,11 +3667,26 @@ pub fn beacon() -> u64 {
                         // A written `.gitignore` decides what the workspace includes, so
                         // this change asks for the whole workspace and its `[source]`
                         // policy is compiled again.
-                        paths: vec![
-                            rift_protocol::read::ProjectPath(".gitignore".to_owned()),
-                            rift_protocol::read::ProjectPath("nested/.gitignore".to_owned()),
+                        files: vec![
+                            FileChange {
+                                path: rift_protocol::read::ProjectPath(".gitignore".to_owned()),
+                                kind: FileChangeKind::Created,
+                                size_bytes: 0,
+                                line_count: 0,
+                                lines_added: 0,
+                                lines_removed: 0,
+                            },
+                            FileChange {
+                                path: rift_protocol::read::ProjectPath(
+                                    "nested/.gitignore".to_owned(),
+                                ),
+                                kind: FileChangeKind::Created,
+                                size_bytes: 0,
+                                line_count: 0,
+                                lines_added: 0,
+                                lines_removed: 0,
+                            },
                         ],
-                        edits: Vec::new(),
                         diagnostics: Vec::new(),
                         guarantees: Vec::new(),
                     },
