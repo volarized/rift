@@ -91,6 +91,7 @@
         },
         "failure_severity": {
           "$ref": "#/$defs/HookFailureSeverity",
+          "default": "error",
           "description": "Severity the server reports when the hook does not pass."
         },
         "guarantees": {
@@ -106,6 +107,7 @@
           "description": "Label for this hook's results, unique within the list.",
           "maxLength": 64,
           "minLength": 1,
+          "pattern": "^[A-Za-z0-9._-]+$",
           "type": "string"
         },
         "include": {
@@ -146,6 +148,7 @@
         },
         "writes": {
           "$ref": "#/$defs/HookWrites",
+          "default": "none",
           "description": "Source files the server permits the hook to change."
         }
       },
@@ -153,8 +156,6 @@
         "id",
         "kind",
         "command",
-        "writes",
-        "failure_severity",
         "determinism"
       ],
       "type": "object"
@@ -175,6 +176,7 @@
           "minItems": 1,
           "prefixItems": [
             {
+              "maxLength": 4096,
               "minLength": 1,
               "type": "string"
             }
@@ -583,7 +585,8 @@
           "type": "object"
         },
         "initialization_options": {
-          "description": "Options handed to the process at initialize. Must be a JSON object\nwhen present; the LSP server defines its meaning."
+          "description": "Options handed to the process at initialize. Must be a JSON object\nwhen present; the LSP server defines its meaning.",
+          "type": "object"
         },
         "output_limit": {
           "$ref": "#/$defs/ByteSize",
@@ -806,9 +809,7 @@
           "$ref": "#/$defs/TextSearchConfiguration",
           "default": {
             "include": [
-              "**/*.md",
-              "**/*.mdx",
-              "**/*.txt"
+              "**"
             ],
             "max_chunk": "1mb"
           },
@@ -1029,15 +1030,13 @@
     },
     "TextSearchConfiguration": {
       "additionalProperties": false,
-      "description": "The `[search.text]` table. `max_chunk` bounds lexical units derived from\nvisible text files.",
+      "description": "The `[search.text]` table. `include` selects which visible paths join the\ntext index once every language entry has had its claim, and `max_chunk`\nbounds the lexical units derived from them.",
       "properties": {
         "include": {
           "default": [
-            "**/*.md",
-            "**/*.mdx",
-            "**/*.txt"
+            "**"
           ],
-          "description": "Project-relative path patterns included as plain text when no language claims them.",
+          "description": "Project-relative path patterns included as plain text when no language claims them.\nThe default `[\"**\"]` selects every unclaimed visible path; an empty list selects none.",
           "items": {
             "$ref": "#/$defs/PathPattern"
           },
@@ -1087,6 +1086,9 @@
       "default": {},
       "description": "Exact language entries keyed by their `name` or `name:dialect` identity segment.",
       "maxProperties": 64,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$"
+      },
       "type": "object"
     },
     "logs": {
@@ -1105,6 +1107,9 @@
       "default": {},
       "description": "Shared LSP processes keyed by name. Language entries select them explicitly.",
       "maxProperties": 16,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9._-]*$"
+      },
       "type": "object"
     },
     "providers": {
@@ -1141,9 +1146,7 @@
         },
         "text": {
           "include": [
-            "**/*.md",
-            "**/*.mdx",
-            "**/*.txt"
+            "**"
           ],
           "max_chunk": "1mb"
         }

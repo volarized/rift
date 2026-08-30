@@ -16,12 +16,12 @@ An editor that supports TOML schema directives can load the generated schema:
 #:schema https://volar.sh/rift/rift.schema.json
 ```
 
-Treat `rift.toml` as executable workspace configuration: the hooks a repository names run with
-the server's OS permissions after each applied change, and the engines it names start with them.
-Inspect the file before running Rift in a cloned repository.
+Treat `rift.toml` as executable workspace configuration: a selected hook runs with the server's
+OS permissions after an applied change, and an LSP process starts with those permissions on its
+first request. Inspect the file before running Rift in a cloned repository.
 
-Each section's example shows its keys at their defaults. Durations take `ms`, `s`, `m`, `h`, or
-`d`; byte sizes take `b`, `kb`, `mb`, `gb`, or `tb` - binary units, so `1kb` is 1024 bytes.
+Each section states its defaults below its example. Durations take `ms`, `s`, `m`, `h`, or `d`;
+byte sizes take `b`, `kb`, `mb`, `gb`, or `tb` - binary units, so `1kb` is 1024 bytes.
 
 ## Server
 
@@ -44,10 +44,10 @@ readiness_timeout = "30s"
   stacking another waiter
 - `idle_timeout` stops the server once no request remains active and that span has passed after
   the last response completed, 1s to 1d; the next `rift mcp` or `rift server start` brings it back
-- `readiness_timeout` bounds one request's whole wait for the workspace's index and its language
-  engines to prove they're ready to answer, 1s to 1h - index validation starts the clock, and
-  once the request has resolved which engines it needs, waiting on them spends whatever time is
-  left
+- `readiness_timeout` bounds one request's whole wait for the workspace's index and its LSP
+  processes to prove they're ready to answer, 1s to 1h - index validation starts the clock, and
+  once the request has resolved which LSP processes it needs, waiting on them spends whatever
+  time is left
 - `port` pins the exact loopback port, 1024 or above; omitted, the server picks the first free
   port from `port_range` - `port_range = { min = 12000, max = 13000 }` is the default - and the
   two keys exclude each other
@@ -111,25 +111,228 @@ or `.gitignore` entry can make the server serve them.
 reach one such file on demand, through the request-side `force_include` override on `search`'s
 `paths` selector.
 
+## Languages and LSP
+
+<VersionBadge version="v0.0.25" />
+
+An exact language entry connects visible paths to shipped syntax, execution permission, and an
+optional LSP process. Its key is a language name, or `name:dialect` for an exact dialect:
+
+```toml
+[languages.rust]
+enabled = true
+include = ["**/*.rs"]
+exclude = ["vendor/**"]
+execution = false
+lsp = "rust"
+
+[lsp.rust]
+command = ["rustup", "run", "1.98", "rust-analyzer"]
+environment = {}
+startup_timeout = "30s"
+request_timeout = "1m"
+output_limit = "4kb"
+
+[lsp.rust.retry]
+attempts = 8
+delay = "250ms"
+delay_limit = "2s"
+
+[lsp.rust.restart]
+attempts = 3
+window = "5m"
+```
+
+Every shipped syntax provider contributes its file patterns. An absent `include` keeps those
+patterns; a present list replaces them, and an empty list matches no file. `exclude` removes
+matches from the effective list. `enabled` defaults to `true`, `exclude` defaults empty,
+`execution` defaults to `false`, and `lsp` is absent by default. A bare language and each of its
+dialect entries are independent. `enabled = false` turns off syntax, LSP service, and execution
+for paths the entry matches.
+
+A language no shipped syntax provider knows must carry a nonempty `include` list. It can still
+select an LSP process and execution permission. One visible path may match one exact language; a
+current path two entries claim refuses the workspace candidate, naming the path and both
+identities, and the previously published revision keeps serving.
+A visible file no language claims remains available to generic reads, and joins lexical search as
+plain text when `[search.text].include` selects it. So does a file whose entry is disabled, or
+whose language ships no grammar: what those entries drop is syntax analysis, not the file.
+
+The `lsp` key is what turns the engine-served tools on:
+[`rename_symbol`](/docs/protocol/mcp#tool-rename_symbol) and
+[`move_file`](/docs/protocol/mcp#tool-move_file) refuse `unsupported` for a language whose entry
+selects no process. Reads and the direct change tools answer either way.
+
+`lsp` accepts an inline process table or the name of one shared top-level process. The inline
+table collapses to one key when the program takes no arguments:
+
+```toml
+[languages.rust]
+lsp.command = "rust-analyzer"
+```
+
+A named process may serve several exact identities, including dialects:
+
+```toml
+[languages.typescript]
+lsp = "typescript"
+
+[languages."typescript:tsx"]
+lsp = "typescript"
+
+[lsp.typescript]
+command = ["node_modules/.bin/typescript-language-server", "--stdio"]
+
+[lsp.typescript.initialization_options.tsserver]
+useSyntaxServer = "never"
+```
+
+`command` accepts a program string without whitespace or a nonempty list holding the program and
+its literal arguments. The list holds one program and at most 64 arguments; each argument holds
+at most 4096 bytes. Rift starts the command directly without a shell. Absolute programs are
+refused. A bare name resolves through the server's `PATH`, with `environment` applied on top.
+`initialization_options` is absent by default and must be a JSON object when present;
+`environment` defaults empty and holds at most 64 entries.
+
+`startup_timeout` defaults to `"30s"` and takes `"1s"` to `"10m"`. `request_timeout` defaults
+to `"1m"` and takes `"1s"` to `"10m"`. `output_limit` defaults to `"4kb"` and takes `"1kb"` to
+`"8mb"`; Rift still reports the full size, so you can tell a truncated log from a short one.
+
+`retry` bounds repeated requests while an answer stays unsettled. `attempts` includes the first
+request; waits start at `delay`, double, and stop at `delay_limit`. `restart` bounds replacement
+processes after a process ends or stops answering. A replacement older than `window` stops
+counting. The server starts a process on its first request and keeps it across later requests.
+Configuration reload reuses unchanged process definitions and ends replaced processes.
+
+`retry.attempts` defaults to `8` and takes `1` to `64`. `retry.delay` defaults to `"250ms"` and
+takes `"1ms"` to `"1m"`; `retry.delay_limit` defaults to `"2s"` and takes `"1ms"` to `"10m"`.
+`restart.attempts` defaults to `3` and takes `0` to `16`; `restart.window` defaults to `"5m"` and
+takes `"1s"` to `"1d"`.
+
+A named process that no language selects is accepted but never started. A language that names a
+missing process is refused during configuration validation. The top-level table holds at most 16
+processes. The workspace holds at most 64 language entries. Each language `include` and `exclude`
+list holds at most 64 patterns.
+
+A language server may decline a request it's already serving, report that the file moved under
+it, or answer before it has loaded the declaration. Every such refusal gets the configured retry
+schedule. If every attempt refuses, Rift returns the language server's latest words.
+
+A capability the server never advertised is not a refusal and returns at once.
+
+A server still loading your project answers anyway, and answers thinly: rust-analyzer reports no
+diagnostics at all for a file it hasn't analyzed, and refuses a rename with `No references found
+at position` for a declaration it hasn't indexed. Neither is its verdict.
+
+LSP's `$/progress` traffic tells Rift when work remains outstanding, so an answer that arrives
+during that work is provisional. Progress doesn't bind completed work to one semantic request, so
+an empty answer or a refusal stays bounded by the retry schedule after progress ends.
+
+Before the first announcement arrives there's nothing to read, and one shape of thin answer says
+exactly what a settled server says: a `move_file` answered with no edit, and a diagnostics pull
+answered with no finding, are also what a loaded server answers for a move with no import to
+rewrite and for a file that's clean. Every empty move or reference answer is therefore asked
+through the retry schedule while one document remains open. A classified workspace change
+invalidates readiness from earlier work.
+
+A move that spends the schedule with no proposal applies with a
+`rift.move.references_not_updated` warning, while an unconfirmed empty reference check refuses
+unless forced. A nonempty full diagnostic report can settle after progress ends. An empty full
+report needs equal evidence at the final attempt; a report still changing at that bound becomes
+`rift.engine.unready`, not an empty finding list.
+
+A `workspace/diagnostic/refresh` request from the language server invalidates an earlier report
+before that comparison.
+
+The waits grow from `delay` and stop growing at `delay_limit`, which keeps the resends off a
+process that is busy indexing. At the defaults a request waits at most 9.75s across its eight
+asks, which covers a rust-analyzer cold start on a small project.
+
+What the caller sees when the attempts run out depends on what was being asked. A rename asks
+before anything is written, so the call fails `temporarily_unavailable` with the tree untouched
+when analysis remains outstanding. Move and reference checks carry their stated warning or
+refusal when final emptiness remains unconfirmed.
+
+A diagnostics pull runs after the change has already applied, so it can't fail the call: the
+summary carries `rift.engine.unready` when the process never settled, or `rift.engine.failed`
+when it failed outright, rather than an empty finding list that would tell the caller the changed
+file is clean.
+
+`restart` bounds what Rift does when the process itself fails. One that ended, that couldn't be
+started, or that stopped answering is replaced automatically, and the replacement serves the
+request. Each replacement spends one of `restart.attempts`, and a replacement older than
+`restart.window` stops counting, so a process that dies once a week never runs out.
+
+One that crash-loops does: once the budget is spent, requests for its languages fail
+`temporarily_unavailable` until the window passes, instead of starting a process that dies again.
+The first process a workspace starts is the start, not a replacement, and a refused `command`
+program, empty or an absolute path, is reported at once rather than started again.
+
+A symbol address spells its language as an identity segment, and a declaration in a `.tsx` file
+is addressed under the dialect: `rift://symbol/typescript:tsx/view.tsx/Banner`. The server looks
+the entry up by that exact identity, so the bare language and the dialect are two independent
+entries, each selecting its own process, and both may select the same named one. Without the
+dialect entry the same rename refuses `unsupported`.
+
+A minimal entry names its process inline. This one names
+[tombi](https://github.com/tombi-toml/tombi), a TOML formatter, linter, and language server:
+
+```toml
+[languages.toml.lsp]
+command = ["tombi", "lsp"]
+```
+
+`lsp` is the subcommand that starts tombi's language server over stdio.
+
+A language server that ships as a package runs from workspace-installed bytes. Pin both packages
+in `package.json`, install from its lockfile, and point `command` at the local executable, the way
+`[lsp.typescript]` above does. This avoids paying package runner resolution at startup.
+
+typescript-language-server refuses its initialize request unless a `typescript` package resolves
+from the workspace root, answering `Could not find a valid TypeScript installation`. Install that
+package in the workspace, or name an existing one with the `tsserver.path` initialization option;
+without either, every rename and move for the language fails on the language server's own words.
+
+The index still walks what `source` leaves visible, so the installed package directory needs an
+exclude:
+
+```toml
+[source]
+exclude = ["node_modules/**"]
+```
+
+Without it the walk reaches `typescript`'s own sources and the first change fails
+`limit_exceeded` on `node_modules/typescript/lib/_tsc.js`, which is past the index's per-file
+byte bound. Any workspace with an installed package directory needs the same entry.
+
+`tsserver.useSyntaxServer = "never"` keeps the process to one semantic server. Under the default
+`auto` it also runs a syntax-only server, and that one can answer the first rename after startup
+from the open file alone: the observed cold answer renamed the declaration and left both
+importers standing. With one semantic server the rename waits for the loaded project and reaches
+every file.
+
 ## Execution
 
-<VersionBadge version="planned" />
+<VersionBadge version="v0.0.25" />
 
-[`execute`](/docs/protocol/mcp#tool-execute) runs a block of code your agent wrote in the
-targeted tree's execution copy. The code still runs on your machine, so `execute` stays off
-until you name the languages it's allowed for. A selector is a language name, or
-`name:dialect` to pin a dialect.
+`languages.<identity>.execution` records whether the planned
+[`execute`](/docs/protocol/mcp#tool-execute) tool may run a block of agent-written code in the
+targeted tree's execution copy. Execution stays off until its exact language entry enables it:
 
 ```toml
 [execution]
-allow = ["python"]
 max_code = "16kb"
 max_timeout = "30s"
 max_output = "8kb"
 max_concurrent = 2
+
+[languages.python]
+include = ["**/*.py"]
+execution = true
 ```
 
-`allow` has no default; the other keys are shown at theirs.
+The execution keys are shown at their defaults. `languages.<identity>.execution` defaults to
+`false`.
 
 - `max_code` bounds one submitted block, 1b to 32kb
 - `max_timeout` bounds one evaluation, 1ms to 1d - the evaluation only: refreshing the
@@ -141,9 +344,8 @@ max_concurrent = 2
 The schema states each range as `rift:range` on the key, and the server enforces it at load -
 schema validation alone can't compare `"16kb"` against a ceiling.
 
-Listing a language under `allow` does nothing when no runtime serves it; the
-[`rift://workspace`](/docs/protocol/mcp#resource-workspace) resource reports what survives that
-intersection per language.
+The language entry also owns file selection, so the execution permission applies to the same
+exact identity and paths that syntax and LSP service use.
 
 ## Providers
 
@@ -173,22 +375,27 @@ walk's cost scales with how far back it reaches. The history provider computes a
 [`SymbolHistory`](/docs/protocol/reference#SymbolHistory) timeline inside that depth; a
 revision beyond it contributes no version.
 
-Provider configuration does not set merge order or freshness. The server reports provider order,
-state, and revision through `rift://workspace`. A provider rebuilding after a file change can
-serve its previous immutable revision; the result then carries a `stale_index` entry in
-`warnings` naming the two tree revision digests.
+Provider configuration does not set merge order or freshness. A provider rebuilding after a file
+change can serve its previous immutable revision; the result then carries a `stale_index` entry
+in `warnings` naming the two tree revision digests.
 
 ## Search
 
 <VersionBadge version="v0.0.9" />
 
-[`search`](/docs/protocol/mcp#tool-search) runs on a lexical index. Every visible file joins when
-it is bounded UTF-8 text without a NUL byte; syntax providers add declaration facts for languages
-they recognize. `[search.text]` bounds text chunks. `pool_slots` bounds pooled connections shared
-by search and stored logs; writes wait for one process-wide turn:
+[`search`](/docs/protocol/mcp#tool-search) runs on a lexical index. `[search.text]` selects the
+plain-text files that join it through `include` and bounds their chunks. `pool_slots` bounds
+pooled connections shared by search and stored logs; writes wait for one process-wide turn.
+
+<VersionBadge version="v0.0.25" />
+
+A visible file joins the lexical index through its effective language entry, or through
+`[search.text].include` when no language claims it. Narrow that list where the workspace holds
+large unclaimed files search should not carry:
 
 ```toml
 [search.text]
+include = ["**/*.md", "**/*.mdx", "**/*.txt"]
 max_chunk = "1mb"
 
 [search]
@@ -196,9 +403,11 @@ pool_slots = 4
 busy_timeout = "5s"
 ```
 
-- `max_chunk` bounds how large a file may grow before it's split into several indexed chunks,
-  1kb to 16mb; an operator who wants a file out of the index entirely excludes it in
-  [`[source]`](/docs/configuration#source)
+- `include` selects text files from the visible paths no language entry claimed, at most 64
+  patterns. It defaults to `["**"]`, so every such path joins the lexical text index; an explicit
+  empty list selects no text file
+- `max_chunk` bounds how large a selected text file may grow before it's split into several
+  indexed chunks, 1kb to 16mb
 - `pool_slots` bounds SQLite connections the workspace database may hold open at once, 1 to 16
 - `busy_timeout` bounds how long a connection waits for a database lock held by another
   process before failing with `SQLITE_BUSY`, 100ms to 30s
@@ -274,209 +483,45 @@ the workspace must not fetch model weights:
 disabled = true
 ```
 
-## Engines
-
-<VersionBadge version="v0.0.14" />
-
-A [language engine](/docs/architecture#semantics) is an external language server Rift starts for
-the workspace and speaks LSP to. Each `[engines.<name>]` table names one program, the languages
-it serves, and the bounds Rift holds it to;
-[`rename_symbol`](/docs/protocol/mcp#tool-rename_symbol) and
-[`move_file`](/docs/protocol/mcp#tool-move_file) refuse `unsupported` for a language no table
-claims, so the entry is what turns those tools on:
-
-```toml
-[engines.rust]
-program = "rustup"
-arguments = ["run", "1.98", "rust-analyzer"]
-languages = ["rust"]
-environment = {}
-startup_timeout = "30s"
-request_timeout = "1m"
-output_limit = "4kb"
-
-[engines.rust.retry]
-attempts = 8
-delay = "250ms"
-delay_limit = "2s"
-
-[engines.rust.restart]
-attempts = 3
-window = "5m"
-```
-
-`program` and `languages` have no default, `initialization_options` is absent unless you write
-it, and the other keys are shown at theirs.
-
-- `program` - refuses an absolute path; a bare name resolves through the `PATH` of the
-  environment the engine runs with - the server's, with `environment` applied on top
-- `arguments` - the program's literal arguments, in order; may be empty, and holds at most 64
-- `environment` - values added on top of the environment the server inherited
-- `languages` - the language identity segments this engine answers for, 1 to 16 of them; each
-  segment belongs to one engine across the whole table
-- `initialization_options` - a JSON object handed to the engine in its initialize request; Rift
-  passes it through untouched and the engine defines what the keys mean
-- `startup_timeout` - bounds the initialize handshake, 1s to 10m; an engine that doesn't finish
-  it in time is killed
-- `request_timeout` - bounds each later request, 1s to 10m
-- `output_limit` - bytes of the engine's standard error Rift keeps, 1kb to 8mb; Rift still
-  reports the full size, so you can tell a truncated log from a short one
-- `retry.attempts` - times one request is asked while its answer stays unsettled, the first ask
-  counted, 1 to 64; `1` never asks twice
-- `retry.delay` - the wait before the second ask, 1ms to 1m; every later wait doubles the one
-  before it
-- `retry.delay_limit` - the longest wait between two asks, 1ms to 10m; the doubling stops here
-- `restart.attempts` - engines Rift starts to replace a failed one inside `restart.window`, 0
-  to 16; `0` never replaces one
-- `restart.window` - the span those restarts are counted over, 1s to 1d
-
-The table holds at most 16 engines. The server starts one on the first request for a language it
-serves and keeps the session across later requests, because a language server pays for its
-project load once and answers from it afterwards.
-
-`retry` bounds what Rift does while an engine's answer is not settled.
-
-A language server may decline a request it is already serving, report that the file moved under it,
-or answer before it has loaded the declaration. All engine refusals receive the configured bounded
-schedule. If every attempt refuses, Rift returns the latest engine words. A capability the engine
-never advertised is not an engine refusal and returns at once.
-
-A server still loading your project answers anyway, and answers thinly: rust-analyzer reports no
-diagnostics at all for a file it has not analyzed, and refuses a rename with `No references found
-at position` for a declaration it has not indexed. Neither is its verdict. LSP's `$/progress`
-traffic tells Rift when work remains outstanding, so an answer that arrives during that work is
-provisional. Progress does not bind completed work to one semantic request, so an empty answer or
-a refusal remains bounded by the retry table after progress ends.
-
-Before the first announcement arrives there is nothing to read, and one shape of thin answer says
-exactly what a settled engine says: a `move_file` the engine answers with no edit, and a
-diagnostics pull it answers with no finding, are also what a loaded engine answers for a move
-with no import to rewrite and for a file that is clean. Every empty move or reference answer is
-therefore asked through the configured retry schedule while one document remains open. A
-classified workspace change invalidates readiness from earlier work. A move
-that spends the table with no proposal applies with a
-`rift.move.references_not_updated` warning, while an unconfirmed empty reference check refuses
-unless forced. A nonempty full diagnostic report can settle after progress ends. An empty full
-report requires equal evidence at the final attempt; a report still changing at that bound becomes
-`rift.engine.unready`, not an empty finding list. An engine's
-`workspace/diagnostic/refresh` request invalidates an earlier report before that comparison.
-
-The waits grow from `delay` and stop growing at `delay_limit`, which keeps the resends off an
-engine that is busy indexing. At the defaults a request waits at most 9.75s across its eight
-asks, which covers a rust-analyzer cold start on a small project.
-
-What the caller sees when the attempts run out depends on what was being asked. A rename asks
-before anything is written, so the call fails `temporarily_unavailable` with the tree untouched
-when analysis remains outstanding. Move and reference checks carry their stated warning or
-refusal when final emptiness remains unconfirmed. A diagnostics pull runs after the change has
-already applied, so it cannot fail the call: the summary carries `rift.engine.unready` when the
-engine never settled, or `rift.engine.failed` when it failed outright, rather than an empty
-finding list that would tell the caller changed file is clean.
-
-`restart` bounds what Rift does when the engine itself fails: one that ended, that could not be
-started, or that stopped answering is replaced automatically, and the replacement serves the
-request. Each replacement spends one of `restart.attempts`, and a replacement older than
-`restart.window` stops counting, so an engine that dies once a week never runs out. An engine
-that crash-loops does: once the budget is spent, requests for its languages fail
-`temporarily_unavailable` until the window passes, instead of starting a process that dies
-again. The first engine a workspace starts is the start, not a replacement, and a refused
-`program` - empty, or an absolute path - is reported at once rather than started again.
-
-A `languages` entry is a language identity segment: a bare name such as `rust`, or
-`name:dialect` to pin one dialect. Segments are how a symbol address spells its language, and a
-declaration in a `.tsx` file is addressed under the dialect -
-`rift://symbol/typescript:tsx/view.tsx/Banner`.
-
-The server looks the engine up by that exact segment, so an engine that should serve those
-declarations lists the dialect beside the bare name:
-`languages = ["typescript", "typescript:tsx"]`. Without the dialect entry the same rename
-refuses `unsupported`.
-
-A segment no syntax provider knows is accepted, because the engine tier may serve a language the
-syntax tier does not. A misspelled segment therefore fails nothing at load and simply never
-matches an address.
-
-A minimal engine needs only `program` and `languages`. This table names
-[tombi](https://github.com/tombi-toml/tombi), a TOML formatter, linter, and language server:
-
-```toml
-[engines.toml]
-program = "tombi"
-arguments = ["lsp"]
-languages = ["toml"]
-```
-
-`lsp` is the subcommand that starts tombi's language server over stdio.
-
-An engine that ships as a package runs from workspace-installed bytes. Pin both packages in
-`package.json`, install from its lockfile, and point Rift at the local executable. This avoids
-package runner resolution during startup:
-
-```toml
-[source]
-exclude = ["node_modules/**"]
-
-[engines.typescript]
-program = "node_modules/.bin/typescript-language-server"
-arguments = ["--stdio"]
-languages = ["typescript", "typescript:tsx"]
-
-[engines.typescript.initialization_options.tsserver]
-useSyntaxServer = "never"
-```
-
-typescript-language-server refuses its initialize request unless a `typescript` package resolves
-from the workspace root, answering `Could not find a valid TypeScript installation`. Install that
-package in the workspace, or name an existing one with the `tsserver.path` initialization option;
-without either, every rename and move for the language fails on the engine's own words.
-
-`[source] exclude` keeps the installed package directory out of the index. Without it the walk
-reaches `typescript`'s own sources and the first change fails with `limit_exceeded` on
-`node_modules/typescript/lib/_tsc.js`, which is past the index's per-file byte bound. Any
-workspace with an installed package directory needs the same entry.
-
-`tsserver.useSyntaxServer = "never"` keeps the engine to one semantic server. Under the default
-`auto` it also runs a syntax-only server, and that one can answer the first rename after startup
-from the open file alone - the observed cold answer renamed the declaration and left both
-importers standing. With one semantic server the rename waits for the loaded project and reaches
-every file.
-
 ## Hooks
 
 <VersionBadge version="v0.0.5" />
 
-`hooks` adds transforms and validations, run in configured order after direct edits land. A
-hook's `type` selects how it runs; `command` - an executable Rift starts directly, without a
-shell - is the only type:
+`hooks` adds transforms and validations, run in configured order after direct edits land.
+
+<VersionBadge version="v0.0.25" />
+
+A hook is selected from the initial changed paths through `include` and `exclude`. Rift selects
+the complete list before any hook runs, so one transform cannot make a later hook join the run.
+`command` accepts a program string without whitespace or a nonempty list holding one program and
+at most 64 literal arguments, each at most 4096 bytes. Rift starts it directly without a shell:
 
 ```toml
 [[hooks]]
-type = "command"
 id = "tests"
 kind = "test"
-program = "cargo"
-arguments = ["test"]
+command = ["cargo", "test"]
 changed_paths = "none"
 writes = "none"
-working_directory = ""
-environment = {}
 timeout = "120s"
 output_limit = "4kb"
 failure_severity = "error"
-guarantees = []
 determinism = "deterministic"
+include = ["crates/**"]
+exclude = ["crates/generated/**"]
 ```
 
 The keys that shape how the command runs:
 
 - `id` - unique within the list, labels the result
-- `program` - refuses an absolute path; a bare name resolves through the `PATH` of the
+- `command` - refuses an absolute program; a bare name resolves through the `PATH` of the
   environment the command runs with - the server's, with `environment` applied on top - and a
   relative one below `working_directory`
-- `working_directory` - relative to the workspace root; its empty value selects the root
-- `arguments` - the program's literal arguments, in order; may be empty
-- `changed_paths` - `"append"` adds the changed project paths after `arguments` in byte order,
+- `working_directory` - relative to the workspace root; an omitted value selects the root
+- `changed_paths` - `"append"` adds the changed project paths after `command` in byte order,
   for a linter that takes files; `"none"` leaves the command alone
+- `include` - selects a hook when an initial changed path matches; empty selects every change
+- `exclude` - removes paths from that selection
 - `writes` - `"none"` makes a validation that may retain no source write; `"changed_paths"`
   makes a transform that may change only paths changed before hooks ran; `"workspace"` lets a
   transform change any visible source file
@@ -485,8 +530,12 @@ The keys that shape how the command runs:
 A hook runs in the tree it checks, so it executes the agent's change each time one applies -
 `cargo test` compiles the very change it's checking.
 
-Every key in the block is required - the schema carries no defaults, so a missing `environment`
-fails the file with `configuration_invalid`. The list holds at most 32 hooks.
+`id`, `kind`, `command`, and `determinism` are required. `changed_paths` and `writes` default to
+`"none"`; `failure_severity` defaults to `"error"`; `working_directory`, `environment`,
+`guarantees`, `include`, and `exclude` default empty; and the timeout and output keys use the
+shown defaults. The list holds at most 32 hooks. `environment` holds at most 64 entries,
+`guarantees` holds at most 16 entries, and each `include` and `exclude` list holds at most 64
+patterns.
 
 Two keys carry bounds: `timeout`, when Rift kills the process, takes `"1ms"` to `"1h"`, and
 `output_limit`, how much of each stream Rift keeps, takes `"256b"` to `"4kb"`. Rift still
@@ -520,18 +569,13 @@ This formatter runs first and may update any visible source path:
 
 ```toml
 [[hooks]]
-type = "command"
 id = "format"
 kind = "format"
-program = "cargo"
-arguments = ["fmt", "--all"]
+command = ["cargo", "fmt", "--all"]
 changed_paths = "none"
 writes = "workspace"
-working_directory = ""
-environment = {}
 timeout = "120s"
 output_limit = "4kb"
 failure_severity = "warning"
-guarantees = []
 determinism = "deterministic"
 ```
