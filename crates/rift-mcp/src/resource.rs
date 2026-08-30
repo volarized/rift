@@ -6,7 +6,7 @@
 //! because the case that needs the logs most is the one where the workspace
 //! reads refuse.
 
-use rift_index::{LOG_PAGE_RECORDS_MAX, LogQuery, StoredLogRecord};
+use rift_index::{LOG_LEVELS, LOG_PAGE_RECORDS_MAX, LogQuery, StoredLogRecord};
 use rift_protocol::workspace::WorkspaceResourcePage;
 use rmcp::ErrorData;
 use rmcp::model::{ReadResourceResult, Resource, ResourceContents, ResourceTemplate};
@@ -30,8 +30,6 @@ pub(crate) const WORKSPACE_TEMPLATE: &str = "rift://workspace{?page_index}";
 const WORKSPACE_QUERY_PREFIX: &str = "rift://workspace?";
 /// The media type every resource read answers in.
 const RESOURCE_MEDIA_TYPE: &str = "application/json";
-/// The levels a level-restricted read accepts, in the spelling the store holds.
-const LOG_LEVELS: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
 
 /// The resources the server lists.
 pub(crate) fn declared_resources() -> Vec<Resource> {
