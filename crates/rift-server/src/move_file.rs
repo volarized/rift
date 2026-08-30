@@ -252,12 +252,12 @@ fn move_targets(params: &MoveFileParams) -> Result<(CoreProjectPath, CoreProject
     Ok((from, to))
 }
 
-/// Resolves the moved file's current bytes directly from the filesystem, and its language
-/// segment when the syntax index claims the path.
+/// Resolves the moved file's current bytes directly from the filesystem, and the exact
+/// language identity an engine is asked under.
 ///
-/// Any visible regular file is movable: absence from the syntax index only means no
-/// language identity exists to ask an engine with, which [`engine_proposal`] and the
-/// move's own warning path already cover. An indexed path already passed the workspace's
+/// Any visible regular file is movable: absence of a language identity only means there
+/// is nothing to ask an engine with, which [`engine_proposal`] and the move's own
+/// warning path already cover. An indexed path already passed the workspace's
 /// `[source]` policy at index construction; a path the index does not hold is checked
 /// against that policy directly here, so an excluded path stays unreachable regardless of
 /// whether a provider would otherwise claim it. A missing path refuses `target_exists`; a
@@ -267,14 +267,11 @@ async fn resolved_source(
     workspace_root: &Path,
     from: &CoreProjectPath,
 ) -> Result<MovedSource, PlanEnd> {
-    let language_segment = reads
-        .index()
-        .file(from)
-        .map(|file| file.syntax().language().identity_segment());
     let absolute = workspace_root.join(from.as_str());
-    if language_segment.is_none() && !source_visible(reads, &absolute) {
+    if reads.index().file(from).is_none() && !source_visible(reads, &absolute) {
         return Err(PlanEnd::Refused(crate::publish::not_visible_refusal(from)));
     }
+    let language_segment = reads.engine_language_segment(from)?;
     let metadata = match tokio::fs::metadata(&absolute).await {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -590,6 +587,18 @@ mod tests {
 
     use super::*;
 
+    fn engine_pool(
+        root: &Path,
+        configuration: rift_protocol::configuration::LspConfiguration,
+    ) -> EnginePool {
+        let key = crate::engine::LspProcessKey::named("fake");
+        EnginePool::new(
+            root,
+            BTreeMap::from([(key.clone(), configuration)]),
+            BTreeMap::from([("rust".to_owned(), key)]),
+        )
+    }
+
     fn params(from: &str, to: &str) -> MoveFileParams {
         MoveFileParams {
             from: ProjectPath(from.to_owned()),
@@ -610,7 +619,7 @@ mod tests {
             HistoryConfiguration::default(),
         )
         .expect("fixture workspace indexes");
-        let engines = EnginePool::new(directory.path(), BTreeMap::new());
+        let engines = EnginePool::new(directory.path(), BTreeMap::new(), BTreeMap::new());
         (directory, reads, engines)
     }
 
@@ -652,11 +661,13 @@ mod tests {
         let script = format!(
             "printf '%s' '{capabilities}{progress_begin}{progress_end}{no_edit}{no_edit_again}'; sleep 0.2"
         );
-        let engine = rift_protocol::configuration::EngineConfiguration {
-            program: "sh".to_owned(),
-            arguments: vec!["-c".to_owned(), script],
+        let engine = rift_protocol::configuration::LspConfiguration {
+            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                script,
+            ]),
             environment: BTreeMap::new(),
-            languages: vec!["rust".to_owned()],
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
             request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
@@ -668,10 +679,7 @@ mod tests {
             },
             restart: rift_protocol::retry::RestartPolicy::default(),
         };
-        let engines = EnginePool::new(
-            directory.path(),
-            BTreeMap::from([("fake".to_owned(), engine)]),
-        );
+        let engines = engine_pool(directory.path(), engine);
         (directory, reads, engines)
     }
 
@@ -735,11 +743,13 @@ mod tests {
         );
         let no_edit = framed(r#"{"jsonrpc":"2.0","id":1,"result":null}"#);
         let script = format!("printf '%s' '{capabilities}{no_edit}'; sleep 0.2");
-        let engine = rift_protocol::configuration::EngineConfiguration {
-            program: "sh".to_owned(),
-            arguments: vec!["-c".to_owned(), script],
+        let engine = rift_protocol::configuration::LspConfiguration {
+            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                script,
+            ]),
             environment: BTreeMap::new(),
-            languages: vec!["rust".to_owned()],
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
             request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
@@ -751,10 +761,7 @@ mod tests {
             },
             restart: rift_protocol::retry::RestartPolicy::default(),
         };
-        let engines = EnginePool::new(
-            directory.path(),
-            BTreeMap::from([("fake".to_owned(), engine)]),
-        );
+        let engines = engine_pool(directory.path(), engine);
         (directory, reads, engines)
     }
 
@@ -912,7 +919,7 @@ mod tests {
             HistoryConfiguration::default(),
         )
         .expect("fixture workspace indexes");
-        let engines = EnginePool::new(directory.path(), BTreeMap::new());
+        let engines = EnginePool::new(directory.path(), BTreeMap::new(), BTreeMap::new());
         let result = refused(
             plan_move(
                 &reads,
@@ -981,7 +988,7 @@ mod tests {
             HistoryConfiguration::default(),
         )
         .expect("fixture workspace indexes");
-        let engines = EnginePool::new(directory.path(), BTreeMap::new());
+        let engines = EnginePool::new(directory.path(), BTreeMap::new(), BTreeMap::new());
         let result = refused(
             plan_move(
                 &reads,
@@ -1082,7 +1089,7 @@ mod tests {
             HistoryConfiguration::default(),
         )
         .expect("fixture workspace indexes");
-        let engines = EnginePool::new(directory.path(), BTreeMap::new());
+        let engines = EnginePool::new(directory.path(), BTreeMap::new(), BTreeMap::new());
         fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000))
             .expect("fixture permissions set");
         let result = plan_move(

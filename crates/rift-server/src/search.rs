@@ -1376,11 +1376,10 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    /// `justfile` carries no extension a `[search.text]` list could ever spell; the default
-    /// policy still reaches it by name alone, and a query for content only it holds returns
-    /// it.
+    /// An explicit `[search.text]` path rule reaches an extensionless `justfile`, and a
+    /// query for content only it holds returns it.
     #[test]
-    fn search_returns_a_justfile_hit_for_content_only_it_holds() -> TestResult {
+    fn search_returns_an_explicitly_included_justfile_hit() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(
             directory.path().join("justfile"),
@@ -1390,7 +1389,7 @@ pub fn compute() -> i32 {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::default(),
+            &rift_core::TextFileInclusion::new(vec!["**".to_owned()], 1 << 20),
             HistoryConfiguration::default(),
         )?;
         let params: SearchParams = serde_json::from_value(json!({
@@ -2004,7 +2003,7 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn search_finds_every_visible_utf8_file_without_an_extension_gate() -> TestResult {
+    fn search_finds_every_explicitly_included_utf8_file() -> TestResult {
         let directory = tempfile::tempdir()?;
         let files = [
             ("history.py", "python_catalog_marker"),
@@ -2019,7 +2018,7 @@ pub fn compute() -> i32 {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::default(),
+            &rift_core::TextFileInclusion::new(vec!["**".to_owned()], 1 << 20),
             HistoryConfiguration::default(),
         )?;
 
@@ -2088,11 +2087,13 @@ pub fn compute() -> i32 {
             "RIFT_HISTORY_PYTHON_MARKER\n",
         )?;
         rift_history::fixture::commit_all(directory.path(), "add history fixture");
-        let service = ReadService::at_revision(
+        let service = ReadService::at_revision_with_languages(
             directory.path(),
             &rift_protocol::read::RevisionId("main".to_owned()),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::new(vec!["**".to_owned()], 1 << 20),
+            &rift_core::LanguageFileSelections::default(),
             HistoryConfiguration::default(),
         )?;
         let params: SearchParams = serde_json::from_value(json!({
@@ -2146,7 +2147,7 @@ pub fn compute() -> i32 {
             directory.path(),
             limits,
             &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::default(),
+            &rift_core::TextFileInclusion::new(vec!["**".to_owned()], 1 << 20),
             HistoryConfiguration::default(),
         )?;
         let params: SearchParams = serde_json::from_value(json!({
@@ -2172,7 +2173,7 @@ pub fn compute() -> i32 {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::default(),
+            &rift_core::TextFileInclusion::new(vec!["**".to_owned()], 1 << 20),
             HistoryConfiguration::default(),
         )?;
         let params: SearchParams = serde_json::from_value(json!({
@@ -2432,7 +2433,7 @@ pub fn compute() -> i32 {
         fs::write(directory.path().join("guide.txt"), "word ".repeat(1000))?;
         // The smallest accepted chunk bound against a several-kilobyte guide forces the file
         // into more than one lexical unit, each of which the query matches.
-        let text_inclusion = rift_core::TextFileInclusion::new(1_024);
+        let text_inclusion = rift_core::TextFileInclusion::new(vec!["**".to_owned()], 1_024);
         let service = ReadService::build(
             directory.path(),
             WorkspaceIndexLimits::default(),

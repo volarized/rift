@@ -19,7 +19,53 @@ use rift_protocol::read::{
 };
 
 use crate::read::{ReadError, ReadFault, ReadService};
-use crate::rewrite::{FileRewrite, REWRITE_FILE_BYTES_MAX, RewriteKind, RewritePermissions};
+use crate::rewrite::{
+    ByteFileRewrite, FileRewrite, REWRITE_FILE_BYTES_MAX, RewriteKind, RewritePermissions,
+};
+
+/// Rewrite fields shared by text changes and raw-byte hook restoration.
+trait PublishedRewrite {
+    fn path(&self) -> &CoreProjectPath;
+    fn kind(&self) -> &RewriteKind;
+    fn next_bytes(&self) -> &[u8];
+    fn permissions(&self) -> &RewritePermissions;
+}
+
+impl PublishedRewrite for FileRewrite {
+    fn path(&self) -> &CoreProjectPath {
+        &self.path
+    }
+
+    fn kind(&self) -> &RewriteKind {
+        &self.kind
+    }
+
+    fn next_bytes(&self) -> &[u8] {
+        self.next_source.as_bytes()
+    }
+
+    fn permissions(&self) -> &RewritePermissions {
+        &self.permissions
+    }
+}
+
+impl PublishedRewrite for ByteFileRewrite {
+    fn path(&self) -> &CoreProjectPath {
+        &self.path
+    }
+
+    fn kind(&self) -> &RewriteKind {
+        &self.kind
+    }
+
+    fn next_bytes(&self) -> &[u8] {
+        &self.next_bytes
+    }
+
+    fn permissions(&self) -> &RewritePermissions {
+        &self.permissions
+    }
+}
 
 /// Whether a write should publish through a symlink's resolved target, or
 /// act on the addressed entry itself.
@@ -326,8 +372,8 @@ impl CreatedDirectories {
 /// publishes to, its captured previous state, the warning to carry when
 /// it resolved through a symlink, and its staged tempfile, present for
 /// every kind but a deletion.
-struct StagedMember<'batch> {
-    rewrite: &'batch FileRewrite,
+struct StagedMember<'batch, Rewrite> {
+    rewrite: &'batch Rewrite,
     absolute: PathBuf,
     previous: PreviousState,
     warning: Option<Diagnostic>,
@@ -337,18 +383,18 @@ struct StagedMember<'batch> {
 }
 
 /// Captures previous state and stages next content in target directory.
-fn stage_member<'batch>(
+fn stage_member<'batch, Rewrite: PublishedRewrite>(
     root: &Path,
-    rewrite: &'batch FileRewrite,
+    rewrite: &'batch Rewrite,
     target: &WriteTarget,
     created: &mut CreatedDirectories,
-) -> Result<StagedMember<'batch>, ReadError> {
-    let previous = if matches!(rewrite.kind, RewriteKind::Create) {
+) -> Result<StagedMember<'batch, Rewrite>, ReadError> {
+    let previous = if matches!(rewrite.kind(), RewriteKind::Create) {
         PreviousState::Absent
     } else {
-        captured_previous_state(rewrite.path.as_str(), &target.absolute)?
+        captured_previous_state(rewrite.path().as_str(), &target.absolute)?
     };
-    let permissions = match (&previous, &rewrite.permissions) {
+    let permissions = match (&previous, rewrite.permissions()) {
         (_, RewritePermissions::Exact(permissions)) => Some(permissions.clone()),
         (_, RewritePermissions::RetainFrom(source)) => Some(captured_permissions(
             source.as_str(),
@@ -360,7 +406,7 @@ fn stage_member<'batch>(
         (PreviousState::Absent, RewritePermissions::Retain) => None,
     };
     let warning = target.symlink_warning();
-    if rewrite.kind.removes_file() {
+    if rewrite.kind().removes_file() {
         return Ok(StagedMember {
             rewrite,
             absolute: target.absolute.clone(),
@@ -371,19 +417,19 @@ fn stage_member<'batch>(
         });
     }
     let parent = target.absolute.parent().unwrap_or(root);
-    if matches!(rewrite.kind, RewriteKind::Create) {
+    if matches!(rewrite.kind(), RewriteKind::Create) {
         created
             .record(root, parent)
-            .map_err(|error| ReadFault::storage(rewrite.path.as_str(), "create_dir", &error))?;
+            .map_err(|error| ReadFault::storage(rewrite.path().as_str(), "create_dir", &error))?;
     }
     let mut file = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|error| ReadFault::storage(rewrite.path.as_str(), "stage", &error))?;
-    file.write_all(rewrite.next_source.as_bytes())
-        .map_err(|error| ReadFault::storage(rewrite.path.as_str(), "stage", &error))?;
+        .map_err(|error| ReadFault::storage(rewrite.path().as_str(), "stage", &error))?;
+    file.write_all(rewrite.next_bytes())
+        .map_err(|error| ReadFault::storage(rewrite.path().as_str(), "stage", &error))?;
     if let Some(permissions) = &permissions {
         file.as_file()
             .set_permissions(permissions.clone())
-            .map_err(|error| ReadFault::storage(rewrite.path.as_str(), "permissions", &error))?;
+            .map_err(|error| ReadFault::storage(rewrite.path().as_str(), "permissions", &error))?;
     }
     Ok(StagedMember {
         rewrite,
@@ -426,14 +472,17 @@ fn apply_published_permissions(
 /// target since it was resolved, and refuses instead of clobbering it
 /// otherwise; every other kind persists its staged tempfile onto the
 /// target unconditionally, through a rename within one directory.
-fn publish_member(member: &mut StagedMember<'_>, mutated: &mut bool) -> Result<(), ReadError> {
+fn publish_member<Rewrite: PublishedRewrite>(
+    member: &mut StagedMember<'_, Rewrite>,
+    mutated: &mut bool,
+) -> Result<(), ReadError> {
     #[cfg(windows)]
-    if !matches!(member.rewrite.kind, RewriteKind::Create) {
+    if !matches!(member.rewrite.kind(), RewriteKind::Create) {
         *mutated = make_target_replaceable(&member.absolute).map_err(|error| {
-            ReadFault::storage(member.rewrite.path.as_str(), "permissions", &error)
+            ReadFault::storage(member.rewrite.path().as_str(), "permissions", &error)
         })?;
     }
-    let outcome: Result<(), std::io::Error> = match (&member.rewrite.kind, member.staged.take()) {
+    let outcome: Result<(), std::io::Error> = match (member.rewrite.kind(), member.staged.take()) {
         (RewriteKind::Delete, _) => fs::remove_file(&member.absolute),
         (RewriteKind::Create, Some(staged)) => staged
             .persist_noclobber(&member.absolute)
@@ -449,19 +498,21 @@ fn publish_member(member: &mut StagedMember<'_>, mutated: &mut bool) -> Result<(
     };
     let outcome = outcome.and_then(|()| {
         *mutated = true;
-        if member.rewrite.kind.removes_file() {
+        if member.rewrite.kind().removes_file() {
             Ok(())
         } else {
             apply_published_permissions(&member.absolute, member.permissions.as_ref())
         }
     });
-    outcome.map_err(|error| ReadFault::storage(member.rewrite.path.as_str(), "publish", &error))
+    outcome.map_err(|error| ReadFault::storage(member.rewrite.path().as_str(), "publish", &error))
 }
 
 /// Publishes every staged member in order; on the first failure, restores
 /// every member already published and returns the failure that stopped
 /// the publish.
-fn publish_staged(staged: &mut [StagedMember<'_>]) -> Result<(), ReadError> {
+fn publish_staged<Rewrite: PublishedRewrite>(
+    staged: &mut [StagedMember<'_, Rewrite>],
+) -> Result<(), ReadError> {
     for index in 0..staged.len() {
         let mut mutated = false;
         if let Err(error) = publish_member(&mut staged[index], &mut mutated) {
@@ -479,7 +530,7 @@ fn publish_staged(staged: &mut [StagedMember<'_>]) -> Result<(), ReadError> {
 
 /// Restores every published member to captured bytes and permissions.
 /// Restoration remains best-effort because caller returns original publish error.
-fn roll_back_published(published: &[StagedMember<'_>]) {
+fn roll_back_published<Rewrite>(published: &[StagedMember<'_, Rewrite>]) {
     for member in published {
         match &member.previous {
             PreviousState::Present { bytes, permissions } => {
@@ -511,7 +562,10 @@ fn roll_back_published(published: &[StagedMember<'_>]) {
 /// it is removed while it is still empty. Consuming `staged` by value
 /// forces every live tempfile to drop before `created` is asked whether
 /// its directories are now empty.
-fn discard_unpublished(staged: Vec<StagedMember<'_>>, created: &CreatedDirectories) {
+fn discard_unpublished<Rewrite>(
+    staged: Vec<StagedMember<'_, Rewrite>>,
+    created: &CreatedDirectories,
+) {
     drop(staged);
     created.remove_if_empty();
 }
@@ -531,8 +585,8 @@ fn canonical_or_addressed(absolute: &Path) -> PathBuf {
 /// resolve to that same location just as two members naming one path
 /// literally would - the second stages over the first, and neither
 /// member's bytes survive the publish.
-fn duplicate_target_refusal(
-    rewrites: &[FileRewrite],
+fn duplicate_target_refusal<Rewrite: PublishedRewrite>(
+    rewrites: &[Rewrite],
     targets: &[WriteTarget],
 ) -> Option<ChangeResult> {
     let mut seen: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
@@ -543,7 +597,7 @@ fn duplicate_target_refusal(
         .map(|(rewrite, _)| {
             crate::rename::unsupported_refusal(format!(
                 "{} is addressed by more than one member of this batch",
-                rewrite.path.as_str()
+                rewrite.path().as_str()
             ))
         })
 }
@@ -597,14 +651,39 @@ pub(crate) fn publish_rewrites(
     if let Some(refusal) = oversized_rewrite_refusal(rewrites) {
         return Ok(Err(refusal));
     }
+    publish_rewrite_batch(reads, root, rewrites)
+}
+
+/// Restores raw bytes captured before a rejected hook ran.
+///
+/// Desired bytes already passed workspace snapshot bounds before the hook started.
+///
+/// # Errors
+///
+/// Returns [`ReadError`] for filesystem failure. An invisible or duplicated target returns a
+/// refused [`ChangeResult`].
+pub(crate) fn publish_byte_rewrites(
+    reads: &ReadService,
+    root: &Path,
+    rewrites: &[ByteFileRewrite],
+) -> Result<Result<Vec<Diagnostic>, ChangeResult>, ReadError> {
+    publish_rewrite_batch(reads, root, rewrites)
+}
+
+/// Stages and publishes one text or raw-byte rewrite batch.
+fn publish_rewrite_batch<Rewrite: PublishedRewrite>(
+    reads: &ReadService,
+    root: &Path,
+    rewrites: &[Rewrite],
+) -> Result<Result<Vec<Diagnostic>, ChangeResult>, ReadError> {
     let mut targets: Vec<WriteTarget> = Vec::with_capacity(rewrites.len());
     for rewrite in rewrites {
-        let resolution = if rewrite.kind.removes_file() {
+        let resolution = if rewrite.kind().removes_file() {
             SymlinkResolution::Addressed
         } else {
             SymlinkResolution::Resolve
         };
-        match resolve_write_target(reads, root, &rewrite.path, resolution)? {
+        match resolve_write_target(reads, root, rewrite.path(), resolution)? {
             Ok(target) => targets.push(target),
             Err(refusal) => return Ok(Err(refusal)),
         }
@@ -613,7 +692,7 @@ pub(crate) fn publish_rewrites(
         return Ok(Err(refusal));
     }
     let mut created_directories = CreatedDirectories::default();
-    let mut staged: Vec<StagedMember<'_>> = Vec::with_capacity(rewrites.len());
+    let mut staged: Vec<StagedMember<'_, Rewrite>> = Vec::with_capacity(rewrites.len());
     for (rewrite, target) in rewrites.iter().zip(&targets) {
         match stage_member(root, rewrite, target, &mut created_directories) {
             Ok(member) => staged.push(member),

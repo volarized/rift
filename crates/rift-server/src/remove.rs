@@ -734,6 +734,18 @@ pub(crate) fn widened_removal_span(source: &str, span: ByteRange) -> ByteRange {
 mod tests {
     use super::*;
 
+    fn engine_pool(
+        root: &Path,
+        configuration: rift_protocol::configuration::LspConfiguration,
+    ) -> EnginePool {
+        let key = crate::engine::LspProcessKey::named("fake");
+        EnginePool::new(
+            root,
+            std::collections::BTreeMap::from([(key.clone(), configuration)]),
+            std::collections::BTreeMap::from([("rust".to_owned(), key)]),
+        )
+    }
+
     fn range(source: &str, needle: &str) -> ByteRange {
         let start = source.find(needle).expect("needle exists in fixture");
         ByteRange {
@@ -765,7 +777,11 @@ mod tests {
             rift_protocol::configuration::HistoryConfiguration::default(),
         )
         .expect("fixture workspace indexes");
-        let engines = EnginePool::new(directory.path(), std::collections::BTreeMap::new());
+        let engines = EnginePool::new(
+            directory.path(),
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+        );
         (directory, reads, engines)
     }
 
@@ -1153,12 +1169,14 @@ mod tests {
     fn references_engine(
         script: String,
         retry: rift_protocol::retry::RetryPolicy,
-    ) -> rift_protocol::configuration::EngineConfiguration {
-        rift_protocol::configuration::EngineConfiguration {
-            program: "sh".to_owned(),
-            arguments: vec!["-c".to_owned(), script],
+    ) -> rift_protocol::configuration::LspConfiguration {
+        rift_protocol::configuration::LspConfiguration {
+            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                script,
+            ]),
             environment: std::collections::BTreeMap::new(),
-            languages: vec!["rust".to_owned()],
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
             request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
@@ -1194,13 +1212,7 @@ mod tests {
             delay: rift_protocol::configuration::Duration::from_millis(1),
             delay_limit: rift_protocol::configuration::Duration::from_millis(1),
         };
-        let engines = EnginePool::new(
-            directory.path(),
-            std::collections::BTreeMap::from([(
-                "fake".to_owned(),
-                references_engine(script, retry),
-            )]),
-        );
+        let engines = engine_pool(directory.path(), references_engine(script, retry));
         (directory, reads, engines)
     }
 
@@ -1243,13 +1255,13 @@ mod tests {
                 delay_limit: rift_protocol::configuration::Duration::from_millis(1),
             },
         );
-        engine
-            .arguments
-            .extend(["rift-engine".to_owned(), transcript.display().to_string()]);
-        let engines = EnginePool::new(
-            directory.path(),
-            std::collections::BTreeMap::from([("fake".to_owned(), engine)]),
-        );
+        let rift_protocol::configuration::CommandInput::ProgramAndArguments(command) =
+            &mut engine.command
+        else {
+            unreachable!("references engine uses a command list")
+        };
+        command.extend(["rift-engine".to_owned(), transcript.display().to_string()]);
+        let engines = engine_pool(directory.path(), engine);
         (directory, reads, engines, transcript)
     }
 

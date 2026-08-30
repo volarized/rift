@@ -27,8 +27,12 @@ mod keyword {
     pub(super) const ENUM: &str = "enum";
     pub(super) const DESCRIPTION: &str = "description";
     pub(super) const MAX_ITEMS: &str = "maxItems";
+    pub(super) const MAX_PROPERTIES: &str = "maxProperties";
     pub(super) const MIN_LENGTH: &str = "minLength";
     pub(super) const MAX_LENGTH: &str = "maxLength";
+    pub(super) const PATTERN: &str = "pattern";
+    pub(super) const PROPERTY_NAMES: &str = "propertyNames";
+    pub(super) const TYPE: &str = "type";
 }
 
 /// The serde property name of one model field, proven against the model:
@@ -42,6 +46,21 @@ macro_rules! property {
         stringify!($field)
     }};
 }
+
+/// The form a `[languages.<identity>]` table key takes: a language name, or
+/// a name and a dialect joined by `:`. Acceptance decodes the key through
+/// [`Language::from_identity_segment`](crate::read::Language::from_identity_segment)
+/// and refuses anything else, so the schema states the same form for editors
+/// reading `rift.toml` before the server does.
+const LANGUAGE_IDENTITY_PATTERN: &str = r"^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$";
+
+/// The form an `[lsp.<name>]` table key takes: one language word, with no
+/// dialect. Acceptance refuses a name carrying `:`, because a process name
+/// is not a language identity.
+const LSP_NAME_PATTERN: &str = r"^[a-z][a-z0-9._-]*$";
+
+/// The charset a hook `id` takes: ASCII alphanumerics, `.`, `_`, and `-`.
+const HOOK_ID_PATTERN: &str = r"^[A-Za-z0-9._-]+$";
 
 /// The Rift extension keyword stating an accepted range schema validation
 /// cannot compare itself: the bounds of a string-spelled `ByteSize` or
@@ -181,6 +200,37 @@ fn annotate_property(schema: &mut Schema, name: &str, key: &str, annotation: Val
         .and_then(Value::as_object_mut);
     if let Some(property) = property {
         property.insert(key.to_owned(), annotation);
+    }
+}
+
+/// A workspace configuration states entry caps on its language and LSP maps.
+pub fn declare_workspace_contract(schema: &mut Schema) {
+    use crate::configuration::{LANGUAGES_MAX, LSP_CONFIGURATIONS_MAX, WorkspaceConfiguration};
+    for (name, accepted) in [
+        (
+            property!(WorkspaceConfiguration, languages),
+            LANGUAGES_MAX as u64,
+        ),
+        (
+            property!(WorkspaceConfiguration, lsp),
+            LSP_CONFIGURATIONS_MAX as u64,
+        ),
+    ] {
+        annotate_property(schema, name, keyword::MAX_PROPERTIES, json!(accepted));
+    }
+    for (name, pattern) in [
+        (
+            property!(WorkspaceConfiguration, languages),
+            LANGUAGE_IDENTITY_PATTERN,
+        ),
+        (property!(WorkspaceConfiguration, lsp), LSP_NAME_PATTERN),
+    ] {
+        annotate_property(
+            schema,
+            name,
+            keyword::PROPERTY_NAMES,
+            json!({ keyword::PATTERN: pattern }),
+        );
     }
 }
 
@@ -335,8 +385,8 @@ pub fn declare_text_ranges(schema: &mut Schema) {
 /// during configuration loading. Transform hooks cannot carry guarantees.
 pub fn declare_hook_contract(schema: &mut Schema) {
     use crate::configuration::{
-        ByteSize, CommandHook, Duration, HOOK_OUTPUT_BYTES_MAX, HOOK_OUTPUT_BYTES_MIN,
-        HOOK_TIMEOUT_MS_MAX, HookWrites,
+        ByteSize, CommandHook, Duration, HOOK_ENVIRONMENT_ENTRIES_MAX, HOOK_OUTPUT_BYTES_MAX,
+        HOOK_OUTPUT_BYTES_MIN, HOOK_TIMEOUT_MS_MAX, HookWrites,
     };
     let ranges = [
         (
@@ -357,6 +407,18 @@ pub fn declare_hook_contract(schema: &mut Schema) {
     for (name, accepted) in ranges {
         annotate_property(schema, name, RIFT_RANGE, accepted);
     }
+    annotate_property(
+        schema,
+        property!(CommandHook, environment),
+        keyword::MAX_PROPERTIES,
+        json!(HOOK_ENVIRONMENT_ENTRIES_MAX),
+    );
+    annotate_property(
+        schema,
+        property!(CommandHook, id),
+        keyword::PATTERN,
+        json!(HOOK_ID_PATTERN),
+    );
     for writes in [HookWrites::ChangedPaths, HookWrites::Workspace] {
         append(
             schema,
@@ -368,43 +430,55 @@ pub fn declare_hook_contract(schema: &mut Schema) {
     }
 }
 
-/// An [`EngineConfiguration`](crate::configuration::EngineConfiguration)
+/// An [`LspConfiguration`](crate::configuration::LspConfiguration)
 /// states its `Duration` and `ByteSize` ceilings as `rift:range` on their
 /// keys: schema validation alone cannot compare `"30s"` or `"4kb"` against
 /// a ceiling, so the server enforces the bound at load and the schema
 /// carries it for readers.
-pub fn declare_engine_ranges(schema: &mut Schema) {
+pub fn declare_lsp_ranges(schema: &mut Schema) {
     use crate::configuration::{
-        ByteSize, Duration, ENGINE_OUTPUT_BYTES_MAX, ENGINE_OUTPUT_BYTES_MIN,
-        ENGINE_REQUEST_TIMEOUT_MS_MAX, ENGINE_REQUEST_TIMEOUT_MS_MIN,
-        ENGINE_STARTUP_TIMEOUT_MS_MAX, ENGINE_STARTUP_TIMEOUT_MS_MIN, EngineConfiguration,
+        ByteSize, Duration, LSP_ENVIRONMENT_ENTRIES_MAX, LSP_OUTPUT_BYTES_MAX,
+        LSP_OUTPUT_BYTES_MIN, LSP_REQUEST_TIMEOUT_MS_MAX, LSP_REQUEST_TIMEOUT_MS_MIN,
+        LSP_STARTUP_TIMEOUT_MS_MAX, LSP_STARTUP_TIMEOUT_MS_MIN, LspConfiguration,
     };
     let ranges = [
         (
-            property!(EngineConfiguration, startup_timeout),
+            property!(LspConfiguration, startup_timeout),
             range(
-                &Duration::from_millis(ENGINE_STARTUP_TIMEOUT_MS_MIN),
-                &Duration::from_millis(ENGINE_STARTUP_TIMEOUT_MS_MAX),
+                &Duration::from_millis(LSP_STARTUP_TIMEOUT_MS_MIN),
+                &Duration::from_millis(LSP_STARTUP_TIMEOUT_MS_MAX),
             ),
         ),
         (
-            property!(EngineConfiguration, request_timeout),
+            property!(LspConfiguration, request_timeout),
             range(
-                &Duration::from_millis(ENGINE_REQUEST_TIMEOUT_MS_MIN),
-                &Duration::from_millis(ENGINE_REQUEST_TIMEOUT_MS_MAX),
+                &Duration::from_millis(LSP_REQUEST_TIMEOUT_MS_MIN),
+                &Duration::from_millis(LSP_REQUEST_TIMEOUT_MS_MAX),
             ),
         ),
         (
-            property!(EngineConfiguration, output_limit),
+            property!(LspConfiguration, output_limit),
             range(
-                &ByteSize::from_bytes(ENGINE_OUTPUT_BYTES_MIN),
-                &ByteSize::from_bytes(ENGINE_OUTPUT_BYTES_MAX),
+                &ByteSize::from_bytes(LSP_OUTPUT_BYTES_MIN),
+                &ByteSize::from_bytes(LSP_OUTPUT_BYTES_MAX),
             ),
         ),
     ];
     for (name, accepted) in ranges {
         annotate_property(schema, name, RIFT_RANGE, accepted);
     }
+    annotate_property(
+        schema,
+        property!(LspConfiguration, environment),
+        keyword::MAX_PROPERTIES,
+        json!(LSP_ENVIRONMENT_ENTRIES_MAX),
+    );
+    annotate_property(
+        schema,
+        property!(LspConfiguration, initialization_options),
+        keyword::TYPE,
+        json!("object"),
+    );
 }
 
 /// A [`RetryPolicy`](crate::retry::RetryPolicy) states its `Duration`
@@ -618,6 +692,68 @@ mod tests {
         Schema::try_from(value).expect("test schema literal must be a valid schema object")
     }
 
+    /// The advertised table-key forms and the acceptance rules they mirror
+    /// must agree on every sample: a key the schema admits is a key the
+    /// server accepts, and a key the schema refuses is one it refuses.
+    #[test]
+    fn test_table_key_patterns_match_the_forms_acceptance_enforces() {
+        use crate::configuration::WorkspaceConfiguration;
+        use crate::read::Language;
+
+        let document =
+            serde_json::to_value(schema_for!(WorkspaceConfiguration)).expect("schema document");
+        assert_eq!(
+            document["properties"]["languages"][keyword::PROPERTY_NAMES][keyword::PATTERN],
+            json!(LANGUAGE_IDENTITY_PATTERN)
+        );
+        assert_eq!(
+            document["properties"]["lsp"][keyword::PROPERTY_NAMES][keyword::PATTERN],
+            json!(LSP_NAME_PATTERN)
+        );
+        let validator = jsonschema::validator_for(&document).expect("schema compiles");
+
+        for key in [
+            "rust",
+            "typescript:tsx",
+            "Rust",
+            "rust:",
+            ":tsx",
+            "9rust",
+            "rust:tsx:jsx",
+        ] {
+            let identity_accepted = Language::from_identity_segment(key).is_ok();
+            assert_eq!(
+                validator.is_valid(&json!({ "languages": { key: {} } })),
+                identity_accepted,
+                "the languages key pattern must admit exactly what acceptance decodes: {key}"
+            );
+            let command = json!({ "lsp": { key: { "command": "tool" } } });
+            assert_eq!(
+                validator.is_valid(&command),
+                identity_accepted && !key.contains(':'),
+                "the lsp key pattern must admit one language word and no dialect: {key}"
+            );
+        }
+    }
+
+    /// A hook `id` and an LSP `initialization_options` object are refused by
+    /// acceptance, so the schema states the same two rules.
+    #[test]
+    fn test_hook_id_and_initialization_options_state_their_accepted_forms() {
+        use crate::configuration::{CommandHook, LspConfiguration};
+
+        let hook = serde_json::to_value(schema_for!(CommandHook)).expect("hook schema");
+        assert_eq!(
+            hook["properties"]["id"][keyword::PATTERN],
+            json!(HOOK_ID_PATTERN)
+        );
+        let lsp = serde_json::to_value(schema_for!(LspConfiguration)).expect("lsp schema");
+        assert_eq!(
+            lsp["properties"]["initialization_options"][keyword::TYPE],
+            json!("object")
+        );
+    }
+
     #[test]
     fn test_append_creates_then_extends_one_keyword() {
         let mut schema = schema_from(json!({}));
@@ -751,8 +887,8 @@ mod tests {
     }
 
     #[test]
-    fn engine_configuration_schema_states_ranges_on_each_bounded_key() {
-        let schema = serde_json::to_value(schema_for!(crate::configuration::EngineConfiguration))
+    fn lsp_configuration_schema_states_ranges_on_each_bounded_key() {
+        let schema = serde_json::to_value(schema_for!(crate::configuration::LspConfiguration))
             .expect("schema");
         let cases = [
             ("startup_timeout", json!({ "min": "1s", "max": "10m" })),
@@ -804,8 +940,8 @@ mod tests {
                 &["timeout", "output_limit", "writes", "guarantees"],
             ),
             (
-                "EngineConfiguration",
-                serde_json::to_value(schema_for!(crate::configuration::EngineConfiguration))
+                "LspConfiguration",
+                serde_json::to_value(schema_for!(crate::configuration::LspConfiguration))
                     .expect("schema"),
                 &["startup_timeout", "request_timeout", "output_limit"],
             ),

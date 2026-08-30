@@ -15,7 +15,7 @@
 //! any server a failed test leaves behind.
 //!
 //! **Adding a case to the end-to-end lane.** Lay out a workspace with
-//! [`laid_out_workspace`] (files, plus an engine table when the case needs
+//! [`laid_out_workspace`] (files, plus LSP configuration when the case needs
 //! one - build it from a fixture in `engine_fixture.rs`/`rust_engine.rs`,
 //! following the pattern those two modules already set for rust), connect
 //! to it with [`proxy_client`], drive it with [`proxied_call`], and gate

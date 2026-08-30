@@ -1,18 +1,18 @@
 //! The pool of language engine sessions the server holds across requests.
 //!
-//! One [`EngineSlot`] exists per accepted `[engines.<name>]` table. A slot
-//! spawns its engine on the first request for a language it serves, reuses
+//! One [`EngineSlot`] exists per accepted LSP process definition. A slot
+//! spawns its engine on the first request for a language bound to it, reuses
 //! the running session across requests, and replaces an engine that ended,
 //! failed to start, or stopped answering within the budget its
-//! `[engines.<name>.restart]` table states. The pool never invents an
-//! engine: a language no table claims answers no slot, and the caller turns
+//! `restart` table states. The pool never invents an engine: a language no
+//! accepted binding names a process for answers no slot, and the caller turns
 //! that absence into its own refusal.
 //!
 //! The slot is also where every transient condition between Rift and one
 //! engine is absorbed. [`EngineSlot::request`] runs the caller's operation
 //! again while the engine answers provisionally, with nothing, or with a refusal, under
-//! that engine's `[engines.<name>.retry]` table, and starts a replacement
-//! engine under its `[engines.<name>.restart]` table when the one it has
+//! that process's `retry` table, and starts a replacement engine under its
+//! `restart` table when the one it has
 //! dies. It also sends an operation again under configured retry policy
 //! when an engine answers nothing. Progress does not bind announced work
 //! to one semantic request, so an empty answer stays provisional.
@@ -31,14 +31,16 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rift_core::{Error, ErrorCode, ErrorName};
 use rift_lsp::session::{EngineError, EngineFault, EngineLaunch, EngineSession};
-use rift_protocol::configuration::EngineConfiguration;
+use rift_protocol::configuration::LspConfiguration;
 use rift_protocol::read::Language;
 use rift_protocol::retry::RestartPolicy;
-use tokio::sync::Mutex;
+use rift_protocol::workspace::LspState;
+use tokio::sync::{Mutex, watch};
 use tokio::time::Instant;
 
 use rift_lsp::session::EngineReadiness;
@@ -60,40 +62,100 @@ fn finish_immediately(_session: &mut EngineSession) -> SessionFuture<'_, ()> {
 /// the graceful path that also asks each engine to exit first.
 #[derive(Debug)]
 pub struct EnginePool {
-    engines: BTreeMap<String, EngineSlot>,
-    served: BTreeMap<String, String>,
+    engines: BTreeMap<LspProcessKey, Arc<EngineSlot>>,
+    served: BTreeMap<String, LspProcessKey>,
+}
+
+/// Identity of one accepted LSP process definition.
+///
+/// Named definitions and inline definitions remain different even when
+/// their visible text is equal. Inline text is one exact language identity
+/// segment.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum LspProcessKey {
+    /// Key from one shared top-level `[lsp.<name>]` definition.
+    Named(String),
+    /// Exact language identity owning one inline LSP definition.
+    Inline(String),
+}
+
+impl LspProcessKey {
+    /// Key for one named top-level LSP definition.
+    #[must_use]
+    pub fn named(name: impl Into<String>) -> Self {
+        Self::Named(name.into())
+    }
+
+    /// Key for an inline definition owned by one exact language.
+    #[must_use]
+    pub fn inline(language: &Language) -> Self {
+        Self::Inline(language.identity_segment())
+    }
+
+    /// Configured name or exact language identity segment.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Named(name) | Self::Inline(name) => name,
+        }
+    }
 }
 
 impl EnginePool {
-    /// Builds the pool for the accepted `[engines]` tables, spawning
-    /// nothing.
-    ///
-    /// Acceptance proves each language identity segment is claimed by one
-    /// engine; on unvalidated input the engine earliest in name order
-    /// keeps the segment.
+    /// Builds a pool from accepted process definitions and exact language
+    /// bindings, spawning nothing.
     #[must_use]
-    pub fn new(workspace_root: &Path, engines: BTreeMap<String, EngineConfiguration>) -> Self {
-        let mut slots = BTreeMap::new();
-        let mut served = BTreeMap::new();
-        for (name, configuration) in engines {
-            for language in &configuration.languages {
-                served
-                    .entry(language.clone())
-                    .or_insert_with(|| name.clone());
-            }
-            slots.insert(
-                name.clone(),
-                EngineSlot {
-                    name,
-                    configuration,
-                    workspace_root: workspace_root.to_path_buf(),
-                    state: Mutex::new(SlotState::default()),
-                },
-            );
-        }
+    pub fn new(
+        workspace_root: &Path,
+        definitions: BTreeMap<LspProcessKey, LspConfiguration>,
+        bindings: BTreeMap<String, LspProcessKey>,
+    ) -> Self {
+        Self::build(None, workspace_root, definitions, bindings)
+    }
+
+    /// Builds a replacement pool, reusing slots whose process key,
+    /// configuration, and workspace root are unchanged.
+    #[must_use]
+    pub fn reconfigure(
+        &self,
+        workspace_root: &Path,
+        definitions: BTreeMap<LspProcessKey, LspConfiguration>,
+        bindings: BTreeMap<String, LspProcessKey>,
+    ) -> Self {
+        Self::build(Some(self), workspace_root, definitions, bindings)
+    }
+
+    fn build(
+        prior: Option<&Self>,
+        workspace_root: &Path,
+        definitions: BTreeMap<LspProcessKey, LspConfiguration>,
+        bindings: BTreeMap<String, LspProcessKey>,
+    ) -> Self {
+        let engines = definitions
+            .into_iter()
+            .map(|(key, configuration)| {
+                let reusable = prior
+                    .and_then(|pool| pool.engines.get(&key))
+                    .filter(|slot| {
+                        slot.configuration == configuration && slot.workspace_root == workspace_root
+                    })
+                    .cloned();
+                let slot = reusable.unwrap_or_else(|| {
+                    let (reported_state, _state_receiver) = watch::channel(LspState::Stopped);
+                    Arc::new(EngineSlot {
+                        key: key.clone(),
+                        configuration,
+                        workspace_root: workspace_root.to_path_buf(),
+                        state: Mutex::new(SlotState::default()),
+                        reported_state,
+                    })
+                });
+                (key, slot)
+            })
+            .collect();
         Self {
-            engines: slots,
-            served,
+            engines,
+            served: bindings,
         }
     }
 
@@ -102,18 +164,37 @@ impl EnginePool {
     #[must_use]
     pub fn engine_for(&self, language: &Language) -> Option<&EngineSlot> {
         let name = self.served.get(&language.identity_segment())?;
-        self.engines.get(name)
+        self.engines.get(name).map(Arc::as_ref)
     }
 
-    /// Whether this pool was built from exactly these engine tables.
+    /// Whether this pool was built from exactly these process definitions
+    /// and language bindings.
     #[must_use]
-    pub fn built_from(&self, engines: &BTreeMap<String, EngineConfiguration>) -> bool {
-        self.engines.len() == engines.len()
-            && engines.iter().all(|(name, table)| {
+    pub fn built_from(
+        &self,
+        definitions: &BTreeMap<LspProcessKey, LspConfiguration>,
+        bindings: &BTreeMap<String, LspProcessKey>,
+    ) -> bool {
+        self.served == *bindings
+            && self.engines.len() == definitions.len()
+            && definitions.iter().all(|(name, table)| {
                 self.engines
                     .get(name)
                     .is_some_and(|slot| &slot.configuration == table)
             })
+    }
+
+    /// Slot for one accepted process key.
+    #[must_use]
+    pub fn engine_by_key(&self, key: &LspProcessKey) -> Option<&EngineSlot> {
+        self.engines.get(key).map(Arc::as_ref)
+    }
+
+    /// Current state of one accepted process definition.
+    #[must_use]
+    pub fn state_for_key(&self, key: &LspProcessKey) -> Option<LspState> {
+        let slot = self.engines.get(key)?;
+        Some(*slot.reported_state.borrow())
     }
 
     /// Ends every running engine with the session's own bounded shutdown.
@@ -131,24 +212,47 @@ impl EnginePool {
             let mut held = slot.state.lock().await;
             if let Some(session) = held.session.take() {
                 let stderr = session.shutdown().await;
+                slot.report_state(LspState::Stopped);
+                let engine = slot.name();
                 tracing::debug!(
                     component = "engine",
-                    engine = %slot.name,
+                    engine,
                     stderr_bytes = stderr.total_bytes,
                     "language engine shut down"
                 );
             }
         }
     }
+
+    /// Ends sessions not shared with one replacement pool.
+    ///
+    /// A reused slot remains live because both pools point to the same allocation.
+    pub async fn shutdown_replaced_by(&self, replacement: &Self) {
+        for (key, slot) in &self.engines {
+            let reused = replacement
+                .engines
+                .get(key)
+                .is_some_and(|replacement| Arc::ptr_eq(slot, replacement));
+            if reused {
+                continue;
+            }
+            let mut held = slot.state.lock().await;
+            if let Some(session) = held.session.take() {
+                let _stderr = session.shutdown().await;
+                slot.report_state(LspState::Stopped);
+            }
+        }
+    }
 }
 
-/// One accepted engine table and the session state behind it.
+/// One accepted LSP process definition and the session state behind it.
 #[derive(Debug)]
 pub struct EngineSlot {
-    name: String,
-    configuration: EngineConfiguration,
+    key: LspProcessKey,
+    configuration: LspConfiguration,
     workspace_root: PathBuf,
     state: Mutex<SlotState>,
+    reported_state: watch::Sender<LspState>,
 }
 
 /// Everything one slot's lock guards: the running engine and the restarts
@@ -292,15 +396,36 @@ fn restart_may_help(error: &EngineError) -> bool {
 }
 
 impl EngineSlot {
-    /// The engine's name: the `[engines.<name>]` key.
-    #[must_use]
-    pub fn name(&self) -> &str {
-        &self.name
+    /// Publishes one nonblocking workspace-resource state observation.
+    fn report_state(&self, state: LspState) {
+        self.reported_state.send_replace(state);
     }
 
-    /// The accepted table this slot serves under.
+    /// Publishes readiness from one live LSP session.
+    fn report_readiness(&self, readiness: EngineReadiness) {
+        let state = match readiness {
+            EngineReadiness::Unconfirmed => LspState::Starting,
+            EngineReadiness::Analyzing => LspState::Analyzing,
+            EngineReadiness::Ready => LspState::Ready,
+        };
+        self.report_state(state);
+    }
+
+    /// Named process key or inline exact language identity segment.
     #[must_use]
-    pub fn configuration(&self) -> &EngineConfiguration {
+    pub fn name(&self) -> &str {
+        self.key.as_str()
+    }
+
+    /// Identity of this accepted process definition.
+    #[must_use]
+    pub fn process_key(&self) -> &LspProcessKey {
+        &self.key
+    }
+
+    /// The accepted LSP process configuration this slot serves under.
+    #[must_use]
+    pub fn configuration(&self) -> &LspConfiguration {
         &self.configuration
     }
 
@@ -472,8 +597,14 @@ impl EngineSlot {
                     Err(error) => return Err(error),
                 }
             }
+            self.report_readiness(session.readiness());
             let outcome = operation(session).await;
             let ended = session.is_ended();
+            if ended {
+                self.report_state(LspState::Failed);
+            } else {
+                self.report_readiness(session.readiness());
+            }
             let final_attempt = retry.delay_after(attempt).is_none();
             let absorbed = match outcome {
                 Ok(answer) => match decide(session, session_generation, answer, final_attempt) {
@@ -505,11 +636,12 @@ impl EngineSlot {
 
     /// What one absorbed condition surfaces once attempt bound is spent.
     fn exhausted<T>(&self, absorbed: Transient<T>, attempts: u64) -> Result<T, EngineError> {
+        let engine = self.name();
         match absorbed {
             Transient::Analyzing | Transient::Unready => {
                 tracing::warn!(
                     component = "engine",
-                    engine = %self.name,
+                    engine,
                     attempts,
                     "language engine was not ready on every attempt"
                 );
@@ -518,7 +650,7 @@ impl EngineSlot {
             Transient::Refused(refusal) => {
                 tracing::warn!(
                     component = "engine",
-                    engine = %self.name,
+                    engine,
                     attempts,
                     "language engine refused every configured attempt"
                 );
@@ -527,7 +659,7 @@ impl EngineSlot {
             Transient::AnsweredNothing(answer) => {
                 tracing::debug!(
                     component = "engine",
-                    engine = %self.name,
+                    engine,
                     attempts,
                     "language engine answered nothing through every configured attempt"
                 );
@@ -552,27 +684,36 @@ impl EngineSlot {
     ) -> Result<EngineSession, EngineError> {
         loop {
             if !budget.claim(&self.configuration.restart, Instant::now()) {
+                self.report_state(LspState::Failed);
+                let engine = self.name();
                 tracing::warn!(
                     component = "engine",
-                    engine = %self.name,
+                    engine,
                     attempts = self.configuration.restart.attempts,
                     "language engine restart budget is spent for this window"
                 );
                 return Err(reported.unwrap_or_else(|| Error::new(EngineFault::Ended)));
             }
+            self.report_state(LspState::Starting);
             match EngineSession::start(self.launch(), &self.workspace_root).await {
-                Ok(session) => return Ok(session),
-                Err(failure) if !restart_may_help(&failure) => return Err(failure),
+                Ok(session) => {
+                    self.report_readiness(session.readiness());
+                    return Ok(session);
+                }
+                Err(failure) if !restart_may_help(&failure) => {
+                    self.report_state(LspState::Failed);
+                    return Err(failure);
+                }
                 Err(failure) => reported = Some(failure),
             }
         }
     }
 
-    /// The launch derived from this engine's accepted table.
+    /// The launch derived from this accepted LSP process configuration.
     fn launch(&self) -> EngineLaunch {
         EngineLaunch {
-            program: self.configuration.program.clone(),
-            arguments: self.configuration.arguments.clone(),
+            program: self.configuration.command.program().to_owned(),
+            arguments: self.configuration.command.arguments().to_vec(),
             environment: self.configuration.environment.clone(),
             initialization_options: self.configuration.initialization_options.clone(),
             startup_timeout: Duration::from_millis(
@@ -590,9 +731,10 @@ impl EngineSlot {
     /// visible in the log.
     async fn reap(&self, dead: EngineSession) {
         let stderr = dead.shutdown().await;
+        let engine = self.name();
         tracing::warn!(
             component = "engine",
-            engine = %self.name,
+            engine,
             stderr = %stderr.text,
             "language engine ended and was reaped"
         );
@@ -602,18 +744,13 @@ impl EngineSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rift_protocol::configuration::{ByteSize, Duration as ConfiguredDuration};
+    use rift_protocol::configuration::{ByteSize, CommandInput, Duration as ConfiguredDuration};
     use rift_protocol::retry::RetryPolicy;
 
-    fn table(program: &str, languages: &[&str]) -> EngineConfiguration {
-        EngineConfiguration {
-            program: program.to_owned(),
-            arguments: Vec::new(),
+    fn table(program: &str) -> LspConfiguration {
+        LspConfiguration {
+            command: CommandInput::Program(program.to_owned()),
             environment: BTreeMap::new(),
-            languages: languages
-                .iter()
-                .map(|&language| language.to_owned())
-                .collect(),
             initialization_options: Some(serde_json::json!({ "engine": "fake" })),
             startup_timeout: ConfiguredDuration::from_millis(10_000),
             request_timeout: ConfiguredDuration::from_millis(20_000),
@@ -630,28 +767,34 @@ mod tests {
         }
     }
 
-    fn pool(entries: Vec<(&str, EngineConfiguration)>) -> EnginePool {
-        let engines = entries
-            .into_iter()
-            .map(|(name, engine)| (name.to_owned(), engine))
-            .collect();
-        EnginePool::new(Path::new("/rift-test-root"), engines)
+    fn pool(entries: Vec<(&str, LspConfiguration, &[&str])>) -> EnginePool {
+        let mut definitions = BTreeMap::new();
+        let mut bindings = BTreeMap::new();
+        for (name, configuration, languages) in entries {
+            let key = LspProcessKey::named(name);
+            definitions.insert(key.clone(), configuration);
+            for language in languages {
+                bindings.insert((*language).to_owned(), key.clone());
+            }
+        }
+        EnginePool::new(Path::new("/rift-test-root"), definitions, bindings)
     }
 
     #[test]
     fn engine_for_maps_identity_segments_and_answers_nothing_else() {
         let built = pool(vec![
-            ("ty", table("uvx", &["python"])),
+            ("ty", table("uvx"), &["python"]),
             (
                 "typescript",
-                table("bunx", &["typescript", "typescript:tsx"]),
+                table("bunx"),
+                &["typescript", "typescript:tsx"],
             ),
         ]);
         let python = built
             .engine_for(&language("python", None))
             .expect("python is served");
         assert_eq!(python.name(), "ty");
-        assert_eq!(python.configuration().program, "uvx");
+        assert_eq!(python.configuration().command.program(), "uvx");
         let tsx = built
             .engine_for(&language("typescript", Some("tsx")))
             .expect("the tsx dialect segment is served");
@@ -669,36 +812,137 @@ mod tests {
     }
 
     #[test]
-    fn first_engine_in_name_order_keeps_a_contested_segment() {
-        let built = pool(vec![
-            ("b", table("second", &["python"])),
-            ("a", table("first", &["python"])),
+    fn named_and_inline_process_keys_with_equal_text_remain_separate() {
+        let named = LspProcessKey::named("rust");
+        let inline = LspProcessKey::inline(&language("rust", None));
+        let definitions = BTreeMap::from([
+            (named.clone(), table("shared")),
+            (inline.clone(), table("inline")),
         ]);
-        let claimed = built
-            .engine_for(&language("python", None))
-            .expect("python is served");
-        assert_eq!(claimed.name(), "a");
+        let bindings = BTreeMap::from([
+            ("python".to_owned(), named.clone()),
+            ("rust".to_owned(), inline.clone()),
+        ]);
+        let built = EnginePool::new(Path::new("/rift-test-root"), definitions, bindings);
+        assert_eq!(
+            built
+                .engine_for(&language("python", None))
+                .expect("python binding")
+                .configuration()
+                .command
+                .program(),
+            "shared"
+        );
+        assert_eq!(
+            built
+                .engine_for(&language("rust", None))
+                .expect("rust binding")
+                .configuration()
+                .command
+                .program(),
+            "inline"
+        );
+        assert_eq!(
+            built
+                .engine_for(&language("python", None))
+                .expect("python binding")
+                .process_key(),
+            &named,
+            "a named definition keeps the name it was configured under"
+        );
+        assert_eq!(
+            built
+                .engine_for(&language("rust", None))
+                .expect("rust binding")
+                .process_key(),
+            &inline,
+            "an inline definition is keyed by the exact language identity owning it"
+        );
     }
 
     #[test]
-    fn built_from_compares_names_and_tables() {
-        let entries = vec![("ty", table("uvx", &["python"]))];
-        let built = pool(entries.clone());
-        let same: BTreeMap<String, EngineConfiguration> = entries
-            .into_iter()
-            .map(|(name, engine)| (name.to_owned(), engine))
-            .collect();
-        assert!(built.built_from(&same));
-        let mut renamed = same.clone();
-        let moved = renamed.remove("ty").expect("the entry exists");
-        renamed.insert("pyright".to_owned(), moved);
-        assert!(!built.built_from(&renamed));
-        let mut retimed = same.clone();
-        if let Some(engine) = retimed.get_mut("ty") {
+    fn built_from_compares_definitions_and_bindings() {
+        let key = LspProcessKey::named("ty");
+        let definitions = BTreeMap::from([(key.clone(), table("uvx"))]);
+        let bindings = BTreeMap::from([("python".to_owned(), key.clone())]);
+        let built = EnginePool::new(
+            Path::new("/rift-test-root"),
+            definitions.clone(),
+            bindings.clone(),
+        );
+        assert!(built.built_from(&definitions, &bindings));
+        let renamed = BTreeMap::from([(LspProcessKey::named("pyright"), table("uvx"))]);
+        assert!(!built.built_from(&renamed, &bindings));
+        let mut retimed = definitions.clone();
+        if let Some(engine) = retimed.get_mut(&key) {
             engine.request_timeout = ConfiguredDuration::from_millis(30_000);
         }
-        assert!(!built.built_from(&retimed));
-        assert!(!built.built_from(&BTreeMap::new()));
+        assert!(!built.built_from(&retimed, &bindings));
+        assert!(!built.built_from(&definitions, &BTreeMap::new()));
+    }
+
+    #[tokio::test]
+    async fn an_active_ready_slot_reports_ready_without_waiting_for_its_request() {
+        let key = LspProcessKey::named("ty");
+        let definitions = BTreeMap::from([(key.clone(), table("uvx"))]);
+        let bindings = BTreeMap::from([("python".to_owned(), key.clone())]);
+        let built = EnginePool::new(Path::new("/rift-test-root"), definitions, bindings);
+        let slot = built.engine_by_key(&key).expect("configured slot");
+        slot.report_readiness(EngineReadiness::Ready);
+
+        let held = slot.state.lock().await;
+        assert_eq!(built.state_for_key(&key), Some(LspState::Ready));
+        drop(held);
+
+        slot.report_readiness(EngineReadiness::Analyzing);
+        assert_eq!(built.state_for_key(&key), Some(LspState::Analyzing));
+        assert_eq!(built.state_for_key(&LspProcessKey::named("absent")), None);
+    }
+
+    #[test]
+    fn reconfigure_reuses_only_unchanged_slots() {
+        let kept = LspProcessKey::named("kept");
+        let changed = LspProcessKey::named("changed");
+        let definitions = BTreeMap::from([
+            (kept.clone(), table("kept")),
+            (changed.clone(), table("before")),
+        ]);
+        let bindings = BTreeMap::from([
+            ("rust".to_owned(), kept.clone()),
+            ("python".to_owned(), changed.clone()),
+        ]);
+        let built = EnginePool::new(
+            Path::new("/rift-test-root"),
+            definitions.clone(),
+            bindings.clone(),
+        );
+        let kept_before = Arc::clone(built.engines.get(&kept).expect("kept slot"));
+        let changed_before = Arc::clone(built.engines.get(&changed).expect("changed slot"));
+
+        let mut replacement = definitions;
+        replacement.insert(changed.clone(), table("after"));
+        let rebuilt = built.reconfigure(Path::new("/rift-test-root"), replacement, bindings);
+        assert!(Arc::ptr_eq(
+            &kept_before,
+            rebuilt.engines.get(&kept).expect("reused slot")
+        ));
+        assert!(!Arc::ptr_eq(
+            &changed_before,
+            rebuilt.engines.get(&changed).expect("new slot")
+        ));
+
+        let moved = rebuilt.reconfigure(
+            Path::new("/other-root"),
+            BTreeMap::from([
+                (kept.clone(), table("kept")),
+                (changed.clone(), table("after")),
+            ]),
+            BTreeMap::new(),
+        );
+        assert!(!Arc::ptr_eq(
+            rebuilt.engines.get(&kept).expect("old root slot"),
+            moved.engines.get(&kept).expect("new root slot")
+        ));
     }
 
     fn restart_policy(attempts: u64, window_ms: u64) -> RestartPolicy {
@@ -876,12 +1120,19 @@ mod tests {
 
     #[test]
     fn launch_carries_the_accepted_table_verbatim() {
-        let built = pool(vec![("ty", table("uvx", &["python"]))]);
+        let mut configuration = table("uvx");
+        configuration.command = CommandInput::ProgramAndArguments(vec![
+            "uvx".to_owned(),
+            "ty".to_owned(),
+            "server".to_owned(),
+        ]);
+        let built = pool(vec![("ty", configuration, &["python"])]);
         let slot = built
             .engine_for(&language("python", None))
             .expect("python is served");
         let launch = slot.launch();
         assert_eq!(launch.program, "uvx");
+        assert_eq!(launch.arguments, ["ty", "server"]);
         assert_eq!(launch.startup_timeout, Duration::from_secs(10));
         assert_eq!(launch.request_timeout, Duration::from_secs(20));
         assert_eq!(launch.stderr_capture_bytes, 2_048);

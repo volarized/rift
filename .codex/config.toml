@@ -1,0 +1,3 @@
+[mcp_servers.rift]
+command = "rift"
+args = ["mcp"]

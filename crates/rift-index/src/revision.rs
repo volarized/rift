@@ -18,8 +18,7 @@ use rift_provider::ProviderComposition;
 use crate::glob::PathMatcher;
 use crate::workspace::{
     ReadIndex, RustFacts, WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits,
-    WorkspaceIndexViolation, component, composition_error, has_source_extension, index_error_at,
-    index_error_caused_by, syntax_provider_for,
+    WorkspaceIndexViolation, component, composition_error, index_error_at, index_error_caused_by,
 };
 
 #[derive(Debug)]
@@ -40,8 +39,37 @@ impl WorkspaceIndex {
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
     ) -> Result<Self, WorkspaceIndexError> {
+        Self::at_revision_with_languages(
+            repository,
+            revision,
+            limits,
+            visibility,
+            &rift_core::TextFileInclusion::default(),
+            &rift_core::LanguageFileSelections::default(),
+        )
+    }
+
+    /// Builds one committed-tree index with configured language entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] for invalid paths, configuration,
+    /// bounds, history reads, or syntax.
+    pub fn at_revision_with_languages(
+        repository: &Repository,
+        revision: &ResolvedRevision,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+        text_inclusion: &rift_core::TextFileInclusion,
+        languages: &rift_core::LanguageFileSelections,
+    ) -> Result<Self, WorkspaceIndexError> {
         let root = repository.root().to_path_buf();
         let composition = revision_composition()?;
+        let language = std::sync::Arc::new(crate::WorkspaceLanguagePolicy::build(
+            &root,
+            languages,
+            text_inclusion,
+        )?);
         let matcher = PathMatcher::build(&root, visibility.include(), visibility.exclude())?;
         let includes = |path: &str| hard_floor_includes(path) && matcher.includes(&root.join(path));
         let listed = repository
@@ -73,6 +101,9 @@ impl WorkspaceIndex {
             if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
                 continue;
             }
+            let Some(class) = language.classifies(&context_path)? else {
+                continue;
+            };
             if text_files.len() >= limits.files_max() {
                 return Err(index_error_at(
                     WorkspaceIndexViolation::TooManyFiles,
@@ -93,11 +124,11 @@ impl WorkspaceIndex {
                 limits,
                 &mut catalog_bytes,
             )?;
-            if has_source_extension(&context_path) {
+            if let crate::language::ClassifiedPath::Source(provider) = class {
                 files.push(super::workspace::indexed_file_from_catalog(
                     &text_file,
                     &context_path,
-                    syntax_provider_for(&context_path),
+                    provider,
                 )?);
             }
             text_files.push(text_file);
@@ -108,7 +139,8 @@ impl WorkspaceIndex {
             text_files,
             composition,
             limits,
-            rift_core::TextFileInclusion::default(),
+            language,
+            text_inclusion.clone(),
         )
     }
 }
@@ -294,6 +326,56 @@ mod tests {
         assert!(has_symbol(&index, "committed"));
         assert!(!has_symbol(&index, "vendored"), "[source] exclude applies");
         assert!(!has_symbol(&index, "floor"), "the hard floor applies");
+    }
+
+    /// The effective language table compiles before any blob is read, so an
+    /// invalid `[search.text].include` pattern refuses the whole revision read.
+    #[test]
+    fn test_at_revision_refuses_an_invalid_text_include_pattern() {
+        let directory = committed_workspace();
+        let (repository, head) = open_head(directory.path());
+        let error = WorkspaceIndex::at_revision_with_languages(
+            &repository,
+            &head,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::new(vec!["[".to_owned()], 1_024),
+            &rift_core::LanguageFileSelections::default(),
+        )
+        .expect_err("an unclosed character class must refuse");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::SourcePatternInvalid
+        );
+    }
+
+    /// An empty `[search.text].include` selects no plain text, so a committed
+    /// path no language claims joins neither lane of the revision index.
+    #[test]
+    fn test_at_revision_with_an_empty_text_selection_drops_a_path_no_language_claims() {
+        let directory = committed_workspace();
+        let (repository, head) = open_head(directory.path());
+        let index = WorkspaceIndex::at_revision_with_languages(
+            &repository,
+            &head,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::new(Vec::new(), 1_024),
+            &rift_core::LanguageFileSelections::default(),
+        )
+        .expect("revision index");
+        assert!(
+            index
+                .file(&ProjectPath::new("src/lib.rs").expect("path"))
+                .is_some(),
+            "a shipped language still claims its own committed path"
+        );
+        assert!(
+            index
+                .text_file(&ProjectPath::new("README.txt").expect("path"))
+                .is_none(),
+            "no text pattern selects the committed prose file"
+        );
     }
 
     #[test]

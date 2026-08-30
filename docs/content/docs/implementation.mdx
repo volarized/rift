@@ -8,7 +8,7 @@ This page goes into how Rift is built. It's developer-oriented - if you just wan
 check the [main documentation](/docs).
 
 <FlatDiagram
-  alt="An agent launches rift mcp, which proxies MCP from stdio to the rift server's /api/mcp route over Streamable HTTP. The server, an Axum application on Tokio, accepts rift.toml, mounts projections through Rift FS, and runs hooks on each change. Inside the providers-and-index box, providers publish Contributions, normalization builds the SymbolRecord graph, and the in-memory index serves readable Symbols and publishes lexical units and vectors through Toasty over SQLite into .rift/db; the database also records server logs. Inside the LSP engine box, the engine adapter sends plan requests to a language server child process and receives edit plans back; the adapter hands proposals to the server, which applies them to the targeted tree as witnessed edits."
+  alt="An agent launches rift mcp, which proxies MCP from stdio to the rift server's /api/mcp route over Streamable HTTP. The server, an Axum application on Tokio, accepts rift.toml, mounts projections through Rift FS, and runs selected hooks on each change. Inside the providers-and-index box, providers publish Contributions, normalization builds the SymbolRecord graph, and the in-memory index serves readable Symbols and publishes lexical units and vectors through Toasty over SQLite into .rift/db; the database also records server logs. Inside the LSP engine box, the engine adapter sends plan requests to a language server child process and receives edit plans back; the adapter hands proposals to the server, which applies them to the targeted tree as witnessed edits."
   chart={`
     flowchart LR
       agent["agent"]:::agent -- "MCP over stdio" --> mcp["rift mcp<br/>rmcp proxy"]:::rift
@@ -101,11 +101,15 @@ accepted configuration outside the async lock, then swaps the complete value und
 lock. Each request clones the published value under a read lock and retains that capture through
 its result, so reads never combine state from two index revisions.
 
+<VersionBadge version="v0.0.25" />
+
 Watcher events and Rift-applied changes advance one workspace change counter and enter the same
 serialized rebuild lane. Each observation carries the paths it saw, and the rebuild reads only
-those files, sharing every other file with the previous index; an observation that names no
-trustworthy path set - a watch failure, a written `rift.toml` or `.gitignore`, a directory
-appearing or disappearing - reads the whole workspace instead.
+those files, sharing every other file with the previous index. A watch failure, a written
+`.gitignore`, or a directory appearing or disappearing reads the whole workspace instead. A
+written `rift.toml` reads the whole workspace when `[source]`, a language file selection, or
+`[search.text]` inclusion or chunk bound changed. Every other accepted configuration change
+reuses the published tree.
 
 Before each current-tree read, the server captures an exact digest of every included workspace
 file, then waits until the published index counter matches its observation. That capture already
@@ -257,11 +261,16 @@ Syntax providers wrap [tree-sitter](https://tree-sitter.github.io/tree-sitter/) 
 a Rift-owned adapter: grammar node kinds resolve to numeric ids once, and raw query and cursor
 APIs never leave the syntax crate.
 
-An LSP-backed language engine is a child process the server spawns in stdio mode - one per
-language and targeted tree, rooted at that tree's directory. Semantic facts and edit plans
-return through the provider contract. After a change, the server sends one classified path batch
-to each affected engine before it opens final document bytes and pulls diagnostics. That batch
-invalidates readiness from earlier work. Fresh progress tokens, diagnostic refresh requests, and
+<VersionBadge version="v0.0.25" />
+
+An LSP-backed language engine is a child process the server spawns in stdio mode, rooted at the
+targeted tree's directory. The server starts one process per accepted inline or named LSP
+definition per targeted tree, and every exact language identity that selects that definition
+shares it. Semantic facts and edit plans return through the provider contract.
+
+After a change, the server sends one classified path batch to each affected engine before it
+opens final document bytes and pulls diagnostics. That batch invalidates readiness from earlier
+work. Fresh progress tokens, diagnostic refresh requests, and
 repeated full reports decide when those answers are settled.
 
 ## Hooks and configuration
@@ -280,3 +289,11 @@ Validation runs afterwards, may retain no source write, and attaches
 [`GuaranteeEvidence`](/docs/protocol/reference#GuaranteeEvidence) or a diagnostic without
 refusing the landed change. A hook that fails or does not finish still gates publication in a
 projection. The [configuration](/docs/configuration) page states the keys and defaults.
+
+<VersionBadge version="v0.0.25" />
+
+A hook declares its program in one `command` key: a string for a bare program, or a list holding
+the program and its literal arguments. The server starts that command directly and runs no shell.
+
+The server selects a change's hooks from its initially changed paths, through each hook's
+`include` and `exclude`, and fixes that list before the first hook runs.

@@ -4,7 +4,7 @@ description: Install Rift, connect its MCP server, and read a workspace.
 ---
 
 <VersionBadge
-  version="v0.0.13"
+  version="v0.0.25"
   languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML"]}
 />
 
@@ -107,7 +107,7 @@ interleaved bytes:
 - [`patch`](/docs/protocol/mcp#tool-patch) applies unified-diff hunks, several files in one
   change; a context mismatch refuses and the tree stays untouched.
 - [`rename_symbol`](/docs/protocol/mcp#tool-rename_symbol) renames a declaration and every
-  reference the configured [language engine](/docs/configuration#engines) resolves.
+  reference the configured [language engine](/docs/configuration#languages-and-lsp) resolves.
 - [`move_file`](/docs/protocol/mcp#tool-move_file) moves one file, and an engine that supports it
   updates the imports that pointed at the old path.
 - [`remove_symbol`](/docs/protocol/mcp#tool-remove_symbol) removes one declaration addressed by

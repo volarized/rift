@@ -1,4 +1,4 @@
-//! The rust-analyzer probe and the real `[engines.rust]` table, for the
+//! Rust-analyzer probe and real Rust language LSP configuration for the
 //! end-to-end lane driven through the real `rift` binary.
 //!
 //! Mirrors `rift-mcp`'s own `rust_engine.rs`; Cargo compiles each crate's
@@ -53,13 +53,13 @@ pub(crate) fn require_rust_analyzer(fixture_root: &Path) {
     }
 }
 
-/// The real `[engines.rust]` table, built from [`fixture`].
+/// Real Rust language LSP configuration, built from [`fixture`].
 pub(crate) fn rust_engine_configuration() -> String {
     fixture().configuration_toml()
 }
 
-/// The fixture data the shared harness turns into the `[engines.rust]`
-/// table: rust-analyzer 1.98 over the fixture's cargo project.
+/// Fixture data the shared harness turns into a Rust language binding and
+/// rust-analyzer 1.98 process over the fixture's cargo project.
 ///
 /// Coverage starts several cold rust-analyzer processes in parallel. Its
 /// fixture retry table keeps shipped pacing but extends attempts to 16, a
@@ -71,6 +71,6 @@ pub(crate) fn fixture() -> EngineFixture {
         program: RUSTUP_PROGRAM,
         arguments: RUST_ANALYZER_ARGUMENTS.to_vec(),
         languages: vec!["rust"],
-        extra_toml: format!("\n[engines.rust.retry]\nattempts = {RUST_ENGINE_RETRY_ATTEMPTS}\n"),
+        extra_toml: format!("\n[lsp.rust.retry]\nattempts = {RUST_ENGINE_RETRY_ATTEMPTS}\n"),
     }
 }

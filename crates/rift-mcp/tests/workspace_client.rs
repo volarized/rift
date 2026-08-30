@@ -2,7 +2,7 @@
 //!
 //! Every suite builds a workspace whose own `rift.toml` turns the semantic
 //! search tier off and, where the suite drives a real engine, carries an
-//! `[engines.<name>]` table built from the shared fixture in
+//! LSP process and language binding built from the shared fixture in
 //! `engine_fixture.rs`, and drives the tools through a live rmcp client.
 //! Engine-specific fixture data lives beside this module: `rust_engine.rs`,
 //! `typescript_engine.rs`, and `toml_engine.rs`; `live_engine_gate.rs`
@@ -29,13 +29,13 @@ pub(crate) type ServedWorkspace = (
     tokio::task::JoinHandle<()>,
 );
 
-/// Builds one workspace of `files`, optionally with an engine table, and
+/// Builds one workspace of `files`, optionally with LSP configuration, and
 /// serves it to one client.
 pub(crate) async fn served_workspace(
     files: &[(&str, &str)],
-    engine: Option<String>,
+    lsp_configuration: Option<String>,
 ) -> TestResult<ServedWorkspace> {
-    let directory = laid_out_workspace(files, engine)?;
+    let directory = laid_out_workspace(files, lsp_configuration)?;
     let (client, server_task) = served_root(directory.path()).await?;
     Ok((directory, client, server_task))
 }
@@ -53,21 +53,21 @@ pub(crate) async fn served_workspace(
 /// way, as `..` segments down to the filesystem root and back up.
 pub(crate) async fn served_relative_workspace(
     files: &[(&str, &str)],
-    engine: Option<String>,
+    lsp_configuration: Option<String>,
 ) -> TestResult<ServedWorkspace> {
-    let directory = laid_out_workspace(files, engine)?;
+    let directory = laid_out_workspace(files, lsp_configuration)?;
     let (client, server_task) = served_root(&relative_spelling(directory.path())?).await?;
     Ok((directory, client, server_task))
 }
 
 /// One temporary workspace holding `files` and a `rift.toml`: the table that turns
-/// the semantic tier off, then the engine table when the suite drives one.
+/// the semantic tier off, then the LSP configuration when the suite drives one.
 ///
-/// A table header ends where the next one begins, so the engine table follows
+/// A table header ends where the next one begins, so the LSP configuration follows
 /// unchanged and each suite still proves whatever its own table carries.
 fn laid_out_workspace(
     files: &[(&str, &str)],
-    engine: Option<String>,
+    lsp_configuration: Option<String>,
 ) -> TestResult<tempfile::TempDir> {
     let directory = tempfile::tempdir()?;
     for (name, source) in files {
@@ -78,9 +78,9 @@ fn laid_out_workspace(
         fs::write(path, source)?;
     }
     let mut configuration = crate::hermetic_search::SEMANTIC_DISABLED.to_owned();
-    if let Some(engine) = engine {
+    if let Some(lsp_configuration) = lsp_configuration {
         configuration.push('\n');
-        configuration.push_str(&engine);
+        configuration.push_str(&lsp_configuration);
     }
     fs::write(directory.path().join("rift.toml"), configuration)?;
     Ok(directory)

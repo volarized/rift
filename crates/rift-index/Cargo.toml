@@ -25,5 +25,6 @@ toasty-driver-sqlite.workspace = true
 
 [dev-dependencies]
 rift-history = { workspace = true, features = ["fixtures"] }
+rift-protocol.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

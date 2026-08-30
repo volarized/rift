@@ -86,7 +86,7 @@ fn proc_macro_project() -> Vec<(&'static str, &'static str)> {
 
 fn proc_macro_configuration() -> String {
     format!(
-        "{}\n[[hooks]]\ntype = \"command\"\nid = \"check\"\nkind = \"build\"\nprogram = \"cargo\"\narguments = [\"check\", \"--workspace\"]\nchanged_paths = \"none\"\nwrites = \"none\"\nworking_directory = \"\"\nenvironment = {{}}\ntimeout = \"2m\"\noutput_limit = \"4kb\"\nfailure_severity = \"error\"\nguarantees = [{{ kind = \"syntax_validated\", scope = {{ kind = \"reach\", reach = \"project\" }}, detail = \"cargo check passes\" }}]\ndeterminism = \"deterministic\"\n",
+        "{}\n[[hooks]]\nid = \"check\"\nkind = \"build\"\ncommand = [\"cargo\", \"check\", \"--workspace\"]\nchanged_paths = \"none\"\nwrites = \"none\"\nworking_directory = \"\"\nenvironment = {{}}\ntimeout = \"2m\"\noutput_limit = \"4kb\"\nfailure_severity = \"error\"\nguarantees = [{{ kind = \"syntax_validated\", scope = {{ kind = \"reach\", reach = \"project\" }}, detail = \"cargo check passes\" }}]\ndeterminism = \"deterministic\"\n",
         rust_engine_configuration()
     )
 }
@@ -540,8 +540,8 @@ async fn forced_remove_symbol_applies_and_carries_the_reference_warning() -> Tes
 }
 
 /// A JSON member's declaration, spelled `"port": 8080` with nothing blank around it, has no
-/// separator to widen over: the removal takes exactly the addressed span. No `[engines]`
-/// table claims `json` in this fixture, so the removal applies unchecked, and the warning
+/// separator to widen over: the removal takes exactly the addressed span. No JSON language
+/// LSP binding exists in this fixture, so the removal applies unchecked, and the warning
 /// names why.
 const SETTINGS_JSON: &str = "{\"server\": {\"port\": 8080}}\n";
 
@@ -594,4 +594,5 @@ fn rust_engine_fixture_pins_1_98() {
     let fixture = rust_engine::fixture();
     assert_eq!(fixture.program, "rustup");
     assert_eq!(fixture.arguments, ["run", "1.98", "rust-analyzer"]);
+    assert_eq!(fixture.extra_toml, "\n[lsp.rust.retry]\nattempts = 16\n");
 }

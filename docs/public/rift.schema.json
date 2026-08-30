@@ -15,7 +15,7 @@
         },
         {
           "const": "append",
-          "description": "The changed project paths follow the configured `arguments`, in byte\norder, for a tool that takes files.",
+          "description": "The changed project paths follow the configured command, in byte\norder, for a tool that takes files.",
           "type": "string"
         }
       ]
@@ -56,19 +56,16 @@
           }
         }
       ],
-      "description": "One `[[hooks]]` command the server runs inside the changed tree.\nEvery key is required; the schema carries no defaults.",
+      "description": "One `[[hooks]]` command the server runs inside the changed tree.",
       "properties": {
-        "arguments": {
-          "description": "The program's literal arguments, in order. May be empty.",
-          "items": {
-            "type": "string"
-          },
-          "maxItems": 64,
-          "type": "array"
-        },
         "changed_paths": {
           "$ref": "#/$defs/ChangedPaths",
-          "description": "Whether the server appends changed project paths after `arguments`, in byte order."
+          "default": "none",
+          "description": "Whether the server appends changed project paths after the configured command, in byte order."
+        },
+        "command": {
+          "$ref": "#/$defs/CommandInput",
+          "description": "Executable and literal arguments. Rift starts it directly without a shell."
         },
         "determinism": {
           "$ref": "#/$defs/Determinism",
@@ -78,14 +75,27 @@
           "additionalProperties": {
             "type": "string"
           },
+          "default": {},
           "description": "Environment values added to the environment the server inherited.",
+          "maxProperties": 64,
           "type": "object"
+        },
+        "exclude": {
+          "default": [],
+          "description": "Project-relative path patterns removed from hook selection.",
+          "items": {
+            "$ref": "#/$defs/PathPattern"
+          },
+          "maxItems": 64,
+          "type": "array"
         },
         "failure_severity": {
           "$ref": "#/$defs/HookFailureSeverity",
+          "default": "error",
           "description": "Severity the server reports when the hook does not pass."
         },
         "guarantees": {
+          "default": [],
           "description": "What a passing validation establishes. Transform hooks cannot declare guarantees.",
           "items": {
             "$ref": "#/$defs/HookGuarantee"
@@ -97,7 +107,17 @@
           "description": "Label for this hook's results, unique within the list.",
           "maxLength": 64,
           "minLength": 1,
+          "pattern": "^[A-Za-z0-9._-]+$",
           "type": "string"
+        },
+        "include": {
+          "default": [],
+          "description": "Project-relative path patterns that select this hook. Empty selects every change.",
+          "items": {
+            "$ref": "#/$defs/PathPattern"
+          },
+          "maxItems": 64,
+          "type": "array"
         },
         "kind": {
           "$ref": "#/$defs/HookKind",
@@ -105,55 +125,65 @@
         },
         "output_limit": {
           "$ref": "#/$defs/ByteSize",
+          "default": "4kb",
           "description": "Bytes of each output stream the server keeps, 256b to 4kb. The full size is still reported.",
           "rift:range": {
             "max": "4kb",
             "min": "256b"
           }
         },
-        "program": {
-          "description": "The executable the server starts. A bare name resolves through `PATH`; a path resolves\nbelow `working_directory`. Absolute paths and `.` or `..` segments are refused.",
-          "minLength": 1,
-          "type": "string"
-        },
         "timeout": {
           "$ref": "#/$defs/Duration",
+          "default": "2m",
           "description": "Wall-clock bound before the server kills the process, 1ms to 1h.",
           "rift:range": {
             "max": "1h",
             "min": "1ms"
           }
         },
-        "type": {
-          "$ref": "#/$defs/HookType",
-          "description": "How the server runs the hook; `command` is the only type."
-        },
         "working_directory": {
           "$ref": "#/$defs/ProjectPath",
+          "default": "",
           "description": "Directory the process starts in, relative to the changed tree's root. Empty selects the\nroot. Absolute paths and `.` or `..` segments are refused."
         },
         "writes": {
           "$ref": "#/$defs/HookWrites",
+          "default": "none",
           "description": "Source files the server permits the hook to change."
         }
       },
       "required": [
-        "type",
         "id",
         "kind",
-        "program",
-        "arguments",
-        "changed_paths",
-        "writes",
-        "working_directory",
-        "environment",
-        "timeout",
-        "output_limit",
-        "failure_severity",
-        "guarantees",
+        "command",
         "determinism"
       ],
       "type": "object"
+    },
+    "CommandInput": {
+      "oneOf": [
+        {
+          "minLength": 1,
+          "pattern": "^\\S+$",
+          "type": "string"
+        },
+        {
+          "items": {
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "maxItems": 65,
+          "minItems": 1,
+          "prefixItems": [
+            {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            }
+          ],
+          "type": "array"
+        }
+      ]
     },
     "CoverageReach": {
       "description": "How far the claim reaches.",
@@ -243,108 +273,10 @@
       "pattern": "^(?:0|[1-9][0-9]*)(?:ms|s|m|h|d)$",
       "type": "string"
     },
-    "EngineConfiguration": {
-      "additionalProperties": false,
-      "description": "One `[engines.<name>]` table: an external LSP server Rift may start.\n\nThe key is the engine's name, a lowercase word in the language-name\ncharset. Rift starts the engine on the first request for a language it\nserves, speaks LSP to it over stdio, and reuses the running engine\nacross requests. The engine never writes: it proposes edits, and Rift\napplies them through its own change path.",
-      "properties": {
-        "arguments": {
-          "default": [],
-          "description": "The program's literal arguments, in order. May be empty.",
-          "items": {
-            "type": "string"
-          },
-          "maxItems": 64,
-          "type": "array"
-        },
-        "environment": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {},
-          "description": "Environment values added on top of the environment the server\ninherited.",
-          "type": "object"
-        },
-        "initialization_options": {
-          "description": "Options handed to the engine at initialize. Must be a JSON object\nwhen present; the engine defines its meaning."
-        },
-        "languages": {
-          "description": "The languages this engine serves: a language name, or `name:dialect`\nto pin a dialect. Each segment belongs to at most one engine across\nthe whole `[engines]` table. A segment no syntax provider knows is\naccepted: an engine may serve languages the syntax tier does not.",
-          "items": {
-            "type": "string"
-          },
-          "maxItems": 16,
-          "minItems": 1,
-          "type": "array"
-        },
-        "output_limit": {
-          "$ref": "#/$defs/ByteSize",
-          "default": "4kb",
-          "description": "Bytes of the engine's standard error Rift keeps, 1kb to 8mb. The\nfull size is still reported.",
-          "rift:range": {
-            "max": "8mb",
-            "min": "1kb"
-          }
-        },
-        "program": {
-          "description": "The executable Rift starts inside the workspace root. An absolute\npath is refused; the name resolves through `PATH`.",
-          "minLength": 1,
-          "type": "string"
-        },
-        "request_timeout": {
-          "$ref": "#/$defs/Duration",
-          "default": "1m",
-          "description": "Wall-clock bound on each later engine request, 1s to 10m.",
-          "rift:range": {
-            "max": "10m",
-            "min": "1s"
-          }
-        },
-        "restart": {
-          "$ref": "#/$defs/RestartPolicy",
-          "default": {
-            "attempts": 3,
-            "window": "5m"
-          },
-          "description": "How often Rift replaces this engine on its own, and over what\nwindow; the budget spent, the engine's own failure surfaces."
-        },
-        "retry": {
-          "$ref": "#/$defs/RetryPolicy",
-          "default": {
-            "attempts": 8,
-            "delay": "250ms",
-            "delay_limit": "2s"
-          },
-          "description": "How often Rift sends this engine the same request again while its\nanswer stays unsettled - a refusal the engine invites again, or an\nanswer it gave while still analyzing - and how the waits between\nthose attempts grow."
-        },
-        "startup_timeout": {
-          "$ref": "#/$defs/Duration",
-          "default": "30s",
-          "description": "Wall-clock bound on the engine's initialize handshake, 1s to 10m.",
-          "rift:range": {
-            "max": "10m",
-            "min": "1s"
-          }
-        }
-      },
-      "required": [
-        "program",
-        "languages"
-      ],
-      "type": "object"
-    },
     "ExecutionConfiguration": {
       "additionalProperties": false,
-      "description": "The `[execution]` table. `execute` stays off until `allow` names the\nlanguages caller-provided code may run as.",
+      "description": "The `[execution]` table. Exact language entries enable execution; this\ntable owns the workspace-wide bounds.",
       "properties": {
-        "allow": {
-          "default": [],
-          "description": "Language selectors enabled for `execute`: a language name, or\n`name:dialect` to pin a dialect. Empty keeps execution off.",
-          "items": {
-            "type": "string"
-          },
-          "maxItems": 64,
-          "type": "array"
-        },
         "max_code": {
           "$ref": "#/$defs/ByteSize",
           "default": "16kb",
@@ -509,16 +441,6 @@
         }
       ]
     },
-    "HookType": {
-      "description": "How a hook runs; `command` - an executable started directly, without a\nshell - is the only type.",
-      "oneOf": [
-        {
-          "const": "command",
-          "description": "An executable Rift starts directly inside the changed tree.",
-          "type": "string"
-        }
-      ]
-    },
     "HookWrites": {
       "description": "Source writes the server may retain from one hook.",
       "oneOf": [
@@ -538,6 +460,68 @@
           "type": "string"
         }
       ]
+    },
+    "LanguageConfiguration": {
+      "additionalProperties": false,
+      "description": "One exact `[languages.<identity>]` entry.",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "description": "Whether syntax, LSP service, and execution are enabled for matched paths.",
+          "type": "boolean"
+        },
+        "exclude": {
+          "default": [],
+          "description": "Path patterns removed from this language's effective matches.",
+          "items": {
+            "$ref": "#/$defs/PathPattern"
+          },
+          "maxItems": 64,
+          "type": "array"
+        },
+        "execution": {
+          "default": false,
+          "description": "Whether caller-provided code may execute under this exact language.",
+          "type": "boolean"
+        },
+        "include": {
+          "default": null,
+          "description": "Replacement path patterns. Absence keeps shipped patterns; an empty list matches none.",
+          "items": {
+            "$ref": "#/$defs/PathPattern"
+          },
+          "maxItems": 64,
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "lsp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LanguageLspConfiguration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Inline LSP process or name of one shared process."
+        }
+      },
+      "type": "object"
+    },
+    "LanguageLspConfiguration": {
+      "anyOf": [
+        {
+          "description": "Name of one shared top-level `[lsp.<name>]` process.",
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/LspConfiguration",
+          "description": "Process used only by this exact language entry."
+        }
+      ],
+      "description": "How one exact language selects an LSP process."
     },
     "LexicalSearchConfiguration": {
       "additionalProperties": false,
@@ -581,6 +565,77 @@
           "type": "integer"
         }
       },
+      "type": "object"
+    },
+    "LspConfiguration": {
+      "additionalProperties": false,
+      "description": "One external LSP process Rift may start.",
+      "properties": {
+        "command": {
+          "$ref": "#/$defs/CommandInput",
+          "description": "Executable and literal arguments. Rift starts it directly without a shell."
+        },
+        "environment": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Environment values added on top of the environment the server\ninherited.",
+          "maxProperties": 64,
+          "type": "object"
+        },
+        "initialization_options": {
+          "description": "Options handed to the process at initialize. Must be a JSON object\nwhen present; the LSP server defines its meaning.",
+          "type": "object"
+        },
+        "output_limit": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "4kb",
+          "description": "Bytes of the process's standard error Rift keeps, 1kb to 8mb. The\nfull size is still reported.",
+          "rift:range": {
+            "max": "8mb",
+            "min": "1kb"
+          }
+        },
+        "request_timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "1m",
+          "description": "Wall-clock bound on each later LSP request, 1s to 10m.",
+          "rift:range": {
+            "max": "10m",
+            "min": "1s"
+          }
+        },
+        "restart": {
+          "$ref": "#/$defs/RestartPolicy",
+          "default": {
+            "attempts": 3,
+            "window": "5m"
+          },
+          "description": "How often Rift replaces this process on its own, and over what\nwindow; the budget spent, the process's own failure surfaces."
+        },
+        "retry": {
+          "$ref": "#/$defs/RetryPolicy",
+          "default": {
+            "attempts": 8,
+            "delay": "250ms",
+            "delay_limit": "2s"
+          },
+          "description": "How often Rift sends this process the same request again while its\nanswer stays unsettled - a refusal the process invites again, or an\nanswer it gave while still analyzing - and how the waits between\nthose attempts grow."
+        },
+        "startup_timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "30s",
+          "description": "Wall-clock bound on the process's initialize handshake, 1s to 10m.",
+          "rift:range": {
+            "max": "10m",
+            "min": "1s"
+          }
+        }
+      },
+      "required": [
+        "command"
+      ],
       "type": "object"
     },
     "PathPattern": {
@@ -753,6 +808,9 @@
         "text": {
           "$ref": "#/$defs/TextSearchConfiguration",
           "default": {
+            "include": [
+              "**"
+            ],
             "max_chunk": "1mb"
           },
           "description": "Chunking policy for visible text files in lexical search."
@@ -922,7 +980,7 @@
         "readiness_timeout": {
           "$ref": "#/$defs/Duration",
           "default": "30s",
-          "description": "Wall-clock bound one request waits for the workspace's index and\nits language engines to prove they are ready to answer, 1s to 1h.\nOne deadline: index validation starts it, and once a request\nresolves the languages it needs, waiting on those engines spends\nwhat remains of it.",
+          "description": "Wall-clock bound one request waits for the workspace's index and\nits language services to prove they are ready to answer, 1s to 1h.\nOne deadline: index validation starts it, and once a request\nresolves the languages it needs, waiting on those services spends\nwhat remains of it.",
           "rift:range": {
             "max": "1h",
             "min": "1s"
@@ -972,8 +1030,19 @@
     },
     "TextSearchConfiguration": {
       "additionalProperties": false,
-      "description": "The `[search.text]` table. `max_chunk` bounds lexical units derived from\nvisible text files.",
+      "description": "The `[search.text]` table. `include` selects which visible paths join the\ntext index once every language entry has had its claim, and `max_chunk`\nbounds the lexical units derived from them.",
       "properties": {
+        "include": {
+          "default": [
+            "**"
+          ],
+          "description": "Project-relative path patterns included as plain text when no language claims them.\nThe default `[\"**\"]` selects every unclaimed visible path; an empty list selects none.",
+          "items": {
+            "$ref": "#/$defs/PathPattern"
+          },
+          "maxItems": 64,
+          "type": "array"
+        },
         "max_chunk": {
           "$ref": "#/$defs/ByteSize",
           "default": "1mb",
@@ -991,18 +1060,9 @@
   "additionalProperties": false,
   "description": "The whole `rift.toml`. Every table is optional and defaults to the\nbehavior documented on it; any key outside these definitions refuses the\nfile as `configuration_invalid`.",
   "properties": {
-    "engines": {
-      "additionalProperties": {
-        "$ref": "#/$defs/EngineConfiguration"
-      },
-      "default": {},
-      "description": "Language engines keyed by name: each `[engines.<name>]` table names\nan external LSP server and the languages it serves.",
-      "type": "object"
-    },
     "execution": {
       "$ref": "#/$defs/ExecutionConfiguration",
       "default": {
-        "allow": [],
         "max_code": "16kb",
         "max_concurrent": 2,
         "max_output": "8kb",
@@ -1019,6 +1079,18 @@
       "maxItems": 32,
       "type": "array"
     },
+    "languages": {
+      "additionalProperties": {
+        "$ref": "#/$defs/LanguageConfiguration"
+      },
+      "default": {},
+      "description": "Exact language entries keyed by their `name` or `name:dialect` identity segment.",
+      "maxProperties": 64,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$"
+      },
+      "type": "object"
+    },
     "logs": {
       "$ref": "#/$defs/LogsConfiguration",
       "default": {
@@ -1027,6 +1099,18 @@
         "retention_records": 50000
       },
       "description": "The server's own log records: how many the workspace database keeps,\nhow many one read returns, and which targets are captured."
+    },
+    "lsp": {
+      "additionalProperties": {
+        "$ref": "#/$defs/LspConfiguration"
+      },
+      "default": {},
+      "description": "Shared LSP processes keyed by name. Language entries select them explicitly.",
+      "maxProperties": 16,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9._-]*$"
+      },
+      "type": "object"
     },
     "providers": {
       "$ref": "#/$defs/ProvidersConfiguration",
@@ -1061,6 +1145,9 @@
           "weight": 0.3
         },
         "text": {
+          "include": [
+            "**"
+          ],
           "max_chunk": "1mb"
         }
       },

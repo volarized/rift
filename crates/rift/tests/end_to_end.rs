@@ -879,15 +879,15 @@ async fn invalid_json_frame_answers_parse_error_and_the_next_frame_still_runs() 
 // path against the `ProjectPath` contract their own doc comments promised,
 // so a hook ran outside the workspace.
 
-/// A hook whose `program` is absolute, and one whose `working_directory`
+/// A hook whose command program is absolute, and one whose `working_directory`
 /// holds `..`, are each refused by the server that reads the `rift.toml`.
 #[cfg(unix)]
 #[tokio::test]
-async fn hooks_with_an_absolute_program_or_a_dot_segment_directory_refuse() -> TestResult {
+async fn hooks_with_an_absolute_command_or_a_dot_segment_directory_refuse() -> TestResult {
     let _serial = SERIAL.lock().await;
 
-    let absolute_program_hook = "[[hooks]]\ntype = \"command\"\nid = \"escape\"\n\
-        kind = \"other\"\nprogram = \"/bin/true\"\narguments = []\n\
+    let absolute_program_hook = "[[hooks]]\nid = \"escape\"\n\
+        kind = \"other\"\ncommand = \"/bin/true\"\n\
         changed_paths = \"none\"\nwrites = \"none\"\nworking_directory = \"\"\nenvironment = {}\n\
         timeout = \"5s\"\noutput_limit = \"4096b\"\nfailure_severity = \"error\"\nguarantees = []\n\
         determinism = \"best_effort\"\n";
@@ -912,17 +912,18 @@ async fn hooks_with_an_absolute_program_or_a_dot_segment_directory_refuse() -> T
         "{data:?}"
     );
     assert!(
-        data.message.contains("hook_executable_absolute"),
+        data.message.contains("command_program_absolute"),
         "{}",
         data.message
     );
-    assert!(data.message.contains("escape"), "{}", data.message);
+    assert!(data.message.contains("hooks.command"), "{}", data.message);
+    assert!(data.message.contains("/bin/true"), "{}", data.message);
     client.cancel().await?;
     let stopped = run_rift(root, &["server", "stop"]).await?;
     require_success(&stopped, "stop after the absolute-program refusal")?;
 
-    let dot_segment_directory_hook = "[[hooks]]\ntype = \"command\"\nid = \"escape\"\n\
-        kind = \"other\"\nprogram = \"true\"\narguments = []\n\
+    let dot_segment_directory_hook = "[[hooks]]\nid = \"escape\"\n\
+        kind = \"other\"\ncommand = \"true\"\n\
         changed_paths = \"none\"\nwrites = \"none\"\nworking_directory = \"../outside\"\nenvironment = {}\n\
         timeout = \"5s\"\noutput_limit = \"4096b\"\nfailure_severity = \"error\"\nguarantees = []\n\
         determinism = \"best_effort\"\n";
@@ -965,8 +966,5 @@ fn rust_engine_fixture_pins_1_98_and_bounded_retries() {
     let fixture = rust_engine::fixture();
     assert_eq!(fixture.program, "rustup");
     assert_eq!(fixture.arguments, ["run", "1.98", "rust-analyzer"]);
-    assert_eq!(
-        fixture.extra_toml,
-        "\n[engines.rust.retry]\nattempts = 16\n"
-    );
+    assert_eq!(fixture.extra_toml, "\n[lsp.rust.retry]\nattempts = 16\n");
 }

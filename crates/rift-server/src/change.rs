@@ -25,7 +25,7 @@ use rift_protocol::read::{
     Diagnostic, DiagnosticCode, DiagnosticContinuation, DiagnosticReliability, Extensions, FileId,
     Language, Severity, SourceSpan, TextRange,
 };
-use rift_syntax::{ByteRange, SyntaxDocument, SyntaxSource, registry};
+use rift_syntax::{ByteRange, SyntaxDocument, SyntaxSource};
 use sha2::{Digest as _, Sha256};
 
 use crate::move_file::MovePlan;
@@ -36,7 +36,7 @@ use crate::read::{
 };
 use crate::remove::{RemovePlan, is_blank_content};
 use crate::rename::{PlannedRewrite, RenamePlan, survivor_findings};
-use crate::rewrite::{FileRewrite, ReplacedRegion, RewriteKind};
+use crate::rewrite::{ByteFileRewrite, FileRewrite, ReplacedRegion, RewriteKind};
 
 /// Most findings one applied change reports: reparse findings and, for a
 /// rewrite that published through a symlink, the warning naming it.
@@ -65,8 +65,15 @@ pub struct HookSnapshot {
 /// One visible source file's bytes and supported permissions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HookSource {
-    bytes: String,
+    bytes: Option<Vec<u8>>,
     permissions: fs::Permissions,
+}
+
+impl HookSource {
+    /// Captured source text when bytes fit bounds and are valid UTF-8.
+    fn text(&self) -> Option<&str> {
+        std::str::from_utf8(self.bytes.as_deref()?).ok()
+    }
 }
 
 impl HookSnapshot {
@@ -95,6 +102,45 @@ impl HookSnapshot {
     pub fn is_unchanged(&self, after: &Self) -> bool {
         self.sources == after.sources
     }
+
+    /// First path whose bytes crossed bounds or are not valid UTF-8.
+    #[must_use]
+    pub fn unavailable_path(&self) -> Option<&str> {
+        self.sources
+            .iter()
+            .find(|(_, source)| source.text().is_none())
+            .map(|(path, _)| path.as_str())
+    }
+
+    /// Requires every captured path to carry bounded UTF-8 source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] naming first unavailable source.
+    pub fn require_source_text(&self) -> Result<(), ReadError> {
+        self.unavailable_path()
+            .map_or(Ok(()), |path| Err(ReadFault::source_unavailable(path)))
+    }
+}
+
+/// Converts bounded visible-file captures into hook source state.
+fn hook_snapshot_from_files<'a>(
+    files: impl IntoIterator<Item = &'a rift_index::VisibleWorkspaceEntry>,
+) -> HookSnapshot {
+    let sources = files
+        .into_iter()
+        .map(|file| {
+            let path = file.path().clone();
+            (
+                path,
+                HookSource {
+                    bytes: file.bytes().map(<[u8]>::to_vec),
+                    permissions: file.permissions().clone(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    HookSnapshot { sources }
 }
 
 /// Iterates union of two snapshot path sets in byte order.
@@ -108,24 +154,75 @@ fn source_paths<'a>(
 }
 
 /// Builds whole-file rewrites from one hook snapshot to another.
-fn snapshot_rewrites(before: &HookSnapshot, after: &HookSnapshot) -> Vec<FileRewrite> {
+///
+/// A rewrite carries source text, so a capture whose bytes crossed the workspace's
+/// bounds or are not UTF-8 refuses here rather than reaching publication.
+fn snapshot_rewrites(
+    before: &HookSnapshot,
+    after: &HookSnapshot,
+) -> Result<Vec<FileRewrite>, ReadError> {
+    let text = |source: &HookSource, path: &CoreProjectPath| {
+        source
+            .text()
+            .map(str::to_owned)
+            .ok_or_else(|| ReadFault::source_unavailable(path.as_str()))
+    };
     source_paths(before, after)
         .filter_map(
             |path| match (before.sources.get(path), after.sources.get(path)) {
-                (Some(previous), Some(next)) if previous != next => Some(
-                    FileRewrite::modify(
-                        path.clone(),
-                        &previous.bytes,
-                        next.bytes.clone(),
-                        Vec::new(),
-                    )
-                    .with_permissions(next.permissions.clone()),
+                (Some(previous), Some(next)) if previous != next => {
+                    Some(text(previous, path).and_then(|previous_text| {
+                        text(next, path).map(|next_text| {
+                            FileRewrite::modify(path.clone(), &previous_text, next_text, Vec::new())
+                                .with_permissions(next.permissions.clone())
+                        })
+                    }))
+                }
+                (Some(previous), None) => Some(
+                    text(previous, path)
+                        .map(|previous_text| FileRewrite::delete(path.clone(), &previous_text)),
                 ),
-                (Some(previous), None) => Some(FileRewrite::delete(path.clone(), &previous.bytes)),
-                (None, Some(next)) => Some(
-                    FileRewrite::create(path.clone(), next.bytes.clone())
-                        .with_permissions(next.permissions.clone()),
-                ),
+                (None, Some(next)) => Some(text(next, path).map(|next_text| {
+                    FileRewrite::create(path.clone(), next_text)
+                        .with_permissions(next.permissions.clone())
+                })),
+                _ => None,
+            },
+        )
+        .collect()
+}
+
+/// Builds raw-byte rewrites that restore `desired` over `current`.
+fn snapshot_byte_rewrites(
+    current: &HookSnapshot,
+    desired: &HookSnapshot,
+) -> Result<Vec<ByteFileRewrite>, ReadError> {
+    source_paths(current, desired)
+        .filter_map(
+            |path| match (current.sources.get(path), desired.sources.get(path)) {
+                (Some(previous), Some(next)) if previous != next => {
+                    Some(next.bytes.as_ref().map_or_else(
+                        || Err(ReadFault::source_unavailable(path.as_str())),
+                        |bytes| {
+                            Ok(ByteFileRewrite::modify(
+                                path.clone(),
+                                bytes.clone(),
+                                next.permissions.clone(),
+                            ))
+                        },
+                    ))
+                }
+                (Some(_), None) => Some(Ok(ByteFileRewrite::delete(path.clone()))),
+                (None, Some(next)) => Some(next.bytes.as_ref().map_or_else(
+                    || Err(ReadFault::source_unavailable(path.as_str())),
+                    |bytes| {
+                        Ok(ByteFileRewrite::create(
+                            path.clone(),
+                            bytes.clone(),
+                            next.permissions.clone(),
+                        ))
+                    },
+                )),
                 _ => None,
             },
         )
@@ -293,31 +390,14 @@ impl ChangeService {
         }
     }
 
-    /// Captures indexed visible source state for hook checks.
+    /// Captures live visible source state for hook checks.
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when filesystem permissions cannot be captured.
-    pub fn hook_snapshot(&self, reads: &ReadService) -> Result<HookSnapshot, ReadError> {
-        let indexed_sources = reads
-            .index()
-            .files()
-            .map(|file| (file.path().clone(), file.source().to_owned()))
-            .chain(
-                reads
-                    .index()
-                    .text_files()
-                    .map(|file| (file.path().clone(), file.content().to_owned())),
-            );
-        let sources = indexed_sources
-            .map(|(path, bytes)| {
-                let permissions = fs::metadata(self.root.join(path.as_str()))
-                    .map_err(|error| ReadFault::storage(path.as_str(), "metadata", &error))?
-                    .permissions();
-                Ok((path, HookSource { bytes, permissions }))
-            })
-            .collect::<Result<BTreeMap<_, _>, ReadError>>()?;
-        Ok(HookSnapshot { sources })
+    /// Returns [`ReadError`] when visible paths, bytes, or permissions cannot be captured.
+    pub fn capture_hook_snapshot(&self, reads: &ReadService) -> Result<HookSnapshot, ReadError> {
+        let files = reads.capture_visible_workspace_entries()?;
+        Ok(hook_snapshot_from_files(files.iter()))
     }
 
     /// Restores source bytes changed during one rejected hook run.
@@ -335,11 +415,11 @@ impl ChangeService {
             .application
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let rewrites = snapshot_rewrites(after, before);
+        let rewrites = snapshot_byte_rewrites(after, before)?;
         if rewrites.is_empty() {
             return Ok(());
         }
-        match crate::publish::publish_rewrites(reads, &self.root, &rewrites)? {
+        match crate::publish::publish_byte_rewrites(reads, &self.root, &rewrites)? {
             Ok(_) => Ok(()),
             Err(refusal) => Err(ReadFault::task(
                 "hook source restore",
@@ -349,19 +429,22 @@ impl ChangeService {
     }
 
     /// Replaces direct summary identity and edits with final hook bytes.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when a captured path carries no source text.
     pub fn finalize_hook_result(
         &self,
         before: &HookSnapshot,
         after: &HookSnapshot,
         mut summary: ChangeSummary,
-    ) -> ChangeResult {
-        let rewrites: Vec<FileRewrite> = snapshot_rewrites(before, after)
+    ) -> Result<ChangeResult, ReadError> {
+        let rewrites: Vec<FileRewrite> = snapshot_rewrites(before, after)?
             .into_iter()
             .filter(FileRewrite::changes_bytes)
             .collect();
         if rewrites.is_empty() {
-            return ChangeResult::Unchanged;
+            return Ok(ChangeResult::Unchanged);
         }
         let mut identity = Sha256::new();
         summary.paths.clear();
@@ -378,7 +461,7 @@ impl ChangeService {
         }
         let digest = identity.finalize();
         summary.id = ChangeId(crate::read::digest_wire_hex(&digest));
-        ChangeResult::Applied { summary }
+        Ok(ChangeResult::Applied { summary })
     }
 
     /// Replaces one declaration addressed by symbol.
@@ -886,7 +969,7 @@ impl ChangeService {
                 )),
             };
             edits.extend(rewrite_edits(rewrite, &unit, ranged));
-            fold_and_bound_diagnostics(&mut diagnostics, rewrite, unit);
+            fold_and_bound_diagnostics(reads, &mut diagnostics, rewrite, unit);
         }
         let digest = identity.finalize();
         Ok(ChangeResult::Applied {
@@ -1415,8 +1498,19 @@ fn decoded(encoded: &str) -> Option<String> {
 /// for a file a patch just created. The registry selects the parsing
 /// provider by the path's extension; a path no provider claims has no
 /// grammar to check against and contributes no findings.
-fn reparse_diagnostics(unit: FileId, path: &CoreProjectPath, source: &str) -> Vec<Diagnostic> {
-    let Some(provider) = path_extension(path).and_then(registry::provider_for_extension) else {
+fn reparse_diagnostics(
+    reads: &ReadService,
+    unit: FileId,
+    path: &CoreProjectPath,
+    source: &str,
+) -> Vec<Diagnostic> {
+    let absolute = reads.index().root().join(path.as_str());
+    let Some(provider) = reads
+        .source_policy()
+        .and_then(|policy| policy.language_for_path(&absolute).ok().flatten())
+        .filter(|language| language.enabled())
+        .and_then(rift_index::EffectiveLanguage::syntax_provider)
+    else {
         return Vec::new();
     };
     let language = provider.language();
@@ -1450,25 +1544,20 @@ fn reparse_diagnostics(unit: FileId, path: &CoreProjectPath, source: &str) -> Ve
 /// still applies to it, so warnings carried in from earlier in the batch
 /// cannot outlive a batch made only of deletions.
 fn fold_and_bound_diagnostics(
+    reads: &ReadService,
     diagnostics: &mut Vec<Diagnostic>,
     rewrite: &FileRewrite,
     unit: FileId,
 ) {
     if !rewrite.kind.removes_file() {
         diagnostics.extend(reparse_diagnostics(
+            reads,
             unit,
             &rewrite.path,
             &rewrite.next_source,
         ));
     }
     diagnostics.truncate(CHANGE_DIAGNOSTICS_MAX);
-}
-
-/// The extension of `path`'s final segment, without its leading dot.
-fn path_extension(path: &CoreProjectPath) -> Option<&str> {
-    Path::new(path.as_str())
-        .extension()
-        .and_then(std::ffi::OsStr::to_str)
 }
 
 fn change_diagnostic(
@@ -1503,15 +1592,16 @@ mod tests {
     use std::fs;
     use std::sync::{Arc, Barrier};
 
-    use rift_core::ProjectPath as CoreProjectPath;
-    use rift_core::SourceVisibility;
+    use rift_core::{LanguageFileSelections, ProjectPath as CoreProjectPath, SourceVisibility};
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::change::{
         BODY_BYTES_MAX, BodySource, ChangeResult, Edit, InsertPosition, InsertSymbolParams,
         OperationPreconditionKind, PatchParams, PreconditionAddress, PreconditionValue,
         RefusalReason, ReplaceNodeParams, ReplaceSymbolParams,
     };
-    use rift_protocol::configuration::HistoryConfiguration;
+    use rift_protocol::configuration::{
+        HistoryConfiguration, LanguageConfiguration, WorkspaceConfiguration,
+    };
     use rift_protocol::read::{
         Diagnostic, DiagnosticContinuation, DiagnosticReliability, Extensions, FileId,
         GetSymbolParams, Language, NodeId, NodesParams, ProjectPath, Severity, SymbolId,
@@ -1519,7 +1609,7 @@ mod tests {
     use rift_syntax::ByteRange;
 
     use super::ChangeService;
-    use crate::read::{ReadService, digest_hex8};
+    use crate::read::{ReadFault, ReadService, digest_hex8};
     use crate::rewrite::{FileRewrite, REWRITE_FILE_BYTES_MAX, ReplacedRegion};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -1543,6 +1633,51 @@ mod tests {
             &rift_core::TextFileInclusion::default(),
             HistoryConfiguration::default(),
         )?;
+        let changes = ChangeService::new(directory.path());
+        Ok((directory, reads, changes))
+    }
+
+    /// A read snapshot over `root` under one workspace's configured language entries.
+    fn reads_with_languages(
+        root: &std::path::Path,
+        configuration: &WorkspaceConfiguration,
+    ) -> Result<ReadService, crate::read::ReadError> {
+        ReadService::build_with_languages(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            &LanguageFileSelections::from(configuration),
+            HistoryConfiguration::default(),
+        )
+    }
+
+    /// A read snapshot over `root` under `limits`.
+    fn reads_within(
+        root: &std::path::Path,
+        limits: WorkspaceIndexLimits,
+    ) -> Result<ReadService, crate::read::ReadError> {
+        ReadService::build(
+            root,
+            limits,
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )
+    }
+
+    /// A workspace whose per-file capture bound is `file_bytes_max`, so a file past it
+    /// is visible and carries permissions while its bytes stay uncaptured.
+    fn bounded_fixture(
+        files: &[(&str, &str)],
+        file_bytes_max: usize,
+    ) -> TestResult<(tempfile::TempDir, ReadService, ChangeService)> {
+        let directory = tempfile::tempdir()?;
+        for (name, source) in files {
+            fs::write(directory.path().join(name), source)?;
+        }
+        let limits = WorkspaceIndexLimits::new(64, file_bytes_max, 1_048_576, 16, 64)?;
+        let reads = reads_within(directory.path(), limits)?;
         let changes = ChangeService::new(directory.path());
         Ok((directory, reads, changes))
     }
@@ -1915,8 +2050,11 @@ mod tests {
 
         let (directory, reads, changes) = fixture_with_name(case.file_name, case.source)?;
         let target = addressed_declaration(&reads, case)?;
-        let engines =
-            crate::engine::EnginePool::new(directory.path(), std::collections::BTreeMap::new());
+        let engines = crate::engine::EnginePool::new(
+            directory.path(),
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+        );
         let resolution = crate::remove::plan_remove_symbol(
             &reads,
             &engines,
@@ -2877,8 +3015,11 @@ mod tests {
                 &rift_core::TextFileInclusion::default(),
                 HistoryConfiguration::default(),
             )?;
-            let engines =
-                crate::engine::EnginePool::new(directory.path(), std::collections::BTreeMap::new());
+            let engines = crate::engine::EnginePool::new(
+                directory.path(),
+                std::collections::BTreeMap::new(),
+                std::collections::BTreeMap::new(),
+            );
             let resolution = crate::remove::plan_remove_symbol(
                 &reads_after_insert,
                 &engines,
@@ -3895,14 +4036,15 @@ mod tests {
     /// `replace_symbol`'s wire surface at all; this proves `reparse_diagnostics`
     /// directly instead of steering an unreachable integration path.
     #[test]
-    fn reparse_diagnostics_reports_a_source_past_the_parser_bound() {
+    fn reparse_diagnostics_reports_a_source_past_the_parser_bound() -> TestResult {
+        let (_directory, reads, _changes) = fixture("pub fn beacon() {}\n")?;
         let source = format!(
             "pub fn beacon() {{}}\n// {}",
             "x".repeat(rift_syntax::RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT)
         );
         let path = CoreProjectPath::new("lib.rs").expect("fixture path is valid");
         let unit = FileId("rift://file/lib.rs".to_owned());
-        let diagnostics = super::reparse_diagnostics(unit, &path, &source);
+        let diagnostics = super::reparse_diagnostics(&reads, unit, &path, &source);
         assert_eq!(diagnostics.len(), 1);
         assert!(
             diagnostics[0]
@@ -3911,6 +4053,7 @@ mod tests {
             "diagnostic must name the crossed bound: {}",
             diagnostics[0].message
         );
+        Ok(())
     }
 
     #[test]
@@ -4079,9 +4222,10 @@ mod tests {
 
     #[test]
     fn reparse_skips_a_path_no_provider_claims() -> TestResult {
+        let (_directory, reads, _changes) = fixture("pub fn beacon() {}\n")?;
         let path = CoreProjectPath::new("notes/TODO.txt")?;
         let unit = FileId("rift://file/notes/TODO.txt".to_owned());
-        let diagnostics = super::reparse_diagnostics(unit, &path, "fn broken( {");
+        let diagnostics = super::reparse_diagnostics(&reads, unit, &path, "fn broken( {");
         assert!(
             diagnostics.is_empty(),
             "an unclaimed extension has no grammar, so no findings"
@@ -4091,9 +4235,10 @@ mod tests {
 
     #[test]
     fn reparse_stamps_findings_with_the_claiming_provider_language() -> TestResult {
+        let (_directory, reads, _changes) = fixture("pub fn beacon() {}\n")?;
         let path = CoreProjectPath::new("lib.rs")?;
         let unit = FileId("rift://file/lib.rs".to_owned());
-        let diagnostics = super::reparse_diagnostics(unit, &path, "fn broken( {");
+        let diagnostics = super::reparse_diagnostics(&reads, unit, &path, "fn broken( {");
         assert!(!diagnostics.is_empty(), "broken rust must report findings");
         assert_eq!(
             diagnostics[0].language,
@@ -4106,6 +4251,31 @@ mod tests {
             diagnostics[0].code.as_deref(),
             Some("rift.syntax.error"),
             "provider parse findings carry one shared Rift code"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reparse_skips_a_disabled_language() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.languages.insert(
+            "rust".to_owned(),
+            LanguageConfiguration {
+                enabled: false,
+                ..LanguageConfiguration::default()
+            },
+        );
+        let reads = reads_with_languages(directory.path(), &configuration)?;
+        let path = CoreProjectPath::new("lib.rs")?;
+        let unit = FileId("rift://file/lib.rs".to_owned());
+
+        let diagnostics = super::reparse_diagnostics(&reads, unit, &path, "fn broken( {");
+
+        assert!(
+            diagnostics.is_empty(),
+            "a disabled language must contribute no syntax findings"
         );
         Ok(())
     }
@@ -4451,10 +4621,10 @@ mod tests {
         let (directory, reads, changes) = fixture(source)?;
         let target = directory.path().join("lib.rs");
         fs::set_permissions(&target, fs::Permissions::from_mode(0o640))?;
-        let before = changes.hook_snapshot(&reads)?;
+        let before = changes.capture_hook_snapshot(&reads)?;
 
         fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
-        let after = changes.hook_snapshot(&reads)?;
+        let after = changes.capture_hook_snapshot(&reads)?;
         assert!(before.permissions_changed(&after));
         assert_eq!(
             before.changed_paths(&after),
@@ -4463,9 +4633,147 @@ mod tests {
 
         changes.restore_hook_snapshot(&reads, &before, &after)?;
         assert_eq!(fs::metadata(&target)?.permissions().mode() & 0o777, 0o640);
-        let restored = changes.hook_snapshot(&reads)?;
+        let restored = changes.capture_hook_snapshot(&reads)?;
         assert!(before.is_unchanged(&restored));
         assert_eq!(fs::read_to_string(target)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn hook_snapshot_captures_unclassified_visible_files() -> TestResult {
+        let lock = "version = 4\n";
+        let (directory, reads, changes) =
+            multi_file_fixture(&[("lib.rs", "pub fn beacon() {}\n"), ("Cargo.lock", lock)])?;
+        let before = changes.capture_hook_snapshot(&reads)?;
+        fs::write(directory.path().join("Cargo.lock"), "version = 3\n")?;
+
+        let after = changes.capture_hook_snapshot(&reads)?;
+
+        assert_eq!(
+            before.changed_paths(&after),
+            [ProjectPath("Cargo.lock".to_owned())]
+        );
+        changes.restore_hook_snapshot(&reads, &before, &after)?;
+        assert_eq!(
+            fs::read_to_string(directory.path().join("Cargo.lock"))?,
+            lock
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hook_snapshot_retains_unclassified_creates_and_deletes() -> TestResult {
+        let lock = "version = 4\n";
+        let (directory, reads, changes) =
+            multi_file_fixture(&[("lib.rs", "pub fn beacon() {}\n"), ("Cargo.lock", lock)])?;
+        let published = changes.capture_hook_snapshot(&reads)?;
+        fs::remove_file(directory.path().join("Cargo.lock"))?;
+        fs::write(directory.path().join("justfile"), "default:\n")?;
+
+        let live = changes.capture_hook_snapshot(&reads)?;
+
+        assert_eq!(
+            published.changed_paths(&live),
+            [
+                ProjectPath("Cargo.lock".to_owned()),
+                ProjectPath("justfile".to_owned()),
+            ]
+        );
+        changes.restore_hook_snapshot(&reads, &published, &live)?;
+        assert_eq!(
+            fs::read_to_string(directory.path().join("Cargo.lock"))?,
+            lock
+        );
+        assert!(!directory.path().join("justfile").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_hook_result_carries_the_files_a_hook_created_and_deleted() -> TestResult {
+        let (directory, reads, changes) =
+            multi_file_fixture(&[("lib.rs", "pub fn beacon() {}\n")])?;
+        let params = ReplaceSymbolParams {
+            symbol: symbol("beacon"),
+            region: None,
+            body: "pub fn beacon() -> u8 { 7 }".to_owned().into(),
+        };
+        let summary = applied_summary(changes.replace_symbol(&reads, &params)?);
+        let before = changes.capture_hook_snapshot(&reads)?;
+        let split = "pub fn split() {}\n";
+        fs::write(directory.path().join("split.rs"), split)?;
+        fs::remove_file(directory.path().join("lib.rs"))?;
+
+        let after = changes.capture_hook_snapshot(&reads)?;
+        let finalized = applied_summary(changes.finalize_hook_result(&before, &after, summary)?);
+
+        assert_eq!(
+            finalized.paths,
+            [
+                ProjectPath("lib.rs".to_owned()),
+                ProjectPath("split.rs".to_owned()),
+            ],
+            "a hook that deletes one file and writes another reports both"
+        );
+        let texts: Vec<&str> = finalized
+            .edits
+            .iter()
+            .map(|Edit::Replace { text, .. }| text.as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            ["", split],
+            "a deleted file's edit empties it and a created file's edit carries its whole source"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn restoring_a_shrunk_file_the_capture_bound_left_out_refuses() -> TestResult {
+        let oversized = "pub fn beacon() {}\n// padding past the capture bound\n";
+        let (directory, reads, changes) = bounded_fixture(&[("lib.rs", oversized)], 16)?;
+        let before = changes.capture_hook_snapshot(&reads)?;
+        let shrunk = "pub fn a() {}\n";
+        fs::write(directory.path().join("lib.rs"), shrunk)?;
+        let after = changes.capture_hook_snapshot(&reads)?;
+
+        let error = changes
+            .restore_hook_snapshot(&reads, &before, &after)
+            .expect_err("bytes the capture bound left out cannot be restored");
+
+        let fault = error.fault();
+        assert!(
+            matches!(fault, ReadFault::SourceUnavailable { path } if path == "lib.rs"),
+            "unexpected fault {fault:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("lib.rs"))?,
+            shrunk,
+            "a refused restore writes nothing"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn restoring_a_deleted_file_the_capture_bound_left_out_refuses() -> TestResult {
+        let oversized = "pub fn beacon() {}\n// padding past the capture bound\n";
+        let (directory, reads, changes) = bounded_fixture(&[("lib.rs", oversized)], 16)?;
+        let before = changes.capture_hook_snapshot(&reads)?;
+        fs::remove_file(directory.path().join("lib.rs"))?;
+        let after = changes.capture_hook_snapshot(&reads)?;
+
+        let error = changes
+            .restore_hook_snapshot(&reads, &before, &after)
+            .expect_err("a deleted file with no captured bytes cannot be written back");
+
+        let fault = error.fault();
+        assert!(
+            matches!(fault, ReadFault::SourceUnavailable { path } if path == "lib.rs"),
+            "unexpected fault {fault:?}"
+        );
+        assert!(
+            !directory.path().join("lib.rs").exists(),
+            "a refused restore creates nothing"
+        );
         Ok(())
     }
 
@@ -4907,12 +5215,13 @@ mod tests {
     /// must not outlive a batch made only of deletions.
     #[test]
     fn test_fold_and_bound_diagnostics_bounds_a_deletions_carried_over_warnings() -> TestResult {
+        let (_directory, reads, _changes) = fixture("pub fn beacon() {}\n")?;
         let mut diagnostics: Vec<Diagnostic> = (0..super::CHANGE_DIAGNOSTICS_MAX + 4)
             .map(|index| warning(&format!("carried warning {index}")))
             .collect();
         let rewrite = FileRewrite::delete(CoreProjectPath::new("gone.rs")?, "");
         let unit = FileId("rift://file/gone.rs".to_owned());
-        super::fold_and_bound_diagnostics(&mut diagnostics, &rewrite, unit);
+        super::fold_and_bound_diagnostics(&reads, &mut diagnostics, &rewrite, unit);
         assert_eq!(
             diagnostics.len(),
             super::CHANGE_DIAGNOSTICS_MAX,

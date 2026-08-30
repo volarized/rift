@@ -524,6 +524,74 @@ impl Language {
             None => self.name.clone(),
         }
     }
+
+    /// Parses the exact segment form [`Self::identity_segment`] returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LanguageIdentityError`] when the segment is not one lowercase
+    /// language word or two such words separated by one colon.
+    pub fn from_identity_segment(segment: &str) -> Result<Self, LanguageIdentityError> {
+        let (name, dialect) = match segment.split_once(':') {
+            Some((name, dialect)) if !dialect.contains(':') => (name, Some(dialect)),
+            Some(_) => return Err(LanguageIdentityError::new(segment)),
+            None => (segment, None),
+        };
+        if !is_language_word(name) || dialect.is_some_and(|dialect| !is_language_word(dialect)) {
+            return Err(LanguageIdentityError::new(segment));
+        }
+        Ok(Self {
+            name: name.to_owned(),
+            dialect: dialect.map(str::to_owned),
+        })
+    }
+}
+
+/// A language identity segment outside the `name` or `name:dialect` form.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LanguageIdentityError {
+    segment: String,
+}
+
+impl LanguageIdentityError {
+    fn new(segment: &str) -> Self {
+        Self {
+            segment: segment.to_owned(),
+        }
+    }
+
+    /// The segment that failed to parse.
+    #[must_use]
+    pub fn segment(&self) -> &str {
+        &self.segment
+    }
+}
+
+impl std::fmt::Display for LanguageIdentityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "language identity {:?} must use `name` or `name:dialect` with lowercase words",
+            self.segment
+        )
+    }
+}
+
+impl std::error::Error for LanguageIdentityError {}
+
+/// Whether one word matches the language identity form.
+fn is_language_word(word: &str) -> bool {
+    let mut characters = word.chars();
+    let starts_lowercase = characters
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase());
+    starts_lowercase
+        && word.len() <= 64
+        && characters.all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '.' | '_' | '-')
+        })
 }
 
 /// A byte range of one file and the language used to parse it. The owner of `App.svelte`
@@ -913,7 +981,9 @@ pub struct Parameter {
 /// and `.` or `..` segments are refused before the filesystem is touched. The limit is 1000
 /// UTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal
 /// fails the read that touches them with `content_unavailable`.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Debug, Default, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct ProjectPath(
@@ -1728,6 +1798,22 @@ mod tests {
     use schemars::schema_for;
     use serde_json::json;
 
+    /// A refused identity segment renders with the segment it read and the two
+    /// forms it accepts, so an operator fixing `rift.toml` sees both.
+    #[test]
+    fn a_refused_language_identity_names_the_segment_and_the_accepted_forms() {
+        let error =
+            Language::from_identity_segment("Rust").expect_err("an uppercase word is refused");
+        assert_eq!(error.segment(), "Rust");
+        let rendered = error.to_string();
+        assert!(rendered.contains("\"Rust\""), "{rendered}");
+        assert!(rendered.contains("name:dialect"), "{rendered}");
+        assert!(
+            std::error::Error::source(&error).is_none(),
+            "the refusal carries no source"
+        );
+    }
+
     /// Attribute arguments and `#[serde(default = ...)]` functions are both compiled apart
     /// from the schema; this pins the advertised default to the constant the field's
     /// default function returns.
@@ -1807,6 +1893,20 @@ mod tests {
             dialect: Some("tsx".to_owned()),
         };
         assert_eq!(language.identity_segment(), "typescript:tsx");
+    }
+
+    #[test]
+    fn language_identity_segment_parser_is_exact_inverse() {
+        for segment in ["rust", "typescript:tsx", "objective-c"] {
+            let language = Language::from_identity_segment(segment).expect("valid identity");
+            assert_eq!(language.identity_segment(), segment);
+        }
+        for segment in ["", "Rust", "rust:", ":rs", "rust:macro:item", "rust lang"] {
+            let error = Language::from_identity_segment(segment).expect_err("invalid identity");
+            assert_eq!(error.segment(), segment);
+        }
+        let oversized = format!("a{}", "b".repeat(64));
+        assert!(Language::from_identity_segment(&oversized).is_err());
     }
 
     #[test]

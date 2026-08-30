@@ -107,7 +107,7 @@ fn corpus() -> Vec<(&'static str, Value)> {
                 "body": "pub fn beacon_three( {"
             }),
         ),
-        // The shared fixture configures no `[engines]` tables, so the
+        // The shared fixture configures no language LSP binding, so the
         // rename refuses `unsupported` with the no-engine capability text.
         (
             "rename_symbol",
@@ -127,7 +127,7 @@ fn corpus() -> Vec<(&'static str, Value)> {
     requests
 }
 
-/// `remove_symbol` requests with no `[engines]` table configured: this fixture proves the
+/// `remove_symbol` requests with no language LSP binding: this fixture proves the
 /// schema and pagination arms the corpus walk needs, not the engine-checked reference arm -
 /// `live_rust_analyzer.rs`'s `remove_symbol_with_a_standing_reference_refuses_and_names_the_caller`
 /// is what proves a real engine's `no_references` precondition, gated behind
@@ -257,7 +257,7 @@ fn patch_corpus() -> Vec<(&'static str, Value)> {
 }
 
 /// `move_file` requests: an applied move into a created directory - the
-/// fixture configures no `[engines]` tables, so its summary carries the
+/// fixture configures no language LSP binding, so its summary carries the
 /// references-not-updated warning - a missing source, and an occupied
 /// destination. `fresh.rs` exists because the patch corpus created it.
 fn move_file_corpus() -> Vec<(&'static str, Value)> {
@@ -564,7 +564,7 @@ async fn served_fixture() -> TestResult<(
         directory.path().join("notes.txt"),
         "Beacon telemetry guidance covers rotating every legacy sensor unit safely.\n",
     )?;
-    // No `[engines]` table stands over this fixture, so both files remove unchecked; a real
+    // No language LSP binding exists in this fixture, so both files remove unchecked; a real
     // engine's own standing-reference refusal is proven in `live_rust_analyzer.rs` instead.
     // `remove_caller.rs` still calls `beacon_watched`, so a future engine-backed suite that
     // reuses this shape finds the reference this fixture cannot check.
@@ -587,7 +587,7 @@ async fn served_fixture() -> TestResult<(
     // `hidden.rs` stays gitignored and uncommitted, everything else lands in
     // the fixture's one commit on `main`.
     //
-    // No `[engines]` table: this fixture proves schema and pagination, not engine-checked
+    // No language LSP binding: this fixture proves schema and pagination, not engine-checked
     // behavior, so `rename_symbol`, `move_file`, and `remove_symbol` all take their
     // no-engine-configured arm. `live_rust_analyzer.rs` and `live_typescript.rs` prove the
     // engine-covered arms of every one of those tools against a real engine.
@@ -1131,7 +1131,7 @@ async fn live_witnessed_replace_node_lands_and_validates() -> TestResult {
 
 /// A fresh witnessed node address round-trips through `remove_node` the way
 /// [`live_witnessed_replace_node_lands_and_validates`] proves it for `replace_node`: no
-/// `[engines]` table stands over this fixture, so the removal applies unchecked and the
+/// language LSP binding exists in this fixture, so the removal applies unchecked and the
 /// listed node's own declaration is what disappears.
 #[tokio::test]
 async fn live_witnessed_remove_node_round_trips_and_validates() -> TestResult {
@@ -1196,11 +1196,9 @@ async fn hooked_change_carries_validated_guarantees_and_findings() -> TestResult
         hermetic_search::SEMANTIC_DISABLED.to_owned()
             + r#"
 [[hooks]]
-type = "command"
 id = "echoes"
 kind = "other"
-program = "echo"
-arguments = ["checked"]
+command = ["echo", "checked"]
 changed_paths = "append"
 writes = "none"
 working_directory = ""
@@ -1214,11 +1212,9 @@ guarantees = [
 determinism = "deterministic"
 
 [[hooks]]
-type = "command"
 id = "refuses"
 kind = "other"
-program = "false"
-arguments = []
+command = "false"
 changed_paths = "none"
 writes = "none"
 working_directory = ""

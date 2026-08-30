@@ -191,8 +191,11 @@ hit. The ranked lane placed it, so the hit is tagged `matched_by: ["ranked"]`, n
 }
 ```
 
-Every visible bounded UTF-8 file without a NUL byte joins the same index, independent of language
-or extension. A hit on one of those files returns as a `file` hit, tagged
+<VersionBadge version="v0.0.25" />
+
+Every visible bounded UTF-8 file without a NUL byte joins the same index when its effective
+language entry or [`[search.text].include`](/docs/configuration#search) selects it. A hit on one
+of those files returns as a `file` hit, tagged
 `matched_by: ["ranked"]` the same way:
 
 **Request:**
@@ -226,15 +229,10 @@ or extension. A hit on one of those files returns as a `file` hit, tagged
 }
 ```
 
-A visible file with no extension - `justfile`, `Dockerfile` - follows the same rule:
+A path carrying no extension - `justfile`, `Dockerfile` - is selected by the same patterns and
+returns the same way, because the selection reads the whole project-relative path.
 
-```json
-{ "query": "cargo fmt --all --check" }
-```
-
-returns `justfile` the same way: a `file` hit carrying `semantic: false`.
-
-Neither hit above carries `source`: a request pays that lookup only when `include` names it.
+The hit above carries no `source`: a request pays that lookup only when `include` names it.
 `include: ["source"]` attaches the excerpt as `source` on every hit; an omitted `include` returns
 the hit's symbol or file, `path`, `span`, and `line` alone, as both hits above do.
 
@@ -276,6 +274,24 @@ set and an `unavailable` reason rather than a refusal.
 `[logs] page_records` bounds one read; `retention_records` bounds the store. Both are
 [workspace configuration](/docs/configuration#logs).
 
+### Workspace [#resource-workspace]
+
+<VersionBadge version="v0.0.25" />
+
+`rift://workspace` reads accepted configuration together with one captured source catalog page.
+The answer carries:
+
+- `configuration_revision` - an eight-character digest of the accepted `rift.toml` bytes
+- `languages` - effective identities in order, with enabled state, include and exclude patterns,
+  syntax availability, execution permission, and selected LSP process state
+- `hooks` - configured hook identities, kinds, and effective path selection
+- `source` - captured project paths, content digests, and matched language identities
+- `pagination` - the zero-based page and total page count
+
+The bare URI selects page zero. `rift://workspace?page_index=1` selects another page. Each page
+holds at most 1000 source units; language and hook summaries repeat so every page can be read
+alone. A page past the end returns an empty `source` list with the true page count.
+
 ### Planned resources
 
 <VersionBadge version="planned" />
@@ -284,7 +300,6 @@ Resources expose workspace state to consumers such as a UI. They carry data shap
 
 | Resource | Content |
 | --- | --- |
-| [`rift://workspace{?page_index}`](#resource-workspace) | source catalog, per-language providers, limits, and hooks |
 | [`rift://projection/{id}`](#resource-projection) | one projection's path on disk and its state |
 | [`rift://changes{?projection,page_index}`](#resource-changes) | one changeset, each change with its evidence |
 | [`rift://fs{/path}{?start,length,page_index}`](#resource-fs) | a directory's entries, or a bounded range of file bytes |
@@ -300,10 +315,6 @@ projection manifest, so a shell write appears in the same changeset as a server-
 A paged resource answer carries `pagination` the same way the read tools do. A file-range read
 continues by byte offset; the payload's `digest` detects a file change and requires a restart
 from offset zero.
-
-The workspace resource pages through the captured source catalog. Each unit identifies its
-owner, package, source kind, language, and content digest; resolver summaries explain which
-discovery revisions produced that catalog.
 
 ## Changes
 
@@ -387,7 +398,7 @@ never reported as the same.
 
 The [language engine](/docs/architecture#semantic-edits) configured for the symbol's language
 proposes the edit set; the server compiles that proposal into the same witnessed rewrites every
-change tool produces. A language no [`[engines]`](/docs/configuration#engines) table claims
+change tool produces. A language with no selected [`lsp`](/docs/configuration#languages-and-lsp)
 refuses as `unsupported`, and an engine that declines the new name refuses as
 `unmet_precondition` naming `engine_proposed_edits`, carrying the engine's own words. After the
 change applies, the server sweeps the tree for surviving occurrences of the old name and reports
@@ -556,10 +567,8 @@ A workspace already at the `max_concurrent` bound of the
 [`[execution]`](/docs/configuration#execution) section returns `temporarily_unavailable`. The
 caller may send the same request after an evaluation slot becomes free.
 
-`execute` needs `rift.toml` to allow the language and a runtime to serve it. The
-[`rift://workspace`](#resource-workspace) resource reports what survives that intersection; a
-call that outruns a stale read of it comes back as `capability_unavailable`, and reading the
-resource again shows what changed.
+`execute` needs `rift.toml` to allow the exact language and a runtime to serve it. A call without
+both refuses with `capability_unavailable`.
 
 ## Errors
 

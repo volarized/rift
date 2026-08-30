@@ -6,7 +6,8 @@ use std::sync::Arc;
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::constants::DIGEST_WIRE_CHARS;
 use rift_core::{
-    Error, ErrorCode, ErrorContext, ErrorName, Fault, SourceVisibility, TextFileInclusion,
+    Error, ErrorCode, ErrorContext, ErrorName, Fault, LanguageFileSelections, SourceVisibility,
+    TextFileInclusion,
 };
 use rift_history::{HistoryError, Repository};
 use rift_index::{
@@ -235,7 +236,9 @@ impl ReadFault {
         })
     }
 
-    pub(crate) fn index(source: WorkspaceIndexError) -> ReadError {
+    /// Keeps an indexing failure's registry identity in one read failure.
+    #[must_use]
+    pub fn index(source: WorkspaceIndexError) -> ReadError {
         Error::new(Self::Index(source))
     }
 
@@ -310,6 +313,30 @@ impl ReadService {
         text_inclusion: &TextFileInclusion,
         history: HistoryConfiguration,
     ) -> Result<Self, ReadError> {
+        Self::build_with_languages(
+            root,
+            limits,
+            visibility,
+            text_inclusion,
+            &LanguageFileSelections::default(),
+            history,
+        )
+    }
+
+    /// Builds one current-tree snapshot with configured language entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when configuration or root cannot be indexed
+    /// within bounds.
+    pub fn build_with_languages(
+        root: &Path,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+        text_inclusion: &TextFileInclusion,
+        languages: &LanguageFileSelections,
+        history: HistoryConfiguration,
+    ) -> Result<Self, ReadError> {
         let span = tracing::info_span!(
             "index.build",
             component = "index",
@@ -318,16 +345,28 @@ impl ReadService {
             outcome = tracing::field::Empty,
         );
         let _entered = span.enter();
-        let index =
-            WorkspaceIndex::build(root, limits, visibility, text_inclusion).map_err(|source| {
-                span.record("outcome", "error");
-                ReadFault::index(source)
-            })?;
-        let source_policy = WorkspaceSourcePolicy::build(root, limits, visibility, text_inclusion)
-            .map_err(|source| {
-                span.record("outcome", "error");
-                ReadFault::index(source)
-            })?;
+        let index = WorkspaceIndex::build_with_languages(
+            root,
+            limits,
+            visibility,
+            text_inclusion,
+            languages,
+        )
+        .map_err(|source| {
+            span.record("outcome", "error");
+            ReadFault::index(source)
+        })?;
+        let source_policy = WorkspaceSourcePolicy::build_with_languages(
+            root,
+            limits,
+            visibility,
+            text_inclusion,
+            languages,
+        )
+        .map_err(|source| {
+            span.record("outcome", "error");
+            ReadFault::index(source)
+        })?;
         let revisions = captured_revisions(&index);
         span.record("files_count", index.file_count());
         span.record("tree_revision", revisions.wire_tree_revision());
@@ -348,6 +387,46 @@ impl ReadService {
     #[must_use]
     pub fn workspace_digests(&self) -> WorkspaceDigests {
         self.index.digests()
+    }
+
+    /// The visibility policy this snapshot reads the filesystem through.
+    ///
+    /// A revision snapshot answers from version control alone and carries none,
+    /// so every capture that touches the tree refuses here first, naming the
+    /// operation the caller asked for.
+    fn filesystem_policy(
+        &self,
+        operation: &'static str,
+    ) -> Result<&WorkspaceSourcePolicy, ReadError> {
+        self.source_policy
+            .as_deref()
+            .ok_or_else(|| ReadFault::task(operation, "a revision snapshot has no filesystem tree"))
+    }
+
+    /// Captures live visible regular-file paths for a workspace change hook.
+    ///
+    /// Bytes stay absent when configured file or workspace bounds stop content capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when this is a revision snapshot or discovery fails.
+    pub fn capture_visible_workspace_entries(
+        &self,
+    ) -> Result<Vec<rift_index::VisibleWorkspaceEntry>, ReadError> {
+        self.filesystem_policy("capture visible workspace entries")?
+            .visible_entries()
+            .map_err(ReadFault::index)
+    }
+
+    /// Returns every visible regular file's content digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when this is a revision snapshot or capture fails.
+    pub fn visible_workspace_digests(&self) -> Result<WorkspaceDigests, ReadError> {
+        self.filesystem_policy("capture visible workspace digests")?
+            .visible_digests()
+            .map_err(ReadFault::index)
     }
 
     /// The digest of the bytes this snapshot indexed at `path`, or nothing when it indexes
@@ -416,13 +495,45 @@ impl ReadService {
         visibility: &SourceVisibility,
         history: HistoryConfiguration,
     ) -> Result<Self, ReadError> {
+        Self::at_revision_with_languages(
+            root,
+            rev,
+            limits,
+            visibility,
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+            history,
+        )
+    }
+
+    /// Builds one revision snapshot with configured language entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when revision or configuration cannot be served.
+    pub fn at_revision_with_languages(
+        root: &Path,
+        rev: &RevisionId,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+        text_inclusion: &TextFileInclusion,
+        languages: &LanguageFileSelections,
+        history: HistoryConfiguration,
+    ) -> Result<Self, ReadError> {
         if let Some(violation) = rev.violation() {
             return Err(ReadFault::invalid("rev", violation.as_str()));
         }
         let repository = Repository::open(root).map_err(ReadFault::history)?;
         let resolved = repository.resolve(&rev.0).map_err(ReadFault::history)?;
-        let index = WorkspaceIndex::at_revision(&repository, &resolved, limits, visibility)
-            .map_err(ReadFault::index)?;
+        let index = WorkspaceIndex::at_revision_with_languages(
+            &repository,
+            &resolved,
+            limits,
+            visibility,
+            text_inclusion,
+            languages,
+        )
+        .map_err(ReadFault::index)?;
         let revisions = captured_revisions(&index);
         Ok(Self {
             index,
@@ -543,16 +654,20 @@ impl ReadService {
 
     /// The failure for a path the syntax index does not hold: `content_unavailable` when
     /// this snapshot's own warnings name `path` as holding invalid UTF-8 - the file exists
-    /// but could not be read - `UnclaimedExtension` naming the unparsed extension when no
-    /// shipped provider parses `path` and this snapshot can confirm the path is real, and
-    /// `not_found` for everything else, including a claimed extension the index simply has
-    /// not read.
+    /// but could not be read - the capability a syntax read lacks when this snapshot can
+    /// confirm the path is real, and `not_found` for everything else, including a claimed
+    /// path the index simply has not read.
     fn missing_file_fault(&self, path: &CoreProjectPath) -> ReadError {
         if self.index_names_invalid_utf8(path) {
             return ReadFault::source_unavailable(path.as_str());
         }
-        match self.unclaimed_extension_capability(path) {
-            Ok(Some(extension)) => ReadFault::unclaimed_extension(extension),
+        match self.unserved_syntax(path) {
+            Ok(Some(UnservedSyntax::Configurable(capability))) => {
+                ReadFault::unsupported(capability)
+            }
+            Ok(Some(UnservedSyntax::Unclaimed(extension))) => {
+                ReadFault::unclaimed_extension(extension)
+            }
             Ok(None) => ReadFault::not_found(path.as_str()),
             Err(storage_fault) => storage_fault,
         }
@@ -567,31 +682,80 @@ impl ReadService {
             .any(|warning| warning.path() == path)
     }
 
-    /// `Some` naming `path`'s extension, or stating that it carries none, when no
-    /// shipped syntax provider parses it and this snapshot can confirm the path is
-    /// real. On the current tree that means the `[source]` policy makes `path` visible
-    /// and the filesystem holds it; on a revision snapshot, which carries no filesystem
-    /// policy, the extension alone decides, because `nodes` can never serve an
-    /// unclaimed extension whatever tree it is pointed at.
-    fn unclaimed_extension_capability(
+    /// The syntax capability `path` lacks, reported only when this snapshot can
+    /// confirm the path is real.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when two language entries match `path`, or when the
+    /// filesystem cannot answer whether it exists.
+    fn unserved_syntax(&self, path: &CoreProjectPath) -> Result<Option<UnservedSyntax>, ReadError> {
+        let Some(reason) = self.unserved_syntax_reason(path)? else {
+            return Ok(None);
+        };
+        Ok(self.path_is_real(path)?.then_some(reason))
+    }
+
+    /// Why a syntax read cannot serve `path`, or nothing when an enabled language
+    /// entry with a shipped provider claims it.
+    fn unserved_syntax_reason(
+        &self,
+        path: &CoreProjectPath,
+    ) -> Result<Option<UnservedSyntax>, ReadError> {
+        let claim = self
+            .index
+            .language_policy()
+            .language_for_path(Path::new(path.as_str()))
+            .map_err(ReadFault::index)?;
+        Ok(match claim {
+            Some(language) if language.enabled() && language.has_syntax() => None,
+            Some(language) => Some(UnservedSyntax::Configurable(format!(
+                "{} files",
+                language.identity()
+            ))),
+            None => Some(UnservedSyntax::Unclaimed(extension_capability(path))),
+        })
+    }
+
+    /// The exact language identity an engine is asked under for `path`: the
+    /// indexed file's own language, or the effective entry claiming the path when
+    /// no shipped provider parses it. An unshipped language reaches an engine this
+    /// way, because its entry selects a process without contributing syntax facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when two language entries match `path`.
+    pub fn engine_language_segment(
         &self,
         path: &CoreProjectPath,
     ) -> Result<Option<String>, ReadError> {
-        if extension_claimed(path) {
-            return Ok(None);
+        if let Some(file) = self.index.file(path) {
+            return Ok(Some(file.syntax().language().identity_segment()));
         }
+        Ok(self
+            .index
+            .language_policy()
+            .language_for_path(Path::new(path.as_str()))
+            .map_err(ReadFault::index)?
+            .filter(|language| language.enabled())
+            .map(|language| language.identity().to_owned()))
+    }
+
+    /// Whether this snapshot can confirm `path` names a real visible file. On the
+    /// current tree the `[source]` policy has to make `path` visible and the
+    /// filesystem has to hold it; a revision snapshot carries no filesystem policy,
+    /// so the tree it was built from is the answer.
+    fn path_is_real(&self, path: &CoreProjectPath) -> Result<bool, ReadError> {
         let Some(policy) = self.source_policy.as_deref() else {
-            return Ok(Some(extension_capability(path)));
+            return Ok(true);
         };
         let absolute = self.index.root().join(path.as_str());
         if !policy.visible(&absolute) {
-            return Ok(None);
+            return Ok(false);
         }
-        match absolute.try_exists() {
-            Ok(true) => Ok(Some(extension_capability(path))),
-            Ok(false) => Ok(None),
-            Err(error) => Err(ReadFault::storage(path.as_str(), "stat", &error)),
-        }
+        absolute
+            .try_exists()
+            .map_err(|error| ReadFault::storage(path.as_str(), "stat", &error))
     }
 
     /// Finds declarations by name, with each hit's version-control timeline
@@ -896,16 +1060,18 @@ fn language_selects(filter: &Language, candidate: &Language) -> bool {
         && (filter.dialect.is_none() || filter.dialect == candidate.dialect)
 }
 
-/// Whether some shipped syntax provider parses `path`'s extension.
-fn extension_claimed(path: &CoreProjectPath) -> bool {
-    Path::new(path.as_str())
-        .extension()
-        .and_then(OsStr::to_str)
-        .is_some_and(|extension| registry::provider_for_extension(extension).is_some())
+/// Why a syntax read cannot serve one path.
+#[derive(Debug)]
+enum UnservedSyntax {
+    /// A language entry claims the path, and this workspace either turned that
+    /// entry off or ships no grammar for it. Configuration can serve the path.
+    Configurable(String),
+    /// No language entry claims the path, so no shipped grammar parses it.
+    Unclaimed(String),
 }
 
-/// The `Unsupported` capability text for a path no syntax provider parses: the
-/// extension itself, or a statement that the path carries none.
+/// The capability text for a path no language entry claims: the extension
+/// itself, or a statement that the path carries none.
 fn extension_capability(path: &CoreProjectPath) -> String {
     match Path::new(path.as_str()).extension().and_then(OsStr::to_str) {
         Some(extension) => format!("{extension} files"),
@@ -1182,7 +1348,8 @@ mod tests {
     use std::error::Error;
     use std::fs;
 
-    use rift_core::SourceVisibility;
+    use rift_core::{LanguageFileSelections, SourceVisibility};
+    use rift_protocol::configuration::{LanguageConfiguration, WorkspaceConfiguration};
     use rift_protocol::read::{
         GetSymbolParams, Language, NodeFacet, NodesParams, NodesResult, ProjectPath, ReadWarning,
         RevisionId,
@@ -1194,6 +1361,88 @@ mod tests {
     use super::{HistoryConfiguration, ReadFault, ReadService, WorkspaceIndexLimits, file_id};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+    /// A read snapshot over `root` under `limits` and `languages`, built through the
+    /// same entry point the server itself uses.
+    fn reads_with(
+        root: &std::path::Path,
+        limits: WorkspaceIndexLimits,
+        text_inclusion: &rift_core::TextFileInclusion,
+        languages: &LanguageFileSelections,
+    ) -> Result<ReadService, super::ReadError> {
+        ReadService::build_with_languages(
+            root,
+            limits,
+            &SourceVisibility::default(),
+            text_inclusion,
+            languages,
+            HistoryConfiguration::default(),
+        )
+    }
+
+    /// One workspace whose `rust` entry is turned off: `lib.rs` stays a real visible
+    /// file that no shipped grammar reaches.
+    fn disabled_rust_fixture() -> TestResult<(TempDir, ReadService)> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.languages.insert(
+            "rust".to_owned(),
+            LanguageConfiguration {
+                enabled: false,
+                ..LanguageConfiguration::default()
+            },
+        );
+        let languages = LanguageFileSelections::from(&configuration);
+        let limits = WorkspaceIndexLimits::default();
+        let text_inclusion = rift_core::TextFileInclusion::default();
+        let service = reads_with(directory.path(), limits, &text_inclusion, &languages)?;
+        Ok((directory, service))
+    }
+
+    #[test]
+    fn nodes_on_a_path_a_disabled_language_claims_name_the_configurable_capability() -> TestResult {
+        let (_directory, service) = disabled_rust_fixture()?;
+
+        let error = service
+            .nodes(NodesParams {
+                path: ProjectPath("lib.rs".to_owned()),
+                position: 0,
+                rev: None,
+            })
+            .expect_err("a language entry that is turned off serves no syntax");
+
+        let fault = error.fault();
+        assert!(
+            matches!(fault, ReadFault::Unsupported { capability } if capability == "rust files"),
+            "an entry the workspace can turn back on refuses as a capability, not as an \
+             unclaimed extension: {fault:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_gitignore_chain_past_the_file_bound_refuses_the_snapshot() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join(".gitignore"), "build\n")?;
+        fs::create_dir(directory.path().join("nested"))?;
+        fs::write(directory.path().join("nested/.gitignore"), "out\n")?;
+        let limits = WorkspaceIndexLimits::new(1, 1_024, 1_048_576, 16, 64)?;
+        // No text pattern selects the ignore files themselves, so the index reads none of
+        // them and the file bound is spent on the chain the source policy compiles.
+        let text_inclusion = rift_core::TextFileInclusion::new(Vec::new(), 1_024);
+        let languages = LanguageFileSelections::default();
+
+        let error = reads_with(directory.path(), limits, &text_inclusion, &languages)
+            .expect_err("an ignore chain past the file bound cannot be compiled");
+
+        let fault = error.fault();
+        assert!(
+            matches!(fault, ReadFault::Index(_)),
+            "unexpected fault {fault:?}"
+        );
+        Ok(())
+    }
 
     fn fixture() -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
@@ -2837,6 +3086,37 @@ pub fn compute() -> i32 {
             &SourceVisibility::default(),
             HistoryConfiguration::default(),
         )
+    }
+
+    #[test]
+    fn a_revision_snapshot_names_the_capture_it_refuses() -> TestResult {
+        let directory = committed_fixture()?;
+        let service = revision_service(directory.path(), "main")?;
+
+        let entries = service
+            .capture_visible_workspace_entries()
+            .expect_err("a revision snapshot has no filesystem tree to walk");
+        let digests = service
+            .visible_workspace_digests()
+            .expect_err("a revision snapshot has no filesystem tree to digest");
+
+        let entries_fault = entries.fault();
+        assert!(
+            matches!(
+                entries_fault,
+                ReadFault::Task { operation, .. } if *operation == "capture visible workspace entries"
+            ),
+            "unexpected fault {entries_fault:?}"
+        );
+        let digests_fault = digests.fault();
+        assert!(
+            matches!(
+                digests_fault,
+                ReadFault::Task { operation, .. } if *operation == "capture visible workspace digests"
+            ),
+            "unexpected fault {digests_fault:?}"
+        );
+        Ok(())
     }
 
     #[test]

@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use crate::lock::{SERVER_PORT_FLOOR, SERVER_PORT_MAX, SERVER_PORT_MIN};
-use crate::read::{CoverageScope, ProjectPath};
+use crate::read::{CoverageScope, Language, PathPattern, ProjectPath};
 use crate::retry::{
     RESTART_ATTEMPTS_MAX, RESTART_ATTEMPTS_MIN, RESTART_WINDOW_MS_MAX, RESTART_WINDOW_MS_MIN,
     RETRY_ATTEMPTS_MAX, RETRY_ATTEMPTS_MIN, RETRY_DELAY_LIMIT_MS_MAX, RETRY_DELAY_LIMIT_MS_MIN,
@@ -30,10 +30,10 @@ pub const SERVER_IDLE_TIMEOUT_MS_MIN: u64 = 1_000;
 /// Milliseconds the server serves after the last request completes before
 /// it stops, at most: one day.
 pub const SERVER_IDLE_TIMEOUT_MS_MAX: u64 = 86_400_000;
-/// Milliseconds a request waits for the workspace and its engines to
+/// Milliseconds a request waits for the workspace and its language services to
 /// prove they are ready to answer, at least: one second.
 pub const SERVER_READINESS_TIMEOUT_MS_MIN: u64 = 1_000;
-/// Milliseconds a request waits for the workspace and its engines to
+/// Milliseconds a request waits for the workspace and its language services to
 /// prove they are ready to answer, at most: one hour.
 pub const SERVER_READINESS_TIMEOUT_MS_MAX: u64 = 3_600_000;
 /// Milliseconds [`ServerConfiguration::readiness_timeout`] defaults to.
@@ -62,8 +62,6 @@ pub const EXECUTION_TIMEOUT_MS_MAX: u64 = 86_400_000;
 pub const EXECUTION_OUTPUT_BYTES_MAX: u64 = 16 << 10;
 /// Evaluations running concurrently across the workspace, at most.
 pub const EXECUTION_CONCURRENT_MAX: u64 = 64;
-/// Entries `execution.allow` may hold, at most.
-pub const EXECUTION_ALLOW_ITEMS_MAX: usize = 64;
 /// Revisions the history provider may walk from the current head, at most.
 pub const HISTORY_REVISIONS_MAX: u64 = 100_000;
 /// Bytes `search.semantic.model` may hold, at most.
@@ -72,8 +70,12 @@ pub const SEMANTIC_MODEL_BYTES_MAX: usize = 128;
 pub const HOOKS_MAX: usize = 32;
 /// Bytes one hook's `id` may hold, at most.
 pub const HOOK_ID_BYTES_MAX: usize = 64;
-/// Entries one hook's `arguments` may hold, at most.
-pub const HOOK_ARGUMENTS_MAX: usize = 64;
+/// Literal arguments one configured command may hold, at most.
+pub const COMMAND_ARGUMENTS_MAX: usize = 64;
+/// Bytes one configured command argument may hold, at most.
+pub const COMMAND_ARGUMENT_BYTES_MAX: usize = 4_096;
+/// Path patterns one language, hook, or text-search table may hold, at most.
+pub const CONFIGURATION_PATTERNS_MAX: usize = 64;
 /// Entries one hook's `environment` may hold, at most.
 pub const HOOK_ENVIRONMENT_ENTRIES_MAX: usize = 64;
 /// Milliseconds one hook may run before Rift kills it, at most: one hour.
@@ -86,34 +88,33 @@ pub const HOOK_OUTPUT_BYTES_MAX: u64 = 4_096;
 pub const HOOK_GUARANTEES_MAX: usize = 16;
 /// Bytes one guarantee's `detail` may hold, at most.
 pub const HOOK_GUARANTEE_DETAIL_BYTES_MAX: usize = 1_024;
-/// Configured language engines one workspace may declare, at most.
-pub const ENGINES_MAX: usize = 16;
-/// Entries one engine's `arguments` may hold, at most.
-pub const ENGINE_ARGUMENTS_MAX: usize = 64;
-/// Bytes one engine argument may hold, at most.
-pub const ENGINE_ARGUMENT_BYTES_MAX: usize = 4_096;
-/// Entries one engine's `environment` may hold, at most.
-pub const ENGINE_ENVIRONMENT_ENTRIES_MAX: usize = 64;
-/// Entries one engine's `languages` may hold, at most.
-pub const ENGINE_LANGUAGES_MAX: usize = 16;
-/// Milliseconds one engine may take to initialize, at least: one second.
-pub const ENGINE_STARTUP_TIMEOUT_MS_MIN: u64 = 1_000;
-/// Milliseconds one engine may take to initialize, at most: ten minutes.
-pub const ENGINE_STARTUP_TIMEOUT_MS_MAX: u64 = 600_000;
-/// Milliseconds `engines.startup_timeout` holds when the key is absent.
-const ENGINE_STARTUP_TIMEOUT_MS_DEFAULT: u64 = 30_000;
-/// Milliseconds one engine request may run, at least: one second.
-pub const ENGINE_REQUEST_TIMEOUT_MS_MIN: u64 = 1_000;
-/// Milliseconds one engine request may run, at most: ten minutes.
-pub const ENGINE_REQUEST_TIMEOUT_MS_MAX: u64 = 600_000;
-/// Milliseconds `engines.request_timeout` holds when the key is absent.
-const ENGINE_REQUEST_TIMEOUT_MS_DEFAULT: u64 = 60_000;
-/// Bytes of each engine's standard error Rift keeps, at least.
-pub const ENGINE_OUTPUT_BYTES_MIN: u64 = 1_024;
-/// Bytes of each engine's standard error Rift keeps, at most.
-pub const ENGINE_OUTPUT_BYTES_MAX: u64 = 8 << 20;
-/// Bytes `engines.output_limit` holds when the key is absent.
-const ENGINE_OUTPUT_BYTES_DEFAULT: u64 = 4_096;
+/// The pattern `[search.text].include` carries when the key is absent: every
+/// visible path no language entry claimed joins the text index.
+pub const TEXT_INCLUDE_PATTERN_DEFAULT: &str = "**";
+/// Configured exact languages one workspace may declare, at most.
+pub const LANGUAGES_MAX: usize = 64;
+/// Named LSP processes one workspace may declare, at most.
+pub const LSP_CONFIGURATIONS_MAX: usize = 16;
+/// Entries one LSP process's `environment` may hold, at most.
+pub const LSP_ENVIRONMENT_ENTRIES_MAX: usize = 64;
+/// Milliseconds one LSP process may take to initialize, at least: one second.
+pub const LSP_STARTUP_TIMEOUT_MS_MIN: u64 = 1_000;
+/// Milliseconds one LSP process may take to initialize, at most: ten minutes.
+pub const LSP_STARTUP_TIMEOUT_MS_MAX: u64 = 600_000;
+/// Milliseconds `lsp.startup_timeout` holds when the key is absent.
+const LSP_STARTUP_TIMEOUT_MS_DEFAULT: u64 = 30_000;
+/// Milliseconds one LSP request may run, at least: one second.
+pub const LSP_REQUEST_TIMEOUT_MS_MIN: u64 = 1_000;
+/// Milliseconds one LSP request may run, at most: ten minutes.
+pub const LSP_REQUEST_TIMEOUT_MS_MAX: u64 = 600_000;
+/// Milliseconds `lsp.request_timeout` holds when the key is absent.
+const LSP_REQUEST_TIMEOUT_MS_DEFAULT: u64 = 60_000;
+/// Bytes of each LSP process's standard error Rift keeps, at least.
+pub const LSP_OUTPUT_BYTES_MIN: u64 = 1_024;
+/// Bytes of each LSP process's standard error Rift keeps, at most.
+pub const LSP_OUTPUT_BYTES_MAX: u64 = 8 << 20;
+/// Bytes `lsp.output_limit` holds when the key is absent.
+const LSP_OUTPUT_BYTES_DEFAULT: u64 = 4_096;
 
 /// The spelling a [`ByteSize`] value must match.
 const BYTE_SIZE_PATTERN: &str = "^(?:0|[1-9][0-9]*)(?:b|kb|mb|gb|tb)$";
@@ -361,6 +362,7 @@ fn split_magnitude<'text>(
 /// file as `configuration_invalid`.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[schemars(transform = crate::schema::declare_workspace_contract)]
 pub struct WorkspaceConfiguration {
     /// The server's own blocking-work bounds: worker count and queue wait.
     pub server: ServerConfiguration,
@@ -379,9 +381,10 @@ pub struct WorkspaceConfiguration {
     /// applies.
     #[schemars(length(max = 32))]
     pub hooks: Vec<CommandHook>,
-    /// Language engines keyed by name: each `[engines.<name>]` table names
-    /// an external LSP server and the languages it serves.
-    pub engines: BTreeMap<String, EngineConfiguration>,
+    /// Exact language entries keyed by their `name` or `name:dialect` identity segment.
+    pub languages: BTreeMap<String, LanguageConfiguration>,
+    /// Shared LSP processes keyed by name. Language entries select them explicitly.
+    pub lsp: BTreeMap<String, LspConfiguration>,
 }
 
 impl WorkspaceConfiguration {
@@ -398,6 +401,25 @@ impl WorkspaceConfiguration {
         }
     }
 
+    /// Resolves one language entry's named or inline LSP process.
+    #[must_use]
+    pub fn resolve_language_lsp(&self, identity: &str) -> Option<ResolvedLspConfiguration<'_>> {
+        match self.languages.get(identity)?.lsp.as_ref()? {
+            LanguageLspConfiguration::Named(name) => {
+                self.lsp
+                    .get(name)
+                    .map(|configuration| ResolvedLspConfiguration {
+                        name: Some(name),
+                        configuration,
+                    })
+            }
+            LanguageLspConfiguration::Inline(configuration) => Some(ResolvedLspConfiguration {
+                name: None,
+                configuration,
+            }),
+        }
+    }
+
     /// The first violated bound, in the order the file declares its tables.
     fn violation(&self) -> Option<ConfigurationViolation> {
         self.server
@@ -408,8 +430,18 @@ impl WorkspaceConfiguration {
             .or_else(|| self.source.violation())
             .or_else(|| self.logs.violation())
             .or_else(|| hooks_violation(&self.hooks))
-            .or_else(|| engines_violation(&self.engines))
+            .or_else(|| languages_violation(&self.languages, &self.lsp))
+            .or_else(|| lsp_configurations_violation(&self.lsp))
     }
+}
+
+/// One language entry's resolved LSP process.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ResolvedLspConfiguration<'configuration> {
+    /// Shared process name, or absent for an inline process.
+    pub name: Option<&'configuration str>,
+    /// Process configuration selected by the language entry.
+    pub configuration: &'configuration LspConfiguration,
 }
 
 /// The `[server]` table. Filesystem scans and parses run on a bounded
@@ -430,9 +462,9 @@ pub struct ServerConfiguration {
     /// the server while no request remains active, 1s to 1d.
     pub idle_timeout: Duration,
     /// Wall-clock bound one request waits for the workspace's index and
-    /// its language engines to prove they are ready to answer, 1s to 1h.
+    /// its language services to prove they are ready to answer, 1s to 1h.
     /// One deadline: index validation starts it, and once a request
-    /// resolves the languages it needs, waiting on those engines spends
+    /// resolves the languages it needs, waiting on those services spends
     /// what remains of it.
     pub readiness_timeout: Duration,
     /// The exact loopback port the server binds, 1024 or above. Excludes
@@ -660,16 +692,12 @@ impl HistoryConfiguration {
     }
 }
 
-/// The `[execution]` table. `execute` stays off until `allow` names the
-/// languages caller-provided code may run as.
+/// The `[execution]` table. Exact language entries enable execution; this
+/// table owns the workspace-wide bounds.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_execution_ranges)]
 pub struct ExecutionConfiguration {
-    /// Language selectors enabled for `execute`: a language name, or
-    /// `name:dialect` to pin a dialect. Empty keeps execution off.
-    #[schemars(length(max = 64))]
-    pub allow: Vec<String>,
     /// Bytes one submitted block may hold, 1b to 32kb.
     pub max_code: ByteSize,
     /// Wall-clock bound per evaluation, 1ms to 1d.
@@ -684,7 +712,6 @@ pub struct ExecutionConfiguration {
 impl Default for ExecutionConfiguration {
     fn default() -> Self {
         Self {
-            allow: Vec::new(),
             max_code: ByteSize::from_bytes(16 << 10),
             max_timeout: Duration::from_millis(30_000),
             max_output: ByteSize::from_bytes(8 << 10),
@@ -694,15 +721,9 @@ impl Default for ExecutionConfiguration {
 }
 
 impl ExecutionConfiguration {
-    /// The table's bounds in key order, then the selector rule.
+    /// The table's bounds in key order.
     fn violation(&self) -> Option<ConfigurationViolation> {
         let limits = [
-            (
-                "execution.allow",
-                self.allow.len() as u64,
-                0,
-                EXECUTION_ALLOW_ITEMS_MAX as u64,
-            ),
             (
                 "execution.max_code",
                 self.max_code.bytes(),
@@ -728,14 +749,7 @@ impl ExecutionConfiguration {
                 EXECUTION_CONCURRENT_MAX,
             ),
         ];
-        first_out_of_range(limits).or_else(|| {
-            self.allow
-                .iter()
-                .find(|selector| !is_language_selector(selector))
-                .map(|selector| ConfigurationViolation::LanguageSelectorInvalid {
-                    selector: selector.clone(),
-                })
-        })
+        first_out_of_range(limits)
     }
 }
 
@@ -1217,12 +1231,17 @@ pub const TEXT_CHUNK_BYTES_MAX: u64 = 16 << 20;
 /// Bytes one lexical chunk from a `search.text` file may hold, by default.
 pub const TEXT_CHUNK_BYTES_DEFAULT: u64 = 1 << 20;
 
-/// The `[search.text]` table. `max_chunk` bounds lexical units derived from
-/// visible text files.
+/// The `[search.text]` table. `include` selects which visible paths join the
+/// text index once every language entry has had its claim, and `max_chunk`
+/// bounds the lexical units derived from them.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_text_ranges)]
 pub struct TextSearchConfiguration {
+    /// Project-relative path patterns included as plain text when no language claims them.
+    /// The default `["**"]` selects every unclaimed visible path; an empty list selects none.
+    #[schemars(length(max = 64))]
+    pub include: Vec<PathPattern>,
     /// Bytes one lexical chunk may hold, 1kb to 16mb. Larger files are indexed as
     /// several chunks of at most this size.
     pub max_chunk: ByteSize,
@@ -1231,6 +1250,7 @@ pub struct TextSearchConfiguration {
 impl Default for TextSearchConfiguration {
     fn default() -> Self {
         Self {
+            include: vec![PathPattern(TEXT_INCLUDE_PATTERN_DEFAULT.to_owned())],
             max_chunk: ByteSize::from_bytes(TEXT_CHUNK_BYTES_DEFAULT),
         }
     }
@@ -1239,66 +1259,199 @@ impl Default for TextSearchConfiguration {
 impl TextSearchConfiguration {
     /// Table numeric bounds.
     fn violation(&self) -> Option<ConfigurationViolation> {
-        first_out_of_range([(
-            "search.text.max_chunk",
-            self.max_chunk.bytes(),
-            TEXT_CHUNK_BYTES_MIN,
-            TEXT_CHUNK_BYTES_MAX,
-        )])
+        first_out_of_range([
+            (
+                "search.text.include",
+                self.include.len() as u64,
+                0,
+                CONFIGURATION_PATTERNS_MAX as u64,
+            ),
+            (
+                "search.text.max_chunk",
+                self.max_chunk.bytes(),
+                TEXT_CHUNK_BYTES_MIN,
+                TEXT_CHUNK_BYTES_MAX,
+            ),
+        ])
+        .or_else(|| path_patterns_violation("search.text.include", &self.include))
+    }
+}
+
+/// One executable command as a program string or a program followed by arguments.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum CommandInput {
+    /// One executable name with no arguments. Whitespace is refused.
+    Program(String),
+    /// Executable first, followed by its literal arguments.
+    ProgramAndArguments(Vec<String>),
+}
+
+impl JsonSchema for CommandInput {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "CommandInput".into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "oneOf": [
+                {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "^\\S+$"
+                },
+                {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 65,
+                    "prefixItems": [{"type": "string", "minLength": 1, "maxLength": 4096}],
+                    "items": {"type": "string", "maxLength": 4096}
+                }
+            ]
+        })
+    }
+}
+
+impl CommandInput {
+    /// The configured executable.
+    #[must_use]
+    pub fn program(&self) -> &str {
+        match self {
+            Self::Program(program) => program,
+            Self::ProgramAndArguments(command) => command.first().map_or("", String::as_str),
+        }
+    }
+
+    /// The configured literal arguments.
+    #[must_use]
+    pub fn arguments(&self) -> &[String] {
+        match self {
+            Self::Program(_) => &[],
+            Self::ProgramAndArguments(command) => command.get(1..).unwrap_or_default(),
+        }
+    }
+
+    fn violation(&self, field: &'static str) -> Option<ConfigurationViolation> {
+        self.program_violation(field)
+            .or_else(|| self.arguments_violation(field))
+    }
+
+    /// The first bound the executable element breaks.
+    ///
+    /// Whitespace refuses the string form alone: there a program carrying a
+    /// space cannot be told from a whole command line. The list form states
+    /// the split itself, so a program name holding a space is accepted.
+    fn program_violation(&self, field: &'static str) -> Option<ConfigurationViolation> {
+        let program = self.program();
+        let string_form = matches!(self, Self::Program(_));
+        match program {
+            "" => Some(ConfigurationViolation::CommandProgramEmpty { field }),
+            _ if program.len() > COMMAND_ARGUMENT_BYTES_MAX => {
+                Some(ConfigurationViolation::CommandProgramOversized {
+                    field,
+                    bytes: program.len() as u64,
+                })
+            }
+            _ if string_form && program.chars().any(char::is_whitespace) => {
+                Some(ConfigurationViolation::CommandProgramWhitespace {
+                    field,
+                    program: program.to_owned(),
+                })
+            }
+            _ if is_absolute_program(program) => {
+                Some(ConfigurationViolation::CommandProgramAbsolute {
+                    field,
+                    program: program.to_owned(),
+                })
+            }
+            _ if program.split('/').any(is_dot_path_segment) => {
+                Some(ConfigurationViolation::CommandProgramDotSegment {
+                    field,
+                    program: program.to_owned(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The first bound the argument list breaks.
+    fn arguments_violation(&self, field: &'static str) -> Option<ConfigurationViolation> {
+        if self.arguments().len() > COMMAND_ARGUMENTS_MAX {
+            return out_of_range(
+                field,
+                self.arguments().len() as u64,
+                0,
+                COMMAND_ARGUMENTS_MAX as u64,
+            );
+        }
+        self.arguments()
+            .iter()
+            .find(|argument| argument.len() > COMMAND_ARGUMENT_BYTES_MAX)
+            .map(
+                |argument| ConfigurationViolation::CommandArgumentOversized {
+                    field,
+                    bytes: argument.len() as u64,
+                },
+            )
     }
 }
 
 /// One `[[hooks]]` command the server runs inside the changed tree.
-/// Every key is required; the schema carries no defaults.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_hook_contract)]
 pub struct CommandHook {
-    /// How the server runs the hook; `command` is the only type.
-    pub r#type: HookType,
     /// Label for this hook's results, unique within the list.
     #[schemars(length(min = 1, max = 64))]
     pub id: String,
     /// What the hook is: a formatter, test suite, linter, build, or another command.
     pub kind: HookKind,
-    /// The executable the server starts. A bare name resolves through `PATH`; a path resolves
-    /// below `working_directory`. Absolute paths and `.` or `..` segments are refused.
-    #[schemars(length(min = 1))]
-    pub program: String,
-    /// The program's literal arguments, in order. May be empty.
-    #[schemars(length(max = 64))]
-    pub arguments: Vec<String>,
-    /// Whether the server appends changed project paths after `arguments`, in byte order.
+    /// Executable and literal arguments. Rift starts it directly without a shell.
+    pub command: CommandInput,
+    /// Whether the server appends changed project paths after the configured command, in byte order.
+    #[serde(default)]
     pub changed_paths: ChangedPaths,
     /// Source files the server permits the hook to change.
+    #[serde(default)]
     pub writes: HookWrites,
     /// Directory the process starts in, relative to the changed tree's root. Empty selects the
     /// root. Absolute paths and `.` or `..` segments are refused.
+    #[serde(default)]
     pub working_directory: ProjectPath,
     /// Environment values added to the environment the server inherited.
+    #[serde(default)]
     pub environment: BTreeMap<String, String>,
     /// Wall-clock bound before the server kills the process, 1ms to 1h.
+    #[serde(default = "default_hook_timeout")]
     pub timeout: Duration,
     /// Bytes of each output stream the server keeps, 256b to 4kb. The full size is still reported.
+    #[serde(default = "default_hook_output_limit")]
     pub output_limit: ByteSize,
     /// Severity the server reports when the hook does not pass.
+    #[serde(default)]
     pub failure_severity: HookFailureSeverity,
     /// What a passing validation establishes. Transform hooks cannot declare guarantees.
+    #[serde(default)]
     #[schemars(length(max = 16))]
     pub guarantees: Vec<HookGuarantee>,
     /// Whether an identical tree and environment are expected to reproduce the result.
     pub determinism: Determinism,
+    /// Project-relative path patterns that select this hook. Empty selects every change.
+    #[serde(default)]
+    #[schemars(length(max = 64))]
+    pub include: Vec<PathPattern>,
+    /// Project-relative path patterns removed from hook selection.
+    #[serde(default)]
+    #[schemars(length(max = 64))]
+    pub exclude: Vec<PathPattern>,
 }
 
-/// How a hook runs; `command` - an executable started directly, without a
-/// shell - is the only type.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum HookType {
-    /// An executable Rift starts directly inside the changed tree.
-    Command,
+fn default_hook_timeout() -> Duration {
+    Duration::from_millis(120_000)
+}
+
+fn default_hook_output_limit() -> ByteSize {
+    ByteSize::from_bytes(4_096)
 }
 
 /// What a hook is, as workspace configuration presents it.
@@ -1321,24 +1474,26 @@ pub enum HookKind {
 
 /// Whether the changed project paths ride the hook's command line.
 #[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+    Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ChangedPaths {
     /// The command runs exactly as configured.
+    #[default]
     None,
-    /// The changed project paths follow the configured `arguments`, in byte
+    /// The changed project paths follow the configured command, in byte
     /// order, for a tool that takes files.
     Append,
 }
 
 /// Source writes the server may retain from one hook.
 #[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+    Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum HookWrites {
     /// A validation hook that may not change source files.
+    #[default]
     None,
     /// A transform hook that may change only paths changed before hooks ran.
     ChangedPaths,
@@ -1362,13 +1517,14 @@ impl HookWrites {
 
 /// Severity the server reports when a hook does not pass.
 #[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+    Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum HookFailureSeverity {
     /// The hook result reports a warning.
     Warning,
     /// The hook result reports an error.
+    #[default]
     Error,
 }
 
@@ -1414,71 +1570,94 @@ pub enum GuaranteeKind {
     BehaviorChecked,
 }
 
-/// One `[engines.<name>]` table: an external LSP server Rift may start.
-///
-/// The key is the engine's name, a lowercase word in the language-name
-/// charset. Rift starts the engine on the first request for a language it
-/// serves, speaks LSP to it over stdio, and reuses the running engine
-/// across requests. The engine never writes: it proposes edits, and Rift
-/// applies them through its own change path.
+/// One external LSP process Rift may start.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(transform = crate::schema::declare_engine_ranges)]
-pub struct EngineConfiguration {
-    /// The executable Rift starts inside the workspace root. An absolute
-    /// path is refused; the name resolves through `PATH`.
-    #[schemars(length(min = 1))]
-    pub program: String,
-    /// The program's literal arguments, in order. May be empty.
-    #[serde(default)]
-    #[schemars(length(max = 64))]
-    pub arguments: Vec<String>,
+#[schemars(transform = crate::schema::declare_lsp_ranges)]
+pub struct LspConfiguration {
+    /// Executable and literal arguments. Rift starts it directly without a shell.
+    pub command: CommandInput,
     /// Environment values added on top of the environment the server
     /// inherited.
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
-    /// The languages this engine serves: a language name, or `name:dialect`
-    /// to pin a dialect. Each segment belongs to at most one engine across
-    /// the whole `[engines]` table. A segment no syntax provider knows is
-    /// accepted: an engine may serve languages the syntax tier does not.
-    #[schemars(length(min = 1, max = 16))]
-    pub languages: Vec<String>,
-    /// Options handed to the engine at initialize. Must be a JSON object
-    /// when present; the engine defines its meaning.
+    /// Options handed to the process at initialize. Must be a JSON object
+    /// when present; the LSP server defines its meaning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initialization_options: Option<serde_json::Value>,
-    /// Wall-clock bound on the engine's initialize handshake, 1s to 10m.
-    #[serde(default = "default_engine_startup_timeout")]
+    /// Wall-clock bound on the process's initialize handshake, 1s to 10m.
+    #[serde(default = "default_lsp_startup_timeout")]
     pub startup_timeout: Duration,
-    /// Wall-clock bound on each later engine request, 1s to 10m.
-    #[serde(default = "default_engine_request_timeout")]
+    /// Wall-clock bound on each later LSP request, 1s to 10m.
+    #[serde(default = "default_lsp_request_timeout")]
     pub request_timeout: Duration,
-    /// Bytes of the engine's standard error Rift keeps, 1kb to 8mb. The
+    /// Bytes of the process's standard error Rift keeps, 1kb to 8mb. The
     /// full size is still reported.
-    #[serde(default = "default_engine_output_limit")]
+    #[serde(default = "default_lsp_output_limit")]
     pub output_limit: ByteSize,
-    /// How often Rift sends this engine the same request again while its
-    /// answer stays unsettled - a refusal the engine invites again, or an
+    /// How often Rift sends this process the same request again while its
+    /// answer stays unsettled - a refusal the process invites again, or an
     /// answer it gave while still analyzing - and how the waits between
     /// those attempts grow.
     #[serde(default)]
     pub retry: RetryPolicy,
-    /// How often Rift replaces this engine on its own, and over what
-    /// window; the budget spent, the engine's own failure surfaces.
+    /// How often Rift replaces this process on its own, and over what
+    /// window; the budget spent, the process's own failure surfaces.
     #[serde(default)]
     pub restart: RestartPolicy,
 }
 
-fn default_engine_startup_timeout() -> Duration {
-    Duration::from_millis(ENGINE_STARTUP_TIMEOUT_MS_DEFAULT)
+fn default_lsp_startup_timeout() -> Duration {
+    Duration::from_millis(LSP_STARTUP_TIMEOUT_MS_DEFAULT)
 }
 
-fn default_engine_request_timeout() -> Duration {
-    Duration::from_millis(ENGINE_REQUEST_TIMEOUT_MS_DEFAULT)
+fn default_lsp_request_timeout() -> Duration {
+    Duration::from_millis(LSP_REQUEST_TIMEOUT_MS_DEFAULT)
 }
 
-fn default_engine_output_limit() -> ByteSize {
-    ByteSize::from_bytes(ENGINE_OUTPUT_BYTES_DEFAULT)
+fn default_lsp_output_limit() -> ByteSize {
+    ByteSize::from_bytes(LSP_OUTPUT_BYTES_DEFAULT)
+}
+
+/// How one exact language selects an LSP process.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum LanguageLspConfiguration {
+    /// Name of one shared top-level `[lsp.<name>]` process.
+    Named(String),
+    /// Process used only by this exact language entry.
+    Inline(LspConfiguration),
+}
+
+/// One exact `[languages.<identity>]` entry.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LanguageConfiguration {
+    /// Whether syntax, LSP service, and execution are enabled for matched paths.
+    pub enabled: bool,
+    /// Replacement path patterns. Absence keeps shipped patterns; an empty list matches none.
+    #[schemars(length(max = 64))]
+    pub include: Option<Vec<PathPattern>>,
+    /// Path patterns removed from this language's effective matches.
+    #[schemars(length(max = 64))]
+    pub exclude: Vec<PathPattern>,
+    /// Whether caller-provided code may execute under this exact language.
+    pub execution: bool,
+    /// Inline LSP process or name of one shared process.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lsp: Option<LanguageLspConfiguration>,
+}
+
+impl Default for LanguageConfiguration {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            include: None,
+            exclude: Vec::new(),
+            execution: false,
+            lsp: None,
+        }
+    }
 }
 
 /// The first bound a configuration file breaks. Field paths name keys as
@@ -1497,10 +1676,26 @@ pub enum ConfigurationViolation {
         /// The largest accepted value.
         max: u64,
     },
-    /// An `execution.allow` entry is not `name` or `name:dialect`.
-    LanguageSelectorInvalid {
-        /// The rejected entry.
-        selector: String,
+    /// A language table key is not `name` or `name:dialect`.
+    LanguageIdentityInvalid {
+        /// The rejected key.
+        language: String,
+    },
+    /// A language names an LSP process absent from the top-level table.
+    LanguageLspUnknown {
+        /// Language entry selecting the process.
+        language: String,
+        /// Missing LSP process name.
+        lsp: String,
+    },
+    /// Two language entries carry the same exact include pattern.
+    LanguageIncludeDuplicate {
+        /// Repeated pattern.
+        pattern: String,
+        /// First language entry carrying it.
+        first: String,
+        /// Later language entry carrying it.
+        second: String,
     },
     /// A `[search.semantic]` identifier is empty, too long, or breaks the form
     /// its declared source sets: `owner/name` with at most one revision after
@@ -1542,26 +1737,45 @@ pub enum ConfigurationViolation {
         /// The rejected id.
         id: String,
     },
-    /// A hook's `program` is empty, so there is nothing to run.
-    HookProgramEmpty {
-        /// The hook missing its executable.
-        id: String,
+    /// A command carries no executable.
+    CommandProgramEmpty {
+        /// Configuration key carrying the command.
+        field: &'static str,
     },
-    /// A hook names its executable by absolute path, which would escape the
-    /// changed tree's `PATH` policy.
-    HookExecutableAbsolute {
-        /// The hook naming the executable.
-        id: String,
-        /// The refused executable path.
+    /// A string command carries whitespace.
+    CommandProgramWhitespace {
+        /// Configuration key carrying the command.
+        field: &'static str,
+        /// Rejected executable.
         program: String,
     },
-    /// A hook's `program` path carries a `.` or `..` segment, which could
-    /// resolve outside `working_directory`.
-    HookProgramDotSegment {
-        /// The hook naming the executable.
-        id: String,
-        /// The refused executable path.
+    /// A command names its executable by absolute path.
+    CommandProgramAbsolute {
+        /// Configuration key carrying the command.
+        field: &'static str,
+        /// Rejected executable.
         program: String,
+    },
+    /// A command program path carries a `.` or `..` segment.
+    CommandProgramDotSegment {
+        /// Configuration key carrying the command.
+        field: &'static str,
+        /// Rejected executable.
+        program: String,
+    },
+    /// One command argument exceeds 4096 bytes.
+    CommandArgumentOversized {
+        /// Configuration key carrying the command.
+        field: &'static str,
+        /// Rejected argument size.
+        bytes: u64,
+    },
+    /// A command executable exceeds 4096 bytes.
+    CommandProgramOversized {
+        /// Configuration key carrying the command.
+        field: &'static str,
+        /// Rejected executable size.
+        bytes: u64,
     },
     /// A hook's `working_directory` is not a project-relative path: it is
     /// absolute, or carries a `.` or `..` segment.
@@ -1578,63 +1792,22 @@ pub enum ConfigurationViolation {
         /// The rejected key.
         key: String,
     },
-    /// An `[engines.<name>]` key is not a lowercase word in the
-    /// language-name charset.
-    EngineNameInvalid {
-        /// The rejected engine name.
+    /// An `[lsp.<name>]` key is not a lowercase word.
+    LspNameInvalid {
+        /// The rejected LSP process name.
         name: String,
     },
-    /// An engine's `program` is empty, so there is nothing to start.
-    EngineProgramEmpty {
-        /// The engine missing its executable.
-        engine: String,
-    },
-    /// An engine names its executable by absolute path, which would escape
-    /// the workspace's `PATH` policy.
-    EngineExecutableAbsolute {
-        /// The engine naming the executable.
-        engine: String,
-        /// The refused executable path.
-        program: String,
-    },
-    /// An engine argument exceeds [`ENGINE_ARGUMENT_BYTES_MAX`] bytes.
-    EngineArgumentOversized {
-        /// The engine declaring the argument.
-        engine: String,
-        /// The oversized argument's length in bytes.
-        bytes: u64,
-    },
-    /// An engine environment key is empty, or carries `=` or a NUL byte.
-    EngineEnvironmentKeyInvalid {
-        /// The engine declaring the entry.
-        engine: String,
+    /// An LSP environment key is empty, or carries `=` or a NUL byte.
+    LspEnvironmentKeyInvalid {
+        /// The LSP process declaring the entry.
+        lsp: String,
         /// The rejected key.
         key: String,
     },
-    /// An engine's `languages` list is empty, so no request could reach it.
-    EngineLanguagesEmpty {
-        /// The engine serving no language.
-        engine: String,
-    },
-    /// An engine `languages` entry is not `name` or `name:dialect`.
-    EngineLanguageInvalid {
-        /// The engine declaring the entry.
-        engine: String,
-        /// The rejected entry.
-        language: String,
-    },
-    /// Two engine `languages` entries claim one language identity segment,
-    /// so a request for it could not pick an engine.
-    EngineLanguageDuplicate {
-        /// The engine claiming the segment again.
-        engine: String,
-        /// The language identity segment claimed twice.
-        language: String,
-    },
-    /// An engine's `initialization_options` value is not a JSON object.
-    EngineInitializationOptionsNotObject {
-        /// The engine declaring the options.
-        engine: String,
+    /// An LSP process's `initialization_options` value is not a JSON object.
+    LspInitializationOptionsNotObject {
+        /// The LSP process declaring the options.
+        lsp: String,
     },
     /// A `source.include` or `source.exclude` entry breaks the forward-slash-only path-pattern
     /// contract: it is empty, absolute, carries a backslash or control character, or a `.` or
@@ -1680,9 +1853,21 @@ impl ConfigurationViolation {
                 ("value", value.to_string()),
                 ("range", format!("{min}..={max}")),
             ],
-            Self::LanguageSelectorInvalid { selector } => {
-                vec![("selector", selector.clone())]
+            Self::LanguageIdentityInvalid { language } => {
+                vec![("language", language.clone())]
             }
+            Self::LanguageLspUnknown { language, lsp } => {
+                vec![("language", language.clone()), ("lsp", lsp.clone())]
+            }
+            Self::LanguageIncludeDuplicate {
+                pattern,
+                first,
+                second,
+            } => vec![
+                ("pattern", pattern.clone()),
+                ("first", first.clone()),
+                ("second", second.clone()),
+            ],
             Self::SemanticModelInvalid { field, value } => {
                 vec![("field", (*field).to_owned()), ("value", value.clone())]
             }
@@ -1707,11 +1892,18 @@ impl ConfigurationViolation {
             Self::HookIdDuplicate { id } | Self::HookIdInvalid { id } => {
                 vec![("id", id.clone())]
             }
-            Self::HookProgramEmpty { id } => vec![("id", id.clone())],
-            Self::HookExecutableAbsolute { id, program }
-            | Self::HookProgramDotSegment { id, program } => {
-                vec![("id", id.clone()), ("program", program.clone())]
+            Self::CommandProgramEmpty { field } => vec![("field", (*field).to_owned())],
+            Self::CommandProgramWhitespace { field, program }
+            | Self::CommandProgramAbsolute { field, program }
+            | Self::CommandProgramDotSegment { field, program } => {
+                vec![("field", (*field).to_owned()), ("program", program.clone())]
             }
+            Self::CommandArgumentOversized { field, bytes }
+            | Self::CommandProgramOversized { field, bytes } => vec![
+                ("field", (*field).to_owned()),
+                ("bytes", bytes.to_string()),
+                ("bytes_max", COMMAND_ARGUMENT_BYTES_MAX.to_string()),
+            ],
             Self::HookWorkingDirectoryInvalid {
                 id,
                 working_directory,
@@ -1722,26 +1914,12 @@ impl ConfigurationViolation {
             Self::HookEnvironmentKeyInvalid { id, key } => {
                 vec![("id", id.clone()), ("key", key.clone())]
             }
-            Self::EngineNameInvalid { name } => vec![("name", name.clone())],
-            Self::EngineProgramEmpty { engine }
-            | Self::EngineLanguagesEmpty { engine }
-            | Self::EngineInitializationOptionsNotObject { engine } => {
-                vec![("engine", engine.clone())]
+            Self::LspNameInvalid { name } => vec![("name", name.clone())],
+            Self::LspEnvironmentKeyInvalid { lsp, key } => {
+                vec![("lsp", lsp.clone()), ("key", key.clone())]
             }
-            Self::EngineExecutableAbsolute { engine, program } => {
-                vec![("engine", engine.clone()), ("program", program.clone())]
-            }
-            Self::EngineArgumentOversized { engine, bytes } => vec![
-                ("engine", engine.clone()),
-                ("bytes", bytes.to_string()),
-                ("bytes_max", ENGINE_ARGUMENT_BYTES_MAX.to_string()),
-            ],
-            Self::EngineEnvironmentKeyInvalid { engine, key } => {
-                vec![("engine", engine.clone()), ("key", key.clone())]
-            }
-            Self::EngineLanguageInvalid { engine, language }
-            | Self::EngineLanguageDuplicate { engine, language } => {
-                vec![("engine", engine.clone()), ("language", language.clone())]
+            Self::LspInitializationOptionsNotObject { lsp } => {
+                vec![("lsp", lsp.clone())]
             }
             Self::PathPatternInvalid { field, pattern } => {
                 vec![("field", (*field).to_owned()), ("pattern", pattern.clone())]
@@ -1784,31 +1962,6 @@ pub(crate) fn first_out_of_range<const ROWS: usize>(
     limits
         .into_iter()
         .find_map(|(field, value, min, max)| out_of_range(field, value, min, max))
-}
-
-/// Whether `selector` is a language name or `name:dialect`, both in the
-/// lowercase form language identities use.
-fn is_language_selector(selector: &str) -> bool {
-    let (name, dialect) = match selector.split_once(':') {
-        Some((name, dialect)) => (name, Some(dialect)),
-        None => (selector, None),
-    };
-    is_language_word(name) && dialect.is_none_or(is_language_word)
-}
-
-/// Whether `word` matches the lowercase language-identifier form.
-fn is_language_word(word: &str) -> bool {
-    let mut characters = word.chars();
-    let starts_lowercase = characters
-        .next()
-        .is_some_and(|first| first.is_ascii_lowercase());
-    starts_lowercase
-        && word.len() <= 64
-        && characters.all(|character| {
-            character.is_ascii_lowercase()
-                || character.is_ascii_digit()
-                || matches!(character, '.' | '_' | '-')
-        })
 }
 
 /// Returns first hook violation in list order.
@@ -1866,23 +2019,7 @@ fn identity_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
 /// The rules on what the hook runs: a present, non-absolute,
 /// dot-segment-free program.
 fn command_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
-    if hook.program.is_empty() {
-        return Some(ConfigurationViolation::HookProgramEmpty {
-            id: hook.id.clone(),
-        });
-    }
-    if is_absolute_program(&hook.program) {
-        return Some(ConfigurationViolation::HookExecutableAbsolute {
-            id: hook.id.clone(),
-            program: hook.program.clone(),
-        });
-    }
-    hook.program.split('/').any(is_dot_path_segment).then(|| {
-        ConfigurationViolation::HookProgramDotSegment {
-            id: hook.id.clone(),
-            program: hook.program.clone(),
-        }
-    })
+    hook.command.violation("hooks.command")
 }
 
 /// The rule on `working_directory`: empty selects the workspace root;
@@ -1938,12 +2075,6 @@ fn guarantee_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
 fn hook_bounds_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
     let limits = [
         (
-            "hooks.arguments",
-            hook.arguments.len() as u64,
-            0,
-            HOOK_ARGUMENTS_MAX as u64,
-        ),
-        (
             "hooks.environment",
             hook.environment.len() as u64,
             0,
@@ -1967,8 +2098,22 @@ fn hook_bounds_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
             0,
             HOOK_GUARANTEES_MAX as u64,
         ),
+        (
+            "hooks.include",
+            hook.include.len() as u64,
+            0,
+            CONFIGURATION_PATTERNS_MAX as u64,
+        ),
+        (
+            "hooks.exclude",
+            hook.exclude.len() as u64,
+            0,
+            CONFIGURATION_PATTERNS_MAX as u64,
+        ),
     ];
     first_out_of_range(limits)
+        .or_else(|| path_patterns_violation("hooks.include", &hook.include))
+        .or_else(|| path_patterns_violation("hooks.exclude", &hook.exclude))
 }
 
 /// Whether `id` labels a hook: nonempty, at most
@@ -1997,65 +2142,177 @@ fn is_absolute_program(program: &str) -> bool {
     }
 }
 
-/// The first violated engine bound, engines in name order.
-///
-/// One claim set spans the whole table, so a language identity segment
-/// repeated within one engine or across two engines is refused either way.
-fn engines_violation(
-    engines: &BTreeMap<String, EngineConfiguration>,
+fn path_patterns_violation(
+    field: &'static str,
+    patterns: &[PathPattern],
 ) -> Option<ConfigurationViolation> {
-    if engines.len() > ENGINES_MAX {
-        return out_of_range("engines", engines.len() as u64, 0, ENGINES_MAX as u64);
+    patterns.iter().find_map(|pattern| {
+        path_pattern_violation(&pattern.0).map(|_| ConfigurationViolation::PathPatternInvalid {
+            field,
+            pattern: pattern.0.clone(),
+        })
+    })
+}
+
+fn languages_violation(
+    languages: &BTreeMap<String, LanguageConfiguration>,
+    lsp: &BTreeMap<String, LspConfiguration>,
+) -> Option<ConfigurationViolation> {
+    if languages.len() > LANGUAGES_MAX {
+        return out_of_range("languages", languages.len() as u64, 0, LANGUAGES_MAX as u64);
     }
-    let mut claimed = std::collections::BTreeSet::new();
-    for (name, engine) in engines {
-        if !is_language_word(name) {
-            return Some(ConfigurationViolation::EngineNameInvalid { name: name.clone() });
+    let mut includes = BTreeMap::<&str, &str>::new();
+    for (identity, language) in languages {
+        if Language::from_identity_segment(identity).is_err() {
+            return Some(ConfigurationViolation::LanguageIdentityInvalid {
+                language: identity.clone(),
+            });
         }
-        if let Some(violation) = engine_violation(name, engine) {
+        if let Some(violation) = language_violation(identity, language, lsp) {
             return Some(violation);
         }
-        for language in &engine.languages {
-            if !claimed.insert(language.as_str()) {
-                return Some(ConfigurationViolation::EngineLanguageDuplicate {
-                    engine: name.clone(),
-                    language: language.clone(),
-                });
+        if let Some(patterns) = &language.include {
+            for pattern in patterns {
+                if let Some(first) = includes.insert(&pattern.0, identity) {
+                    return Some(ConfigurationViolation::LanguageIncludeDuplicate {
+                        pattern: pattern.0.clone(),
+                        first: first.to_owned(),
+                        second: identity.clone(),
+                    });
+                }
             }
         }
     }
     None
 }
 
-/// The first bound one engine breaks, rules in key order.
-fn engine_violation(name: &str, engine: &EngineConfiguration) -> Option<ConfigurationViolation> {
-    engine_program_violation(name, engine)
-        .or_else(|| engine_arguments_violation(name, engine))
-        .or_else(|| engine_environment_violation(name, engine))
-        .or_else(|| engine_languages_violation(name, engine))
-        .or_else(|| engine_options_violation(name, engine))
-        .or_else(|| engine_bounds_violation(engine))
-        .or_else(|| engine_retry_violation(&engine.retry))
-        .or_else(|| engine_restart_violation(&engine.restart))
-}
-
-/// The bounds one engine's `[retry]` table carries, in key order.
-fn engine_retry_violation(retry: &RetryPolicy) -> Option<ConfigurationViolation> {
+fn language_violation(
+    identity: &str,
+    language: &LanguageConfiguration,
+    lsp: &BTreeMap<String, LspConfiguration>,
+) -> Option<ConfigurationViolation> {
+    let include_len = language.include.as_ref().map_or(0, Vec::len);
     first_out_of_range([
         (
-            "engines.retry.attempts",
+            "languages.include",
+            include_len as u64,
+            0,
+            CONFIGURATION_PATTERNS_MAX as u64,
+        ),
+        (
+            "languages.exclude",
+            language.exclude.len() as u64,
+            0,
+            CONFIGURATION_PATTERNS_MAX as u64,
+        ),
+    ])
+    .or_else(|| {
+        language
+            .include
+            .as_deref()
+            .and_then(|patterns| path_patterns_violation("languages.include", patterns))
+    })
+    .or_else(|| path_patterns_violation("languages.exclude", &language.exclude))
+    .or_else(|| match &language.lsp {
+        Some(LanguageLspConfiguration::Named(name)) if !lsp.contains_key(name) => {
+            Some(ConfigurationViolation::LanguageLspUnknown {
+                language: identity.to_owned(),
+                lsp: name.clone(),
+            })
+        }
+        Some(LanguageLspConfiguration::Inline(configuration)) => {
+            lsp_violation("languages.lsp", identity, configuration)
+        }
+        _ => None,
+    })
+}
+
+fn lsp_configurations_violation(
+    configurations: &BTreeMap<String, LspConfiguration>,
+) -> Option<ConfigurationViolation> {
+    if configurations.len() > LSP_CONFIGURATIONS_MAX {
+        return out_of_range(
+            "lsp",
+            configurations.len() as u64,
+            0,
+            LSP_CONFIGURATIONS_MAX as u64,
+        );
+    }
+    configurations.iter().find_map(|(name, configuration)| {
+        let parsed = Language::from_identity_segment(name);
+        if parsed.as_ref().is_err() || parsed.is_ok_and(|language| language.dialect.is_some()) {
+            return Some(ConfigurationViolation::LspNameInvalid { name: name.clone() });
+        }
+        lsp_violation("lsp", name, configuration)
+    })
+}
+
+fn lsp_violation(
+    field: &'static str,
+    name: &str,
+    lsp: &LspConfiguration,
+) -> Option<ConfigurationViolation> {
+    let command_field = if field == "languages.lsp" {
+        "languages.lsp.command"
+    } else {
+        "lsp.command"
+    };
+    let environment_field = if field == "languages.lsp" {
+        "languages.lsp.environment"
+    } else {
+        "lsp.environment"
+    };
+    lsp.command
+        .violation(command_field)
+        .or_else(|| {
+            first_out_of_range([(
+                environment_field,
+                lsp.environment.len() as u64,
+                0,
+                LSP_ENVIRONMENT_ENTRIES_MAX as u64,
+            )])
+        })
+        .or_else(|| {
+            let key = lsp
+                .environment
+                .keys()
+                .find(|key| !is_environment_key(key))?;
+            Some(ConfigurationViolation::LspEnvironmentKeyInvalid {
+                lsp: name.to_owned(),
+                key: key.clone(),
+            })
+        })
+        .or_else(|| {
+            lsp.initialization_options
+                .as_ref()
+                .is_some_and(|options| !options.is_object())
+                .then(
+                    || ConfigurationViolation::LspInitializationOptionsNotObject {
+                        lsp: name.to_owned(),
+                    },
+                )
+        })
+        .or_else(|| lsp_bounds_violation(lsp))
+        .or_else(|| lsp_retry_violation(&lsp.retry))
+        .or_else(|| lsp_restart_violation(&lsp.restart))
+}
+
+fn lsp_retry_violation(retry: &RetryPolicy) -> Option<ConfigurationViolation> {
+    first_out_of_range([
+        (
+            "lsp.retry.attempts",
             retry.attempts,
             RETRY_ATTEMPTS_MIN,
             RETRY_ATTEMPTS_MAX,
         ),
         (
-            "engines.retry.delay",
+            "lsp.retry.delay",
             retry.delay.milliseconds(),
             RETRY_DELAY_MS_MIN,
             RETRY_DELAY_MS_MAX,
         ),
         (
-            "engines.retry.delay_limit",
+            "lsp.retry.delay_limit",
             retry.delay_limit.milliseconds(),
             RETRY_DELAY_LIMIT_MS_MIN,
             RETRY_DELAY_LIMIT_MS_MAX,
@@ -2063,17 +2320,16 @@ fn engine_retry_violation(retry: &RetryPolicy) -> Option<ConfigurationViolation>
     ])
 }
 
-/// The bounds one engine's `[restart]` table carries, in key order.
-fn engine_restart_violation(restart: &RestartPolicy) -> Option<ConfigurationViolation> {
+fn lsp_restart_violation(restart: &RestartPolicy) -> Option<ConfigurationViolation> {
     first_out_of_range([
         (
-            "engines.restart.attempts",
+            "lsp.restart.attempts",
             restart.attempts,
             RESTART_ATTEMPTS_MIN,
             RESTART_ATTEMPTS_MAX,
         ),
         (
-            "engines.restart.window",
+            "lsp.restart.window",
             restart.window.milliseconds(),
             RESTART_WINDOW_MS_MIN,
             RESTART_WINDOW_MS_MAX,
@@ -2081,130 +2337,25 @@ fn engine_restart_violation(restart: &RestartPolicy) -> Option<ConfigurationViol
     ])
 }
 
-/// The rules on what the engine runs: a present, non-absolute program.
-fn engine_program_violation(
-    name: &str,
-    engine: &EngineConfiguration,
-) -> Option<ConfigurationViolation> {
-    if engine.program.is_empty() {
-        return Some(ConfigurationViolation::EngineProgramEmpty {
-            engine: name.to_owned(),
-        });
-    }
-    is_absolute_program(&engine.program).then(|| ConfigurationViolation::EngineExecutableAbsolute {
-        engine: name.to_owned(),
-        program: engine.program.clone(),
-    })
-}
-
-/// The `arguments` rules: a bounded count, then bounded entry sizes.
-fn engine_arguments_violation(
-    name: &str,
-    engine: &EngineConfiguration,
-) -> Option<ConfigurationViolation> {
-    first_out_of_range([(
-        "engines.arguments",
-        engine.arguments.len() as u64,
-        0,
-        ENGINE_ARGUMENTS_MAX as u64,
-    )])
-    .or_else(|| {
-        let oversized = engine
-            .arguments
-            .iter()
-            .find(|argument| argument.len() > ENGINE_ARGUMENT_BYTES_MAX)?;
-        Some(ConfigurationViolation::EngineArgumentOversized {
-            engine: name.to_owned(),
-            bytes: oversized.len() as u64,
-        })
-    })
-}
-
-/// The `environment` rules: a bounded count, then every entry's key.
-fn engine_environment_violation(
-    name: &str,
-    engine: &EngineConfiguration,
-) -> Option<ConfigurationViolation> {
-    first_out_of_range([(
-        "engines.environment",
-        engine.environment.len() as u64,
-        0,
-        ENGINE_ENVIRONMENT_ENTRIES_MAX as u64,
-    )])
-    .or_else(|| {
-        let key = engine
-            .environment
-            .keys()
-            .find(|key| !is_environment_key(key))?;
-        Some(ConfigurationViolation::EngineEnvironmentKeyInvalid {
-            engine: name.to_owned(),
-            key: key.clone(),
-        })
-    })
-}
-
-/// The `languages` rules: at least one entry, a bounded count, and each
-/// entry a language identity segment.
-fn engine_languages_violation(
-    name: &str,
-    engine: &EngineConfiguration,
-) -> Option<ConfigurationViolation> {
-    if engine.languages.is_empty() {
-        return Some(ConfigurationViolation::EngineLanguagesEmpty {
-            engine: name.to_owned(),
-        });
-    }
-    first_out_of_range([(
-        "engines.languages",
-        engine.languages.len() as u64,
-        1,
-        ENGINE_LANGUAGES_MAX as u64,
-    )])
-    .or_else(|| {
-        let invalid = engine
-            .languages
-            .iter()
-            .find(|language| !is_language_selector(language))?;
-        Some(ConfigurationViolation::EngineLanguageInvalid {
-            engine: name.to_owned(),
-            language: invalid.clone(),
-        })
-    })
-}
-
-/// The `initialization_options` rule: one JSON object, when present.
-fn engine_options_violation(
-    name: &str,
-    engine: &EngineConfiguration,
-) -> Option<ConfigurationViolation> {
-    let options = engine.initialization_options.as_ref()?;
-    (!options.is_object()).then(
-        || ConfigurationViolation::EngineInitializationOptionsNotObject {
-            engine: name.to_owned(),
-        },
-    )
-}
-
-/// The numeric bounds one engine carries, as a table in key order.
-fn engine_bounds_violation(engine: &EngineConfiguration) -> Option<ConfigurationViolation> {
+fn lsp_bounds_violation(lsp: &LspConfiguration) -> Option<ConfigurationViolation> {
     first_out_of_range([
         (
-            "engines.startup_timeout",
-            engine.startup_timeout.milliseconds(),
-            ENGINE_STARTUP_TIMEOUT_MS_MIN,
-            ENGINE_STARTUP_TIMEOUT_MS_MAX,
+            "lsp.startup_timeout",
+            lsp.startup_timeout.milliseconds(),
+            LSP_STARTUP_TIMEOUT_MS_MIN,
+            LSP_STARTUP_TIMEOUT_MS_MAX,
         ),
         (
-            "engines.request_timeout",
-            engine.request_timeout.milliseconds(),
-            ENGINE_REQUEST_TIMEOUT_MS_MIN,
-            ENGINE_REQUEST_TIMEOUT_MS_MAX,
+            "lsp.request_timeout",
+            lsp.request_timeout.milliseconds(),
+            LSP_REQUEST_TIMEOUT_MS_MIN,
+            LSP_REQUEST_TIMEOUT_MS_MAX,
         ),
         (
-            "engines.output_limit",
-            engine.output_limit.bytes(),
-            ENGINE_OUTPUT_BYTES_MIN,
-            ENGINE_OUTPUT_BYTES_MAX,
+            "lsp.output_limit",
+            lsp.output_limit.bytes(),
+            LSP_OUTPUT_BYTES_MIN,
+            LSP_OUTPUT_BYTES_MAX,
         ),
     ])
 }
@@ -2217,11 +2368,9 @@ mod tests {
 
     fn hook() -> CommandHook {
         CommandHook {
-            r#type: HookType::Command,
             id: "tests".to_owned(),
             kind: HookKind::Test,
-            program: "cargo".to_owned(),
-            arguments: vec!["test".to_owned()],
+            command: CommandInput::ProgramAndArguments(vec!["cargo".to_owned(), "test".to_owned()]),
             changed_paths: ChangedPaths::None,
             writes: HookWrites::None,
             working_directory: ProjectPath(String::new()),
@@ -2231,31 +2380,25 @@ mod tests {
             failure_severity: HookFailureSeverity::Error,
             guarantees: Vec::new(),
             determinism: Determinism::Deterministic,
+            include: Vec::new(),
+            exclude: Vec::new(),
         }
     }
 
-    fn engine() -> EngineConfiguration {
-        EngineConfiguration {
-            program: "uvx".to_owned(),
-            arguments: vec!["ty".to_owned(), "server".to_owned()],
+    fn lsp() -> LspConfiguration {
+        LspConfiguration {
+            command: CommandInput::ProgramAndArguments(vec![
+                "uvx".to_owned(),
+                "ty".to_owned(),
+                "server".to_owned(),
+            ]),
             environment: BTreeMap::new(),
-            languages: vec!["python".to_owned()],
             initialization_options: None,
-            startup_timeout: Duration::from_millis(ENGINE_STARTUP_TIMEOUT_MS_DEFAULT),
-            request_timeout: Duration::from_millis(ENGINE_REQUEST_TIMEOUT_MS_DEFAULT),
-            output_limit: ByteSize::from_bytes(ENGINE_OUTPUT_BYTES_DEFAULT),
+            startup_timeout: Duration::from_millis(LSP_STARTUP_TIMEOUT_MS_DEFAULT),
+            request_timeout: Duration::from_millis(LSP_REQUEST_TIMEOUT_MS_DEFAULT),
+            output_limit: ByteSize::from_bytes(LSP_OUTPUT_BYTES_DEFAULT),
             retry: RetryPolicy::default(),
             restart: RestartPolicy::default(),
-        }
-    }
-
-    fn engines(entries: Vec<(&str, EngineConfiguration)>) -> WorkspaceConfiguration {
-        WorkspaceConfiguration {
-            engines: entries
-                .into_iter()
-                .map(|(name, engine)| (name.to_owned(), engine))
-                .collect(),
-            ..WorkspaceConfiguration::default()
         }
     }
 
@@ -2431,7 +2574,12 @@ mod tests {
         assert!(configuration.source.exclude.is_empty());
         assert!(configuration.source.respect_gitignore);
         assert!(configuration.hooks.is_empty());
-        assert!(configuration.engines.is_empty());
+        assert!(configuration.languages.is_empty());
+        assert!(configuration.lsp.is_empty());
+        assert_eq!(
+            configuration.search.text.include,
+            vec![PathPattern(TEXT_INCLUDE_PATTERN_DEFAULT.to_owned())]
+        );
         assert_eq!(configuration.validate(), Ok(()));
     }
 
@@ -2445,9 +2593,11 @@ mod tests {
             json!({ "search": { "unknown": "x" } }),
             json!({ "search": { "text": { "unknown": "x" } } }),
             json!({ "source": { "unknown": "x" } }),
-            json!({ "engines": { "ty": {
-                "program": "uvx", "languages": ["python"], "unknown": 1,
+            json!({ "lsp": { "ty": {
+                "command": "ty", "unknown": 1,
             } } }),
+            json!({ "engines": {} }),
+            json!({ "execution": { "allow": ["python"] } }),
         ];
         for case in cases {
             assert!(
@@ -2458,10 +2608,10 @@ mod tests {
     }
 
     #[test]
-    fn test_hook_block_requires_every_key() {
+    fn test_hook_block_requires_non_defaulted_keys() {
         let complete = serde_json::to_value(hook()).expect("serialize");
         let object = complete.as_object().expect("hook serializes to an object");
-        for missing in object.keys() {
+        for missing in ["id", "kind", "command", "determinism"] {
             let mut trimmed = object.clone();
             trimmed.remove(missing);
             assert!(
@@ -2725,25 +2875,6 @@ mod tests {
                 ..
             })
         ));
-    }
-
-    #[test]
-    fn test_language_selectors_accept_names_and_dialects() {
-        let mut configuration = WorkspaceConfiguration::default();
-        configuration.execution.allow = vec!["python".to_owned(), "sql:postgresql".to_owned()];
-        assert_eq!(configuration.validate(), Ok(()));
-        for selector in ["", "Python", "sql:", ":postgresql", "sql:Post", "a b"] {
-            configuration.execution.allow = vec![selector.to_owned()];
-            let violation = configuration
-                .validate()
-                .expect_err("the selector must refuse the configuration");
-            let evidence_key = violation.evidence().first().map(|(key, _)| *key);
-            assert_eq!(
-                evidence_key,
-                Some("selector"),
-                "{selector:?} gave {violation:?}"
-            );
-        }
     }
 
     /// The verdict `[search.semantic]` reaches on one model value under one
@@ -3106,7 +3237,7 @@ mod tests {
     }
 
     #[test]
-    fn test_search_text_rejects_unknown_keys_and_schema_has_only_max_chunk() {
+    fn test_search_text_rejects_unknown_keys_and_schema_has_declared_keys() {
         let unknown = json!({ "search": { "text": { "extensions": ["md"] } } });
         assert!(
             serde_json::from_value::<WorkspaceConfiguration>(unknown).is_err(),
@@ -3116,7 +3247,8 @@ mod tests {
         let schema =
             serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
         let properties = &schema["$defs"]["TextSearchConfiguration"]["properties"];
-        assert_eq!(properties.as_object().expect("properties").len(), 1);
+        assert_eq!(properties.as_object().expect("properties").len(), 2);
+        assert!(properties.get("include").is_some());
         assert!(properties.get("max_chunk").is_some());
     }
 
@@ -3174,1100 +3306,10 @@ mod tests {
         assert_eq!(configuration.validate(), Ok(()));
     }
 
-    /// One way to break a hook bound, and the check its refusal must pass.
-    type HookBoundCase = (fn(&mut CommandHook), fn(&ConfigurationViolation) -> bool);
-
-    /// Proves each broken hook is refused with the expected violation, and
-    /// that the matcher rejects an unrelated one.
-    fn assert_hooks_refused<const CASES: usize>(break_and_expect: [HookBoundCase; CASES]) {
-        let unrelated = ConfigurationViolation::HookIdDuplicate {
-            id: "unrelated".to_owned(),
-        };
-        for (break_bound, expected) in break_and_expect {
-            let mut broken = hook();
-            break_bound(&mut broken);
-            let configuration = WorkspaceConfiguration {
-                hooks: vec![broken],
-                ..WorkspaceConfiguration::default()
-            };
-            let violation = configuration
-                .validate()
-                .expect_err("the broken hook must be refused");
-            assert!(expected(&violation), "unexpected violation {violation:?}");
-            assert!(
-                !expected(&unrelated),
-                "the matcher must reject an unrelated violation"
-            );
-        }
-    }
-
-    #[test]
-    fn test_hook_command_rules_are_enforced() {
-        let break_and_expect: [HookBoundCase; 7] = [
-            (
-                |hook| hook.id = "spaced id".to_owned(),
-                |violation| matches!(violation, ConfigurationViolation::HookIdInvalid { .. }),
-            ),
-            (
-                |hook| hook.program = String::new(),
-                |violation| matches!(violation, ConfigurationViolation::HookProgramEmpty { .. }),
-            ),
-            (
-                |hook| hook.program = "/bin/echo".to_owned(),
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::HookExecutableAbsolute { .. }
-                    )
-                },
-            ),
-            (
-                |hook| hook.program = "C:\\tools\\echo.exe".to_owned(),
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::HookExecutableAbsolute { .. }
-                    )
-                },
-            ),
-            (
-                |hook| hook.program = "../evil".to_owned(),
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::HookProgramDotSegment { .. }
-                    )
-                },
-            ),
-            (
-                |hook| hook.program = "scripts/../evil".to_owned(),
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::HookProgramDotSegment { .. }
-                    )
-                },
-            ),
-            (
-                |hook| hook.program = "./evil".to_owned(),
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::HookProgramDotSegment { .. }
-                    )
-                },
-            ),
-        ];
-        assert_hooks_refused(break_and_expect);
-    }
-
-    #[test]
-    fn test_hook_working_directory_rules_are_enforced() {
-        let break_and_expect: [HookBoundCase; 5] = [
-            (
-                |hook| hook.working_directory = ProjectPath("/etc".to_owned()),
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::HookWorkingDirectoryInvalid { .. }
-                    )
-                },
-            ),
-            (
-                |hook| hook.working_directory = ProjectPath("C:\\Windows".to_owned()),
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::HookWorkingDirectoryInvalid { .. }
-                    )
-                },
-            ),
-            (
-                |hook| hook.working_directory = ProjectPath("..".to_owned()),
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::HookWorkingDirectoryInvalid { .. }
-                    )
-                },
-            ),
-            (
-                |hook| hook.working_directory = ProjectPath("../outside".to_owned()),
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::HookWorkingDirectoryInvalid { .. }
-                    )
-                },
-            ),
-            (
-                |hook| hook.working_directory = ProjectPath("scripts/../outside".to_owned()),
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::HookWorkingDirectoryInvalid { .. }
-                    )
-                },
-            ),
-        ];
-        assert_hooks_refused(break_and_expect);
-    }
-
-    #[test]
-    fn test_hook_working_directory_and_program_accept_project_relative_forms() {
-        let mut accepted = hook();
-        accepted.program = "scripts/tool".to_owned();
-        accepted.working_directory = ProjectPath("scripts".to_owned());
-        let with_relative_forms = WorkspaceConfiguration {
-            hooks: vec![accepted],
-            ..WorkspaceConfiguration::default()
-        };
-        assert_eq!(with_relative_forms.validate(), Ok(()));
-
-        let mut root = hook();
-        root.working_directory = ProjectPath(String::new());
-        let with_root = WorkspaceConfiguration {
-            hooks: vec![root],
-            ..WorkspaceConfiguration::default()
-        };
-        assert_eq!(
-            with_root.validate(),
-            Ok(()),
-            "an empty working_directory must keep meaning the workspace root"
-        );
-    }
-
-    #[test]
-    fn test_hook_bounds_are_enforced() {
-        let break_and_expect: [HookBoundCase; 5] = [
-            (
-                |hook| hook.arguments = vec![String::new(); HOOK_ARGUMENTS_MAX + 1],
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::LimitOutOfRange {
-                            field: "hooks.arguments",
-                            ..
-                        }
-                    )
-                },
-            ),
-            (
-                |hook| {
-                    hook.guarantees = vec![
-                        HookGuarantee {
-                            kind: GuaranteeKind::BehaviorChecked,
-                            scope: CoverageScope::Reach {
-                                reach: crate::read::CoverageReach::Project,
-                            },
-                            detail: "the suite ran".to_owned(),
-                        };
-                        HOOK_GUARANTEES_MAX + 1
-                    ];
-                },
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::LimitOutOfRange {
-                            field: "hooks.guarantees",
-                            ..
-                        }
-                    )
-                },
-            ),
-            (
-                |hook| {
-                    hook.guarantees = vec![HookGuarantee {
-                        kind: GuaranteeKind::BehaviorChecked,
-                        scope: CoverageScope::Reach {
-                            reach: crate::read::CoverageReach::Project,
-                        },
-                        detail: String::new(),
-                    }];
-                },
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::LimitOutOfRange {
-                            field: "hooks.guarantees.detail",
-                            ..
-                        }
-                    )
-                },
-            ),
-            (
-                |hook| hook.timeout = Duration::from_millis(0),
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::LimitOutOfRange {
-                            field: "hooks.timeout",
-                            ..
-                        }
-                    )
-                },
-            ),
-            (
-                |hook| {
-                    hook.output_limit = ByteSize::from_bytes(HOOK_OUTPUT_BYTES_MIN - 1);
-                },
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::LimitOutOfRange {
-                            field: "hooks.output_limit",
-                            ..
-                        }
-                    )
-                },
-            ),
-        ];
-        assert_hooks_refused(break_and_expect);
-    }
-
-    #[test]
-    fn test_duplicate_hook_ids_are_refused() {
-        let configuration = WorkspaceConfiguration {
-            hooks: vec![hook(), hook()],
-            ..WorkspaceConfiguration::default()
-        };
-        assert!(matches!(
-            configuration.validate(),
-            Err(ConfigurationViolation::HookIdDuplicate { .. })
-        ));
-    }
-
-    #[test]
-    fn test_hook_write_classification_is_exact() {
-        assert!(HookWrites::None.is_validation());
-        assert!(!HookWrites::None.is_transform());
-        for writes in [HookWrites::ChangedPaths, HookWrites::Workspace] {
-            assert!(writes.is_transform());
-            assert!(!writes.is_validation());
-        }
-    }
-
-    #[test]
-    fn test_transform_hooks_must_precede_validation_hooks() {
-        let mut transform = hook();
-        transform.id = "format".to_owned();
-        transform.kind = HookKind::Format;
-        transform.writes = HookWrites::Workspace;
-        let mut validation = hook();
-        validation.id = "check".to_owned();
-
-        let accepted = WorkspaceConfiguration {
-            hooks: vec![transform.clone(), validation.clone()],
-            ..WorkspaceConfiguration::default()
-        };
-        assert_eq!(accepted.validate(), Ok(()));
-
-        let refused = WorkspaceConfiguration {
-            hooks: vec![validation, transform],
-            ..WorkspaceConfiguration::default()
-        };
-        assert_eq!(
-            refused.validate(),
-            Err(ConfigurationViolation::HookTransformAfterValidation {
-                transform: "format".to_owned(),
-                validation: "check".to_owned(),
-            })
-        );
-    }
-
-    #[test]
-    fn test_transform_hooks_cannot_declare_guarantees() {
-        let mut transform = hook();
-        transform.id = "format".to_owned();
-        transform.kind = HookKind::Format;
-        transform.writes = HookWrites::ChangedPaths;
-        transform.guarantees.push(
-            serde_json::from_value(json!({
-                "kind": "syntax_validated",
-                "scope": { "kind": "reach", "reach": "project" },
-                "detail": "formatted source parses"
-            }))
-            .expect("guarantee"),
-        );
-        let configuration = WorkspaceConfiguration {
-            hooks: vec![transform],
-            ..WorkspaceConfiguration::default()
-        };
-        assert_eq!(
-            configuration.validate(),
-            Err(ConfigurationViolation::HookTransformGuarantees {
-                id: "format".to_owned(),
-            })
-        );
-    }
-
-    #[test]
-    fn test_hook_environment_keys_are_checked() {
-        let mut broken = hook();
-        broken
-            .environment
-            .insert("BAD=KEY".to_owned(), "1".to_owned());
-        let configuration = WorkspaceConfiguration {
-            hooks: vec![broken],
-            ..WorkspaceConfiguration::default()
-        };
-        assert!(matches!(
-            configuration.validate(),
-            Err(ConfigurationViolation::HookEnvironmentKeyInvalid { .. })
-        ));
-    }
-
-    #[test]
-    fn test_violation_evidence_names_field_value_and_range() {
-        let violation = ConfigurationViolation::LimitOutOfRange {
-            field: "hooks.timeout",
-            value: 0,
-            min: 1,
-            max: HOOK_TIMEOUT_MS_MAX,
-        };
-        assert_eq!(
-            violation.evidence(),
-            vec![
-                ("field", "hooks.timeout".to_owned()),
-                ("value", "0".to_owned()),
-                ("range", "1..=3600000".to_owned()),
-            ]
-        );
-    }
-
-    #[test]
-    #[expect(clippy::too_many_lines, reason = "one data row per violation variant")]
-    fn test_every_violation_variant_carries_its_evidence() {
-        let id = || "tests".to_owned();
-        let cases = [
-            (
-                ConfigurationViolation::LanguageSelectorInvalid {
-                    selector: "Python".to_owned(),
-                },
-                vec![("selector", "Python".to_owned())],
-            ),
-            (
-                ConfigurationViolation::SemanticModelInvalid {
-                    field: "search.semantic.model",
-                    value: "spaced out".to_owned(),
-                },
-                vec![
-                    ("field", "search.semantic.model".to_owned()),
-                    ("value", "spaced out".to_owned()),
-                ],
-            ),
-            (
-                ConfigurationViolation::SearchWeightsInvalid {
-                    lexical: 0.5,
-                    semantic: 0.6,
-                },
-                vec![
-                    ("lexical_weight", "0.5".to_owned()),
-                    ("semantic_weight", "0.6".to_owned()),
-                ],
-            ),
-            (
-                ConfigurationViolation::HookIdDuplicate { id: id() },
-                vec![("id", id())],
-            ),
-            (
-                ConfigurationViolation::HookIdInvalid { id: id() },
-                vec![("id", id())],
-            ),
-            (
-                ConfigurationViolation::HookProgramEmpty { id: id() },
-                vec![("id", id())],
-            ),
-            (
-                ConfigurationViolation::HookExecutableAbsolute {
-                    id: id(),
-                    program: "/bin/echo".to_owned(),
-                },
-                vec![("id", id()), ("program", "/bin/echo".to_owned())],
-            ),
-            (
-                ConfigurationViolation::HookProgramDotSegment {
-                    id: id(),
-                    program: "../evil".to_owned(),
-                },
-                vec![("id", id()), ("program", "../evil".to_owned())],
-            ),
-            (
-                ConfigurationViolation::HookWorkingDirectoryInvalid {
-                    id: id(),
-                    working_directory: "../outside".to_owned(),
-                },
-                vec![("id", id()), ("working_directory", "../outside".to_owned())],
-            ),
-            (
-                ConfigurationViolation::HookEnvironmentKeyInvalid {
-                    id: id(),
-                    key: "BAD=KEY".to_owned(),
-                },
-                vec![("id", id()), ("key", "BAD=KEY".to_owned())],
-            ),
-            (
-                ConfigurationViolation::PathPatternInvalid {
-                    field: "source.include",
-                    pattern: "src\\lib.rs".to_owned(),
-                },
-                vec![
-                    ("field", "source.include".to_owned()),
-                    ("pattern", "src\\lib.rs".to_owned()),
-                ],
-            ),
-            (
-                ConfigurationViolation::LogCaptureInvalid {
-                    capture: "[".to_owned(),
-                    detail: "invalid filter".to_owned(),
-                },
-                vec![
-                    ("field", "logs.capture".to_owned()),
-                    ("capture", "[".to_owned()),
-                    ("detail", "invalid filter".to_owned()),
-                ],
-            ),
-            (
-                ConfigurationViolation::EngineNameInvalid {
-                    name: "Ty".to_owned(),
-                },
-                vec![("name", "Ty".to_owned())],
-            ),
-            (
-                ConfigurationViolation::EngineProgramEmpty {
-                    engine: "ty".to_owned(),
-                },
-                vec![("engine", "ty".to_owned())],
-            ),
-            (
-                ConfigurationViolation::EngineLanguagesEmpty {
-                    engine: "ty".to_owned(),
-                },
-                vec![("engine", "ty".to_owned())],
-            ),
-            (
-                ConfigurationViolation::EngineInitializationOptionsNotObject {
-                    engine: "ty".to_owned(),
-                },
-                vec![("engine", "ty".to_owned())],
-            ),
-            (
-                ConfigurationViolation::EngineExecutableAbsolute {
-                    engine: "ty".to_owned(),
-                    program: "/usr/bin/ty".to_owned(),
-                },
-                vec![
-                    ("engine", "ty".to_owned()),
-                    ("program", "/usr/bin/ty".to_owned()),
-                ],
-            ),
-            (
-                ConfigurationViolation::EngineArgumentOversized {
-                    engine: "ty".to_owned(),
-                    bytes: 5_000,
-                },
-                vec![
-                    ("engine", "ty".to_owned()),
-                    ("bytes", "5000".to_owned()),
-                    ("bytes_max", ENGINE_ARGUMENT_BYTES_MAX.to_string()),
-                ],
-            ),
-            (
-                ConfigurationViolation::EngineEnvironmentKeyInvalid {
-                    engine: "ty".to_owned(),
-                    key: "BAD=KEY".to_owned(),
-                },
-                vec![("engine", "ty".to_owned()), ("key", "BAD=KEY".to_owned())],
-            ),
-            (
-                ConfigurationViolation::EngineLanguageInvalid {
-                    engine: "ty".to_owned(),
-                    language: "Python".to_owned(),
-                },
-                vec![
-                    ("engine", "ty".to_owned()),
-                    ("language", "Python".to_owned()),
-                ],
-            ),
-            (
-                ConfigurationViolation::EngineLanguageDuplicate {
-                    engine: "b".to_owned(),
-                    language: "python".to_owned(),
-                },
-                vec![
-                    ("engine", "b".to_owned()),
-                    ("language", "python".to_owned()),
-                ],
-            ),
-        ];
-        for (violation, expected) in cases {
-            assert_eq!(violation.evidence(), expected, "{violation:?}");
-        }
-    }
-
-    #[test]
-    fn test_hook_count_above_the_cap_is_refused() {
-        let hooks = (0..=HOOKS_MAX)
-            .map(|index| {
-                let mut numbered = hook();
-                numbered.id = format!("hook-{index}");
-                numbered
-            })
-            .collect();
-        let configuration = WorkspaceConfiguration {
-            hooks,
-            ..WorkspaceConfiguration::default()
-        };
-        assert!(matches!(
-            configuration.validate(),
-            Err(ConfigurationViolation::LimitOutOfRange { field: "hooks", .. })
-        ));
-    }
-
-    #[test]
-    fn test_engine_table_defaults_apply_to_the_optional_keys() {
-        let configuration: WorkspaceConfiguration = serde_json::from_value(json!({
-            "engines": { "ty": { "program": "uvx", "languages": ["python"] } }
-        }))
-        .expect("a minimal engine table must deserialize");
-        let engine = &configuration.engines["ty"];
-        assert!(engine.arguments.is_empty());
-        assert!(engine.environment.is_empty());
-        assert_eq!(engine.initialization_options, None);
-        assert_eq!(
-            engine.startup_timeout,
-            Duration::from_millis(ENGINE_STARTUP_TIMEOUT_MS_DEFAULT)
-        );
-        assert_eq!(
-            engine.request_timeout,
-            Duration::from_millis(ENGINE_REQUEST_TIMEOUT_MS_DEFAULT)
-        );
-        assert_eq!(
-            engine.output_limit,
-            ByteSize::from_bytes(ENGINE_OUTPUT_BYTES_DEFAULT)
-        );
-        assert_eq!(engine.retry, RetryPolicy::default());
-        assert_eq!(engine.restart, RestartPolicy::default());
-        assert_eq!(configuration.validate(), Ok(()));
-    }
-
-    #[test]
-    fn test_engine_retry_and_restart_tables_decode_key_by_key() {
-        let configuration: WorkspaceConfiguration = serde_json::from_value(json!({
-            "engines": { "ty": {
-                "program": "uvx",
-                "languages": ["python"],
-                "retry": { "attempts": 3, "delay": "1s" },
-                "restart": { "attempts": 0 },
-            } }
-        }))
-        .expect("the nested tables must deserialize");
-        let engine = &configuration.engines["ty"];
-        assert_eq!(engine.retry.attempts, 3);
-        assert_eq!(engine.retry.delay, Duration::from_millis(1_000));
-        assert_eq!(
-            engine.retry.delay_limit,
-            RetryPolicy::default().delay_limit,
-            "an absent key inside the table keeps its own default"
-        );
-        assert_eq!(engine.restart.attempts, 0);
-        assert_eq!(engine.restart.window, RestartPolicy::default().window);
-        assert_eq!(configuration.validate(), Ok(()));
-        let value = serde_json::to_value(&configuration).expect("serialize");
-        assert_eq!(value["engines"]["ty"]["retry"]["delay"], json!("1s"));
-        assert_eq!(value["engines"]["ty"]["restart"]["window"], json!("5m"));
-    }
-
-    #[test]
-    fn test_engine_table_requires_program_and_languages() {
-        for trimmed in [
-            json!({ "languages": ["python"] }),
-            json!({ "program": "uvx" }),
-        ] {
-            let table = json!({ "engines": { "ty": trimmed } });
-            assert!(
-                serde_json::from_value::<WorkspaceConfiguration>(table.clone()).is_err(),
-                "{table} must be refused"
-            );
-        }
-    }
-
-    #[test]
-    fn test_two_engine_table_round_trips_with_exact_wire_names() {
-        let mut typescript = engine();
-        typescript.program = "bunx".to_owned();
-        typescript.arguments = vec![
-            "typescript-language-server".to_owned(),
-            "--stdio".to_owned(),
-        ];
-        typescript.languages = vec!["typescript".to_owned(), "typescript:tsx".to_owned()];
-        typescript.initialization_options = Some(json!({ "tsserver": { "logVerbosity": "off" } }));
-        let configuration = engines(vec![("ty", engine()), ("typescript", typescript)]);
-        assert_eq!(configuration.validate(), Ok(()));
-        let value = serde_json::to_value(&configuration).expect("serialize");
-        assert_eq!(value["engines"]["ty"]["startup_timeout"], json!("30s"));
-        assert_eq!(value["engines"]["ty"]["request_timeout"], json!("1m"));
-        assert_eq!(value["engines"]["ty"]["output_limit"], json!("4kb"));
-        assert_eq!(
-            value["engines"]["typescript"]["languages"],
-            json!(["typescript", "typescript:tsx"])
-        );
-        let round_tripped: WorkspaceConfiguration =
-            serde_json::from_value(value).expect("deserialize");
-        assert_eq!(round_tripped, configuration);
-    }
-
-    /// One way to break an engine bound, and the check its refusal must
-    /// pass.
-    type EngineBoundCase = (
-        fn(&mut EngineConfiguration),
-        fn(&ConfigurationViolation) -> bool,
-    );
-
-    /// Proves each broken engine is refused with the expected violation,
-    /// and that the matcher rejects an unrelated one.
-    fn assert_engines_refused<const CASES: usize>(break_and_expect: [EngineBoundCase; CASES]) {
-        let unrelated = ConfigurationViolation::HookIdDuplicate {
-            id: "unrelated".to_owned(),
-        };
-        for (break_bound, expected) in break_and_expect {
-            let mut broken = engine();
-            break_bound(&mut broken);
-            let configuration = engines(vec![("ty", broken)]);
-            let violation = configuration
-                .validate()
-                .expect_err("the broken engine must be refused");
-            assert!(expected(&violation), "unexpected violation {violation:?}");
-            assert!(
-                !expected(&unrelated),
-                "the matcher must reject an unrelated violation"
-            );
-        }
-    }
-
-    #[test]
-    fn test_engine_command_rules_are_enforced() {
-        let break_and_expect: [EngineBoundCase; 3] = [
-            (
-                |engine| engine.program = String::new(),
-                |violation| matches!(violation, ConfigurationViolation::EngineProgramEmpty { .. }),
-            ),
-            (
-                |engine| engine.program = "/usr/bin/ty".to_owned(),
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::EngineExecutableAbsolute { .. }
-                    )
-                },
-            ),
-            (
-                |engine| engine.program = "C:\\tools\\ty.exe".to_owned(),
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::EngineExecutableAbsolute { .. }
-                    )
-                },
-            ),
-        ];
-        assert_engines_refused(break_and_expect);
-    }
-
-    #[test]
-    fn test_engine_language_rules_are_enforced() {
-        let break_and_expect: [EngineBoundCase; 4] = [
-            (
-                |engine| engine.languages = Vec::new(),
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::EngineLanguagesEmpty { .. }
-                    )
-                },
-            ),
-            (
-                |engine| engine.languages = vec!["Python".to_owned()],
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::EngineLanguageInvalid { .. }
-                    )
-                },
-            ),
-            (
-                |engine| engine.languages = vec!["sql:".to_owned()],
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::EngineLanguageInvalid { .. }
-                    )
-                },
-            ),
-            (
-                |engine| engine.languages = vec!["python".to_owned(), "python".to_owned()],
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::EngineLanguageDuplicate { .. }
-                    )
-                },
-            ),
-        ];
-        assert_engines_refused(break_and_expect);
-    }
-
-    #[test]
-    #[expect(clippy::too_many_lines, reason = "one data row per engine bound")]
-    fn test_engine_bounds_are_enforced() {
-        let break_and_expect: [EngineBoundCase; 9] = [
-            (
-                |engine| engine.arguments = vec![String::new(); ENGINE_ARGUMENTS_MAX + 1],
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::LimitOutOfRange {
-                            field: "engines.arguments",
-                            ..
-                        }
-                    )
-                },
-            ),
-            (
-                |engine| engine.arguments = vec!["x".repeat(ENGINE_ARGUMENT_BYTES_MAX + 1)],
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::EngineArgumentOversized { .. }
-                    )
-                },
-            ),
-            (
-                |engine| {
-                    engine.environment = (0..=ENGINE_ENVIRONMENT_ENTRIES_MAX)
-                        .map(|index| (format!("KEY_{index}"), "1".to_owned()))
-                        .collect();
-                },
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::LimitOutOfRange {
-                            field: "engines.environment",
-                            ..
-                        }
-                    )
-                },
-            ),
-            (
-                |engine| {
-                    engine.environment = [("BAD=KEY".to_owned(), "1".to_owned())].into();
-                },
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::EngineEnvironmentKeyInvalid { .. }
-                    )
-                },
-            ),
-            (
-                |engine| {
-                    engine.languages = (0..=ENGINE_LANGUAGES_MAX)
-                        .map(|index| format!("language{index}"))
-                        .collect();
-                },
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::LimitOutOfRange {
-                            field: "engines.languages",
-                            ..
-                        }
-                    )
-                },
-            ),
-            (
-                |engine| {
-                    engine.startup_timeout =
-                        Duration::from_millis(ENGINE_STARTUP_TIMEOUT_MS_MIN - 1);
-                },
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::LimitOutOfRange {
-                            field: "engines.startup_timeout",
-                            ..
-                        }
-                    )
-                },
-            ),
-            (
-                |engine| {
-                    engine.request_timeout =
-                        Duration::from_millis(ENGINE_REQUEST_TIMEOUT_MS_MAX + 1);
-                },
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::LimitOutOfRange {
-                            field: "engines.request_timeout",
-                            ..
-                        }
-                    )
-                },
-            ),
-            (
-                |engine| engine.output_limit = ByteSize::from_bytes(ENGINE_OUTPUT_BYTES_MIN - 1),
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::LimitOutOfRange {
-                            field: "engines.output_limit",
-                            ..
-                        }
-                    )
-                },
-            ),
-            (
-                |engine| engine.output_limit = ByteSize::from_bytes(ENGINE_OUTPUT_BYTES_MAX + 1),
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::LimitOutOfRange {
-                            field: "engines.output_limit",
-                            ..
-                        }
-                    )
-                },
-            ),
-        ];
-        assert_engines_refused(break_and_expect);
-    }
-
-    #[test]
-    fn test_engine_retry_and_restart_bounds_are_enforced() {
-        let break_and_expect: [EngineBoundCase; 6] = [
-            (
-                |engine| engine.retry.attempts = RETRY_ATTEMPTS_MIN - 1,
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::LimitOutOfRange {
-                            field: "engines.retry.attempts",
-                            ..
-                        }
-                    )
-                },
-            ),
-            (
-                |engine| engine.retry.attempts = RETRY_ATTEMPTS_MAX + 1,
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::LimitOutOfRange {
-                            field: "engines.retry.attempts",
-                            ..
-                        }
-                    )
-                },
-            ),
-            (
-                |engine| engine.retry.delay = Duration::from_millis(RETRY_DELAY_MS_MIN - 1),
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::LimitOutOfRange {
-                            field: "engines.retry.delay",
-                            ..
-                        }
-                    )
-                },
-            ),
-            (
-                |engine| {
-                    engine.retry.delay_limit = Duration::from_millis(RETRY_DELAY_LIMIT_MS_MAX + 1);
-                },
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::LimitOutOfRange {
-                            field: "engines.retry.delay_limit",
-                            ..
-                        }
-                    )
-                },
-            ),
-            (
-                |engine| engine.restart.attempts = RESTART_ATTEMPTS_MAX + 1,
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::LimitOutOfRange {
-                            field: "engines.restart.attempts",
-                            ..
-                        }
-                    )
-                },
-            ),
-            (
-                |engine| engine.restart.window = Duration::from_millis(RESTART_WINDOW_MS_MIN - 1),
-                |violation| {
-                    matches!(
-                        violation,
-                        ConfigurationViolation::LimitOutOfRange {
-                            field: "engines.restart.window",
-                            ..
-                        }
-                    )
-                },
-            ),
-        ];
-        assert_engines_refused(break_and_expect);
-    }
-
-    #[test]
-    fn test_engine_bounds_accept_their_edges() {
-        let mut edged = engine();
-        edged.arguments = vec!["x".repeat(ENGINE_ARGUMENT_BYTES_MAX); ENGINE_ARGUMENTS_MAX];
-        edged.environment = (0..ENGINE_ENVIRONMENT_ENTRIES_MAX)
-            .map(|index| (format!("KEY_{index}"), "1".to_owned()))
-            .collect();
-        edged.languages = (0..ENGINE_LANGUAGES_MAX)
-            .map(|index| format!("language{index}"))
-            .collect();
-        edged.startup_timeout = Duration::from_millis(ENGINE_STARTUP_TIMEOUT_MS_MAX);
-        edged.request_timeout = Duration::from_millis(ENGINE_REQUEST_TIMEOUT_MS_MIN);
-        edged.output_limit = ByteSize::from_bytes(ENGINE_OUTPUT_BYTES_MAX);
-        edged.retry = RetryPolicy {
-            attempts: RETRY_ATTEMPTS_MAX,
-            delay: Duration::from_millis(RETRY_DELAY_MS_MIN),
-            delay_limit: Duration::from_millis(RETRY_DELAY_LIMIT_MS_MAX),
-        };
-        edged.restart = RestartPolicy {
-            attempts: RESTART_ATTEMPTS_MIN,
-            window: Duration::from_millis(RESTART_WINDOW_MS_MAX),
-        };
-        assert_eq!(engines(vec![("ty", edged)]).validate(), Ok(()));
-    }
-
-    #[test]
-    fn test_engine_name_key_charset_is_checked() {
-        for name in ["Ty", "spaced name", "", ":python", "9ty"] {
-            let configuration = engines(vec![(name, engine())]);
-            assert_eq!(
-                configuration.validate(),
-                Err(ConfigurationViolation::EngineNameInvalid {
-                    name: name.to_owned(),
-                }),
-                "{name:?} must be refused"
-            );
-        }
-        for name in ["ty", "typescript", "engine-2", "rust.analyzer"] {
-            let configuration = engines(vec![(name, engine())]);
-            assert_eq!(
-                configuration.validate(),
-                Ok(()),
-                "{name:?} must be accepted"
-            );
-        }
-    }
-
-    #[test]
-    fn test_cross_engine_language_duplicates_name_the_colliding_segment() {
-        let mut second = engine();
-        second.program = "pyright".to_owned();
-        let configuration = engines(vec![("a", engine()), ("b", second)]);
-        assert_eq!(
-            configuration.validate(),
-            Err(ConfigurationViolation::EngineLanguageDuplicate {
-                engine: "b".to_owned(),
-                language: "python".to_owned(),
-            })
-        );
-    }
-
-    #[test]
-    fn test_engine_initialization_options_must_be_an_object() {
-        for options in [json!([1]), json!("text"), json!(7), json!(true)] {
-            let mut broken = engine();
-            broken.initialization_options = Some(options.clone());
-            assert_eq!(
-                engines(vec![("ty", broken)]).validate(),
-                Err(
-                    ConfigurationViolation::EngineInitializationOptionsNotObject {
-                        engine: "ty".to_owned(),
-                    }
-                ),
-                "{options} must be refused"
-            );
-        }
-        let mut accepted = engine();
-        accepted.initialization_options = Some(json!({ "settings": {} }));
-        assert_eq!(engines(vec![("ty", accepted)]).validate(), Ok(()));
-    }
-
-    #[test]
-    fn test_engine_count_above_the_cap_is_refused() {
-        let entries: Vec<(String, EngineConfiguration)> = (0..=ENGINES_MAX)
-            .map(|index| {
-                let mut numbered = engine();
-                numbered.languages = vec![format!("language{index}")];
-                (format!("engine{index}"), numbered)
-            })
-            .collect();
-        let configuration = WorkspaceConfiguration {
-            engines: entries.into_iter().collect(),
-            ..WorkspaceConfiguration::default()
-        };
-        assert!(matches!(
-            configuration.validate(),
-            Err(ConfigurationViolation::LimitOutOfRange {
-                field: "engines",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn test_engine_schema_bounds_and_defaults_equal_the_enforced_constants() {
-        let schema =
-            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
-        let engine = &schema["$defs"]["EngineConfiguration"]["properties"];
-        let cases = [
-            ("program min", &engine["program"]["minLength"], json!(1)),
-            (
-                "arguments max",
-                &engine["arguments"]["maxItems"],
-                json!(ENGINE_ARGUMENTS_MAX),
-            ),
-            ("languages min", &engine["languages"]["minItems"], json!(1)),
-            (
-                "languages max",
-                &engine["languages"]["maxItems"],
-                json!(ENGINE_LANGUAGES_MAX),
-            ),
-            (
-                "startup timeout default",
-                &engine["startup_timeout"]["default"],
-                json!("30s"),
-            ),
-            (
-                "request timeout default",
-                &engine["request_timeout"]["default"],
-                json!("1m"),
-            ),
-            (
-                "output limit default",
-                &engine["output_limit"]["default"],
-                json!("4kb"),
-            ),
-        ];
-        assert_schema_bounds(&cases);
-    }
-
     #[test]
     fn test_hook_round_trips_through_json_with_exact_wire_names() {
         let value = serde_json::to_value(hook()).expect("serialize");
-        assert_eq!(value["type"], json!("command"));
+        assert_eq!(value["command"], json!(["cargo", "test"]));
         assert_eq!(value["changed_paths"], json!("none"));
         assert_eq!(value["writes"], json!("none"));
         assert_eq!(value["failure_severity"], json!("error"));
@@ -4463,11 +3505,6 @@ mod tests {
                 json!(HOOKS_MAX),
             ),
             (
-                "allow max",
-                &execution["allow"]["maxItems"],
-                json!(EXECUTION_ALLOW_ITEMS_MAX),
-            ),
-            (
                 "num workers min",
                 &server["num_workers"]["minimum"],
                 json!(1),
@@ -4538,14 +3575,15 @@ mod tests {
         let definitions = &schema["$defs"];
         let hook = &definitions["CommandHook"]["properties"];
         let guarantee = &definitions["HookGuarantee"]["properties"];
+        let command = &definitions["CommandInput"]["oneOf"];
         let cases = [
             ("id min", &hook["id"]["minLength"], json!(1)),
             ("id max", &hook["id"]["maxLength"], json!(HOOK_ID_BYTES_MAX)),
-            ("program min", &hook["program"]["minLength"], json!(1)),
+            ("program min", &command[0]["minLength"], json!(1)),
             (
-                "arguments max",
-                &hook["arguments"]["maxItems"],
-                json!(HOOK_ARGUMENTS_MAX),
+                "command max",
+                &command[1]["maxItems"],
+                json!(COMMAND_ARGUMENTS_MAX + 1),
             ),
             (
                 "guarantees max",
@@ -4560,5 +3598,505 @@ mod tests {
             ),
         ];
         assert_schema_bounds(&cases);
+    }
+
+    #[test]
+    fn test_command_input_accepts_both_forms_and_enforces_bounds() {
+        let program: CommandInput = serde_json::from_value(json!("cargo")).expect("program");
+        assert_eq!(program.program(), "cargo");
+        assert!(program.arguments().is_empty());
+
+        let command: CommandInput =
+            serde_json::from_value(json!(["cargo", "test"])).expect("command");
+        assert_eq!(command.program(), "cargo");
+        assert_eq!(command.arguments(), &["test"]);
+
+        for refused in [
+            CommandInput::Program(String::new()),
+            CommandInput::Program("cargo test".to_owned()),
+            CommandInput::ProgramAndArguments(Vec::new()),
+        ] {
+            assert!(refused.violation("command").is_some());
+        }
+        assert!(matches!(
+            CommandInput::Program("/usr/bin/cargo".to_owned()).violation("command"),
+            Some(ConfigurationViolation::CommandProgramAbsolute { .. })
+        ));
+        for escaping in ["../evil", "bin/../evil", "./evil"] {
+            assert!(
+                matches!(
+                    CommandInput::Program(escaping.to_owned()).violation("command"),
+                    Some(ConfigurationViolation::CommandProgramDotSegment { .. })
+                ),
+                "a program path leaving the workspace is refused: {escaping}"
+            );
+        }
+        let too_many = CommandInput::ProgramAndArguments(
+            std::iter::once("tool".to_owned())
+                .chain((0..=COMMAND_ARGUMENTS_MAX).map(|_| "x".to_owned()))
+                .collect(),
+        );
+        assert!(matches!(
+            too_many.violation("command"),
+            Some(ConfigurationViolation::LimitOutOfRange { .. })
+        ));
+        let oversized = CommandInput::ProgramAndArguments(vec![
+            "tool".to_owned(),
+            "x".repeat(COMMAND_ARGUMENT_BYTES_MAX + 1),
+        ]);
+        assert!(matches!(
+            oversized.violation("command"),
+            Some(ConfigurationViolation::CommandArgumentOversized { .. })
+        ));
+        let oversized_program = CommandInput::Program("x".repeat(COMMAND_ARGUMENT_BYTES_MAX + 1));
+        assert!(matches!(
+            oversized_program.violation("command"),
+            Some(ConfigurationViolation::CommandProgramOversized { .. })
+        ));
+        let spaced_list = CommandInput::ProgramAndArguments(vec!["my tool".to_owned()]);
+        assert_eq!(spaced_list.violation("command"), None);
+    }
+
+    #[test]
+    fn test_language_entries_validate_identity_lsp_and_exact_include_duplicates() {
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.lsp.insert("ty".to_owned(), lsp());
+        configuration.languages.insert(
+            "python".to_owned(),
+            LanguageConfiguration {
+                lsp: Some(LanguageLspConfiguration::Named("ty".to_owned())),
+                include: Some(vec![PathPattern("**/*.py".to_owned())]),
+                ..LanguageConfiguration::default()
+            },
+        );
+        assert_eq!(configuration.validate(), Ok(()));
+        let resolved = configuration
+            .resolve_language_lsp("python")
+            .expect("named LSP must resolve");
+        assert_eq!(resolved.name, Some("ty"));
+
+        configuration.languages.insert(
+            "rust".to_owned(),
+            LanguageConfiguration {
+                lsp: Some(LanguageLspConfiguration::Inline(lsp())),
+                ..LanguageConfiguration::default()
+            },
+        );
+        let inline = configuration
+            .resolve_language_lsp("rust")
+            .expect("an inline LSP must resolve");
+        assert_eq!(
+            inline.name, None,
+            "an inline process belongs to its own entry and carries no shared name"
+        );
+        assert_eq!(inline.configuration, &lsp());
+        assert!(
+            configuration.resolve_language_lsp("javascript").is_none(),
+            "a language with no entry resolves no process"
+        );
+        configuration
+            .languages
+            .insert("javascript".to_owned(), LanguageConfiguration::default());
+        assert!(
+            configuration.resolve_language_lsp("javascript").is_none(),
+            "an entry with no lsp key resolves no process"
+        );
+
+        configuration.languages.insert(
+            "python:stub".to_owned(),
+            LanguageConfiguration {
+                include: Some(vec![PathPattern("**/*.py".to_owned())]),
+                ..LanguageConfiguration::default()
+            },
+        );
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LanguageIncludeDuplicate { .. })
+        ));
+
+        configuration.languages.remove("python:stub");
+        configuration
+            .languages
+            .get_mut("python")
+            .expect("language")
+            .lsp = Some(LanguageLspConfiguration::Named("missing".to_owned()));
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LanguageLspUnknown { .. })
+        ));
+
+        configuration.languages.clear();
+        configuration
+            .languages
+            .insert("Python".to_owned(), LanguageConfiguration::default());
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LanguageIdentityInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn test_language_and_hook_defaults_and_legacy_keys() {
+        let language: LanguageConfiguration = serde_json::from_value(json!({})).expect("language");
+        assert!(language.enabled);
+        assert!(language.include.is_none());
+        assert!(language.exclude.is_empty());
+        assert!(!language.execution);
+        assert!(language.lsp.is_none());
+
+        let value = json!({
+            "id": "tests",
+            "kind": "test",
+            "command": ["cargo", "test"],
+            "determinism": "deterministic"
+        });
+        let hook: CommandHook = serde_json::from_value(value).expect("hook defaults");
+        assert_eq!(hook.changed_paths, ChangedPaths::None);
+        assert_eq!(hook.writes, HookWrites::None);
+        assert_eq!(hook.working_directory, ProjectPath::default());
+        assert!(hook.environment.is_empty());
+        assert_eq!(hook.timeout, Duration::from_millis(120_000));
+        assert_eq!(hook.output_limit, ByteSize::from_bytes(4_096));
+        assert_eq!(hook.failure_severity, HookFailureSeverity::Error);
+        assert!(hook.guarantees.is_empty());
+
+        for legacy in [
+            json!({"type": "command", "id": "x", "kind": "test", "command": "cargo", "writes": "none", "failure_severity": "error", "determinism": "deterministic"}),
+            json!({"id": "x", "kind": "test", "program": "cargo", "arguments": [], "writes": "none", "failure_severity": "error", "determinism": "deterministic"}),
+        ] {
+            assert!(serde_json::from_value::<CommandHook>(legacy).is_err());
+        }
+    }
+
+    #[test]
+    fn test_lsp_defaults_validation_and_legacy_keys() {
+        let parsed: LspConfiguration =
+            serde_json::from_value(json!({"command": "rust-analyzer"})).expect("LSP defaults");
+        assert_eq!(parsed.startup_timeout, Duration::from_millis(30_000));
+        assert_eq!(parsed.request_timeout, Duration::from_millis(60_000));
+        assert_eq!(parsed.output_limit, ByteSize::from_bytes(4_096));
+
+        for legacy in [
+            json!({"program": "rust-analyzer"}),
+            json!({"command": "rust-analyzer", "arguments": []}),
+            json!({"command": "rust-analyzer", "languages": ["rust"]}),
+        ] {
+            assert!(serde_json::from_value::<LspConfiguration>(legacy).is_err());
+        }
+
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.lsp.insert("Rust".to_owned(), lsp());
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LspNameInvalid { .. })
+        ));
+        configuration.lsp.clear();
+        let mut invalid = lsp();
+        invalid
+            .environment
+            .insert("BAD=KEY".to_owned(), "x".to_owned());
+        configuration.lsp.insert("rust".to_owned(), invalid);
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LspEnvironmentKeyInvalid { .. })
+        ));
+        configuration
+            .lsp
+            .get_mut("rust")
+            .expect("LSP")
+            .environment
+            .clear();
+        configuration
+            .lsp
+            .get_mut("rust")
+            .expect("LSP")
+            .initialization_options = Some(json!([]));
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LspInitializationOptionsNotObject { .. })
+        ));
+    }
+
+    #[test]
+    fn test_lsp_and_pattern_collection_bounds_are_enforced() {
+        let mut configuration = WorkspaceConfiguration {
+            lsp: (0..=LSP_CONFIGURATIONS_MAX)
+                .map(|index| (format!("lsp{index}"), lsp()))
+                .collect(),
+            ..WorkspaceConfiguration::default()
+        };
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LimitOutOfRange { field: "lsp", .. })
+        ));
+
+        configuration = WorkspaceConfiguration::default();
+        configuration.languages = (0..=LANGUAGES_MAX)
+            .map(|index| (format!("language{index}"), LanguageConfiguration::default()))
+            .collect();
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LimitOutOfRange {
+                field: "languages",
+                ..
+            })
+        ));
+
+        configuration = WorkspaceConfiguration::default();
+        configuration.search.text.include = vec![PathPattern("../outside".to_owned())];
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::PathPatternInvalid {
+                field: "search.text.include",
+                ..
+            })
+        ));
+
+        let mut hook = hook();
+        hook.include = vec![PathPattern("../outside".to_owned())];
+        configuration = WorkspaceConfiguration {
+            hooks: vec![hook],
+            ..WorkspaceConfiguration::default()
+        };
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::PathPatternInvalid {
+                field: "hooks.include",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_lsp_numeric_bounds_are_enforced() {
+        type BreakBound = fn(&mut LspConfiguration);
+
+        let cases: [(BreakBound, &'static str); 5] = [
+            (
+                |lsp| lsp.startup_timeout = Duration::from_millis(LSP_STARTUP_TIMEOUT_MS_MIN - 1),
+                "lsp.startup_timeout",
+            ),
+            (
+                |lsp| lsp.request_timeout = Duration::from_millis(LSP_REQUEST_TIMEOUT_MS_MAX + 1),
+                "lsp.request_timeout",
+            ),
+            (
+                |lsp| lsp.output_limit = ByteSize::from_bytes(LSP_OUTPUT_BYTES_MIN - 1),
+                "lsp.output_limit",
+            ),
+            (
+                |lsp| lsp.retry.attempts = RETRY_ATTEMPTS_MAX + 1,
+                "lsp.retry.attempts",
+            ),
+            (
+                |lsp| lsp.restart.attempts = RESTART_ATTEMPTS_MAX + 1,
+                "lsp.restart.attempts",
+            ),
+        ];
+        for (break_bound, field) in cases {
+            let mut invalid = lsp();
+            break_bound(&mut invalid);
+            let configuration = WorkspaceConfiguration {
+                lsp: BTreeMap::from([("server".to_owned(), invalid)]),
+                ..WorkspaceConfiguration::default()
+            };
+            assert!(matches!(
+                configuration.validate(),
+                Err(ConfigurationViolation::LimitOutOfRange { field: actual, .. }) if actual == field
+            ));
+        }
+    }
+
+    #[test]
+    fn test_lsp_and_command_schemas_state_collection_bounds() {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let command = &schema["$defs"]["CommandInput"]["oneOf"];
+        assert_eq!(command[1]["minItems"], json!(1));
+        assert_eq!(command[1]["maxItems"], json!(COMMAND_ARGUMENTS_MAX + 1));
+        assert_eq!(
+            command[1]["items"]["maxLength"],
+            json!(COMMAND_ARGUMENT_BYTES_MAX)
+        );
+        assert_eq!(
+            command[1]["prefixItems"][0]["maxLength"],
+            json!(COMMAND_ARGUMENT_BYTES_MAX)
+        );
+        assert_eq!(schema["properties"]["hooks"]["maxItems"], json!(HOOKS_MAX));
+        assert_eq!(
+            schema["properties"]["languages"]["maxProperties"],
+            json!(LANGUAGES_MAX)
+        );
+        assert_eq!(
+            schema["properties"]["lsp"]["maxProperties"],
+            json!(LSP_CONFIGURATIONS_MAX)
+        );
+        assert_eq!(
+            schema["$defs"]["CommandHook"]["properties"]["environment"]["maxProperties"],
+            json!(HOOK_ENVIRONMENT_ENTRIES_MAX)
+        );
+        assert_eq!(
+            schema["$defs"]["LspConfiguration"]["properties"]["environment"]["maxProperties"],
+            json!(LSP_ENVIRONMENT_ENTRIES_MAX)
+        );
+        assert_eq!(
+            schema["$defs"]["LanguageConfiguration"]["properties"]["exclude"]["maxItems"],
+            json!(CONFIGURATION_PATTERNS_MAX)
+        );
+        assert_eq!(
+            schema["$defs"]["LanguageConfiguration"]["properties"]["include"]["maxItems"],
+            json!(CONFIGURATION_PATTERNS_MAX)
+        );
+        assert_eq!(
+            schema["$defs"]["CommandHook"]["properties"]["include"]["maxItems"],
+            json!(CONFIGURATION_PATTERNS_MAX)
+        );
+        assert_eq!(
+            schema["$defs"]["TextSearchConfiguration"]["properties"]["include"]["maxItems"],
+            json!(CONFIGURATION_PATTERNS_MAX)
+        );
+    }
+
+    #[test]
+    fn test_hook_contract_validation_covers_command_order_and_bounds() {
+        let mut invalid = hook();
+        invalid.command = CommandInput::Program(String::new());
+        let configuration = WorkspaceConfiguration {
+            hooks: vec![invalid],
+            ..WorkspaceConfiguration::default()
+        };
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::CommandProgramEmpty { .. })
+        ));
+
+        let mut invalid = hook();
+        invalid.working_directory = ProjectPath("../outside".to_owned());
+        let configuration = WorkspaceConfiguration {
+            hooks: vec![invalid],
+            ..WorkspaceConfiguration::default()
+        };
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::HookWorkingDirectoryInvalid { .. })
+        ));
+
+        let mut transform = hook();
+        transform.id = "format".to_owned();
+        transform.writes = HookWrites::ChangedPaths;
+        let validation = hook();
+        let accepted = WorkspaceConfiguration {
+            hooks: vec![transform.clone(), validation.clone()],
+            ..WorkspaceConfiguration::default()
+        };
+        assert_eq!(accepted.validate(), Ok(()));
+        let refused = WorkspaceConfiguration {
+            hooks: vec![validation, transform],
+            ..WorkspaceConfiguration::default()
+        };
+        assert!(matches!(
+            refused.validate(),
+            Err(ConfigurationViolation::HookTransformAfterValidation { .. })
+        ));
+
+        let mut invalid = hook();
+        invalid.output_limit = ByteSize::from_bytes(HOOK_OUTPUT_BYTES_MIN - 1);
+        let configuration = WorkspaceConfiguration {
+            hooks: vec![invalid],
+            ..WorkspaceConfiguration::default()
+        };
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LimitOutOfRange {
+                field: "hooks.output_limit",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_every_configuration_violation_carries_evidence() {
+        let text = || "x".to_owned();
+        let violations = [
+            ConfigurationViolation::LimitOutOfRange {
+                field: "x",
+                value: 2,
+                min: 0,
+                max: 1,
+            },
+            ConfigurationViolation::LanguageIdentityInvalid { language: text() },
+            ConfigurationViolation::LanguageLspUnknown {
+                language: text(),
+                lsp: text(),
+            },
+            ConfigurationViolation::LanguageIncludeDuplicate {
+                pattern: text(),
+                first: text(),
+                second: text(),
+            },
+            ConfigurationViolation::SemanticModelInvalid {
+                field: "x",
+                value: text(),
+            },
+            ConfigurationViolation::SearchWeightsInvalid {
+                lexical: 0.2,
+                semantic: 0.2,
+            },
+            ConfigurationViolation::HookTransformAfterValidation {
+                transform: text(),
+                validation: text(),
+            },
+            ConfigurationViolation::HookTransformGuarantees { id: text() },
+            ConfigurationViolation::HookIdDuplicate { id: text() },
+            ConfigurationViolation::HookIdInvalid { id: text() },
+            ConfigurationViolation::CommandProgramEmpty { field: "x" },
+            ConfigurationViolation::CommandProgramWhitespace {
+                field: "x",
+                program: text(),
+            },
+            ConfigurationViolation::CommandProgramAbsolute {
+                field: "x",
+                program: text(),
+            },
+            ConfigurationViolation::CommandProgramDotSegment {
+                field: "x",
+                program: text(),
+            },
+            ConfigurationViolation::CommandArgumentOversized {
+                field: "x",
+                bytes: 4_097,
+            },
+            ConfigurationViolation::CommandProgramOversized {
+                field: "x",
+                bytes: 4_097,
+            },
+            ConfigurationViolation::HookWorkingDirectoryInvalid {
+                id: text(),
+                working_directory: text(),
+            },
+            ConfigurationViolation::HookEnvironmentKeyInvalid {
+                id: text(),
+                key: text(),
+            },
+            ConfigurationViolation::LspNameInvalid { name: text() },
+            ConfigurationViolation::LspEnvironmentKeyInvalid {
+                lsp: text(),
+                key: text(),
+            },
+            ConfigurationViolation::LspInitializationOptionsNotObject { lsp: text() },
+            ConfigurationViolation::PathPatternInvalid {
+                field: "x",
+                pattern: text(),
+            },
+            ConfigurationViolation::LogCaptureInvalid {
+                capture: text(),
+                detail: text(),
+            },
+            ConfigurationViolation::PortSelectionConflict,
+            ConfigurationViolation::PortRangeInverted { min: 2, max: 1 },
+        ];
+        for violation in violations {
+            assert!(!violation.evidence().is_empty(), "{violation:?}");
+        }
     }
 }

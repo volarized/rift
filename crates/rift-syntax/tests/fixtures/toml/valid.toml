@@ -11,11 +11,11 @@ cert = "server.pem"
 
 [[hooks]]
 id = "format"
-program = "cargo"
+command = "cargo"
 
 [[hooks]]
 id = "lint"
-program = "cargo"
+command = "cargo"
 
 "quoted key" = "value"
 'literal key' = "value"

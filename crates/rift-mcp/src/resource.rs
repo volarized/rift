@@ -7,6 +7,7 @@
 //! reads refuse.
 
 use rift_index::{LOG_PAGE_RECORDS_MAX, LogQuery, StoredLogRecord};
+use rift_protocol::workspace::WorkspaceResourcePage;
 use rmcp::ErrorData;
 use rmcp::model::{ReadResourceResult, Resource, ResourceContents, ResourceTemplate};
 use serde_json::{Map, Value, json};
@@ -21,8 +22,14 @@ pub(crate) const LOGS_COMPONENT_PREFIX: &str = "rift://logs/component/";
 pub(crate) const LOGS_LEVEL_TEMPLATE: &str = "rift://logs/level/{level}";
 /// The template a client expands to reach one component.
 pub(crate) const LOGS_COMPONENT_TEMPLATE: &str = "rift://logs/component/{component}";
-/// The media type every log read answers in.
-const LOGS_MEDIA_TYPE: &str = "application/json";
+/// The first workspace resource page.
+pub(crate) const WORKSPACE_URI: &str = "rift://workspace";
+/// The template a client expands to reach one workspace resource page.
+pub(crate) const WORKSPACE_TEMPLATE: &str = "rift://workspace{?page_index}";
+/// The query prefix selecting one workspace resource page.
+const WORKSPACE_QUERY_PREFIX: &str = "rift://workspace?";
+/// The media type every resource read answers in.
+const RESOURCE_MEDIA_TYPE: &str = "application/json";
 /// The levels a level-restricted read accepts, in the spelling the store holds.
 const LOG_LEVELS: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
 
@@ -36,7 +43,14 @@ pub(crate) fn declared_resources() -> Vec<Resource> {
                  and engine did. Read this when a tool refuses and the refusal alone does \
                  not say why.",
             )
-            .with_mime_type(LOGS_MEDIA_TYPE),
+            .with_mime_type(RESOURCE_MEDIA_TYPE),
+        Resource::new(WORKSPACE_URI, "workspace")
+            .with_title("Workspace")
+            .with_description(
+                "The server's effective language and hook configuration, with one page of the \
+                 captured source catalog.",
+            )
+            .with_mime_type(RESOURCE_MEDIA_TYPE),
     ]
 }
 
@@ -49,14 +63,20 @@ pub(crate) fn declared_templates() -> Vec<ResourceTemplate> {
                 "The recorded diagnostics at one severity: trace, debug, info, warn, or \
                  error.",
             )
-            .with_mime_type(LOGS_MEDIA_TYPE),
+            .with_mime_type(RESOURCE_MEDIA_TYPE),
         ResourceTemplate::new(LOGS_COMPONENT_TEMPLATE, "logs-for-component")
             .with_title("Server logs from one component")
             .with_description(
                 "The recorded diagnostics one component emitted, as its spans label them: \
                  index, search, engine, change, or logs.",
             )
-            .with_mime_type(LOGS_MEDIA_TYPE),
+            .with_mime_type(RESOURCE_MEDIA_TYPE),
+        ResourceTemplate::new(WORKSPACE_TEMPLATE, "workspace-page")
+            .with_title("Workspace page")
+            .with_description(
+                "One page of the workspace resource, selected by zero-based `page_index`.",
+            )
+            .with_mime_type(RESOURCE_MEDIA_TYPE),
     ]
 }
 
@@ -97,6 +117,39 @@ pub(crate) fn log_query(uri: &str, page_records: u64) -> Result<LogQuery, ErrorD
     ))
 }
 
+/// Returns whether `uri` addresses the workspace resource family.
+#[must_use]
+pub(crate) fn is_workspace_uri(uri: &str) -> bool {
+    uri == WORKSPACE_URI || uri.starts_with(WORKSPACE_QUERY_PREFIX)
+}
+
+/// The zero-based page one workspace resource URI selects.
+pub(crate) fn workspace_page_index(uri: &str) -> Result<u64, ErrorData> {
+    if uri == WORKSPACE_URI {
+        return Ok(0);
+    }
+    let Some(query) = uri.strip_prefix(WORKSPACE_QUERY_PREFIX) else {
+        return Err(ErrorData::resource_not_found(
+            format!("no resource is published at {uri:?}"),
+            None,
+        ));
+    };
+    let Some(value) = query.strip_prefix("page_index=") else {
+        return Err(workspace_page_error(query));
+    };
+    value
+        .parse::<u64>()
+        .map_err(|_| workspace_page_error(value))
+}
+
+/// Refusal for a workspace resource query that does not select one page.
+fn workspace_page_error(value: &str) -> ErrorData {
+    ErrorData::invalid_params(
+        format!("`page_index` must be a zero-based integer, such as 0, not {value:?}"),
+        None,
+    )
+}
+
 /// The answer one log read returns: the records it selected, newest first.
 pub(crate) fn rendered_logs(uri: &str, records: &[StoredLogRecord]) -> ReadResourceResult {
     let body = json!({
@@ -105,7 +158,7 @@ pub(crate) fn rendered_logs(uri: &str, records: &[StoredLogRecord]) -> ReadResou
         "record_count": records.len(),
     });
     ReadResourceResult::new(vec![
-        ResourceContents::text(body.to_string(), uri).with_mime_type(LOGS_MEDIA_TYPE),
+        ResourceContents::text(body.to_string(), uri).with_mime_type(RESOURCE_MEDIA_TYPE),
     ])
 }
 
@@ -120,7 +173,16 @@ pub(crate) fn logs_unavailable(uri: &str, reason: &str) -> ReadResourceResult {
         "unavailable": reason,
     });
     ReadResourceResult::new(vec![
-        ResourceContents::text(body.to_string(), uri).with_mime_type(LOGS_MEDIA_TYPE),
+        ResourceContents::text(body.to_string(), uri).with_mime_type(RESOURCE_MEDIA_TYPE),
+    ])
+}
+
+/// The typed answer one workspace resource read returns.
+pub(crate) fn rendered_workspace(uri: &str, page: &WorkspaceResourcePage) -> ReadResourceResult {
+    let body = serde_json::to_string(page)
+        .unwrap_or_else(|error| unreachable!("workspace resource pages serialize: {error}"));
+    ReadResourceResult::new(vec![
+        ResourceContents::text(body, uri).with_mime_type(RESOURCE_MEDIA_TYPE),
     ])
 }
 
@@ -146,10 +208,13 @@ fn rendered_record(stored: &StoredLogRecord) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        LOGS_COMPONENT_PREFIX, LOGS_LEVEL_PREFIX, LOGS_URI, declared_resources, declared_templates,
-        log_query, logs_unavailable, rendered_logs,
+        LOGS_COMPONENT_PREFIX, LOGS_LEVEL_PREFIX, LOGS_URI, WORKSPACE_TEMPLATE, WORKSPACE_URI,
+        declared_resources, declared_templates, is_workspace_uri, log_query, logs_unavailable,
+        rendered_logs, rendered_workspace, workspace_page_index,
     };
     use rift_index::{LOG_PAGE_RECORDS_MAX, LogRecord, LogStore, StoredLogRecord};
+    use rift_protocol::read::{Digest, Pagination};
+    use rift_protocol::workspace::WorkspaceResourcePage;
     use rmcp::model::ResourceContents;
     use serde_json::Value;
 
@@ -161,7 +226,21 @@ mod tests {
     fn text(result: &rmcp::model::ReadResourceResult) -> String {
         match result.contents.first() {
             Some(ResourceContents::TextResourceContents { text, .. }) => text.clone(),
-            other => unreachable!("a log read answers with text, not {other:?}"),
+            other => unreachable!("a resource read answers with text, not {other:?}"),
+        }
+    }
+
+    /// Empty first workspace page under one accepted configuration revision.
+    fn workspace_page() -> WorkspaceResourcePage {
+        WorkspaceResourcePage {
+            configuration_revision: Digest("3f9a1c2e".to_owned()),
+            languages: Vec::new(),
+            hooks: Vec::new(),
+            source: Vec::new(),
+            pagination: Pagination {
+                page_index: 0,
+                total_pages: 0,
+            },
         }
     }
 
@@ -209,7 +288,7 @@ mod tests {
     #[test]
     fn an_unpublished_uri_is_refused_as_not_found() {
         let refusal =
-            log_query("rift://workspace", PAGE).expect_err("an unpublished URI must be refused");
+            log_query("rift://missing", PAGE).expect_err("an unpublished URI must be refused");
 
         assert_eq!(refusal.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
     }
@@ -271,17 +350,81 @@ mod tests {
     }
 
     #[test]
+    fn workspace_bare_uri_selects_the_first_page() {
+        let page = workspace_page_index(WORKSPACE_URI).expect("bare workspace URI is published");
+        assert_eq!(page, 0);
+        assert!(is_workspace_uri(WORKSPACE_URI));
+    }
+
+    #[test]
+    fn workspace_query_selects_its_zero_based_page() {
+        let uri = "rift://workspace?page_index=17";
+
+        let page = workspace_page_index(uri).expect("workspace page URI is published");
+        assert_eq!(page, 17);
+        assert!(is_workspace_uri(uri));
+    }
+
+    #[test]
+    fn workspace_query_refuses_missing_or_invalid_page_index() {
+        for uri in [
+            "rift://workspace?",
+            "rift://workspace?page=1",
+            "rift://workspace?page_index=",
+            "rift://workspace?page_index=one",
+            "rift://workspace?page_index=1&extra=2",
+            "rift://workspace?page_index=18446744073709551616",
+        ] {
+            let refusal = workspace_page_index(uri).expect_err("invalid page must be refused");
+            assert_eq!(refusal.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert!(refusal.message.contains("page_index"), "{refusal:?}");
+        }
+    }
+
+    #[test]
+    fn workspace_path_is_not_a_workspace_resource_uri() {
+        let uri = "rift://workspace/1";
+        let refusal = workspace_page_index(uri).expect_err("workspace paths are not published");
+
+        assert!(!is_workspace_uri(uri));
+        assert_eq!(refusal.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
+    }
+
+    #[test]
+    fn rendered_workspace_answer_carries_typed_json() {
+        let rendered = rendered_workspace(WORKSPACE_URI, &workspace_page());
+        let body: Value = serde_json::from_str(&text(&rendered)).expect("the body is JSON");
+
+        assert_eq!(body["configuration_revision"], "3f9a1c2e");
+        assert_eq!(body["languages"], serde_json::json!([]));
+        assert_eq!(body["hooks"], serde_json::json!([]));
+        assert_eq!(body["source"], serde_json::json!([]));
+        match rendered.contents.first() {
+            Some(ResourceContents::TextResourceContents { uri, mime_type, .. }) => {
+                assert_eq!(uri, WORKSPACE_URI);
+                assert_eq!(mime_type.as_deref(), Some("application/json"));
+            }
+            other => unreachable!("a workspace read answers with text, not {other:?}"),
+        }
+    }
+
+    #[test]
     fn the_published_surface_names_the_log_family() {
         let resources = declared_resources();
         let templates = declared_templates();
 
-        assert_eq!(resources.len(), 1);
+        assert_eq!(resources.len(), 2);
         assert_eq!(resources[0].uri, LOGS_URI);
-        assert_eq!(templates.len(), 2);
-        assert!(templates.iter().all(|template| {
+        assert_eq!(resources[1].uri, WORKSPACE_URI);
+        assert!(resources[1].description.is_some());
+        assert_eq!(templates.len(), 3);
+        assert!(templates[..2].iter().all(|template| {
             template.uri_template.starts_with("rift://logs/")
                 && template.description.is_some()
                 && template.mime_type.is_some()
         }));
+        assert_eq!(templates[2].uri_template, WORKSPACE_TEMPLATE);
+        assert!(templates[2].description.is_some());
+        assert!(templates[2].mime_type.is_some());
     }
 }

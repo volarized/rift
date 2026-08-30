@@ -29,6 +29,27 @@ struct Hook<'a> {
     failure_severity: &'a str,
     timeout: &'a str,
     guarantee: bool,
+    /// The hook's `include` list, spelled as the TOML array the file carries.
+    include: &'a str,
+    /// The hook's `exclude` list, spelled the same way.
+    exclude: &'a str,
+}
+
+impl Hook<'_> {
+    /// A validation hook that runs `script` and selects every change.
+    const fn validation(id: &'static str, script: &'static str) -> Hook<'static> {
+        Hook {
+            id,
+            kind: "lint",
+            script,
+            writes: "none",
+            failure_severity: "error",
+            timeout: "30s",
+            guarantee: false,
+            include: "[]",
+            exclude: "[]",
+        }
+    }
 }
 
 fn configuration(hooks: &[Hook<'_>]) -> String {
@@ -43,11 +64,9 @@ fn configuration(hooks: &[Hook<'_>]) -> String {
             configuration,
             r#"
 [[hooks]]
-type = "command"
 id = "{id}"
 kind = "{kind}"
-program = "sh"
-arguments = ["{script}"]
+command = ["sh", "{script}"]
 changed_paths = "none"
 writes = "{writes}"
 working_directory = ""
@@ -57,6 +76,8 @@ output_limit = "4kb"
 failure_severity = "{failure_severity}"
 guarantees = {guarantees}
 determinism = "deterministic"
+include = {include}
+exclude = {exclude}
 "#,
             id = hook.id,
             kind = hook.kind,
@@ -64,6 +85,8 @@ determinism = "deterministic"
             writes = hook.writes,
             timeout = hook.timeout,
             failure_severity = hook.failure_severity,
+            include = hook.include,
+            exclude = hook.exclude,
         )
         .expect("writing to String must succeed");
     }
@@ -134,6 +157,15 @@ async fn replace(client: &RunningService<RoleClient, ()>, body: &str) -> TestRes
         .ok_or_else(|| "replace_symbol must return structured content".into())
 }
 
+async fn patch(client: &RunningService<RoleClient, ()>, body: &str) -> TestResult<Value> {
+    let request =
+        CallToolRequestParams::new("patch").with_arguments(arguments(&json!({ "patch": body }))?);
+    call_retrying_acceptance(client, request)
+        .await?
+        .structured_content
+        .ok_or_else(|| "patch must return structured content".into())
+}
+
 async fn read_beacon_source(client: &RunningService<RoleClient, ()>) -> TestResult<String> {
     let request = CallToolRequestParams::new("get_symbol")
         .with_arguments(arguments(&json!({ "name": "beacon" }))?);
@@ -197,6 +229,8 @@ async fn transform_configuration_precedes_validation_and_format_kind_is_accepted
             failure_severity: "warning",
             timeout: "30s",
             guarantee: false,
+            include: "[]",
+            exclude: "[]",
         },
         Hook {
             id: "tests",
@@ -206,6 +240,8 @@ async fn transform_configuration_precedes_validation_and_format_kind_is_accepted
             failure_severity: "error",
             timeout: "30s",
             guarantee: true,
+            include: "[]",
+            exclude: "[]",
         },
     ];
     let scripts = [("format.sh", "exit 0\n"), ("tests.sh", "exit 0\n")];
@@ -229,6 +265,8 @@ async fn validation_before_transform_is_refused_by_writes_classification() -> Te
             failure_severity: "error",
             timeout: "30s",
             guarantee: false,
+            include: "[]",
+            exclude: "[]",
         },
         Hook {
             id: "late-write",
@@ -238,6 +276,8 @@ async fn validation_before_transform_is_refused_by_writes_classification() -> Te
             failure_severity: "warning",
             timeout: "30s",
             guarantee: false,
+            include: "[]",
+            exclude: "[]",
         },
     ];
     let scripts = [("tests.sh", "exit 0\n"), ("late.sh", "exit 0\n")];
@@ -263,6 +303,8 @@ async fn transform_guarantees_are_refused_as_validation_only() -> TestResult {
         failure_severity: "warning",
         timeout: "30s",
         guarantee: true,
+        include: "[]",
+        exclude: "[]",
     }];
     let scripts = [("format.sh", "exit 0\n")];
     let (_directory, client, server_task) = served_workspace(&hooks, &scripts, &[]).await?;
@@ -288,6 +330,8 @@ async fn successful_transform_defines_final_edits_id_and_index_source() -> TestR
         failure_severity: "warning",
         timeout: "30s",
         guarantee: false,
+        include: "[]",
+        exclude: "[]",
     }];
     let scripts = [("format.sh", "echo 'pub fn beacon() -> u8 { 2 }' > lib.rs\n")];
 
@@ -338,6 +382,8 @@ async fn workspace_transform_reports_every_final_path_and_edit() -> TestResult {
         failure_severity: "warning",
         timeout: "30s",
         guarantee: false,
+        include: "[]",
+        exclude: "[]",
     }];
     let scripts = [(
         "format.sh",
@@ -394,6 +440,8 @@ async fn failed_timed_out_and_out_of_scope_transforms_restore_only_hook_writes()
             failure_severity: "warning",
             timeout,
             guarantee: false,
+            include: "[]",
+            exclude: "[]",
         }];
         let scripts = [("hook.sh", script)];
         let files = [("notes.txt", "original note\n")];
@@ -422,6 +470,167 @@ async fn failed_timed_out_and_out_of_scope_transforms_restore_only_hook_writes()
 
 #[cfg(unix)]
 #[tokio::test]
+async fn failed_transform_keeps_an_unclassified_direct_edit() -> TestResult {
+    let hooks = [Hook {
+        id: "failed",
+        kind: "format",
+        script: "hook.sh",
+        writes: "changed_paths",
+        failure_severity: "warning",
+        timeout: "30s",
+        guarantee: false,
+        include: "[]",
+        exclude: "[]",
+    }];
+    let scripts = [("hook.sh", "echo 'version = 9' > Cargo.lock\nexit 1\n")];
+    let files = [("Cargo.lock", "version = 4\n")];
+    let (directory, client, server_task) = served_workspace(&hooks, &scripts, &files).await?;
+
+    let result = patch(
+        &client,
+        "--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1 +1 @@\n-version = 4\n+version = 3\n",
+    )
+    .await?;
+
+    assert_eq!(result["status"], json!("applied"));
+    assert_eq!(result["summary"]["paths"], json!(["Cargo.lock"]));
+    assert_eq!(
+        fs::read_to_string(directory.path().join("Cargo.lock"))?,
+        "version = 3\n",
+        "failed hook rollback must retain unclassified direct edit"
+    );
+    assert_eq!(diagnostic(&result, "failed")?["severity"], json!("warning"));
+    stop(client, server_task).await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unavailable_transform_output_is_restored() -> TestResult {
+    let cases = [
+        ("binary", "printf '\\377' > notes.txt\n"),
+        ("oversized", "head -c 4194305 /dev/zero > notes.txt\n"),
+    ];
+    for (id, script) in cases {
+        let hooks = [Hook {
+            id,
+            kind: "format",
+            script: "hook.sh",
+            writes: "workspace",
+            failure_severity: "warning",
+            timeout: "30s",
+            guarantee: false,
+            include: "[]",
+            exclude: "[]",
+        }];
+        let scripts = [("hook.sh", script)];
+        let files = [("notes.txt", "original note\n")];
+        let (directory, client, server_task) = served_workspace(&hooks, &scripts, &files).await?;
+
+        let result = replace(&client, "pub fn beacon() -> u8 { 1 }").await?;
+
+        assert_eq!(result["status"], json!("applied"));
+        assert_eq!(
+            fs::read(directory.path().join("notes.txt"))?,
+            b"original note\n",
+            "unavailable hook output must be restored for {id}"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("lib.rs"))?,
+            DIRECT_SOURCE,
+            "direct edit must survive unavailable hook output for {id}"
+        );
+        assert_eq!(diagnostic(&result, id)?["severity"], json!("warning"));
+        stop(client, server_task).await?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rejected_gitignore_changes_keep_original_file_membership() -> TestResult {
+    let cases = [
+        (
+            "tighten",
+            "echo 'notes.txt' > .gitignore\necho 'hook note' > notes.txt\nexit 1\n",
+            "",
+        ),
+        ("relax", ": > .gitignore\nexit 1\n", "ignored.txt\n"),
+    ];
+    for (id, script, ignore) in cases {
+        let hooks = [Hook {
+            id,
+            kind: "format",
+            script: "hook.sh",
+            writes: "workspace",
+            failure_severity: "warning",
+            timeout: "30s",
+            guarantee: false,
+            include: "[]",
+            exclude: "[]",
+        }];
+        let scripts = [("hook.sh", script)];
+        let files = [
+            (".gitignore", ignore),
+            ("notes.txt", "original note\n"),
+            ("ignored.txt", "must remain\n"),
+        ];
+        let (directory, client, server_task) = served_workspace(&hooks, &scripts, &files).await?;
+
+        let result = replace(&client, "pub fn beacon() -> u8 { 1 }").await?;
+
+        assert_eq!(result["status"], json!("applied"));
+        assert_eq!(
+            fs::read_to_string(directory.path().join(".gitignore"))?,
+            ignore
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("notes.txt"))?,
+            "original note\n"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("ignored.txt"))?,
+            "must remain\n",
+            "rollback must not delete a file hidden before hook {id}"
+        );
+        assert_eq!(diagnostic(&result, id)?["severity"], json!("warning"));
+        stop(client, server_task).await?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unavailable_input_refuses_before_direct_write() -> TestResult {
+    let hooks = [Hook {
+        id: "format",
+        kind: "format",
+        script: "hook.sh",
+        writes: "workspace",
+        failure_severity: "warning",
+        timeout: "30s",
+        guarantee: false,
+        include: "[]",
+        exclude: "[]",
+    }];
+    let scripts = [("hook.sh", "exit 0\n")];
+    let (directory, client, server_task) = served_workspace(&hooks, &scripts, &[]).await?;
+    fs::write(directory.path().join("binary.data"), [0xff])?;
+
+    let error = replace(&client, "pub fn beacon() -> u8 { 1 }")
+        .await
+        .expect_err("unavailable input must refuse change");
+
+    assert!(error.to_string().contains("content_unavailable"));
+    assert_eq!(
+        fs::read_to_string(directory.path().join("lib.rs"))?,
+        INITIAL_SOURCE,
+        "direct write must not land before hook input capture"
+    );
+    stop(client, server_task).await
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn failed_second_transform_keeps_first_transform() -> TestResult {
     let hooks = [
         Hook {
@@ -432,6 +641,8 @@ async fn failed_second_transform_keeps_first_transform() -> TestResult {
             failure_severity: "warning",
             timeout: "30s",
             guarantee: false,
+            include: "[]",
+            exclude: "[]",
         },
         Hook {
             id: "second",
@@ -441,6 +652,8 @@ async fn failed_second_transform_keeps_first_transform() -> TestResult {
             failure_severity: "warning",
             timeout: "30s",
             guarantee: false,
+            include: "[]",
+            exclude: "[]",
         },
     ];
     let scripts = [
@@ -474,6 +687,8 @@ async fn validation_reads_transformed_tree_reports_failure_and_restores_writes()
             failure_severity: "warning",
             timeout: "30s",
             guarantee: false,
+            include: "[]",
+            exclude: "[]",
         },
         Hook {
             id: "observes-final",
@@ -483,6 +698,8 @@ async fn validation_reads_transformed_tree_reports_failure_and_restores_writes()
             failure_severity: "error",
             timeout: "30s",
             guarantee: true,
+            include: "[]",
+            exclude: "[]",
         },
         Hook {
             id: "fails",
@@ -492,6 +709,8 @@ async fn validation_reads_transformed_tree_reports_failure_and_restores_writes()
             failure_severity: "error",
             timeout: "30s",
             guarantee: false,
+            include: "[]",
+            exclude: "[]",
         },
         Hook {
             id: "writes-source",
@@ -501,6 +720,8 @@ async fn validation_reads_transformed_tree_reports_failure_and_restores_writes()
             failure_severity: "warning",
             timeout: "30s",
             guarantee: false,
+            include: "[]",
+            exclude: "[]",
         },
     ];
     let scripts = [
@@ -548,6 +769,8 @@ async fn transform_that_erases_direct_difference_returns_unchanged() -> TestResu
         failure_severity: "warning",
         timeout: "30s",
         guarantee: false,
+        include: "[]",
+        exclude: "[]",
     }];
     let scripts = [("format.sh", "echo 'pub fn beacon() {}' > lib.rs\n")];
     let (directory, client, server_task) = served_workspace(&hooks, &scripts, &[]).await?;
@@ -582,6 +805,8 @@ async fn hook_permission_writes_are_restored_and_never_reported_as_byte_edits() 
             failure_severity: "warning",
             timeout: "30s",
             guarantee,
+            include: "[]",
+            exclude: "[]",
         }];
         let scripts = [("permissions.sh", "chmod 600 lib.rs\n")];
         let (directory, client, server_task) = served_workspace(&hooks, &scripts, &[]).await?;
@@ -614,5 +839,79 @@ async fn hook_permission_writes_are_restored_and_never_reported_as_byte_edits() 
         );
         stop(client, server_task).await?;
     }
+    Ok(())
+}
+
+/// A hook's `include` and `exclude` select it from the change's own paths.
+/// One change that touches a manifest and a source file runs the hook covering
+/// both exactly once, and leaves a hook covering neither out of the run.
+#[cfg(unix)]
+#[tokio::test]
+async fn hook_path_selection_runs_a_covering_hook_once_and_skips_an_unrelated_one() -> TestResult {
+    let mut rust_only = Hook::validation("rust-only", "fail.sh");
+    rust_only.include = r#"["**/*.rs"]"#;
+    let mut manifest_only = Hook::validation("manifest-only", "fail.sh");
+    manifest_only.include = r#"["**/Cargo.toml"]"#;
+    let mut generated_excluded = Hook::validation("generated-excluded", "fail.sh");
+    generated_excluded.exclude = r#"["**/*.rs"]"#;
+    let hooks = [rust_only, manifest_only, generated_excluded];
+    let scripts = [("fail.sh", "exit 1\n")];
+    let files = [("Cargo.toml", "[package]\nname = \"beacon\"\n")];
+    let (_directory, client, server_task) = served_workspace(&hooks, &scripts, &files).await?;
+
+    let source_only = replace(&client, "pub fn beacon() -> u8 { 1 }").await?;
+    assert_eq!(source_only["status"], json!("applied"));
+    assert_eq!(
+        diagnostic(&source_only, "rust-only")?["severity"],
+        json!("error"),
+        "a hook including the changed source runs"
+    );
+    assert!(
+        diagnostic(&source_only, "manifest-only").is_err(),
+        "a hook including only the manifest stays out of a source change: {source_only:#}"
+    );
+    assert!(
+        diagnostic(&source_only, "generated-excluded").is_err(),
+        "an exclude that covers every changed path removes the hook: {source_only:#}"
+    );
+
+    let both = patch(
+        &client,
+        "--- a/Cargo.toml\n\
+         +++ b/Cargo.toml\n\
+         @@ -1,2 +1,3 @@\n\
+         \x20[package]\n\
+         \x20name = \"beacon\"\n\
+         +version = \"0.1.0\"\n\
+         --- a/lib.rs\n\
+         +++ b/lib.rs\n\
+         @@ -1 +1 @@\n\
+         -pub fn beacon() -> u8 { 1 }\n\
+         +pub fn beacon() -> u8 { 2 }\n",
+    )
+    .await?;
+    assert_eq!(both["status"], json!("applied"));
+    let matching: Vec<&Value> = both["summary"]["diagnostics"]
+        .as_array()
+        .ok_or("applied result must carry diagnostics")?
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("rust-only"))
+        })
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "a hook runs once for a multi-file change: {both:#}"
+    );
+    assert_eq!(
+        diagnostic(&both, "manifest-only")?["severity"],
+        json!("error"),
+        "the manifest path selects its own hook in the same change"
+    );
+
+    stop(client, server_task).await?;
     Ok(())
 }
