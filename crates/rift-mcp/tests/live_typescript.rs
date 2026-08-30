@@ -34,6 +34,19 @@ use workspace_client::{
     TestResult, call_retrying_acceptance, served_relative_workspace, served_workspace, tool_request,
 };
 
+/// The project paths one applied change reports, in the order it carries them.
+fn changed_paths(structured: &Value) -> Vec<&str> {
+    structured["summary"]["files"]
+        .as_array()
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|file| file["path"].as_str())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The manifest and lockfile `bun install --frozen-lockfile` reads.
 const PACKAGE: &str = include_str!("fixtures/typescript/package.json");
 const LOCKFILE: &str = include_str!("fixtures/typescript/bun.lock");
@@ -191,41 +204,46 @@ async fn applied_rename_rewrites_the_module_the_importer_and_the_component() -> 
         call_retrying_acceptance(&client, rename_request(BEACON_SYMBOL, "flare")).await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
     assert_eq!(
-        structured["summary"]["paths"],
-        json!(["caller.ts", "hub.ts", "view.tsx"]),
+        changed_paths(&structured),
+        ["caller.ts", "hub.ts", "view.tsx"],
         "the declaration and both importers carry the rename: {structured:#}"
     );
+    let renamed_hub = "export function flare(value: number): number {\n  return value;\n}\n";
+    let renamed_caller = "import { flare } from \"./hub\";\nimport { Banner } from \"./view\";\n\n\
+                          export function total(): number {\n  return flare(2);\n}\n\n\
+                          export const heading = Banner;\n";
+    let renamed_view = "import { flare } from \"./hub\";\n\nexport function Banner() {\n  \
+                        return <span>{flare(3)}</span>;\n}\n";
     assert_eq!(
-        structured["summary"]["edits"],
+        structured["summary"]["files"],
         json!([
             {
-                "kind": "replace",
-                "span": { "unit": "rift://file/caller.ts", "range": { "start": 9, "end": 15 } },
-                "text": "flare"
+                "path": "caller.ts",
+                "kind": "modified",
+                "size_bytes": renamed_caller.len(),
+                "line_count": 8,
+                "lines_added": 2,
+                "lines_removed": 2
             },
             {
-                "kind": "replace",
-                "span": { "unit": "rift://file/caller.ts", "range": { "start": 109, "end": 115 } },
-                "text": "flare"
+                "path": "hub.ts",
+                "kind": "modified",
+                "size_bytes": renamed_hub.len(),
+                "line_count": 3,
+                "lines_added": 1,
+                "lines_removed": 1
             },
             {
-                "kind": "replace",
-                "span": { "unit": "rift://file/hub.ts", "range": { "start": 16, "end": 22 } },
-                "text": "flare"
-            },
-            {
-                "kind": "replace",
-                "span": { "unit": "rift://file/view.tsx", "range": { "start": 9, "end": 15 } },
-                "text": "flare"
-            },
-            {
-                "kind": "replace",
-                "span": { "unit": "rift://file/view.tsx", "range": { "start": 76, "end": 82 } },
-                "text": "flare"
+                "path": "view.tsx",
+                "kind": "modified",
+                "size_bytes": renamed_view.len(),
+                "line_count": 5,
+                "lines_added": 2,
+                "lines_removed": 2
             }
         ]),
-        "each edit names one identifier the engine resolved, so the import and the call in \
-         one file are two edits: {structured:#}"
+        "the import and the call in one importer are two changed lines, the declaration one: \
+         {structured:#}"
     );
     assert!(
         coded_findings(&structured, "rift.rename.survivor").is_empty(),
@@ -237,19 +255,16 @@ async fn applied_rename_rewrites_the_module_the_importer_and_the_component() -> 
     );
     assert_eq!(
         fs::read_to_string(directory.path().join("hub.ts"))?,
-        "export function flare(value: number): number {\n  return value;\n}\n"
+        renamed_hub
     );
     assert_eq!(
         fs::read_to_string(directory.path().join("caller.ts"))?,
-        "import { flare } from \"./hub\";\nimport { Banner } from \"./view\";\n\n\
-         export function total(): number {\n  return flare(2);\n}\n\n\
-         export const heading = Banner;\n",
+        renamed_caller,
         "the plain importer's specifier binding and its call both follow the declaration"
     );
     assert_eq!(
         fs::read_to_string(directory.path().join("view.tsx"))?,
-        "import { flare } from \"./hub\";\n\nexport function Banner() {\n  \
-         return <span>{flare(3)}</span>;\n}\n",
+        renamed_view,
         "the tsx component's call inside JSX follows the declaration too"
     );
 
@@ -275,8 +290,8 @@ async fn applied_rename_of_the_component_routes_the_tsx_dialect() -> TestResult 
         call_retrying_acceptance(&client, rename_request(BANNER_SYMBOL, "Marker")).await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
     assert_eq!(
-        structured["summary"]["paths"],
-        json!(["caller.ts", "view.tsx"]),
+        changed_paths(&structured),
+        ["caller.ts", "view.tsx"],
         "the tsx declaration and its plain-dialect importer: {structured:#}"
     );
     assert!(
@@ -322,8 +337,8 @@ async fn applied_move_matches_the_typescript_engine_proposal() -> TestResult {
     match warnings.as_slice() {
         [] => {
             assert_eq!(
-                structured["summary"]["paths"],
-                json!(["caller.ts", "hub.ts", "spoke.ts", "view.tsx"]),
+                changed_paths(&structured),
+                ["caller.ts", "hub.ts", "spoke.ts", "view.tsx"],
                 "the proposal rewrites, old path, and new path ride the summary: {structured:#}"
             );
             assert_eq!(
@@ -350,8 +365,8 @@ async fn applied_move_matches_the_typescript_engine_proposal() -> TestResult {
                 "the warning names the engine and skipped updates: {structured:#}"
             );
             assert_eq!(
-                structured["summary"]["paths"],
-                json!(["hub.ts", "spoke.ts"]),
+                changed_paths(&structured),
+                ["hub.ts", "spoke.ts"],
                 "an empty proposal moves only the requested file: {structured:#}"
             );
             assert_eq!(
@@ -395,7 +410,7 @@ async fn applied_patch_carries_no_engine_diagnostics() -> TestResult {
     )
     .await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
-    assert_eq!(structured["summary"]["paths"], json!(["caller.ts"]));
+    assert_eq!(changed_paths(&structured), ["caller.ts"]);
     assert_eq!(
         structured["summary"]["diagnostics"],
         json!([]),

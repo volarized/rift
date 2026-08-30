@@ -28,6 +28,19 @@ use workspace_client::{
     TestResult, call_retrying_acceptance, served_relative_workspace, served_workspace, tool_request,
 };
 
+/// The project paths one applied change reports, in the order it carries them.
+fn changed_paths(structured: &Value) -> Vec<&str> {
+    structured["summary"]["files"]
+        .as_array()
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|file| file["path"].as_str())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// A well-formed table with one key, so the patch below is the file's only
 /// violation.
 const CONFIG: &str = "[server]\nname = \"primary\"\n";
@@ -82,7 +95,7 @@ async fn applied_patch_carries_the_toml_engine_diagnostic() -> TestResult {
     let introduce = tool_request("patch", &json!({ "patch": DUPLICATE_KEY_PATCH }));
     let structured = call_retrying_acceptance(&client, introduce).await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
-    assert_eq!(structured["summary"]["paths"], json!(["config.toml"]));
+    assert_eq!(changed_paths(&structured), ["config.toml"]);
 
     let findings = coded_findings(&structured, "duplicate-key");
     assert_eq!(
@@ -128,7 +141,7 @@ async fn applied_patch_over_a_clean_file_carries_no_finding() -> TestResult {
     )
     .await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
-    assert_eq!(structured["summary"]["paths"], json!(["config.toml"]));
+    assert_eq!(changed_paths(&structured), ["config.toml"]);
     assert!(
         coded_findings(&structured, "duplicate-key").is_empty(),
         "a change that removes the violation leaves no finding: {structured:#}"
