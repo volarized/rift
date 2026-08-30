@@ -12,4 +12,6 @@ workspace = true
 
 [dependencies]
 rift-core.workspace = true
+rift-provider.workspace = true
 serde.workspace = true
+serde_json.workspace = true
