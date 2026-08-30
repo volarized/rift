@@ -4,7 +4,7 @@ description: Install Rift, connect its MCP server, and read a workspace.
 ---
 
 <VersionBadge
-  version="v0.0.25"
+  version="v0.0.26"
   languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML"]}
 />
 
@@ -127,7 +127,30 @@ rift update
 ```
 
 The command downloads the latest verified release for your platform and replaces the current
-executable.
+executable. While it runs, the command reports each stage on the terminal: the release it found,
+the download with its byte progress, checksum verification, extraction, and installation.
+
+## Server logs
+
+When a tool refuses and the refusal alone doesn't say why, read the server's own diagnostics. The
+server records them beside the index in `.rift/db`, and `rift server logs` prints them oldest
+first, with or without a running server:
+
+```sh
+rift server logs
+```
+
+The flags narrow what prints:
+
+- `-f`, `--follow` keeps printing records as the server writes them
+- `-n`, `--tail` prints only the newest records
+- `--since` takes a duration such as `10m`
+- `--level` selects one severity
+- `--component` selects one component: `index`, `search`, `engine`, `change`, or `logs`
+
+Those are the records an agent reads through the
+[`rift://logs`](/docs/protocol/mcp#resource-logs) resource, and the
+[`[logs]`](/docs/configuration#logs) table bounds how many the server keeps.
 
 ## CLI
 

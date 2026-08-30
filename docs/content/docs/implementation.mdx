@@ -174,7 +174,7 @@ The database tables:
   and `content`, with `identity` riding unindexed as the join key; ranking is FTS5's `bm25`
   with per-column weights, comparable only within one search.
 - `semantic_vectors` - one row per model and declaration digest.
-- `log_records` - bounded server diagnostics read through `rift://logs`.
+- `log_records` - bounded server diagnostics read through `rift://logs` and `rift server logs`.
 
 A rebuild that named its files deletes and reinserts exactly those paths, which is why
 `lexical_units` carries an index on `path`. Every named path is replaced, added ones included:
