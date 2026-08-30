@@ -6,11 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 description = "Persistent filesystem projections and validated source transactions for agents"
-# `engine_fixture.rs`, `harness.rs`, `live_engine_gate.rs`, `raw_proxy.rs`, and
-# `rust_engine.rs` are shared helper files compiled separately into every test binary
-# that declares them; Cargo's own discovery would compile each as a test binary of its
-# own. The suites are listed below instead, and a helper is reached with `mod <name>;`
-# from each suite that uses it.
+# `engine_fixture.rs`, `harness.rs`, `live_engine_gate.rs`, and `rust_engine.rs` are
+# shared helper files compiled separately into every test binary that declares them;
+# Cargo's own discovery would compile each as a test binary of its own. The suites are
+# listed below instead, and a helper is reached with `mod <name>;` from each suite that
+# uses it.
 autotests = false
 
 [lints]

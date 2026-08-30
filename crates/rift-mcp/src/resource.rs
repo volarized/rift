@@ -291,6 +291,7 @@ mod tests {
             log_query("rift://missing", PAGE).expect_err("an unpublished URI must be refused");
 
         assert_eq!(refusal.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
+        assert!(refusal.message.contains("rift://missing"), "{refusal:?}");
     }
 
     #[test]

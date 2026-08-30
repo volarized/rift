@@ -3,6 +3,7 @@
 use std::fs;
 use std::io::{self, Read as _};
 use std::path::Path;
+use std::sync::OnceLock;
 
 use rift_core::constants::RELEASE_BINARY_BYTES_MAX;
 use rift_protocol::lock::ProductIdentity;
@@ -24,10 +25,18 @@ const CURRENT_EXECUTABLE_BYTES_MAX: u64 = if cfg!(debug_assertions) {
 };
 
 /// Computes this process's package, executable, and canonical tool identity.
+///
+/// A running process's executable bytes and served schema do not change, so the first
+/// success is cached and answers every later call, while a failure is not cached.
 pub(crate) async fn product_identity() -> io::Result<ProductIdentity> {
-    tokio::task::spawn_blocking(|| product_identity_for(&std::env::current_exe()?))
+    static PRODUCT_IDENTITY: OnceLock<ProductIdentity> = OnceLock::new();
+    if let Some(identity) = PRODUCT_IDENTITY.get() {
+        return Ok(identity.clone());
+    }
+    let identity = tokio::task::spawn_blocking(|| product_identity_for(&std::env::current_exe()?))
         .await
-        .map_err(|error| io::Error::other(format!("product identity task failed: {error}")))?
+        .map_err(|error| io::Error::other(format!("product identity task failed: {error}")))??;
+    Ok(PRODUCT_IDENTITY.get_or_init(|| identity).clone())
 }
 
 fn product_identity_for(executable: &Path) -> io::Result<ProductIdentity> {
@@ -116,5 +125,15 @@ mod tests {
             super::CURRENT_EXECUTABLE_BYTES_MAX,
             rift_core::constants::RELEASE_BINARY_BYTES_MAX * 16
         );
+    }
+
+    #[tokio::test]
+    async fn product_identity_answers_one_cached_identity_per_process() {
+        let first = super::product_identity().await.expect("first identity");
+        let second = super::product_identity().await.expect("cached identity");
+        assert_eq!(first, second);
+        let executable = std::env::current_exe().expect("current executable");
+        let computed = super::product_identity_for(&executable).expect("recomputed identity");
+        assert_eq!(second, computed);
     }
 }
