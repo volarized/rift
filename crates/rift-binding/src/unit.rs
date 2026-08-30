@@ -853,7 +853,7 @@ mod tests {
     use super::{
         IMPORT_EXPLICIT_RANK, UnitBindingFacts, UnitBindingFactsBuilder, UnitDefinition,
         UnitDefinitionIndex, UnitImport, UnitMemberLink, UnitModuleDeclaration, UnitReference,
-        UnitScopeIndex, assemble,
+        UnitScopeIndex, assemble, minted,
     };
     use crate::failure::{BindingError, BindingViolation};
     use crate::fixture::{kind, name, origin, path, range, source};
@@ -931,6 +931,19 @@ mod tests {
             .definition(definition(root, "run", 10))
             .expect("definition accepted");
         builder.build()
+    }
+
+    #[test]
+    fn test_unit_minted_index_beyond_id_space_refused() {
+        let refused = minted(UnitDefinitionIndex::from_index, usize::MAX);
+        assert_eq!(
+            violation(refused),
+            Some(BindingViolation::GraphLimit(ExhaustedLimit::GraphNodes))
+        );
+        assert!(
+            minted(UnitDefinitionIndex::from_index, 0).is_ok(),
+            "an index inside the id space mints"
+        );
     }
 
     #[test]

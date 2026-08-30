@@ -543,7 +543,9 @@ mod tests {
     };
     use crate::failure::BindingViolation;
     use crate::fixture::{self, Fixture};
-    use crate::graph::{BindingGraph, Definition, DefinitionOrder, PathAnchor, VisibilitySpelling};
+    use crate::graph::{
+        BindingGraph, Definition, DefinitionOrder, PathAnchor, Reference, VisibilitySpelling,
+    };
     use crate::limits::{BindingLimits, ExhaustedLimit};
     use crate::link::LinkedGraph;
     use crate::resolve::{NeverCancelled, ResolutionSet, resolve_all};
@@ -1384,6 +1386,106 @@ mod tests {
             item.equivalence(),
             [EquivalenceEvidence::Declaration(declaration)]
         );
+    }
+
+    #[test]
+    fn test_publisher_member_scope_publishes_member_kind() {
+        let mut fixture = Fixture::new();
+        let unit = fixture.unit("src/lib.rs");
+        let module = fixture.module(unit, None, 0, 100);
+        fixture.member(unit, Some(module), 20, 40);
+        let graph = fixture.build();
+        let output = published(&graph, BindingLimits::default());
+        let member = contribution_with_symbol(
+            output.publication(),
+            "rift://binding/scope/src/lib.rs@20-40",
+        );
+        let BindingFact::Scope { scope_kind, .. } = fact_of(member) else {
+            panic!("scope fact expected");
+        };
+        assert_eq!(scope_kind, ScopeKindFact::Member);
+    }
+
+    #[test]
+    fn test_publisher_reference_anchors_publish_as_spelled() {
+        let cases = [
+            (10, PathAnchor::Crate, AnchorFact::Crate),
+            (20, PathAnchor::SelfModule, AnchorFact::SelfModule),
+            (30, PathAnchor::Super(2), AnchorFact::Super(2)),
+        ];
+        let mut fixture = Fixture::new();
+        let unit = fixture.unit("src/lib.rs");
+        let module = fixture.module(unit, None, 0, 100);
+        for (start, anchor, _) in cases {
+            fixture.reference(module, start, anchor, "run");
+        }
+        let graph = fixture.build();
+        let output = published(&graph, BindingLimits::default());
+        for (start, _, expected) in cases {
+            let symbol = format!("rift://binding/reference/src/lib.rs@{start}-{}", start + 1);
+            let reference = contribution_with_symbol(output.publication(), &symbol);
+            let BindingFact::Reference { anchor, .. } = fact_of(reference) else {
+                panic!("reference fact expected");
+            };
+            assert_eq!(anchor, expected, "anchor fact for {symbol}");
+        }
+    }
+
+    #[test]
+    fn test_publisher_super_visibility_publishes_super_fact() {
+        let mut fixture = Fixture::new();
+        let unit = fixture.unit("src/lib.rs");
+        let module = fixture.module(unit, None, 0, 100);
+        fixture.item(module, "run", 1, 9, VisibilitySpelling::Super);
+        let graph = fixture.build();
+        let output = published(&graph, BindingLimits::default());
+        let definition = contribution_with_symbol(
+            output.publication(),
+            "rift://binding/definition/src/lib.rs@1-9",
+        );
+        let BindingFact::Definition { visibility, .. } = fact_of(definition) else {
+            panic!("definition fact expected");
+        };
+        assert_eq!(visibility, VisibilityFact::Super);
+    }
+
+    #[test]
+    fn test_publisher_reference_roles_publish_as_spelled() {
+        let cases = [
+            (10, ReferenceRole::Definition, RoleFact::Definition),
+            (20, ReferenceRole::Read, RoleFact::Read),
+            (30, ReferenceRole::Write, RoleFact::Write),
+            (40, ReferenceRole::Import, RoleFact::Import),
+            (50, ReferenceRole::Call, RoleFact::Call),
+            (60, ReferenceRole::Type, RoleFact::Type),
+            (70, ReferenceRole::Unknown, RoleFact::Unknown),
+        ];
+        let mut fixture = Fixture::new();
+        let unit = fixture.unit("src/lib.rs");
+        let module = fixture.module(unit, None, 0, 100);
+        for (start, role, _) in cases {
+            let reference = Reference::new(
+                module,
+                fixture::range(start, start + 1),
+                PathAnchor::Lexical,
+                fixture::path("run"),
+                role,
+            );
+            fixture
+                .builder
+                .reference(reference)
+                .expect("reference accepted");
+        }
+        let graph = fixture.build();
+        let output = published(&graph, BindingLimits::default());
+        for (start, _, expected) in cases {
+            let symbol = format!("rift://binding/reference/src/lib.rs@{start}-{}", start + 1);
+            let reference = contribution_with_symbol(output.publication(), &symbol);
+            let BindingFact::Reference { role, .. } = fact_of(reference) else {
+                panic!("reference fact expected");
+            };
+            assert_eq!(role, expected, "role fact for {symbol}");
+        }
     }
 
     #[test]
