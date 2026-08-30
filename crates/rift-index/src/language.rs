@@ -210,16 +210,27 @@ impl WorkspaceLanguagePolicy {
         Ok(first)
     }
 
+    /// Which lane one visible path joins.
+    ///
+    /// An enabled entry with a shipped provider makes the path source. Every
+    /// other path falls through to `[search.text]`, so a path an entry claims
+    /// while disabled, or one whose language ships no grammar, still reaches
+    /// lexical search as plain text.
+    ///
+    /// # Errors
+    ///
+    /// Returns `WorkspaceIndexError` when two language entries match `path`.
     pub(crate) fn classifies(
         &self,
         path: &Path,
     ) -> Result<Option<ClassifiedPath>, WorkspaceIndexError> {
         let path = self.absolute(path);
-        if let Some(language) = self.language_for_path(&path)? {
-            return Ok(match (language.enabled, language.provider) {
-                (true, Some(provider)) => Some(ClassifiedPath::Source(provider)),
-                _ => None,
-            });
+        if let Some(provider) = self
+            .language_for_path(&path)?
+            .filter(|language| language.enabled)
+            .and_then(EffectiveLanguage::syntax_provider)
+        {
+            return Ok(Some(ClassifiedPath::Source(provider)));
         }
         Ok(self
             .text
@@ -356,6 +367,57 @@ mod tests {
         );
     }
 
+    /// A misspelled shipped name is a language no build ships, so it meets the
+    /// same rule: the entry stands only as an explicit selection with its own
+    /// patterns, and the refusal names the key to fix.
+    #[test]
+    fn test_a_misspelled_shipped_language_name_is_refused_without_patterns() {
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration
+            .languages
+            .insert("rustt".to_owned(), LanguageConfiguration::default());
+        let error = WorkspaceLanguagePolicy::build(
+            Path::new("/workspace"),
+            &LanguageFileSelections::from(&configuration),
+            &TextFileInclusion::from(&configuration.search),
+        )
+        .expect_err("a misspelled shipped name carries no shipped patterns");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::LanguageIncludeRequired
+        );
+        assert!(
+            error.to_string().contains("rustt"),
+            "the refusal names the key: {error}"
+        );
+
+        configuration.languages.insert(
+            "rustt".to_owned(),
+            LanguageConfiguration {
+                include: Some(vec![rift_protocol::read::PathPattern(
+                    "**/*.rustt".to_owned(),
+                )]),
+                ..LanguageConfiguration::default()
+            },
+        );
+        let policy = policy(&configuration);
+        let rust = policy
+            .language_for_path(Path::new("src/lib.rs"))
+            .expect("lookup")
+            .expect("the shipped Rust entry keeps its own patterns");
+        assert_eq!(
+            rust.identity(),
+            "rust",
+            "the misspelled entry claims only what its own patterns name"
+        );
+        let claimed = policy
+            .language_for_path(Path::new("src/main.rustt"))
+            .expect("lookup")
+            .expect("its own pattern selects it");
+        assert_eq!(claimed.identity(), "rustt");
+        assert!(!claimed.has_syntax(), "no build ships that grammar");
+    }
+
     #[test]
     fn test_overlapping_language_patterns_report_both_entries() {
         let mut configuration = WorkspaceConfiguration::default();
@@ -385,5 +447,150 @@ mod tests {
         );
         let message = error.to_string();
         assert!(message.contains("rust") && message.contains("python"));
+    }
+
+    /// A `rift://workspace` page reports one entry per shipped provider plus
+    /// one per configured entry the shipped set does not name, so the page's
+    /// advertised bound has to cover both.
+    #[test]
+    fn test_every_shipped_provider_fits_the_workspace_page_language_bound() {
+        use rift_protocol::configuration::LANGUAGES_MAX;
+        use rift_protocol::workspace::WORKSPACE_LANGUAGE_SUMMARIES_MAX;
+
+        let shipped = registry::providers().count();
+        assert!(
+            shipped + LANGUAGES_MAX <= WORKSPACE_LANGUAGE_SUMMARIES_MAX,
+            "the workspace page must carry every effective entry: shipped={shipped}, \
+             languages_max={LANGUAGES_MAX}, summaries_max={WORKSPACE_LANGUAGE_SUMMARIES_MAX}"
+        );
+    }
+
+    /// Under the shipped defaults, a provider extension classifies as source
+    /// and every other visible path falls through to the text lane, an
+    /// extensionless one included.
+    #[test]
+    fn test_default_policy_classifies_provider_extensions_as_source_and_the_rest_as_text() {
+        let policy = policy(&WorkspaceConfiguration::default());
+        for path in ["lib.rs", "readme.md", "config.json", "deploy.yaml"] {
+            assert!(
+                matches!(
+                    policy.classifies(Path::new(path)),
+                    Ok(Some(ClassifiedPath::Source(_)))
+                ),
+                "a shipped provider must claim {path}"
+            );
+        }
+        for path in ["notes.unknown", "justfile", "Dockerfile", "readme.txt"] {
+            assert!(
+                matches!(
+                    policy.classifies(Path::new(path)),
+                    Ok(Some(ClassifiedPath::Text))
+                ),
+                "an unclaimed path must join the text lane: {path}"
+            );
+        }
+    }
+
+    /// `enabled = false` drops syntax facts for the paths an entry claims and
+    /// leaves them reachable as plain text, so lexical search still holds them.
+    #[test]
+    fn test_a_disabled_language_keeps_its_paths_in_the_text_lane() {
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.languages.insert(
+            "rust".to_owned(),
+            LanguageConfiguration {
+                enabled: false,
+                ..LanguageConfiguration::default()
+            },
+        );
+        let policy = policy(&configuration);
+        assert!(
+            matches!(
+                policy.classifies(Path::new("src/lib.rs")),
+                Ok(Some(ClassifiedPath::Text))
+            ),
+            "a disabled entry drops syntax facts, not the file"
+        );
+    }
+
+    /// An unshipped language selects a process without contributing syntax, so
+    /// its paths reach lexical search as plain text.
+    #[test]
+    fn test_an_unshipped_language_keeps_its_paths_in_the_text_lane() {
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.languages.insert(
+            "python".to_owned(),
+            LanguageConfiguration {
+                include: Some(vec![rift_protocol::read::PathPattern("**/*.py".to_owned())]),
+                ..LanguageConfiguration::default()
+            },
+        );
+        let policy = policy(&configuration);
+        assert!(
+            matches!(
+                policy.classifies(Path::new("src/main.py")),
+                Ok(Some(ClassifiedPath::Text))
+            ),
+            "a language with no shipped grammar still reaches lexical search"
+        );
+    }
+
+    /// A bare language and one of its dialects are independent entries: a
+    /// pattern set on one leaves the other's shipped patterns standing.
+    #[test]
+    fn test_a_dialect_inherits_no_matching_from_its_bare_language() {
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.languages.insert(
+            "typescript".to_owned(),
+            LanguageConfiguration {
+                include: Some(vec![rift_protocol::read::PathPattern(
+                    "**/*.mts".to_owned(),
+                )]),
+                ..LanguageConfiguration::default()
+            },
+        );
+        let policy = policy(&configuration);
+
+        let typescript = policy
+            .language_for_path(Path::new("src/main.mts"))
+            .expect("lookup")
+            .expect("the configured pattern selects typescript");
+        assert_eq!(typescript.identity(), "typescript");
+        assert!(
+            policy
+                .language_for_path(Path::new("src/main.ts"))
+                .expect("lookup")
+                .is_none(),
+            "a present include replaces the shipped patterns"
+        );
+        let tsx = policy
+            .language_for_path(Path::new("src/view.tsx"))
+            .expect("lookup")
+            .expect("the dialect keeps its own shipped patterns");
+        assert_eq!(tsx.identity(), "typescript:tsx");
+    }
+
+    /// An empty `[languages]` table leaves every shipped provider serving the
+    /// extensions it declares.
+    #[test]
+    fn test_absent_language_table_keeps_every_shipped_provider_and_pattern() {
+        let policy = policy(&WorkspaceConfiguration::default());
+        for provider in registry::providers() {
+            let identity = provider.language().identity_segment();
+            let entry = policy
+                .languages()
+                .iter()
+                .find(|language| language.identity() == identity)
+                .unwrap_or_else(|| panic!("shipped provider {identity} must have an entry"));
+            assert!(entry.enabled(), "{identity} must stay enabled");
+            assert!(entry.has_syntax(), "{identity} must keep its provider");
+            let expected: Vec<String> = provider
+                .extensions()
+                .iter()
+                .map(|extension| format!("**/*.{extension}"))
+                .collect();
+            assert_eq!(entry.include(), expected, "{identity} keeps its patterns");
+            assert!(entry.exclude().is_empty(), "{identity} excludes nothing");
+        }
     }
 }

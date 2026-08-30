@@ -158,18 +158,9 @@ pub struct TextFileInclusion {
 }
 
 impl TextFileInclusion {
-    /// Builds one text-file policy from its chunk bound.
-    #[must_use]
-    pub fn new(chunk_bytes_max: u64) -> Self {
-        Self {
-            include: vec!["**".to_owned()],
-            chunk_bytes_max,
-        }
-    }
-
     /// Builds one text-file policy from its patterns and chunk bound.
     #[must_use]
-    pub const fn with_include(include: Vec<String>, chunk_bytes_max: u64) -> Self {
+    pub const fn new(include: Vec<String>, chunk_bytes_max: u64) -> Self {
         Self {
             include,
             chunk_bytes_max,
@@ -198,7 +189,7 @@ impl Default for TextFileInclusion {
 
 impl From<&SearchConfiguration> for TextFileInclusion {
     fn from(search: &SearchConfiguration) -> Self {
-        Self::with_include(
+        Self::new(
             search
                 .text
                 .include
