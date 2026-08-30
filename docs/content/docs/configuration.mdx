@@ -62,8 +62,8 @@ requests as soon as the file is accepted.
 
 `logs` bounds what the server records about itself. Diagnostics admitted by `capture` enter a
 bounded queue and land in the workspace database, where the `rift://logs` resource reads them
-back - so a refusal an agent meets can be explained without an operator reading the server's
-terminal:
+back for an agent and `rift server logs` reads the same records for an operator - so a refusal an
+agent meets can be explained without an operator reading the server's terminal:
 
 ```toml
 [logs]

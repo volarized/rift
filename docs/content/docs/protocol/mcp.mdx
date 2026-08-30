@@ -389,6 +389,9 @@ source, and the reverse. A located hunk's context keeps the exact bytes already 
 and a line the hunk inserts takes the ending already prevailing at that position, so no hunk
 introduces a foreign ending elsewhere in the file.
 
+The server refuses a body that is not a unified diff, such as an `*** Begin Patch` envelope, as
+`invalid_request` naming the `--- a/` and `+++ b/` form to send.
+
 A hunk that resolves nowhere refuses with `unmet_precondition`, naming the failed hunk's
 ordinal, the file line the search reached, and the context it expected against what stood there.
 A real mismatch names each side's content and line ending, so two lines that print alike are
