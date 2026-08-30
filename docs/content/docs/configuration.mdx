@@ -375,6 +375,50 @@ walk's cost scales with how far back it reaches. The history provider computes a
 [`SymbolHistory`](/docs/protocol/reference#SymbolHistory) timeline inside that depth; a
 revision beyond it contributes no version.
 
+<VersionBadge version="v0.0.27" />
+
+`[providers.binding]` bounds the name binding provider, which resolves references from syntax
+facts inside the server, with no language engine involved. The keys are shown at their
+defaults:
+
+```toml
+[providers.binding]
+enabled = true
+max_unit_scopes = 4096
+max_unit_definitions = 16384
+max_unit_references = 65536
+max_unit_links = 4096
+max_graph_nodes = 2000000
+max_graph_links = 500000
+max_reference_work = 4096
+max_path_depth = 64
+max_reference_targets = 64
+max_publication_work = 50000000
+```
+
+`enabled = false` turns the provider off: reads answer from syntax facts alone.
+
+The provider assembles every file's facts into one graph and resolves each reference on a
+bounded work queue; each bound caps one phase of that work:
+
+- `max_unit_scopes` bounds the scopes one file may contribute, 1 to 40960
+- `max_unit_definitions` bounds the definitions one file may contribute, 1 to 163840
+- `max_unit_references` bounds the references one file may contribute, 1 to 655360
+- `max_unit_links` bounds the imports, member links, and module declarations one file may
+  contribute together, 1 to 40960
+- `max_graph_nodes` bounds the scopes, definitions, and references one build's graph holds,
+  1 to 20000000
+- `max_graph_links` bounds that graph's links, 1 to 5000000
+- `max_reference_work` bounds the work items one reference may enqueue while resolving,
+  1 to 409600
+- `max_path_depth` bounds the steps one work item may accumulate, 1 to 640
+- `max_reference_targets` bounds the definitions one reference may resolve to, 1 to 256
+- `max_publication_work` bounds the work items one build may enqueue across every reference,
+  1 to 5000000000
+
+An exhausted bound never fails a build: the revision publishes with the syntax facts alone,
+and the breach lands in the server log naming the bound.
+
 Provider configuration does not set merge order or freshness. A provider rebuilding after a file
 change can serve its previous immutable revision; the result then carries a `stale_index` entry
 in `warnings` naming the two tree revision digests.
