@@ -549,7 +549,7 @@ says whether the same tree and environment are expected to give the same answer 
 
 Every transform must appear before every validation. Transform hooks cannot declare guarantees.
 A passing transform keeps writes inside its declared scope, and those writes become part of the
-change's final `paths`, `edits`, and `id`. Rift restores transform writes when the command fails,
+change's final `files` and `id`. Rift restores transform writes when the command fails,
 times out, writes outside scope, or changes source permissions. If transforms undo every direct
 edit, result is `unchanged`.
 

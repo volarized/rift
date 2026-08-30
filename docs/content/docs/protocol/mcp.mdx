@@ -483,16 +483,17 @@ still standing. A `replace_node` whose listing went stale shows the shape:
 ```
 
 **Applied**, when final bytes differ from original bytes after transform hooks. At least one path
-changed. The result's `summary` carries change `id`, final changed `paths`, concrete `edits`,
-diagnostics, and guarantees passing validation hooks established. Paths and edits are sorted by
-project path; transform writes are part of same summary.
+changed. The result's `summary` carries change `id`, the `files` the change wrote, diagnostics, and
+guarantees passing validation hooks established. Files are sorted by project path; transform writes
+are part of same summary.
 
-Each entry in `edits` names the bytes it replaced: one entry per hunk for `patch`, one per
-engine-proposed edit for `rename_symbol` and `move_file`, and one spanning the whole file for a
-file the change created or removed.
+Each entry in `files` names one file, whether the change created, modified, or deleted it, the
+file's `size_bytes` and `line_count` after the change, and the `lines_added` and `lines_removed`
+the change counted. A line whose content changed counts once in each; a deleted file reports zero
+bytes and zero lines.
 
 **Unchanged**, when direct edits landed but successful transform hooks restored original tree
-bytes. Response is `{ "status": "unchanged" }`: no change id, path, edit, index rebuild, or engine
+bytes. Response is `{ "status": "unchanged" }`: no change id, file, index rebuild, or engine
 diagnostic is reported for bytes that did not remain changed.
 
 ## Projections
