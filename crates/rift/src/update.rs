@@ -20,6 +20,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tokio::io::AsyncWriteExt as _;
 
+use crate::progress::TerminalProgress;
+
 /// File name for the staged latest-release metadata response.
 const RELEASE_METADATA_FILE_NAME: &str = "latest.json";
 /// User agent identifying the Rift updater to GitHub.
@@ -99,6 +101,32 @@ pub(super) enum OldBinaryCleanup {
     Remaining(PathBuf),
 }
 
+/// One point in an update the operator can watch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum UpdateStage {
+    /// The latest release is being looked up.
+    CheckingRelease,
+    /// The lookup answered with `latest`.
+    ReleaseFound { latest: Version },
+    /// The release archive is being downloaded, `total_bytes` when declared.
+    Downloading {
+        received_bytes: u64,
+        total_bytes: Option<u64>,
+    },
+    /// The downloaded archive is being checked against its published digest.
+    Verifying,
+    /// The binary is being extracted from the archive.
+    Extracting,
+    /// The extracted binary is replacing the running one.
+    Installing,
+}
+
+/// Where an update reports its stages.
+pub(super) trait UpdateProgress {
+    /// Records that the update reached `stage`.
+    fn report(&self, stage: UpdateStage);
+}
+
 impl fmt::Display for UpdateOutcome {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -108,10 +136,10 @@ impl fmt::Display for UpdateOutcome {
             ),
             Self::Unreleased { current, latest } => write!(
                 formatter,
-                "You're running a rift version that has never been released. That's a spirit for innovation! (current v{current}, latest release v{latest})"
+                "🧪 You're running a rift version that has never been released. That's a spirit for innovation! (current v{current}, latest release v{latest})"
             ),
             Self::Updated { from, to, cleanup } => {
-                write!(formatter, "Updated Rift from v{from} to v{to}.")?;
+                write!(formatter, "✅ Updated Rift from v{from} to v{to}.")?;
                 match cleanup {
                     OldBinaryCleanup::Unnecessary => Ok(()),
                     OldBinaryCleanup::Scheduled => formatter.write_str(
@@ -228,12 +256,18 @@ trait DownloadTransport {
         url: &str,
         destination: &Path,
         bytes_max: u64,
+        progress: &dyn Fn(u64, Option<u64>),
     ) -> Result<(), UpdateError>;
 }
 
 trait UpdateSource {
     async fn latest_version(&self, directory: &Path) -> Result<Version, UpdateError>;
-    async fn stage(&self, directory: &Path, version: Version) -> Result<PathBuf, UpdateError>;
+    async fn stage(
+        &self,
+        directory: &Path,
+        version: Version,
+        progress: &dyn UpdateProgress,
+    ) -> Result<PathBuf, UpdateError>;
 }
 
 trait Publisher {
@@ -273,7 +307,8 @@ struct AtomicPublisher;
 /// then fail benignly against the removed staging directory, a Unix
 /// replacement publishes atomically or cleans its staged sibling, and a
 /// Windows replacement may leave sibling files that the next `rift update`
-/// run removes or reports.
+/// run removes or reports. The stage line the drop interrupts stays on
+/// stderr as it was last drawn.
 pub(super) async fn update() -> Result<UpdateOutcome, UpdateError> {
     let current = std::env::current_exe().map_err(locate_error)?;
     let current_version = Version::parse(env!("CARGO_PKG_VERSION"))
@@ -285,6 +320,7 @@ pub(super) async fn update() -> Result<UpdateOutcome, UpdateError> {
         &AtomicPublisher,
         &current,
         current_version,
+        &TerminalProgress::new(),
     )
     .await
 }
@@ -294,9 +330,14 @@ async fn update_with(
     publisher: &impl Publisher,
     current_path: &Path,
     current_version: Version,
+    progress: &impl UpdateProgress,
 ) -> Result<UpdateOutcome, UpdateError> {
     let staging = run_blocking(|| tempfile::tempdir().map_err(staging_error)).await?;
+    progress.report(UpdateStage::CheckingRelease);
     let latest_version = source.latest_version(staging.path()).await?;
+    progress.report(UpdateStage::ReleaseFound {
+        latest: latest_version.clone(),
+    });
     match latest_version.cmp(&current_version) {
         Ordering::Equal => Ok(UpdateOutcome::Current(current_version)),
         Ordering::Less => Ok(UpdateOutcome::Unreleased {
@@ -304,7 +345,10 @@ async fn update_with(
             latest: latest_version,
         }),
         Ordering::Greater => {
-            let candidate = source.stage(staging.path(), latest_version.clone()).await?;
+            let candidate = source
+                .stage(staging.path(), latest_version.clone(), progress)
+                .await?;
+            progress.report(UpdateStage::Installing);
             let cleanup = publisher.publish(current_path, &candidate).await?;
             Ok(UpdateOutcome::Updated {
                 from: current_version,
@@ -403,6 +447,7 @@ impl DownloadTransport for ReqwestTransport {
         url: &str,
         destination: &Path,
         bytes_max: u64,
+        progress: &dyn Fn(u64, Option<u64>),
     ) -> Result<(), UpdateError> {
         let mut response = self
             .client
@@ -421,7 +466,7 @@ impl DownloadTransport for ReqwestTransport {
         let mut output = tokio::fs::File::create(destination)
             .await
             .map_err(download_error)?;
-        let received = write_bounded_body(&mut response, &mut output, bytes_max).await?;
+        let received = write_bounded_body(&mut response, &mut output, bytes_max, progress).await?;
         if received == 0 || received > bytes_max {
             return Err(download_too_large(bytes_max));
         }
@@ -433,13 +478,16 @@ impl DownloadTransport for ReqwestTransport {
 /// Streams a response body to `output`, counting at most one byte past `bytes_max`.
 ///
 /// Reading stops at the sentinel ceiling, so an oversized body is detected
-/// without being drained or buffered whole.
+/// without being drained or buffered whole. Each chunk reports the running
+/// byte count and the total the response declared, when it declared one.
 async fn write_bounded_body(
     response: &mut reqwest::Response,
     output: &mut tokio::fs::File,
     bytes_max: u64,
+    progress: &dyn Fn(u64, Option<u64>),
 ) -> Result<u64, UpdateError> {
     let ceiling = bytes_max_with_sentinel(bytes_max);
+    let total_bytes = response.content_length();
     let mut received = 0_u64;
     while received < ceiling {
         let Some(chunk) = response.chunk().await.map_err(download_error)? else {
@@ -451,6 +499,7 @@ async fn write_bounded_body(
             .await
             .map_err(download_error)?;
         received = received.saturating_add(u64::try_from(kept).unwrap_or(u64::MAX));
+        progress(received, total_bytes);
     }
     Ok(received)
 }
@@ -460,11 +509,19 @@ fn bytes_within_budget(chunk_length: usize, budget: u64) -> usize {
     usize::try_from(budget).map_or(chunk_length, |budget| chunk_length.min(budget))
 }
 
+/// Reports nothing: the metadata and manifest reads are too small to watch.
+fn unwatched(_received_bytes: u64, _total_bytes: Option<u64>) {}
+
 impl<T: DownloadTransport> UpdateSource for GitHubReleaseSource<T> {
     async fn latest_version(&self, directory: &Path) -> Result<Version, UpdateError> {
         let metadata_path = directory.join(RELEASE_METADATA_FILE_NAME);
         self.transport
-            .download(RELEASE_API_URL, &metadata_path, RELEASE_METADATA_BYTES_MAX)
+            .download(
+                RELEASE_API_URL,
+                &metadata_path,
+                RELEASE_METADATA_BYTES_MAX,
+                &unwatched,
+            )
             .await?;
         let bytes = tokio::fs::read(&metadata_path)
             .await
@@ -472,7 +529,12 @@ impl<T: DownloadTransport> UpdateSource for GitHubReleaseSource<T> {
         parse_release_metadata(&bytes)
     }
 
-    async fn stage(&self, directory: &Path, version: Version) -> Result<PathBuf, UpdateError> {
+    async fn stage(
+        &self,
+        directory: &Path,
+        version: Version,
+        progress: &dyn UpdateProgress,
+    ) -> Result<PathBuf, UpdateError> {
         let artifact = ReleaseArtifact::new(version);
         let manifest_path = directory.join(&artifact.checksum_name);
         let archive_path = directory.join(&artifact.archive_name);
@@ -481,6 +543,7 @@ impl<T: DownloadTransport> UpdateSource for GitHubReleaseSource<T> {
                 &artifact.download_url(&artifact.checksum_name),
                 &manifest_path,
                 CHECKSUM_MANIFEST_BYTES_MAX,
+                &unwatched,
             )
             .await?;
         self.transport
@@ -488,13 +551,22 @@ impl<T: DownloadTransport> UpdateSource for GitHubReleaseSource<T> {
                 &artifact.download_url(&artifact.archive_name),
                 &archive_path,
                 RELEASE_ARCHIVE_BYTES_MAX,
+                &|received_bytes, total_bytes| {
+                    progress.report(UpdateStage::Downloading {
+                        received_bytes,
+                        total_bytes,
+                    });
+                },
             )
             .await?;
+        progress.report(UpdateStage::Verifying);
+        let checked_archive = archive_path.clone();
+        let checked_name = artifact.archive_name.clone();
+        run_blocking(move || verify_checksum(&checked_archive, &manifest_path, &checked_name))
+            .await?;
+        progress.report(UpdateStage::Extracting);
         let directory = directory.to_owned();
-        run_blocking(move || {
-            stage_verified_candidate(&archive_path, &manifest_path, &directory, &artifact)
-        })
-        .await
+        run_blocking(move || extract_candidate(&archive_path, &directory, &artifact)).await
     }
 }
 
@@ -502,17 +574,6 @@ impl<T: DownloadTransport> UpdateSource for GitHubReleaseSource<T> {
 fn parse_release_metadata(bytes: &[u8]) -> Result<Version, UpdateError> {
     let release: LatestRelease = serde_json::from_slice(bytes).map_err(release_error)?;
     parse_release_tag(&release.tag_name)
-}
-
-/// Verifies the archive checksum, then extracts and validates the binary candidate.
-fn stage_verified_candidate(
-    archive_path: &Path,
-    manifest_path: &Path,
-    directory: &Path,
-    artifact: &ReleaseArtifact,
-) -> Result<PathBuf, UpdateError> {
-    verify_checksum(archive_path, manifest_path, &artifact.archive_name)?;
-    extract_candidate(archive_path, directory, artifact)
 }
 
 fn parse_release_tag(tag: &str) -> Result<Version, UpdateError> {
@@ -1002,7 +1063,7 @@ pub(super) fn cleanup_replaced_binary() -> Result<(), UpdateError> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::error::Error;
     use std::fs;
 
@@ -1010,10 +1071,29 @@ mod tests {
 
     use super::{
         AtomicPublisher, OldBinaryCleanup, Publisher, ReleaseArtifact, UpdateError, UpdateOutcome,
-        UpdateSource, parse_release_tag, update_with, validate_candidate, verify_checksum,
+        UpdateProgress, UpdateSource, UpdateStage, parse_release_tag, update_with,
+        validate_candidate, verify_checksum,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    /// Keeps every stage an update reported, in the order it reported them.
+    #[derive(Default)]
+    struct RecordingProgress {
+        stages: RefCell<Vec<UpdateStage>>,
+    }
+
+    impl RecordingProgress {
+        fn stages(&self) -> Vec<UpdateStage> {
+            self.stages.borrow().clone()
+        }
+    }
+
+    impl UpdateProgress for RecordingProgress {
+        fn report(&self, stage: UpdateStage) {
+            self.stages.borrow_mut().push(stage);
+        }
+    }
 
     struct FakeSource {
         version: Version,
@@ -1032,8 +1112,19 @@ mod tests {
             &self,
             directory: &std::path::Path,
             _version: Version,
+            progress: &dyn UpdateProgress,
         ) -> impl std::future::Future<Output = Result<std::path::PathBuf, UpdateError>> {
             self.stage_calls.set(self.stage_calls.get() + 1);
+            progress.report(UpdateStage::Downloading {
+                received_bytes: 4,
+                total_bytes: Some(9),
+            });
+            progress.report(UpdateStage::Downloading {
+                received_bytes: 9,
+                total_bytes: Some(9),
+            });
+            progress.report(UpdateStage::Verifying);
+            progress.report(UpdateStage::Extracting);
             let path = directory.join("rift");
             let result = fs::write(&path, b"candidate")
                 .map_err(super::archive_error)
@@ -1112,9 +1203,20 @@ mod tests {
                 version: version(latest),
                 stage_calls: Cell::new(0),
             };
-            let result = update_with(&source, &publisher, &current, version("0.0.2")).await?;
+            let progress = RecordingProgress::default();
+            let result =
+                update_with(&source, &publisher, &current, version("0.0.2"), &progress).await?;
             assert_eq!(result, expected);
             assert_eq!(source.stage_calls.get(), 0);
+            assert_eq!(
+                progress.stages(),
+                [
+                    UpdateStage::CheckingRelease,
+                    UpdateStage::ReleaseFound {
+                        latest: version(latest),
+                    },
+                ]
+            );
         }
         assert_eq!(publisher.calls.get(), 0);
         Ok(())
@@ -1129,13 +1231,10 @@ mod tests {
         let publisher = FakePublisher {
             calls: Cell::new(0),
         };
-        let outcome = update_with(
-            &source,
-            &publisher,
-            &std::env::current_exe()?,
-            version("0.0.2"),
-        )
-        .await?;
+        let progress = RecordingProgress::default();
+        let current = std::env::current_exe()?;
+        let outcome =
+            update_with(&source, &publisher, &current, version("0.0.2"), &progress).await?;
         assert_eq!(
             outcome,
             UpdateOutcome::Updated {
@@ -1146,6 +1245,26 @@ mod tests {
         );
         assert_eq!(source.stage_calls.get(), 1);
         assert_eq!(publisher.calls.get(), 1);
+        assert_eq!(
+            progress.stages(),
+            [
+                UpdateStage::CheckingRelease,
+                UpdateStage::ReleaseFound {
+                    latest: version("0.0.3"),
+                },
+                UpdateStage::Downloading {
+                    received_bytes: 4,
+                    total_bytes: Some(9),
+                },
+                UpdateStage::Downloading {
+                    received_bytes: 9,
+                    total_bytes: Some(9),
+                },
+                UpdateStage::Verifying,
+                UpdateStage::Extracting,
+                UpdateStage::Installing,
+            ]
+        );
         Ok(())
     }
 
@@ -1161,7 +1280,7 @@ mod tests {
                 latest: version("0.0.2"),
             }
             .to_string(),
-            "You're running a rift version that has never been released. That's a spirit for innovation! (current v0.0.3, latest release v0.0.2)"
+            "🧪 You're running a rift version that has never been released. That's a spirit for innovation! (current v0.0.3, latest release v0.0.2)"
         );
         for (cleanup, suffix) in [
             (OldBinaryCleanup::Unnecessary, String::new()),
@@ -1181,7 +1300,7 @@ mod tests {
             };
             assert_eq!(
                 outcome.to_string(),
-                format!("Updated Rift from v0.0.1 to v0.0.2.{suffix}")
+                format!("✅ Updated Rift from v0.0.1 to v0.0.2.{suffix}")
             );
         }
         assert!(super::error_for_test().source().is_some());
@@ -1535,6 +1654,7 @@ mod tests {
             url: &str,
             destination: &std::path::Path,
             _bytes_max: u64,
+            progress: &dyn Fn(u64, Option<u64>),
         ) -> impl std::future::Future<Output = Result<(), UpdateError>> {
             let bytes = if url == rift_core::constants::RELEASE_API_URL {
                 &self.metadata
@@ -1548,6 +1668,8 @@ mod tests {
                     "fixture download unavailable",
                 )))
             } else {
+                let received = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                progress(received, Some(received));
                 fs::write(destination, bytes).map_err(super::download_error)
             };
             std::future::ready(result)
@@ -1566,7 +1688,11 @@ mod tests {
                 },
             };
             let error = source
-                .stage(staging.path(), version("0.0.3"))
+                .stage(
+                    staging.path(),
+                    version("0.0.3"),
+                    &RecordingProgress::default(),
+                )
                 .await
                 .expect_err("unavailable release asset must fail");
             assert!(error.to_string().contains("release download failed"));
@@ -1629,8 +1755,23 @@ mod tests {
                 archive: archive.clone(),
             },
         };
-        let candidate = source.stage(staging.path(), version("0.0.3")).await?;
+        let progress = RecordingProgress::default();
+        let candidate = source
+            .stage(staging.path(), version("0.0.3"), &progress)
+            .await?;
         assert_eq!(fs::read(candidate)?, b"binary");
+        let downloaded = u64::try_from(archive.len())?;
+        assert_eq!(
+            progress.stages(),
+            [
+                UpdateStage::Downloading {
+                    received_bytes: downloaded,
+                    total_bytes: Some(downloaded),
+                },
+                UpdateStage::Verifying,
+                UpdateStage::Extracting,
+            ]
+        );
 
         let staging = tempfile::tempdir()?;
         let source = super::GitHubReleaseSource {
@@ -1641,7 +1782,11 @@ mod tests {
             },
         };
         let error = source
-            .stage(staging.path(), version("0.0.3"))
+            .stage(
+                staging.path(),
+                version("0.0.3"),
+                &RecordingProgress::default(),
+            )
             .await
             .expect_err("corrupted archive must fail");
         assert!(
@@ -1724,20 +1869,34 @@ mod tests {
         let transport = super::ReqwestTransport::new()?;
         let directory = tempfile::tempdir()?;
         let destination = directory.path().join("payload");
+        let reports: RefCell<Vec<(u64, Option<u64>)>> = RefCell::new(Vec::new());
         super::DownloadTransport::download(
             &transport,
             &format!("http://{address}/ok"),
             &destination,
             64,
+            &|received_bytes, total_bytes| reports.borrow_mut().push((received_bytes, total_bytes)),
         )
         .await?;
         assert_eq!(fs::read(&destination)?, b"payload");
+        let reports = reports.into_inner();
+        assert!(!reports.is_empty(), "a download must report its chunks");
+        assert!(
+            reports.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "{reports:?}"
+        );
+        assert!(
+            reports.iter().all(|(_, total)| *total == Some(7)),
+            "{reports:?}"
+        );
+        assert_eq!(reports.last().copied(), Some((7, Some(7))));
 
         let error = super::DownloadTransport::download(
             &transport,
             &format!("http://{address}/large"),
             &destination,
             3,
+            &super::unwatched,
         )
         .await
         .expect_err("oversized download must fail");
@@ -1748,6 +1907,7 @@ mod tests {
             &format!("http://{address}/unsized"),
             &destination,
             3,
+            &super::unwatched,
         )
         .await
         .expect_err("unsized oversized body must stop at the counting ceiling");
@@ -1758,6 +1918,7 @@ mod tests {
             &format!("http://{address}/truncated"),
             &destination,
             256,
+            &super::unwatched,
         )
         .await
         .expect_err("body shorter than its declared length must fail");
@@ -1768,6 +1929,7 @@ mod tests {
             &format!("http://{address}/absent"),
             &destination,
             64,
+            &super::unwatched,
         )
         .await
         .expect_err("missing asset must fail");
@@ -1778,6 +1940,7 @@ mod tests {
             &format!("http://{address}/redirect"),
             &destination,
             64,
+            &super::unwatched,
         )
         .await
         .expect_err("insecure redirect must stop with an empty body");
@@ -1813,6 +1976,7 @@ mod tests {
             &format!("http://{address}/redirect"),
             &destination,
             64,
+            &super::unwatched,
         )
         .await
         .expect_err("followed secure redirect must fail to connect");

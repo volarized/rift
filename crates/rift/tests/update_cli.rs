@@ -1,5 +1,5 @@
 //! Proves `rift update` fails typed on an unreachable network, never
-//! panicking on the async runtime.
+//! panicking on the async runtime and never drawing progress off a terminal.
 
 use std::process::Command;
 
@@ -32,5 +32,9 @@ fn update_reports_a_typed_failure_off_the_runtime() {
     assert!(
         !stderr.contains("panicked"),
         "the updater must never panic on the runtime, stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Checking the latest rift release"),
+        "stage lines are drawn on a terminal only, stderr: {stderr}"
     );
 }

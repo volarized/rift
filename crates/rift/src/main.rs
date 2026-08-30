@@ -1,5 +1,6 @@
 //! Rift CLI.
 
+mod progress;
 mod server;
 mod update;
 use std::fmt;
