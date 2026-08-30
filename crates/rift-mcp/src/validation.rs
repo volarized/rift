@@ -703,6 +703,22 @@ impl IndexValidation {
     /// Before the first publication installs a policy there is nothing to ask, so only the
     /// root `rift.toml` and a `.gitignore` are taken as inclusion deciders; a published
     /// policy answers for its own root spellings and excluded directories.
+    /// Whether one watched path is the workspace's own configuration file.
+    ///
+    /// Before the first publication there is no policy to normalize through, so the
+    /// raw spelling decides; afterwards the policy answers, which is what makes the
+    /// comparison hold on a platform whose temporary root is a symlink.
+    fn is_workspace_configuration(&self, root: &Path, path: &Path) -> bool {
+        let current = self
+            .source_policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        current.as_ref().map_or_else(
+            || path == root.join(WORKSPACE_CONFIGURATION_FILE),
+            |policy| policy.is_workspace_configuration(path),
+        )
+    }
+
     pub(crate) fn decides_inclusion(&self, root: &Path, path: &Path) -> bool {
         let current = self
             .source_policy
@@ -897,7 +913,7 @@ pub(crate) fn watch_path_impact(
     kind: EventKind,
     path: &Path,
 ) -> WatchImpact {
-    if path == root.join(WORKSPACE_CONFIGURATION_FILE) {
+    if validation.is_workspace_configuration(root, path) {
         return ProjectPath::new(WORKSPACE_CONFIGURATION_FILE.to_owned())
             .map_or(WatchImpact::WholeWorkspace, |path| {
                 WatchImpact::Paths(vec![path])
@@ -2083,8 +2099,11 @@ mod tests {
             (
                 EventKind::Modify(ModifyKind::Any),
                 "rift.toml",
-                super::WatchImpact::WholeWorkspace,
-                "the configuration file decides what is included",
+                super::WatchImpact::Paths(vec![
+                    rift_core::ProjectPath::new("rift.toml").expect("project path"),
+                ]),
+                "a written configuration file names itself, and acceptance decides \
+                 whether the tree rebuilds",
             ),
         ];
         for (kind, path, expected, reason) in expectations {
@@ -2395,8 +2414,11 @@ mod tests {
                 &validation,
                 &event(EventKind::Modify(ModifyKind::Any), "rift.toml")
             ),
-            super::WatchImpact::WholeWorkspace,
-            "a written configuration file decides what the workspace includes"
+            super::WatchImpact::Paths(vec![
+                rift_core::ProjectPath::new("rift.toml").expect("project path"),
+            ]),
+            "a written configuration file names itself: acceptance compares the tables \
+             and decides whether the tree rebuilds at all"
         );
         assert_eq!(
             super::watch_event_impact(

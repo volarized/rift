@@ -889,17 +889,29 @@ impl WorkspaceSourcePolicy {
     /// nothing, because no file below it is indexed either way.
     #[must_use]
     pub fn decides_inclusion(&self, path: &Path) -> bool {
+        if self.is_workspace_configuration(path) {
+            return true;
+        }
         let Some(normalized) = self.normalized_path(path) else {
             return false;
         };
         let normalized = normalized.as_ref();
-        if normalized == self.root.join(WORKSPACE_CONFIGURATION_FILE) {
-            return true;
-        }
         normalized.file_name() == Some(OsStr::new(VCS_IGNORE_FILE))
             && normalized
                 .parent()
                 .is_some_and(|parent| self.may_include_descendant(parent))
+    }
+
+    /// Whether `path` names this workspace's own `rift.toml`.
+    ///
+    /// The watcher reports a path in whatever spelling the platform hands it, and a
+    /// macOS temporary root reaches the watcher through a symlink, so the comparison
+    /// runs on the normalized form rather than on the bytes the event carried.
+    #[must_use]
+    pub fn is_workspace_configuration(&self, path: &Path) -> bool {
+        self.normalized_path(path).is_some_and(|normalized| {
+            normalized.as_ref() == self.root.join(WORKSPACE_CONFIGURATION_FILE)
+        })
     }
 
     /// Maps watched spelling onto canonical root without touching event path.
@@ -4514,6 +4526,48 @@ mod tests {
                 .iter()
                 .any(|entry| entry.value().contains("lib.rs")),
             "the refusal names the conflicting path: {error:?}"
+        );
+    }
+
+    /// A watcher reports the root in whatever spelling it was handed, and on macOS a
+    /// temporary directory is reached through a symlink. The configuration file has to
+    /// be recognized under that spelling too, or a workspace there rebuilds its whole
+    /// tree for every `rift.toml` write.
+    #[cfg(unix)]
+    #[test]
+    fn test_the_configuration_file_is_recognized_through_a_symlinked_root() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let real = directory.path().join("workspace");
+        fs::create_dir(&real).expect("workspace directory");
+        fs::write(real.join("rift.toml"), "[source]\n").expect("configuration file");
+        fs::write(real.join("lib.rs"), "pub fn beacon() {}\n").expect("source file");
+        let linked = directory.path().join("linked");
+        unix_fs::symlink(&real, &linked).expect("root symlink");
+
+        let policy = WorkspaceSourcePolicy::build(
+            &linked,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("source policy");
+
+        assert!(
+            policy.is_workspace_configuration(&linked.join("rift.toml")),
+            "the watched spelling names the same configuration file"
+        );
+        let canonical = fs::canonicalize(&real).expect("canonical workspace");
+        assert!(
+            policy.is_workspace_configuration(&canonical.join("rift.toml")),
+            "so does the canonical spelling"
+        );
+        assert!(
+            !policy.is_workspace_configuration(&linked.join("lib.rs")),
+            "no other file is the configuration file"
+        );
+        assert!(
+            policy.decides_inclusion(&linked.join("rift.toml")),
+            "writing it decides what the workspace includes"
         );
     }
 
