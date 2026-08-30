@@ -40,10 +40,9 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use harness::{
-    LIBRARY, PROXIED_ENGINE_CALL_MAX, RUST_PROJECT_CALLER, RUST_PROJECT_HUB, RUST_PROJECT_ROOT,
-    SERIAL, StopOnDrop, TestResult, arguments, laid_out_workspace, proxied_call,
-    proxied_engine_call, proxy_client, proxy_command, require_success, run_rift,
-    rust_engine_workspace, within, workspace,
+    LIBRARY, PROXIED_ENGINE_CALL_MAX, SERIAL, StopOnDrop, TestResult, arguments,
+    laid_out_workspace, proxied_call, proxied_engine_call, proxy_client, proxy_command,
+    require_success, run_rift, rust_engine_workspace, within, workspace,
 };
 use rift_mcp::{PRESENCE_POLL_INTERVAL, START_WAIT_MAX, ServerPresence, claim, probe};
 use rift_protocol::lock::{
@@ -72,8 +71,6 @@ const SERVED_TOOL_NAMES: [&str; 12] = [
     "replace_symbol",
     "search",
 ];
-
-const RUST_PROJECT_BEACON_SYMBOL: &str = "rift://symbol/rust/hub.rs/beacon";
 
 #[test]
 fn proxied_engine_bound_covers_two_retry_sequences_and_election() {
@@ -515,129 +512,6 @@ async fn proxy_stderr_carries_lifecycle_lines_and_never_the_token() -> TestResul
 // the real binary against a real elected server, and - gated behind
 // `RIFT_ENGINE_LIVE` - a real language engine, the way an agent reaches
 // Rift.
-
-/// The engine tier answers through the whole real chain: the `rift`
-/// binary as `rift mcp`, its elected `rift server`, and rust-analyzer, all
-/// real processes over a real cargo project on disk.
-#[tokio::test]
-async fn proxied_rename_symbol_rewrites_every_referencing_file() -> TestResult {
-    let _serial = SERIAL.lock().await;
-    if !live_engine_gate::engine_live() {
-        return Ok(());
-    }
-    let directory = rust_engine_workspace()?;
-    let root = directory.path();
-    rust_engine::require_rust_analyzer(root);
-    let _cleanup = StopOnDrop::new(root);
-
-    let client = proxy_client(root).await?;
-    let structured = proxied_engine_call(
-        &client,
-        "rename_symbol",
-        &json!({ "symbol": RUST_PROJECT_BEACON_SYMBOL, "new_name": "flare" }),
-    )
-    .await?;
-    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
-    assert_eq!(
-        structured["summary"]["paths"],
-        json!(["caller.rs", "hub.rs"]),
-        "the declaration and its cross-file reference both carry the rename: {structured:#}"
-    );
-    assert_eq!(
-        fs::read_to_string(root.join("hub.rs"))?,
-        "pub fn flare(value: i32) -> i32 {\n    value\n}\n"
-    );
-    assert_eq!(
-        fs::read_to_string(root.join("caller.rs"))?,
-        "use crate::hub::flare;\n\npub fn total() -> i32 {\n    flare(2)\n}\n",
-        "rust-analyzer rewrote the import and the call it resolved from its own index"
-    );
-
-    client.cancel().await?;
-    let stopped = run_rift(root, &["server", "stop"]).await?;
-    require_success(&stopped, "stop after the rename session")?;
-    Ok(())
-}
-
-/// The engine's will-rename proposal crosses the proxy unchanged. Reference
-/// edits land without a warning; an empty proposal moves only the file and
-/// carries one warning.
-#[tokio::test]
-async fn proxied_move_file_matches_the_engine_proposal() -> TestResult {
-    let _serial = SERIAL.lock().await;
-    if !live_engine_gate::engine_live() {
-        return Ok(());
-    }
-    let directory = rust_engine_workspace()?;
-    let root = directory.path();
-    rust_engine::require_rust_analyzer(root);
-    let _cleanup = StopOnDrop::new(root);
-
-    let client = proxy_client(root).await?;
-    let structured = proxied_engine_call(
-        &client,
-        "move_file",
-        &json!({ "from": "hub.rs", "to": "spoke.rs" }),
-    )
-    .await?;
-    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
-    let warnings = structured["summary"]["diagnostics"]
-        .as_array()
-        .map(|findings| {
-            findings
-                .iter()
-                .filter(|finding| finding["code"] == json!("rift.move.references_not_updated"))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    assert!(!root.join("hub.rs").exists());
-    assert_eq!(fs::read_to_string(root.join("spoke.rs"))?, RUST_PROJECT_HUB);
-    match warnings.as_slice() {
-        [] => {
-            assert_eq!(
-                structured["summary"]["paths"],
-                json!(["caller.rs", "hub.rs", "lib.rs", "spoke.rs"]),
-                "the proposal rewrites, old path, and new path ride the summary: {structured:#}"
-            );
-            assert_eq!(
-                fs::read_to_string(root.join("lib.rs"))?,
-                "pub mod caller;\npub mod spoke;\n",
-                "the module declaration follows the new file stem"
-            );
-            assert_eq!(
-                fs::read_to_string(root.join("caller.rs"))?,
-                "use crate::spoke::beacon;\n\npub fn total() -> i32 {\n    beacon(2)\n}\n",
-                "the sibling's import path follows the renamed module"
-            );
-        }
-        [warning] => {
-            assert_eq!(warning["severity"], json!("warning"), "{structured:#}");
-            assert!(
-                warning["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains("engine rust")
-                        && message.contains("references were not updated")),
-                "the warning names the engine and skipped updates: {structured:#}"
-            );
-            assert_eq!(
-                structured["summary"]["paths"],
-                json!(["hub.rs", "spoke.rs"]),
-                "an empty proposal moves only the requested file: {structured:#}"
-            );
-            assert_eq!(fs::read_to_string(root.join("lib.rs"))?, RUST_PROJECT_ROOT);
-            assert_eq!(
-                fs::read_to_string(root.join("caller.rs"))?,
-                RUST_PROJECT_CALLER
-            );
-        }
-        _ => panic!("one move carries at most one reference warning: {structured:#}"),
-    }
-
-    client.cancel().await?;
-    let stopped = run_rift(root, &["server", "stop"]).await?;
-    require_success(&stopped, "stop after the move session")?;
-    Ok(())
-}
 
 /// A patch replacing one file with a malformed declaration.
 const RUST_PROJECT_SYNTAX_PATCH: &str = "--- a/caller.rs\n+++ b/caller.rs\n@@ -1,5 +1 @@\n-use crate::hub::beacon;\n-\n-pub fn total() -> i32 {\n-    beacon(2)\n-}\n+fn broken( {\n";

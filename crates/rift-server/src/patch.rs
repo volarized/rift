@@ -2352,8 +2352,9 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains("link.rs")
+                    && diagnostic.message.contains("resolved target")
                     && diagnostic.message.contains("real.rs")),
-            "the result must carry a warning naming both paths: {:?}",
+            "the result must carry a warning naming the link and its resolved target: {:?}",
             summary.diagnostics
         );
         Ok(())
@@ -2402,7 +2403,8 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.message.contains("link.rs")),
+                .any(|diagnostic| diagnostic.message.contains("link.rs")
+                    && diagnostic.message.contains("outside the workspace")),
             "{diagnostics:?}"
         );
         assert!(
