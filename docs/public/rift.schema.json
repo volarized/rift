@@ -1,5 +1,97 @@
 {
   "$defs": {
+    "BindingConfiguration": {
+      "additionalProperties": false,
+      "description": "The `[providers.binding]` table. The binding provider maps references to the\ndefinitions they can name from syntax facts alone; each phase of that work runs\nunder one of these bounds, and a build that breaches a bound keeps the prior\nbinding publication.",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "description": "Whether the binding provider runs at all.",
+          "type": "boolean"
+        },
+        "max_graph_links": {
+          "default": 500000,
+          "description": "Links one publication's graph may hold, at most.",
+          "format": "uint64",
+          "maximum": 5000000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_graph_nodes": {
+          "default": 2000000,
+          "description": "Scopes, definitions, and references one publication's graph may hold together, at most.",
+          "format": "uint64",
+          "maximum": 20000000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_path_depth": {
+          "default": 64,
+          "description": "Steps one resolution work item may accumulate, at most.",
+          "format": "uint64",
+          "maximum": 640,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_publication_work": {
+          "default": 50000000,
+          "description": "Work items one publication may enqueue across every reference, at most.",
+          "format": "uint64",
+          "maximum": 5000000000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_reference_targets": {
+          "default": 64,
+          "description": "Definitions one reference may resolve to, at most.",
+          "format": "uint64",
+          "maximum": 256,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_reference_work": {
+          "default": 4096,
+          "description": "Work items one reference may enqueue during resolution, at most.",
+          "format": "uint64",
+          "maximum": 409600,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_unit_definitions": {
+          "default": 16384,
+          "description": "Definitions one source unit may contribute, at most.",
+          "format": "uint64",
+          "maximum": 163840,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_unit_links": {
+          "default": 4096,
+          "description": "Links one source unit may contribute, at most.",
+          "format": "uint64",
+          "maximum": 40960,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_unit_references": {
+          "default": 65536,
+          "description": "References one source unit may contribute, at most.",
+          "format": "uint64",
+          "maximum": 655360,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_unit_scopes": {
+          "default": 4096,
+          "description": "Scopes one source unit may contribute, at most.",
+          "format": "uint64",
+          "maximum": 40960,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "ByteSize": {
       "description": "A byte size: an integer magnitude with a required unit suffix `b`, `kb`, `mb`, `gb`, or `tb`; units are binary, so `1kb` is 1024 bytes.",
       "pattern": "^(?:0|[1-9][0-9]*)(?:b|kb|mb|gb|tb)$",
@@ -684,6 +776,23 @@
       "additionalProperties": false,
       "description": "The `[providers]` table: the built-in providers run without\nconfiguration, and this table bounds or disables them.",
       "properties": {
+        "binding": {
+          "$ref": "#/$defs/BindingConfiguration",
+          "default": {
+            "enabled": true,
+            "max_graph_links": 500000,
+            "max_graph_nodes": 2000000,
+            "max_path_depth": 64,
+            "max_publication_work": 50000000,
+            "max_reference_targets": 64,
+            "max_reference_work": 4096,
+            "max_unit_definitions": 16384,
+            "max_unit_links": 4096,
+            "max_unit_references": 65536,
+            "max_unit_scopes": 4096
+          },
+          "description": "The binding provider's switch and bounds."
+        },
         "history": {
           "$ref": "#/$defs/HistoryConfiguration",
           "default": {
@@ -1115,6 +1224,19 @@
     "providers": {
       "$ref": "#/$defs/ProvidersConfiguration",
       "default": {
+        "binding": {
+          "enabled": true,
+          "max_graph_links": 500000,
+          "max_graph_nodes": 2000000,
+          "max_path_depth": 64,
+          "max_publication_work": 50000000,
+          "max_reference_targets": 64,
+          "max_reference_work": 4096,
+          "max_unit_definitions": 16384,
+          "max_unit_links": 4096,
+          "max_unit_references": 65536,
+          "max_unit_scopes": 4096
+        },
         "history": {
           "enabled": true,
           "max_revisions": 500

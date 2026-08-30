@@ -13,18 +13,20 @@ workspace = true
 [dependencies]
 ignore.workspace = true
 tokio = { workspace = true, features = ["sync"] }
+rift-binding.workspace = true
 rift-core.workspace = true
 rift-history.workspace = true
 serde.workspace = true
 sha2.workspace = true
+rift-protocol.workspace = true
 rift-provider.workspace = true
 rift-syntax.workspace = true
 toasty.workspace = true
 toasty-core.workspace = true
 toasty-driver-sqlite.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 rift-history = { workspace = true, features = ["fixtures"] }
-rift-protocol.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

@@ -15,7 +15,9 @@ mod toml;
 mod typescript;
 mod yaml;
 
-pub use contribution::{SYNTAX_PROVIDER_ID, SyntaxPublicationBuilder, SyntaxPublicationError};
+pub use contribution::{
+    SYNTAX_PROVIDER_ID, SyntaxPublicationBuilder, SyntaxPublicationError, source_unit,
+};
 pub use document::{ByteRange, SyntaxDocument, SyntaxNode, SyntaxSymbol};
 pub use failure::{SyntaxBound, SyntaxError, SyntaxFault, SyntaxViolation};
 pub use javascript::JavaScriptSyntaxProvider;

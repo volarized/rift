@@ -194,7 +194,16 @@ impl SyntaxPublicationBuilder {
     }
 }
 
-fn source_unit(document: &SyntaxDocument) -> Result<SourceUnitId, SourceUnitIdError> {
+/// Mints one syntax document's project source-unit identity.
+///
+/// The spelling is `rift://source/project/<escaped path>`, the identity every
+/// project-tree Contribution carries, so a consumer joining another provider's
+/// facts to this document addresses the same unit.
+///
+/// # Errors
+///
+/// Returns [`SourceUnitIdError`] when the document's path breaks source-unit rules.
+pub fn source_unit(document: &SyntaxDocument) -> Result<SourceUnitId, SourceUnitIdError> {
     SourceUnitId::parse(&format!(
         "rift://source/project/{}",
         encode_path(document.path().as_str())
