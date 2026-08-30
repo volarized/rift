@@ -40,7 +40,7 @@ use rift_protocol::configuration::LspConfiguration;
 use rift_protocol::read::Language;
 use rift_protocol::retry::RestartPolicy;
 use rift_protocol::workspace::LspState;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tokio::time::Instant;
 
 use rift_lsp::session::EngineReadiness;
@@ -141,11 +141,13 @@ impl EnginePool {
                     })
                     .cloned();
                 let slot = reusable.unwrap_or_else(|| {
+                    let (reported_state, _state_receiver) = watch::channel(LspState::Stopped);
                     Arc::new(EngineSlot {
                         key: key.clone(),
                         configuration,
                         workspace_root: workspace_root.to_path_buf(),
                         state: Mutex::new(SlotState::default()),
+                        reported_state,
                     })
                 });
                 (key, slot)
@@ -192,18 +194,7 @@ impl EnginePool {
     #[must_use]
     pub fn state_for_key(&self, key: &LspProcessKey) -> Option<LspState> {
         let slot = self.engines.get(key)?;
-        let Ok(held) = slot.state.try_lock() else {
-            return Some(LspState::Starting);
-        };
-        Some(match held.session.as_ref() {
-            Some(session) => match session.readiness() {
-                EngineReadiness::Unconfirmed => LspState::Starting,
-                EngineReadiness::Analyzing => LspState::Analyzing,
-                EngineReadiness::Ready => LspState::Ready,
-            },
-            None if held.restarts.started => LspState::Failed,
-            None => LspState::Stopped,
-        })
+        Some(*slot.reported_state.borrow())
     }
 
     /// Ends every running engine with the session's own bounded shutdown.
@@ -221,6 +212,7 @@ impl EnginePool {
             let mut held = slot.state.lock().await;
             if let Some(session) = held.session.take() {
                 let stderr = session.shutdown().await;
+                slot.report_state(LspState::Stopped);
                 tracing::debug!(
                     component = "engine",
                     engine = %slot.name(),
@@ -246,6 +238,7 @@ impl EnginePool {
             let mut held = slot.state.lock().await;
             if let Some(session) = held.session.take() {
                 let _stderr = session.shutdown().await;
+                slot.report_state(LspState::Stopped);
             }
         }
     }
@@ -258,6 +251,7 @@ pub struct EngineSlot {
     configuration: LspConfiguration,
     workspace_root: PathBuf,
     state: Mutex<SlotState>,
+    reported_state: watch::Sender<LspState>,
 }
 
 /// Everything one slot's lock guards: the running engine and the restarts
@@ -401,6 +395,21 @@ fn restart_may_help(error: &EngineError) -> bool {
 }
 
 impl EngineSlot {
+    /// Publishes one nonblocking workspace-resource state observation.
+    fn report_state(&self, state: LspState) {
+        self.reported_state.send_replace(state);
+    }
+
+    /// Publishes readiness from one live LSP session.
+    fn report_readiness(&self, readiness: EngineReadiness) {
+        let state = match readiness {
+            EngineReadiness::Unconfirmed => LspState::Starting,
+            EngineReadiness::Analyzing => LspState::Analyzing,
+            EngineReadiness::Ready => LspState::Ready,
+        };
+        self.report_state(state);
+    }
+
     /// Named process key or inline exact language identity segment.
     #[must_use]
     pub fn name(&self) -> &str {
@@ -587,8 +596,14 @@ impl EngineSlot {
                     Err(error) => return Err(error),
                 }
             }
+            self.report_readiness(session.readiness());
             let outcome = operation(session).await;
             let ended = session.is_ended();
+            if ended {
+                self.report_state(LspState::Failed);
+            } else {
+                self.report_readiness(session.readiness());
+            }
             let final_attempt = retry.delay_after(attempt).is_none();
             let absorbed = match outcome {
                 Ok(answer) => match decide(session, session_generation, answer, final_attempt) {
@@ -667,6 +682,7 @@ impl EngineSlot {
     ) -> Result<EngineSession, EngineError> {
         loop {
             if !budget.claim(&self.configuration.restart, Instant::now()) {
+                self.report_state(LspState::Failed);
                 tracing::warn!(
                     component = "engine",
                     engine = %self.name(),
@@ -675,9 +691,16 @@ impl EngineSlot {
                 );
                 return Err(reported.unwrap_or_else(|| Error::new(EngineFault::Ended)));
             }
+            self.report_state(LspState::Starting);
             match EngineSession::start(self.launch(), &self.workspace_root).await {
-                Ok(session) => return Ok(session),
-                Err(failure) if !restart_may_help(&failure) => return Err(failure),
+                Ok(session) => {
+                    self.report_readiness(session.readiness());
+                    return Ok(session);
+                }
+                Err(failure) if !restart_may_help(&failure) => {
+                    self.report_state(LspState::Failed);
+                    return Err(failure);
+                }
                 Err(failure) => reported = Some(failure),
             }
         }
@@ -833,6 +856,24 @@ mod tests {
         }
         assert!(!built.built_from(&retimed, &bindings));
         assert!(!built.built_from(&definitions, &BTreeMap::new()));
+    }
+
+    #[tokio::test]
+    async fn an_active_ready_slot_reports_ready_without_waiting_for_its_request() {
+        let key = LspProcessKey::named("ty");
+        let definitions = BTreeMap::from([(key.clone(), table("uvx"))]);
+        let bindings = BTreeMap::from([("python".to_owned(), key.clone())]);
+        let built = EnginePool::new(Path::new("/rift-test-root"), definitions, bindings);
+        let slot = built.engine_by_key(&key).expect("configured slot");
+        slot.report_readiness(EngineReadiness::Ready);
+
+        let held = slot.state.lock().await;
+        assert_eq!(built.state_for_key(&key), Some(LspState::Ready));
+        drop(held);
+
+        slot.report_readiness(EngineReadiness::Analyzing);
+        assert_eq!(built.state_for_key(&key), Some(LspState::Analyzing));
+        assert_eq!(built.state_for_key(&LspProcessKey::named("absent")), None);
     }
 
     #[test]

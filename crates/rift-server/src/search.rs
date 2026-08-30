@@ -1389,7 +1389,7 @@ pub fn compute() -> i32 {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::new(1 << 20),
+            &rift_core::TextFileInclusion::new(vec!["**".to_owned()], 1 << 20),
             HistoryConfiguration::default(),
         )?;
         let params: SearchParams = serde_json::from_value(json!({
@@ -2018,7 +2018,7 @@ pub fn compute() -> i32 {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::new(1 << 20),
+            &rift_core::TextFileInclusion::new(vec!["**".to_owned()], 1 << 20),
             HistoryConfiguration::default(),
         )?;
 
@@ -2092,7 +2092,7 @@ pub fn compute() -> i32 {
             &rift_protocol::read::RevisionId("main".to_owned()),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::new(1 << 20),
+            &rift_core::TextFileInclusion::new(vec!["**".to_owned()], 1 << 20),
             &rift_core::LanguageFileSelections::default(),
             HistoryConfiguration::default(),
         )?;
@@ -2147,7 +2147,7 @@ pub fn compute() -> i32 {
             directory.path(),
             limits,
             &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::new(1 << 20),
+            &rift_core::TextFileInclusion::new(vec!["**".to_owned()], 1 << 20),
             HistoryConfiguration::default(),
         )?;
         let params: SearchParams = serde_json::from_value(json!({
@@ -2173,7 +2173,7 @@ pub fn compute() -> i32 {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::new(1 << 20),
+            &rift_core::TextFileInclusion::new(vec!["**".to_owned()], 1 << 20),
             HistoryConfiguration::default(),
         )?;
         let params: SearchParams = serde_json::from_value(json!({
@@ -2433,7 +2433,7 @@ pub fn compute() -> i32 {
         fs::write(directory.path().join("guide.txt"), "word ".repeat(1000))?;
         // The smallest accepted chunk bound against a several-kilobyte guide forces the file
         // into more than one lexical unit, each of which the query matches.
-        let text_inclusion = rift_core::TextFileInclusion::new(1_024);
+        let text_inclusion = rift_core::TextFileInclusion::new(vec!["**".to_owned()], 1_024);
         let service = ReadService::build(
             directory.path(),
             WorkspaceIndexLimits::default(),

@@ -4,7 +4,8 @@
 //! changed tree, its streams captured up to the configured prefix, its
 //! wall-clock bounded by `timeout`. A command starts from the environment
 //! the server inherited, with the hook's `environment` entries laid on top.
-//! [`run_hooks`] selects commands against the initially changed project paths.
+//! [`selected_hooks`] picks the commands one change runs from its initially
+//! changed project paths.
 //! Hooks observe an already-applied change: a failing hook rides the result
 //! as evidence and never rolls the change back.
 
@@ -53,32 +54,28 @@ pub enum HookStatus {
     Error(String),
 }
 
-/// Runs each selected hook inside the changed tree, in list order.
+/// The hooks one applied change runs, in list order.
 ///
-/// Selection uses the initially changed paths. Each selected hook runs once
-/// over the same byte-ordered path list. An invalid pattern produces an error
-/// run for its hook. Work is bounded by the configured hook count and each
-/// hook's `timeout`.
-#[must_use]
-pub fn run_hooks(
-    hooks: &[CommandHook],
+/// Selection reads the initially changed paths, so a transform's own writes
+/// cannot pull a later hook into the run. The list is fixed before the first
+/// hook starts, and each selected hook runs once.
+///
+/// # Errors
+///
+/// Returns [`WorkspaceIndexError`] when a hook's `include` or `exclude` list
+/// holds a pattern that is not a valid glob.
+pub fn selected_hooks<'configuration>(
+    hooks: &'configuration [CommandHook],
     tree_root: &Path,
     changed_paths: &[ProjectPath],
-) -> Vec<HookRun> {
-    let mut ordered: Vec<&str> = changed_paths.iter().map(|path| path.0.as_str()).collect();
-    ordered.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+) -> Result<Vec<&'configuration CommandHook>, WorkspaceIndexError> {
     hooks
         .iter()
-        .filter_map(
-            |hook| match hook_matches_paths(hook, tree_root, changed_paths) {
-                Ok(true) => Some(run_one(hook, tree_root, &ordered)),
-                Ok(false) => None,
-                Err(error) => Some(error_run(
-                    hook,
-                    format!("hook path selection failed: {error}"),
-                )),
-            },
-        )
+        .filter_map(|hook| {
+            hook_matches_paths(hook, tree_root, changed_paths)
+                .map(|selected| selected.then_some(hook))
+                .transpose()
+        })
         .collect()
 }
 
@@ -369,8 +366,13 @@ mod tests {
         let mut string = hook("true", &[]);
         string.command = CommandInput::Program("true".to_owned());
         let list = hook("true", &[]);
-        let runs = run_hooks(&[string, list], directory.path(), &[]);
-        assert_eq!(runs.len(), 2);
+        let hooks = [string, list];
+        let selected = selected_hooks(&hooks, directory.path(), &[]).expect("selection");
+        assert_eq!(selected.len(), 2);
+        let runs: Vec<HookRun> = selected
+            .iter()
+            .map(|hook| run_hook(hook, directory.path(), &[]))
+            .collect();
         assert!(runs.iter().all(|run| run.status == HookStatus::Passed));
     }
 
@@ -390,9 +392,12 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let mut selected = hook("true", &[]);
         selected.include = vec![pattern("src/**")];
-        let runs = run_hooks(&[selected], directory.path(), &paths(&["src/lib.rs"]));
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].status, HookStatus::Passed);
+        let hooks = [selected];
+        let chosen =
+            selected_hooks(&hooks, directory.path(), &paths(&["src/lib.rs"])).expect("selection");
+        assert_eq!(chosen.len(), 1);
+        let run = run_hook(chosen[0], directory.path(), &paths(&["src/lib.rs"]));
+        assert_eq!(run.status, HookStatus::Passed);
     }
 
     #[test]
@@ -400,8 +405,10 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let mut excluded = hook("true", &[]);
         excluded.exclude = vec![pattern("generated/**")];
-        let runs = run_hooks(&[excluded], directory.path(), &paths(&["generated/lib.rs"]));
-        assert!(runs.is_empty());
+        let hooks = [excluded];
+        let chosen = selected_hooks(&hooks, directory.path(), &paths(&["generated/lib.rs"]))
+            .expect("selection");
+        assert!(chosen.is_empty());
     }
 
     #[test]
@@ -409,8 +416,10 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let mut rust = hook("true", &[]);
         rust.include = vec![pattern("**/*.rs")];
-        let runs = run_hooks(&[rust], directory.path(), &paths(&["Cargo.toml"]));
-        assert!(runs.is_empty());
+        let hooks = [rust];
+        let chosen =
+            selected_hooks(&hooks, directory.path(), &paths(&["Cargo.toml"])).expect("selection");
+        assert!(chosen.is_empty());
     }
 
     #[test]
@@ -419,42 +428,42 @@ mod tests {
         let mut rust = hook("true", &[]);
         rust.include = vec![pattern("src/**")];
         let changed = paths(&["src/lib.rs", "src/main.rs", "README.md"]);
-        let runs = run_hooks(&[rust], directory.path(), &changed);
-        assert_eq!(runs.len(), 1);
+        let hooks = [rust];
+        let chosen = selected_hooks(&hooks, directory.path(), &changed).expect("selection");
+        assert_eq!(chosen.len(), 1);
     }
 
     #[test]
     fn test_empty_include_selects_every_change() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let runs = run_hooks(
-            &[hook("true", &[])],
-            directory.path(),
-            &paths(&["notes.unknown"]),
-        );
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].status, HookStatus::Passed);
+        let hooks = [hook("true", &[])];
+        let changed = paths(&["notes.unknown"]);
+        let chosen = selected_hooks(&hooks, directory.path(), &changed).expect("selection");
+        assert_eq!(chosen.len(), 1);
+        let run = run_hook(chosen[0], directory.path(), &changed);
+        assert_eq!(run.status, HookStatus::Passed);
     }
 
     #[test]
-    fn test_invalid_hook_pattern_returns_error_without_panicking() {
+    fn test_invalid_hook_pattern_refuses_selection_without_panicking() {
         let directory = tempfile::tempdir().expect("tempdir");
         let mut invalid = hook("true", &[]);
         invalid.include = vec![pattern("[")];
-        let runs = run_hooks(&[invalid], directory.path(), &paths(&["src/lib.rs"]));
-        assert_eq!(runs.len(), 1);
-        let status = &runs[0].status;
+        let hooks = [invalid];
+        let error = selected_hooks(&hooks, directory.path(), &paths(&["src/lib.rs"]))
+            .expect_err("an invalid glob must refuse selection");
         assert!(
-            error_text(status).contains("path selection failed"),
-            "{status:?}"
+            error.to_string().contains("pattern"),
+            "the refusal names the pattern: {error}"
         );
     }
 
     #[test]
     fn test_nonzero_exit_fails_with_its_code() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let runs = run_hooks(&[hook("false", &[])], directory.path(), &[]);
-        assert_eq!(runs[0].status, HookStatus::Failed);
-        assert_eq!(runs[0].exit_code, Some(1));
+        let run = run_hook(&hook("false", &[]), directory.path(), &[]);
+        assert_eq!(run.status, HookStatus::Failed);
+        assert_eq!(run.exit_code, Some(1));
     }
 
     #[test]
@@ -463,9 +472,9 @@ mod tests {
         let mut slow = hook("sleep", &["10"]);
         slow.timeout = hook_configuration::Duration::from_millis(200);
         let started = Instant::now();
-        let runs = run_hooks(&[slow], directory.path(), &[]);
-        assert_eq!(runs[0].status, HookStatus::TimedOut);
-        assert_eq!(runs[0].exit_code, None);
+        let run = run_hook(&slow, directory.path(), &[]);
+        assert_eq!(run.status, HookStatus::TimedOut);
+        assert_eq!(run.exit_code, None);
         let elapsed = started.elapsed();
         assert!(
             elapsed < Duration::from_secs(5),
@@ -478,12 +487,12 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let mut noisy = hook("seq", &["1", "5000"]);
         noisy.output_limit = hook_configuration::ByteSize::from_bytes(256);
-        let runs = run_hooks(&[noisy], directory.path(), &[]);
-        let stdout = &runs[0].stdout;
+        let run = run_hook(&noisy, directory.path(), &[]);
+        let stdout = &run.stdout;
         assert_eq!(stdout.captured_bytes, 256);
         assert!(stdout.total_bytes > 256, "total {}", stdout.total_bytes);
         assert!(stdout.truncated);
-        assert_eq!(runs[0].status, HookStatus::Passed);
+        assert_eq!(run.status, HookStatus::Passed);
     }
 
     #[test]
@@ -496,45 +505,46 @@ mod tests {
         with_environment
             .environment
             .insert("RIFT_HOOK_PROBE".to_owned(), "42".to_owned());
-        let runs = run_hooks(&[in_sub, with_environment], directory.path(), &[]);
-        let stdout = runs[0].stdout.text.trim_end();
+        let in_sub_run = run_hook(&in_sub, directory.path(), &[]);
+        let stdout = in_sub_run.stdout.text.trim_end();
         assert!(stdout.ends_with("/sub"), "{stdout}");
-        assert_eq!(runs[1].stdout.text, "42\n");
+        let environment_run = run_hook(&with_environment, directory.path(), &[]);
+        assert_eq!(environment_run.stdout.text, "42\n");
     }
 
     #[test]
     fn test_missing_program_is_an_error_not_a_panic() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let runs = run_hooks(
-            &[hook("rift-test-binary-that-does-not-exist", &[])],
+        let run = run_hook(
+            &hook("rift-test-binary-that-does-not-exist", &[]),
             directory.path(),
             &[],
         );
-        let status = &runs[0].status;
+        let status = &run.status;
         assert!(error_text(status).contains("launch"), "{status:?}");
     }
 
     #[test]
     fn test_absolute_program_is_refused_before_spawning() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let runs = run_hooks(&[hook("/bin/echo", &["hi"])], directory.path(), &[]);
-        let status = &runs[0].status;
+        let run = run_hook(&hook("/bin/echo", &["hi"]), directory.path(), &[]);
+        let status = &run.status;
         assert!(error_text(status).contains("absolute"), "{status:?}");
     }
 
     #[test]
     fn test_empty_program_is_an_error() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let runs = run_hooks(&[hook("", &[])], directory.path(), &[]);
-        let status = &runs[0].status;
+        let run = run_hook(&hook("", &[]), directory.path(), &[]);
+        let status = &run.status;
         assert!(error_text(status).contains("program"), "{status:?}");
     }
 
     #[test]
     fn test_bare_program_name_is_accepted() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let runs = run_hooks(&[hook("echo", &["hi"])], directory.path(), &[]);
-        assert_eq!(runs[0].status, HookStatus::Passed);
+        let run = run_hook(&hook("echo", &["hi"]), directory.path(), &[]);
+        assert_eq!(run.status, HookStatus::Passed);
     }
 
     #[test]
@@ -549,16 +559,16 @@ mod tests {
             .permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
         std::fs::set_permissions(&script, permissions).expect("set script executable");
-        let runs = run_hooks(&[hook("bin/run.sh", &[])], directory.path(), &[]);
-        assert_eq!(runs[0].status, HookStatus::Passed, "{:?}", runs[0].status);
+        let run = run_hook(&hook("bin/run.sh", &[]), directory.path(), &[]);
+        assert_eq!(run.status, HookStatus::Passed, "{:?}", run.status);
     }
 
     #[test]
     fn test_program_dot_segment_is_refused_before_spawning() {
         let directory = tempfile::tempdir().expect("tempdir");
         for program in ["../evil", "sub/../evil", "./evil"] {
-            let runs = run_hooks(&[hook(program, &[])], directory.path(), &[]);
-            let status = &runs[0].status;
+            let run = run_hook(&hook(program, &[]), directory.path(), &[]);
+            let status = &run.status;
             assert!(
                 error_text(status).contains("escapes the workspace"),
                 "{program}: {status:?}"
@@ -571,8 +581,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let mut escaping = hook("echo", &[]);
         escaping.working_directory = ProjectPath("/etc".to_owned());
-        let runs = run_hooks(&[escaping], directory.path(), &[]);
-        let status = &runs[0].status;
+        let run = run_hook(&escaping, directory.path(), &[]);
+        let status = &run.status;
         assert!(
             error_text(status).contains("working directory"),
             "{status:?}"
@@ -585,8 +595,8 @@ mod tests {
         for working_directory in ["..", "../outside", "scripts/../outside"] {
             let mut escaping = hook("echo", &[]);
             escaping.working_directory = ProjectPath(working_directory.to_owned());
-            let runs = run_hooks(&[escaping], directory.path(), &[]);
-            let status = &runs[0].status;
+            let run = run_hook(&escaping, directory.path(), &[]);
+            let status = &run.status;
             assert!(
                 error_text(status).contains("working directory"),
                 "{working_directory}: {status:?}"
@@ -599,9 +609,9 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let mut at_root = hook("pwd", &[]);
         at_root.working_directory = ProjectPath(String::new());
-        let runs = run_hooks(&[at_root], directory.path(), &[]);
-        assert_eq!(runs[0].status, HookStatus::Passed);
-        let printed = runs[0].stdout.text.trim_end();
+        let run = run_hook(&at_root, directory.path(), &[]);
+        assert_eq!(run.status, HookStatus::Passed);
+        let printed = run.stdout.text.trim_end();
         let canonical_root =
             std::fs::canonicalize(directory.path()).expect("temporary directory must resolve");
         assert_eq!(
@@ -613,10 +623,10 @@ mod tests {
     #[test]
     fn test_hook_inherits_the_server_environment() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let runs = run_hooks(&[hook("printenv", &["PATH"])], directory.path(), &[]);
-        assert_eq!(runs[0].status, HookStatus::Passed);
+        let run = run_hook(&hook("printenv", &["PATH"]), directory.path(), &[]);
+        assert_eq!(run.status, HookStatus::Passed);
         assert!(
-            !runs[0].stdout.text.trim().is_empty(),
+            !run.stdout.text.trim().is_empty(),
             "the child must see the server's PATH"
         );
     }
@@ -628,8 +638,8 @@ mod tests {
         overlaid
             .environment
             .insert("HOME".to_owned(), "/rift/overlay".to_owned());
-        let runs = run_hooks(&[overlaid], directory.path(), &[]);
-        assert_eq!(runs[0].stdout.text, "/rift/overlay\n");
+        let run = run_hook(&overlaid, directory.path(), &[]);
+        assert_eq!(run.stdout.text, "/rift/overlay\n");
     }
 
     /// A stream that never ends, for proving the drain ceiling.
@@ -701,7 +711,12 @@ mod tests {
         first.id = "first".to_owned();
         let mut second = hook("echo", &["second"]);
         second.id = "second".to_owned();
-        let runs = run_hooks(&[first, second], directory.path(), &[]);
+        let hooks = [first, second];
+        let selected = selected_hooks(&hooks, directory.path(), &[]).expect("selection");
+        let runs: Vec<HookRun> = selected
+            .iter()
+            .map(|hook| run_hook(hook, directory.path(), &[]))
+            .collect();
         assert_eq!(runs[0].id, "first");
         assert_eq!(runs[1].id, "second");
     }

@@ -82,6 +82,61 @@ pub(crate) struct FileRewrite {
     pub(crate) permissions: RewritePermissions,
 }
 
+/// One raw-byte whole-file rewrite used only to restore a rejected hook write.
+#[derive(Clone, Debug)]
+pub(crate) struct ByteFileRewrite {
+    /// File this rewrite lands on.
+    pub(crate) path: ProjectPath,
+    /// Kind of filesystem change.
+    pub(crate) kind: RewriteKind,
+    /// Complete bytes after this rewrite lands.
+    pub(crate) next_bytes: Vec<u8>,
+    /// Permissions published with retained bytes.
+    pub(crate) permissions: RewritePermissions,
+}
+
+impl ByteFileRewrite {
+    /// Restores an existing file's bytes and permissions.
+    pub(crate) fn modify(
+        path: ProjectPath,
+        next_bytes: Vec<u8>,
+        permissions: fs::Permissions,
+    ) -> Self {
+        Self {
+            path,
+            kind: RewriteKind::Modify {
+                replaced: Vec::new(),
+            },
+            next_bytes,
+            permissions: RewritePermissions::Exact(permissions),
+        }
+    }
+
+    /// Restores a missing file's bytes and permissions.
+    pub(crate) fn create(
+        path: ProjectPath,
+        next_bytes: Vec<u8>,
+        permissions: fs::Permissions,
+    ) -> Self {
+        Self {
+            path,
+            kind: RewriteKind::Create,
+            next_bytes,
+            permissions: RewritePermissions::Exact(permissions),
+        }
+    }
+
+    /// Removes a file created by a rejected hook.
+    pub(crate) fn delete(path: ProjectPath) -> Self {
+        Self {
+            path,
+            kind: RewriteKind::Delete,
+            next_bytes: Vec::new(),
+            permissions: RewritePermissions::Retain,
+        }
+    }
+}
+
 impl FileRewrite {
     /// Builds the in-place modification of `path` from its previous image
     /// to `next_source`, replacing `replaced`.

@@ -24,7 +24,7 @@ pub use diagnose::{
     engine_change_set_diagnostics,
 };
 pub use engine::{EnginePool, EngineSlot, LspProcessKey};
-pub use hook::{HookRun, HookStatus, hook_matches_paths, run_hook, run_hooks};
+pub use hook::{HookRun, HookStatus, hook_matches_paths, run_hook, selected_hooks};
 pub use move_file::{MovePlan, MoveResolution, plan_move};
 pub use read::{ReadError, ReadFault, ReadService};
 pub use remove::{

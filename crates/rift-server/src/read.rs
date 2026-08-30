@@ -389,6 +389,46 @@ impl ReadService {
         self.index.digests()
     }
 
+    /// The visibility policy this snapshot reads the filesystem through.
+    ///
+    /// A revision snapshot answers from version control alone and carries none,
+    /// so every capture that touches the tree refuses here first, naming the
+    /// operation the caller asked for.
+    fn filesystem_policy(
+        &self,
+        operation: &'static str,
+    ) -> Result<&WorkspaceSourcePolicy, ReadError> {
+        self.source_policy
+            .as_deref()
+            .ok_or_else(|| ReadFault::task(operation, "a revision snapshot has no filesystem tree"))
+    }
+
+    /// Captures live visible regular-file paths for a workspace change hook.
+    ///
+    /// Bytes stay absent when configured file or workspace bounds stop content capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when this is a revision snapshot or discovery fails.
+    pub fn capture_visible_workspace_entries(
+        &self,
+    ) -> Result<Vec<rift_index::VisibleWorkspaceEntry>, ReadError> {
+        self.filesystem_policy("capture visible workspace entries")?
+            .visible_entries()
+            .map_err(ReadFault::index)
+    }
+
+    /// Returns every visible regular file's content digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when this is a revision snapshot or capture fails.
+    pub fn visible_workspace_digests(&self) -> Result<WorkspaceDigests, ReadError> {
+        self.filesystem_policy("capture visible workspace digests")?
+            .visible_digests()
+            .map_err(ReadFault::index)
+    }
+
     /// The digest of the bytes this snapshot indexed at `path`, or nothing when it indexes
     /// no file there.
     ///
@@ -614,16 +654,20 @@ impl ReadService {
 
     /// The failure for a path the syntax index does not hold: `content_unavailable` when
     /// this snapshot's own warnings name `path` as holding invalid UTF-8 - the file exists
-    /// but could not be read - `UnclaimedExtension` naming the unparsed extension when no
-    /// shipped provider parses `path` and this snapshot can confirm the path is real, and
-    /// `not_found` for everything else, including a claimed extension the index simply has
-    /// not read.
+    /// but could not be read - the capability a syntax read lacks when this snapshot can
+    /// confirm the path is real, and `not_found` for everything else, including a claimed
+    /// path the index simply has not read.
     fn missing_file_fault(&self, path: &CoreProjectPath) -> ReadError {
         if self.index_names_invalid_utf8(path) {
             return ReadFault::source_unavailable(path.as_str());
         }
-        match self.unclaimed_extension_capability(path) {
-            Ok(Some(extension)) => ReadFault::unclaimed_extension(extension),
+        match self.unserved_syntax(path) {
+            Ok(Some(UnservedSyntax::Configurable(capability))) => {
+                ReadFault::unsupported(capability)
+            }
+            Ok(Some(UnservedSyntax::Unclaimed(extension))) => {
+                ReadFault::unclaimed_extension(extension)
+            }
             Ok(None) => ReadFault::not_found(path.as_str()),
             Err(storage_fault) => storage_fault,
         }
@@ -638,31 +682,80 @@ impl ReadService {
             .any(|warning| warning.path() == path)
     }
 
-    /// `Some` naming `path`'s extension, or stating that it carries none, when no
-    /// shipped syntax provider parses it and this snapshot can confirm the path is
-    /// real. On the current tree that means the `[source]` policy makes `path` visible
-    /// and the filesystem holds it; on a revision snapshot, which carries no filesystem
-    /// policy, the extension alone decides, because `nodes` can never serve an
-    /// unclaimed extension whatever tree it is pointed at.
-    fn unclaimed_extension_capability(
+    /// The syntax capability `path` lacks, reported only when this snapshot can
+    /// confirm the path is real.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when two language entries match `path`, or when the
+    /// filesystem cannot answer whether it exists.
+    fn unserved_syntax(&self, path: &CoreProjectPath) -> Result<Option<UnservedSyntax>, ReadError> {
+        let Some(reason) = self.unserved_syntax_reason(path)? else {
+            return Ok(None);
+        };
+        Ok(self.path_is_real(path)?.then_some(reason))
+    }
+
+    /// Why a syntax read cannot serve `path`, or nothing when an enabled language
+    /// entry with a shipped provider claims it.
+    fn unserved_syntax_reason(
+        &self,
+        path: &CoreProjectPath,
+    ) -> Result<Option<UnservedSyntax>, ReadError> {
+        let claim = self
+            .index
+            .language_policy()
+            .language_for_path(Path::new(path.as_str()))
+            .map_err(ReadFault::index)?;
+        Ok(match claim {
+            Some(language) if language.enabled() && language.has_syntax() => None,
+            Some(language) => Some(UnservedSyntax::Configurable(format!(
+                "{} files",
+                language.identity()
+            ))),
+            None => Some(UnservedSyntax::Unclaimed(extension_capability(path))),
+        })
+    }
+
+    /// The exact language identity an engine is asked under for `path`: the
+    /// indexed file's own language, or the effective entry claiming the path when
+    /// no shipped provider parses it. An unshipped language reaches an engine this
+    /// way, because its entry selects a process without contributing syntax facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when two language entries match `path`.
+    pub fn engine_language_segment(
         &self,
         path: &CoreProjectPath,
     ) -> Result<Option<String>, ReadError> {
-        if extension_claimed(path) {
-            return Ok(None);
+        if let Some(file) = self.index.file(path) {
+            return Ok(Some(file.syntax().language().identity_segment()));
         }
+        Ok(self
+            .index
+            .language_policy()
+            .language_for_path(Path::new(path.as_str()))
+            .map_err(ReadFault::index)?
+            .filter(|language| language.enabled())
+            .map(|language| language.identity().to_owned()))
+    }
+
+    /// Whether this snapshot can confirm `path` names a real visible file. On the
+    /// current tree the `[source]` policy has to make `path` visible and the
+    /// filesystem has to hold it; a revision snapshot carries no filesystem policy,
+    /// so the tree it was built from is the answer.
+    fn path_is_real(&self, path: &CoreProjectPath) -> Result<bool, ReadError> {
         let Some(policy) = self.source_policy.as_deref() else {
-            return Ok(Some(extension_capability(path)));
+            return Ok(true);
         };
         let absolute = self.index.root().join(path.as_str());
         if !policy.visible(&absolute) {
-            return Ok(None);
+            return Ok(false);
         }
-        match absolute.try_exists() {
-            Ok(true) => Ok(Some(extension_capability(path))),
-            Ok(false) => Ok(None),
-            Err(error) => Err(ReadFault::storage(path.as_str(), "stat", &error)),
-        }
+        absolute
+            .try_exists()
+            .map_err(|error| ReadFault::storage(path.as_str(), "stat", &error))
     }
 
     /// Finds declarations by name, with each hit's version-control timeline
@@ -967,16 +1060,18 @@ fn language_selects(filter: &Language, candidate: &Language) -> bool {
         && (filter.dialect.is_none() || filter.dialect == candidate.dialect)
 }
 
-/// Whether some shipped syntax provider parses `path`'s extension.
-fn extension_claimed(path: &CoreProjectPath) -> bool {
-    Path::new(path.as_str())
-        .extension()
-        .and_then(OsStr::to_str)
-        .is_some_and(|extension| registry::provider_for_extension(extension).is_some())
+/// Why a syntax read cannot serve one path.
+#[derive(Debug)]
+enum UnservedSyntax {
+    /// A language entry claims the path, and this workspace either turned that
+    /// entry off or ships no grammar for it. Configuration can serve the path.
+    Configurable(String),
+    /// No language entry claims the path, so no shipped grammar parses it.
+    Unclaimed(String),
 }
 
-/// The `Unsupported` capability text for a path no syntax provider parses: the
-/// extension itself, or a statement that the path carries none.
+/// The capability text for a path no language entry claims: the extension
+/// itself, or a statement that the path carries none.
 fn extension_capability(path: &CoreProjectPath) -> String {
     match Path::new(path.as_str()).extension().and_then(OsStr::to_str) {
         Some(extension) => format!("{extension} files"),

@@ -252,12 +252,12 @@ fn move_targets(params: &MoveFileParams) -> Result<(CoreProjectPath, CoreProject
     Ok((from, to))
 }
 
-/// Resolves the moved file's current bytes directly from the filesystem, and its language
-/// segment when the syntax index claims the path.
+/// Resolves the moved file's current bytes directly from the filesystem, and the exact
+/// language identity an engine is asked under.
 ///
-/// Any visible regular file is movable: absence from the syntax index only means no
-/// language identity exists to ask an engine with, which [`engine_proposal`] and the
-/// move's own warning path already cover. An indexed path already passed the workspace's
+/// Any visible regular file is movable: absence of a language identity only means there
+/// is nothing to ask an engine with, which [`engine_proposal`] and the move's own
+/// warning path already cover. An indexed path already passed the workspace's
 /// `[source]` policy at index construction; a path the index does not hold is checked
 /// against that policy directly here, so an excluded path stays unreachable regardless of
 /// whether a provider would otherwise claim it. A missing path refuses `target_exists`; a
@@ -267,14 +267,11 @@ async fn resolved_source(
     workspace_root: &Path,
     from: &CoreProjectPath,
 ) -> Result<MovedSource, PlanEnd> {
-    let language_segment = reads
-        .index()
-        .file(from)
-        .map(|file| file.syntax().language().identity_segment());
     let absolute = workspace_root.join(from.as_str());
-    if language_segment.is_none() && !source_visible(reads, &absolute) {
+    if reads.index().file(from).is_none() && !source_visible(reads, &absolute) {
         return Err(PlanEnd::Refused(crate::publish::not_visible_refusal(from)));
     }
+    let language_segment = reads.engine_language_segment(from)?;
     let metadata = match tokio::fs::metadata(&absolute).await {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
