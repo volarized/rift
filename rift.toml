@@ -9,44 +9,28 @@ include = []
 exclude = [".claude/**", ".agents/**", "docs/public/**"]
 respect_gitignore = true
 
-[languages.rust]
-lsp = "rust"
-
-[languages.toml]
-lsp = "toml"
-
-[lsp.rust]
+# Each process serves one exact language, so its table belongs to that language entry.
+# The toolchain pin keeps rust-analyzer on the version `rust-toolchain.toml` names.
+[languages.rust.lsp]
 command = ["rustup", "run", "1.98", "rust-analyzer"]
 
-[lsp.toml]
+[languages.toml.lsp]
 command = ["tombi", "lsp"]
 
 [[hooks]]
 id = "format"
 kind = "format"
 command = ["cargo", "fmt", "--all"]
-changed_paths = "none"
 writes = "workspace"
-working_directory = ""
-environment = {}
-timeout = "120s"
-output_limit = "4kb"
 failure_severity = "warning"
-guarantees = []
 determinism = "deterministic"
 
 [[hooks]]
 id = "check"
 kind = "build"
 command = ["just", "check"]
-changed_paths = "none"
-writes = "none"
-working_directory = ""
-environment = {}
 timeout = "600s"
-output_limit = "4kb"
-failure_severity = "error"
+determinism = "deterministic"
 guarantees = [
   { kind = "syntax_validated", scope = { kind = "reach", reach = "project" }, detail = "cargo check and the architecture gate pass" },
 ]
-determinism = "deterministic"
