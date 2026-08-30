@@ -2,6 +2,11 @@
 
 mod attachment;
 mod binding;
+#[cfg(test)]
+mod fixture;
+mod layout;
+
+pub use layout::RustCrateLayout;
 
 use rift_core::Error;
 use rift_protocol::read::{Language, NodeFacet, SymbolFacet};

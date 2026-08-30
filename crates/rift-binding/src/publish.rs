@@ -608,6 +608,48 @@ mod tests {
     }
 
     #[test]
+    fn test_publisher_generated_and_stdlib_origins_kept_on_contributions() {
+        use rift_core::{ContributionOrigin, SourceKind, SourceLocation};
+        let generated = ContributionOrigin::new(
+            Some(SourceLocation::Project { package: None }),
+            SourceKind::Generated,
+        );
+        let generated = generated.expect("generated origin");
+        let stdlib = ContributionOrigin::new(Some(SourceLocation::Stdlib {}), SourceKind::Authored)
+            .expect("stdlib origin");
+        let mut fixture = Fixture::new();
+        let first = fixture
+            .builder
+            .unit(fixture::source("build/out.rs"), generated.clone());
+        let first = first.expect("generated unit accepted");
+        let second = fixture
+            .builder
+            .unit(fixture::source("vendor/core.rs"), stdlib.clone());
+        let second = second.expect("stdlib unit accepted");
+        let first_scope = fixture.module(first, None, 0, 50);
+        let second_scope = fixture.module(second, None, 0, 50);
+        fixture.item(first_scope, "made", 1, 9, VisibilitySpelling::Public);
+        fixture.item(second_scope, "core", 1, 9, VisibilitySpelling::Public);
+        let graph = fixture.build();
+        let output = published(&graph, BindingLimits::default());
+        let made = contribution_with_symbol(
+            output.publication(),
+            "rift://binding/definition/build/out.rs@1-9",
+        );
+        assert_eq!(made.origin(), &generated);
+        let made_scope = contribution_with_symbol(
+            output.publication(),
+            "rift://binding/scope/build/out.rs@0-50",
+        );
+        assert_eq!(made_scope.origin(), &generated);
+        let core = contribution_with_symbol(
+            output.publication(),
+            "rift://binding/definition/vendor/core.rs@1-9",
+        );
+        assert_eq!(core.origin(), &stdlib);
+    }
+
+    #[test]
     fn test_provider_symbol_id_binding_spelling_accepted() {
         for spelling in [
             "rift://binding/scope/src/lib.rs@0-10",

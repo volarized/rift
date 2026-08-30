@@ -466,6 +466,64 @@ impl UnitBindingFacts {
     pub fn module_declarations(&self) -> &[UnitModuleDeclaration] {
         &self.module_declarations
     }
+
+    /// Returns one scope by its unit-local index.
+    #[must_use]
+    pub fn scope(&self, index: UnitScopeIndex) -> Option<&UnitScope> {
+        self.scopes.get(index.index())
+    }
+
+    /// Returns one definition by its unit-local index.
+    #[must_use]
+    pub fn definition(&self, index: UnitDefinitionIndex) -> Option<&UnitDefinition> {
+        self.definitions.get(index.index())
+    }
+
+    /// The same facts with `declarations` replacing every module declaration.
+    ///
+    /// A layout pass recomputes candidate paths once the project path set is known; the
+    /// replacement revalidates what the builder checked as each declaration arrived.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BindingViolation::MissingDefinition`] for an unknown definition,
+    /// [`BindingViolation::InvalidPath`] for an empty candidate list, or the
+    /// `unit_links_max` limit violation over the unit's imports, member links, and
+    /// replaced declarations together.
+    pub fn with_module_declarations(
+        &self,
+        declarations: Vec<UnitModuleDeclaration>,
+        limits: &BindingLimits,
+    ) -> Result<Self, BindingError> {
+        for declaration in &declarations {
+            self.accept_declaration(declaration)?;
+        }
+        let held = self.imports.len() + self.member_links.len() + declarations.len();
+        if held > limits.unit_links_max() {
+            return Err(binding_error(
+                BindingViolation::UnitLimit(ExhaustedLimit::UnitLinks),
+                format!("{held} would be held, bound {}", limits.unit_links_max()),
+            ));
+        }
+        let mut replaced = self.clone();
+        replaced.module_declarations = declarations;
+        Ok(replaced)
+    }
+
+    /// Refuses a declaration naming an unknown definition or carrying no candidates.
+    fn accept_declaration(&self, declaration: &UnitModuleDeclaration) -> Result<(), BindingError> {
+        if declaration.definition().index() >= self.definitions.len() {
+            let detail = format!("{:?} has not been added", declaration.definition());
+            return Err(binding_error(BindingViolation::MissingDefinition, detail));
+        }
+        if declaration.candidates().is_empty() {
+            return Err(binding_error(
+                BindingViolation::InvalidPath,
+                "a module declaration needs at least one candidate path",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Collects one unit's facts, validating indices and per-unit bounds as each arrives.
@@ -596,16 +654,7 @@ impl UnitBindingFactsBuilder {
         &mut self,
         declaration: UnitModuleDeclaration,
     ) -> Result<(), BindingError> {
-        if declaration.definition().index() >= self.facts.definitions.len() {
-            let detail = format!("{:?} has not been added", declaration.definition());
-            return Err(binding_error(BindingViolation::MissingDefinition, detail));
-        }
-        if declaration.candidates().is_empty() {
-            return Err(binding_error(
-                BindingViolation::InvalidPath,
-                "a module declaration needs at least one candidate path",
-            ));
-        }
+        self.facts.accept_declaration(&declaration)?;
         self.accept_link()?;
         self.facts.module_declarations.push(declaration);
         Ok(())
@@ -1136,6 +1185,75 @@ mod tests {
         assert_eq!(graph.links().len(), 0);
         let linked = LinkedGraph::link(&graph, &limits).expect("graph links");
         assert_eq!(linked.unlinked_modules(), &[]);
+    }
+
+    #[test]
+    fn test_unit_facts_with_module_declarations_replaces_candidates() {
+        let facts = declaring_facts(&["src/x.rs"]);
+        let declaration = facts.module_declarations()[0].definition();
+        let replaced = UnitModuleDeclaration::new(declaration, vec!["src/a/x.rs".to_owned()]);
+        let refined = facts.with_module_declarations(vec![replaced], &BindingLimits::default());
+        let refined = refined.expect("replacement accepted");
+        assert_eq!(refined.module_declarations().len(), 1);
+        assert_eq!(
+            refined.module_declarations()[0].candidates(),
+            ["src/a/x.rs".to_owned()]
+        );
+        assert_eq!(refined.definitions().len(), facts.definitions().len());
+        let emptied = facts.with_module_declarations(Vec::new(), &BindingLimits::default());
+        let emptied = emptied.expect("dropping every declaration accepted");
+        assert_eq!(emptied.module_declarations(), &[]);
+        let named = facts
+            .definition(declaration)
+            .map(|definition| definition.name().as_str());
+        assert_eq!(named, Some("x"));
+        assert!(facts.scope(facts.definitions()[0].scope()).is_some());
+        assert_eq!(facts.definition(UnitDefinitionIndex(9)), None);
+        assert_eq!(facts.scope(UnitScopeIndex(9)), None);
+    }
+
+    #[test]
+    fn test_unit_facts_with_module_declarations_unknown_definition_refused() {
+        let facts = declaring_facts(&["src/x.rs"]);
+        let unknown =
+            UnitModuleDeclaration::new(UnitDefinitionIndex(9), vec!["src/x.rs".to_owned()]);
+        let refused = facts.with_module_declarations(vec![unknown], &BindingLimits::default());
+        assert_eq!(
+            violation(refused),
+            Some(BindingViolation::MissingDefinition)
+        );
+    }
+
+    #[test]
+    fn test_unit_facts_with_module_declarations_empty_candidates_refused() {
+        let facts = declaring_facts(&["src/x.rs"]);
+        let declaration = facts.module_declarations()[0].definition();
+        let empty = UnitModuleDeclaration::new(declaration, Vec::new());
+        let refused = facts.with_module_declarations(vec![empty], &BindingLimits::default());
+        assert_eq!(violation(refused), Some(BindingViolation::InvalidPath));
+    }
+
+    #[test]
+    fn test_unit_facts_with_module_declarations_one_over_link_bound_refused() {
+        let facts = declaring_facts(&["src/x.rs"]);
+        let declaration = facts.module_declarations()[0].definition();
+        let limits = BindingLimits::builder().unit_links_max(1).build();
+        let limits = limits.unwrap_or_default();
+        let at_bound = facts.with_module_declarations(
+            vec![UnitModuleDeclaration::new(
+                declaration,
+                vec!["src/x.rs".to_owned()],
+            )],
+            &limits,
+        );
+        assert!(at_bound.is_ok(), "one declaration meets the bound of one");
+        let over = vec![
+            UnitModuleDeclaration::new(declaration, vec!["src/x.rs".to_owned()]),
+            UnitModuleDeclaration::new(declaration, vec!["src/x/mod.rs".to_owned()]),
+        ];
+        let refused = facts.with_module_declarations(over, &limits);
+        let expected = BindingViolation::UnitLimit(ExhaustedLimit::UnitLinks);
+        assert_eq!(violation(refused), Some(expected));
     }
 
     #[test]
