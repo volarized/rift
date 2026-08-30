@@ -10,7 +10,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use crate::engine_fixture::EngineFixture;
+use crate::engine_fixture::{EngineFixture, LspPlacement};
 
 /// The package manager that installs the fixture's pinned `typescript`.
 pub(crate) const BUN_PROGRAM: &str = "bun";
@@ -78,6 +78,7 @@ pub(crate) fn typescript_engine_configuration() -> String {
 /// The fixture data used for the local TypeScript engine.
 pub(crate) fn fixture() -> EngineFixture {
     EngineFixture {
+        placement: LspPlacement::Named,
         name: "typescript",
         program: LANGUAGE_SERVER_PROGRAM,
         arguments: vec!["--stdio"],

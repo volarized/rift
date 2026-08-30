@@ -188,15 +188,8 @@ fn observed_digests(
     let mut observed = Vec::with_capacity(paths.len());
     for path in paths {
         let absolute = root.join(path.as_str());
-        if !policy.includes(&absolute) {
-            observed.push((path.clone(), None));
-            continue;
-        }
-        match std::fs::read(&absolute) {
-            Ok(bytes) => observed.push((path.clone(), Some(FileDigest::of(&bytes)))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                observed.push((path.clone(), None));
-            }
+        match policy.visible_digest(&absolute) {
+            Ok(digest) => observed.push((path.clone(), digest)),
             Err(_) => return None,
         }
     }
@@ -419,6 +412,11 @@ impl ConfigurationState {
     }
 
     /// LSP process definitions and exact language bindings from the last acceptance.
+    ///
+    /// A named `[lsp.<name>]` entry becomes a definition whether or not a language
+    /// selects it, so the pool can start it the moment one does. An inline table
+    /// belongs to its own language entry alone, so a disabled entry contributes
+    /// neither the definition nor the binding.
     pub(crate) fn lsp_runtime_configuration(
         &self,
     ) -> (
@@ -438,6 +436,9 @@ impl ConfigurationState {
             let Some(lsp) = &language.lsp else {
                 continue;
             };
+            if !language.enabled {
+                continue;
+            }
             let key = match lsp {
                 LanguageLspConfiguration::Named(name) => LspProcessKey::Named(name.clone()),
                 LanguageLspConfiguration::Inline(lsp) => {
@@ -446,9 +447,7 @@ impl ConfigurationState {
                     key
                 }
             };
-            if language.enabled {
-                bindings.insert(identity.clone(), key);
-            }
+            bindings.insert(identity.clone(), key);
         }
         (definitions, bindings)
     }
@@ -685,7 +684,7 @@ impl IndexValidation {
             .source_policy
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        current.as_ref().is_none_or(|policy| policy.includes(path))
+        current.as_ref().is_none_or(|policy| policy.visible(path))
     }
 
     /// Returns whether current policy can include source below one directory.
@@ -2022,6 +2021,12 @@ mod tests {
             ),
             (
                 EventKind::Modify(ModifyKind::Any),
+                "src/Cargo.lock",
+                source_path("src/Cargo.lock")?,
+                "a visible unclassified file names itself",
+            ),
+            (
+                EventKind::Modify(ModifyKind::Any),
                 "src/generated/code.rs",
                 super::WatchImpact::None,
                 "an excluded path changes nothing the index holds",
@@ -3268,6 +3273,21 @@ mod tests {
     /// Wait between two reads of a store the lane has not stamped yet.
     const LANE_POLL: Duration = Duration::from_millis(50);
 
+    /// Waits until the supervisor takes pending work for its next rebuild.
+    async fn pending_work_taken_within_bound(validation: &IndexValidation) -> bool {
+        for _attempt in 0..LANE_ATTEMPTS_MAX {
+            let taken = {
+                let pending = validation.locked_pending();
+                !pending.covers_whole_workspace() && pending.paths().next().is_none()
+            };
+            if taken {
+                return true;
+            }
+            tokio::time::sleep(LANE_POLL).await;
+        }
+        false
+    }
+
     /// Polls `index` until it carries `revision`, which the lane's pass stamps.
     ///
     /// # Errors
@@ -3481,11 +3501,10 @@ mod tests {
             .observe_whole_workspace()
             .map_err(|error| format!("first observation must land: {error:?}"))?;
         assert_eq!(first_epoch, 1);
-        // Gives the supervisor's debounce (50ms) real wall-clock time to elapse and its
-        // rebuild to reach and queue behind the held placeholder. The held slot - not this
-        // wait - is what guarantees the rebuild cannot be accepted until released; a
-        // slower scheduler just makes this wait less generous, never wrong.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            pending_work_taken_within_bound(&validation).await,
+            "the supervisor must take epoch 1 before the test moves the epoch"
+        );
 
         // Moves the epoch again with no invalidation signal, so no second rebuild cycle is
         // ever triggered - only the already-queued rebuild for epoch 1 observes this move.

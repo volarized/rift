@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::engine_fixture::EngineFixture;
+use crate::engine_fixture::{EngineFixture, LspPlacement};
 
 /// Rustup program that selects the pinned engine toolchain.
 pub(crate) const RUSTUP_PROGRAM: &str = "rustup";
@@ -64,6 +64,7 @@ pub(crate) fn rust_engine_configuration() -> String {
 /// engine test into a machine-speed test.
 pub(crate) fn fixture() -> EngineFixture {
     EngineFixture {
+        placement: LspPlacement::Named,
         name: "rust",
         program: RUSTUP_PROGRAM,
         arguments: RUST_ANALYZER_ARGUMENTS.to_vec(),

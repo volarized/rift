@@ -14,9 +14,9 @@ use rift_protocol::change::{
     ReplaceNodeParams, ReplaceSymbolParams,
 };
 use rift_protocol::configuration::{
-    CommandHook, Duration as WireDuration, LspConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX,
-    SEARCH_POOL_SLOTS_MAX, SERVER_NUM_WORKERS_MAX, SearchConfiguration,
-    SemanticSearchConfiguration, SemanticSource, ServerConfiguration, WorkspaceConfiguration,
+    Duration as WireDuration, LspConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX, SEARCH_POOL_SLOTS_MAX,
+    SERVER_NUM_WORKERS_MAX, SearchConfiguration, SemanticSearchConfiguration, SemanticSource,
+    ServerConfiguration, WorkspaceConfiguration,
 };
 use rift_protocol::error as wire;
 use rift_protocol::lock::ProductIdentity;
@@ -33,8 +33,8 @@ use rift_search::{
     SearchIndexLimits, SemanticReadiness,
 };
 use rift_server::{
-    ChangeService, EnginePool, HookStatus, LspProcessKey, MoveResolution, ReadError, ReadFault,
-    ReadService, RemoveResolution, RenameResolution, plan_move, plan_remove_node,
+    ChangeService, EnginePool, HookSnapshot, HookStatus, LspProcessKey, MoveResolution, ReadError,
+    ReadFault, ReadService, RemoveResolution, RenameResolution, plan_move, plan_remove_node,
     plan_remove_symbol, plan_rename,
 };
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
@@ -930,13 +930,13 @@ impl RiftMcp {
     /// unchanged reuses the running sessions, and one whose tables differ
     /// replaces the pool and shuts the old engines down.
     pub async fn engine_pool(&self) -> Arc<EnginePool> {
-        let (definitions, bindings) = self
-            .published
-            .read()
-            .await
-            .current
-            .configuration
-            .lsp_runtime_configuration();
+        let published = Arc::clone(&self.published.read().await.current);
+        self.engine_pool_for(&published).await
+    }
+
+    /// The engine pool serving one captured publication's LSP configuration.
+    async fn engine_pool_for(&self, published: &PublishedWorkspace) -> Arc<EnginePool> {
+        let (definitions, bindings) = published.configuration.lsp_runtime_configuration();
         self.engines.pool_for(definitions, bindings).await
     }
 
@@ -1170,7 +1170,7 @@ impl RiftMcp {
     ) -> Result<Json<ChangeResult>, ErrorData> {
         let published = self.published_workspace(wire::ErrorPhase::Change).await?;
         published.configuration.accepted(wire::ErrorPhase::Change)?;
-        let pool = self.engine_pool().await;
+        let pool = self.engine_pool_for(&published).await;
         let resolution = plan_rename(&published.reads, &pool, &self.root, &params)
             .await
             .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
@@ -1196,7 +1196,7 @@ impl RiftMcp {
     ) -> Result<Json<ChangeResult>, ErrorData> {
         let published = self.published_workspace(wire::ErrorPhase::Change).await?;
         published.configuration.accepted(wire::ErrorPhase::Change)?;
-        let pool = self.engine_pool().await;
+        let pool = self.engine_pool_for(&published).await;
         let resolution = plan_move(&published.reads, &pool, &self.root, &params)
             .await
             .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
@@ -1225,7 +1225,7 @@ impl RiftMcp {
     ) -> Result<Json<ChangeResult>, ErrorData> {
         let published = self.published_workspace(wire::ErrorPhase::Change).await?;
         published.configuration.accepted(wire::ErrorPhase::Change)?;
-        let pool = self.engine_pool().await;
+        let pool = self.engine_pool_for(&published).await;
         let resolution = plan_remove_symbol(&published.reads, &pool, &self.root, &params)
             .await
             .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
@@ -1252,7 +1252,7 @@ impl RiftMcp {
     ) -> Result<Json<ChangeResult>, ErrorData> {
         let published = self.published_workspace(wire::ErrorPhase::Change).await?;
         published.configuration.accepted(wire::ErrorPhase::Change)?;
-        let pool = self.engine_pool().await;
+        let pool = self.engine_pool_for(&published).await;
         let resolution = plan_remove_node(&published.reads, &pool, &self.root, &params)
             .await
             .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
@@ -1594,7 +1594,7 @@ impl RiftMcp {
             if publication.previous.configuration.has_validation_hooks() {
                 self.engines.shutdown().await;
             }
-            let engines = self.engine_pool().await;
+            let engines = self.engine_pool_for(&snapshot).await;
             summary.diagnostics.extend(
                 rift_server::engine_change_set_diagnostics(
                     &engines,
@@ -1715,9 +1715,25 @@ impl RiftMcp {
             Ok(configuration) => configuration,
             Err(error) => return Ok(SerializedChange::wire(Err(error))),
         };
+        let original = if configuration.hooks.is_empty() {
+            None
+        } else {
+            let snapshot = changes.capture_hook_snapshot(&current.reads)?;
+            snapshot.require_source_text()?;
+            Some(snapshot)
+        };
         let result = operation(&current.reads, changes)?;
-        let mut result =
-            Self::apply_hook_pipeline(root, limits, &configuration, changes, &current, result)?;
+        let mut result = match original {
+            Some(original) => Self::apply_hook_pipeline(
+                root,
+                &configuration,
+                changes,
+                &current,
+                &original,
+                result,
+            )?,
+            None => result,
+        };
         let candidate = if let ChangeResult::Applied { summary } = &mut result {
             Self::rebuild_after_applied_change(
                 root,
@@ -1801,75 +1817,68 @@ impl RiftMcp {
     /// Runs transforms, restores rejected writes, then runs validations.
     fn apply_hook_pipeline(
         root: &Path,
-        limits: WorkspaceIndexLimits,
         configuration: &WorkspaceConfiguration,
         changes: &ChangeService,
         current: &PublishedWorkspace,
+        original: &HookSnapshot,
         result: ChangeResult,
     ) -> Result<ChangeResult, ReadError> {
         let ChangeResult::Applied { mut summary } = result else {
             return Ok(result);
         };
-        if configuration.hooks.is_empty() {
-            return Ok(ChangeResult::Applied { summary });
-        }
-        let selected_hooks = selected_hooks(configuration, root, &summary.paths)?;
+        let selected_hooks =
+            rift_server::selected_hooks(&configuration.hooks, root, &summary.paths)
+                .map_err(ReadFault::index)?;
         if selected_hooks.is_empty() {
             return Ok(ChangeResult::Applied { summary });
         }
-        let build_reads = || {
-            let languages = rift_core::LanguageFileSelections::from(configuration);
-            ReadService::build_with_languages(
-                root,
-                limits,
-                &SourceVisibility::from(&configuration.source),
-                &rift_core::TextFileInclusion::from(&configuration.search),
-                &languages,
-                configuration.providers.history.clone(),
-            )
-        };
-        let original = changes.hook_snapshot(&current.reads)?;
         let direct_paths: std::collections::BTreeSet<&str> =
             summary.paths.iter().map(|path| path.0.as_str()).collect();
-        let mut accepted_reads = build_reads()?;
 
         for hook in selected_hooks
             .iter()
             .copied()
             .filter(|hook| hook.writes.is_transform())
         {
-            let before = changes.hook_snapshot(&accepted_reads)?;
+            let before = changes.capture_hook_snapshot(&current.reads)?;
+            before.require_source_text()?;
             let run = rift_server::run_hook(hook, root, &summary.paths);
-            let observed_reads = build_reads()?;
-            let after = changes.hook_snapshot(&observed_reads)?;
+            let after = changes.capture_hook_snapshot(&current.reads)?;
             let hook_paths = before.changed_paths(&after);
             let in_scope = hook.writes == rift_protocol::configuration::HookWrites::Workspace
                 || hook_paths
                     .iter()
                     .all(|path| direct_paths.contains(path.0.as_str()));
             let permissions_changed = before.permissions_changed(&after);
-            if run.status == HookStatus::Passed && in_scope && !permissions_changed {
-                accepted_reads = observed_reads;
+            let unavailable_path = after.unavailable_path();
+            if run.status == HookStatus::Passed
+                && in_scope
+                && !permissions_changed
+                && unavailable_path.is_none()
+            {
                 continue;
             }
-            changes.restore_hook_snapshot(&observed_reads, &before, &after)?;
+            changes.restore_hook_snapshot(&current.reads, &before, &after)?;
             let mut reported = run;
             if reported.status == HookStatus::Passed {
-                let detail = if permissions_changed {
-                    "hook changed source permissions"
+                let detail = if let Some(path) = unavailable_path {
+                    format!("hook source unavailable: {path}")
+                } else if permissions_changed {
+                    "hook changed source permissions".to_owned()
                 } else {
-                    "hook changed source outside declared write scope"
+                    "hook changed source outside declared write scope".to_owned()
                 };
-                reported.status = HookStatus::Error(detail.to_owned());
+                reported.status = HookStatus::Error(detail);
             }
             summary
                 .diagnostics
                 .push(hook_failure_diagnostic(hook, &reported));
         }
 
-        let final_snapshot = changes.hook_snapshot(&accepted_reads)?;
+        let final_snapshot = changes.capture_hook_snapshot(&current.reads)?;
+        final_snapshot.require_source_text()?;
         let ChangeResult::Applied { mut summary } =
-            changes.finalize_hook_result(&original, &final_snapshot, summary)
+            changes.finalize_hook_result(original, &final_snapshot, summary)?
         else {
             return Ok(ChangeResult::Unchanged);
         };
@@ -1879,12 +1888,12 @@ impl RiftMcp {
             .copied()
             .filter(|hook| hook.writes.is_validation())
         {
-            let before = changes.hook_snapshot(&accepted_reads)?;
+            let before = changes.capture_hook_snapshot(&current.reads)?;
+            before.require_source_text()?;
             let run = rift_server::run_hook(hook, root, &summary.paths);
-            let observed_reads = build_reads()?;
-            let after = changes.hook_snapshot(&observed_reads)?;
+            let after = changes.capture_hook_snapshot(&current.reads)?;
             if !before.is_unchanged(&after) {
-                changes.restore_hook_snapshot(&observed_reads, &before, &after)?;
+                changes.restore_hook_snapshot(&current.reads, &before, &after)?;
                 let mut reported = run;
                 reported.status =
                     HookStatus::Error("validation hook changed source files".to_owned());
@@ -1944,8 +1953,8 @@ impl RiftMcp {
     /// Answers one `rift://workspace` read from the current publication.
     async fn read_workspace(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
         let page_index = resource::workspace_page_index(uri)?;
-        let pool = self.engine_pool().await;
         let current = Arc::clone(&self.published.read().await.current);
+        let pool = self.engine_pool_for(&current).await;
         let configuration = current
             .configuration
             .accepted
@@ -1963,9 +1972,11 @@ impl RiftMcp {
                 exclude: hook.exclude.clone(),
             })
             .collect();
-        let source = current
+        let source_digests = current
             .reads
-            .workspace_digests()
+            .visible_workspace_digests()
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        let source = source_digests
             .iter()
             .map(|(path, digest)| {
                 let language = current
@@ -2008,23 +2019,6 @@ impl RiftMcp {
     }
 }
 
-fn selected_hooks<'configuration>(
-    configuration: &'configuration WorkspaceConfiguration,
-    root: &Path,
-    paths: &[ProjectPath],
-) -> Result<Vec<&'configuration CommandHook>, ReadError> {
-    configuration
-        .hooks
-        .iter()
-        .filter_map(|hook| {
-            rift_server::hook_matches_paths(hook, root, paths)
-                .map(|selected| selected.then_some(hook))
-                .transpose()
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(ReadFault::index)
-}
-
 fn workspace_languages(
     current: &PublishedWorkspace,
     configuration: &WorkspaceConfiguration,
@@ -2038,7 +2032,9 @@ fn workspace_languages(
             let language = Language::from_identity_segment(effective.identity())
                 .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
             let input = configuration.languages.get(effective.identity());
+            let enabled = effective.enabled();
             let lsp = input
+                .filter(|_input| enabled)
                 .and_then(|input| input.lsp.as_ref())
                 .map(|lsp| match lsp {
                     rift_protocol::configuration::LanguageLspConfiguration::Named(name) => {
@@ -2057,7 +2053,7 @@ fn workspace_languages(
                 });
             Ok(WorkspaceLanguageSummary {
                 language,
-                enabled: effective.enabled(),
+                enabled,
                 include: effective
                     .include()
                     .iter()
@@ -2070,7 +2066,7 @@ fn workspace_languages(
                     .cloned()
                     .map(rift_protocol::read::PathPattern)
                     .collect(),
-                execution: input.is_some_and(|input| input.execution),
+                execution: enabled && input.is_some_and(|input| input.execution),
                 syntax: effective.has_syntax(),
                 lsp,
             })
@@ -2314,6 +2310,92 @@ mod tests {
         assert!(
             Arc::ptr_eq(&pool, &again),
             "unchanged published configuration reuses the held pool"
+        );
+        Ok(())
+    }
+
+    /// The design's headline shape - one exact language, one inline command
+    /// string, no repeated language list and no argument list - reaches an
+    /// engine for that language and for no other.
+    #[tokio::test]
+    async fn an_inline_command_string_serves_its_exact_language() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(
+            directory.path(),
+            "[languages.rust]\nlsp.command = \"rust-analyzer\"\n",
+        )?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        let pool = server.engine_pool().await;
+        let language = |name: &str, dialect: Option<&str>| rift_protocol::read::Language {
+            name: name.to_owned(),
+            dialect: dialect.map(str::to_owned),
+        };
+        assert!(
+            pool.engine_for(&language("rust", None)).is_some(),
+            "an inline command string serves its own language"
+        );
+        assert!(
+            pool.engine_for(&language("typescript", Some("tsx")))
+                .is_none(),
+            "no other exact language selects that process"
+        );
+        Ok(())
+    }
+
+    /// A language entry turned off contributes neither its inline process
+    /// definition nor a binding, so nothing can start it.
+    #[tokio::test]
+    async fn a_disabled_language_binds_no_engine() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(
+            directory.path(),
+            "[languages.rust]\nenabled = false\nlsp.command = \"rust-analyzer\"\n",
+        )?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        let pool = server.engine_pool().await;
+        assert!(
+            pool.engine_for(&rift_protocol::read::Language {
+                name: "rust".to_owned(),
+                dialect: None,
+            })
+            .is_none(),
+            "a disabled entry selects no process"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn engine_pool_for_a_capture_does_not_adopt_a_later_publication() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(
+            directory.path(),
+            "[lsp.ty]\ncommand = \"uvx\"\n[languages.python]\ninclude = [\"**/*.py\"]\nlsp = \"ty\"\n",
+        )?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        server.validation.cancellation.cancel();
+        let earlier = Arc::clone(&server.published.read().await.current);
+
+        super::hermetic_workspace(
+            directory.path(),
+            "[languages.rust.lsp]\ncommand = \"rust-analyzer\"\n",
+        )?;
+        let later = stable_candidate(directory.path(), 1)?;
+        server.published.write().await.current = Arc::clone(&later);
+
+        let earlier_pool = server.engine_pool_for(&earlier).await;
+        let (earlier_definitions, earlier_bindings) =
+            earlier.configuration.lsp_runtime_configuration();
+        assert!(earlier_pool.built_from(&earlier_definitions, &earlier_bindings));
+
+        let later_pool = server.engine_pool().await;
+        let (later_definitions, later_bindings) = later.configuration.lsp_runtime_configuration();
+        assert!(later_pool.built_from(&later_definitions, &later_bindings));
+        assert!(
+            !earlier_pool.built_from(&later_definitions, &later_bindings),
+            "captured request keeps its own LSP selection after publication moves"
         );
         Ok(())
     }
@@ -3774,6 +3856,109 @@ pub fn beacon() -> u64 {
             body["pagination"],
             serde_json::json!({ "page_index": 0, "total_pages": 1 })
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_resource_reports_named_inline_and_disabled_languages() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(directory.path().join("script.py"), "print('beacon')\n")?;
+        super::hermetic_workspace(
+            directory.path(),
+            "[lsp.shared]\ncommand = \"language-server\"\n\
+             [languages.python]\ninclude = [\"**/*.py\"]\nexecution = true\nlsp = \"shared\"\n\
+             [languages.rust.lsp]\ncommand = \"rust-analyzer\"\n\
+             [languages.toml]\nenabled = false\nexecution = true\nlsp = \"shared\"\n",
+        )?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+
+        let answer = server.read_workspace("rift://workspace").await?;
+        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = answer
+            .contents
+            .first()
+            .expect("a workspace read answers with one content")
+        else {
+            unreachable!("a workspace read answers with text");
+        };
+        let body: serde_json::Value = serde_json::from_str(text)?;
+        let languages = body["languages"]
+            .as_array()
+            .expect("workspace languages are an array");
+        let language = |name: &str| {
+            languages
+                .iter()
+                .find(|entry| entry["language"]["name"] == serde_json::json!(name))
+                .expect("configured language is reported")
+        };
+
+        let rust = language("rust");
+        assert_eq!(rust["lsp"]["process"], serde_json::json!("rust"));
+        assert_eq!(rust["lsp"]["state"], serde_json::json!("stopped"));
+        assert_eq!(
+            rust["execution"],
+            serde_json::json!(false),
+            "execution stays off until its own entry enables it"
+        );
+
+        let python = language("python");
+        assert_eq!(
+            python["execution"],
+            serde_json::json!(true),
+            "an enabled entry carries its own execution permission"
+        );
+        assert_eq!(python["syntax"], serde_json::json!(false));
+        assert_eq!(python["lsp"]["process"], serde_json::json!("shared"));
+        assert_eq!(python["lsp"]["state"], serde_json::json!("stopped"));
+
+        let toml = language("toml");
+        assert_eq!(toml["enabled"], serde_json::json!(false));
+        assert_eq!(toml["execution"], serde_json::json!(false));
+        assert!(
+            toml.get("lsp").is_none(),
+            "disabled language omits LSP state"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_resource_includes_an_unclassified_visible_file() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(directory.path().join("Cargo.lock"), "version = 4\n")?;
+        super::hermetic_workspace(directory.path(), "[languages.rust]\nenabled = false\n")?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+
+        let answer = server.read_workspace("rift://workspace").await?;
+        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = answer
+            .contents
+            .first()
+            .expect("a workspace read answers with one content")
+        else {
+            unreachable!("a workspace read answers with text");
+        };
+        let body: serde_json::Value = serde_json::from_str(text)?;
+        let lock = body["source"]
+            .as_array()
+            .and_then(|source| {
+                source
+                    .iter()
+                    .find(|unit| unit["path"] == serde_json::json!("Cargo.lock"))
+            })
+            .expect("visible Cargo.lock must join the source catalog");
+        assert!(
+            lock.get("language").is_none(),
+            "an unclassified file must omit language: {lock}"
+        );
+        let rust = body["source"]
+            .as_array()
+            .and_then(|source| {
+                source
+                    .iter()
+                    .find(|unit| unit["path"] == serde_json::json!("lib.rs"))
+            })
+            .expect("disabled Rust source must remain in the source catalog");
+        assert_eq!(rust["language"]["name"], serde_json::json!("rust"));
         Ok(())
     }
 

@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::engine_fixture::EngineFixture;
+use crate::engine_fixture::{EngineFixture, LspPlacement};
 
 /// Program the live TOML fixture places first in `command`.
 ///
@@ -50,6 +50,7 @@ pub(crate) fn toml_engine_configuration() -> String {
 /// with no warm-up loop.
 pub(crate) fn fixture() -> EngineFixture {
     EngineFixture {
+        placement: LspPlacement::Inline,
         name: "toml",
         program: TOMBI_PROGRAM,
         arguments: vec![TOMBI_LSP_ARGUMENT],

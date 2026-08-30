@@ -17,7 +17,12 @@ use std::fmt::Write as _;
 /// fixture: a live engine's own cold-start cost, not the server's
 /// absorption policy, is what the suites are proving.
 pub(crate) struct EngineFixture {
-    /// Shared top-level LSP process name.
+    /// Where the process definition is written: a shared top-level table, or
+    /// the one language entry that uses it.
+    pub(crate) placement: LspPlacement,
+    /// Shared top-level LSP process name, read under
+    /// [`LspPlacement::Named`] alone: an inline process is keyed by the
+    /// language entry that holds it.
     pub(crate) name: &'static str,
     /// The executable name, resolved through `PATH`.
     pub(crate) program: &'static str,
@@ -36,30 +41,68 @@ pub(crate) struct EngineFixture {
 /// Startup and request timeout every fixture advertises.
 const FIXTURE_TIMEOUT: &str = "2m";
 
+/// Which of the two accepted spellings a fixture writes its process in.
+///
+/// Cargo compiles each live suite as its own binary and each binary carries
+/// exactly one engine module, so the spelling that suite does not use is
+/// unconstructed there.
+#[derive(Clone, Copy)]
+#[expect(
+    dead_code,
+    reason = "each live suite constructs one placement; the other is unused in that binary"
+)]
+pub(crate) enum LspPlacement {
+    /// One `[lsp.<name>]` table every listed identity selects by name.
+    Named,
+    /// One `[languages.<identity>.lsp]` table belonging to that entry alone.
+    /// Only a fixture serving exactly one identity can use it.
+    Inline,
+}
+
 impl EngineFixture {
-    /// Language bindings and named LSP process this fixture resolves to.
+    /// Language entries and the LSP process this fixture resolves to.
     pub(crate) fn configuration_toml(&self) -> String {
-        let mut languages = String::new();
-        for language in &self.languages {
-            let table = if language.contains(':') {
-                format!("\"{language}\"")
-            } else {
-                (*language).to_owned()
-            };
-            write!(languages, "[languages.{table}]\nlsp = \"{}\"\n", self.name)
-                .expect("writing to a String cannot fail");
-        }
         let command = std::iter::once(self.program)
             .chain(self.arguments.iter().copied())
             .map(|argument| format!("\"{argument}\""))
             .collect::<Vec<_>>()
             .join(", ");
-        format!(
-            "{languages}[lsp.{name}]\ncommand = [{command}]\nstartup_timeout = \"{timeout}\"\n\
+        let bounds = format!(
+            "command = [{command}]\nstartup_timeout = \"{timeout}\"\n\
              request_timeout = \"{timeout}\"\n{extra}",
-            name = self.name,
             timeout = FIXTURE_TIMEOUT,
             extra = self.extra_toml,
-        )
+        );
+        match self.placement {
+            LspPlacement::Inline => {
+                let [identity] = self.languages.as_slice() else {
+                    panic!("an inline process belongs to exactly one language entry");
+                };
+                format!("[languages.{}.lsp]\n{bounds}", Self::table_key(identity))
+            }
+            LspPlacement::Named => {
+                let mut languages = String::new();
+                for language in &self.languages {
+                    write!(
+                        languages,
+                        "[languages.{}]\nlsp = \"{}\"\n",
+                        Self::table_key(language),
+                        self.name
+                    )
+                    .expect("writing to a String cannot fail");
+                }
+                format!("{languages}[lsp.{name}]\n{bounds}", name = self.name)
+            }
+        }
+    }
+
+    /// One exact identity spelled as a TOML table key: a dialect carries `:`,
+    /// which only a quoted key accepts.
+    fn table_key(identity: &str) -> String {
+        if identity.contains(':') {
+            format!("\"{identity}\"")
+        } else {
+            identity.to_owned()
+        }
     }
 }

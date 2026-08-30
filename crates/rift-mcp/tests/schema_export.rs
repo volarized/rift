@@ -57,17 +57,23 @@ fn configuration_schema_document_is_deterministic_and_validates_hooks() -> TestR
     assert_eq!(document["title"], "WorkspaceConfiguration");
     let hook = &document["$defs"]["CommandHook"];
     assert_eq!(hook["additionalProperties"], Value::Bool(false));
-    let required = hook["required"]
+    let required: Vec<&str> = hook["required"]
         .as_array()
-        .ok_or("hook required must be an array")?;
+        .ok_or("hook required must be an array")?
+        .iter()
+        .map(|field| {
+            field
+                .as_str()
+                .ok_or("hook required entries must be strings")
+        })
+        .collect::<Result<_, _>>()?;
     assert_eq!(
-        required.len(),
-        hook["properties"]
-            .as_object()
-            .ok_or("hook properties must be an object")?
-            .len(),
-        "every hook key is required: the schema carries no defaults"
+        required,
+        ["id", "kind", "command", "determinism"],
+        "only hook identity, kind, command, and determinism are required"
     );
+    assert_eq!(hook["properties"]["writes"]["default"], "none");
+    assert_eq!(hook["properties"]["failure_severity"]["default"], "error");
     Ok(())
 }
 

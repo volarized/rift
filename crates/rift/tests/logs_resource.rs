@@ -149,23 +149,21 @@ async fn a_component_read_returns_only_that_component() -> TestResult {
 }
 
 #[tokio::test]
-async fn an_unpublished_resource_uri_is_refused() -> TestResult {
+async fn a_resource_uri_the_server_does_not_serve_is_refused() -> TestResult {
     let _serial = SERIAL.lock().await;
     let directory = workspace()?;
     let _stop = StopOnDrop::new(directory.path());
     let client = proxy_client(directory.path()).await?;
 
     let refusal = within(
-        "an unpublished read",
-        client.read_resource(ReadResourceRequestParams::new(
-            "rift://workspace".to_owned(),
-        )),
+        "a read of an unserved URI",
+        client.read_resource(ReadResourceRequestParams::new("rift://missing".to_owned())),
     )
     .await?
-    .expect_err("an unpublished URI must be refused");
+    .expect_err("a URI the server does not serve must be refused");
 
     assert!(
-        refusal.to_string().contains("rift://workspace"),
+        refusal.to_string().contains("rift://missing"),
         "the refusal names the URI: {refusal}"
     );
     client.cancel().await?;
