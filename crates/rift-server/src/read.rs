@@ -940,7 +940,7 @@ pub(crate) fn wire_symbol(
 ) -> Result<(Symbol, Option<ReadWarning>), ReadError> {
     let readable = index.assembled_symbol(matched).map_err(ReadFault::index)?;
     let symbol = assembled_wire_symbol(&readable);
-    let disagreement = symbol_disagreement_warning(&readable);
+    let disagreement = symbol_disagreement_warning(readable.assembled());
     Ok((symbol, disagreement))
 }
 
@@ -1031,12 +1031,11 @@ fn source_location_package(location: &rift_core::SourceLocation) -> Option<Packa
 /// retained a presentation disagreement and the symbol has an established identity to
 /// name in it. An unestablished symbol already says as much through its missing `id`;
 /// the warning adds nothing there, so it stays silent.
-fn symbol_disagreement_warning(readable: &ReadableSymbol) -> Option<ReadWarning> {
-    let assembled = readable.assembled();
+fn symbol_disagreement_warning(assembled: &rift_provider::AssembledSymbol) -> Option<ReadWarning> {
     if assembled.disagreements().is_empty() {
         return None;
     }
-    let identity = readable.identity()?;
+    let identity = assembled.identity()?;
     let providers: Vec<String> = assembled
         .disagreements()
         .iter()
@@ -3462,5 +3461,145 @@ pub fn compute() -> i32 {
                 "a withdrawn projection field must fail deserialization: {case}"
             );
         }
+    }
+
+    /// One contribution for the disagreement fixtures, anchored when `identity` is given.
+    fn disagreement_contribution(
+        provider_id: &str,
+        symbol: &str,
+        name: &str,
+        identity: Option<&str>,
+        equivalent_to: Option<(&str, &str)>,
+    ) -> rift_core::Contribution {
+        let facts = rift_core::PortableSymbolFacts::new(
+            rift_core::Language {
+                name: "rust".to_owned(),
+                dialect: None,
+            },
+            name,
+            format!("crate::{name}"),
+            rift_core::ExactKind("function".to_owned()),
+        );
+        let mut builder = rift_core::Contribution::builder(
+            rift_core::ContributionKey::new(
+                rift_core::ProviderId::new(provider_id).expect("provider"),
+                rift_core::ProviderRevision::new(1).expect("revision"),
+                rift_core::ProviderSymbolId::new(symbol).expect("provider symbol"),
+            ),
+            rift_core::SourceApplicability::Independent,
+            facts,
+            rift_core::ContributionOrigin::new(
+                Some(rift_core::SourceLocation::Project { package: None }),
+                rift_core::SourceKind::Authored,
+            )
+            .expect("origin"),
+        );
+        if let Some(identity) = identity {
+            builder = builder
+                .source(rift_core::DeclarationBinding::new(
+                    rift_core::SourceUnitId::parse("rift://source/rift.sources.project/src/lib.rs")
+                        .expect("source unit"),
+                    rift_core::SourceRange::new(0, 8).expect("range"),
+                    None,
+                ))
+                .identity_anchor(rift_core::SymbolId::new(identity).expect("identity"));
+        }
+        if let Some((provider_id, symbol)) = equivalent_to {
+            builder = builder.equivalence(vec![rift_core::EquivalenceEvidence::Explicit(
+                rift_core::ContributionReference::new(
+                    rift_core::ProviderId::new(provider_id).expect("provider"),
+                    rift_core::ProviderSymbolId::new(symbol).expect("provider symbol"),
+                ),
+            )]);
+        }
+        builder.build().expect("contribution")
+    }
+
+    /// Normalizes one two-provider graph whose contributions disagree on the name.
+    fn disagreeing_assembly(identity: Option<&str>) -> rift_provider::AssembledSymbol {
+        let limits = rift_provider::PublicationLimits::default();
+        let syntax = rift_provider::ProviderPublication::new(
+            rift_core::ProviderId::new("syntax").expect("provider"),
+            rift_core::ProviderRevision::new(1).expect("revision"),
+            vec![disagreement_contribution(
+                "syntax",
+                "syntax-beacon",
+                "Beacon",
+                identity,
+                None,
+            )],
+            limits,
+        )
+        .expect("syntax publication");
+        let binding = rift_provider::ProviderPublication::new(
+            rift_core::ProviderId::new("binding").expect("provider"),
+            rift_core::ProviderRevision::new(1).expect("revision"),
+            vec![disagreement_contribution(
+                "binding",
+                "binding-beacon",
+                "beacon",
+                None,
+                Some(("syntax", "syntax-beacon")),
+            )],
+            limits,
+        )
+        .expect("binding publication");
+        let set = rift_provider::PublicationSet::empty(limits)
+            .replaced(syntax)
+            .and_then(|set| set.replaced(binding))
+            .expect("publications");
+        let graph = rift_provider::Normalizer::normalize(
+            rift_core::IndexRevision::new(1).expect("index"),
+            rift_core::SourceRevision::new(1).expect("source"),
+            rift_core::TreeRevision::new(1).expect("tree"),
+            &std::sync::Arc::new(set),
+            None,
+        )
+        .expect("graph");
+        let record = graph
+            .records()
+            .iter()
+            .find(|record| record.contributions().len() == 2)
+            .expect("merged record")
+            .clone();
+        rift_provider::SymbolAssembler::assemble(
+            &graph,
+            &record,
+            &[rift_core::ProviderId::new("syntax").expect("provider")],
+        )
+        .expect("assembled symbol")
+    }
+
+    #[test]
+    fn a_retained_disagreement_becomes_one_symbol_disagreement_warning() {
+        let assembled = disagreeing_assembly(Some("symbol:beacon"));
+        assert!(
+            !assembled.disagreements().is_empty(),
+            "the two-provider fixture must disagree on the name"
+        );
+        let warning = super::symbol_disagreement_warning(&assembled)
+            .expect("an established disagreeing symbol warns");
+        let ReadWarning::SymbolDisagreement {
+            symbol,
+            providers,
+            detail,
+        } = warning
+        else {
+            panic!("the warning must carry the symbol_disagreement code");
+        };
+        assert_eq!(symbol.0, "symbol:beacon");
+        assert_eq!(
+            providers,
+            ["binding"],
+            "the warning names the providers whose presentation lost the selection"
+        );
+        assert!(detail.contains("binding"), "{detail}");
+    }
+
+    #[test]
+    fn a_disagreement_without_an_established_identity_stays_silent() {
+        let assembled = disagreeing_assembly(None);
+        assert!(!assembled.disagreements().is_empty());
+        assert_eq!(super::symbol_disagreement_warning(&assembled), None);
     }
 }
