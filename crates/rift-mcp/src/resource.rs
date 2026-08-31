@@ -55,9 +55,9 @@ pub(crate) fn declared_resources() -> Vec<Resource> {
         Resource::new(MAP_URI, "map")
             .with_title("Workspace map")
             .with_description(
-                "Workspace orientation snapshot - language totals, the directory tree, the \
-                 most-referenced symbols, entry points, and docs - computed once when the \
-                 index publishes and served from cache until the next one.",
+                "Workspace orientation snapshot, computed once per index publication and \
+                 served from cache. Carries language totals, the module tree, the \
+                 most-referenced symbols, entry points, and documentation paths.",
             )
             .with_mime_type(RESOURCE_MEDIA_TYPE),
     ]

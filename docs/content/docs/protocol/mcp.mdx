@@ -295,8 +295,8 @@ alone. A page past the end returns an empty `source` list with the true page cou
 <VersionBadge version="v0.0.29" />
 
 `rift://map` reads a workspace orientation snapshot: a starting picture for an agent new to the
-codebase, computed once when the index publishes and served from cache after that - a read
-costs a lookup, never a rebuild. The answer carries:
+codebase, computed once when the index publishes and served from cache after that, so a read
+costs a lookup. The answer carries:
 
 - `revision` - an eight-character [`Digest`](/docs/protocol/reference#Digest) of the indexed
   tree the map was computed from
@@ -336,8 +336,7 @@ a workspace with no such facts.
         {
           "path": "crates/rift-server",
           "files": 16,
-          "symbols": 418,
-          "children": []
+          "symbols": 418
         }
       ]
     }

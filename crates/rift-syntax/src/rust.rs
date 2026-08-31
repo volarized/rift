@@ -540,6 +540,7 @@ fn declaration_facets(kind: RustSymbolKind, visibility: &RustVisibility) -> Vec<
 struct RustEnclosureKinds {
     module: u16,
     implementation: u16,
+    trait_definition: u16,
     function: u16,
 }
 
@@ -556,6 +557,7 @@ impl RustEnclosureKinds {
     fn resolve(language: &tree_sitter::Language) -> Self {
         let mod_item = language.id_for_node_kind(RustGrammarNodeKind::ModItem.as_str(), true);
         let impl_item = language.id_for_node_kind(RustGrammarNodeKind::ImplItem.as_str(), true);
+        let trait_item = language.id_for_node_kind(RustGrammarNodeKind::TraitItem.as_str(), true);
         let function_item =
             language.id_for_node_kind(RustGrammarNodeKind::FunctionItem.as_str(), true);
         assert!(
@@ -567,12 +569,17 @@ impl RustEnclosureKinds {
             "pinned Rust grammar must define node kind: kind=impl_item"
         );
         assert!(
+            trait_item != 0,
+            "pinned Rust grammar must define node kind: kind=trait_item"
+        );
+        assert!(
             function_item != 0,
             "pinned Rust grammar must define node kind: kind=function_item"
         );
         Self {
             module: mod_item,
             implementation: impl_item,
+            trait_definition: trait_item,
             function: function_item,
         }
     }
@@ -585,14 +592,19 @@ fn rust_enclosure_kinds() -> &'static RustEnclosureKinds {
 }
 
 /// Reports whether `node` is a direct child of the source file's root scope:
-/// no ancestor is a `mod_item`, `impl_item`, or `function_item`. Bounded by
-/// the parsed tree's depth, which [`SyntaxLimits`] caps during extraction.
+/// no ancestor is a `mod_item`, `impl_item`, `trait_item`, or
+/// `function_item`. Bounded by the parsed tree's depth, which
+/// [`SyntaxLimits`] caps during extraction.
 fn is_file_scope(node: Node<'_>) -> bool {
     let kinds = rust_enclosure_kinds();
     let mut ancestor = node.parent();
     while let Some(current) = ancestor {
         let kind_id = current.kind_id();
-        if kind_id == kinds.module || kind_id == kinds.implementation || kind_id == kinds.function {
+        if kind_id == kinds.module
+            || kind_id == kinds.implementation
+            || kind_id == kinds.trait_definition
+            || kind_id == kinds.function
+        {
             return false;
         }
         ancestor = current.parent();
@@ -602,7 +614,7 @@ fn is_file_scope(node: Node<'_>) -> bool {
 
 /// Reports whether `node` is a file-scope `fn main` - the binary
 /// entrypoint - so [`SymbolFacet::Entrypoint`] applies. A `main` nested in
-/// a `mod`, an `impl`, or another `fn` never qualifies.
+/// a `mod`, an `impl`, a `trait`, or another `fn` never qualifies.
 fn is_entrypoint(node: Node<'_>, kind: RustSymbolKind, name: &str) -> bool {
     kind == RustSymbolKind::Function && name == "main" && is_file_scope(node)
 }
@@ -1227,6 +1239,17 @@ mod tests {
             .iter()
             .find(|symbol| symbol.name == "main");
         let main = main.expect("fixture declares a method named main");
+        assert!(!main.facets.contains(&SymbolFacet::Entrypoint));
+    }
+
+    #[test]
+    fn test_a_trait_default_main_does_not_carry_the_entrypoint_facet() {
+        let document = analyze("trait Runs {\n    fn main() {}\n}\n");
+        let main = document
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == "main");
+        let main = main.expect("fixture declares a trait default method named main");
         assert!(!main.facets.contains(&SymbolFacet::Entrypoint));
     }
 }

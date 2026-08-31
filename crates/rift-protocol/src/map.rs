@@ -8,7 +8,7 @@ use crate::read::{Digest, ExactKind, Language, Pagination, ProjectPath, SymbolId
 use crate::schema;
 
 /// Directory depth a [`MapModule`] tree carries, at most. A directory deeper than this folds
-/// into its depth-3 ancestor's counts and lists no [`MapModule::children`] of its own.
+/// into its deepest listed ancestor's counts and lists no [`MapModule::children`] of its own.
 pub const MAP_MODULE_DEPTH_MAX: usize = 3;
 /// [`WorkspaceMap::hubs`] entries one map carries, at most.
 pub const MAP_HUBS_MAX: usize = 20;
@@ -17,10 +17,10 @@ pub const MAP_ENTRY_POINTS_MAX: usize = 50;
 /// [`WorkspaceMap::docs`] entries one map carries, at most.
 pub const MAP_DOCS_MAX: usize = 100;
 
-/// Workspace orientation snapshot served by `rift://map`: per-language totals, the directory
-/// tree indexed files sit under, the most-referenced symbols, where execution starts, and
-/// where documentation lives. Computed once when the index publishes and served from cache
-/// until the next publication.
+/// Workspace orientation snapshot served by `rift://map`. Carries per-language totals, the
+/// directory tree indexed files sit under, the most-referenced symbols, entry points, and
+/// documentation paths. Computed once when the index publishes and served from cache until
+/// the next publication.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::declare_workspace_map_empty_defaults)]
@@ -33,17 +33,16 @@ pub struct WorkspaceMap {
     pub languages: Vec<MapLanguage>,
     /// Workspace directories holding indexed files, in path order, each carrying counts
     /// inclusive of its descendants. A directory deeper than [`MAP_MODULE_DEPTH_MAX`] folds
-    /// into its depth-3 ancestor. Absent when empty.
+    /// into its deepest listed ancestor. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 1_000))]
     pub modules: Vec<MapModule>,
-    /// The most-referenced symbols in the workspace, ranked by reference count descending,
-    /// ties broken by symbol identity. Absent when empty.
+    /// The most-referenced symbols, ranked by reference count descending with identity
+    /// breaking ties. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 20))]
     pub hubs: Vec<MapHub>,
-    /// Symbols carrying the `entrypoint` facet, in path then identity order. Absent when
-    /// empty.
+    /// Symbols carrying the `entrypoint` facet, in identity order. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 50))]
     pub entry_points: Vec<SymbolId>,
@@ -141,7 +140,7 @@ mod tests {
                 references: 87,
             }],
             entry_points: vec![SymbolId(
-                "rift://symbol/rust/crates/rift-cli/src/main.rs/main".to_owned(),
+                "rift://symbol/rust/crates/rift/src/main.rs/main".to_owned(),
             )],
             docs: vec![ProjectPath("README.md".to_owned())],
             pagination: Pagination {
@@ -170,7 +169,7 @@ mod tests {
         assert_eq!(value["hubs"][0]["kind"], json!("struct"));
         assert_eq!(
             value["entry_points"][0],
-            json!("rift://symbol/rust/crates/rift-cli/src/main.rs/main")
+            json!("rift://symbol/rust/crates/rift/src/main.rs/main")
         );
         assert_eq!(value["docs"][0], json!("README.md"));
         assert_eq!(value["pagination"]["total_pages"], json!(1));
