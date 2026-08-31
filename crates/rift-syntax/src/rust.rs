@@ -8,6 +8,8 @@ mod layout;
 
 pub use layout::RustCrateLayout;
 
+use std::sync::OnceLock;
+
 use rift_binding::ModuleLayout;
 use rift_core::Error;
 use rift_protocol::read::{Language, NodeFacet, SymbolFacet};
@@ -454,10 +456,14 @@ impl GrammarRules for RustGrammarRules {
             return Ok(None);
         };
         let visibility = declaration_visibility(node, text);
+        let mut facets = declaration_facets(kind, &visibility);
+        if is_entrypoint(node, kind, &name) {
+            facets.push(SymbolFacet::Entrypoint);
+        }
         Ok(Some(Declaration {
             name,
             kind: kind.word(),
-            facets: declaration_facets(kind, &visibility),
+            facets,
             visibility: Some(visibility.authored()),
             body_range: body_range(node, kind)?,
             documentation: attachment::attached_documentation(node, text),
@@ -526,6 +532,79 @@ fn declaration_facets(kind: RustSymbolKind, visibility: &RustVisibility) -> Vec<
         facets.push(SymbolFacet::Public);
     }
     facets
+}
+
+/// Numeric grammar ids for the ancestor kinds [`is_file_scope`] checks,
+/// resolved once from the pinned Tree-sitter Rust language so each
+/// classification compares integers instead of node-kind strings.
+struct RustEnclosureKinds {
+    module: u16,
+    implementation: u16,
+    function: u16,
+}
+
+impl RustEnclosureKinds {
+    /// Resolves every kind id this module reads from `language`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the pinned grammar has no node kind by one of the named
+    /// spellings: `id_for_node_kind` returning `0` means the grammar the
+    /// runtime loaded no longer defines a kind this module depends on, a
+    /// programmer/grammar-version error rather than a reachable runtime
+    /// state.
+    fn resolve(language: &tree_sitter::Language) -> Self {
+        let mod_item = language.id_for_node_kind(RustGrammarNodeKind::ModItem.as_str(), true);
+        let impl_item = language.id_for_node_kind(RustGrammarNodeKind::ImplItem.as_str(), true);
+        let function_item =
+            language.id_for_node_kind(RustGrammarNodeKind::FunctionItem.as_str(), true);
+        assert!(
+            mod_item != 0,
+            "pinned Rust grammar must define node kind: kind=mod_item"
+        );
+        assert!(
+            impl_item != 0,
+            "pinned Rust grammar must define node kind: kind=impl_item"
+        );
+        assert!(
+            function_item != 0,
+            "pinned Rust grammar must define node kind: kind=function_item"
+        );
+        Self {
+            module: mod_item,
+            implementation: impl_item,
+            function: function_item,
+        }
+    }
+}
+
+/// Returns the process-wide resolved [`RustEnclosureKinds`], computing it once.
+fn rust_enclosure_kinds() -> &'static RustEnclosureKinds {
+    static KINDS: OnceLock<RustEnclosureKinds> = OnceLock::new();
+    KINDS.get_or_init(|| RustEnclosureKinds::resolve(&rust_grammar()))
+}
+
+/// Reports whether `node` is a direct child of the source file's root scope:
+/// no ancestor is a `mod_item`, `impl_item`, or `function_item`. Bounded by
+/// the parsed tree's depth, which [`SyntaxLimits`] caps during extraction.
+fn is_file_scope(node: Node<'_>) -> bool {
+    let kinds = rust_enclosure_kinds();
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        let kind_id = current.kind_id();
+        if kind_id == kinds.module || kind_id == kinds.implementation || kind_id == kinds.function {
+            return false;
+        }
+        ancestor = current.parent();
+    }
+    true
+}
+
+/// Reports whether `node` is a file-scope `fn main` - the binary
+/// entrypoint - so [`SymbolFacet::Entrypoint`] applies. A `main` nested in
+/// a `mod`, an `impl`, or another `fn` never qualifies.
+fn is_entrypoint(node: Node<'_>, kind: RustSymbolKind, name: &str) -> bool {
+    kind == RustSymbolKind::Function && name == "main" && is_file_scope(node)
 }
 
 /// The implementation part of one declaration: its grammar `body` or `value`
@@ -1119,5 +1198,35 @@ mod tests {
             zero.context(),
             vec![ErrorContext::new("bound", "source_bytes_max")]
         );
+    }
+
+    #[test]
+    fn test_file_scope_main_carries_the_entrypoint_facet() {
+        let document = analyze("fn main() {}\n");
+        let main = &document.symbols()[0];
+        assert_eq!(main.name, "main");
+        assert!(main.facets.contains(&SymbolFacet::Entrypoint));
+    }
+
+    #[test]
+    fn test_main_nested_in_a_module_does_not_carry_the_entrypoint_facet() {
+        let document = analyze("mod tests {\n    fn main() {}\n}\n");
+        let main = document
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == "main");
+        let main = main.expect("fixture declares a nested main");
+        assert!(!main.facets.contains(&SymbolFacet::Entrypoint));
+    }
+
+    #[test]
+    fn test_a_method_named_main_does_not_carry_the_entrypoint_facet() {
+        let document = analyze("struct S;\nimpl S {\n    fn main(&self) {}\n}\n");
+        let main = document
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == "main");
+        let main = main.expect("fixture declares a method named main");
+        assert!(!main.facets.contains(&SymbolFacet::Entrypoint));
     }
 }
