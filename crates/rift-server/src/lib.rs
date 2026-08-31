@@ -15,6 +15,7 @@ mod remove;
 mod rename;
 mod rewrite;
 mod search;
+mod traversal;
 
 pub use change::{ChangeService, HookSnapshot};
 pub use configuration::{
