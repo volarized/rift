@@ -157,7 +157,7 @@ pub struct File {
     pub languages: Vec<Language>,
     /// Byte ranges parsed with each language grammar. Entries sort by start, end, language
     /// name, and dialect with null first. Regions may overlap when two grammars parse the
-    /// same bytes, absent when empty.
+    /// same bytes. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub regions: Vec<LanguageRegion>,
     /// Whether Rift produced facts from this file. False where there is nothing to read,

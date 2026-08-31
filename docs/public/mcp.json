@@ -12110,7 +12110,7 @@
               },
               "regions": {
                 "default": [],
-                "description": "Byte ranges parsed with each language grammar. Entries sort by start, end, language\nname, and dialect with null first. Regions may overlap when two grammars parse the\nsame bytes, absent when empty.",
+                "description": "Byte ranges parsed with each language grammar. Entries sort by start, end, language\nname, and dialect with null first. Regions may overlap when two grammars parse the\nsame bytes. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/LanguageRegion"
                 },
