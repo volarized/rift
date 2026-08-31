@@ -133,7 +133,7 @@ impl SyntaxPublicationBuilder {
                 document.language().clone(),
                 symbol.name.clone(),
                 symbol.qualified_name.clone(),
-                ExactKind(format!("{}.{}", document.language().name, symbol.kind)),
+                ExactKind(symbol.kind.to_owned()),
             )
             .facets(symbol.facets.clone())
             .signatures(symbol.signatures.clone())

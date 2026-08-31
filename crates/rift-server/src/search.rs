@@ -13,15 +13,15 @@ use rift_index::{
     SymbolMatch, SymbolMatchRank, TextSourceFile, WorkspaceIndex,
 };
 use rift_protocol::read::{
-    File, FileContent, MatchedField, PathPattern, PathSelector, ResultOrder, SearchHit,
-    SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget, SearchResult, SymbolId,
+    MatchedField, PathPattern, PathSelector, ResultOrder, SearchHit, SearchHitTarget,
+    SearchInclude, SearchParams, SearchParamsTarget, SearchResult, SymbolId,
 };
 use rift_search::{Declaration, DescribedUnit, RankedUnit};
 use rift_syntax::{ByteRange, SyntaxSymbol};
 
 use crate::read::{
-    ReadError, ReadFault, ReadService, accepted_limit, excerpt, file_id, page, project_path,
-    source_span, validate_common, wire_symbol,
+    ReadError, ReadFault, ReadService, accepted_limit, excerpt, page, project_path, text_range,
+    validate_common, wire_symbol,
 };
 
 impl ReadService {
@@ -414,8 +414,8 @@ fn build_symbol_hit(
         matched_by,
         source: payloads
             .source
-            .then(|| excerpt(matched.file, matched.symbol.range).text),
-        span: Some(source_span(matched.file.path(), matched.symbol.range)),
+            .then(|| excerpt(matched.file, matched.symbol.range)),
+        range: Some(text_range(matched.symbol.range)),
         line: Some(line::line_number_at(
             matched.file.source(),
             matched.symbol.range.start,
@@ -438,21 +438,13 @@ fn file_search_hit(
     let range = ByteRange { start, end };
     SearchHit {
         hit: SearchHitTarget::File {
-            file: File {
-                id: file_id(file.path()),
-                content: FileContent::Regular {
-                    size: u64::try_from(file.source().len()).unwrap_or(u64::MAX),
-                    executable: file.executable(),
-                },
-                languages: vec![file.syntax().language().clone()],
-                regions: Vec::new(),
-                semantic: true,
-            },
+            size: u64::try_from(file.source().len()).unwrap_or(u64::MAX),
+            languages: vec![file.syntax().language().clone()],
         },
         score: 1.0,
         matched_by: vec![MatchedField::Content],
         source: payloads.source.then_some(text),
-        span: Some(source_span(file.path(), range)),
+        range: Some(text_range(range)),
         line: Some(u64::try_from(line_index).unwrap_or(u64::MAX)),
         path: Some(project_path(file.path())),
         traversal_path: None,
@@ -460,17 +452,12 @@ fn file_search_hit(
     }
 }
 
-/// Builds one baseline content file wire value.
-fn text_file_wire(file: &TextSourceFile) -> File {
-    File {
-        id: file_id(file.path()),
-        content: FileContent::Regular {
-            size: u64::try_from(file.content().len()).unwrap_or(u64::MAX),
-            executable: file.executable(),
-        },
+/// Builds one baseline content file hit's target: a `[search.text]` file carries no
+/// language claim, unlike a syntax-indexed file's own.
+fn text_file_hit_target(file: &TextSourceFile) -> SearchHitTarget {
+    SearchHitTarget::File {
+        size: u64::try_from(file.content().len()).unwrap_or(u64::MAX),
         languages: Vec::new(),
-        regions: Vec::new(),
-        semantic: false,
     }
 }
 
@@ -486,13 +473,11 @@ fn text_search_hit(
     let end = start.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
     let range = ByteRange { start, end };
     SearchHit {
-        hit: SearchHitTarget::File {
-            file: text_file_wire(file),
-        },
+        hit: text_file_hit_target(file),
         score: 1.0,
         matched_by: vec![MatchedField::Content],
         source: payloads.source.then_some(text),
-        span: Some(source_span(file.path(), range)),
+        range: Some(text_range(range)),
         line: Some(u64::try_from(line_index).unwrap_or(u64::MAX)),
         path: Some(project_path(file.path())),
         traversal_path: None,
@@ -714,13 +699,11 @@ fn ranked_file_hit(
     payloads: HitPayloads,
 ) -> SearchHit {
     SearchHit {
-        hit: SearchHitTarget::File {
-            file: text_file_wire(file),
-        },
+        hit: text_file_hit_target(file),
         score,
         matched_by: vec![MatchedField::Ranked],
         source: payloads.source.then_some(text),
-        span: Some(source_span(file.path(), range)),
+        range: Some(text_range(range)),
         line: Some(line_number),
         path: Some(project_path(file.path())),
         traversal_path: None,
@@ -758,8 +741,8 @@ fn hit_identity(hit: &SearchHit) -> &str {
             .id
             .as_ref()
             .map_or(symbol.name.as_str(), |identity| identity.0.as_str()),
-        SearchHitTarget::File { file } => file.id.0.as_str(),
-        SearchHitTarget::Node { node } => node.id.0.as_str(),
+        SearchHitTarget::File { .. } => hit.path.as_ref().map_or("", |path| path.0.as_str()),
+        SearchHitTarget::Node { node } => node.0.as_str(),
     }
 }
 
@@ -773,15 +756,14 @@ mod tests {
     use rift_index::{LexicalIndexLimits, LexicalUnitKind, WorkspaceIndexLimits};
     use rift_protocol::configuration::HistoryConfiguration;
     use rift_protocol::read::{
-        ExactKind, Extensions, FileContent, FileId, MatchedField, Node, NodeId, ResultOrder,
-        SearchParams, SearchParamsTarget, TextRange,
+        MatchedField, NodeId, ResultOrder, SearchParams, SearchParamsTarget,
     };
     use rift_search::{RankedUnit, SearchIndex, SearchIndexLimits};
     use serde_json::json;
     use tempfile::TempDir;
 
     use super::{
-        ByteRange, File, ReadFault, ReadService, SearchHit, SearchHitTarget, SymbolMatchRank,
+        ByteRange, ReadFault, ReadService, SearchHit, SearchHitTarget, SymbolMatchRank,
         symbol_match_score,
     };
 
@@ -937,8 +919,8 @@ pub fn compute() -> i32 {
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert!(!results.is_empty());
         let symbol = &results[0]["hit"]["symbol"];
-        assert_eq!(symbol["language"], json!({ "name": "typescript" }));
-        assert_eq!(symbol["kind"], json!("typescript.interface"));
+        assert_eq!(symbol["language"], json!("typescript"));
+        assert_eq!(symbol["kind"], json!("interface"));
         assert_eq!(
             symbol["id"],
             json!("rift://symbol/typescript/routes.ts/Route")
@@ -969,8 +951,8 @@ pub fn compute() -> i32 {
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert!(!results.is_empty());
         let symbol = &results[0]["hit"]["symbol"];
-        assert_eq!(symbol["language"], json!({ "name": "markdown" }));
-        assert_eq!(symbol["kind"], json!("markdown.heading"));
+        assert_eq!(symbol["language"], json!("markdown"));
+        assert_eq!(symbol["kind"], json!("heading"));
         assert_eq!(
             symbol["id"],
             json!("rift://symbol/markdown/notes.md/Beacon%20Notes")
@@ -998,13 +980,13 @@ pub fn compute() -> i32 {
             (
                 "beacon port",
                 "json",
-                "json.member",
+                "member",
                 "rift://symbol/json/config.json/beacon%20port",
             ),
             (
                 "beacon retries",
                 "yaml",
-                "yaml.mapping_entry",
+                "mapping_entry",
                 "rift://symbol/yaml/deploy.yaml/beacon%20retries",
             ),
         ];
@@ -1019,7 +1001,7 @@ pub fn compute() -> i32 {
             let results = value["results"].as_array().ok_or("results must be array")?;
             assert!(!results.is_empty(), "{query} must return a hit");
             let symbol = &results[0]["hit"]["symbol"];
-            assert_eq!(symbol["language"], json!({ "name": language }));
+            assert_eq!(symbol["language"], json!(language));
             assert_eq!(symbol["kind"], json!(kind));
             assert_eq!(symbol["id"], json!(id));
         }
@@ -1039,28 +1021,30 @@ pub fn compute() -> i32 {
         assert_eq!(results.len(), 4);
         // The pool holds five candidates, all but one tied at score 1.0: two matching source
         // lines in `src/lib.rs`, the text-lane `README.txt`'s one matching content line, and
-        // the struct symbol. The identity tie-break sorts `rift://file/README.txt` ahead of
-        // `rift://file/src/lib.rs` ahead of `rift://symbol/...`, so the text-lane hit leads
-        // and the struct symbol lands fourth; the `signal` method's substring match on the
-        // qualified name `Beacon::signal` scores lower and lands on the next page.
+        // the struct symbol. A file hit's own identity is its plain `path`; a symbol hit's is
+        // its `rift://symbol/...` id. The tie-break sorts `README.txt` first (`R` < `r`), the
+        // `Beacon` struct symbol second (`rift://symbol/...` < `src/lib.rs`), then the two
+        // `src/lib.rs` file hits, in the order they were matched; the `signal` method's
+        // substring match on the qualified name `Beacon::signal` scores lower and lands on
+        // the next page.
         assert_eq!(
             value["pagination"],
             json!({ "page_index": 0, "total_pages": 2 })
         );
         assert_eq!(results[0]["hit"]["target"], "file");
         assert_eq!(results[0]["path"], json!("README.txt"));
-        assert_eq!(results[0]["hit"]["file"]["semantic"], json!(false));
-        assert_eq!(results[1]["hit"]["target"], "file");
+        assert_eq!(results[1]["hit"]["target"], "symbol");
         assert_eq!(results[1]["path"], json!("src/lib.rs"));
         assert_eq!(results[2]["hit"]["target"], "file");
         assert_eq!(results[2]["path"], json!("src/lib.rs"));
-        assert_eq!(results[3]["hit"]["target"], "symbol");
+        assert_eq!(results[3]["hit"]["target"], "file");
+        assert_eq!(results[3]["path"], json!("src/lib.rs"));
         assert!(
-            results[3]["path"]
+            results[1]["path"]
                 .as_str()
                 .is_some_and(|path| !path.is_empty()),
             "every hit must carry a non-empty project-relative path: {:#?}",
-            results[3]
+            results[1]
         );
         Ok(())
     }
@@ -1093,7 +1077,6 @@ pub fn compute() -> i32 {
             "baseline catalog fills results_max with one candidate: \
              {results:#?}"
         );
-        assert_eq!(results[0]["hit"]["file"]["semantic"], json!(false));
         assert_eq!(results[0]["path"], json!("README.txt"));
         Ok(())
     }
@@ -1168,7 +1151,7 @@ pub fn compute() -> i32 {
     }
 
     /// The excerpt used to duplicate the hit's own `span` inside `source`; it now carries
-    /// text only, and the span a caller needs is the one already on the hit.
+    /// text only, and the range a caller needs is the one already on the hit.
     #[test]
     fn search_hit_source_excerpt_is_text_only_with_no_duplicate_span() -> TestResult {
         let (_directory, service) = fixture()?;
@@ -1185,12 +1168,12 @@ pub fn compute() -> i32 {
             "excerpt must serialize as a bare string, not an object carrying a span: {hit}"
         );
         assert_eq!(hit["source"], json!("pub struct Beacon;"));
-        assert_eq!(hit["span"]["range"]["start"], 0);
+        assert_eq!(hit["range"]["start"], 0);
         Ok(())
     }
 
     /// An omitted `include` never pays the `source` lookup: every hit still carries its
-    /// symbol or file, `path`, `span`, and `line`, and none carries `source`.
+    /// symbol or file, `path`, `range`, and `line`, and none carries `source`.
     #[test]
     fn search_without_include_omits_source_but_keeps_symbol_path_span_and_line() -> TestResult {
         let (_directory, service) = fixture()?;
@@ -1205,10 +1188,10 @@ pub fn compute() -> i32 {
         );
         assert!(
             results.iter().all(|hit| !hit["path"].is_null()
-                && !hit["span"].is_null()
+                && !hit["range"].is_null()
                 && !hit["line"].is_null()
                 && !hit["hit"].is_null()),
-            "an omitted include must still carry the hit's symbol or file, path, span, and \
+            "an omitted include must still carry the hit's symbol or file, path, range, and \
              line: {results:#?}"
         );
         Ok(())
@@ -1354,21 +1337,21 @@ pub fn compute() -> i32 {
         let results = value["results"].as_array().ok_or("results must be array")?;
         let readme = results
             .iter()
-            .find(|hit| hit["hit"]["file"]["id"] == json!("rift://file/README.md"))
+            .find(|hit| hit["path"] == json!("README.md"))
             .ok_or("the provider-claimed file must return a hit")?;
         assert_eq!(
-            readme["hit"]["file"]["semantic"],
-            json!(true),
-            "a provider-claimed file carries semantic true: {readme:#?}"
+            readme["hit"]["languages"],
+            json!(["markdown"]),
+            "a provider-claimed file carries the language that claimed it: {readme:#?}"
         );
         let mdx = results
             .iter()
-            .find(|hit| hit["hit"]["file"]["id"] == json!("rift://file/guide.mdx"))
+            .find(|hit| hit["path"] == json!("guide.mdx"))
             .ok_or("the text-lane file must return a hit through the lexical lane")?;
         assert_eq!(
-            mdx["hit"]["file"]["semantic"],
-            json!(false),
-            "a text-lane file no provider claims carries semantic false: {mdx:#?}"
+            mdx["hit"]["languages"],
+            serde_json::Value::Null,
+            "a text-lane file no provider claims carries no language: {mdx:#?}"
         );
         Ok(())
     }
@@ -1401,11 +1384,12 @@ pub fn compute() -> i32 {
             1,
             "only the justfile holds this content: {results:#?}"
         );
+        assert_eq!(results[0]["path"], json!("justfile"));
         assert_eq!(
-            results[0]["hit"]["file"]["id"],
-            json!("rift://file/justfile")
+            results[0]["hit"]["languages"],
+            serde_json::Value::Null,
+            "a baseline [search.text] file claims no language"
         );
-        assert_eq!(results[0]["hit"]["file"]["semantic"], json!(false));
         Ok(())
     }
 
@@ -1413,15 +1397,15 @@ pub fn compute() -> i32 {
     fn search_resolves_every_rust_symbol_kind_and_visibility() -> TestResult {
         let (_directory, service) = rich_fixture()?;
         let cases = [
-            ("Level", "rust.enum", None),
-            ("Speaks", "rust.trait", None),
-            ("Alias", "rust.type_alias", None),
-            ("MAX", "rust.constant", None),
-            ("NAME", "rust.static", None),
-            ("inner", "rust.module", None),
-            ("noop", "rust.macro", None),
-            ("Hidden", "rust.struct", Some("private")),
-            ("scoped", "rust.function", Some("pub(crate)")),
+            ("Level", "enum", None),
+            ("Speaks", "trait", None),
+            ("Alias", "type_alias", None),
+            ("MAX", "constant", None),
+            ("NAME", "static", None),
+            ("inner", "module", None),
+            ("noop", "macro", None),
+            ("Hidden", "struct", Some("private")),
+            ("scoped", "function", Some("pub(crate)")),
         ];
         for (name, kind, visibility) in cases {
             let params: SearchParams = serde_json::from_value(json!({
@@ -1501,7 +1485,7 @@ pub fn compute() -> i32 {
         assert!(results.iter().all(|hit| {
             hit["hit"]["symbol"]["id"]
                 .as_str()
-                .or_else(|| hit["hit"]["file"]["id"].as_str())
+                .or_else(|| hit["path"].as_str())
                 .is_some_and(|id| id.contains("other.rs"))
         }));
         Ok(())
@@ -1595,11 +1579,7 @@ pub fn compute() -> i32 {
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert!(!results.is_empty());
         assert!(results.iter().all(|hit| hit["hit"]["target"] == "file"));
-        assert!(
-            results
-                .iter()
-                .all(|hit| hit["hit"]["file"]["id"] == json!("rift://file/src/lib.rs"))
-        );
+        assert!(results.iter().all(|hit| hit["path"] == json!("src/lib.rs")));
         Ok(())
     }
 
@@ -1834,7 +1814,7 @@ pub fn compute() -> i32 {
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert_eq!(results.len(), 2);
         for hit in results {
-            assert!(hit["span"]["range"]["start"].is_u64());
+            assert!(hit["range"]["start"].is_u64());
             let id = hit["hit"]["symbol"]["id"]
                 .as_str()
                 .ok_or("force_include hit must carry a symbol id")?;
@@ -1857,10 +1837,10 @@ pub fn compute() -> i32 {
         assert_eq!(results.len(), 1);
         let hit = &results[0];
         assert_eq!(hit["matched_by"][0], "content");
-        let id = hit["hit"]["file"]["id"]
+        let path = hit["path"]
             .as_str()
-            .ok_or("content hit must carry a file id")?;
-        assert!(id.contains("gitignored.rs"));
+            .ok_or("content hit must carry a path")?;
+        assert!(path.contains("gitignored.rs"));
         let text = hit["source"]
             .as_str()
             .ok_or("content hit must carry the matched line")?;
@@ -2152,34 +2132,6 @@ pub fn compute() -> i32 {
         let value = serde_json::to_value(service.search(&params, &[])?)?;
         assert_eq!(value["results"].as_array().map(Vec::len), Some(1));
         assert_eq!(value["results"][0]["path"], json!("visible.py"));
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn search_file_result_reports_captured_executable_state() -> TestResult {
-        use std::os::unix::fs::PermissionsExt;
-
-        let directory = tempfile::tempdir()?;
-        let script = directory.path().join("tool.py");
-        fs::write(&script, "EXECUTABLE_SEARCH_MARKER\n")?;
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))?;
-        let service = ReadService::build(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::new(vec!["**".to_owned()], 1 << 20),
-            HistoryConfiguration::default(),
-        )?;
-        let params: SearchParams = serde_json::from_value(json!({
-            "query": "EXECUTABLE_SEARCH_MARKER",
-            "target": "file"
-        }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
-        assert_eq!(
-            value["results"][0]["hit"]["file"]["content"]["executable"],
-            json!(true)
-        );
         Ok(())
     }
 
@@ -2539,7 +2491,11 @@ pub fn compute() -> i32 {
             .results
             .iter()
             .find(|hit| {
-                matches!(&hit.hit, SearchHitTarget::File { file } if file.id.0.contains("README"))
+                matches!(&hit.hit, SearchHitTarget::File { .. })
+                    && hit
+                        .path
+                        .as_ref()
+                        .is_some_and(|path| path.0.contains("README"))
             })
             .ok_or("the text-lane file must reach the answer")?;
         assert!(
@@ -2695,30 +2651,18 @@ pub fn compute() -> i32 {
         assert_eq!(text, content);
     }
 
-    fn file_hit_stub(id: &str, score: f64) -> SearchHit {
-        file_hit_stub_with_path(id, None, score)
-    }
-
-    fn file_hit_stub_with_path(id: &str, path: Option<&str>, score: f64) -> SearchHit {
+    fn file_hit_stub(path: &str, score: f64) -> SearchHit {
         SearchHit {
             hit: SearchHitTarget::File {
-                file: File {
-                    id: FileId(id.to_owned()),
-                    content: FileContent::Regular {
-                        size: 0,
-                        executable: false,
-                    },
-                    languages: Vec::new(),
-                    regions: Vec::new(),
-                    semantic: false,
-                },
+                size: 0,
+                languages: Vec::new(),
             },
             score,
             matched_by: vec![MatchedField::Content],
             source: None,
-            span: None,
+            range: None,
             line: None,
-            path: path.map(|path| rift_protocol::read::ProjectPath(path.to_owned())),
+            path: Some(rift_protocol::read::ProjectPath(path.to_owned())),
             traversal_path: None,
             distance: None,
         }
@@ -2752,22 +2696,25 @@ pub fn compute() -> i32 {
     }
 
     /// `order: "path"` groups by project path, breaking a tie - two hits at the same path -
-    /// on the hit's own wire identity, the same tie-break `relevance` uses.
+    /// on the hit's own wire identity, the same tie-break `relevance` uses. A file hit's
+    /// own identity is its `path`, so two file hits can never tie this way; a node hit's
+    /// identity is its own witnessed id, distinct from the path it also carries, so this
+    /// proves the tie-break through node hits instead.
     #[test]
     fn order_hits_path_sorts_by_path_then_breaks_ties_on_identity() {
         let mut hits = vec![
-            file_hit_stub_with_path("rift://file/z.rs", Some("z.rs"), 0.9),
-            file_hit_stub_with_path("rift://file/a.rs-two", Some("a.rs"), 0.1),
-            file_hit_stub_with_path("rift://file/a.rs-one", Some("a.rs"), 0.5),
+            node_hit_stub_with_path("rift://node/rust/z.rs@0-1#00000000", Some("z.rs"), 0.9),
+            node_hit_stub_with_path("rift://node/rust/a.rs@0-1#00000002", Some("a.rs"), 0.1),
+            node_hit_stub_with_path("rift://node/rust/a.rs@0-1#00000001", Some("a.rs"), 0.5),
         ];
         super::order_hits(&mut hits, ResultOrder::Path);
         let ids: Vec<&str> = hits.iter().map(super::hit_identity).collect();
         assert_eq!(
             ids,
             [
-                "rift://file/a.rs-one",
-                "rift://file/a.rs-two",
-                "rift://file/z.rs"
+                "rift://node/rust/a.rs@0-1#00000001",
+                "rift://node/rust/a.rs@0-1#00000002",
+                "rift://node/rust/z.rs@0-1#00000000",
             ],
             "path order groups by path; two hits at the same path break the tie on identity"
         );
@@ -2786,30 +2733,20 @@ pub fn compute() -> i32 {
     }
 
     fn node_hit_stub(id: &str, score: f64) -> SearchHit {
+        node_hit_stub_with_path(id, None, score)
+    }
+
+    fn node_hit_stub_with_path(id: &str, path: Option<&str>, score: f64) -> SearchHit {
         SearchHit {
             hit: SearchHitTarget::Node {
-                node: Node {
-                    id: NodeId(id.to_owned()),
-                    symbol: None,
-                    unit: FileId("rift://file/lib.rs".to_owned()),
-                    language: rift_protocol::read::Language {
-                        name: "rust".to_owned(),
-                        dialect: None,
-                    },
-                    kind: ExactKind("rust.function_item".to_owned()),
-                    facets: Vec::new(),
-                    range: TextRange { start: 0, end: 1 },
-                    regions: Vec::new(),
-                    parent: None,
-                    extensions: Extensions(std::collections::BTreeMap::new()),
-                },
+                node: NodeId(id.to_owned()),
             },
             score,
             matched_by: vec![MatchedField::Content],
             source: None,
-            span: None,
+            range: None,
             line: None,
-            path: None,
+            path: path.map(|path| rift_protocol::read::ProjectPath(path.to_owned())),
             traversal_path: None,
             distance: None,
         }

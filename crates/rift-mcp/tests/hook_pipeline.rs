@@ -173,7 +173,7 @@ async fn read_beacon_source(client: &RunningService<RoleClient, ()>) -> TestResu
         .await?
         .structured_content
         .ok_or("get_symbol must return structured content")?;
-    structured["hits"][0]["source"]["text"]
+    structured["hits"][0]["source"]
         .as_str()
         .map(str::to_owned)
         .ok_or_else(|| "get_symbol must carry declaration source".into())
