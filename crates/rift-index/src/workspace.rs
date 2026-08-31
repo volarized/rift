@@ -32,6 +32,7 @@ use crate::chunk::text_chunks;
 use crate::glob::PathMatcher;
 use crate::language::{ClassifiedPath, LanguagePolicyError, WorkspaceLanguagePolicy};
 use crate::lexical::{LexicalUnit, LexicalUnitKind};
+use crate::relationship::RelationshipStore;
 use crate::semantic::{BindingPolicy, WorkspaceSemantics};
 
 #[derive(Debug)]
@@ -1358,6 +1359,12 @@ impl WorkspaceIndex {
     #[must_use]
     pub const fn normalized_graph(&self) -> &NormalizedGraph {
         self.semantics.graph()
+    }
+
+    /// Returns the symbol reference adjacency built from this index's normalized graph.
+    #[must_use]
+    pub const fn relationships(&self) -> &RelationshipStore {
+        self.semantics.relationships()
     }
 
     /// Assembles readable symbol through its normalized record.
