@@ -473,6 +473,30 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
              {structured:#}"
         );
     }
+    if name == "get_symbol" {
+        let include = request.get("include").and_then(Value::as_array);
+        let expects_source = include.is_none_or(|entries| entries.contains(&Value::from("source")));
+        let expects_history =
+            include.is_some_and(|entries| entries.contains(&Value::from("history")));
+        for hit in structured["hits"].as_array().into_iter().flatten() {
+            assert_eq!(
+                hit.get("source").is_some(),
+                expects_source,
+                "a hit carries source exactly when the request includes it: {request:#} {hit:#}"
+            );
+            assert_eq!(
+                hit.get("node").is_some(),
+                expects_source,
+                "the node address rides with source: {request:#} {hit:#}"
+            );
+            if !expects_history {
+                assert!(
+                    hit.get("history").is_none(),
+                    "a hit omits history unless the request includes it: {request:#} {hit:#}"
+                );
+            }
+        }
+    }
     if name == "search"
         && let Some(warnings) = structured["warnings"].as_array()
     {

@@ -2229,6 +2229,34 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
+    /// An omitted `include` serves exactly what `["source"]` serves; `[]` serves neither.
+    #[test]
+    fn get_symbol_include_omitted_matches_source_and_empty_serves_neither() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let omitted: GetSymbolParams = serde_json::from_value(json!({"name": "beacon"}))?;
+        let explicit: GetSymbolParams =
+            serde_json::from_value(json!({"name": "beacon", "include": ["source"]}))?;
+        let empty: GetSymbolParams =
+            serde_json::from_value(json!({"name": "beacon", "include": []}))?;
+        let omitted = serde_json::to_value(service.get_symbol(&omitted)?)?;
+        let explicit = serde_json::to_value(service.get_symbol(&explicit)?)?;
+        let empty = serde_json::to_value(service.get_symbol(&empty)?)?;
+        assert_eq!(
+            omitted, explicit,
+            "an omitted include answers as include: [\"source\"]"
+        );
+        let hit = &empty["hits"][0];
+        assert!(
+            hit.get("source").is_none() && hit.get("node").is_none(),
+            "an explicit empty include serves neither source nor node: {hit:#}"
+        );
+        assert!(
+            !omitted["hits"][0]["source"].is_null(),
+            "the omitted form serves source: {omitted:#}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn nodes_missing_source_is_not_found() -> TestResult {
         let (_directory, service) = fixture()?;

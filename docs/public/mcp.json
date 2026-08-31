@@ -11088,7 +11088,7 @@
             "type": "string"
           },
           "SearchInclude": {
-            "description": "Extra payload to attach to every hit. Each entry costs a lookup per hit, so the caller\nrequests only what it will read.",
+            "description": "Extra payload to attach to every hit. Every entry costs response bytes per hit, so the\ncaller requests only what it will read.",
             "oneOf": [
               {
                 "const": "source",
@@ -11152,7 +11152,7 @@
         ],
         "properties": {
           "include": {
-            "description": "Extra payload to attach to every hit. Each entry costs a lookup per hit, so the\ncaller requests only what it will read.",
+            "description": "Extra payload to attach to every hit. Every entry costs response bytes per hit, so\nthe caller requests only what it will read.",
             "items": {
               "$ref": "#/$defs/SearchInclude"
             },

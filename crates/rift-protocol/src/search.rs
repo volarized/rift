@@ -234,8 +234,8 @@ pub enum SearchHitTarget {
     },
 }
 
-/// Extra payload to attach to every hit. Each entry costs a lookup per hit, so the caller
-/// requests only what it will read.
+/// Extra payload to attach to every hit. Every entry costs response bytes per hit, so the
+/// caller requests only what it will read.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
@@ -295,8 +295,8 @@ pub struct SearchParams {
     /// every visible file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paths: Option<PathSelector>,
-    /// Extra payload to attach to every hit. Each entry costs a lookup per hit, so the
-    /// caller requests only what it will read.
+    /// Extra payload to attach to every hit. Every entry costs response bytes per hit, so
+    /// the caller requests only what it will read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include: Option<Vec<SearchInclude>>,
     /// Most hits to return in one page. `max_page_items` from the workspace resource caps
