@@ -1,0 +1,15 @@
+[package]
+name = "rift-binding"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Name binding from syntax facts for Rift"
+
+[lints]
+workspace = true
+
+[dependencies]
+rift-core.workspace = true
+serde.workspace = true

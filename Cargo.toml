@@ -10,6 +10,7 @@ license = "MIT"
 publish = false
 
 [workspace.dependencies]
+rift-binding = { path = "crates/rift-binding" }
 rift-core = { path = "crates/rift-core" }
 rift-history = { path = "crates/rift-history" }
 rift-index = { path = "crates/rift-index" }
