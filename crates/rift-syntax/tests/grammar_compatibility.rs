@@ -1,7 +1,8 @@
 //! Proves every pinned grammar's compatibility with the pinned Tree-sitter
 //! runtime.
 
-use rift_syntax::RustQuery;
+use rift_core::ProjectPath;
+use rift_syntax::{RustQuery, RustSyntaxProvider, SyntaxProvider, SyntaxSource};
 use tree_sitter::{Language, MIN_COMPATIBLE_LANGUAGE_VERSION, Parser, Tree};
 
 const REQUIRED_CAPTURE: &str = "rift.node";
@@ -221,6 +222,22 @@ fn test_rust_grammar_resolves_attachment_node_kind_ids() {
              classification: kind={kind}",
         );
     }
+}
+
+#[test]
+fn test_rust_grammar_resolves_every_binding_kind_and_field() {
+    let path = ProjectPath::new("src/lib.rs").expect("path");
+    let document = RustSyntaxProvider::default()
+        .analyze(SyntaxSource {
+            path: &path,
+            text: "pub fn beacon() {}\n",
+        })
+        .expect("document");
+    assert!(
+        document.binding().is_some(),
+        "resolving the binding grammar asserts every kind and field id; \
+         a grammar bump that drops one fails here, not in extraction",
+    );
 }
 
 #[test]

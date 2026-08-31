@@ -1,6 +1,7 @@
 //! Rust syntax facts from the pinned tree-sitter-rust grammar.
 
 mod attachment;
+mod binding;
 
 use rift_core::Error;
 use rift_protocol::read::{Language, NodeFacet, SymbolFacet};
@@ -395,13 +396,19 @@ impl SyntaxProvider for RustSyntaxProvider {
             &self.language,
             &RustGrammarRules,
         )?;
-        Ok(SyntaxDocument::new(
+        let document = SyntaxDocument::new(
             self.language.clone(),
             source.path.clone(),
             nodes,
             symbols,
             tree.root_node().has_error(),
-        ))
+        );
+        Ok(
+            match binding::unit_binding_facts(tree.root_node(), source, self.limits) {
+                Some(facts) => document.with_binding(facts),
+                None => document,
+            },
+        )
     }
 
     fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {

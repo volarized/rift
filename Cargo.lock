@@ -3610,6 +3610,7 @@ dependencies = [
 name = "rift-syntax"
 version = "0.0.26"
 dependencies = [
+ "rift-binding",
  "rift-core",
  "rift-protocol",
  "rift-provider",
