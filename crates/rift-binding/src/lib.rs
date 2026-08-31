@@ -3,7 +3,8 @@
 //! A language rule feeds scopes, definitions, references, and links through
 //! [`GraphBuilder`]; [`LinkedGraph::link`] joins units through module links, computes the
 //! module tree, and attaches member scopes; [`resolve_all`] maps every reference to the
-//! definitions it can name under [`BindingLimits`].
+//! definitions it can name under [`BindingLimits`]; and [`BindingPublisher::publish`]
+//! turns the resolved graph into one provider publication.
 
 mod failure;
 #[cfg(test)]
@@ -11,6 +12,7 @@ mod fixture;
 mod graph;
 mod limits;
 mod link;
+mod publish;
 mod resolve;
 
 pub use failure::{BindingError, BindingFault, BindingViolation};
@@ -26,6 +28,9 @@ pub use limits::{
     UNIT_LINKS_MAX_DEFAULT, UNIT_REFERENCES_MAX_DEFAULT, UNIT_SCOPES_MAX_DEFAULT,
 };
 pub use link::LinkedGraph;
+pub use publish::{
+    BINDING_EXTENSION_KEY, BINDING_EXTENSION_VERSION, BINDING_PROVIDER_ID, BindingPublisher,
+};
 pub use resolve::{
     CANCELLATION_CHECK_INTERVAL, Cancellation, DEFINITION_RANK, LEXICAL_RANK, NeverCancelled,
     Resolution, ResolutionSet, resolve_all,

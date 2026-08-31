@@ -3450,7 +3450,9 @@ name = "rift-binding"
 version = "0.0.26"
 dependencies = [
  "rift-core",
+ "rift-provider",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
