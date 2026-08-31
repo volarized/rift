@@ -34,10 +34,9 @@ pub struct Diagnostic {
     /// grey text; absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<DiagnosticTag>,
-    /// Whether the facts around this finding came off a clean parse.
+    /// How reliable the surrounding facts are.
     pub reliability: DiagnosticReliability,
-    /// Whether the finding is an artefact of source that stops mid-way, which is the normal
-    /// state of a file the caller is halfway through writing.
+    /// Whether the finding is a mid-file artefact.
     pub continuation: DiagnosticContinuation,
     /// Diagnostic fields the model has no place for, namespaced by the provider that
     /// emitted them. Absent when empty.

@@ -84,8 +84,7 @@ pub struct Digest(
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Documentation {
-    /// Which markup the text is written in, since whoever displays a doc comment is the one
-    /// that renders it.
+    /// Markup the comment text uses.
     pub format: DocumentationFormat,
     /// The body of the comment, with the comment syntax stripped.
     pub text: String,
@@ -870,42 +869,32 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
-    /// The semantic ranking is still being built, so the answer was ranked lexically
-    /// alone. A query that shares no token with the code it describes reaches nothing
-    /// until every declaration carries a vector; the counts state how far that has got.
-    /// `ready_in` is an estimate the server derives from how large the workspace is and
-    /// how much of it is embedded, not a measurement of this machine, so a caller may
-    /// report it and must not schedule against it.
+    /// The semantic ranking is still being built, so the answer was ranked lexically alone.
+    /// `prepared` and `total` state how many declarations already carry a vector, and
+    /// `ready_in` is derived from workspace size and embedding progress.
     SemanticIndexPreparing {
         /// Declarations that already carry a vector.
         prepared: u64,
         /// Declarations the published set holds.
         total: u64,
-        /// Estimated wait before the semantic ranking joins an answer. The server derives
-        /// it from how large the workspace is and how much of it is embedded, not from
-        /// this machine's measured rate, so it is worth reporting and must not be
-        /// scheduled against.
+        /// Estimated wait before the semantic ranking joins an answer, not a measurement
+        /// of this machine. A caller may report it and must not schedule against it.
         ready_in: Duration,
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
         detail: String,
     },
     /// The semantic ranking will not answer for the life of this server, so every answer
-    /// is ranked lexically alone. The weights could not be acquired or the model could
-    /// not load; no retry is coming, and a caller that needs the semantic ranking fixes
-    /// the `[search.semantic]` configuration and starts the server again.
+    /// is ranked lexically alone. No retry is coming: fix the `[search.semantic]`
+    /// configuration and start the server again.
     SemanticRankingUnavailable {
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
         detail: String,
     },
     /// The full-text tier is not answering, so the answer came from identifier matching
-    /// alone. Ranking reaches what a name match reaches and no further, and a query
-    /// phrased as prose finds nothing. The tier is read under the tree revision the answer
-    /// was computed from, so a tier holding another tree is recaptured rather than warned
-    /// about; this covers a tier that refused to load, or that holds no indexed tree at
-    /// all, and will not answer without operator action - which a caller cannot otherwise
-    /// tell from a tier that searched and found nothing.
+    /// alone: a query phrased as prose finds nothing. The tier failed to load or holds no
+    /// indexed tree, and will not answer without operator action.
     LexicalRankingUnavailable {
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
@@ -922,9 +911,7 @@ pub enum ReadWarning {
         detail: String,
     },
     /// Contributions selected for one symbol's presentation disagree on at least one
-    /// field. The answer carries what normalization selected; the warning names the
-    /// symbol and every provider whose Contribution differed, so a caller can weigh
-    /// whether the difference matters to it.
+    /// field. The answer carries what normalization selected.
     SymbolDisagreement {
         /// The symbol whose presentation facts disagree.
         symbol: SymbolId,
@@ -995,9 +982,9 @@ pub struct Relationship {
     pub extensions: Extensions,
 }
 
-/// How this edge was established. Every edge reaches Rift from a provider; this field
-/// records how much the provider knew. A consumer may act on `resolution` directly. Lower
-/// levels require another check before rewriting.
+/// How this edge was established. Every edge reaches Rift from a provider, and this field
+/// records how much the provider knew: `syntax` and `heuristic` need another check before
+/// rewriting.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
@@ -1344,18 +1331,16 @@ pub struct Symbol {
     /// kinds `trait` and `interface` can both carry the `type` facet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub facets: Vec<SymbolFacet>,
-    /// Where the declaration belongs, how it was produced, and its source unit where that
-    /// differs from the hit's own path. Absent when it says a project declaration,
-    /// authored, with no package - the common case.
+    /// Where the declaration belongs and how it was produced. Absent when it says a
+    /// project declaration, authored, with no package - the common case.
     #[serde(
         default = "default_symbol_origin",
         skip_serializing_if = "SymbolOrigin::is_common_default"
     )]
     pub origin: SymbolOrigin,
     /// The symbol this one belongs to - the class that owns a method, the module that owns
-    /// a function. Ownership is not lexical: a Go method is written beside its type and a
-    /// Rust method inside an `impl` block, and both name the type here. Absent at the top
-    /// level.
+    /// a function. Ownership is not lexical: a Go method sits beside its type and a Rust
+    /// method inside an `impl` block, both naming the type here; absent at the top level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<SymbolId>,
     /// Language keywords qualifying the declaration: `export`, `async`, `const`. Absent
@@ -1535,7 +1520,7 @@ pub struct SymbolVersion {
     pub revision: RevisionId,
     /// Where the declaration lived at that revision.
     pub path: ProjectPath,
-    /// What the revision did to the symbol.
+    /// How the revision changed the symbol.
     pub kind: SymbolVersionKind,
     /// When the revision was recorded, as RFC 3339 date-time.
     #[schemars(length(max = 64))]
@@ -1587,7 +1572,7 @@ pub struct TextRange {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TypeBinding {
-    /// What this type is to the symbol that carries it.
+    /// The role this type plays for the symbol.
     pub role: TypeBindingRole,
     /// Where the type fact came from.
     pub origin: TypeBindingOrigin,
