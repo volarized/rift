@@ -3398,7 +3398,10 @@ pub fn beacon() -> u64 {
             .structured_content
             .ok_or("replace_symbol must return structured content")?;
         assert_eq!(structured["status"], json!("applied"));
-        assert_eq!(structured["summary"]["diagnostics"], json!([]));
+        assert!(
+            structured["summary"].get("diagnostics").is_none(),
+            "an applied change with no findings must omit diagnostics"
+        );
 
         let skipped = get_symbol(&reads, "beacon").await?;
         assert!(skipped.hits.is_empty());
@@ -3460,7 +3463,10 @@ pub fn beacon() -> u64 {
         assert_eq!(wire["code"], json!("invalid_request"));
         assert_eq!(wire["retry"], json!("never"));
         assert_eq!(wire["phase"], json!("read"));
-        assert_eq!(wire["causes"], json!([]));
+        assert!(
+            wire.get("causes").is_none(),
+            "a failure with no causal chain must omit causes"
+        );
         Ok(())
     }
 

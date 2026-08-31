@@ -137,6 +137,7 @@ pub struct LimitEvidence {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::error_limit_rides_limit_exceeded)]
+#[schemars(transform = schema::declare_error_data_empty_defaults)]
 pub struct ErrorData {
     /// Why the request failed.
     pub code: ErrorCode,
@@ -148,7 +149,8 @@ pub struct ErrorData {
     pub retry: RetryDirective,
     /// How far the request got before it failed.
     pub phase: ErrorPhase,
-    /// What a provider reported while the request was failing. Empty where none ran.
+    /// What a provider reported while the request was failing. Absent where none ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 64))]
     pub diagnostics: Vec<DiagnosticContext>,
     /// Which advertised limit was hit, and by how much. Present only when `code` is
@@ -156,7 +158,8 @@ pub struct ErrorData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<LimitEvidence>,
     /// What led to this failure, outermost first. A code alone rarely says whether the
-    /// cause is worth waiting out.
+    /// cause is worth waiting out; absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 8))]
     pub causes: Vec<ErrorCause>,
 }

@@ -167,13 +167,15 @@ pub enum ResultOrder {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::pair_span_with_line)]
+#[schemars(transform = schema::declare_search_hit_empty_defaults)]
 pub struct SearchHit {
     /// What was found. A symbol, a node, or a file - whichever `target` allowed.
     pub hit: SearchHitTarget,
     /// How well this hit matched. Scores are comparable within one answer and nowhere
     /// else.
     pub score: f64,
-    /// Which indexed fields produced the match.
+    /// Which indexed fields produced the match. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub matched_by: Vec<MatchedField>,
     /// The source text around the hit, requested with `include: ["source"]`. Covers the
     /// hit's `span`; a caller that needs the range already has it there.
@@ -334,6 +336,7 @@ pub enum SearchParamsTarget {
 /// One page of search hits from one captured tree.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = schema::declare_search_result_empty_defaults)]
 #[schemars(extend("examples" = [
     {
         "results": [
@@ -368,7 +371,6 @@ pub enum SearchParamsTarget {
                             "source_kind": "authored",
                             "unit": "rift://source/project/src/config.rs"
                         },
-                        "modifiers": [],
                         "visibility": "pub",
                         "types": [
                             {
@@ -378,8 +380,7 @@ pub enum SearchParamsTarget {
                                     "language": {
                                         "name": "rust"
                                     },
-                                    "source": "Result<Config, ConfigError>",
-                                    "extensions": {}
+                                    "source": "Result<Config, ConfigError>"
                                 }
                             }
                         ],
@@ -409,14 +410,12 @@ pub enum SearchParamsTarget {
                                                     "language": {
                                                         "name": "rust"
                                                     },
-                                                    "source": "&Path",
-                                                    "extensions": {}
+                                                    "source": "&Path"
                                                 }
                                             }
                                         ],
                                         "optional": false,
-                                        "variadic": false,
-                                        "extensions": {}
+                                        "variadic": false
                                     }
                                 ],
                                 "returns": [
@@ -427,15 +426,10 @@ pub enum SearchParamsTarget {
                                             "language": {
                                                 "name": "rust"
                                             },
-                                            "source": "Result<Config, ConfigError>",
-                                            "extensions": {}
+                                            "source": "Result<Config, ConfigError>"
                                         }
                                     }
-                                ],
-                                "type_parameters": [],
-                                "throws": [],
-                                "effects": [],
-                                "extensions": {}
+                                ]
                             }
                         ],
                         "documentation": [
@@ -443,10 +437,7 @@ pub enum SearchParamsTarget {
                                 "format": "markdown",
                                 "text": "Loads the workspace configuration from `rift.toml`."
                             }
-                        ],
-                        "extensions": {},
-                        "disagreements": [],
-                        "document_local": false
+                        ]
                     }
                 },
                 "score": 0.9,
@@ -479,7 +470,6 @@ pub enum SearchParamsTarget {
                                 "name": "rust"
                             }
                         ],
-                        "regions": [],
                         "semantic": true
                     }
                 },
@@ -502,8 +492,7 @@ pub enum SearchParamsTarget {
         "pagination": {
             "page_index": 0,
             "total_pages": 3
-        },
-        "warnings": []
+        }
     }
 ]))]
 pub struct SearchResult {
@@ -511,7 +500,8 @@ pub struct SearchResult {
     pub results: Vec<SearchHit>,
     /// Where this page sits in the full result set under the request's `limit`.
     pub pagination: Pagination,
-    /// Warnings attached to this result, empty when there is nothing to warn about.
+    /// Warnings attached to this result. Absent when there is nothing to warn about.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<ReadWarning>,
 }
 

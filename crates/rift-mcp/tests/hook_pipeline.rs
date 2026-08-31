@@ -835,10 +835,9 @@ async fn hook_permission_writes_are_restored_and_never_reported_as_changed_files
         );
         assert_eq!(diagnostic(&result, id)?["severity"], json!("warning"));
         assert!(
-            result["summary"]["guarantees"]
-                .as_array()
-                .is_some_and(Vec::is_empty),
-            "a validation hook that changes permissions must add no guarantee"
+            result["summary"].get("guarantees").is_none(),
+            "a validation hook that changes permissions must add no guarantee, so \
+             guarantees is omitted"
         );
         stop(client, server_task).await?;
     }
@@ -896,7 +895,7 @@ async fn hook_path_selection_runs_a_covering_hook_once_and_skips_an_unrelated_on
     assert_eq!(both["status"], json!("applied"));
     let matching: Vec<&Value> = both["summary"]["diagnostics"]
         .as_array()
-        .ok_or("applied result must carry diagnostics")?
+        .ok_or("a rust-only hook scoped to lib.rs must contribute a diagnostic")?
         .iter()
         .filter(|diagnostic| {
             diagnostic["message"]

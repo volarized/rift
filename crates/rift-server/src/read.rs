@@ -1566,7 +1566,10 @@ pub fn compute() -> i32 {
                 .as_str()
                 .is_some_and(|id| id.starts_with("rift://node/rust/"))
         );
-        assert_eq!(value["warnings"], json!([]));
+        assert!(
+            value.get("warnings").is_none(),
+            "a live nodes result must omit warnings when there is nothing to warn about"
+        );
         Ok(())
     }
 
@@ -1849,7 +1852,10 @@ pub fn compute() -> i32 {
                 .as_str()
                 .is_some_and(|identity| !identity.is_empty())
         );
-        assert_eq!(symbol["disagreements"], json!([]));
+        assert!(
+            symbol.get("disagreements").is_none(),
+            "an established symbol with no disagreements must omit the member"
+        );
         assert!(
             symbol["facets"]
                 .as_array()
@@ -2764,7 +2770,10 @@ pub fn compute() -> i32 {
         let symbol = &value["hits"][0]["symbol"];
         assert_eq!(symbol["language"], json!({ "name": "markdown" }));
         assert_eq!(symbol["kind"], json!("markdown.heading"));
-        assert_eq!(symbol["facets"], json!([]));
+        assert!(
+            symbol.get("facets").is_none(),
+            "no facets must omit the member"
+        );
         assert_eq!(
             symbol["id"],
             json!("rift://symbol/markdown/src/guide.md/Beacon%20Guide")
@@ -2872,7 +2881,10 @@ pub fn compute() -> i32 {
         let symbol = &value["hits"][0]["symbol"];
         assert_eq!(symbol["language"], json!({ "name": "json" }));
         assert_eq!(symbol["kind"], json!("json.member"));
-        assert_eq!(symbol["facets"], json!([]));
+        assert!(
+            symbol.get("facets").is_none(),
+            "no facets must omit the member"
+        );
         assert_eq!(
             symbol["id"],
             json!("rift://symbol/json/settings.json/beacon%20settings")
@@ -2906,7 +2918,10 @@ pub fn compute() -> i32 {
         let symbol = &value["hits"][0]["symbol"];
         assert_eq!(symbol["language"], json!({ "name": "yaml" }));
         assert_eq!(symbol["kind"], json!("yaml.mapping_entry"));
-        assert_eq!(symbol["facets"], json!([]));
+        assert!(
+            symbol.get("facets").is_none(),
+            "no facets must omit the member"
+        );
         assert_eq!(
             symbol["id"],
             json!("rift://symbol/yaml/pipeline.yaml/beacon%20pipeline")
@@ -3160,7 +3175,10 @@ pub fn compute() -> i32 {
             value["hits"][0]["source"]["text"], "pub fn beacon() {}",
             "the committed body answers, not the drifted working tree"
         );
-        assert_eq!(value["warnings"], json!([]));
+        assert!(
+            value.get("warnings").is_none(),
+            "a live get_symbol result must omit warnings when there is nothing to warn about"
+        );
         Ok(())
     }
 

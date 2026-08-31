@@ -33,6 +33,7 @@ mod keyword {
     pub(super) const PATTERN: &str = "pattern";
     pub(super) const PROPERTY_NAMES: &str = "propertyNames";
     pub(super) const TYPE: &str = "type";
+    pub(super) const DEFAULT: &str = "default";
 }
 
 /// The serde property name of one model field, proven against the model:
@@ -190,17 +191,60 @@ fn range<T: Serialize>(min: &T, max: &T) -> Value {
     json!({ "min": wire(min), "max": wire(max) })
 }
 
-/// Adds `annotation` under `key` on one named property of `schema`, for
-/// extension keywords that ride a property's own clause.
-fn annotate_property(schema: &mut Schema, name: &str, key: &str, annotation: Value) {
-    let property = schema
-        .ensure_object()
+/// Adds `annotation` under `key` on one named property of the object schema
+/// `owner` carries under [`keyword::PROPERTIES`].
+fn annotate_property_in(owner: &mut Map<String, Value>, name: &str, key: &str, annotation: Value) {
+    let property = owner
         .get_mut(keyword::PROPERTIES)
         .and_then(|properties| properties.get_mut(name))
         .and_then(Value::as_object_mut);
     if let Some(property) = property {
         property.insert(key.to_owned(), annotation);
     }
+}
+
+/// Adds `annotation` under `key` on one named property of `schema`, for
+/// extension keywords that ride a property's own clause.
+fn annotate_property(schema: &mut Schema, name: &str, key: &str, annotation: Value) {
+    annotate_property_in(schema.ensure_object(), name, key, annotation);
+}
+
+/// States `default: []` on each named array property: schemars omits `default` when a
+/// field's `skip_serializing_if` predicate matches its own `#[serde(default)]` value, the
+/// case for every empty-collection field this rule targets (proven by
+/// [`tests::schemars_omits_default_when_it_matches_skip_serializing_if`]).
+fn declare_empty_array_defaults(schema: &mut Schema, names: &[&str]) {
+    for name in names {
+        annotate_property(schema, name, keyword::DEFAULT, json!([]));
+    }
+}
+
+/// States `default: {}` on each named map property, the [`Extensions`](crate::read::Extensions)
+/// form of [`declare_empty_array_defaults`].
+fn declare_empty_object_defaults(schema: &mut Schema, names: &[&str]) {
+    for name in names {
+        annotate_property(schema, name, keyword::DEFAULT, json!({}));
+    }
+}
+
+/// The object schema for one arm of a tagged union, selected by its constant `tag` value.
+/// [`ChangeResult`](crate::change::ChangeResult)'s struct variants generate as inline
+/// `oneOf` object schemas rather than `$defs` entries, so a variant-scoped default has
+/// nowhere else to attach.
+fn tagged_union_arm<'schema>(
+    schema: &'schema mut Schema,
+    tag: &str,
+    value: &str,
+) -> Option<&'schema mut Map<String, Value>> {
+    schema
+        .ensure_object()
+        .get_mut(keyword::ONE_OF)
+        .and_then(Value::as_array_mut)
+        .and_then(|arms| {
+            arms.iter_mut()
+                .find(|arm| arm[keyword::PROPERTIES][tag][keyword::CONST] == json!(value))
+        })
+        .and_then(Value::as_object_mut)
 }
 
 /// A workspace configuration states entry caps on its language and LSP maps.
@@ -682,6 +726,190 @@ pub fn declare_insert_node_body_length(schema: &mut Schema) {
     );
 }
 
+/// A [`File`](crate::read::File) states `default: []` on `languages` and `regions`.
+pub fn declare_file_empty_defaults(schema: &mut Schema) {
+    use crate::read::File;
+    declare_empty_array_defaults(
+        schema,
+        &[property!(File, languages), property!(File, regions)],
+    );
+}
+
+/// A [`Node`](crate::read::Node) states `default: []` on `facets` and `regions`, and
+/// `default: {}` on `extensions`.
+pub fn declare_node_empty_defaults(schema: &mut Schema) {
+    use crate::read::Node;
+    declare_empty_array_defaults(schema, &[property!(Node, facets), property!(Node, regions)]);
+    declare_empty_object_defaults(schema, &[property!(Node, extensions)]);
+}
+
+/// A [`Symbol`](crate::read::Symbol) states `default: []` on its collection fields,
+/// `default: {}` on `extensions`, and `default: false` on `document_local`.
+pub fn declare_symbol_empty_defaults(schema: &mut Schema) {
+    use crate::read::Symbol;
+    declare_empty_array_defaults(
+        schema,
+        &[
+            property!(Symbol, contributions),
+            property!(Symbol, facets),
+            property!(Symbol, modifiers),
+            property!(Symbol, types),
+            property!(Symbol, signatures),
+            property!(Symbol, documentation),
+            property!(Symbol, disagreements),
+        ],
+    );
+    declare_empty_object_defaults(schema, &[property!(Symbol, extensions)]);
+    annotate_property(
+        schema,
+        property!(Symbol, document_local),
+        keyword::DEFAULT,
+        json!(false),
+    );
+}
+
+/// A [`Signature`](crate::read::Signature) states `default: []` on its collection fields
+/// and `default: {}` on `extensions`.
+pub fn declare_signature_empty_defaults(schema: &mut Schema) {
+    use crate::read::Signature;
+    declare_empty_array_defaults(
+        schema,
+        &[
+            property!(Signature, links),
+            property!(Signature, parameters),
+            property!(Signature, returns),
+            property!(Signature, type_parameters),
+            property!(Signature, throws),
+            property!(Signature, effects),
+        ],
+    );
+    declare_empty_object_defaults(schema, &[property!(Signature, extensions)]);
+}
+
+/// A [`Parameter`](crate::read::Parameter) states `default: []` on `types` and
+/// `default: {}` on `extensions`.
+pub fn declare_parameter_empty_defaults(schema: &mut Schema) {
+    use crate::read::Parameter;
+    declare_empty_array_defaults(schema, &[property!(Parameter, types)]);
+    declare_empty_object_defaults(schema, &[property!(Parameter, extensions)]);
+}
+
+/// A [`Relationship`](crate::read::Relationship) states `default: []` on `evidence` and
+/// `default: {}` on `extensions`. `facets` carries its own `minItems: 1` and is never
+/// optional, so it states no default.
+pub fn declare_relationship_empty_defaults(schema: &mut Schema) {
+    use crate::read::Relationship;
+    declare_empty_array_defaults(schema, &[property!(Relationship, evidence)]);
+    declare_empty_object_defaults(schema, &[property!(Relationship, extensions)]);
+}
+
+/// A [`TypeExpression`](crate::read::TypeExpression) states `default: {}` on `extensions`.
+pub fn declare_type_expression_empty_defaults(schema: &mut Schema) {
+    use crate::read::TypeExpression;
+    declare_empty_object_defaults(schema, &[property!(TypeExpression, extensions)]);
+}
+
+/// A [`GetSymbolResult`](crate::read::GetSymbolResult) states `default: []` on `warnings`.
+pub fn declare_get_symbol_result_empty_defaults(schema: &mut Schema) {
+    use crate::read::GetSymbolResult;
+    declare_empty_array_defaults(schema, &[property!(GetSymbolResult, warnings)]);
+}
+
+/// A [`NodesResult`](crate::read::NodesResult) states `default: []` on `warnings`. `nodes`
+/// and `source` are the tool's own answer and stay required.
+pub fn declare_nodes_result_empty_defaults(schema: &mut Schema) {
+    use crate::read::NodesResult;
+    declare_empty_array_defaults(schema, &[property!(NodesResult, warnings)]);
+}
+
+/// A [`SearchHit`] states `default: []` on `matched_by`.
+pub fn declare_search_hit_empty_defaults(schema: &mut Schema) {
+    use crate::read::SearchHit;
+    declare_empty_array_defaults(schema, &[property!(SearchHit, matched_by)]);
+}
+
+/// A [`SearchResult`](crate::search::SearchResult) states `default: []` on `warnings`.
+pub fn declare_search_result_empty_defaults(schema: &mut Schema) {
+    use crate::search::SearchResult;
+    declare_empty_array_defaults(schema, &[property!(SearchResult, warnings)]);
+}
+
+/// A [`ChangeSummary`](crate::change::ChangeSummary) states `default: []` on `diagnostics`
+/// and `guarantees`. `files` carries its own `minItems: 1` and is never optional, so it
+/// states no default.
+pub fn declare_change_summary_empty_defaults(schema: &mut Schema) {
+    use crate::change::ChangeSummary;
+    declare_empty_array_defaults(
+        schema,
+        &[
+            property!(ChangeSummary, diagnostics),
+            property!(ChangeSummary, guarantees),
+        ],
+    );
+}
+
+/// The `refused` arm of [`ChangeResult`](crate::change::ChangeResult) states `default: []`
+/// on `diagnostics`. `preconditions` carries no default: a refusal's evidence is the
+/// answer, so it is never optional (proven by a same-named test in this module).
+pub fn declare_change_result_empty_defaults(schema: &mut Schema) {
+    const CHANGE_RESULT_TAG: &str = "status";
+    const CHANGE_RESULT_REFUSED: &str = "refused";
+    const REFUSED_DIAGNOSTICS: &str = "diagnostics";
+    if let Some(arm) = tagged_union_arm(schema, CHANGE_RESULT_TAG, CHANGE_RESULT_REFUSED) {
+        annotate_property_in(arm, REFUSED_DIAGNOSTICS, keyword::DEFAULT, json!([]));
+    }
+}
+
+/// A [`Diagnostic`](crate::diagnostic::Diagnostic) states `default: []` on `related` and
+/// `tags`, and `default: {}` on `extensions`.
+pub fn declare_diagnostic_empty_defaults(schema: &mut Schema) {
+    use crate::diagnostic::Diagnostic;
+    declare_empty_array_defaults(
+        schema,
+        &[property!(Diagnostic, related), property!(Diagnostic, tags)],
+    );
+    declare_empty_object_defaults(schema, &[property!(Diagnostic, extensions)]);
+}
+
+/// An [`ErrorData`](crate::error::ErrorData) states `default: []` on `diagnostics` and
+/// `causes`.
+pub fn declare_error_data_empty_defaults(schema: &mut Schema) {
+    use crate::error::ErrorData;
+    declare_empty_array_defaults(
+        schema,
+        &[
+            property!(ErrorData, diagnostics),
+            property!(ErrorData, causes),
+        ],
+    );
+}
+
+/// A [`WorkspaceLanguageSummary`](crate::workspace::WorkspaceLanguageSummary) states
+/// `default: []` on `include` and `exclude`.
+pub fn declare_workspace_language_summary_empty_defaults(schema: &mut Schema) {
+    use crate::workspace::WorkspaceLanguageSummary;
+    declare_empty_array_defaults(
+        schema,
+        &[
+            property!(WorkspaceLanguageSummary, include),
+            property!(WorkspaceLanguageSummary, exclude),
+        ],
+    );
+}
+
+/// A [`WorkspaceHookSummary`](crate::workspace::WorkspaceHookSummary) states `default: []`
+/// on `include` and `exclude`.
+pub fn declare_workspace_hook_summary_empty_defaults(schema: &mut Schema) {
+    use crate::workspace::WorkspaceHookSummary;
+    declare_empty_array_defaults(
+        schema,
+        &[
+            property!(WorkspaceHookSummary, include),
+            property!(WorkspaceHookSummary, exclude),
+        ],
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1114,6 +1342,276 @@ mod tests {
         assert!(
             defs.contains_key("BodySource"),
             "BodySource must be its own $defs entry: {defs:?}"
+        );
+    }
+
+    /// The premise every `declare_*_empty_defaults` function is built on: schemars 1.2.2
+    /// states no `default` keyword for a field whose own `#[serde(default)]` value matches
+    /// its `skip_serializing_if` predicate - the case for every empty collection and every
+    /// `false` boolean this rule targets. Quoted probe output (schemars 1.2.2, this test):
+    /// `{"properties":{"document_local":{"type":"boolean"},"modifiers":{"items":{"type":"string"},"type":"array"}},"type":"object"}`
+    /// - no `required`, no `default`, on either field.
+    #[test]
+    fn schemars_omits_default_when_it_matches_skip_serializing_if() {
+        #[derive(Serialize, schemars::JsonSchema)]
+        struct Probe {
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            modifiers: Vec<String>,
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            document_local: bool,
+        }
+        let schema = serde_json::to_value(schema_for!(Probe)).expect("probe schema");
+        assert_eq!(schema.get(keyword::REQUIRED), None, "{schema:#}");
+        assert_eq!(
+            schema[keyword::PROPERTIES]["modifiers"].get(keyword::DEFAULT),
+            None,
+            "{schema:#}"
+        );
+        assert_eq!(
+            schema[keyword::PROPERTIES]["document_local"].get(keyword::DEFAULT),
+            None,
+            "{schema:#}"
+        );
+    }
+
+    /// One model's schema, and the fields on it expected to carry a stated default.
+    type DefaultCase = (&'static str, Value, Vec<(&'static str, Value)>);
+
+    /// Every field a `declare_*_empty_defaults` transform targets states the `default`
+    /// [`schemars_omits_default_when_it_matches_skip_serializing_if`] proved schemars
+    /// leaves out on its own, and leaves the model's `required` list.
+    fn assert_default_cases(cases: Vec<DefaultCase>) {
+        for (model, schema, fields) in cases {
+            let required: Vec<String> = schema[keyword::REQUIRED]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect();
+            for (name, expected_default) in fields {
+                assert_eq!(
+                    schema[keyword::PROPERTIES][name][keyword::DEFAULT],
+                    expected_default,
+                    "{model}.{name} must advertise default: {expected_default}: {schema:#}"
+                );
+                assert!(
+                    !required.contains(&name.to_owned()),
+                    "{model}.{name} must leave required: {schema:#}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_model_empty_defaults_are_declared() {
+        let array = json!([]);
+        let object = json!({});
+        assert_default_cases(vec![
+            (
+                "File",
+                serde_json::to_value(schema_for!(crate::read::File)).expect("schema"),
+                vec![("languages", array.clone()), ("regions", array.clone())],
+            ),
+            (
+                "Node",
+                serde_json::to_value(schema_for!(crate::read::Node)).expect("schema"),
+                vec![
+                    ("facets", array.clone()),
+                    ("regions", array.clone()),
+                    ("extensions", object.clone()),
+                ],
+            ),
+            (
+                "Symbol",
+                serde_json::to_value(schema_for!(crate::read::Symbol)).expect("schema"),
+                vec![
+                    ("contributions", array.clone()),
+                    ("facets", array.clone()),
+                    ("modifiers", array.clone()),
+                    ("types", array.clone()),
+                    ("signatures", array.clone()),
+                    ("documentation", array.clone()),
+                    ("disagreements", array.clone()),
+                    ("extensions", object.clone()),
+                    ("document_local", json!(false)),
+                ],
+            ),
+            (
+                "Signature",
+                serde_json::to_value(schema_for!(crate::read::Signature)).expect("schema"),
+                vec![
+                    ("links", array.clone()),
+                    ("parameters", array.clone()),
+                    ("returns", array.clone()),
+                    ("type_parameters", array.clone()),
+                    ("throws", array.clone()),
+                    ("effects", array.clone()),
+                    ("extensions", object.clone()),
+                ],
+            ),
+            (
+                "Parameter",
+                serde_json::to_value(schema_for!(crate::read::Parameter)).expect("schema"),
+                vec![("types", array.clone()), ("extensions", object.clone())],
+            ),
+            (
+                "Relationship",
+                serde_json::to_value(schema_for!(crate::read::Relationship)).expect("schema"),
+                vec![("evidence", array.clone()), ("extensions", object.clone())],
+            ),
+            (
+                "TypeExpression",
+                serde_json::to_value(schema_for!(crate::read::TypeExpression)).expect("schema"),
+                vec![("extensions", object)],
+            ),
+            (
+                "GetSymbolResult",
+                serde_json::to_value(schema_for!(crate::read::GetSymbolResult)).expect("schema"),
+                vec![("warnings", array.clone())],
+            ),
+            (
+                "NodesResult",
+                serde_json::to_value(schema_for!(crate::read::NodesResult)).expect("schema"),
+                vec![("warnings", array)],
+            ),
+        ]);
+    }
+
+    #[test]
+    fn search_model_empty_defaults_are_declared() {
+        let array = json!([]);
+        assert_default_cases(vec![
+            (
+                "SearchHit",
+                serde_json::to_value(schema_for!(SearchHit)).expect("schema"),
+                vec![("matched_by", array.clone())],
+            ),
+            (
+                "SearchResult",
+                serde_json::to_value(schema_for!(crate::search::SearchResult)).expect("schema"),
+                vec![("warnings", array)],
+            ),
+        ]);
+    }
+
+    #[test]
+    fn change_and_diagnostic_model_empty_defaults_are_declared() {
+        let array = json!([]);
+        let object = json!({});
+        assert_default_cases(vec![
+            (
+                "ChangeSummary",
+                serde_json::to_value(schema_for!(crate::change::ChangeSummary)).expect("schema"),
+                vec![
+                    ("diagnostics", array.clone()),
+                    ("guarantees", array.clone()),
+                ],
+            ),
+            (
+                "Diagnostic",
+                serde_json::to_value(schema_for!(crate::diagnostic::Diagnostic)).expect("schema"),
+                vec![
+                    ("related", array.clone()),
+                    ("tags", array.clone()),
+                    ("extensions", object),
+                ],
+            ),
+            (
+                "ErrorData",
+                serde_json::to_value(schema_for!(crate::error::ErrorData)).expect("schema"),
+                vec![("diagnostics", array.clone()), ("causes", array)],
+            ),
+        ]);
+    }
+
+    #[test]
+    fn workspace_model_empty_defaults_are_declared() {
+        let array = json!([]);
+        assert_default_cases(vec![
+            (
+                "WorkspaceLanguageSummary",
+                serde_json::to_value(schema_for!(crate::workspace::WorkspaceLanguageSummary))
+                    .expect("schema"),
+                vec![("include", array.clone()), ("exclude", array.clone())],
+            ),
+            (
+                "WorkspaceHookSummary",
+                serde_json::to_value(schema_for!(crate::workspace::WorkspaceHookSummary))
+                    .expect("schema"),
+                vec![("include", array.clone()), ("exclude", array)],
+            ),
+        ]);
+    }
+
+    /// `ChangeSummary.files` and `Relationship.facets` both carry `minItems: 1`, so neither
+    /// is ever empty: they state no `default` and stay in `required`, the deliberate
+    /// exception `declare_change_summary_empty_defaults` and
+    /// `declare_relationship_empty_defaults` leave alone.
+    #[test]
+    fn min_length_one_collections_state_no_default_and_stay_required() {
+        let cases = [
+            (
+                "ChangeSummary",
+                serde_json::to_value(schema_for!(crate::change::ChangeSummary)).expect("schema"),
+                "files",
+            ),
+            (
+                "Relationship",
+                serde_json::to_value(schema_for!(crate::read::Relationship)).expect("schema"),
+                "facets",
+            ),
+        ];
+        for (model, schema, name) in cases {
+            assert_eq!(
+                schema[keyword::PROPERTIES][name].get(keyword::DEFAULT),
+                None,
+                "{model}.{name} must never advertise a default: it is never empty: {schema:#}"
+            );
+            let required = schema[keyword::REQUIRED]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                required.contains(&json!(name)),
+                "{model}.{name} must stay required: {schema:#}"
+            );
+        }
+    }
+
+    /// The `refused` arm of `ChangeResult` states `default: []` on `diagnostics` and
+    /// leaves it out of that arm's `required` list; `preconditions` states no default and
+    /// stays required, because a refusal's evidence is the answer.
+    #[test]
+    fn change_result_refused_arm_states_diagnostics_default_and_no_precondition_default() {
+        let schema =
+            serde_json::to_value(schema_for!(crate::change::ChangeResult)).expect("schema");
+        let arms = schema[keyword::ONE_OF].as_array().expect("oneOf arms");
+        let refused = arms
+            .iter()
+            .find(|arm| arm[keyword::PROPERTIES]["status"][keyword::CONST] == json!("refused"))
+            .expect("a refused arm");
+        assert_eq!(
+            refused[keyword::PROPERTIES]["diagnostics"][keyword::DEFAULT],
+            json!([]),
+            "{refused:#}"
+        );
+        assert_eq!(
+            refused[keyword::PROPERTIES]["preconditions"].get(keyword::DEFAULT),
+            None,
+            "{refused:#}"
+        );
+        let required: Vec<String> = refused[keyword::REQUIRED]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect();
+        assert!(!required.contains(&"diagnostics".to_owned()), "{refused:#}");
+        assert!(
+            required.contains(&"preconditions".to_owned()),
+            "{refused:#}"
         );
     }
 }

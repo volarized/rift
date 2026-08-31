@@ -411,10 +411,10 @@ async fn applied_patch_carries_no_engine_diagnostics() -> TestResult {
     .await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
     assert_eq!(changed_paths(&structured), ["caller.ts"]);
-    assert_eq!(
-        structured["summary"]["diagnostics"],
-        json!([]),
-        "an engine without pull diagnostics stays silent: {structured:#}"
+    assert!(
+        structured["summary"].get("diagnostics").is_none(),
+        "an engine without pull diagnostics stays silent, so diagnostics is omitted: \
+         {structured:#}"
     );
     assert_eq!(
         fs::read_to_string(directory.path().join("caller.ts"))?,
