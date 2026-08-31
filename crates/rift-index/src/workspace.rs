@@ -1367,6 +1367,14 @@ impl WorkspaceIndex {
         self.semantics.relationships()
     }
 
+    /// Whether the binding provider ran for this index. `false` explains an empty
+    /// [`RelationshipStore`] as a disabled capability rather than a workspace with no
+    /// resolved references.
+    #[must_use]
+    pub const fn binding_enabled(&self) -> bool {
+        self.binding.is_enabled()
+    }
+
     /// Assembles readable symbol through its normalized record.
     ///
     /// # Errors
