@@ -3424,6 +3424,7 @@ dependencies = [
  "flate2",
  "fs4",
  "indicatif",
+ "jiff",
  "reqwest",
  "rift-core",
  "rift-index",

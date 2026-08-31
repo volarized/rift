@@ -12,6 +12,10 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use jiff::Timestamp;
+use jiff::fmt::temporal::DateTimePrinter;
+use jiff::tz::TimeZone;
+
 use rift_core::constants::{RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME};
 use rift_core::{CliCode, Error, ErrorContext, ErrorName, Fault};
 use rift_index::{
@@ -44,20 +48,11 @@ const TAIL_COUNT_EXPECTED: &str = "`all`, or a positive integer such as `20`";
 /// What a workspace holding no recorded diagnostics prints on stderr.
 const NO_RECORDED_LOGS: &str = "💤 no server diagnostics recorded for this workspace yet; \
                                 start one with `rift server start`";
-/// Seconds in one minute.
-const SECONDS_PER_MINUTE: i64 = 60;
-/// Minutes in one hour.
-const MINUTES_PER_HOUR: i64 = 60;
-/// Milliseconds in one second.
-const MILLISECONDS_PER_SECOND: i64 = 1_000;
-/// Milliseconds in one minute.
-const MILLISECONDS_PER_MINUTE: i64 = 60_000;
-/// Milliseconds in one hour.
-const MILLISECONDS_PER_HOUR: i64 = 3_600_000;
-/// Milliseconds in one day, the span a rendered timestamp splits its date from.
-const MILLISECONDS_PER_DAY: i64 = 86_400_000;
-/// Days between the proleptic Gregorian era's first day and the Unix epoch.
-const EPOCH_DAY_IN_ERA: i64 = 719_468;
+/// Renders a logged instant with exactly 3 fractional-second digits.
+///
+/// `DateTimePrinter::new` and `precision` are both `const fn`, so the
+/// configured printer is a compile-time value shared by every render.
+const TIMESTAMP_PRINTER: DateTimePrinter = DateTimePrinter::new().precision(Some(3));
 
 /// Failure while running one `rift server` command.
 pub(super) type ServerCommandError = Error<ServerCommandFault>;
@@ -387,7 +382,8 @@ pub(super) async fn run(
             component,
         } => {
             let query = logs_query(tail, since, level, component.as_deref());
-            print_logs(root, &query, tail, &logs_mode(follow))
+            let time_zone = TimeZone::system();
+            print_logs(root, &query, tail, &logs_mode(follow), &time_zone)
                 .await
                 .map(|()| None)
         }
@@ -709,6 +705,7 @@ async fn print_logs(
     query: &LogQuery,
     tail: TailCount,
     mode: &LogsMode,
+    time_zone: &TimeZone,
 ) -> Result<(), ServerCommandError> {
     let database = root
         .join(RIFT_STATE_DIRECTORY)
@@ -723,12 +720,12 @@ async fn print_logs(
         }));
     };
     let printed = match tail {
-        TailCount::All => print_records_after(&store, query, 0).await?,
-        TailCount::Newest(_) => print_newest_records(&store, query).await?,
+        TailCount::All => print_records_after(&store, query, 0, time_zone).await?,
+        TailCount::Newest(_) => print_newest_records(&store, query, time_zone).await?,
     };
     match mode {
         LogsMode::Once => Ok(()),
-        LogsMode::Following => follow_records(&store, query, printed).await,
+        LogsMode::Following => follow_records(&store, query, printed, time_zone).await,
     }
 }
 
@@ -742,6 +739,7 @@ async fn print_records_after(
     store: &LogStore,
     query: &LogQuery,
     after: i64,
+    time_zone: &TimeZone,
 ) -> Result<i64, ServerCommandError> {
     let mut newest = after;
     loop {
@@ -750,7 +748,7 @@ async fn print_records_after(
             .await
             .map_err(logs_unavailable)?;
         for stored in &page {
-            let line = rendered_record(stored);
+            let line = rendered_record(stored, time_zone);
             println!("{line}");
             newest = stored.identity();
         }
@@ -765,12 +763,13 @@ async fn print_records_after(
 async fn print_newest_records(
     store: &LogStore,
     query: &LogQuery,
+    time_zone: &TimeZone,
 ) -> Result<i64, ServerCommandError> {
     let mut records = store.recent(query).await.map_err(logs_unavailable)?;
     records.reverse();
     let mut newest = 0;
     for stored in &records {
-        let line = rendered_record(stored);
+        let line = rendered_record(stored, time_zone);
         println!("{line}");
         newest = stored.identity();
     }
@@ -782,10 +781,11 @@ async fn follow_records(
     store: &LogStore,
     query: &LogQuery,
     printed: i64,
+    time_zone: &TimeZone,
 ) -> Result<(), ServerCommandError> {
     let interrupted = CancellationToken::new();
     let interrupt = tokio::spawn(cancel_on_interrupt(interrupted.clone()));
-    let followed = follow_until_interrupt(store, query, printed, &interrupted).await;
+    let followed = follow_until_interrupt(store, query, printed, &interrupted, time_zone).await;
     interrupt.abort();
     let _ = interrupt.await;
     followed
@@ -801,10 +801,11 @@ async fn follow_until_interrupt(
     query: &LogQuery,
     printed: i64,
     interrupted: &CancellationToken,
+    time_zone: &TimeZone,
 ) -> Result<(), ServerCommandError> {
     let mut newest = printed;
     while !interrupted.is_cancelled() {
-        newest = print_records_after(store, query, newest).await?;
+        newest = print_records_after(store, query, newest, time_zone).await?;
         tokio::select! {
             () = interrupted.cancelled() => {}
             () = tokio::time::sleep(LOG_FOLLOW_POLL_INTERVAL) => {}
@@ -821,14 +822,14 @@ fn logs_unavailable(source: LexicalIndexError) -> ServerCommandError {
 }
 
 /// One stored record as one printed line.
-fn rendered_record(stored: &StoredLogRecord) -> String {
-    rendered_line(stored.record())
+fn rendered_record(stored: &StoredLogRecord, time_zone: &TimeZone) -> String {
+    rendered_line(stored.record(), time_zone)
 }
 
 /// One record as the operator reads it: when it happened, how severe it was,
 /// where it came from, what it said, and the fields it carried.
-fn rendered_line(record: &LogRecord) -> String {
-    let timestamp = rendered_timestamp(record.recorded_at_ms());
+fn rendered_line(record: &LogRecord, time_zone: &TimeZone) -> String {
+    let timestamp = rendered_timestamp(record.recorded_at_ms(), time_zone);
     let glyph = level_glyph(record.level());
     let level = record.level().to_uppercase();
     let component = label(record.component());
@@ -882,36 +883,19 @@ fn rendered_value(value: &Value) -> String {
     }
 }
 
-/// One recorded instant as an RFC 3339 UTC timestamp with milliseconds.
+/// One recorded instant as an RFC 3339 timestamp in `time_zone`'s local offset.
 ///
-/// The arithmetic is integer and the calendar proleptic Gregorian: a printed
-/// record needs no time zone, and the workspace carries no date library.
-fn rendered_timestamp(recorded_at_ms: i64) -> String {
-    let (year, month, day) = civil_date(recorded_at_ms.div_euclid(MILLISECONDS_PER_DAY));
-    let time_of_day_ms = recorded_at_ms.rem_euclid(MILLISECONDS_PER_DAY);
-    let hour = time_of_day_ms / MILLISECONDS_PER_HOUR;
-    let minute = time_of_day_ms / MILLISECONDS_PER_MINUTE % MINUTES_PER_HOUR;
-    let second = time_of_day_ms / MILLISECONDS_PER_SECOND % SECONDS_PER_MINUTE;
-    let millisecond = time_of_day_ms % MILLISECONDS_PER_SECOND;
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millisecond:03}Z")
-}
-
-/// The proleptic Gregorian year, month, and day `days` after the Unix epoch.
-///
-/// Howard Hinnant's `civil_from_days`, with floor division where the algorithm
-/// asks for it, so a day before the epoch answers as exactly as one after.
-fn civil_date(days: i64) -> (i64, i64, i64) {
-    let shifted = days + EPOCH_DAY_IN_ERA;
-    let era = shifted.div_euclid(146_097);
-    let day_of_era = shifted.rem_euclid(146_097);
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let shifted_month = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
-    let month = shifted_month + if shifted_month < 10 { 3 } else { -9 };
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
-    (year, month, day)
+/// Local offset needs the tz database; jiff owns both parsing the recorded
+/// millisecond count and rendering it, with exactly 3 fractional digits and
+/// a numeric offset - never `Z`, since the offset is always known here. A
+/// millisecond count outside jiff's representable range falls back to the
+/// raw count instead of panicking.
+fn rendered_timestamp(recorded_at_ms: i64, time_zone: &TimeZone) -> String {
+    let Ok(timestamp) = Timestamp::from_millisecond(recorded_at_ms) else {
+        return recorded_at_ms.to_string();
+    };
+    let offset = time_zone.to_offset(timestamp);
+    TIMESTAMP_PRINTER.timestamp_with_offset_to_string(&timestamp, offset)
 }
 
 /// Milliseconds since the Unix epoch, or zero on a clock before it.
@@ -936,19 +920,22 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{
-        LogLevel, LogsMode, MILLISECONDS_PER_HOUR, PRESENCE_POLL_INTERVAL,
-        START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, STOP_POLL_ATTEMPT_COUNT, STOP_WAIT_MAX,
-        ServerCommandFault, ServerOutcome, StaleReason, StartMode, TailCount, await_serving,
-        await_stopped, civil_date, discard_stale_document, foreground_refused, holder_evidence,
-        label, level_glyph, logs_mode, logs_query, logs_unavailable, now_ms, print_logs,
-        rendered_fields, rendered_line, rendered_timestamp, stale_reason_phrase, start_mode,
-        status, stop, stop_log_drain,
+        LogLevel, LogsMode, PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX,
+        STOP_POLL_ATTEMPT_COUNT, STOP_WAIT_MAX, ServerCommandFault, ServerOutcome, StaleReason,
+        StartMode, TailCount, await_serving, await_stopped, discard_stale_document,
+        foreground_refused, holder_evidence, label, level_glyph, logs_mode, logs_query,
+        logs_unavailable, now_ms, print_logs, rendered_fields, rendered_line, rendered_timestamp,
+        stale_reason_phrase, start_mode, status, stop, stop_log_drain,
     };
+    use jiff::tz::{Offset, TimeZone};
     use rift_core::Error;
     use rift_index::{
         LOG_BATCH_RECORDS_MAX, LOG_LEVELS, LOG_PAGE_RECORDS_MAX, LogRecord, LogStore,
     };
     use rift_protocol::lock::{ProductIdentity, ServerLock, ServerLockViolation};
+
+    /// Milliseconds in one hour, for fixture instants only.
+    const MILLISECONDS_PER_HOUR: i64 = 3_600_000;
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -1533,7 +1520,14 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let query = logs_query(TailCount::All, None, None, None);
 
-        print_logs(directory.path(), &query, TailCount::All, &LogsMode::Once).await?;
+        print_logs(
+            directory.path(),
+            &query,
+            TailCount::All,
+            &LogsMode::Once,
+            &TimeZone::UTC,
+        )
+        .await?;
 
         assert!(
             !directory.path().join(".rift").exists(),
@@ -1590,8 +1584,8 @@ mod tests {
         );
 
         assert_eq!(
-            rendered_line(&record),
-            "2025-08-30T11:22:24.123Z 🔵 INFO  index    rebuild      \
+            rendered_line(&record, &TimeZone::UTC),
+            "2025-08-30T11:22:24.123+00:00 🔵 INFO  index    rebuild      \
              published 412 units unit_count=412"
         );
     }
@@ -1601,8 +1595,8 @@ mod tests {
         let record = LogRecord::new(0, "warn", "rift", "", "", "late", "{}");
 
         assert_eq!(
-            rendered_line(&record),
-            "1970-01-01T00:00:00.000Z 🟡 WARN  -        -            late"
+            rendered_line(&record, &TimeZone::UTC),
+            "1970-01-01T00:00:00.000+00:00 🟡 WARN  -        -            late"
         );
         assert_eq!(label(""), "-");
         assert_eq!(label("index"), "index");
@@ -1635,14 +1629,51 @@ mod tests {
     }
 
     #[test]
-    fn timestamps_render_in_utc_with_milliseconds() {
-        assert_eq!(rendered_timestamp(0), "1970-01-01T00:00:00.000Z");
+    fn rendered_timestamp_uses_the_given_time_zones_offset() {
         assert_eq!(
-            rendered_timestamp(1_756_552_944_123),
-            "2025-08-30T11:22:24.123Z"
+            rendered_timestamp(0, &TimeZone::UTC),
+            "1970-01-01T00:00:00.000+00:00"
         );
-        assert_eq!(rendered_timestamp(-1), "1969-12-31T23:59:59.999Z");
-        assert_eq!(civil_date(0), (1970, 1, 1));
-        assert_eq!(civil_date(-1), (1969, 12, 31));
+        assert_eq!(
+            rendered_timestamp(-1, &TimeZone::UTC),
+            "1969-12-31T23:59:59.999+00:00"
+        );
+
+        let positive = TimeZone::fixed(Offset::from_hours(2).expect("+2h must be a valid offset"));
+        assert_eq!(
+            rendered_timestamp(1_756_552_944_123, &positive),
+            "2025-08-30T13:22:24.123+02:00"
+        );
+
+        let negative = TimeZone::fixed(Offset::from_hours(-5).expect("-5h must be a valid offset"));
+        assert_eq!(
+            rendered_timestamp(1_756_552_944_123, &negative),
+            "2025-08-30T06:22:24.123-05:00"
+        );
+
+        let berlin =
+            TimeZone::get("Europe/Berlin").expect("the tz database must carry Europe/Berlin");
+        assert_eq!(
+            rendered_timestamp(1_756_552_944_123, &berlin),
+            "2025-08-30T13:22:24.123+02:00",
+            "August is daylight saving time in Berlin, CEST"
+        );
+        assert_eq!(
+            rendered_timestamp(1_736_940_144_123, &berlin),
+            "2025-01-15T12:22:24.123+01:00",
+            "January is standard time in Berlin, CET"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_millisecond_count_falls_back_to_the_raw_count() {
+        assert_eq!(
+            rendered_timestamp(i64::MAX, &TimeZone::UTC),
+            i64::MAX.to_string()
+        );
+        assert_eq!(
+            rendered_timestamp(i64::MIN, &TimeZone::UTC),
+            i64::MIN.to_string()
+        );
     }
 }
