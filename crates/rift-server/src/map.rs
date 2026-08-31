@@ -254,18 +254,16 @@ fn hubs(graph: &NormalizedGraph) -> Vec<MapHub> {
         if hubs.len() >= MAP_HUBS_MAX {
             break;
         }
-        let Some(assembled) = records_by_identity
+        let Some(kind) = records_by_identity
             .get(&identity)
             .and_then(|record| SymbolAssembler::assemble(graph, record, &precedence))
+            .and_then(|assembled| assembled.facts().map(|facts| facts.kind().clone()))
         else {
-            continue;
-        };
-        let Some(facts) = assembled.facts() else {
             continue;
         };
         hubs.push(MapHub {
             symbol: SymbolId(identity.as_str().to_owned()),
-            kind: facts.kind().clone(),
+            kind,
             references,
         });
     }
@@ -526,6 +524,119 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&first)?,
             serde_json::to_string(&second)?
+        );
+        Ok(())
+    }
+
+    /// Builds one normalized graph by hand: `holder` declares portable facts and references
+    /// `ghost`, whose only contribution carries an identity anchor and no facts. The graph
+    /// then resolves `ghost` as a reference target the hub ranking must skip.
+    #[test]
+    fn hubs_skip_a_resolved_target_whose_record_carries_no_portable_facts() -> TestResult {
+        use std::sync::Arc;
+
+        use rift_core::{
+            Contribution, ContributionKey, ContributionOrigin, ContributionReference,
+            DeclarationBinding, ExactKind, IndexRevision, Language, PortableSymbolFacts,
+            ProviderId, ProviderRevision, ProviderSymbolId, ReferenceRole, SemanticReference,
+            SourceApplicability, SourceKind, SourceLocation, SourcePath, SourceRange,
+            SourceResolverId, SourceRevision, SourceUnitId, SymbolId, TreeRevision,
+        };
+        use rift_provider::{
+            NormalizedTarget, Normalizer, ProviderPublication, PublicationLimits, PublicationSet,
+        };
+
+        let provider = ProviderId::new("syntax")?;
+        let key = |symbol: &str| -> Result<ContributionKey, Box<dyn Error>> {
+            Ok(ContributionKey::new(
+                provider.clone(),
+                ProviderRevision::new(1)?,
+                ProviderSymbolId::new(symbol)?,
+            ))
+        };
+        let unit = SourceUnitId::new(
+            SourceResolverId::new("project")?,
+            SourcePath::new("src/lib.rs")?,
+        )?;
+        let applicability = SourceApplicability::Exact {
+            source_revision: SourceRevision::new(1)?,
+            tree_revision: TreeRevision::new(1)?,
+        };
+        let origin = ContributionOrigin::new(
+            Some(SourceLocation::Project { package: None }),
+            SourceKind::Authored,
+        )?;
+        let holder_identity = "rift://symbol/rust/src/lib.rs/holder";
+        let ghost_identity = SymbolId::new("rift://symbol/rust/src/lib.rs/ghost")?;
+        let holder = Contribution::builder(
+            key("holder")?,
+            applicability.clone(),
+            PortableSymbolFacts::new(
+                Language {
+                    name: "rust".to_owned(),
+                    dialect: None,
+                },
+                holder_identity,
+                holder_identity,
+                ExactKind("rust.function".to_owned()),
+            ),
+            origin.clone(),
+        )
+        .source(DeclarationBinding::new(
+            unit.clone(),
+            SourceRange::new(0, 40)?,
+            None,
+        ))
+        .identity_anchor(SymbolId::new(holder_identity)?)
+        .build()?;
+        let ghost =
+            Contribution::fact_builder(key("ghost")?, applicability.clone(), origin.clone())
+                .source(DeclarationBinding::new(
+                    unit.clone(),
+                    SourceRange::new(50, 60)?,
+                    None,
+                ))
+                .identity_anchor(ghost_identity.clone())
+                .build()?;
+        let reference = Contribution::fact_builder(key("holder_ref_ghost")?, applicability, origin)
+            .references(vec![SemanticReference::new(
+                DeclarationBinding::new(unit, SourceRange::new(10, 15)?, None),
+                ReferenceRole::Call,
+                vec![ContributionReference::new(
+                    provider.clone(),
+                    ProviderSymbolId::new("ghost")?,
+                )],
+            )?])
+            .build()?;
+        let publication = ProviderPublication::new(
+            provider,
+            ProviderRevision::new(1)?,
+            vec![holder, ghost, reference],
+            PublicationLimits::default(),
+        )?;
+        let publications =
+            Arc::new(PublicationSet::empty(PublicationLimits::default()).replaced(publication)?);
+        let graph = Normalizer::normalize(
+            IndexRevision::new(1)?,
+            SourceRevision::new(1)?,
+            TreeRevision::new(1)?,
+            &publications,
+            None,
+        )?;
+
+        let ghost_resolved = graph.references().iter().any(|reference| {
+            reference.targets().iter().any(
+                |target| matches!(target, NormalizedTarget::Symbol(id) if id == &ghost_identity),
+            )
+        });
+        assert!(
+            ghost_resolved,
+            "the ghost target must resolve to an established identity so the skip arm runs"
+        );
+        let hubs = super::hubs(&graph);
+        assert!(
+            hubs.iter().all(|hub| !hub.symbol.0.ends_with("/ghost")),
+            "a record with no portable facts never ranks as a hub: hubs={hubs:?}"
         );
         Ok(())
     }
