@@ -296,6 +296,7 @@ fn docs(index: &WorkspaceIndex) -> Vec<ProjectPath> {
 #[cfg(test)]
 mod tests {
     use std::error::Error;
+    use std::fmt::Write as _;
     use std::fs;
 
     use rift_core::SourceVisibility;
@@ -404,12 +405,12 @@ mod tests {
         fs::create_dir_all(directory.path().join("src"))?;
         let mut source = String::new();
         for index in 0..25 {
-            source.push_str(&format!("pub fn callee_{index:02}() {{}}\n"));
+            writeln!(source, "pub fn callee_{index:02}() {{}}")?;
         }
         source
             .push_str("pub fn caller() {\n    let local = 1;\n    let doubled = local + local;\n");
         for index in 0..25 {
-            source.push_str(&format!("    callee_{index:02}();\n"));
+            writeln!(source, "    callee_{index:02}();")?;
         }
         source.push_str("    assert!(doubled > 0);\n}\n");
         fs::write(directory.path().join("src/lib.rs"), source)?;
