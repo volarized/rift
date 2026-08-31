@@ -9,6 +9,20 @@ include = []
 exclude = [".claude/**", ".agents/**", "docs/public/**"]
 respect_gitignore = true
 
+# The name binding provider and the semantic ranking both run by default; the explicit
+# tables pin that intent so a future default change cannot silently drop either capability.
+[providers.binding]
+enabled = true
+
+[search.semantic]
+disabled = false
+
+# Text indexing defaults to every unclaimed visible file. The list keeps docs, scripts,
+# and tooling text searchable while the lockfiles stay out: a lockfile hit restates a
+# manifest entry the same answer already carries.
+[search.text]
+include = ["**/*.mdx", "**/*.py", "**/*.mjs", "**/*.css", "**/*.jsonc", "justfile"]
+
 # Each process serves one exact language, so its table belongs to that language entry.
 # The toolchain pin keeps rust-analyzer on the version `rust-toolchain.toml` names.
 [languages.rust.lsp]
