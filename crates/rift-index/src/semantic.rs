@@ -14,7 +14,8 @@ use rift_core::{
 use rift_protocol::configuration::BindingConfiguration;
 use rift_protocol::read::Language;
 use rift_provider::{
-    AssembledSymbol, NormalizedGraph, Normalizer, PublicationError, PublicationLimits,
+    AssembledSymbol, CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT, CONTRIBUTIONS_TOTAL_MAX_DEFAULT,
+    NormalizedGraph, Normalizer, PROVIDERS_MAX_DEFAULT, PublicationError, PublicationLimits,
     PublicationSet, SymbolAssembler,
 };
 use rift_syntax::{
@@ -126,7 +127,7 @@ impl WorkspaceSemantics {
         let source_revision = SourceRevision::new(revision)?;
         let tree_revision = TreeRevision::new(revision)?;
         let provider_revision = ProviderRevision::new(revision)?;
-        let limits = PublicationLimits::default();
+        let limits = publication_limits(binding)?;
         let documents: Vec<&SyntaxDocument> = documents.into_iter().collect();
         let mut builder = SyntaxPublicationBuilder::new(
             provider_revision,
@@ -181,11 +182,34 @@ impl WorkspaceSemantics {
     }
 }
 
+/// Publication bounds sized so the configured binding graph fits beside syntax.
+///
+/// The binding provider publishes one Contribution per graph node, and the
+/// graph is already bounded by `[providers.binding] max_graph_nodes`; the
+/// per-provider bound follows that configured bound so acceptance cannot
+/// refuse work the graph bounds admit. The total keeps one default of
+/// headroom for the syntax publication.
+fn publication_limits(
+    binding: &BindingPolicy,
+) -> Result<PublicationLimits, WorkspaceSemanticError> {
+    let per_provider =
+        CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT.max(binding.limits().graph_nodes_max());
+    let total = CONTRIBUTIONS_TOTAL_MAX_DEFAULT
+        .max(per_provider.saturating_add(CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT));
+    Ok(PublicationLimits::new(
+        PROVIDERS_MAX_DEFAULT,
+        per_provider,
+        total,
+    )?)
+}
+
 /// Adds the binding provider's publication beside syntax, keeping syntax alone on failure.
 ///
-/// The failure is recorded as a `tracing` warning naming the cause, so the operator
-/// can raise the breached `[providers.binding]` bound; the returned set is the one
-/// the caller handed in.
+/// The failure is recorded as a `tracing` warning naming the cause. Publication
+/// derives its per-provider bound from `[providers.binding] max_graph_nodes`
+/// (see `publication_limits`), so raising that key also raises the bound that
+/// would otherwise refuse the graph it admits; the returned set is the one the
+/// caller handed in.
 fn with_binding(
     publications: PublicationSet,
     documents: &[&SyntaxDocument],
@@ -619,5 +643,63 @@ mod tests {
         assert!(matches!(error, WorkspaceSemanticError::Syntax(_)));
         assert!(!error.to_string().is_empty());
         assert!(std::error::Error::source(&error).is_some());
+    }
+
+    /// Default binding limits exceed the publication default, so the graph bound wins.
+    #[test]
+    fn test_publication_limits_default_policy_follows_the_graph_node_default() {
+        let policy = BindingPolicy::default();
+        let derived = super::publication_limits(&policy).expect("derived limits");
+        assert_eq!(
+            derived.contributions_per_provider_max(),
+            rift_binding::GRAPH_NODES_MAX_DEFAULT,
+            "the default binding graph bound exceeds the publication default"
+        );
+        assert_eq!(
+            derived.contributions_total_max(),
+            rift_binding::GRAPH_NODES_MAX_DEFAULT
+                + rift_provider::CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT
+        );
+    }
+
+    /// A graph bound below the publication default keeps the publication floor.
+    #[test]
+    fn test_publication_limits_small_graph_bound_keeps_the_publication_floor() {
+        let limits = rift_binding::BindingLimits::builder()
+            .graph_nodes_max(10)
+            .build()
+            .expect("small graph bound accepted");
+        let policy = BindingPolicy::new(true, limits);
+        let derived = super::publication_limits(&policy).expect("derived limits");
+        assert_eq!(
+            derived.contributions_per_provider_max(),
+            rift_provider::CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT,
+            "a graph bound below the publication default keeps the publication floor"
+        );
+        assert_eq!(
+            derived.contributions_total_max(),
+            rift_provider::CONTRIBUTIONS_TOTAL_MAX_DEFAULT,
+            "the summed bound also stays below the total floor"
+        );
+    }
+
+    /// Acceptance can never refuse work the configured graph bound admits.
+    #[test]
+    fn test_publication_limits_per_provider_bound_never_undercuts_the_graph_bound() {
+        let cases = [
+            rift_binding::BindingLimits::default(),
+            rift_binding::BindingLimits::builder()
+                .graph_nodes_max(10)
+                .build()
+                .expect("small graph bound accepted"),
+        ];
+        for limits in cases {
+            let policy = BindingPolicy::new(true, limits);
+            let derived = super::publication_limits(&policy).expect("derived limits");
+            assert!(
+                derived.contributions_per_provider_max() >= policy.limits().graph_nodes_max(),
+                "publication acceptance must not refuse work the graph bounds admit"
+            );
+        }
     }
 }

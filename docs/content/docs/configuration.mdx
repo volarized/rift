@@ -416,6 +416,9 @@ bounded work queue; each bound caps one phase of that work:
 - `max_publication_work` bounds the work items one build may enqueue across every reference,
   1 to 5000000000
 
+The index's publication acceptance follows `max_graph_nodes` too: raising it also raises the
+bound on what one build can publish beside syntax.
+
 An exhausted bound never fails a build: the revision publishes with the syntax facts alone,
 and the breach lands in the server log naming the bound.
 
