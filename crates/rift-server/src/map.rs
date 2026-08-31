@@ -531,8 +531,7 @@ mod tests {
     /// Builds one normalized graph by hand: `holder` declares portable facts and references
     /// `ghost`, whose only contribution carries an identity anchor and no facts. The graph
     /// then resolves `ghost` as a reference target the hub ranking must skip.
-    #[test]
-    fn hubs_skip_a_resolved_target_whose_record_carries_no_portable_facts() -> TestResult {
+    fn fact_less_target_graph() -> TestResult<rift_provider::NormalizedGraph> {
         use std::sync::Arc;
 
         use rift_core::{
@@ -542,9 +541,7 @@ mod tests {
             SourceApplicability, SourceKind, SourceLocation, SourcePath, SourceRange,
             SourceResolverId, SourceRevision, SourceUnitId, SymbolId, TreeRevision,
         };
-        use rift_provider::{
-            NormalizedTarget, Normalizer, ProviderPublication, PublicationLimits, PublicationSet,
-        };
+        use rift_provider::{Normalizer, ProviderPublication, PublicationLimits, PublicationSet};
 
         let provider = ProviderId::new("syntax")?;
         let key = |symbol: &str| -> Result<ContributionKey, Box<dyn Error>> {
@@ -570,7 +567,7 @@ mod tests {
         let ghost_identity = SymbolId::new("rift://symbol/rust/src/lib.rs/ghost")?;
         let holder = Contribution::builder(
             key("holder")?,
-            applicability.clone(),
+            applicability,
             PortableSymbolFacts::new(
                 Language {
                     name: "rust".to_owned(),
@@ -589,15 +586,14 @@ mod tests {
         ))
         .identity_anchor(SymbolId::new(holder_identity)?)
         .build()?;
-        let ghost =
-            Contribution::fact_builder(key("ghost")?, applicability.clone(), origin.clone())
-                .source(DeclarationBinding::new(
-                    unit.clone(),
-                    SourceRange::new(50, 60)?,
-                    None,
-                ))
-                .identity_anchor(ghost_identity.clone())
-                .build()?;
+        let ghost = Contribution::fact_builder(key("ghost")?, applicability, origin.clone())
+            .source(DeclarationBinding::new(
+                unit.clone(),
+                SourceRange::new(50, 60)?,
+                None,
+            ))
+            .identity_anchor(ghost_identity.clone())
+            .build()?;
         let reference = Contribution::fact_builder(key("holder_ref_ghost")?, applicability, origin)
             .references(vec![SemanticReference::new(
                 DeclarationBinding::new(unit, SourceRange::new(10, 15)?, None),
@@ -623,7 +619,15 @@ mod tests {
             &publications,
             None,
         )?;
+        Ok(graph)
+    }
 
+    #[test]
+    fn hubs_skip_a_resolved_target_whose_record_carries_no_portable_facts() -> TestResult {
+        use rift_provider::NormalizedTarget;
+
+        let graph = fact_less_target_graph()?;
+        let ghost_identity = rift_core::SymbolId::new("rift://symbol/rust/src/lib.rs/ghost")?;
         let ghost_resolved = graph.references().iter().any(|reference| {
             reference.targets().iter().any(
                 |target| matches!(target, NormalizedTarget::Symbol(id) if id == &ghost_identity),
