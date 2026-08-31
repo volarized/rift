@@ -81,9 +81,7 @@ A workspace with no git repository refuses a revision read and names the remedy:
   "code": "capability_unavailable",
   "message": "no configured provider serves this request: workspace /Users/alice/projects/charming-aurora, requires a git repository - run `git init`, or omit `rev` to read the current tree; adjust the request to a served capability, or configure a provider that serves it",
   "retry": "operator_action",
-  "phase": "read",
-  "diagnostics": [],
-  "causes": []
+  "phase": "read"
 }
 ```
 
@@ -166,18 +164,11 @@ hit. The ranked lane placed it, so the hit is tagged `matched_by: ["ranked"]`, n
       "kind": "rust.function",
       "facets": ["value", "callable", "public"],
       "origin": {
-        "location": { "kind": "project", "package": null },
+        "location": { "kind": "project" },
         "source_kind": "authored",
         "unit": "rift://source/project/crates/rift-core/src/identity.rs"
       },
-      "container": null,
-      "modifiers": [],
-      "visibility": "pub",
-      "types": [],
-      "signatures": [],
-      "documentation": [],
-      "extensions": {},
-      "document_local": false
+      "visibility": "pub"
     }
   },
   "score": 0.31,
@@ -213,8 +204,6 @@ of those files returns as a `file` hit, tagged
     "file": {
       "id": "rift://file/README.md",
       "content": { "kind": "regular", "size": 3546, "executable": false },
-      "languages": [],
-      "regions": [],
       "semantic": false
     }
   },
@@ -480,8 +469,7 @@ still standing. A `replace_node` whose listing went stale shows the shape:
       "expected": { "kind": "text", "value": "3f9a1c2e" },
       "observed": { "kind": "text", "value": "b81d02aa" }
     }
-  ],
-  "diagnostics": []
+  ]
 }
 ```
 
