@@ -131,13 +131,13 @@ pub enum PreconditionAddress {
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
 pub enum OperationPreconditionKind {
-    /// Wire value `target_exists`.
+    /// Whether the addressed file or declaration exists.
     #[serde(rename = "target_exists")]
     TargetExists,
-    /// Wire value `source_unchanged`.
+    /// Whether the addressed bytes still match the witness or patch context supplied.
     #[serde(rename = "source_unchanged")]
     SourceUnchanged,
-    /// Wire value `no_references`.
+    /// Whether the addressed declaration has no standing references.
     #[serde(rename = "no_references")]
     NoReferences,
     /// Wire value `body_readable`. The failed entry names the [`BodySource`] `file`

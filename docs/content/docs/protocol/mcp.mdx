@@ -47,6 +47,22 @@ Every read result also carries `warnings`. A `stale_index` warning reports an an
 from an index that lags the tree the read captured, and names the two tree revision digests that
 disagree.
 
+Three more warnings cover the search ranking tiers:
+
+- `semantic_index_preparing` - the semantic ranking is still being built. A query sharing no
+  token with the code it describes reaches nothing until every declaration carries a vector;
+  `prepared` and `total` state how far that has got.
+- `semantic_ranking_unavailable` - the semantic ranking will not answer for the life of this
+  server: the model weights could not be acquired, or the model failed to load.
+- `lexical_ranking_unavailable` - the full-text tier failed to load or holds no indexed tree.
+  Ranking falls back to identifier matching, so a query phrased as prose finds nothing; the
+  tier is read under the answer's own tree revision, so one holding another tree is recaptured
+  rather than warned about, a case a caller cannot otherwise tell apart from a tier that
+  searched and found nothing.
+
+A `symbol_disagreement` warning names a symbol whose selected presentation and at least one
+provider's own facts disagree.
+
 Every read carries an optional `rev`, and reads the workspace tree when it is absent.
 
 ### Revision-addressed reads [#revision-reads]

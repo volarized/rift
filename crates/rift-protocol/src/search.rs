@@ -195,8 +195,8 @@ pub struct SearchHit {
     /// a hit whose only location is a dependency or standard-library source unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<ProjectPath>,
-    /// Shortest relationship path from `traversal.seed` to this hit. Present whenever the
-    /// traversal reached the hit, including a hit also matched lexically.
+    /// Shortest relationship path to this hit, present when a traversal reached it,
+    /// including a hit also matched lexically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = 2))]
     pub traversal_path: Option<Vec<GraphHop>>,
