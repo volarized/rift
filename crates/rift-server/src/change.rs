@@ -1557,6 +1557,7 @@ mod tests {
             &SourceVisibility::default(),
             &rift_core::TextFileInclusion::default(),
             &LanguageFileSelections::from(configuration),
+            rift_index::BindingPolicy::default(),
             HistoryConfiguration::default(),
         )
     }

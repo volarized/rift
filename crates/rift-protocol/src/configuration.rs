@@ -64,6 +64,27 @@ pub const EXECUTION_OUTPUT_BYTES_MAX: u64 = 16 << 10;
 pub const EXECUTION_CONCURRENT_MAX: u64 = 64;
 /// Revisions the history provider may walk from the current head, at most.
 pub const HISTORY_REVISIONS_MAX: u64 = 100_000;
+/// Scopes one source unit may contribute to the binding provider, at most.
+pub const BINDING_UNIT_SCOPES_MAX: u64 = 40_960;
+/// Definitions one source unit may contribute to the binding provider, at most.
+pub const BINDING_UNIT_DEFINITIONS_MAX: u64 = 163_840;
+/// References one source unit may contribute to the binding provider, at most.
+pub const BINDING_UNIT_REFERENCES_MAX: u64 = 655_360;
+/// Links one source unit may contribute to the binding provider, at most.
+pub const BINDING_UNIT_LINKS_MAX: u64 = 40_960;
+/// Scopes, definitions, and references one binding graph may hold together, at most.
+pub const BINDING_GRAPH_NODES_MAX: u64 = 20_000_000;
+/// Links one binding graph may hold, at most.
+pub const BINDING_GRAPH_LINKS_MAX: u64 = 5_000_000;
+/// Work items one reference may enqueue during binding resolution, at most.
+pub const BINDING_REFERENCE_WORK_MAX: u64 = 409_600;
+/// Steps one binding resolution work item may accumulate, at most.
+pub const BINDING_PATH_DEPTH_MAX: u64 = 640;
+/// Definitions one reference may resolve to, at most: the reference facts one
+/// Contribution carries.
+pub const BINDING_REFERENCE_TARGETS_MAX: u64 = 256;
+/// Work items one binding publication may enqueue across every reference, at most.
+pub const BINDING_PUBLICATION_WORK_MAX: u64 = 5_000_000_000;
 /// Bytes `search.semantic.model` may hold, at most.
 pub const SEMANTIC_MODEL_BYTES_MAX: usize = 128;
 /// Configured hooks one workspace may declare, at most.
@@ -426,6 +447,7 @@ impl WorkspaceConfiguration {
             .violation()
             .or_else(|| self.execution.violation())
             .or_else(|| self.providers.history.violation())
+            .or_else(|| self.providers.binding.violation())
             .or_else(|| self.search.violation())
             .or_else(|| self.source.violation())
             .or_else(|| self.logs.violation())
@@ -658,6 +680,8 @@ impl LogsConfiguration {
 pub struct ProvidersConfiguration {
     /// The history provider's budget.
     pub history: HistoryConfiguration,
+    /// The binding provider's switch and bounds.
+    pub binding: BindingConfiguration,
 }
 
 /// The `[providers.history]` table. The history provider's cost scales with
@@ -689,6 +713,128 @@ impl HistoryConfiguration {
             1,
             HISTORY_REVISIONS_MAX,
         )
+    }
+}
+
+/// The `[providers.binding]` table. The binding provider maps references to the
+/// definitions they can name from syntax facts alone; each phase of that work runs
+/// under one of these bounds, and a build that breaches a bound keeps the prior
+/// binding publication.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BindingConfiguration {
+    /// Whether the binding provider runs at all.
+    pub enabled: bool,
+    /// Scopes one source unit may contribute, at most.
+    #[schemars(range(min = 1, max = 40_960))]
+    pub max_unit_scopes: u64,
+    /// Definitions one source unit may contribute, at most.
+    #[schemars(range(min = 1, max = 163_840))]
+    pub max_unit_definitions: u64,
+    /// References one source unit may contribute, at most.
+    #[schemars(range(min = 1, max = 655_360))]
+    pub max_unit_references: u64,
+    /// Links one source unit may contribute, at most.
+    #[schemars(range(min = 1, max = 40_960))]
+    pub max_unit_links: u64,
+    /// Scopes, definitions, and references one publication's graph may hold together, at most.
+    #[schemars(range(min = 1, max = 20_000_000))]
+    pub max_graph_nodes: u64,
+    /// Links one publication's graph may hold, at most.
+    #[schemars(range(min = 1, max = 5_000_000))]
+    pub max_graph_links: u64,
+    /// Work items one reference may enqueue during resolution, at most.
+    #[schemars(range(min = 1, max = 409_600))]
+    pub max_reference_work: u64,
+    /// Steps one resolution work item may accumulate, at most.
+    #[schemars(range(min = 1, max = 640))]
+    pub max_path_depth: u64,
+    /// Definitions one reference may resolve to, at most.
+    #[schemars(range(min = 1, max = 256))]
+    pub max_reference_targets: u64,
+    /// Work items one publication may enqueue across every reference, at most.
+    #[schemars(range(min = 1, max = 5_000_000_000_u64))]
+    pub max_publication_work: u64,
+}
+
+impl Default for BindingConfiguration {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_unit_scopes: 4096,
+            max_unit_definitions: 16_384,
+            max_unit_references: 65_536,
+            max_unit_links: 4096,
+            max_graph_nodes: 2_000_000,
+            max_graph_links: 500_000,
+            max_reference_work: 4096,
+            max_path_depth: 64,
+            max_reference_targets: 64,
+            max_publication_work: 50_000_000,
+        }
+    }
+}
+
+impl BindingConfiguration {
+    /// The first violated bound, in the order the table declares its keys.
+    ///
+    /// `enabled` is a switch and carries no range; only the bounds are checked.
+    fn violation(&self) -> Option<ConfigurationViolation> {
+        let bounds = [
+            (
+                "providers.binding.max_unit_scopes",
+                self.max_unit_scopes,
+                BINDING_UNIT_SCOPES_MAX,
+            ),
+            (
+                "providers.binding.max_unit_definitions",
+                self.max_unit_definitions,
+                BINDING_UNIT_DEFINITIONS_MAX,
+            ),
+            (
+                "providers.binding.max_unit_references",
+                self.max_unit_references,
+                BINDING_UNIT_REFERENCES_MAX,
+            ),
+            (
+                "providers.binding.max_unit_links",
+                self.max_unit_links,
+                BINDING_UNIT_LINKS_MAX,
+            ),
+            (
+                "providers.binding.max_graph_nodes",
+                self.max_graph_nodes,
+                BINDING_GRAPH_NODES_MAX,
+            ),
+            (
+                "providers.binding.max_graph_links",
+                self.max_graph_links,
+                BINDING_GRAPH_LINKS_MAX,
+            ),
+            (
+                "providers.binding.max_reference_work",
+                self.max_reference_work,
+                BINDING_REFERENCE_WORK_MAX,
+            ),
+            (
+                "providers.binding.max_path_depth",
+                self.max_path_depth,
+                BINDING_PATH_DEPTH_MAX,
+            ),
+            (
+                "providers.binding.max_reference_targets",
+                self.max_reference_targets,
+                BINDING_REFERENCE_TARGETS_MAX,
+            ),
+            (
+                "providers.binding.max_publication_work",
+                self.max_publication_work,
+                BINDING_PUBLICATION_WORK_MAX,
+            ),
+        ];
+        bounds
+            .into_iter()
+            .find_map(|(field, value, max)| out_of_range(field, value, 1, max))
     }
 }
 
@@ -2544,6 +2690,18 @@ mod tests {
         assert_eq!(execution.max_concurrent, 2);
         assert!(configuration.providers.history.enabled);
         assert_eq!(configuration.providers.history.max_revisions, 500);
+        let binding = &configuration.providers.binding;
+        assert!(binding.enabled);
+        assert_eq!(binding.max_unit_scopes, 4096);
+        assert_eq!(binding.max_unit_definitions, 16_384);
+        assert_eq!(binding.max_unit_references, 65_536);
+        assert_eq!(binding.max_unit_links, 4096);
+        assert_eq!(binding.max_graph_nodes, 2_000_000);
+        assert_eq!(binding.max_graph_links, 500_000);
+        assert_eq!(binding.max_reference_work, 4096);
+        assert_eq!(binding.max_path_depth, 64);
+        assert_eq!(binding.max_reference_targets, 64);
+        assert_eq!(binding.max_publication_work, 50_000_000);
         let semantic = &configuration.search.semantic;
         assert!(is_weight(
             configuration.search.lexical.weight,
@@ -2590,6 +2748,7 @@ mod tests {
             json!({ "execution": { "unknown": true } }),
             json!({ "providers": { "unknown": {} } }),
             json!({ "providers": { "history": { "unknown": 1 } } }),
+            json!({ "providers": { "binding": { "unknown": 1 } } }),
             json!({ "search": { "unknown": "x" } }),
             json!({ "search": { "text": { "unknown": "x" } } }),
             json!({ "source": { "unknown": "x" } }),
@@ -2875,6 +3034,110 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// One `[providers.binding]` bound: its field name, ceiling, and setter.
+    type BindingBound = (&'static str, u64, fn(&mut BindingConfiguration, u64));
+
+    /// Every `[providers.binding]` bound.
+    fn binding_bounds() -> [BindingBound; 10] {
+        [
+            (
+                "providers.binding.max_unit_scopes",
+                BINDING_UNIT_SCOPES_MAX,
+                |binding, value| binding.max_unit_scopes = value,
+            ),
+            (
+                "providers.binding.max_unit_definitions",
+                BINDING_UNIT_DEFINITIONS_MAX,
+                |binding, value| binding.max_unit_definitions = value,
+            ),
+            (
+                "providers.binding.max_unit_references",
+                BINDING_UNIT_REFERENCES_MAX,
+                |binding, value| binding.max_unit_references = value,
+            ),
+            (
+                "providers.binding.max_unit_links",
+                BINDING_UNIT_LINKS_MAX,
+                |binding, value| binding.max_unit_links = value,
+            ),
+            (
+                "providers.binding.max_graph_nodes",
+                BINDING_GRAPH_NODES_MAX,
+                |binding, value| binding.max_graph_nodes = value,
+            ),
+            (
+                "providers.binding.max_graph_links",
+                BINDING_GRAPH_LINKS_MAX,
+                |binding, value| binding.max_graph_links = value,
+            ),
+            (
+                "providers.binding.max_reference_work",
+                BINDING_REFERENCE_WORK_MAX,
+                |binding, value| binding.max_reference_work = value,
+            ),
+            (
+                "providers.binding.max_path_depth",
+                BINDING_PATH_DEPTH_MAX,
+                |binding, value| binding.max_path_depth = value,
+            ),
+            (
+                "providers.binding.max_reference_targets",
+                BINDING_REFERENCE_TARGETS_MAX,
+                |binding, value| binding.max_reference_targets = value,
+            ),
+            (
+                "providers.binding.max_publication_work",
+                BINDING_PUBLICATION_WORK_MAX,
+                |binding, value| binding.max_publication_work = value,
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_binding_bounds_out_of_range_are_refused_naming_the_field() {
+        for (field, max, set) in binding_bounds() {
+            for value in [0, max + 1] {
+                let mut configuration = WorkspaceConfiguration::default();
+                set(&mut configuration.providers.binding, value);
+                match configuration.validate() {
+                    Err(ConfigurationViolation::LimitOutOfRange { field: named, .. }) => {
+                        assert_eq!(named, field, "{field} at {value}");
+                    }
+                    other => panic!("{field} at {value} must be refused, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_binding_bounds_accept_their_edges() {
+        let mut ceiling = WorkspaceConfiguration::default();
+        let mut floor = WorkspaceConfiguration::default();
+        floor.providers.binding.enabled = false;
+        for (_, max, set) in binding_bounds() {
+            set(&mut ceiling.providers.binding, max);
+            set(&mut floor.providers.binding, 1);
+        }
+        assert_eq!(ceiling.validate(), Ok(()));
+        assert_eq!(floor.validate(), Ok(()));
+    }
+
+    #[test]
+    fn test_binding_schema_bounds_equal_the_enforced_constants() {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let binding = &schema["$defs"]["BindingConfiguration"]["properties"];
+        for (field, max, _) in binding_bounds() {
+            let key = field
+                .strip_prefix("providers.binding.")
+                .expect("binding field names share the table prefix");
+            assert_schema_bounds(&[
+                (field, &binding[key]["minimum"], json!(1)),
+                (field, &binding[key]["maximum"], json!(max)),
+            ]);
+        }
     }
 
     /// The verdict `[search.semantic]` reaches on one model value under one
