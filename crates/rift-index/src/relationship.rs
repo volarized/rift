@@ -17,10 +17,8 @@
 //! An edge's `facet` is [`role_facet`]'s mapping of the reference's [`ReferenceRole`].
 //!
 //! An edge's `occurrence` is the reference's own [`DeclarationBinding`]: unit, byte range, and
-//! an optional syntax node. Every production reference binding this workspace constructs
-//! today - the name-binding publisher and the SCIP adapter alike - carries `node: None`; the
-//! field stays `Option` so a future occurrence carrying a node needs no store change, but no
-//! shipped path populates it yet.
+//! an optional syntax node. The name-binding publisher and the SCIP adapter both construct
+//! reference bindings with `node: None`, so the node arm is populated by no production path.
 //!
 //! Building stops at [`RELATIONSHIP_EDGES_MAX`] edges; [`RelationshipStore::is_complete`] and
 //! [`RelationshipStore::dropped_edges`] report the truncation.
@@ -79,7 +77,7 @@ impl RelationshipEdge {
     }
 
     /// Where the reference occurred: unit, byte range, and syntax node when the binding
-    /// provider supplied one (see the module doc for why that is `None` today).
+    /// provider supplied one. No production binding supplies a node (module doc).
     #[must_use]
     pub const fn occurrence(&self) -> &DeclarationBinding {
         &self.occurrence
@@ -123,8 +121,9 @@ impl EnclosingDefinitions {
         Self { by_unit }
     }
 
-    /// The innermost definition whose range contains `occurrence`'s range in its unit;
-    /// `None` when no definition in that unit encloses it.
+    /// The innermost definition whose range contains `occurrence`'s range in its unit.
+    /// Answers `None` when no definition in that unit encloses it. Two enclosing
+    /// candidates of equal size tie toward the earlier-starting one.
     ///
     /// `by_unit` sorts each unit's candidates by start, so every candidate that could
     /// contain `occurrence` sits in the prefix ending where `partition_point` splits it;
@@ -638,5 +637,75 @@ mod tests {
         assert_eq!(outgoing[0].facet(), RelationshipFacet::Calls);
         assert!(index.relationships().is_complete());
         Ok(())
+    }
+
+    #[test]
+    fn a_self_call_yields_one_edge_listed_in_both_directions() {
+        let occurrence = binding("src/lib.rs", 10, 17);
+        let contributions = vec![
+            definition(
+                "recurse",
+                "rift://symbol/rust/src/lib.rs/recurse",
+                "src/lib.rs",
+                (0, 40),
+            ),
+            reference("self_ref", occurrence, ReferenceRole::Call, "recurse"),
+        ];
+        let store = RelationshipStore::build(&graph(contributions));
+
+        let recurse = symbol("rift://symbol/rust/src/lib.rs/recurse");
+        let outgoing = store.outgoing(&recurse);
+        let incoming = store.incoming(&recurse);
+        assert_eq!(outgoing.len(), 1, "outgoing={outgoing:?}");
+        assert_eq!(incoming.len(), 1, "incoming={incoming:?}");
+        assert_eq!(outgoing[0], incoming[0]);
+        assert_eq!(outgoing[0].from(), outgoing[0].to());
+    }
+
+    #[test]
+    fn two_call_sites_to_one_target_keep_two_edges_in_occurrence_order() {
+        let contributions = vec![
+            definition(
+                "caller",
+                "rift://symbol/rust/src/lib.rs/caller",
+                "src/lib.rs",
+                (0, 40),
+            ),
+            definition(
+                "callee",
+                "rift://symbol/rust/src/lib.rs/callee",
+                "src/lib.rs",
+                (40, 60),
+            ),
+            reference(
+                "second_site",
+                binding("src/lib.rs", 20, 26),
+                ReferenceRole::Call,
+                "callee",
+            ),
+            reference(
+                "first_site",
+                binding("src/lib.rs", 5, 11),
+                ReferenceRole::Call,
+                "callee",
+            ),
+        ];
+        let store = RelationshipStore::build(&graph(contributions));
+
+        let caller = symbol("rift://symbol/rust/src/lib.rs/caller");
+        let callee = symbol("rift://symbol/rust/src/lib.rs/callee");
+        let outgoing = store.outgoing(&caller);
+        assert_eq!(outgoing.len(), 2, "outgoing={outgoing:?}");
+        assert!(outgoing.iter().all(|edge| edge.to() == &callee));
+        assert_eq!(store.incoming(&callee).len(), 2);
+        let positions: Vec<u64> = outgoing
+            .iter()
+            .map(|edge| edge.occurrence().range().start())
+            .collect();
+        assert_eq!(
+            positions,
+            vec![5, 20],
+            "edges sharing endpoint and facet order by occurrence position"
+        );
     }
 }
