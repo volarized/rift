@@ -12,6 +12,11 @@ use crate::update::{UpdateProgress, UpdateStage};
 
 /// Redraw interval of the spinner standing for a running stage.
 const SPINNER_TICK: Duration = Duration::from_millis(80);
+/// Message drawn while the latest release is being looked up.
+///
+/// Named so the terminal-width regression test in this module's `tests`
+/// draws the exact production text, which carries a double-width emoji.
+const CHECKING_RELEASE_MESSAGE: &str = "🔍 Checking the latest rift release...";
 /// Download line drawn when the response declared the archive's size.
 const SIZED_DOWNLOAD_TEMPLATE: &str = "{msg}  [{bar}]  {bytes} / {total_bytes}";
 /// Download line drawn when the response declared no size.
@@ -76,7 +81,7 @@ impl UpdateProgress for TerminalProgress {
     fn report(&self, stage: UpdateStage) {
         let mut line = self.line.lock().unwrap_or_else(PoisonError::into_inner);
         match stage {
-            UpdateStage::CheckingRelease => line.start("🔍 Checking the latest rift release..."),
+            UpdateStage::CheckingRelease => line.start(CHECKING_RELEASE_MESSAGE),
             UpdateStage::ReleaseFound { latest } => {
                 line.finish(format!("🔍 Latest release: v{latest}"));
                 line.latest = Some(latest);
@@ -98,6 +103,7 @@ impl UpdateProgress for TerminalProgress {
                 line.finish("📦 Binary extracted");
                 line.start("🚀 Installing...");
             }
+            UpdateStage::Installed => line.finish("🚀 Installed"),
         }
     }
 }
@@ -174,28 +180,59 @@ mod tests {
 
     use indicatif::{ProgressBar, ProgressDrawTarget, TermLike};
     use semver::Version;
+    use unicode_width::UnicodeWidthStr as _;
 
-    use super::{TerminalProgress, download_bar, rendered_bytes, stage_style};
+    use super::{
+        CHECKING_RELEASE_MESSAGE, TerminalProgress, download_bar, rendered_bytes, stage_style,
+    };
     use crate::update::{UpdateProgress, UpdateStage};
 
-    /// A terminal keeping every byte a progress bar drew on it.
-    #[derive(Debug, Clone, Default)]
+    /// A terminal keeping every frame a progress bar drew on it.
+    ///
+    /// A frame is everything written between two `flush` calls: indicatif
+    /// flushes once per redraw, so each frame is exactly what one
+    /// `draw_to_term` call sent, and its total cell width is what a real
+    /// terminal would show before wrapping.
+    #[derive(Debug, Clone)]
     struct RecordingTerminal {
-        drawn: Arc<Mutex<String>>,
+        width: u16,
+        frames: Arc<Mutex<Vec<String>>>,
+        current_frame: Arc<Mutex<String>>,
     }
 
     impl RecordingTerminal {
-        fn drawn(&self) -> String {
-            self.drawn
+        /// A terminal `width` columns wide, with no frames drawn yet.
+        fn new(width: u16) -> Self {
+            Self {
+                width,
+                frames: Arc::new(Mutex::new(Vec::new())),
+                current_frame: Arc::new(Mutex::new(String::new())),
+            }
+        }
+
+        /// Every completed frame, oldest first.
+        fn frames(&self) -> Vec<String> {
+            self.frames
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone()
+        }
+
+        /// Every byte drawn across every frame, concatenated.
+        fn drawn(&self) -> String {
+            self.frames().concat()
+        }
+    }
+
+    impl Default for RecordingTerminal {
+        fn default() -> Self {
+            Self::new(120)
         }
     }
 
     impl TermLike for RecordingTerminal {
         fn width(&self) -> u16 {
-            120
+            self.width
         }
 
         fn move_cursor_up(&self, _lines: usize) -> io::Result<()> {
@@ -219,7 +256,7 @@ mod tests {
         }
 
         fn write_str(&self, text: &str) -> io::Result<()> {
-            self.drawn
+            self.current_frame
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push_str(text);
@@ -231,6 +268,14 @@ mod tests {
         }
 
         fn flush(&self) -> io::Result<()> {
+            let mut current_frame = self
+                .current_frame
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.frames
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(std::mem::take(&mut *current_frame));
             Ok(())
         }
     }
@@ -297,8 +342,40 @@ mod tests {
             UpdateStage::Verifying,
             UpdateStage::Extracting,
             UpdateStage::Installing,
+            UpdateStage::Installed,
         ] {
             progress.report(stage);
+        }
+    }
+
+    /// A terminal column budget under the production message's real width, so
+    /// the wide-char undercount defect this test guards against pads the
+    /// drawn line past what a real terminal can show without wrapping.
+    const NARROW_TERMINAL_WIDTH: u16 = 40;
+
+    #[test]
+    fn a_double_width_stage_message_never_overflows_a_narrow_terminal() {
+        let spinner = ProgressBar::new_spinner().with_message(CHECKING_RELEASE_MESSAGE);
+        let terminal = RecordingTerminal::new(NARROW_TERMINAL_WIDTH);
+        spinner.set_draw_target(ProgressDrawTarget::term_like(Box::new(terminal.clone())));
+        spinner.force_draw();
+
+        // `unicode_width` measures independently of whatever indicatif chose
+        // for its own padding: indicatif derives the padding from the same
+        // function it would be compared against, so a comparison against
+        // that same function fits by construction regardless of correctness.
+        let frames = terminal.frames();
+        assert!(
+            !frames.is_empty(),
+            "the spinner must draw at least one frame"
+        );
+        for frame in &frames {
+            let drawn_width = frame.width();
+            assert!(
+                drawn_width <= usize::from(NARROW_TERMINAL_WIDTH),
+                "a drawn frame must fit the terminal: width={NARROW_TERMINAL_WIDTH}, \
+                 drawn_width={drawn_width}, frame={frame:?}"
+            );
         }
     }
 }

@@ -119,6 +119,8 @@ pub(super) enum UpdateStage {
     Extracting,
     /// The extracted binary is replacing the running one.
     Installing,
+    /// The extracted binary replaced the running one.
+    Installed,
 }
 
 /// Where an update reports its stages.
@@ -349,6 +351,7 @@ async fn update_with(
                 .stage(staging.path(), latest_version.clone(), progress)
                 .await?;
             progress.report(UpdateStage::Installing);
+            progress.report(UpdateStage::Installed);
             let cleanup = publisher.publish(current_path, &candidate).await?;
             Ok(UpdateOutcome::Updated {
                 from: current_version,
@@ -1263,6 +1266,7 @@ mod tests {
                 UpdateStage::Verifying,
                 UpdateStage::Extracting,
                 UpdateStage::Installing,
+                UpdateStage::Installed,
             ]
         );
         Ok(())
