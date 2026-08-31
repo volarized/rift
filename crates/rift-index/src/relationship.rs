@@ -692,12 +692,12 @@ mod tests {
         ];
         let store = RelationshipStore::build(&graph(contributions));
 
-        let caller = symbol("rift://symbol/rust/src/lib.rs/caller");
-        let callee = symbol("rift://symbol/rust/src/lib.rs/callee");
-        let outgoing = store.outgoing(&caller);
+        let from_symbol = symbol("rift://symbol/rust/src/lib.rs/caller");
+        let to_symbol = symbol("rift://symbol/rust/src/lib.rs/callee");
+        let outgoing = store.outgoing(&from_symbol);
         assert_eq!(outgoing.len(), 2, "outgoing={outgoing:?}");
-        assert!(outgoing.iter().all(|edge| edge.to() == &callee));
-        assert_eq!(store.incoming(&callee).len(), 2);
+        assert!(outgoing.iter().all(|edge| edge.to() == &to_symbol));
+        assert_eq!(store.incoming(&to_symbol).len(), 2);
         let positions: Vec<u64> = outgoing
             .iter()
             .map(|edge| edge.occurrence().range().start())
