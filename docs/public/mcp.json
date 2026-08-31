@@ -331,10 +331,12 @@
             "properties": {
               "extensions": {
                 "$ref": "#/$defs/Extensions",
-                "description": "Syntax facts the model has no field for, namespaced by the provider that emitted\nthem."
+                "default": {},
+                "description": "Syntax facts the model has no field for, namespaced by the provider that emitted\nthem. Absent when empty."
               },
               "facets": {
-                "description": "Portable structural classification, so a query can ask for bodies or imports without\nknowing the grammar that produced them.",
+                "default": [],
+                "description": "Portable structural classification, so a query can ask for bodies or imports without\nknowing the grammar that produced them. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/NodeFacet"
                 },
@@ -368,7 +370,8 @@
                 "description": "The bytes it spans, as offsets into the file."
               },
               "regions": {
-                "description": "The node's named parts, so an operation can rewrite a function body without touching\nthe documentation above it.",
+                "default": [],
+                "description": "The node's named parts, so an operation can rewrite a function body without touching\nthe documentation above it. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/NodeRegion"
                 },
@@ -395,10 +398,7 @@
               "unit",
               "language",
               "kind",
-              "facets",
-              "range",
-              "regions",
-              "extensions"
+              "range"
             ],
             "type": "object"
           },
@@ -591,7 +591,8 @@
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
-                "description": "Parameter facts the model has no field for, namespaced by the provider that emitted\nthem."
+                "default": {},
+                "description": "Parameter facts the model has no field for, namespaced by the provider that emitted\nthem. Absent when empty."
               },
               "name": {
                 "description": "What the parameter is called. Absent where the language allows an unnamed one, as\na positional parameter in a function type.",
@@ -616,7 +617,8 @@
                 "type": "boolean"
               },
               "types": {
-                "description": "What it accepts. An array because a declared type and an inferred one are separate\nbindings.",
+                "default": [],
+                "description": "What it accepts, absent when empty. An array because a declared type and an\ninferred one are separate bindings.",
                 "items": {
                   "$ref": "#/$defs/TypeBinding"
                 },
@@ -628,10 +630,8 @@
               }
             },
             "required": [
-              "types",
               "optional",
-              "variadic",
-              "extensions"
+              "variadic"
             ],
             "type": "object"
           },
@@ -840,7 +840,8 @@
                 "type": "string"
               },
               "effects": {
-                "description": "Effect keywords the declaration carries, in the language's own words: `async`,\n`unsafe`, `pure`. The spelling is preserved and never mapped onto a portable\nmeaning.",
+                "default": [],
+                "description": "Effect keywords the declaration carries, in the language's own words: `async`,\n`unsafe`, `pure`. The spelling is preserved and never mapped onto a portable\nmeaning; absent when empty.",
                 "items": {
                   "type": "string"
                 },
@@ -848,21 +849,24 @@
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
-                "description": "Signature facts the model has no field for, namespaced by the provider that emitted\nthem."
+                "default": {},
+                "description": "Signature facts the model has no field for, namespaced by the provider that emitted\nthem. Absent when empty."
               },
               "language": {
                 "$ref": "#/$defs/Language",
                 "description": "The language whose syntax `display` is written in."
               },
               "links": {
-                "description": "Symbols named inside `display`, each with the byte range of `display` that names it,\nso a renderer can turn the rendered text into links.",
+                "default": [],
+                "description": "Symbols named inside `display`, each with the byte range of `display` that names it,\nso a renderer can turn the rendered text into links. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/SignatureLink"
                 },
                 "type": "array"
               },
               "parameters": {
-                "description": "Declared parameters, in source order.",
+                "default": [],
+                "description": "Declared parameters, in source order. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/Parameter"
                 },
@@ -880,21 +884,24 @@
                 "description": "The implicit first parameter - `self`, `this`. Absent for a free function, and for\nlanguages that have no such thing."
               },
               "returns": {
-                "description": "What the call yields. An array because a language may return several values, and\nbecause a declared and an inferred return are separate bindings.",
+                "default": [],
+                "description": "What the call yields, absent when empty. An array because a language may return\nseveral values, and because a declared and an inferred return are separate\nbindings.",
                 "items": {
                   "$ref": "#/$defs/TypeBinding"
                 },
                 "type": "array"
               },
               "throws": {
-                "description": "Types this form declares it can raise.",
+                "default": [],
+                "description": "Types this form declares it can raise. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/TypeExpression"
                 },
                 "type": "array"
               },
               "type_parameters": {
-                "description": "The generic parameters this form declares, each as the symbol that declares it.",
+                "default": [],
+                "description": "The generic parameters this form declares, each as the symbol that declares it.\nAbsent when empty.",
                 "items": {
                   "$ref": "#/$defs/SymbolId"
                 },
@@ -903,14 +910,7 @@
             },
             "required": [
               "display",
-              "links",
-              "language",
-              "parameters",
-              "returns",
-              "type_parameters",
-              "throws",
-              "effects",
-              "extensions"
+              "language"
             ],
             "type": "object"
           },
@@ -1091,25 +1091,29 @@
                 "description": "The symbol this one belongs to - the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method is written beside its type and a\nRust method inside an `impl` block, and both name the type here. Absent at the top\nlevel."
               },
               "contributions": {
-                "description": "Contributions selected for this request, in presentation order.",
+                "default": [],
+                "description": "Contributions selected for this request, in presentation order. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/ContributionKey"
                 },
                 "type": "array"
               },
               "disagreements": {
-                "description": "Presentation differences retained after field selection.",
+                "default": [],
+                "description": "Presentation differences retained after field selection. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/SymbolDisagreement"
                 },
                 "type": "array"
               },
               "document_local": {
-                "description": "Whether language semantics confine this symbol to the document that declares it. The\nprovider classifies locality from its language model.",
+                "default": false,
+                "description": "Whether language semantics confine this symbol to the document that declares it. The\nprovider classifies locality from its language model; absent when `false`.",
                 "type": "boolean"
               },
               "documentation": {
-                "description": "Doc comments attached to the declaration, with the markup format they were written\nin.",
+                "default": [],
+                "description": "Doc comments attached to the declaration, with the markup format they were written\nin. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/Documentation"
                 },
@@ -1117,10 +1121,12 @@
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
-                "description": "Language-specific facts with no portable equivalent, namespaced by the provider that\nemitted them."
+                "default": {},
+                "description": "Language-specific facts with no portable equivalent, namespaced by the provider that\nemitted them. Absent when empty."
               },
               "facets": {
-                "description": "Portable classification for cross-language queries. The local kinds `trait` and\n`interface` can both carry the `type` facet.",
+                "default": [],
+                "description": "Portable classification for cross-language queries, absent when empty. The local\nkinds `trait` and `interface` can both carry the `type` facet.",
                 "items": {
                   "$ref": "#/$defs/SymbolFacet"
                 },
@@ -1152,7 +1158,8 @@
                 "description": "The language this symbol belongs to."
               },
               "modifiers": {
-                "description": "Language keywords qualifying the declaration: `export`, `async`, `const`.",
+                "default": [],
+                "description": "Language keywords qualifying the declaration: `export`, `async`, `const`. Absent\nwhen empty.",
                 "items": {
                   "type": "string"
                 },
@@ -1172,14 +1179,16 @@
                 "description": "Whether normalization established one Symbol identity."
               },
               "signatures": {
-                "description": "One entry per callable form. Where the language dispatches overloads separately they\nare separate symbols joined by the `overloads` edge; several entries here are\nalternative forms of one dispatch target, as `typing.overload` writes them.",
+                "default": [],
+                "description": "One entry per callable form, absent when empty. Where the language dispatches\noverloads separately they are separate symbols joined by the `overloads` edge;\nseveral entries here are alternative forms of one dispatch target, as\n`typing.overload` writes them.",
                 "items": {
                   "$ref": "#/$defs/Signature"
                 },
                 "type": "array"
               },
               "types": {
-                "description": "The types this symbol carries, each tagged with the role it plays: a return type, a\nfield type, a bound.",
+                "default": [],
+                "description": "The types this symbol carries, each tagged with the role it plays: a return type, a\nfield type, a bound. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/TypeBinding"
                 },
@@ -1196,19 +1205,10 @@
             "required": [
               "index_revision",
               "resolution",
-              "contributions",
               "language",
               "name",
               "kind",
-              "facets",
-              "origin",
-              "modifiers",
-              "types",
-              "signatures",
-              "documentation",
-              "extensions",
-              "disagreements",
-              "document_local"
+              "origin"
             ],
             "type": "object"
           },
@@ -1732,7 +1732,8 @@
             "properties": {
               "extensions": {
                 "$ref": "#/$defs/Extensions",
-                "description": "Type facts the model has no field for, namespaced by the provider that emitted them."
+                "default": {},
+                "description": "Type facts the model has no field for, namespaced by the provider that emitted them.\nAbsent when empty."
               },
               "language": {
                 "$ref": "#/$defs/Language",
@@ -1756,8 +1757,7 @@
             },
             "required": [
               "language",
-              "source",
-              "extensions"
+              "source"
             ],
             "type": "object"
           }
@@ -1788,7 +1788,6 @@
                   ]
                 },
                 "node": {
-                  "extensions": {},
                   "facets": [
                     "declaration",
                     "definition"
@@ -1847,15 +1846,12 @@
                       "symbol": "load_config"
                     }
                   ],
-                  "disagreements": [],
-                  "document_local": false,
                   "documentation": [
                     {
                       "format": "markdown",
                       "text": "Loads the workspace configuration from `rift.toml`."
                     }
                   ],
-                  "extensions": {},
                   "facets": [
                     "value",
                     "callable",
@@ -1867,7 +1863,6 @@
                   "language": {
                     "name": "rust"
                   },
-                  "modifiers": [],
                   "name": "load_config",
                   "origin": {
                     "location": {
@@ -1880,8 +1875,6 @@
                   "signatures": [
                     {
                       "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
-                      "effects": [],
-                      "extensions": {},
                       "language": {
                         "name": "rust"
                       },
@@ -1896,7 +1889,6 @@
                       ],
                       "parameters": [
                         {
-                          "extensions": {},
                           "name": "path",
                           "optional": false,
                           "types": [
@@ -1904,7 +1896,6 @@
                               "origin": "declared",
                               "role": "parameter",
                               "type": {
-                                "extensions": {},
                                 "language": {
                                   "name": "rust"
                                 },
@@ -1920,16 +1911,13 @@
                           "origin": "declared",
                           "role": "return",
                           "type": {
-                            "extensions": {},
                             "language": {
                               "name": "rust"
                             },
                             "source": "Result<Config, ConfigError>"
                           }
                         }
-                      ],
-                      "throws": [],
-                      "type_parameters": []
+                      ]
                     }
                   ],
                   "types": [
@@ -1937,7 +1925,6 @@
                       "origin": "declared",
                       "role": "return",
                       "type": {
-                        "extensions": {},
                         "language": {
                           "name": "rust"
                         },
@@ -1952,8 +1939,7 @@
             "pagination": {
               "page_index": 0,
               "total_pages": 1
-            },
-            "warnings": []
+            }
           }
         ],
         "properties": {
@@ -1969,7 +1955,8 @@
             "description": "Where this page sits in the full result set under the request's `limit`."
           },
           "warnings": {
-            "description": "Warnings attached to this result, empty when there is nothing to warn about.",
+            "default": [],
+            "description": "Warnings attached to this result. Absent when there is nothing to warn about.",
             "items": {
               "$ref": "#/$defs/ReadWarning"
             },
@@ -1978,8 +1965,7 @@
         },
         "required": [
           "hits",
-          "pagination",
-          "warnings"
+          "pagination"
         ],
         "type": "object"
       }
@@ -2085,7 +2071,8 @@
             "description": "One applied change, with everything Rift learned while resolving it.",
             "properties": {
               "diagnostics": {
-                "description": "Resolution findings in source order, then one finding per hook that\ndid not pass.",
+                "default": [],
+                "description": "Resolution findings in source order, then one finding per hook that\ndid not pass. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/Diagnostic"
                 },
@@ -2102,7 +2089,8 @@
                 "type": "array"
               },
               "guarantees": {
-                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order.",
+                "default": [],
+                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/GuaranteeEvidence"
                 },
@@ -2116,9 +2104,7 @@
             },
             "required": [
               "id",
-              "files",
-              "diagnostics",
-              "guarantees"
+              "files"
             ],
             "type": "object"
           },
@@ -2207,7 +2193,8 @@
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
-                "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them."
+                "default": {},
+                "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them. Absent when empty."
               },
               "language": {
                 "anyOf": [
@@ -2226,7 +2213,8 @@
                 "type": "string"
               },
               "related": {
-                "description": "Other places the provider pointed at while explaining this one.",
+                "default": [],
+                "description": "Other places the provider pointed at while explaining this one. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/DiagnosticRelated"
                 },
@@ -2252,7 +2240,8 @@
                 "description": "Where it applies. Absent for a finding about the file as a whole, or about the\nbuild."
               },
               "tags": {
-                "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text.",
+                "default": [],
+                "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text; absent when empty.",
                 "items": {
                   "$ref": "#/$defs/DiagnosticTag"
                 },
@@ -2262,11 +2251,8 @@
             "required": [
               "severity",
               "message",
-              "related",
-              "tags",
               "reliability",
-              "continuation",
-              "extensions"
+              "continuation"
             ],
             "type": "object"
           },
@@ -2862,12 +2848,9 @@
                 {
                   "code": "rift.hook.failed",
                   "continuation": "unknown",
-                  "extensions": {},
                   "message": "hook format did not pass: exited 1; stderr (32 of 32 bytes): Diff in src/config.rs at line 12",
-                  "related": [],
                   "reliability": "reliable",
-                  "severity": "error",
-                  "tags": []
+                  "severity": "error"
                 }
               ],
               "files": [
@@ -2895,7 +2878,6 @@
             }
           },
           {
-            "diagnostics": [],
             "preconditions": [
               {
                 "addresses": [
@@ -2948,7 +2930,8 @@
             "description": "Resolution produced no edits, so the targeted tree is untouched.",
             "properties": {
               "diagnostics": {
-                "description": "Evidence that explains the refusal.",
+                "default": [],
+                "description": "Evidence that explains the refusal. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/Diagnostic"
                 },
@@ -2975,8 +2958,7 @@
             "required": [
               "status",
               "reason",
-              "preconditions",
-              "diagnostics"
+              "preconditions"
             ],
             "type": "object"
           },
@@ -3159,7 +3141,8 @@
             "description": "One applied change, with everything Rift learned while resolving it.",
             "properties": {
               "diagnostics": {
-                "description": "Resolution findings in source order, then one finding per hook that\ndid not pass.",
+                "default": [],
+                "description": "Resolution findings in source order, then one finding per hook that\ndid not pass. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/Diagnostic"
                 },
@@ -3176,7 +3159,8 @@
                 "type": "array"
               },
               "guarantees": {
-                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order.",
+                "default": [],
+                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/GuaranteeEvidence"
                 },
@@ -3190,9 +3174,7 @@
             },
             "required": [
               "id",
-              "files",
-              "diagnostics",
-              "guarantees"
+              "files"
             ],
             "type": "object"
           },
@@ -3281,7 +3263,8 @@
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
-                "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them."
+                "default": {},
+                "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them. Absent when empty."
               },
               "language": {
                 "anyOf": [
@@ -3300,7 +3283,8 @@
                 "type": "string"
               },
               "related": {
-                "description": "Other places the provider pointed at while explaining this one.",
+                "default": [],
+                "description": "Other places the provider pointed at while explaining this one. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/DiagnosticRelated"
                 },
@@ -3326,7 +3310,8 @@
                 "description": "Where it applies. Absent for a finding about the file as a whole, or about the\nbuild."
               },
               "tags": {
-                "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text.",
+                "default": [],
+                "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text; absent when empty.",
                 "items": {
                   "$ref": "#/$defs/DiagnosticTag"
                 },
@@ -3336,11 +3321,8 @@
             "required": [
               "severity",
               "message",
-              "related",
-              "tags",
               "reliability",
-              "continuation",
-              "extensions"
+              "continuation"
             ],
             "type": "object"
           },
@@ -3936,12 +3918,9 @@
                 {
                   "code": "rift.hook.failed",
                   "continuation": "unknown",
-                  "extensions": {},
                   "message": "hook format did not pass: exited 1; stderr (32 of 32 bytes): Diff in src/config.rs at line 12",
-                  "related": [],
                   "reliability": "reliable",
-                  "severity": "error",
-                  "tags": []
+                  "severity": "error"
                 }
               ],
               "files": [
@@ -3969,7 +3948,6 @@
             }
           },
           {
-            "diagnostics": [],
             "preconditions": [
               {
                 "addresses": [
@@ -4022,7 +4000,8 @@
             "description": "Resolution produced no edits, so the targeted tree is untouched.",
             "properties": {
               "diagnostics": {
-                "description": "Evidence that explains the refusal.",
+                "default": [],
+                "description": "Evidence that explains the refusal. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/Diagnostic"
                 },
@@ -4049,8 +4028,7 @@
             "required": [
               "status",
               "reason",
-              "preconditions",
-              "diagnostics"
+              "preconditions"
             ],
             "type": "object"
           },
@@ -4126,7 +4104,8 @@
             "description": "One applied change, with everything Rift learned while resolving it.",
             "properties": {
               "diagnostics": {
-                "description": "Resolution findings in source order, then one finding per hook that\ndid not pass.",
+                "default": [],
+                "description": "Resolution findings in source order, then one finding per hook that\ndid not pass. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/Diagnostic"
                 },
@@ -4143,7 +4122,8 @@
                 "type": "array"
               },
               "guarantees": {
-                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order.",
+                "default": [],
+                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/GuaranteeEvidence"
                 },
@@ -4157,9 +4137,7 @@
             },
             "required": [
               "id",
-              "files",
-              "diagnostics",
-              "guarantees"
+              "files"
             ],
             "type": "object"
           },
@@ -4248,7 +4226,8 @@
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
-                "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them."
+                "default": {},
+                "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them. Absent when empty."
               },
               "language": {
                 "anyOf": [
@@ -4267,7 +4246,8 @@
                 "type": "string"
               },
               "related": {
-                "description": "Other places the provider pointed at while explaining this one.",
+                "default": [],
+                "description": "Other places the provider pointed at while explaining this one. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/DiagnosticRelated"
                 },
@@ -4293,7 +4273,8 @@
                 "description": "Where it applies. Absent for a finding about the file as a whole, or about the\nbuild."
               },
               "tags": {
-                "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text.",
+                "default": [],
+                "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text; absent when empty.",
                 "items": {
                   "$ref": "#/$defs/DiagnosticTag"
                 },
@@ -4303,11 +4284,8 @@
             "required": [
               "severity",
               "message",
-              "related",
-              "tags",
               "reliability",
-              "continuation",
-              "extensions"
+              "continuation"
             ],
             "type": "object"
           },
@@ -4903,12 +4881,9 @@
                 {
                   "code": "rift.hook.failed",
                   "continuation": "unknown",
-                  "extensions": {},
                   "message": "hook format did not pass: exited 1; stderr (32 of 32 bytes): Diff in src/config.rs at line 12",
-                  "related": [],
                   "reliability": "reliable",
-                  "severity": "error",
-                  "tags": []
+                  "severity": "error"
                 }
               ],
               "files": [
@@ -4936,7 +4911,6 @@
             }
           },
           {
-            "diagnostics": [],
             "preconditions": [
               {
                 "addresses": [
@@ -4989,7 +4963,8 @@
             "description": "Resolution produced no edits, so the targeted tree is untouched.",
             "properties": {
               "diagnostics": {
-                "description": "Evidence that explains the refusal.",
+                "default": [],
+                "description": "Evidence that explains the refusal. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/Diagnostic"
                 },
@@ -5016,8 +4991,7 @@
             "required": [
               "status",
               "reason",
-              "preconditions",
-              "diagnostics"
+              "preconditions"
             ],
             "type": "object"
           },
@@ -5194,10 +5168,12 @@
             "properties": {
               "extensions": {
                 "$ref": "#/$defs/Extensions",
-                "description": "Syntax facts the model has no field for, namespaced by the provider that emitted\nthem."
+                "default": {},
+                "description": "Syntax facts the model has no field for, namespaced by the provider that emitted\nthem. Absent when empty."
               },
               "facets": {
-                "description": "Portable structural classification, so a query can ask for bodies or imports without\nknowing the grammar that produced them.",
+                "default": [],
+                "description": "Portable structural classification, so a query can ask for bodies or imports without\nknowing the grammar that produced them. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/NodeFacet"
                 },
@@ -5231,7 +5207,8 @@
                 "description": "The bytes it spans, as offsets into the file."
               },
               "regions": {
-                "description": "The node's named parts, so an operation can rewrite a function body without touching\nthe documentation above it.",
+                "default": [],
+                "description": "The node's named parts, so an operation can rewrite a function body without touching\nthe documentation above it. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/NodeRegion"
                 },
@@ -5258,10 +5235,7 @@
               "unit",
               "language",
               "kind",
-              "facets",
-              "range",
-              "regions",
-              "extensions"
+              "range"
             ],
             "type": "object"
           },
@@ -5655,8 +5629,6 @@
           {
             "nodes": [
               {
-                "extensions": {},
-                "facets": [],
                 "id": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
                 "kind": "rust.source_file",
                 "language": {
@@ -5666,11 +5638,9 @@
                   "end": 356,
                   "start": 0
                 },
-                "regions": [],
                 "unit": "rift://file/src/config.rs"
               },
               {
-                "extensions": {},
                 "facets": [
                   "declaration",
                   "definition"
@@ -5705,8 +5675,6 @@
                 "unit": "rift://file/src/config.rs"
               },
               {
-                "extensions": {},
-                "facets": [],
                 "id": "rift://node/rust/src/config.rs@281-355#4e554fa8",
                 "kind": "rust.block",
                 "language": {
@@ -5717,11 +5685,9 @@
                   "end": 355,
                   "start": 281
                 },
-                "regions": [],
                 "unit": "rift://file/src/config.rs"
               },
               {
-                "extensions": {},
                 "facets": [
                   "expression"
                 ],
@@ -5735,12 +5701,9 @@
                   "end": 353,
                   "start": 334
                 },
-                "regions": [],
                 "unit": "rift://file/src/config.rs"
               },
               {
-                "extensions": {},
-                "facets": [],
                 "id": "rift://node/rust/src/config.rs@334-346#03f22dac",
                 "kind": "rust.identifier",
                 "language": {
@@ -5751,7 +5714,6 @@
                   "end": 346,
                   "start": 334
                 },
-                "regions": [],
                 "unit": "rift://file/src/config.rs"
               }
             ],
@@ -5806,8 +5768,7 @@
                 },
                 "text": "parse_config"
               }
-            ],
-            "warnings": []
+            ]
           }
         ],
         "properties": {
@@ -5826,7 +5787,8 @@
             "type": "array"
           },
           "warnings": {
-            "description": "Warnings attached to this result, empty when there is nothing to warn about.",
+            "default": [],
+            "description": "Warnings attached to this result. Absent when there is nothing to warn about.",
             "items": {
               "$ref": "#/$defs/ReadWarning"
             },
@@ -5835,8 +5797,7 @@
         },
         "required": [
           "nodes",
-          "source",
-          "warnings"
+          "source"
         ],
         "type": "object"
       }
@@ -5906,7 +5867,8 @@
             "description": "One applied change, with everything Rift learned while resolving it.",
             "properties": {
               "diagnostics": {
-                "description": "Resolution findings in source order, then one finding per hook that\ndid not pass.",
+                "default": [],
+                "description": "Resolution findings in source order, then one finding per hook that\ndid not pass. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/Diagnostic"
                 },
@@ -5923,7 +5885,8 @@
                 "type": "array"
               },
               "guarantees": {
-                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order.",
+                "default": [],
+                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/GuaranteeEvidence"
                 },
@@ -5937,9 +5900,7 @@
             },
             "required": [
               "id",
-              "files",
-              "diagnostics",
-              "guarantees"
+              "files"
             ],
             "type": "object"
           },
@@ -6028,7 +5989,8 @@
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
-                "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them."
+                "default": {},
+                "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them. Absent when empty."
               },
               "language": {
                 "anyOf": [
@@ -6047,7 +6009,8 @@
                 "type": "string"
               },
               "related": {
-                "description": "Other places the provider pointed at while explaining this one.",
+                "default": [],
+                "description": "Other places the provider pointed at while explaining this one. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/DiagnosticRelated"
                 },
@@ -6073,7 +6036,8 @@
                 "description": "Where it applies. Absent for a finding about the file as a whole, or about the\nbuild."
               },
               "tags": {
-                "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text.",
+                "default": [],
+                "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text; absent when empty.",
                 "items": {
                   "$ref": "#/$defs/DiagnosticTag"
                 },
@@ -6083,11 +6047,8 @@
             "required": [
               "severity",
               "message",
-              "related",
-              "tags",
               "reliability",
-              "continuation",
-              "extensions"
+              "continuation"
             ],
             "type": "object"
           },
@@ -6683,12 +6644,9 @@
                 {
                   "code": "rift.hook.failed",
                   "continuation": "unknown",
-                  "extensions": {},
                   "message": "hook format did not pass: exited 1; stderr (32 of 32 bytes): Diff in src/config.rs at line 12",
-                  "related": [],
                   "reliability": "reliable",
-                  "severity": "error",
-                  "tags": []
+                  "severity": "error"
                 }
               ],
               "files": [
@@ -6716,7 +6674,6 @@
             }
           },
           {
-            "diagnostics": [],
             "preconditions": [
               {
                 "addresses": [
@@ -6769,7 +6726,8 @@
             "description": "Resolution produced no edits, so the targeted tree is untouched.",
             "properties": {
               "diagnostics": {
-                "description": "Evidence that explains the refusal.",
+                "default": [],
+                "description": "Evidence that explains the refusal. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/Diagnostic"
                 },
@@ -6796,8 +6754,7 @@
             "required": [
               "status",
               "reason",
-              "preconditions",
-              "diagnostics"
+              "preconditions"
             ],
             "type": "object"
           },
@@ -6874,7 +6831,8 @@
             "description": "One applied change, with everything Rift learned while resolving it.",
             "properties": {
               "diagnostics": {
-                "description": "Resolution findings in source order, then one finding per hook that\ndid not pass.",
+                "default": [],
+                "description": "Resolution findings in source order, then one finding per hook that\ndid not pass. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/Diagnostic"
                 },
@@ -6891,7 +6849,8 @@
                 "type": "array"
               },
               "guarantees": {
-                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order.",
+                "default": [],
+                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/GuaranteeEvidence"
                 },
@@ -6905,9 +6864,7 @@
             },
             "required": [
               "id",
-              "files",
-              "diagnostics",
-              "guarantees"
+              "files"
             ],
             "type": "object"
           },
@@ -6996,7 +6953,8 @@
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
-                "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them."
+                "default": {},
+                "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them. Absent when empty."
               },
               "language": {
                 "anyOf": [
@@ -7015,7 +6973,8 @@
                 "type": "string"
               },
               "related": {
-                "description": "Other places the provider pointed at while explaining this one.",
+                "default": [],
+                "description": "Other places the provider pointed at while explaining this one. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/DiagnosticRelated"
                 },
@@ -7041,7 +7000,8 @@
                 "description": "Where it applies. Absent for a finding about the file as a whole, or about the\nbuild."
               },
               "tags": {
-                "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text.",
+                "default": [],
+                "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text; absent when empty.",
                 "items": {
                   "$ref": "#/$defs/DiagnosticTag"
                 },
@@ -7051,11 +7011,8 @@
             "required": [
               "severity",
               "message",
-              "related",
-              "tags",
               "reliability",
-              "continuation",
-              "extensions"
+              "continuation"
             ],
             "type": "object"
           },
@@ -7651,12 +7608,9 @@
                 {
                   "code": "rift.hook.failed",
                   "continuation": "unknown",
-                  "extensions": {},
                   "message": "hook format did not pass: exited 1; stderr (32 of 32 bytes): Diff in src/config.rs at line 12",
-                  "related": [],
                   "reliability": "reliable",
-                  "severity": "error",
-                  "tags": []
+                  "severity": "error"
                 }
               ],
               "files": [
@@ -7684,7 +7638,6 @@
             }
           },
           {
-            "diagnostics": [],
             "preconditions": [
               {
                 "addresses": [
@@ -7737,7 +7690,8 @@
             "description": "Resolution produced no edits, so the targeted tree is untouched.",
             "properties": {
               "diagnostics": {
-                "description": "Evidence that explains the refusal.",
+                "default": [],
+                "description": "Evidence that explains the refusal. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/Diagnostic"
                 },
@@ -7764,8 +7718,7 @@
             "required": [
               "status",
               "reason",
-              "preconditions",
-              "diagnostics"
+              "preconditions"
             ],
             "type": "object"
           },
@@ -7842,7 +7795,8 @@
             "description": "One applied change, with everything Rift learned while resolving it.",
             "properties": {
               "diagnostics": {
-                "description": "Resolution findings in source order, then one finding per hook that\ndid not pass.",
+                "default": [],
+                "description": "Resolution findings in source order, then one finding per hook that\ndid not pass. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/Diagnostic"
                 },
@@ -7859,7 +7813,8 @@
                 "type": "array"
               },
               "guarantees": {
-                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order.",
+                "default": [],
+                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/GuaranteeEvidence"
                 },
@@ -7873,9 +7828,7 @@
             },
             "required": [
               "id",
-              "files",
-              "diagnostics",
-              "guarantees"
+              "files"
             ],
             "type": "object"
           },
@@ -7964,7 +7917,8 @@
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
-                "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them."
+                "default": {},
+                "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them. Absent when empty."
               },
               "language": {
                 "anyOf": [
@@ -7983,7 +7937,8 @@
                 "type": "string"
               },
               "related": {
-                "description": "Other places the provider pointed at while explaining this one.",
+                "default": [],
+                "description": "Other places the provider pointed at while explaining this one. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/DiagnosticRelated"
                 },
@@ -8009,7 +7964,8 @@
                 "description": "Where it applies. Absent for a finding about the file as a whole, or about the\nbuild."
               },
               "tags": {
-                "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text.",
+                "default": [],
+                "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text; absent when empty.",
                 "items": {
                   "$ref": "#/$defs/DiagnosticTag"
                 },
@@ -8019,11 +7975,8 @@
             "required": [
               "severity",
               "message",
-              "related",
-              "tags",
               "reliability",
-              "continuation",
-              "extensions"
+              "continuation"
             ],
             "type": "object"
           },
@@ -8619,12 +8572,9 @@
                 {
                   "code": "rift.hook.failed",
                   "continuation": "unknown",
-                  "extensions": {},
                   "message": "hook format did not pass: exited 1; stderr (32 of 32 bytes): Diff in src/config.rs at line 12",
-                  "related": [],
                   "reliability": "reliable",
-                  "severity": "error",
-                  "tags": []
+                  "severity": "error"
                 }
               ],
               "files": [
@@ -8652,7 +8602,6 @@
             }
           },
           {
-            "diagnostics": [],
             "preconditions": [
               {
                 "addresses": [
@@ -8705,7 +8654,8 @@
             "description": "Resolution produced no edits, so the targeted tree is untouched.",
             "properties": {
               "diagnostics": {
-                "description": "Evidence that explains the refusal.",
+                "default": [],
+                "description": "Evidence that explains the refusal. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/Diagnostic"
                 },
@@ -8732,8 +8682,7 @@
             "required": [
               "status",
               "reason",
-              "preconditions",
-              "diagnostics"
+              "preconditions"
             ],
             "type": "object"
           },
@@ -8812,7 +8761,8 @@
             "description": "One applied change, with everything Rift learned while resolving it.",
             "properties": {
               "diagnostics": {
-                "description": "Resolution findings in source order, then one finding per hook that\ndid not pass.",
+                "default": [],
+                "description": "Resolution findings in source order, then one finding per hook that\ndid not pass. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/Diagnostic"
                 },
@@ -8829,7 +8779,8 @@
                 "type": "array"
               },
               "guarantees": {
-                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order.",
+                "default": [],
+                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/GuaranteeEvidence"
                 },
@@ -8843,9 +8794,7 @@
             },
             "required": [
               "id",
-              "files",
-              "diagnostics",
-              "guarantees"
+              "files"
             ],
             "type": "object"
           },
@@ -8934,7 +8883,8 @@
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
-                "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them."
+                "default": {},
+                "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them. Absent when empty."
               },
               "language": {
                 "anyOf": [
@@ -8953,7 +8903,8 @@
                 "type": "string"
               },
               "related": {
-                "description": "Other places the provider pointed at while explaining this one.",
+                "default": [],
+                "description": "Other places the provider pointed at while explaining this one. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/DiagnosticRelated"
                 },
@@ -8979,7 +8930,8 @@
                 "description": "Where it applies. Absent for a finding about the file as a whole, or about the\nbuild."
               },
               "tags": {
-                "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text.",
+                "default": [],
+                "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text; absent when empty.",
                 "items": {
                   "$ref": "#/$defs/DiagnosticTag"
                 },
@@ -8989,11 +8941,8 @@
             "required": [
               "severity",
               "message",
-              "related",
-              "tags",
               "reliability",
-              "continuation",
-              "extensions"
+              "continuation"
             ],
             "type": "object"
           },
@@ -9589,12 +9538,9 @@
                 {
                   "code": "rift.hook.failed",
                   "continuation": "unknown",
-                  "extensions": {},
                   "message": "hook format did not pass: exited 1; stderr (32 of 32 bytes): Diff in src/config.rs at line 12",
-                  "related": [],
                   "reliability": "reliable",
-                  "severity": "error",
-                  "tags": []
+                  "severity": "error"
                 }
               ],
               "files": [
@@ -9622,7 +9568,6 @@
             }
           },
           {
-            "diagnostics": [],
             "preconditions": [
               {
                 "addresses": [
@@ -9675,7 +9620,8 @@
             "description": "Resolution produced no edits, so the targeted tree is untouched.",
             "properties": {
               "diagnostics": {
-                "description": "Evidence that explains the refusal.",
+                "default": [],
+                "description": "Evidence that explains the refusal. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/Diagnostic"
                 },
@@ -9702,8 +9648,7 @@
             "required": [
               "status",
               "reason",
-              "preconditions",
-              "diagnostics"
+              "preconditions"
             ],
             "type": "object"
           },
@@ -9855,7 +9800,8 @@
             "description": "One applied change, with everything Rift learned while resolving it.",
             "properties": {
               "diagnostics": {
-                "description": "Resolution findings in source order, then one finding per hook that\ndid not pass.",
+                "default": [],
+                "description": "Resolution findings in source order, then one finding per hook that\ndid not pass. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/Diagnostic"
                 },
@@ -9872,7 +9818,8 @@
                 "type": "array"
               },
               "guarantees": {
-                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order.",
+                "default": [],
+                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/GuaranteeEvidence"
                 },
@@ -9886,9 +9833,7 @@
             },
             "required": [
               "id",
-              "files",
-              "diagnostics",
-              "guarantees"
+              "files"
             ],
             "type": "object"
           },
@@ -9977,7 +9922,8 @@
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
-                "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them."
+                "default": {},
+                "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them. Absent when empty."
               },
               "language": {
                 "anyOf": [
@@ -9996,7 +9942,8 @@
                 "type": "string"
               },
               "related": {
-                "description": "Other places the provider pointed at while explaining this one.",
+                "default": [],
+                "description": "Other places the provider pointed at while explaining this one. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/DiagnosticRelated"
                 },
@@ -10022,7 +9969,8 @@
                 "description": "Where it applies. Absent for a finding about the file as a whole, or about the\nbuild."
               },
               "tags": {
-                "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text.",
+                "default": [],
+                "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text; absent when empty.",
                 "items": {
                   "$ref": "#/$defs/DiagnosticTag"
                 },
@@ -10032,11 +9980,8 @@
             "required": [
               "severity",
               "message",
-              "related",
-              "tags",
               "reliability",
-              "continuation",
-              "extensions"
+              "continuation"
             ],
             "type": "object"
           },
@@ -10632,12 +10577,9 @@
                 {
                   "code": "rift.hook.failed",
                   "continuation": "unknown",
-                  "extensions": {},
                   "message": "hook format did not pass: exited 1; stderr (32 of 32 bytes): Diff in src/config.rs at line 12",
-                  "related": [],
                   "reliability": "reliable",
-                  "severity": "error",
-                  "tags": []
+                  "severity": "error"
                 }
               ],
               "files": [
@@ -10665,7 +10607,6 @@
             }
           },
           {
-            "diagnostics": [],
             "preconditions": [
               {
                 "addresses": [
@@ -10718,7 +10659,8 @@
             "description": "Resolution produced no edits, so the targeted tree is untouched.",
             "properties": {
               "diagnostics": {
-                "description": "Evidence that explains the refusal.",
+                "default": [],
+                "description": "Evidence that explains the refusal. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/Diagnostic"
                 },
@@ -10745,8 +10687,7 @@
             "required": [
               "status",
               "reason",
-              "preconditions",
-              "diagnostics"
+              "preconditions"
             ],
             "type": "object"
           },
@@ -10898,7 +10839,8 @@
             "description": "One applied change, with everything Rift learned while resolving it.",
             "properties": {
               "diagnostics": {
-                "description": "Resolution findings in source order, then one finding per hook that\ndid not pass.",
+                "default": [],
+                "description": "Resolution findings in source order, then one finding per hook that\ndid not pass. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/Diagnostic"
                 },
@@ -10915,7 +10857,8 @@
                 "type": "array"
               },
               "guarantees": {
-                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order.",
+                "default": [],
+                "description": "Properties the workspace's passing validation hooks established about this\nchange, in hook list order. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/GuaranteeEvidence"
                 },
@@ -10929,9 +10872,7 @@
             },
             "required": [
               "id",
-              "files",
-              "diagnostics",
-              "guarantees"
+              "files"
             ],
             "type": "object"
           },
@@ -11020,7 +10961,8 @@
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
-                "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them."
+                "default": {},
+                "description": "Diagnostic fields the model has no place for, namespaced by the provider that\nemitted them. Absent when empty."
               },
               "language": {
                 "anyOf": [
@@ -11039,7 +10981,8 @@
                 "type": "string"
               },
               "related": {
-                "description": "Other places the provider pointed at while explaining this one.",
+                "default": [],
+                "description": "Other places the provider pointed at while explaining this one. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/DiagnosticRelated"
                 },
@@ -11065,7 +11008,8 @@
                 "description": "Where it applies. Absent for a finding about the file as a whole, or about the\nbuild."
               },
               "tags": {
-                "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text.",
+                "default": [],
+                "description": "Presentation tags for the finding. A consumer can render them as strikethrough or\ngrey text; absent when empty.",
                 "items": {
                   "$ref": "#/$defs/DiagnosticTag"
                 },
@@ -11075,11 +11019,8 @@
             "required": [
               "severity",
               "message",
-              "related",
-              "tags",
               "reliability",
-              "continuation",
-              "extensions"
+              "continuation"
             ],
             "type": "object"
           },
@@ -11675,12 +11616,9 @@
                 {
                   "code": "rift.hook.failed",
                   "continuation": "unknown",
-                  "extensions": {},
                   "message": "hook format did not pass: exited 1; stderr (32 of 32 bytes): Diff in src/config.rs at line 12",
-                  "related": [],
                   "reliability": "reliable",
-                  "severity": "error",
-                  "tags": []
+                  "severity": "error"
                 }
               ],
               "files": [
@@ -11708,7 +11646,6 @@
             }
           },
           {
-            "diagnostics": [],
             "preconditions": [
               {
                 "addresses": [
@@ -11761,7 +11698,8 @@
             "description": "Resolution produced no edits, so the targeted tree is untouched.",
             "properties": {
               "diagnostics": {
-                "description": "Evidence that explains the refusal.",
+                "default": [],
+                "description": "Evidence that explains the refusal. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/Diagnostic"
                 },
@@ -11788,8 +11726,7 @@
             "required": [
               "status",
               "reason",
-              "preconditions",
-              "diagnostics"
+              "preconditions"
             ],
             "type": "object"
           },
@@ -12164,14 +12101,16 @@
                 "description": "Project-relative source identity and the URI from which this record and its bytes\nare read."
               },
               "languages": {
-                "description": "Distinct `Language` values in `regions`, sorted by name and dialect. A file holding\nembedded languages advertises each of them.",
+                "default": [],
+                "description": "Distinct `Language` values in `regions`, sorted by name and dialect. A file holding\nembedded languages advertises each of them. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/Language"
                 },
                 "type": "array"
               },
               "regions": {
-                "description": "Byte ranges parsed with each language grammar. Entries sort by start, end, language\nname, and dialect with null first. Regions may overlap when two grammars parse the\nsame bytes.",
+                "default": [],
+                "description": "Byte ranges parsed with each language grammar. Entries sort by start, end, language\nname, and dialect with null first. Regions may overlap when two grammars parse the\nsame bytes, absent when empty.",
                 "items": {
                   "$ref": "#/$defs/LanguageRegion"
                 },
@@ -12185,8 +12124,6 @@
             "required": [
               "id",
               "content",
-              "languages",
-              "regions",
               "semantic"
             ],
             "type": "object"
@@ -12381,10 +12318,12 @@
             "properties": {
               "extensions": {
                 "$ref": "#/$defs/Extensions",
-                "description": "Syntax facts the model has no field for, namespaced by the provider that emitted\nthem."
+                "default": {},
+                "description": "Syntax facts the model has no field for, namespaced by the provider that emitted\nthem. Absent when empty."
               },
               "facets": {
-                "description": "Portable structural classification, so a query can ask for bodies or imports without\nknowing the grammar that produced them.",
+                "default": [],
+                "description": "Portable structural classification, so a query can ask for bodies or imports without\nknowing the grammar that produced them. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/NodeFacet"
                 },
@@ -12418,7 +12357,8 @@
                 "description": "The bytes it spans, as offsets into the file."
               },
               "regions": {
-                "description": "The node's named parts, so an operation can rewrite a function body without touching\nthe documentation above it.",
+                "default": [],
+                "description": "The node's named parts, so an operation can rewrite a function body without touching\nthe documentation above it. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/NodeRegion"
                 },
@@ -12445,10 +12385,7 @@
               "unit",
               "language",
               "kind",
-              "facets",
-              "range",
-              "regions",
-              "extensions"
+              "range"
             ],
             "type": "object"
           },
@@ -12641,7 +12578,8 @@
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
-                "description": "Parameter facts the model has no field for, namespaced by the provider that emitted\nthem."
+                "default": {},
+                "description": "Parameter facts the model has no field for, namespaced by the provider that emitted\nthem. Absent when empty."
               },
               "name": {
                 "description": "What the parameter is called. Absent where the language allows an unnamed one, as\na positional parameter in a function type.",
@@ -12666,7 +12604,8 @@
                 "type": "boolean"
               },
               "types": {
-                "description": "What it accepts. An array because a declared type and an inferred one are separate\nbindings.",
+                "default": [],
+                "description": "What it accepts, absent when empty. An array because a declared type and an\ninferred one are separate bindings.",
                 "items": {
                   "$ref": "#/$defs/TypeBinding"
                 },
@@ -12678,10 +12617,8 @@
               }
             },
             "required": [
-              "types",
               "optional",
-              "variadic",
-              "extensions"
+              "variadic"
             ],
             "type": "object"
           },
@@ -12892,7 +12829,8 @@
                 "description": "How this edge was established."
               },
               "evidence": {
-                "description": "The nodes this edge was read from.",
+                "default": [],
+                "description": "The nodes this edge was read from. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/NodeId"
                 },
@@ -12900,7 +12838,8 @@
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
-                "description": "Edge facts the model has no field for, namespaced by the provider that emitted them."
+                "default": {},
+                "description": "Edge facts the model has no field for, namespaced by the provider that emitted them.\nAbsent when empty."
               },
               "facets": {
                 "description": "Portable classification, so a query for `imports` finds local kinds such as `import`\nand `use` alike.",
@@ -12928,9 +12867,7 @@
               "kind",
               "facets",
               "to",
-              "evidence",
-              "derivation",
-              "extensions"
+              "derivation"
             ],
             "type": "object"
           },
@@ -13182,7 +13119,8 @@
                 ]
               },
               "matched_by": {
-                "description": "Which indexed fields produced the match.",
+                "default": [],
+                "description": "Which indexed fields produced the match. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/MatchedField"
                 },
@@ -13237,8 +13175,7 @@
             },
             "required": [
               "hit",
-              "score",
-              "matched_by"
+              "score"
             ],
             "type": "object"
           },
@@ -13313,7 +13250,8 @@
                 "type": "string"
               },
               "effects": {
-                "description": "Effect keywords the declaration carries, in the language's own words: `async`,\n`unsafe`, `pure`. The spelling is preserved and never mapped onto a portable\nmeaning.",
+                "default": [],
+                "description": "Effect keywords the declaration carries, in the language's own words: `async`,\n`unsafe`, `pure`. The spelling is preserved and never mapped onto a portable\nmeaning; absent when empty.",
                 "items": {
                   "type": "string"
                 },
@@ -13321,21 +13259,24 @@
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
-                "description": "Signature facts the model has no field for, namespaced by the provider that emitted\nthem."
+                "default": {},
+                "description": "Signature facts the model has no field for, namespaced by the provider that emitted\nthem. Absent when empty."
               },
               "language": {
                 "$ref": "#/$defs/Language",
                 "description": "The language whose syntax `display` is written in."
               },
               "links": {
-                "description": "Symbols named inside `display`, each with the byte range of `display` that names it,\nso a renderer can turn the rendered text into links.",
+                "default": [],
+                "description": "Symbols named inside `display`, each with the byte range of `display` that names it,\nso a renderer can turn the rendered text into links. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/SignatureLink"
                 },
                 "type": "array"
               },
               "parameters": {
-                "description": "Declared parameters, in source order.",
+                "default": [],
+                "description": "Declared parameters, in source order. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/Parameter"
                 },
@@ -13353,21 +13294,24 @@
                 "description": "The implicit first parameter - `self`, `this`. Absent for a free function, and for\nlanguages that have no such thing."
               },
               "returns": {
-                "description": "What the call yields. An array because a language may return several values, and\nbecause a declared and an inferred return are separate bindings.",
+                "default": [],
+                "description": "What the call yields, absent when empty. An array because a language may return\nseveral values, and because a declared and an inferred return are separate\nbindings.",
                 "items": {
                   "$ref": "#/$defs/TypeBinding"
                 },
                 "type": "array"
               },
               "throws": {
-                "description": "Types this form declares it can raise.",
+                "default": [],
+                "description": "Types this form declares it can raise. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/TypeExpression"
                 },
                 "type": "array"
               },
               "type_parameters": {
-                "description": "The generic parameters this form declares, each as the symbol that declares it.",
+                "default": [],
+                "description": "The generic parameters this form declares, each as the symbol that declares it.\nAbsent when empty.",
                 "items": {
                   "$ref": "#/$defs/SymbolId"
                 },
@@ -13376,14 +13320,7 @@
             },
             "required": [
               "display",
-              "links",
-              "language",
-              "parameters",
-              "returns",
-              "type_parameters",
-              "throws",
-              "effects",
-              "extensions"
+              "language"
             ],
             "type": "object"
           },
@@ -13545,25 +13482,29 @@
                 "description": "The symbol this one belongs to - the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method is written beside its type and a\nRust method inside an `impl` block, and both name the type here. Absent at the top\nlevel."
               },
               "contributions": {
-                "description": "Contributions selected for this request, in presentation order.",
+                "default": [],
+                "description": "Contributions selected for this request, in presentation order. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/ContributionKey"
                 },
                 "type": "array"
               },
               "disagreements": {
-                "description": "Presentation differences retained after field selection.",
+                "default": [],
+                "description": "Presentation differences retained after field selection. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/SymbolDisagreement"
                 },
                 "type": "array"
               },
               "document_local": {
-                "description": "Whether language semantics confine this symbol to the document that declares it. The\nprovider classifies locality from its language model.",
+                "default": false,
+                "description": "Whether language semantics confine this symbol to the document that declares it. The\nprovider classifies locality from its language model; absent when `false`.",
                 "type": "boolean"
               },
               "documentation": {
-                "description": "Doc comments attached to the declaration, with the markup format they were written\nin.",
+                "default": [],
+                "description": "Doc comments attached to the declaration, with the markup format they were written\nin. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/Documentation"
                 },
@@ -13571,10 +13512,12 @@
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
-                "description": "Language-specific facts with no portable equivalent, namespaced by the provider that\nemitted them."
+                "default": {},
+                "description": "Language-specific facts with no portable equivalent, namespaced by the provider that\nemitted them. Absent when empty."
               },
               "facets": {
-                "description": "Portable classification for cross-language queries. The local kinds `trait` and\n`interface` can both carry the `type` facet.",
+                "default": [],
+                "description": "Portable classification for cross-language queries, absent when empty. The local\nkinds `trait` and `interface` can both carry the `type` facet.",
                 "items": {
                   "$ref": "#/$defs/SymbolFacet"
                 },
@@ -13606,7 +13549,8 @@
                 "description": "The language this symbol belongs to."
               },
               "modifiers": {
-                "description": "Language keywords qualifying the declaration: `export`, `async`, `const`.",
+                "default": [],
+                "description": "Language keywords qualifying the declaration: `export`, `async`, `const`. Absent\nwhen empty.",
                 "items": {
                   "type": "string"
                 },
@@ -13626,14 +13570,16 @@
                 "description": "Whether normalization established one Symbol identity."
               },
               "signatures": {
-                "description": "One entry per callable form. Where the language dispatches overloads separately they\nare separate symbols joined by the `overloads` edge; several entries here are\nalternative forms of one dispatch target, as `typing.overload` writes them.",
+                "default": [],
+                "description": "One entry per callable form, absent when empty. Where the language dispatches\noverloads separately they are separate symbols joined by the `overloads` edge;\nseveral entries here are alternative forms of one dispatch target, as\n`typing.overload` writes them.",
                 "items": {
                   "$ref": "#/$defs/Signature"
                 },
                 "type": "array"
               },
               "types": {
-                "description": "The types this symbol carries, each tagged with the role it plays: a return type, a\nfield type, a bound.",
+                "default": [],
+                "description": "The types this symbol carries, each tagged with the role it plays: a return type, a\nfield type, a bound. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/TypeBinding"
                 },
@@ -13650,19 +13596,10 @@
             "required": [
               "index_revision",
               "resolution",
-              "contributions",
               "language",
               "name",
               "kind",
-              "facets",
-              "origin",
-              "modifiers",
-              "types",
-              "signatures",
-              "documentation",
-              "extensions",
-              "disagreements",
-              "document_local"
+              "origin"
             ],
             "type": "object"
           },
@@ -14091,7 +14028,8 @@
             "properties": {
               "extensions": {
                 "$ref": "#/$defs/Extensions",
-                "description": "Type facts the model has no field for, namespaced by the provider that emitted them."
+                "default": {},
+                "description": "Type facts the model has no field for, namespaced by the provider that emitted them.\nAbsent when empty."
               },
               "language": {
                 "$ref": "#/$defs/Language",
@@ -14115,8 +14053,7 @@
             },
             "required": [
               "language",
-              "source",
-              "extensions"
+              "source"
             ],
             "type": "object"
           }
@@ -14140,15 +14077,12 @@
                         "symbol": "load_config"
                       }
                     ],
-                    "disagreements": [],
-                    "document_local": false,
                     "documentation": [
                       {
                         "format": "markdown",
                         "text": "Loads the workspace configuration from `rift.toml`."
                       }
                     ],
-                    "extensions": {},
                     "facets": [
                       "value",
                       "callable",
@@ -14160,7 +14094,6 @@
                     "language": {
                       "name": "rust"
                     },
-                    "modifiers": [],
                     "name": "load_config",
                     "origin": {
                       "location": {
@@ -14173,8 +14106,6 @@
                     "signatures": [
                       {
                         "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
-                        "effects": [],
-                        "extensions": {},
                         "language": {
                           "name": "rust"
                         },
@@ -14189,7 +14120,6 @@
                         ],
                         "parameters": [
                           {
-                            "extensions": {},
                             "name": "path",
                             "optional": false,
                             "types": [
@@ -14197,7 +14127,6 @@
                                 "origin": "declared",
                                 "role": "parameter",
                                 "type": {
-                                  "extensions": {},
                                   "language": {
                                     "name": "rust"
                                   },
@@ -14213,16 +14142,13 @@
                             "origin": "declared",
                             "role": "return",
                             "type": {
-                              "extensions": {},
                               "language": {
                                 "name": "rust"
                               },
                               "source": "Result<Config, ConfigError>"
                             }
                           }
-                        ],
-                        "throws": [],
-                        "type_parameters": []
+                        ]
                       }
                     ],
                     "types": [
@@ -14230,7 +14156,6 @@
                         "origin": "declared",
                         "role": "return",
                         "type": {
-                          "extensions": {},
                           "language": {
                             "name": "rust"
                           },
@@ -14271,7 +14196,6 @@
                         "name": "rust"
                       }
                     ],
-                    "regions": [],
                     "semantic": true
                   },
                   "target": "file"
@@ -14291,8 +14215,7 @@
                   "unit": "rift://source/project/src/lib.rs"
                 }
               }
-            ],
-            "warnings": []
+            ]
           }
         ],
         "properties": {
@@ -14308,7 +14231,8 @@
             "type": "array"
           },
           "warnings": {
-            "description": "Warnings attached to this result, empty when there is nothing to warn about.",
+            "default": [],
+            "description": "Warnings attached to this result. Absent when there is nothing to warn about.",
             "items": {
               "$ref": "#/$defs/ReadWarning"
             },
@@ -14317,8 +14241,7 @@
         },
         "required": [
           "results",
-          "pagination",
-          "warnings"
+          "pagination"
         ],
         "type": "object"
       }
