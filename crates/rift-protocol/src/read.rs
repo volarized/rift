@@ -186,16 +186,29 @@ pub struct GetSymbolHit {
     #[schemars(range(min = 1_u64))]
     pub line: u64,
     /// The declaration node's identity, the full edit address `replace_node` accepts.
-    /// Absent when source is unavailable or outside the project.
+    /// Absent unless `include` names `source`, or when source is unavailable or outside
+    /// the project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<NodeId>,
-    /// The declaration source when the request asked for bodies and the provider can read
-    /// it. Absent for source-less declarations.
+    /// The declaration source, present when `include` names `source` and the provider
+    /// can read it. Absent for a source-less declaration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// The symbol's timeline, present when the request asked for history.
+    /// The symbol's timeline, present when `include` names `history`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<SymbolHistory>,
+}
+
+/// One optional `get_symbol` hit field the caller may opt into through `include`.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GetSymbolInclude {
+    /// The hit's node identity and declaration source excerpt.
+    Source,
+    /// The hit's version-control timeline.
+    History,
 }
 
 /// Gets declarations by name and returns them with their bodies inline, so one call replaces
@@ -207,8 +220,7 @@ pub struct GetSymbolHit {
     {
         "name": "ReadService",
         "language": "rust",
-        "include_body": true,
-        "include_history": true,
+        "include": ["source", "history"],
         "limit": 5,
         "page_index": 0
     },
@@ -227,13 +239,10 @@ pub struct GetSymbolParams {
     /// Narrows the answer to one language. Omitted searches every served language.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<Language>,
-    /// Whether each hit carries its declaration source.
-    #[serde(default = "default_get_symbol_params_include_body")]
-    pub include_body: bool,
-    /// Whether each hit carries its version-control timeline. Off by default: a timeline is
-    /// read when the caller is deciding about the symbol, not on every lookup.
-    #[serde(default = "default_get_symbol_params_include_history")]
-    pub include_history: bool,
+    /// Optional hit fields to attach: `source`, `history`. Omitted defaults to
+    /// `["source"]`; an explicit empty list carries neither.
+    #[serde(default = "default_get_symbol_params_include")]
+    pub include: Vec<GetSymbolInclude>,
     /// Most hits to return in one page, capped by `max_page_items`.
     #[serde(default = "default_get_symbol_params_limit")]
     #[schemars(range(min = 1_u64, max = 10_000_u64))]
@@ -250,12 +259,8 @@ pub struct GetSymbolParams {
     pub rev: Option<RevisionId>,
 }
 
-fn default_get_symbol_params_include_body() -> bool {
-    true
-}
-
-fn default_get_symbol_params_include_history() -> bool {
-    false
+fn default_get_symbol_params_include() -> Vec<GetSymbolInclude> {
+    vec![GetSymbolInclude::Source]
 }
 
 fn default_get_symbol_params_limit() -> u64 {
@@ -1693,6 +1698,32 @@ mod tests {
         assert_eq!(
             schema["properties"]["page_index"]["default"],
             json!(PAGE_INDEX_DEFAULT)
+        );
+    }
+
+    /// The advertised schema states the same default the field's default function
+    /// returns: an omitted `include` implies `["source"]`.
+    #[test]
+    fn get_symbol_params_schema_include_default_is_source_only() {
+        let schema = serde_json::to_value(schema_for!(GetSymbolParams)).expect("schema");
+        assert_eq!(
+            schema["properties"]["include"]["default"],
+            json!(["source"])
+        );
+    }
+
+    /// `include: ["body"]` names no `GetSymbolInclude` member; a request naming it is
+    /// refused at deserialization, and the refusal names the accepted values.
+    #[test]
+    fn get_symbol_include_rejects_an_unknown_entry_and_names_the_accepted_values() {
+        let error = serde_json::from_value::<GetSymbolParams>(
+            json!({"name": "Beacon", "include": ["body"]}),
+        )
+        .expect_err("an unknown include entry must fail deserialization");
+        let message = error.to_string();
+        assert!(
+            message.contains("source") && message.contains("history"),
+            "{message}"
         );
     }
 

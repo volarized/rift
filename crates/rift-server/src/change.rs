@@ -1867,7 +1867,7 @@ mod tests {
     ) -> TestResult<SymbolId> {
         let params: GetSymbolParams = serde_json::from_value(serde_json::json!({
             "name": case.name,
-            "include_body": true
+            "include": ["source"]
         }))?;
         let hits = reads.get_symbol(&params)?.hits;
         assert_eq!(

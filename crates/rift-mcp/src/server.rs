@@ -964,8 +964,8 @@ impl RiftMcp {
     }
 
     /// Finds declarations and their source by exact symbol name. Each hit
-    /// carries the declaration and its source excerpt; `include_body: false` omits
-    /// both. `include_history: true` adds each hit's version-control timeline,
+    /// carries the declaration and its source excerpt unless `include` omits
+    /// `source`. `include: ["history"]` adds each hit's version-control timeline,
     /// walked from the served revision. `rev` serves the lookup from a
     /// version-control revision instead of the current tree. Use `search` when
     /// the name is not exactly known.

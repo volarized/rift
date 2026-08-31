@@ -33,21 +33,19 @@ fn corpus() -> Vec<(&'static str, Value)> {
     let mut requests = vec![
         ("get_symbol", json!({ "name": "beacon_one" })),
         ("get_symbol", json!({ "name": "beacon", "limit": 1 })),
-        (
-            "get_symbol",
-            json!({ "name": "beacon", "include_body": false }),
-        ),
+        ("get_symbol", json!({ "name": "beacon", "include": [] })),
         // The fixture's committed baseline serves the timeline: one
         // `introduced` version from the walk's first commit.
         (
             "get_symbol",
-            json!({ "name": "beacon_one", "include_history": true }),
+            json!({ "name": "beacon_one", "include": ["history"] }),
         ),
         ("search", json!({ "query": "beacon" })),
         (
             "search",
             json!({ "query": "beacon", "include": ["source"] }),
         ),
+        ("search", json!({ "query": "beacon", "include": ["score"] })),
         (
             "search",
             json!({
@@ -475,6 +473,30 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
              {structured:#}"
         );
     }
+    if name == "get_symbol" {
+        let include = request.get("include").and_then(Value::as_array);
+        let expects_source = include.is_none_or(|entries| entries.contains(&Value::from("source")));
+        let expects_history =
+            include.is_some_and(|entries| entries.contains(&Value::from("history")));
+        for hit in structured["hits"].as_array().into_iter().flatten() {
+            assert_eq!(
+                hit.get("source").is_some(),
+                expects_source,
+                "a hit carries source exactly when the request includes it: {request:#} {hit:#}"
+            );
+            assert_eq!(
+                hit.get("node").is_some(),
+                expects_source,
+                "the node address rides with source: {request:#} {hit:#}"
+            );
+            if !expects_history {
+                assert!(
+                    hit.get("history").is_none(),
+                    "a hit omits history unless the request includes it: {request:#} {hit:#}"
+                );
+            }
+        }
+    }
     if name == "search"
         && let Some(warnings) = structured["warnings"].as_array()
     {
@@ -493,6 +515,9 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
         let source_requested = request["include"]
             .as_array()
             .is_some_and(|include| include.iter().any(|value| value == "source"));
+        let score_requested = request["include"]
+            .as_array()
+            .is_some_and(|include| include.iter().any(|value| value == "score"));
         for hit in results {
             assert!(
                 !hit["path"].is_null(),
@@ -508,6 +533,18 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
                 assert!(
                     hit["source"].is_null(),
                     "a hit must omit source when the request never names it: {hit:#}"
+                );
+            }
+            if score_requested {
+                assert!(
+                    !hit["score"].is_null(),
+                    "a hit must carry score once the request names \
+                     include: [\"score\"]: {hit:#}"
+                );
+            } else {
+                assert!(
+                    hit["score"].is_null(),
+                    "a hit must omit score when the request never names it: {hit:#}"
                 );
             }
         }

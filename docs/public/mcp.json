@@ -2,9 +2,24 @@
   "description": "Tools served by the Rift MCP server, with the JSON Schemas derived from the Rust wire models.",
   "tools": [
     {
-      "description": "Finds declarations and their source by exact symbol name. Each hit\ncarries the declaration and its source excerpt; `include_body: false` omits\nboth. `include_history: true` adds each hit's version-control timeline,\nwalked from the served revision. `rev` serves the lookup from a\nversion-control revision instead of the current tree. Use `search` when\nthe name is not exactly known.",
+      "description": "Finds declarations and their source by exact symbol name. Each hit\ncarries the declaration and its source excerpt unless `include` omits\n`source`. `include: [\"history\"]` adds each hit's version-control timeline,\nwalked from the served revision. `rev` serves the lookup from a\nversion-control revision instead of the current tree. Use `search` when\nthe name is not exactly known.",
       "input_schema": {
         "$defs": {
+          "GetSymbolInclude": {
+            "description": "One optional `get_symbol` hit field the caller may opt into through `include`.",
+            "oneOf": [
+              {
+                "const": "source",
+                "description": "The hit's node identity and declaration source excerpt.",
+                "type": "string"
+              },
+              {
+                "const": "history",
+                "description": "The hit's version-control timeline.",
+                "type": "string"
+              }
+            ]
+          },
           "Language": {
             "description": "A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.",
             "examples": [
@@ -27,8 +42,10 @@
         "additionalProperties": false,
         "examples": [
           {
-            "include_body": true,
-            "include_history": true,
+            "include": [
+              "source",
+              "history"
+            ],
             "language": "rust",
             "limit": 5,
             "name": "ReadService",
@@ -41,15 +58,15 @@
           }
         ],
         "properties": {
-          "include_body": {
-            "default": true,
-            "description": "Whether each hit carries its declaration source.",
-            "type": "boolean"
-          },
-          "include_history": {
-            "default": false,
-            "description": "Whether each hit carries its version-control timeline. Off by default: a timeline is\nread when the caller is deciding about the symbol, not on every lookup.",
-            "type": "boolean"
+          "include": {
+            "default": [
+              "source"
+            ],
+            "description": "Optional hit fields to attach: `source`, `history`. Omitted defaults to\n`[\"source\"]`; an explicit empty list carries neither.",
+            "items": {
+              "$ref": "#/$defs/GetSymbolInclude"
+            },
+            "type": "array"
           },
           "language": {
             "anyOf": [
@@ -225,7 +242,7 @@
                     "type": "null"
                   }
                 ],
-                "description": "The symbol's timeline, present when the request asked for history."
+                "description": "The symbol's timeline, present when `include` names `history`."
               },
               "line": {
                 "description": "The 1-based source line where the declaration begins.",
@@ -242,7 +259,7 @@
                     "type": "null"
                   }
                 ],
-                "description": "The declaration node's identity, the full edit address `replace_node` accepts.\nAbsent when source is unavailable or outside the project."
+                "description": "The declaration node's identity, the full edit address `replace_node` accepts.\nAbsent unless `include` names `source`, or when source is unavailable or outside\nthe project."
               },
               "path": {
                 "anyOf": [
@@ -260,7 +277,7 @@
                 "description": "Byte range of the declaration within `path` or `unit`."
               },
               "source": {
-                "description": "The declaration source when the request asked for bodies and the provider can read\nit. Absent for source-less declarations.",
+                "description": "The declaration source, present when `include` names `source` and the provider\ncan read it. Absent for a source-less declaration.",
                 "type": [
                   "string",
                   "null"
@@ -11071,11 +11088,16 @@
             "type": "string"
           },
           "SearchInclude": {
-            "description": "Extra payload to attach to every hit. Each entry costs a lookup per hit, so the caller\nrequests only what it will read.",
+            "description": "Extra payload to attach to every hit. Every entry costs response bytes per hit, so the\ncaller requests only what it will read.",
             "oneOf": [
               {
                 "const": "source",
                 "description": "The source text around each hit.",
+                "type": "string"
+              },
+              {
+                "const": "score",
+                "description": "The fused ranking value used to order the page.",
                 "type": "string"
               }
             ]
@@ -11130,7 +11152,7 @@
         ],
         "properties": {
           "include": {
-            "description": "Extra payload to attach to every hit. Each entry costs a lookup per hit, so the\ncaller requests only what it will read.",
+            "description": "Extra payload to attach to every hit. Every entry costs response bytes per hit, so\nthe caller requests only what it will read.",
             "items": {
               "$ref": "#/$defs/SearchInclude"
             },
@@ -12015,6 +12037,14 @@
                   }
                 ],
                 "description": "Byte range of the hit within `path`. Absent for a symbol whose source is\nunavailable or synthetic."
+              },
+              "score": {
+                "description": "How well this hit matched, used to order the page and merge duplicate hits.\nPresent on the wire when `include` names `score`; comparable within one answer\nand nowhere else.",
+                "format": "double",
+                "type": [
+                  "number",
+                  "null"
+                ]
               },
               "source": {
                 "description": "The source text around the hit, requested with `include: [\"source\"]`. Covers the\nhit's `range`; a caller that needs the range already has it there.",

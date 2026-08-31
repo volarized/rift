@@ -6,8 +6,8 @@
 use rift_protocol::change::ChangeResult;
 use rift_protocol::error::ErrorData;
 use rift_protocol::read::{
-    Diagnostic, DiagnosticReliability, GetSymbolParams, GetSymbolResult, NodesResult, ResultOrder,
-    SearchParams, SearchParamsTarget, Severity,
+    Diagnostic, DiagnosticReliability, GetSymbolInclude, GetSymbolParams, GetSymbolResult,
+    NodesResult, ResultOrder, SearchParams, SearchParamsTarget, Severity,
 };
 use rift_protocol::search::SearchResult;
 use schemars::schema_for;
@@ -145,9 +145,30 @@ fn error_data_deserializes_with_diagnostics_and_causes_absent() -> TestResult {
 #[test]
 fn get_symbol_params_fill_documented_defaults() -> TestResult {
     let params: GetSymbolParams = serde_json::from_value(json!({ "name": "ReadService" }))?;
-    assert!(params.include_body);
-    assert!(!params.include_history);
+    assert_eq!(params.include, vec![GetSymbolInclude::Source]);
     assert_eq!(params.limit, 5);
+    Ok(())
+}
+
+/// An explicit empty `include` list decodes to no entries, distinct from the omitted
+/// field's `["source"]` default.
+#[test]
+fn get_symbol_params_include_explicit_empty_list_carries_no_entries() -> TestResult {
+    let params: GetSymbolParams =
+        serde_json::from_value(json!({ "name": "ReadService", "include": [] }))?;
+    assert_eq!(params.include, Vec::<GetSymbolInclude>::new());
+    Ok(())
+}
+
+/// `include: ["source", "history"]` decodes to both entries.
+#[test]
+fn get_symbol_params_include_explicit_both_carries_both_entries() -> TestResult {
+    let params: GetSymbolParams =
+        serde_json::from_value(json!({ "name": "ReadService", "include": ["source", "history"] }))?;
+    assert_eq!(
+        params.include,
+        vec![GetSymbolInclude::Source, GetSymbolInclude::History]
+    );
     Ok(())
 }
 

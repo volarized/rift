@@ -82,7 +82,7 @@ async fn served_wire_errors_validate_against_the_error_data_schema() -> TestResu
         ),
         (
             "get_symbol",
-            json!({ "name": "beacon", "include_history": true }),
+            json!({ "name": "beacon", "include": ["history"] }),
         ),
         ("get_symbol", json!({ "name": "beacon", "rev": "main" })),
         ("search", json!({ "query": "beacon", "rev": "main" })),
@@ -242,7 +242,7 @@ async fn symbol_history_without_a_repository_names_the_remedy() -> TestResult {
     let wire = failing_wire_error(
         directory.path(),
         "get_symbol",
-        json!({ "name": "beacon", "include_history": true }),
+        json!({ "name": "beacon", "include": ["history"] }),
     )
     .await?;
     assert_eq!(wire["code"], json!("capability_unavailable"));
@@ -269,7 +269,7 @@ async fn symbol_history_with_history_disabled_is_refused() -> TestResult {
     let wire = failing_wire_error(
         directory.path(),
         "get_symbol",
-        json!({ "name": "beacon", "include_history": true }),
+        json!({ "name": "beacon", "include": ["history"] }),
     )
     .await?;
     assert_eq!(wire["code"], json!("capability_unavailable"));

@@ -54,10 +54,11 @@ impl ReadService {
         let root = self.index().root();
         let selector = params.paths.as_ref();
         let matcher = path_matcher(root, selector)?;
+        let payloads = HitPayloads::requested(params);
         let criteria = SearchCriteria {
             query,
             target: params.target,
-            payloads: HitPayloads::requested(params),
+            payloads,
         };
         // The whole candidate pool is collected up to the index's own `results_max` bound -
         // bounded work whatever the page size - then ordered and truncated to that same
@@ -95,7 +96,12 @@ impl ReadService {
         )?;
         order_hits(&mut results, params.order);
         results.truncate(fetch_limit);
-        let (results, pagination) = page(results, params.page_index, limit);
+        let (mut results, pagination) = page(results, params.page_index, limit);
+        if !payloads.score {
+            for hit in &mut results {
+                hit.score = None;
+            }
+        }
         Ok(SearchResult {
             results,
             pagination,
@@ -171,19 +177,19 @@ fn force_include_requested(params: &SearchParams) -> bool {
 }
 
 /// Which extra payload `params.include` asked to attach to every hit, derived once per
-/// request. `source` is the only member `SearchInclude` serves.
+/// request: `source` attaches the excerpt, `score` attaches the fused ranking value.
 #[derive(Clone, Copy, Debug, Default)]
 struct HitPayloads {
     source: bool,
+    score: bool,
 }
 
 impl HitPayloads {
     fn requested(params: &SearchParams) -> Self {
+        let include = params.include.as_deref().unwrap_or_default();
         Self {
-            source: params
-                .include
-                .as_deref()
-                .is_some_and(|include| include.contains(&SearchInclude::Source)),
+            source: include.contains(&SearchInclude::Source),
+            score: include.contains(&SearchInclude::Score),
         }
     }
 }
@@ -410,7 +416,7 @@ fn build_symbol_hit(
         hit: SearchHitTarget::Symbol {
             symbol: Box::new(symbol),
         },
-        score,
+        score: Some(score),
         matched_by,
         source: payloads
             .source
@@ -441,7 +447,7 @@ fn file_search_hit(
             size: u64::try_from(file.source().len()).unwrap_or(u64::MAX),
             languages: vec![file.syntax().language().clone()],
         },
-        score: 1.0,
+        score: Some(1.0),
         matched_by: vec![MatchedField::Content],
         source: payloads.source.then_some(text),
         range: Some(text_range(range)),
@@ -474,7 +480,7 @@ fn text_search_hit(
     let range = ByteRange { start, end };
     SearchHit {
         hit: text_file_hit_target(file),
-        score: 1.0,
+        score: Some(1.0),
         matched_by: vec![MatchedField::Content],
         source: payloads.source.then_some(text),
         range: Some(text_range(range)),
@@ -687,7 +693,7 @@ fn absorb_ranked_match(existing: &mut SearchHit, score: f64) {
     if !existing.matched_by.contains(&MatchedField::Ranked) {
         existing.matched_by.push(MatchedField::Ranked);
     }
-    existing.score = existing.score.max(score);
+    existing.score = Some(existing.score.map_or(score, |current| current.max(score)));
 }
 
 fn ranked_file_hit(
@@ -700,7 +706,7 @@ fn ranked_file_hit(
 ) -> SearchHit {
     SearchHit {
         hit: text_file_hit_target(file),
-        score,
+        score: Some(score),
         matched_by: vec![MatchedField::Ranked],
         source: payloads.source.then_some(text),
         range: Some(text_range(range)),
@@ -2174,10 +2180,6 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "the score under test is f64::max over exact literals, not a measurement subject to rounding drift"
-    )]
     fn merge_symbol_hit_unions_matched_by_and_keeps_the_higher_score() -> TestResult {
         let (_directory, service) = fixture()?;
         let (file, symbol) = indexed_symbol(&service, "src/lib.rs", "Beacon")?;
@@ -2203,7 +2205,7 @@ pub fn compute() -> i32 {
             super::HitPayloads::default(),
         )?;
         assert_eq!(results.len(), 1, "the same symbol must not duplicate");
-        assert_eq!(results[0].score, 0.9, "the higher score must win");
+        assert_eq!(results[0].score, Some(0.9), "the higher score must win");
         assert_eq!(
             results[0].matched_by,
             vec![MatchedField::Name, MatchedField::Ranked]
@@ -2220,7 +2222,7 @@ pub fn compute() -> i32 {
             super::HitPayloads::default(),
         )?;
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].score, 0.9);
+        assert_eq!(results[0].score, Some(0.9));
         assert_eq!(
             results[0].matched_by,
             vec![MatchedField::Name, MatchedField::Ranked]
@@ -2372,11 +2374,6 @@ pub fn compute() -> i32 {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "the surviving score is one of the fused scores the tier returned, compared \
-                  against that exact value rather than a measurement"
-    )]
     async fn text_file_chunk_units_collapse_to_one_hit_at_the_best_score() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("guide.txt"), "word ".repeat(1000))?;
@@ -2423,7 +2420,11 @@ pub fn compute() -> i32 {
             1,
             "chunk units for the same file must collapse to one hit: {results:#?}"
         );
-        assert_eq!(results[0].score, best, "the best fused score must survive");
+        assert_eq!(
+            results[0].score,
+            Some(best),
+            "the best fused score must survive"
+        );
         Ok(())
     }
 
@@ -2432,7 +2433,8 @@ pub fn compute() -> i32 {
         let (directory, service) = fixture()?;
         let database = directory.path().join("search.db");
         let ranked = ranked_units(&database, &service, "Beacon").await?;
-        let params: SearchParams = serde_json::from_value(json!({"query": "Beacon"}))?;
+        let params: SearchParams =
+            serde_json::from_value(json!({"query": "Beacon", "include": ["score"]}))?;
         let answer = service.search(&params, &ranked)?;
         for unit in &ranked {
             let path = unit.path().as_str();
@@ -2448,8 +2450,8 @@ pub fn compute() -> i32 {
             answer
                 .results
                 .iter()
-                .all(|hit| hit.score > 0.0 && hit.score <= 1.0),
-            "a fused score reaches the wire unchanged, inside 0 to 1: {answer:#?}"
+                .all(|hit| hit.score.is_some_and(|score| score > 0.0 && score <= 1.0)),
+            "a fused score reaches the wire when requested, inside 0 to 1: {answer:#?}"
         );
         assert!(
             answer
@@ -2538,11 +2540,6 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "the winning score is an exact literal the test supplies, not a measurement \
-                  subject to rounding drift"
-    )]
     fn merge_file_hit_absorbs_a_second_match_at_the_same_path_and_line() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("guide.txt"), "alpha units beta\n")?;
@@ -2574,7 +2571,7 @@ pub fn compute() -> i32 {
             super::HitPayloads::default(),
         );
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].score, 0.4);
+        assert_eq!(results[0].score, Some(0.4));
         assert_eq!(results[0].matched_by, vec![MatchedField::Ranked]);
 
         super::merge_file_hit(
@@ -2591,7 +2588,7 @@ pub fn compute() -> i32 {
             1,
             "a second match at the same path and line must not duplicate the hit"
         );
-        assert_eq!(results[0].score, 0.9, "the higher score must win");
+        assert_eq!(results[0].score, Some(0.9), "the higher score must win");
         assert_eq!(
             results[0].matched_by,
             vec![MatchedField::Ranked],
@@ -2609,7 +2606,7 @@ pub fn compute() -> i32 {
             super::HitPayloads::default(),
         );
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].score, 0.9);
+        assert_eq!(results[0].score, Some(0.9));
         Ok(())
     }
 
@@ -2659,7 +2656,7 @@ pub fn compute() -> i32 {
                 size: 0,
                 languages: Vec::new(),
             },
-            score,
+            score: Some(score),
             matched_by: vec![MatchedField::Content],
             source: None,
             range: None,
@@ -2743,7 +2740,7 @@ pub fn compute() -> i32 {
             hit: SearchHitTarget::Node {
                 node: NodeId(id.to_owned()),
             },
-            score,
+            score: Some(score),
             matched_by: vec![MatchedField::Content],
             source: None,
             range: None,

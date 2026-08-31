@@ -171,10 +171,11 @@ pub enum ResultOrder {
 pub struct SearchHit {
     /// What was found. A symbol, a node, or a file - whichever `target` allowed.
     pub hit: SearchHitTarget,
-    /// How well this hit matched, used only to order the page and merge duplicate hits.
-    /// Comparable within one answer and nowhere else. Never reaches the wire.
-    #[serde(skip)]
-    pub score: f64,
+    /// How well this hit matched, used to order the page and merge duplicate hits.
+    /// Present on the wire when `include` names `score`; comparable within one answer
+    /// and nowhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
     /// Which indexed fields produced the match. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub matched_by: Vec<MatchedField>,
@@ -233,8 +234,8 @@ pub enum SearchHitTarget {
     },
 }
 
-/// Extra payload to attach to every hit. Each entry costs a lookup per hit, so the caller
-/// requests only what it will read.
+/// Extra payload to attach to every hit. Every entry costs response bytes per hit, so the
+/// caller requests only what it will read.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
@@ -242,6 +243,8 @@ pub enum SearchHitTarget {
 pub enum SearchInclude {
     /// The source text around each hit.
     Source,
+    /// The fused ranking value used to order the page.
+    Score,
 }
 
 /// Criteria for one search. The caller supplies lexical `query`, and `paths` narrows the
@@ -292,8 +295,8 @@ pub struct SearchParams {
     /// every visible file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paths: Option<PathSelector>,
-    /// Extra payload to attach to every hit. Each entry costs a lookup per hit, so the
-    /// caller requests only what it will read.
+    /// Extra payload to attach to every hit. Every entry costs response bytes per hit, so
+    /// the caller requests only what it will read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include: Option<Vec<SearchInclude>>,
     /// Most hits to return in one page. `max_page_items` from the workspace resource caps
@@ -481,6 +484,20 @@ mod tests {
         assert_eq!(
             schema["properties"]["page_index"]["default"],
             json!(PAGE_INDEX_DEFAULT)
+        );
+    }
+
+    /// `include: ["body"]` names no `SearchInclude` member; a request naming it is
+    /// refused at deserialization, and the refusal names the accepted values.
+    #[test]
+    fn search_include_rejects_an_unknown_entry_and_names_the_accepted_values() {
+        let error =
+            serde_json::from_value::<SearchParams>(json!({"query": "Beacon", "include": ["body"]}))
+                .expect_err("an unknown include entry must fail deserialization");
+        let message = error.to_string();
+        assert!(
+            message.contains("source") && message.contains("score"),
+            "{message}"
         );
     }
 
