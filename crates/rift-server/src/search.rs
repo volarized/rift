@@ -1443,8 +1443,7 @@ pub fn compute() -> i32 {
                 assert!(
                     !hit["facets"]
                         .as_array()
-                        .ok_or("facets must be array")?
-                        .contains(&json!("public")),
+                        .is_some_and(|facets| facets.contains(&json!("public"))),
                     "{name} must not carry public facet"
                 );
             }
@@ -1987,10 +1986,9 @@ pub fn compute() -> i32 {
         let value = serde_json::to_value(service.search(&committed, &[])?)?;
         let results = value["results"].as_array().ok_or("results array")?;
         assert!(!results.is_empty(), "the committed declaration matches");
-        assert_eq!(
-            value["warnings"],
-            json!([]),
-            "a search served from one index warns nothing"
+        assert!(
+            value.get("warnings").is_none(),
+            "a search served from one index warns nothing, so warnings is omitted"
         );
         let drifted: SearchParams = serde_json::from_value(json!({"query": "drifted_probe"}))?;
         let drifted_value = serde_json::to_value(service.search(&drifted, &[])?)?;

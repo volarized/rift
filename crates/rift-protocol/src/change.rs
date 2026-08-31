@@ -235,6 +235,7 @@ pub struct GuaranteeEvidence {
 /// One applied change, with everything Rift learned while resolving it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = schema::declare_change_summary_empty_defaults)]
 pub struct ChangeSummary {
     /// Identity of this applied change.
     pub id: ChangeId,
@@ -242,11 +243,13 @@ pub struct ChangeSummary {
     #[schemars(length(min = 1, max = 256))]
     pub files: Vec<FileChange>,
     /// Resolution findings in source order, then one finding per hook that
-    /// did not pass.
+    /// did not pass. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 256))]
     pub diagnostics: Vec<Diagnostic>,
     /// Properties the workspace's passing validation hooks established about this
-    /// change, in hook list order.
+    /// change, in hook list order. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 512))]
     pub guarantees: Vec<GuaranteeEvidence>,
 }
@@ -263,6 +266,7 @@ impl ChangeSummary {
 /// unchanged.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "status", deny_unknown_fields)]
+#[schemars(transform = schema::declare_change_result_empty_defaults)]
 #[schemars(extend("examples" = [
     {
         "status": "applied",
@@ -283,11 +287,8 @@ impl ChangeSummary {
                     "severity": "error",
                     "code": "rift.hook.failed",
                     "message": "hook format did not pass: exited 1; stderr (32 of 32 bytes): Diff in src/config.rs at line 12",
-                    "related": [],
-                    "tags": [],
                     "reliability": "reliable",
-                    "continuation": "unknown",
-                    "extensions": {}
+                    "continuation": "unknown"
                 }
             ],
             "guarantees": [
@@ -328,8 +329,7 @@ impl ChangeSummary {
                     "value": false
                 }
             }
-        ],
-        "diagnostics": []
+        ]
     }
 ]))]
 pub enum ChangeResult {
@@ -348,7 +348,8 @@ pub enum ChangeResult {
         /// `unmet_precondition`.
         #[schemars(length(max = 16))]
         preconditions: Vec<OperationPrecondition>,
-        /// Evidence that explains the refusal.
+        /// Evidence that explains the refusal. Absent when empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         #[schemars(length(max = 256))]
         diagnostics: Vec<Diagnostic>,
     },

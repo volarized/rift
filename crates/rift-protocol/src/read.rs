@@ -127,15 +127,24 @@ pub struct ExtensionValue {
 /// Facts a provider carries that the model has no field for, under a reverse-domain key.
 /// Keys and values use RFC 8785 canonical JSON. Consumers skip entries they do not
 /// implement.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct Extensions(pub BTreeMap<ExtensionKey, ExtensionValue>);
+
+impl Extensions {
+    /// Whether this holds no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
 
 /// One file and the languages that read it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::forbid_symlink_language_facts)]
+#[schemars(transform = schema::declare_file_empty_defaults)]
 pub struct File {
     /// Project-relative source identity and the URI from which this record and its bytes
     /// are read.
@@ -143,11 +152,13 @@ pub struct File {
     /// Regular-file metadata or a symbolic-link target.
     pub content: FileContent,
     /// Distinct `Language` values in `regions`, sorted by name and dialect. A file holding
-    /// embedded languages advertises each of them.
+    /// embedded languages advertises each of them. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub languages: Vec<Language>,
     /// Byte ranges parsed with each language grammar. Entries sort by start, end, language
     /// name, and dialect with null first. Regions may overlap when two grammars parse the
-    /// same bytes.
+    /// same bytes. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub regions: Vec<LanguageRegion>,
     /// Whether Rift produced facts from this file. False where there is nothing to read,
     /// and where no provider claims the path.
@@ -291,6 +302,7 @@ fn default_get_symbol_params_page_index() -> u64 {
 /// One page of declarations matching a name.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = schema::declare_get_symbol_result_empty_defaults)]
 #[schemars(extend("examples" = [
     {
         "hits": [
@@ -323,7 +335,6 @@ fn default_get_symbol_params_page_index() -> u64 {
                         "source_kind": "authored",
                         "unit": "rift://source/project/src/config.rs"
                     },
-                    "modifiers": [],
                     "visibility": "pub",
                     "types": [
                         {
@@ -333,8 +344,7 @@ fn default_get_symbol_params_page_index() -> u64 {
                                 "language": {
                                     "name": "rust"
                                 },
-                                "source": "Result<Config, ConfigError>",
-                                "extensions": {}
+                                "source": "Result<Config, ConfigError>"
                             }
                         }
                     ],
@@ -364,14 +374,12 @@ fn default_get_symbol_params_page_index() -> u64 {
                                                 "language": {
                                                     "name": "rust"
                                                 },
-                                                "source": "&Path",
-                                                "extensions": {}
+                                                "source": "&Path"
                                             }
                                         }
                                     ],
                                     "optional": false,
-                                    "variadic": false,
-                                    "extensions": {}
+                                    "variadic": false
                                 }
                             ],
                             "returns": [
@@ -382,15 +390,10 @@ fn default_get_symbol_params_page_index() -> u64 {
                                         "language": {
                                             "name": "rust"
                                         },
-                                        "source": "Result<Config, ConfigError>",
-                                        "extensions": {}
+                                        "source": "Result<Config, ConfigError>"
                                     }
                                 }
-                            ],
-                            "type_parameters": [],
-                            "throws": [],
-                            "effects": [],
-                            "extensions": {}
+                            ]
                         }
                     ],
                     "documentation": [
@@ -398,10 +401,7 @@ fn default_get_symbol_params_page_index() -> u64 {
                             "format": "markdown",
                             "text": "Loads the workspace configuration from `rift.toml`."
                         }
-                    ],
-                    "extensions": {},
-                    "disagreements": [],
-                    "document_local": false
+                    ]
                 },
                 "span": {
                     "unit": "rift://source/project/src/config.rs",
@@ -442,8 +442,7 @@ fn default_get_symbol_params_page_index() -> u64 {
                             }
                         }
                     ],
-                    "parent": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
-                    "extensions": {}
+                    "parent": "rift://node/rust/src/config.rs@0-356#dcbef6dd"
                 },
                 "source": {
                     "span": {
@@ -479,8 +478,7 @@ fn default_get_symbol_params_page_index() -> u64 {
         "pagination": {
             "page_index": 0,
             "total_pages": 1
-        },
-        "warnings": []
+        }
     }
 ]))]
 pub struct GetSymbolResult {
@@ -488,7 +486,8 @@ pub struct GetSymbolResult {
     pub hits: Vec<GetSymbolHit>,
     /// Where this page sits in the full result set under the request's `limit`.
     pub pagination: Pagination,
-    /// Warnings attached to this result, empty when there is nothing to warn about.
+    /// Warnings attached to this result. Absent when there is nothing to warn about.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<ReadWarning>,
 }
 
@@ -611,6 +610,7 @@ pub struct LanguageRegion {
 /// language supplies one.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = schema::declare_node_empty_defaults)]
 pub struct Node {
     /// Unique identifier of this source region, and the URI that resolves it.
     pub id: NodeId,
@@ -627,18 +627,21 @@ pub struct Node {
     /// `selector.class`.
     pub kind: ExactKind,
     /// Portable structural classification, so a query can ask for bodies or imports without
-    /// knowing the grammar that produced them.
+    /// knowing the grammar that produced them. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub facets: Vec<NodeFacet>,
     /// The bytes it spans, as offsets into the file.
     pub range: TextRange,
     /// The node's named parts, so an operation can rewrite a function body without touching
-    /// the documentation above it.
+    /// the documentation above it. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub regions: Vec<NodeRegion>,
     /// The region this one is nested inside. Absent at the top level of a unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<NodeId>,
     /// Syntax facts the model has no field for, namespaced by the provider that emitted
-    /// them.
+    /// them. Absent when empty.
+    #[serde(default, skip_serializing_if = "Extensions::is_empty")]
     pub extensions: Extensions,
 }
 
@@ -747,6 +750,7 @@ pub struct NodesParams {
 /// from this listing refuses cleanly once the bytes drift.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = schema::declare_nodes_result_empty_defaults)]
 #[schemars(extend("examples" = [
     {
         "nodes": [
@@ -757,13 +761,10 @@ pub struct NodesParams {
                     "name": "rust"
                 },
                 "kind": "rust.source_file",
-                "facets": [],
                 "range": {
                     "start": 0,
                     "end": 356
-                },
-                "regions": [],
-                "extensions": {}
+                }
             },
             {
                 "id": "rift://node/rust/src/config.rs@218-355#67ecfb36",
@@ -797,8 +798,7 @@ pub struct NodesParams {
                         }
                     }
                 ],
-                "parent": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
-                "extensions": {}
+                "parent": "rift://node/rust/src/config.rs@0-356#dcbef6dd"
             },
             {
                 "id": "rift://node/rust/src/config.rs@281-355#4e554fa8",
@@ -807,14 +807,11 @@ pub struct NodesParams {
                     "name": "rust"
                 },
                 "kind": "rust.block",
-                "facets": [],
                 "range": {
                     "start": 281,
                     "end": 355
                 },
-                "regions": [],
-                "parent": "rift://node/rust/src/config.rs@218-355#67ecfb36",
-                "extensions": {}
+                "parent": "rift://node/rust/src/config.rs@218-355#67ecfb36"
             },
             {
                 "id": "rift://node/rust/src/config.rs@334-353#4df4426e",
@@ -830,9 +827,7 @@ pub struct NodesParams {
                     "start": 334,
                     "end": 353
                 },
-                "regions": [],
-                "parent": "rift://node/rust/src/config.rs@281-355#4e554fa8",
-                "extensions": {}
+                "parent": "rift://node/rust/src/config.rs@281-355#4e554fa8"
             },
             {
                 "id": "rift://node/rust/src/config.rs@334-346#03f22dac",
@@ -841,14 +836,11 @@ pub struct NodesParams {
                     "name": "rust"
                 },
                 "kind": "rust.identifier",
-                "facets": [],
                 "range": {
                     "start": 334,
                     "end": 346
                 },
-                "regions": [],
-                "parent": "rift://node/rust/src/config.rs@334-353#4df4426e",
-                "extensions": {}
+                "parent": "rift://node/rust/src/config.rs@334-353#4df4426e"
             }
         ],
         "source": [
@@ -902,8 +894,7 @@ pub struct NodesParams {
                 },
                 "text": "parse_config"
             }
-        ],
-        "warnings": []
+        ]
     }
 ]))]
 pub struct NodesResult {
@@ -912,7 +903,8 @@ pub struct NodesResult {
     /// One excerpt per node in `nodes`, in the same order, each spanning that node's own
     /// range. Empty when `nodes` is empty.
     pub source: Vec<SourceExcerpt>,
-    /// Warnings attached to this result, empty when there is nothing to warn about.
+    /// Warnings attached to this result. Absent when there is nothing to warn about.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<ReadWarning>,
 }
 
@@ -952,6 +944,7 @@ pub struct Pagination {
 /// position in the parameter list.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = schema::declare_parameter_empty_defaults)]
 pub struct Parameter {
     /// What the parameter is called. Absent where the language allows an unnamed one, as
     /// a positional parameter in a function type.
@@ -960,8 +953,9 @@ pub struct Parameter {
     /// Where this parameter is written in the source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<NodeId>,
-    /// What it accepts. An array because a declared type and an inferred one are separate
-    /// bindings.
+    /// What it accepts, absent when empty. An array because a declared type and an
+    /// inferred one are separate bindings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub types: Vec<TypeBinding>,
     /// Whether a call may leave it out.
     pub optional: bool,
@@ -971,7 +965,8 @@ pub struct Parameter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
     /// Parameter facts the model has no field for, namespaced by the provider that emitted
-    /// them.
+    /// them. Absent when empty.
+    #[serde(default, skip_serializing_if = "Extensions::is_empty")]
     pub extensions: Extensions,
 }
 
@@ -1092,6 +1087,7 @@ pub enum RegionRole {
 /// its derivation is how much the provider knew when it was read.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = schema::declare_relationship_empty_defaults)]
 pub struct Relationship {
     /// The symbol the edge starts at.
     pub from: SymbolId,
@@ -1105,7 +1101,8 @@ pub struct Relationship {
     /// The symbol the edge points at. One Rift cannot read carries the `external` origin;
     /// the edge is the same either way.
     pub to: SymbolId,
-    /// The nodes this edge was read from.
+    /// The nodes this edge was read from. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<NodeId>,
     /// How this edge was established.
     pub derivation: RelationshipDerivation,
@@ -1115,6 +1112,8 @@ pub struct Relationship {
     #[schemars(range(min = 0, max = 1))]
     pub confidence: Option<f64>,
     /// Edge facts the model has no field for, namespaced by the provider that emitted them.
+    /// Absent when empty.
+    #[serde(default, skip_serializing_if = "Extensions::is_empty")]
     pub extensions: Extensions,
 }
 
@@ -1287,11 +1286,13 @@ pub enum Severity {
 /// and its structure. Overloads are separate entries.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = schema::declare_signature_empty_defaults)]
 pub struct Signature {
     /// The signature as a reader sees it, in the language's own syntax.
     pub display: String,
     /// Symbols named inside `display`, each with the byte range of `display` that names it,
-    /// so a renderer can turn the rendered text into links.
+    /// so a renderer can turn the rendered text into links. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<SignatureLink>,
     /// The language whose syntax `display` is written in.
     pub language: Language,
@@ -1299,21 +1300,29 @@ pub struct Signature {
     /// languages that have no such thing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiver: Option<Parameter>,
-    /// Declared parameters, in source order.
+    /// Declared parameters, in source order. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parameters: Vec<Parameter>,
-    /// What the call yields. An array because a language may return several values, and
-    /// because a declared and an inferred return are separate bindings.
+    /// What the call yields, absent when empty. An array because a language may return
+    /// several values, and because a declared and an inferred return are separate
+    /// bindings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub returns: Vec<TypeBinding>,
     /// The generic parameters this form declares, each as the symbol that declares it.
+    /// Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub type_parameters: Vec<SymbolId>,
-    /// Types this form declares it can raise.
+    /// Types this form declares it can raise. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub throws: Vec<TypeExpression>,
     /// Effect keywords the declaration carries, in the language's own words: `async`,
     /// `unsafe`, `pure`. The spelling is preserved and never mapped onto a portable
-    /// meaning.
+    /// meaning; absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<String>,
     /// Signature facts the model has no field for, namespaced by the provider that emitted
-    /// them.
+    /// them. Absent when empty.
+    #[serde(default, skip_serializing_if = "Extensions::is_empty")]
     pub extensions: Extensions,
 }
 
@@ -1480,6 +1489,7 @@ pub struct SymbolDisagreement {
 /// and is connected through Relationship.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = schema::declare_symbol_empty_defaults)]
 pub struct Symbol {
     /// Captured index revision used to assemble this Symbol.
     #[schemars(range(min = 1_u64))]
@@ -1490,7 +1500,8 @@ pub struct Symbol {
     pub id: Option<SymbolId>,
     /// Whether normalization established one Symbol identity.
     pub resolution: SymbolResolution,
-    /// Contributions selected for this request, in presentation order.
+    /// Contributions selected for this request, in presentation order. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contributions: Vec<ContributionKey>,
     /// The language this symbol belongs to.
     pub language: Language,
@@ -1501,8 +1512,9 @@ pub struct Symbol {
     /// What this symbol is in the provider's vocabulary, such as `trait`, `function`, or
     /// `table`.
     pub kind: ExactKind,
-    /// Portable classification for cross-language queries. The local kinds `trait` and
-    /// `interface` can both carry the `type` facet.
+    /// Portable classification for cross-language queries, absent when empty. The local
+    /// kinds `trait` and `interface` can both carry the `type` facet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub facets: Vec<SymbolFacet>,
     /// Where the declaration belongs, how it was produced, and its source unit when
     /// readable.
@@ -1513,29 +1525,38 @@ pub struct Symbol {
     /// level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<SymbolId>,
-    /// Language keywords qualifying the declaration: `export`, `async`, `const`.
+    /// Language keywords qualifying the declaration: `export`, `async`, `const`. Absent
+    /// when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modifiers: Vec<String>,
     /// How widely the symbol is visible, in the language's own terms - `public`, `private`,
     /// `pub(crate)`. Absent where the language has no such concept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visibility: Option<String>,
     /// The types this symbol carries, each tagged with the role it plays: a return type, a
-    /// field type, a bound.
+    /// field type, a bound. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub types: Vec<TypeBinding>,
-    /// One entry per callable form. Where the language dispatches overloads separately they
-    /// are separate symbols joined by the `overloads` edge; several entries here are
-    /// alternative forms of one dispatch target, as `typing.overload` writes them.
+    /// One entry per callable form, absent when empty. Where the language dispatches
+    /// overloads separately they are separate symbols joined by the `overloads` edge;
+    /// several entries here are alternative forms of one dispatch target, as
+    /// `typing.overload` writes them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub signatures: Vec<Signature>,
     /// Doc comments attached to the declaration, with the markup format they were written
-    /// in.
+    /// in. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub documentation: Vec<Documentation>,
     /// Language-specific facts with no portable equivalent, namespaced by the provider that
-    /// emitted them.
+    /// emitted them. Absent when empty.
+    #[serde(default, skip_serializing_if = "Extensions::is_empty")]
     pub extensions: Extensions,
-    /// Presentation differences retained after field selection.
+    /// Presentation differences retained after field selection. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disagreements: Vec<SymbolDisagreement>,
     /// Whether language semantics confine this symbol to the document that declares it. The
-    /// provider classifies locality from its language model.
+    /// provider classifies locality from its language model; absent when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub document_local: bool,
 }
 
@@ -1775,6 +1796,7 @@ pub enum TypeBindingRole {
 /// `{ a: string }` - has the spelling and nothing to resolve to.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = schema::declare_type_expression_empty_defaults)]
 pub struct TypeExpression {
     /// The language the spelling is in, and so which provider produced it.
     pub language: Language,
@@ -1785,6 +1807,8 @@ pub struct TypeExpression {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved: Option<SymbolId>,
     /// Type facts the model has no field for, namespaced by the provider that emitted them.
+    /// Absent when empty.
+    #[serde(default, skip_serializing_if = "Extensions::is_empty")]
     pub extensions: Extensions,
 }
 
@@ -1941,23 +1965,20 @@ mod tests {
             "origin": {
                 "location": { "kind": "project" },
                 "source_kind": "authored"
-            },
-            "modifiers": [],
-            "types": [],
-            "signatures": [],
-            "documentation": [],
-            "extensions": {},
-            "disagreements": [],
-            "document_local": false
+            }
         });
         let symbol: Symbol =
             serde_json::from_value(value.clone()).expect("unresolved Symbol decodes");
         assert_eq!(symbol.id, None);
         assert_eq!(symbol.resolution, SymbolResolution::Unresolved);
         assert_eq!(symbol.contributions[0].provider, "framework");
+        assert_eq!(symbol.modifiers, Vec::<String>::new());
+        assert_eq!(symbol.disagreements, Vec::new());
+        assert!(!symbol.document_local);
         assert_eq!(
             serde_json::to_value(symbol).expect("unresolved Symbol encodes"),
-            value
+            value,
+            "every empty collection and document_local's false stay off the wire"
         );
     }
 

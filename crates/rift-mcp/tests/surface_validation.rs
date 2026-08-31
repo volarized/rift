@@ -469,10 +469,10 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
     assert_no_bare_sha256_digest(structured, &context);
     assert_source_unit_ids_use_project_resolver(structured, &context);
     if matches!(name, "get_symbol" | "nodes") {
-        assert_eq!(
-            structured["warnings"],
-            json!([]),
-            "a live {name} result must carry empty warnings: {structured:#}"
+        assert!(
+            structured.get("warnings").is_none(),
+            "a live {name} result must omit warnings when there is nothing to warn about: \
+             {structured:#}"
         );
     }
     if name == "search"

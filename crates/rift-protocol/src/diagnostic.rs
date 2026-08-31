@@ -4,6 +4,7 @@
 //! resolving.
 
 use crate::read::{Extensions, Language, Severity, SourceExcerpt, SourceSpan};
+use crate::schema;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 /// vocabulary.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = schema::declare_diagnostic_empty_defaults)]
 pub struct Diagnostic {
     /// How much it matters.
     pub severity: Severity,
@@ -25,10 +27,12 @@ pub struct Diagnostic {
     /// build.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<SourceSpan>,
-    /// Other places the provider pointed at while explaining this one.
+    /// Other places the provider pointed at while explaining this one. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related: Vec<DiagnosticRelated>,
     /// Presentation tags for the finding. A consumer can render them as strikethrough or
-    /// grey text.
+    /// grey text; absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<DiagnosticTag>,
     /// Whether the facts around this finding came off a clean parse.
     pub reliability: DiagnosticReliability,
@@ -36,7 +40,8 @@ pub struct Diagnostic {
     /// state of a file the caller is halfway through writing.
     pub continuation: DiagnosticContinuation,
     /// Diagnostic fields the model has no place for, namespaced by the provider that
-    /// emitted them.
+    /// emitted them. Absent when empty.
+    #[serde(default, skip_serializing_if = "Extensions::is_empty")]
     pub extensions: Extensions,
     /// The language whose provider produced this. Absent for a finding Rift itself
     /// raised.

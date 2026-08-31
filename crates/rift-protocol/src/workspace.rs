@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::configuration::HookKind;
 use crate::read::{Digest, Language, Pagination, ProjectPath};
+use crate::schema;
 use crate::search::PathPattern;
 
 /// Source units one workspace resource page may carry, at most.
@@ -50,15 +51,18 @@ pub struct WorkspaceResourcePage {
 /// Effective configuration for one exact language identity.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = schema::declare_workspace_language_summary_empty_defaults)]
 pub struct WorkspaceLanguageSummary {
     /// Exact language name and optional dialect.
     pub language: Language,
     /// Whether syntax, LSP service, and execution are enabled for matched paths.
     pub enabled: bool,
-    /// Effective path patterns selecting files for this language.
+    /// Effective path patterns selecting files for this language. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 64))]
     pub include: Vec<PathPattern>,
-    /// Effective path patterns removed from this language's selection.
+    /// Effective path patterns removed from this language's selection. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 64))]
     pub exclude: Vec<PathPattern>,
     /// Whether caller-provided code may run as this exact language.
@@ -103,16 +107,19 @@ pub enum LspState {
 /// Effective path selection for one configured hook.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = schema::declare_workspace_hook_summary_empty_defaults)]
 pub struct WorkspaceHookSummary {
     /// Hook identity from workspace configuration.
     #[schemars(length(min = 1, max = 64))]
     pub id: String,
     /// What the hook checks or changes.
     pub kind: HookKind,
-    /// Path patterns selecting initially changed files for this hook.
+    /// Path patterns selecting initially changed files for this hook. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 64))]
     pub include: Vec<PathPattern>,
-    /// Path patterns removed from hook selection.
+    /// Path patterns removed from hook selection. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 64))]
     pub exclude: Vec<PathPattern>,
 }
