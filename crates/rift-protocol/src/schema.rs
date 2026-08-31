@@ -906,6 +906,28 @@ pub fn declare_workspace_hook_summary_empty_defaults(schema: &mut Schema) {
     );
 }
 
+/// A [`WorkspaceMap`](crate::map::WorkspaceMap) states `default: []` on its collection
+/// fields.
+pub fn declare_workspace_map_empty_defaults(schema: &mut Schema) {
+    use crate::map::WorkspaceMap;
+    declare_empty_array_defaults(
+        schema,
+        &[
+            property!(WorkspaceMap, languages),
+            property!(WorkspaceMap, modules),
+            property!(WorkspaceMap, hubs),
+            property!(WorkspaceMap, entry_points),
+            property!(WorkspaceMap, docs),
+        ],
+    );
+}
+
+/// A [`MapModule`](crate::map::MapModule) states `default: []` on `children`.
+pub fn declare_map_module_empty_defaults(schema: &mut Schema) {
+    use crate::map::MapModule;
+    declare_empty_array_defaults(schema, &[property!(MapModule, children)]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
