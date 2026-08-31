@@ -183,7 +183,7 @@ impl LspContributionAdapter {
                 self.language.clone(),
                 symbol.name,
                 symbol.qualified_name,
-                ExactKind(format!("lsp.{}", kind_name(symbol.kind))),
+                ExactKind(kind_name(symbol.kind).to_owned()),
             )
             .facets(kind_facets(symbol.kind));
             if let Some(parent) = symbol.parent {

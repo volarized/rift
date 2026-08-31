@@ -10,6 +10,7 @@
             "examples": [
               "rust"
             ],
+            "maxLength": 129,
             "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$",
             "type": "string"
           },
@@ -293,6 +294,7 @@
             "examples": [
               "rust"
             ],
+            "maxLength": 129,
             "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$",
             "type": "string"
           },
@@ -2002,6 +2004,7 @@
             "examples": [
               "rust"
             ],
+            "maxLength": 129,
             "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$",
             "type": "string"
           },
@@ -3052,6 +3055,7 @@
             "examples": [
               "rust"
             ],
+            "maxLength": 129,
             "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$",
             "type": "string"
           },
@@ -3995,6 +3999,7 @@
             "examples": [
               "rust"
             ],
+            "maxLength": 129,
             "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$",
             "type": "string"
           },
@@ -4585,6 +4590,7 @@
             "examples": [
               "rust"
             ],
+            "maxLength": 129,
             "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$",
             "type": "string"
           },
@@ -5652,6 +5658,7 @@
             "examples": [
               "rust"
             ],
+            "maxLength": 129,
             "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$",
             "type": "string"
           },
@@ -6596,6 +6603,7 @@
             "examples": [
               "rust"
             ],
+            "maxLength": 129,
             "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$",
             "type": "string"
           },
@@ -7540,6 +7548,7 @@
             "examples": [
               "rust"
             ],
+            "maxLength": 129,
             "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$",
             "type": "string"
           },
@@ -8486,6 +8495,7 @@
             "examples": [
               "rust"
             ],
+            "maxLength": 129,
             "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$",
             "type": "string"
           },
@@ -9505,6 +9515,7 @@
             "examples": [
               "rust"
             ],
+            "maxLength": 129,
             "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$",
             "type": "string"
           },
@@ -10524,6 +10535,7 @@
             "examples": [
               "rust"
             ],
+            "maxLength": 129,
             "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$",
             "type": "string"
           },
@@ -11321,6 +11333,7 @@
             "examples": [
               "rust"
             ],
+            "maxLength": 129,
             "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$",
             "type": "string"
           },

@@ -1691,7 +1691,7 @@ pub fn compute() -> i32 {
 
     #[test]
     fn nodes_source_carries_one_excerpt_per_node_in_order_spanning_its_own_range() -> TestResult {
-        let (_directory, service) = fixture()?;
+        let (directory, service) = fixture()?;
         let result = service.nodes(NodesParams {
             path: ProjectPath("src/lib.rs".to_owned()),
             position: 5,
@@ -1706,13 +1706,50 @@ pub fn compute() -> i32 {
             result.source.len(),
             "one excerpt must ride per listed node"
         );
+        let text = std::fs::read_to_string(directory.path().join("src/lib.rs"))?;
         for (node, source) in result.nodes.iter().zip(result.source.iter()) {
+            let start = usize::try_from(node.range.start)?;
+            let end = usize::try_from(node.range.end)?;
             assert_eq!(
-                source.len() as u64,
-                node.range.end - node.range.start,
+                source.as_str(),
+                &text[start..end],
                 "each excerpt must span its own node's range, not the requested position"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn hit_location_answers_exactly_one_address_for_every_location_kind() -> TestResult {
+        let path = rift_core::ProjectPath::new("src/lib.rs")?;
+        for kind in [
+            None,
+            Some(rift_protocol::read::SourceLocationKind::Project),
+            Some(rift_protocol::read::SourceLocationKind::Dependency),
+            Some(rift_protocol::read::SourceLocationKind::Stdlib),
+            Some(rift_protocol::read::SourceLocationKind::External),
+        ] {
+            let (project, unit) = super::hit_location(kind, &path);
+            assert!(
+                project.is_some() != unit.is_some(),
+                "exactly one of path and unit per hit: kind={kind:?}, path={project:?}, unit={unit:?}"
+            );
+        }
+        let (project, unit) = super::hit_location(
+            Some(rift_protocol::read::SourceLocationKind::Project),
+            &path,
+        );
+        assert_eq!(project.map(|p| p.0), Some("src/lib.rs".to_owned()));
+        assert_eq!(unit, None);
+        let (project, unit) = super::hit_location(
+            Some(rift_protocol::read::SourceLocationKind::Dependency),
+            &path,
+        );
+        assert_eq!(project, None);
+        assert!(
+            unit.is_some(),
+            "a dependency hit re-addresses through the source catalog"
+        );
         Ok(())
     }
 

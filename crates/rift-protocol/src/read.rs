@@ -14,6 +14,10 @@ use std::collections::BTreeMap;
 /// agree on: one lowercase language word, or two joined by `:`. The
 /// `[languages.<identity>]` configuration table key uses the same grammar.
 pub(crate) const LANGUAGE_IDENTITY_PATTERN: &str = r"^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$";
+/// Longest accepted language name or dialect word, in bytes.
+pub(crate) const LANGUAGE_WORD_BYTES_MAX: usize = 64;
+/// Longest accepted language identity segment: two words joined by one colon.
+pub(crate) const LANGUAGE_IDENTITY_BYTES_MAX: usize = LANGUAGE_WORD_BYTES_MAX * 2 + 1;
 
 // Search-specific models (`SearchParams`, `PathSelector`, and their neighbors) live in
 // `search` so this module stays below its size bound; re-exporting them here keeps every
@@ -458,6 +462,7 @@ impl JsonSchema for Language {
         schemars::json_schema!({
             "type": "string",
             "pattern": LANGUAGE_IDENTITY_PATTERN,
+            "maxLength": LANGUAGE_IDENTITY_BYTES_MAX,
             "examples": ["rust"],
             "description": "A language name and its optional dialect, joined by `:`. \
                             `sql` and `sql:postgresql` are two languages with two symbol \
@@ -505,7 +510,7 @@ fn is_language_word(word: &str) -> bool {
         .next()
         .is_some_and(|first| first.is_ascii_lowercase());
     starts_lowercase
-        && word.len() <= 64
+        && word.len() <= LANGUAGE_WORD_BYTES_MAX
         && characters.all(|character| {
             character.is_ascii_lowercase()
                 || character.is_ascii_digit()
@@ -1806,13 +1811,23 @@ mod tests {
         assert!(serde_json::from_value::<Language>(json!({"name": "rust"})).is_err());
     }
 
-    /// The advertised schema pattern is the exact grammar [`Language::from_identity_segment`]
-    /// enforces, pinned by [`LANGUAGE_IDENTITY_PATTERN`].
+    /// The advertised schema pattern and length are the exact grammar
+    /// [`Language::from_identity_segment`] enforces.
     #[test]
     fn language_schema_pattern_equals_the_identity_segment_grammar() {
         let schema = serde_json::to_value(schema_for!(Language)).expect("language schema");
         assert_eq!(schema["type"], json!("string"));
         assert_eq!(schema["pattern"], json!(LANGUAGE_IDENTITY_PATTERN));
+        assert_eq!(
+            schema["maxLength"],
+            json!(super::LANGUAGE_IDENTITY_BYTES_MAX)
+        );
+        assert!(!super::is_language_word(
+            &"a".repeat(super::LANGUAGE_WORD_BYTES_MAX + 1)
+        ));
+        assert!(super::is_language_word(
+            &"a".repeat(super::LANGUAGE_WORD_BYTES_MAX)
+        ));
     }
 
     #[test]

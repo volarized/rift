@@ -741,6 +741,8 @@ fn hit_identity(hit: &SearchHit) -> &str {
             .id
             .as_ref()
             .map_or(symbol.name.as_str(), |identity| identity.0.as_str()),
+        // Every file hit is built with its project path set; the empty fallback
+        // only orders a hit no constructor in this crate produces.
         SearchHitTarget::File { .. } => hit.path.as_ref().map_or("", |path| path.0.as_str()),
         SearchHitTarget::Node { node } => node.0.as_str(),
     }
