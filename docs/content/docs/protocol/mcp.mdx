@@ -320,6 +320,10 @@ alone - and refuses `capability_unavailable` the same way. A `seed` that resolve
 graph node nor a lexical declaration refuses `resource_not_found`; one that resolves but carries
 no edges answers an empty result set, since an isolated declaration is a legitimate answer.
 
+A walk the server stops at its node bound attaches a `traversal_truncated` entry to
+`warnings`, naming how many symbols it visited: hits reachable beyond the bound are missing,
+and a tighter `facets` list, a smaller `depth`, or a less-connected `seed` fits the walk under it.
+
 <McpTool name="nodes" />
 
 Each identity carries the witness a later

@@ -925,6 +925,17 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
+    /// A traversal walk stopped at its node bound before exhausting the reachable graph,
+    /// so hits reachable beyond the bound are missing from this answer. Narrow the walk -
+    /// a tighter `facets` list, a smaller `depth`, or a less-connected seed - to fit it
+    /// under the bound.
+    TraversalTruncated {
+        /// Symbols the walk visited before it stopped, equal to the bound it hit.
+        visited: u64,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
 }
 
 /// One named part of a node. A language marks these out inside a declaration, so an

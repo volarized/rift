@@ -244,7 +244,7 @@ pub enum SearchHitTarget {
 pub enum SearchInclude {
     /// The source text around each hit.
     Source,
-    /// The fused ranking value used to order the page.
+    /// The ranking value used to order the page.
     Score,
 }
 

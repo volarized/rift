@@ -17,7 +17,7 @@ use rift_index::{
 };
 use rift_protocol::read::{
     ExactKind, Extensions, GraphHop, HopDirection, MatchedField, PathPattern, PathSelector,
-    Relationship, RelationshipDerivation, ResultOrder, SEARCH_TRAVERSAL_DEPTH_MAX,
+    ReadWarning, Relationship, RelationshipDerivation, ResultOrder, SEARCH_TRAVERSAL_DEPTH_MAX,
     SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX, SearchHit, SearchHitTarget,
     SearchInclude, SearchParams, SearchParamsTarget, SearchResult, SearchTraversal, SymbolId,
     TraversalDirection,
@@ -103,13 +103,14 @@ impl ReadService {
                 &mut results,
             )?;
         }
+        let mut traversal_truncated = false;
         if let Some(traversal) = params.traversal.as_ref()
             && matches!(
                 params.target,
                 SearchParamsTarget::All | SearchParamsTarget::Symbol
             )
         {
-            collect_traversal_hits(
+            traversal_truncated = collect_traversal_hits(
                 self,
                 matcher.as_ref(),
                 root,
@@ -129,7 +130,13 @@ impl ReadService {
         Ok(SearchResult {
             results,
             pagination,
-            warnings: self.warnings(),
+            warnings: {
+                let mut warnings = self.warnings();
+                if traversal_truncated {
+                    warnings.push(traversal_truncation_warning());
+                }
+                warnings
+            },
         })
     }
 
@@ -793,13 +800,14 @@ fn collect_traversal_hits(
     traversal: &SearchTraversal,
     payloads: HitPayloads,
     results: &mut Vec<SearchHit>,
-) -> Result<(), ReadError> {
+) -> Result<bool, ReadError> {
     let store = reads.relationships();
     if store.is_empty() && !reads.index().binding_enabled() {
         return Err(ReadFault::unsupported("binding"));
     }
     let seed = resolve_traversal_seed(reads, &traversal.seed)?;
-    for (identity, path) in walk_traversal(store, &seed, traversal) {
+    let walk = walk_traversal(store, &seed, traversal);
+    for (identity, path) in walk.discovered {
         if traversal
             .to
             .as_ref()
@@ -818,7 +826,7 @@ fn collect_traversal_hits(
         }
         merge_traversal_hit(reads.index(), results, file, symbol, path, payloads)?;
     }
-    Ok(())
+    Ok(walk.truncated)
 }
 
 /// Resolves a traversal's `seed`, refusing `not_found` naming it when the identity exists
@@ -848,6 +856,26 @@ fn resolve_graph_symbol<'a>(
     resolve_symbol(index, &address.path, identity.as_str())
 }
 
+/// One traversal walk's outcome: each discovered symbol with its shortest path, and whether
+/// the node bound stopped the walk before the reachable graph was exhausted.
+struct TraversalWalk {
+    discovered: Vec<(CoreSymbolId, Vec<GraphHop>)>,
+    truncated: bool,
+}
+
+/// The warning a truncated traversal walk attaches: the bound the walk hit, and the
+/// narrowing that fits a walk under it.
+fn traversal_truncation_warning() -> ReadWarning {
+    ReadWarning::TraversalTruncated {
+        visited: TRAVERSAL_NODES_MAX as u64,
+        detail: format!(
+            "the traversal walk stopped at its {TRAVERSAL_NODES_MAX}-symbol bound; \
+             narrow facets, lower depth, or start from a less-connected seed to walk \
+             the rest"
+        ),
+    }
+}
+
 /// Walks `store` breadth-first from `seed`, honoring `traversal`'s direction, facet filter,
 /// and depth bound. BFS visits each symbol at its shortest path first and never requeues a
 /// visited symbol, so every returned path is the shortest one `store` has to it. Bounded by
@@ -856,7 +884,7 @@ fn walk_traversal(
     store: &RelationshipStore,
     seed: &CoreSymbolId,
     traversal: &SearchTraversal,
-) -> Vec<(CoreSymbolId, Vec<GraphHop>)> {
+) -> TraversalWalk {
     walk_traversal_capped(store, seed, traversal, TRAVERSAL_NODES_MAX)
 }
 
@@ -868,9 +896,10 @@ fn walk_traversal_capped(
     seed: &CoreSymbolId,
     traversal: &SearchTraversal,
     nodes_max: usize,
-) -> Vec<(CoreSymbolId, Vec<GraphHop>)> {
+) -> TraversalWalk {
     let mut visited: BTreeSet<CoreSymbolId> = BTreeSet::from([seed.clone()]);
     let mut budget = LoopBudget::new(nodes_max);
+    let mut truncated = false;
     let mut queue: VecDeque<(CoreSymbolId, Vec<GraphHop>)> =
         VecDeque::from([(seed.clone(), Vec::new())]);
     let mut discovered = Vec::new();
@@ -886,7 +915,11 @@ fn walk_traversal_capped(
                 HopDirection::Outgoing => edge.to().clone(),
                 HopDirection::Incoming => edge.from().clone(),
             };
-            if visited.contains(&next) || budget.consume().is_err() {
+            if visited.contains(&next) {
+                continue;
+            }
+            if budget.consume().is_err() {
+                truncated = true;
                 continue;
             }
             visited.insert(next.clone());
@@ -896,7 +929,10 @@ fn walk_traversal_capped(
             discovered.push((next, next_path));
         }
     }
-    discovered
+    TraversalWalk {
+        discovered,
+        truncated,
+    }
 }
 
 /// The edges a search traversal walks from `current`, tagged with the [`HopDirection`] each
@@ -1077,8 +1113,8 @@ mod tests {
     };
     use rift_protocol::configuration::{BindingConfiguration, HistoryConfiguration};
     use rift_protocol::read::{
-        MatchedField, NodeId, RelationshipFacet, ResultOrder, SearchParams, SearchParamsTarget,
-        SearchTraversal, TraversalDirection,
+        MatchedField, NodeId, ReadWarning, RelationshipFacet, ResultOrder, SearchParams,
+        SearchParamsTarget, SearchTraversal, TraversalDirection,
     };
     use rift_provider::{
         NormalizedGraph, Normalizer, ProviderPublication, PublicationLimits, PublicationSet,
@@ -3289,7 +3325,8 @@ pub fn compute() -> i32 {
         let store = call_graph_store();
         let root = graph_symbol_id("rift://symbol/rust/lib.rs/root");
         let request = traversal_request(&root, TraversalDirection::Outgoing, 1, vec![]);
-        let discovered = walk_traversal_capped(&store, &root, &request, TRAVERSAL_NODES_MAX);
+        let discovered =
+            walk_traversal_capped(&store, &root, &request, TRAVERSAL_NODES_MAX).discovered;
         let reached: Vec<&str> = discovered.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(
             reached,
@@ -3312,7 +3349,8 @@ pub fn compute() -> i32 {
         let store = call_graph_store();
         let leaf = graph_symbol_id("rift://symbol/rust/lib.rs/leaf");
         let request = traversal_request(&leaf, TraversalDirection::Incoming, 1, vec![]);
-        let discovered = walk_traversal_capped(&store, &leaf, &request, TRAVERSAL_NODES_MAX);
+        let discovered =
+            walk_traversal_capped(&store, &leaf, &request, TRAVERSAL_NODES_MAX).discovered;
         let reached: Vec<&str> = discovered.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(
             reached,
@@ -3336,7 +3374,8 @@ pub fn compute() -> i32 {
         let store = call_graph_store();
         let branch_a = graph_symbol_id("rift://symbol/rust/lib.rs/branch_a");
         let request = traversal_request(&branch_a, TraversalDirection::Both, 1, vec![]);
-        let discovered = walk_traversal_capped(&store, &branch_a, &request, TRAVERSAL_NODES_MAX);
+        let discovered =
+            walk_traversal_capped(&store, &branch_a, &request, TRAVERSAL_NODES_MAX).discovered;
         let reached: Vec<(&str, super::HopDirection)> = discovered
             .iter()
             .map(|(id, path)| (id.as_str(), path[0].direction))
@@ -3367,7 +3406,8 @@ pub fn compute() -> i32 {
             1,
             vec![RelationshipFacet::Calls],
         );
-        let discovered = walk_traversal_capped(&store, &root, &request, TRAVERSAL_NODES_MAX);
+        let discovered =
+            walk_traversal_capped(&store, &root, &request, TRAVERSAL_NODES_MAX).discovered;
         let reached: Vec<&str> = discovered.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(
             reached,
@@ -3386,7 +3426,8 @@ pub fn compute() -> i32 {
         let store = call_graph_store();
         let root = graph_symbol_id("rift://symbol/rust/lib.rs/root");
         let request = traversal_request(&root, TraversalDirection::Outgoing, 2, vec![]);
-        let discovered = walk_traversal_capped(&store, &root, &request, TRAVERSAL_NODES_MAX);
+        let discovered =
+            walk_traversal_capped(&store, &root, &request, TRAVERSAL_NODES_MAX).discovered;
         let leaf_hits: Vec<_> = discovered
             .iter()
             .filter(|(id, _)| id.as_str() == "rift://symbol/rust/lib.rs/leaf")
@@ -3413,7 +3454,12 @@ pub fn compute() -> i32 {
         let store = call_graph_store();
         let root = graph_symbol_id("rift://symbol/rust/lib.rs/root");
         let request = traversal_request(&root, TraversalDirection::Outgoing, 2, vec![]);
-        let discovered = walk_traversal_capped(&store, &root, &request, 2);
+        let walk = walk_traversal_capped(&store, &root, &request, 2);
+        assert!(
+            walk.truncated,
+            "a walk stopped by its bound reports the truncation"
+        );
+        let discovered = walk.discovered;
         assert_eq!(
             discovered.len(),
             2,
@@ -3431,12 +3477,26 @@ pub fn compute() -> i32 {
     }
 
     #[test]
+    fn traversal_truncation_warning_names_the_bound_it_hit() {
+        let warning = super::traversal_truncation_warning();
+        let ReadWarning::TraversalTruncated { visited, detail } = warning else {
+            panic!("expected the traversal truncation variant: {warning:?}");
+        };
+        assert_eq!(visited, TRAVERSAL_NODES_MAX as u64);
+        assert!(
+            detail.contains(&TRAVERSAL_NODES_MAX.to_string()),
+            "the detail names the bound: {detail}"
+        );
+    }
+
+    #[test]
     fn walk_traversal_from_an_edgeless_seed_finds_nothing() {
         let store = call_graph_store();
         let helper = graph_symbol_id("rift://symbol/rust/lib.rs/helper");
         // `helper` has an incoming edge but no outgoing one.
         let request = traversal_request(&helper, TraversalDirection::Outgoing, 2, vec![]);
-        let discovered = walk_traversal_capped(&store, &helper, &request, TRAVERSAL_NODES_MAX);
+        let discovered =
+            walk_traversal_capped(&store, &helper, &request, TRAVERSAL_NODES_MAX).discovered;
         assert!(discovered.is_empty(), "{discovered:?}");
     }
 

@@ -613,6 +613,33 @@
                   "detail"
                 ],
                 "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A traversal walk stopped at its node bound before exhausting the reachable graph,\nso hits reachable beyond the bound are missing from this answer. Narrow the walk -\na tighter `facets` list, a smaller `depth`, or a less-connected seed - to fit it\nunder the bound.",
+                "properties": {
+                  "code": {
+                    "const": "traversal_truncated",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "visited": {
+                    "description": "Symbols the walk visited before it stopped, equal to the bound it hit.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "visited",
+                  "detail"
+                ],
+                "type": "object"
               }
             ]
           },
@@ -4979,6 +5006,33 @@
                   "code",
                   "symbol",
                   "providers",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A traversal walk stopped at its node bound before exhausting the reachable graph,\nso hits reachable beyond the bound are missing from this answer. Narrow the walk -\na tighter `facets` list, a smaller `depth`, or a less-connected seed - to fit it\nunder the bound.",
+                "properties": {
+                  "code": {
+                    "const": "traversal_truncated",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "visited": {
+                    "description": "Symbols the walk visited before it stopped, equal to the bound it hit.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "visited",
                   "detail"
                 ],
                 "type": "object"
@@ -11247,7 +11301,7 @@
               },
               {
                 "const": "score",
-                "description": "The fused ranking value used to order the page.",
+                "description": "The ranking value used to order the page.",
                 "type": "string"
               }
             ]
@@ -11945,6 +11999,33 @@
                   "code",
                   "symbol",
                   "providers",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A traversal walk stopped at its node bound before exhausting the reachable graph,\nso hits reachable beyond the bound are missing from this answer. Narrow the walk -\na tighter `facets` list, a smaller `depth`, or a less-connected seed - to fit it\nunder the bound.",
+                "properties": {
+                  "code": {
+                    "const": "traversal_truncated",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "visited": {
+                    "description": "Symbols the walk visited before it stopped, equal to the bound it hit.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "visited",
                   "detail"
                 ],
                 "type": "object"
