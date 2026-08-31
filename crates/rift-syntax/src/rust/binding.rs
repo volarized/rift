@@ -38,10 +38,6 @@ const TYPE_PARAMETER_KIND_WORD: &str = "type_parameter";
 const LOCAL_FACETS: &[SymbolFacet] = &[SymbolFacet::Value];
 /// Facets a parameter binding carries.
 const PARAMETER_FACETS: &[SymbolFacet] = &[SymbolFacet::Value, SymbolFacet::Parameter];
-/// File names whose `mod` declarations resolve beside the file itself.
-const DIRECTORY_OWNING_FILE_NAMES: [&str; 3] = ["lib.rs", "main.rs", "mod.rs"];
-/// Extension a module candidate file carries.
-const RUST_FILE_SUFFIX: &str = ".rs";
 /// Most chain nodes one path extraction walks; a longer chain cannot form a valid path.
 const PATH_NODES_MAX: usize = NAME_PATH_SEGMENTS_MAX * 2;
 
@@ -1660,29 +1656,16 @@ fn restricted_spelling(text: &str) -> VisibilitySpelling {
 }
 
 /// The two project paths that could hold a declared module's body, strongest first.
+///
+/// The parse-time rule keys off the file name alone; a layout pass over the project
+/// path set recomputes the candidates through `RustCrateLayout::refined_facts`.
 fn module_candidates(unit_path: &str, module: &str) -> Vec<String> {
-    let (directory, file) = match unit_path.rsplit_once('/') {
-        Some((directory, file)) => (directory, file),
-        None => ("", unit_path),
-    };
-    let base = if DIRECTORY_OWNING_FILE_NAMES.contains(&file) {
-        directory.to_owned()
-    } else {
-        let stem = file.strip_suffix(RUST_FILE_SUFFIX).unwrap_or(file);
-        joined(directory, stem)
-    };
-    vec![
-        joined(&base, &format!("{module}{RUST_FILE_SUFFIX}")),
-        joined(&base, &format!("{module}/mod{RUST_FILE_SUFFIX}")),
-    ]
-}
-
-fn joined(directory: &str, tail: &str) -> String {
-    if directory.is_empty() {
-        tail.to_owned()
-    } else {
-        format!("{directory}/{tail}")
-    }
+    let file = unit_path
+        .rsplit_once('/')
+        .map_or(unit_path, |(_, file)| file);
+    let owns_directory = super::layout::DIRECTORY_OWNING_FILE_NAMES.contains(&file);
+    let directory = super::layout::candidate_directory(unit_path, owns_directory);
+    super::layout::module_body_candidates(&directory, module).into()
 }
 
 #[cfg(test)]
@@ -1691,30 +1674,11 @@ mod tests {
         BindingGraph, BindingLimits, LinkedGraph, NeverCancelled, ResolutionSet, assemble,
         resolve_all,
     };
-    use rift_core::{
-        ContributionOrigin, ProjectPath, ReferenceRole, SourceKind, SourceLocation, SourceUnitId,
-        encode_path,
-    };
+    use rift_core::ReferenceRole;
 
+    use super::super::fixture::{analyze, last_offset, offset, origin, source_unit, targets_at};
     use super::{binding_grammar, module_candidates};
-    use crate::{RustSyntaxProvider, SyntaxDocument, SyntaxProvider, SyntaxSource};
-
-    fn analyze(path: &str, text: &str) -> SyntaxDocument {
-        let path = ProjectPath::new(path).expect("fixture path");
-        RustSyntaxProvider::default()
-            .analyze(SyntaxSource { path: &path, text })
-            .expect("fixture parses")
-    }
-
-    fn source_unit(path: &str) -> SourceUnitId {
-        SourceUnitId::parse(&format!("rift://source/project/{}", encode_path(path)))
-            .expect("fixture unit identity")
-    }
-
-    fn origin() -> ContributionOrigin {
-        let location = SourceLocation::Project { package: None };
-        ContributionOrigin::new(Some(location), SourceKind::Authored).expect("authored origin")
-    }
+    use crate::SyntaxDocument;
 
     /// Assembles, links, and resolves the documents' extracted binding facts.
     fn resolved(documents: &[(&str, &SyntaxDocument)]) -> (BindingGraph, ResolutionSet) {
@@ -1732,44 +1696,6 @@ mod tests {
             resolve_all(&linked, &limits, &NeverCancelled).expect("resolution completes")
         };
         (graph, set)
-    }
-
-    fn offset(text: &str, needle: &str) -> u64 {
-        u64::try_from(text.find(needle).expect("needle in fixture")).expect("offset fits")
-    }
-
-    fn last_offset(text: &str, needle: &str) -> u64 {
-        u64::try_from(text.rfind(needle).expect("needle in fixture")).expect("offset fits")
-    }
-
-    /// Targets of the reference starting at `at` in `unit_path`: `(name, unit key, start)`.
-    fn targets_at(
-        graph: &BindingGraph,
-        set: &ResolutionSet,
-        unit_path: &str,
-        at: u64,
-    ) -> Vec<(String, String, u64)> {
-        let reference = graph
-            .reference_ids()
-            .find(|id| {
-                let reference = graph.reference(*id);
-                let unit = graph.unit(graph.scope(reference.scope()).unit());
-                unit.source().key().as_str() == unit_path && reference.range().start() == at
-            })
-            .expect("reference at offset");
-        set.resolution(reference)
-            .targets()
-            .iter()
-            .map(|id| {
-                let definition = graph.definition(*id);
-                let unit = graph.unit(graph.scope(definition.scope()).unit());
-                (
-                    definition.name().as_str().to_owned(),
-                    unit.source().key().as_str().to_owned(),
-                    definition.range().start(),
-                )
-            })
-            .collect()
     }
 
     fn lib_targets(text: &str, at: u64) -> Vec<(String, String, u64)> {
