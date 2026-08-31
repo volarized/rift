@@ -186,17 +186,21 @@ fn diagnostic_omits_absent_code_span_and_language() -> TestResult {
 
 #[test]
 fn schema_constraints_land_on_their_models() {
-    let file = serde_json::to_value(schema_for!(rift_protocol::read::File)).expect("file schema");
+    let get_symbol_hit =
+        serde_json::to_value(schema_for!(rift_protocol::read::GetSymbolHit)).expect("hit schema");
     assert_eq!(
-        file["allOf"][0]["then"]["properties"]["semantic"]["const"],
-        json!(false)
+        get_symbol_hit["allOf"][0]["oneOf"],
+        json!([{ "required": ["path"] }, { "required": ["unit"] }])
     );
 
     let hit =
         serde_json::to_value(schema_for!(rift_protocol::read::SearchHit)).expect("hit schema");
     assert_eq!(
         hit["allOf"][0]["oneOf"][0]["required"],
-        json!(["span", "line"])
+        json!(["range", "line"])
     );
-    assert_eq!(hit["allOf"][1]["then"]["required"], json!(["span", "line"]));
+    assert_eq!(
+        hit["allOf"][1]["then"]["required"],
+        json!(["range", "line"])
+    );
 }

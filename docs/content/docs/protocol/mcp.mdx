@@ -159,18 +159,15 @@ hit. The ranked lane placed it, so the hit is tagged `matched_by: ["ranked"]`, n
     "target": "symbol",
     "symbol": {
       "id": "rift://symbol/rust/crates/rift-core/src/identity.rs/encode_path",
-      "language": { "name": "rust" },
+      "language": "rust",
       "name": "encode_path",
-      "kind": "rust.function",
+      "kind": "function",
       "facets": ["value", "callable", "public"],
       "visibility": "pub"
     }
   },
   "matched_by": ["ranked"],
-  "span": {
-    "unit": "rift://source/project/crates/rift-core/src/identity.rs",
-    "range": { "start": 1496, "end": 1925 }
-  },
+  "range": { "start": 1496, "end": 1925 },
   "line": 43,
   "path": "crates/rift-core/src/identity.rs"
 }
@@ -195,28 +192,23 @@ of those files returns as a `file` hit, tagged
 {
   "hit": {
     "target": "file",
-    "file": {
-      "id": "rift://file/README.md",
-      "content": { "kind": "regular", "size": 3546, "executable": false },
-      "semantic": false
-    }
+    "size": 3546
   },
   "matched_by": ["ranked"],
-  "span": {
-    "unit": "rift://source/project/README.md",
-    "range": { "start": 820, "end": 920 }
-  },
+  "range": { "start": 820, "end": 920 },
   "line": 35,
   "path": "README.md"
 }
 ```
 
 A path carrying no extension - `justfile`, `Dockerfile` - is selected by the same patterns and
-returns the same way, because the selection reads the whole project-relative path.
+returns the same way, because the selection reads the whole project-relative path. A file hit
+carries `languages` only where a syntax provider claims the path; the ranked lane can also reach
+a file no provider claims, as this one does.
 
 The hit above carries no `source`: a request pays that lookup only when `include` names it.
 `include: ["source"]` attaches the excerpt as `source` on every hit; an omitted `include` returns
-the hit's symbol or file, `path`, `span`, and `line` alone, as both hits above do.
+the hit's symbol or file, `path`, `range`, and `line` alone, as both hits above do.
 
 <McpTool name="nodes" />
 

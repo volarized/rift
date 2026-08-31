@@ -107,7 +107,7 @@ async fn applied_patch_carries_the_toml_engine_diagnostic() -> TestResult {
     assert_eq!(finding["severity"], json!("error"));
     assert_eq!(
         finding["language"],
-        json!({ "name": "toml" }),
+        json!("toml"),
         "the engine's language stamps the finding: {finding:#}"
     );
     assert_eq!(finding["message"], json!("duplicate key: name"));

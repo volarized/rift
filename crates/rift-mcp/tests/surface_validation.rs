@@ -1087,6 +1087,61 @@ async fn insert_symbol_file_target_creation_is_visible_to_a_later_read() -> Test
     Ok(())
 }
 
+/// `get_symbol`'s `node` field is the same witnessed [`NodeId`](rift_protocol::read::NodeId)
+/// string `nodes` returns - the flattened edit address `replace_node` accepts directly, with
+/// no field to unwrap first. This proves the round trip through `get_symbol` the way
+/// [`live_witnessed_replace_node_lands_and_validates`] proves it through `nodes`.
+#[tokio::test]
+async fn live_get_symbol_node_address_round_trips_through_replace_node() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+    let tools = client.list_all_tools().await?;
+    let validators = tool_validators(&tools)?;
+
+    let found = client
+        .call_tool(
+            CallToolRequestParams::new("get_symbol")
+                .with_arguments(arguments(&json!({ "name": "beacon_two" }))?),
+        )
+        .await?;
+    let found = found
+        .structured_content
+        .ok_or("get_symbol must return structured content")?;
+    let witnessed = found["hits"][0]["node"]
+        .as_str()
+        .ok_or("a get_symbol hit must carry the bare witnessed node address")?
+        .to_owned();
+    assert!(
+        witnessed.starts_with("rift://node/"),
+        "get_symbol's node field is the address form itself, not a wrapper: {witnessed}"
+    );
+
+    let replaced = client
+        .call_tool(
+            CallToolRequestParams::new("replace_node").with_arguments(arguments(
+                &json!({ "node": witnessed, "body": "pub fn beacon_two() { /* replaced */ }" }),
+            )?),
+        )
+        .await?;
+    let replaced = replaced
+        .structured_content
+        .ok_or("replace_node must return structured content")?;
+    let (_, output_validator) = &validators["replace_node"];
+    assert_validates(
+        output_validator,
+        &replaced,
+        "get_symbol-addressed replace_node result",
+    );
+    assert_eq!(
+        replaced["status"],
+        json!("applied"),
+        "an address taken straight from get_symbol's node field must land: {replaced:#}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn live_witnessed_replace_node_lands_and_validates() -> TestResult {
     let (_directory, client, server_task) = served_fixture().await?;

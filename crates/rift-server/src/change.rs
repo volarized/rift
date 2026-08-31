@@ -1878,7 +1878,7 @@ mod tests {
         );
         let hit = &hits[0];
         assert_eq!(
-            hit.source.as_ref().map(|source| source.text.as_str()),
+            hit.source.as_deref(),
             Some(case.declaration),
             "{} must emit its exact declaration bytes",
             case.language_segment
@@ -3661,7 +3661,7 @@ mod tests {
         let index = listing
             .source
             .iter()
-            .position(|excerpt| excerpt.text == declaration)
+            .position(|excerpt| excerpt == declaration)
             .ok_or("no listed node's excerpt matches the expected declaration")?;
         Ok(listing.nodes[index].id.clone())
     }

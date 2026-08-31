@@ -100,9 +100,8 @@ async fn patch_batch_failing_mid_publish_restores_every_file() -> TestResult {
 // `search.rs` unit tests (`search_matched_by_carries_both_members_once_the_lexical_lane_covers_text_files`
 // and the sans-I/O tests beside it) prove that half of the fix directly.
 
-/// `search` returns a `.mdx` file and a `justfile` for text they hold, with
-/// each carrying `semantic: false` - the field naming a hit no syntax
-/// provider claims.
+/// `search` returns a `.mdx` file and a `justfile` for text they hold, each
+/// as a flat file hit whose `matched_by` claims the `content` lane.
 #[tokio::test]
 async fn search_reaches_the_mdx_file_and_the_extensionless_justfile() -> TestResult {
     let _serial = SERIAL.lock().await;
@@ -138,9 +137,15 @@ async fn search_reaches_the_mdx_file_and_the_extensionless_justfile() -> TestRes
         .collect();
     assert_eq!(mdx_hits.len(), 1, "the mdx file must surface once: {mdx:#}");
     assert_eq!(
-        mdx_hits[0]["hit"]["file"]["semantic"],
-        json!(false),
-        "a text-lane hit no provider claims must carry semantic: false: {mdx:#}"
+        mdx_hits[0]["hit"]["target"],
+        json!("file"),
+        "a text-lane hit answers as a file target: {mdx:#}"
+    );
+    assert!(
+        mdx_hits[0]["matched_by"]
+            .as_array()
+            .is_some_and(|lanes| lanes.contains(&json!("content"))),
+        "a text-lane hit claims the content lane: {mdx:#}"
     );
 
     let just = proxied_call(
@@ -160,9 +165,11 @@ async fn search_reaches_the_mdx_file_and_the_extensionless_justfile() -> TestRes
         1,
         "the extensionless justfile must surface: {just:#}"
     );
-    assert_eq!(
-        just_hits[0]["hit"]["file"]["semantic"],
-        json!(false),
+    assert_eq!(just_hits[0]["hit"]["target"], json!("file"), "{just:#}");
+    assert!(
+        just_hits[0]["matched_by"]
+            .as_array()
+            .is_some_and(|lanes| lanes.contains(&json!("content"))),
         "{just:#}"
     );
 

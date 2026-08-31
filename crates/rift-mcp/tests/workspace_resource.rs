@@ -60,7 +60,7 @@ async fn the_workspace_resource_answers_effective_languages_hooks_and_source() -
         .ok_or("workspace languages are an array")?;
     let rust = languages
         .iter()
-        .find(|language| language["language"]["name"] == "rust")
+        .find(|language| language["language"] == "rust")
         .ok_or("the shipped Rust entry is reported")?;
     assert_eq!(rust["syntax"], Value::from(true), "{rust}");
     assert_eq!(rust["lsp"]["process"], Value::from("rust"), "{rust}");

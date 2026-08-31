@@ -3,8 +3,8 @@
 //! from `read` so existing `rift_protocol::read::SearchParams`-style paths keep resolving.
 
 use crate::read::{
-    File, Node, PAGE_INDEX_DEFAULT, Pagination, ProjectPath, ReadWarning, Relationship, RevisionId,
-    SourceUnitSpan, Symbol,
+    Language, NodeId, PAGE_INDEX_DEFAULT, Pagination, ProjectPath, ReadWarning, Relationship,
+    RevisionId, Symbol, TextRange,
 };
 use crate::schema;
 use schemars::JsonSchema;
@@ -166,7 +166,7 @@ pub enum ResultOrder {
 /// Dependency and synthetic symbols can have no readable source; node and file hits cannot.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-#[schemars(transform = schema::pair_span_with_line)]
+#[schemars(transform = schema::pair_range_with_line)]
 #[schemars(transform = schema::declare_search_hit_empty_defaults)]
 pub struct SearchHit {
     /// What was found. A symbol, a node, or a file - whichever `target` allowed.
@@ -179,14 +179,14 @@ pub struct SearchHit {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub matched_by: Vec<MatchedField>,
     /// The source text around the hit, requested with `include: ["source"]`. Covers the
-    /// hit's `span`; a caller that needs the range already has it there.
+    /// hit's `range`; a caller that needs the range already has it there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// Where the hit is written in the source catalog. Absent for a symbol whose source
-    /// is unavailable or synthetic.
+    /// Byte range of the hit within `path`. Absent for a symbol whose source is
+    /// unavailable or synthetic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub span: Option<SourceUnitSpan>,
-    /// The 1-based source line where the hit begins, or absent with `span`.
+    pub range: Option<TextRange>,
+    /// The 1-based source line where the hit begins, or absent with `range`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1_u64))]
     pub line: Option<u64>,
@@ -209,6 +209,7 @@ pub struct SearchHit {
 /// What a search hit is. Tagged, so the payload correlation survives code generation.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "target", deny_unknown_fields, rename_all = "snake_case")]
+#[schemars(transform = schema::declare_search_hit_target_file_empty_defaults)]
 pub enum SearchHitTarget {
     /// A symbol hit: the declaration a provider resolved.
     Symbol {
@@ -217,14 +218,18 @@ pub enum SearchHitTarget {
     },
     /// A node hit: one place in a syntax tree, without its enclosing symbol record.
     Node {
-        /// The syntax-tree node that matched, and the symbol written at it where there is
-        /// one.
-        node: Node,
+        /// The syntax-tree node's identity, the full edit address `replace_node` accepts.
+        node: NodeId,
     },
     /// A file hit: one entry of the tree, whether or not any provider reads it.
     File {
-        /// The tree entry that matched: what it holds, and which languages read it.
-        file: File,
+        /// Size in bytes.
+        #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
+        size: u64,
+        /// Distinct `Language` values that read this file, sorted by name and dialect.
+        /// Absent when empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        languages: Vec<Language>,
     },
 }
 
@@ -346,11 +351,9 @@ pub enum SearchParamsTarget {
                     "target": "symbol",
                     "symbol": {
                         "id": "rift://symbol/rust/src/config.rs/load_config",
-                        "language": {
-                            "name": "rust"
-                        },
+                        "language": "rust",
                         "name": "load_config",
-                        "kind": "rust.function",
+                        "kind": "function",
                         "facets": [
                             "value",
                             "callable",
@@ -362,9 +365,7 @@ pub enum SearchParamsTarget {
                                 "role": "return",
                                 "origin": "declared",
                                 "type": {
-                                    "language": {
-                                        "name": "rust"
-                                    },
+                                    "language": "rust",
                                     "source": "Result<Config, ConfigError>"
                                 }
                             }
@@ -381,9 +382,7 @@ pub enum SearchParamsTarget {
                                         "symbol": "rift://symbol/rust/src/config.rs/Config"
                                     }
                                 ],
-                                "language": {
-                                    "name": "rust"
-                                },
+                                "language": "rust",
                                 "parameters": [
                                     {
                                         "name": "path",
@@ -392,9 +391,7 @@ pub enum SearchParamsTarget {
                                                 "role": "parameter",
                                                 "origin": "declared",
                                                 "type": {
-                                                    "language": {
-                                                        "name": "rust"
-                                                    },
+                                                    "language": "rust",
                                                     "source": "&Path"
                                                 }
                                             }
@@ -408,9 +405,7 @@ pub enum SearchParamsTarget {
                                         "role": "return",
                                         "origin": "declared",
                                         "type": {
-                                            "language": {
-                                                "name": "rust"
-                                            },
+                                            "language": "rust",
                                             "source": "Result<Config, ConfigError>"
                                         }
                                     }
@@ -429,12 +424,9 @@ pub enum SearchParamsTarget {
                     "name"
                 ],
                 "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-                "span": {
-                    "unit": "rift://source/project/src/config.rs",
-                    "range": {
-                        "start": 162,
-                        "end": 355
-                    }
+                "range": {
+                    "start": 162,
+                    "end": 355
                 },
                 "line": 10,
                 "path": "src/config.rs"
@@ -442,31 +434,18 @@ pub enum SearchParamsTarget {
             {
                 "hit": {
                     "target": "file",
-                    "file": {
-                        "id": "rift://file/src/lib.rs",
-                        "content": {
-                            "kind": "regular",
-                            "size": 241,
-                            "executable": false
-                        },
-                        "languages": [
-                            {
-                                "name": "rust"
-                            }
-                        ],
-                        "semantic": true
-                    }
+                    "size": 241,
+                    "languages": [
+                        "rust"
+                    ]
                 },
                 "matched_by": [
                     "content"
                 ],
                 "source": "    let config = load_config(&arguments.path)?;",
-                "span": {
-                    "unit": "rift://source/project/src/lib.rs",
-                    "range": {
-                        "start": 121,
-                        "end": 168
-                    }
+                "range": {
+                    "start": 121,
+                    "end": 168
                 },
                 "line": 7,
                 "path": "src/lib.rs"

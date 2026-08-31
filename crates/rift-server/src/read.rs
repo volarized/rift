@@ -7,7 +7,7 @@ use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::constants::DIGEST_WIRE_CHARS;
 use rift_core::{
     Error, ErrorCode, ErrorContext, ErrorName, Fault, LanguageFileSelections, SourceVisibility,
-    TextFileInclusion,
+    TextFileInclusion, line,
 };
 use rift_history::{HistoryError, Repository};
 use rift_index::{
@@ -19,8 +19,8 @@ use rift_protocol::configuration::HistoryConfiguration;
 use rift_protocol::read::{
     Digest, ExactKind, Extensions, FileId, GetSymbolHit, GetSymbolParams, GetSymbolResult,
     Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, PackageIdentity, Pagination,
-    ProjectPath, ReadWarning, RevisionId, SourceExcerpt, SourceLocationKind, SourceUnitId,
-    SourceUnitSpan, Symbol, SymbolId, SymbolOrigin, TextRange,
+    ProjectPath, ReadWarning, RevisionId, SourceLocationKind, SourceUnitId, Symbol, SymbolId,
+    SymbolOrigin, TextRange,
 };
 use rift_syntax::{ByteRange, SyntaxNode, SyntaxProvider, SyntaxSymbol, registry};
 use sha2::{Digest as _, Sha256};
@@ -802,10 +802,14 @@ impl ReadService {
             if let Some(warning) = disagreement {
                 disagreements.push(warning);
             }
+            let (path, unit) = hit_location(symbol.origin.location, matched.file.path());
             hits.push(GetSymbolHit {
                 symbol,
-                span: source_span(matched.file.path(), matched.symbol.range),
-                node: params.include_body.then(|| symbol_node(matched)),
+                path,
+                unit,
+                range: text_range(matched.symbol.range),
+                line: line::line_number_at(matched.file.source(), matched.symbol.range.start),
+                node: params.include_body.then(|| symbol_node(matched).id),
                 source: params
                     .include_body
                     .then(|| excerpt(matched.file, matched.symbol.range)),
@@ -891,7 +895,7 @@ fn wire_node(file: &IndexedFile, node: &SyntaxNode) -> Node {
         symbol: symbol_for_range(file, node.range).map(|symbol| symbol_id(file, symbol)),
         unit: file_id(file.path()),
         language: language.clone(),
-        kind: wire_kind(language, &node.kind),
+        kind: wire_kind(&node.kind),
         facets: language_provider(language).node_facets(&node.kind),
         range: text_range(node.range),
         regions: Vec::new(),
@@ -915,7 +919,7 @@ fn symbol_node(matched: SymbolMatch<'_>) -> Node {
                 symbol: Some(symbol_id(matched.file, matched.symbol)),
                 unit: file_id(matched.file.path()),
                 language: language.clone(),
-                kind: wire_kind(language, matched.symbol.kind),
+                kind: wire_kind(matched.symbol.kind),
                 facets: vec![NodeFacet::Declaration, NodeFacet::Definition],
                 range: text_range(matched.symbol.range),
                 regions: Vec::new(),
@@ -935,12 +939,12 @@ pub(crate) fn wire_symbol(
     matched: SymbolMatch<'_>,
 ) -> Result<(Symbol, Option<ReadWarning>), ReadError> {
     let readable = index.assembled_symbol(matched).map_err(ReadFault::index)?;
-    let symbol = assembled_wire_symbol(matched, &readable);
+    let symbol = assembled_wire_symbol(&readable);
     let disagreement = symbol_disagreement_warning(readable.assembled());
     Ok((symbol, disagreement))
 }
 
-fn assembled_wire_symbol(matched: SymbolMatch<'_>, readable: &ReadableSymbol) -> Symbol {
+fn assembled_wire_symbol(readable: &ReadableSymbol) -> Symbol {
     let assembled = readable.assembled();
     let facts = readable.facts();
     let mut extension_values = BTreeMap::new();
@@ -959,7 +963,7 @@ fn assembled_wire_symbol(matched: SymbolMatch<'_>, readable: &ReadableSymbol) ->
         name: facts.name().to_owned(),
         kind: facts.kind().clone(),
         facets: facts.symbol_facets().to_vec(),
-        origin: wire_symbol_origin(assembled.origin(), matched),
+        origin: wire_symbol_origin(assembled.origin()),
         container: assembled
             .container()
             .map(|container| SymbolId(container.as_str().to_owned())),
@@ -973,22 +977,34 @@ fn assembled_wire_symbol(matched: SymbolMatch<'_>, readable: &ReadableSymbol) ->
     }
 }
 
-/// Builds the wire origin from `origin`'s internal location and source kind. `unit` stays
-/// off the wire for a project declaration; a dependency, stdlib, or external declaration
-/// keeps it, naming the source-catalog unit the declaration was read from.
-fn wire_symbol_origin(
-    origin: &rift_core::ContributionOrigin,
-    matched: SymbolMatch<'_>,
-) -> SymbolOrigin {
+/// Builds the wire origin from `origin`'s internal location and source kind. The
+/// declaration's source-catalog unit, where its location differs from the project, rides
+/// on the hit itself (see [`hit_location`]) rather than being repeated here.
+fn wire_symbol_origin(origin: &rift_core::ContributionOrigin) -> SymbolOrigin {
     let location = origin.location();
     SymbolOrigin {
         location: location.map(wire_source_location_kind),
         package: location.and_then(source_location_package),
         source_kind: origin.source_kind(),
-        unit: match location {
-            Some(rift_core::SourceLocation::Project { .. }) | None => None,
-            Some(_) => Some(source_unit_id(matched.file.path())),
-        },
+    }
+}
+
+/// A `get_symbol` hit's own location: `path` for a project declaration or a declaration
+/// whose location is unestablished, `unit` for one that belongs to a dependency, the
+/// standard library, or source external to the workspace. `matched.file.path()` is the
+/// project-relative path the declaration was indexed at either way; `unit` re-addresses
+/// it through the source catalog for a location the hit's own `path` cannot name.
+fn hit_location(
+    location: Option<SourceLocationKind>,
+    path: &CoreProjectPath,
+) -> (Option<ProjectPath>, Option<SourceUnitId>) {
+    match location {
+        None | Some(SourceLocationKind::Project) => (Some(project_path(path)), None),
+        Some(
+            SourceLocationKind::Dependency
+            | SourceLocationKind::Stdlib
+            | SourceLocationKind::External,
+        ) => (None, Some(source_unit_id(path))),
     }
 }
 
@@ -1046,38 +1062,28 @@ fn symbol_disagreement_warning(assembled: &rift_provider::AssembledSymbol) -> Op
     })
 }
 
-pub(crate) fn excerpt(file: &IndexedFile, range: ByteRange) -> SourceExcerpt {
+pub(crate) fn excerpt(file: &IndexedFile, range: ByteRange) -> String {
     let start = usize::try_from(range.start)
         .unwrap_or(file.source().len())
         .min(file.source().len());
     let end = usize::try_from(range.end)
         .unwrap_or(file.source().len())
         .min(file.source().len());
-    let text = file.source().get(start..end).unwrap_or_default().to_owned();
-    SourceExcerpt {
-        span: source_span(file.path(), range),
-        text,
-    }
+    file.source().get(start..end).unwrap_or_default().to_owned()
 }
 
-pub(crate) fn source_span(path: &CoreProjectPath, range: ByteRange) -> SourceUnitSpan {
-    SourceUnitSpan {
-        unit: source_unit_id(path),
-        range: text_range(range),
-    }
-}
-
-fn text_range(range: ByteRange) -> TextRange {
+pub(crate) fn text_range(range: ByteRange) -> TextRange {
     TextRange {
         start: range.start,
         end: range.end,
     }
 }
 
-/// Composes the wire kind for one grammar fact: the language name, a dot,
-/// the provider's kind word, as in `rust.function_item`.
-fn wire_kind(language: &Language, kind: &str) -> ExactKind {
-    ExactKind(format!("{}.{kind}", language.name))
+/// Composes the wire kind for one grammar fact: the provider's own kind word, as in
+/// `function_item`. `language` rides beside `kind` in every payload that carries one, so
+/// the wire kind carries no language prefix of its own.
+fn wire_kind(kind: &str) -> ExactKind {
+    ExactKind(kind.to_owned())
 }
 
 /// The registered provider filing facts under `language`.
@@ -1596,7 +1602,7 @@ pub fn compute() -> i32 {
                 .as_array()
                 .is_some_and(|nodes| !nodes.is_empty())
         );
-        assert_eq!(value["nodes"][0]["language"]["name"], "rust");
+        assert_eq!(value["nodes"][0]["language"], "rust");
         assert!(
             value["nodes"][0]["id"]
                 .as_str()
@@ -1684,7 +1690,7 @@ pub fn compute() -> i32 {
 
     #[test]
     fn nodes_source_carries_one_excerpt_per_node_in_order_spanning_its_own_range() -> TestResult {
-        let (_directory, service) = fixture()?;
+        let (directory, service) = fixture()?;
         let result = service.nodes(NodesParams {
             path: ProjectPath("src/lib.rs".to_owned()),
             position: 5,
@@ -1699,12 +1705,50 @@ pub fn compute() -> i32 {
             result.source.len(),
             "one excerpt must ride per listed node"
         );
+        let text = std::fs::read_to_string(directory.path().join("src/lib.rs"))?;
         for (node, source) in result.nodes.iter().zip(result.source.iter()) {
+            let start = usize::try_from(node.range.start)?;
+            let end = usize::try_from(node.range.end)?;
             assert_eq!(
-                source.span.range, node.range,
+                source.as_str(),
+                &text[start..end],
                 "each excerpt must span its own node's range, not the requested position"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn hit_location_answers_exactly_one_address_for_every_location_kind() -> TestResult {
+        let path = rift_core::ProjectPath::new("src/lib.rs")?;
+        for kind in [
+            None,
+            Some(rift_protocol::read::SourceLocationKind::Project),
+            Some(rift_protocol::read::SourceLocationKind::Dependency),
+            Some(rift_protocol::read::SourceLocationKind::Stdlib),
+            Some(rift_protocol::read::SourceLocationKind::External),
+        ] {
+            let (project, unit) = super::hit_location(kind, &path);
+            assert!(
+                project.is_some() != unit.is_some(),
+                "exactly one of path and unit per hit: kind={kind:?}, path={project:?}, unit={unit:?}"
+            );
+        }
+        let (project, unit) = super::hit_location(
+            Some(rift_protocol::read::SourceLocationKind::Project),
+            &path,
+        );
+        assert_eq!(project.map(|p| p.0), Some("src/lib.rs".to_owned()));
+        assert_eq!(unit, None);
+        let (project, unit) = super::hit_location(
+            Some(rift_protocol::read::SourceLocationKind::Dependency),
+            &path,
+        );
+        assert_eq!(project, None);
+        assert!(
+            unit.is_some(),
+            "a dependency hit re-addresses through the source catalog"
+        );
         Ok(())
     }
 
@@ -1799,21 +1843,22 @@ pub fn compute() -> i32 {
             "include_body: false must carry no source excerpt"
         );
         assert_eq!(
-            with_body_value["hits"][0]["span"], without_body_value["hits"][0]["span"],
-            "the span must not depend on include_body"
+            with_body_value["hits"][0]["path"], without_body_value["hits"][0]["path"],
+            "the path must not depend on include_body"
         );
         assert_eq!(
-            without_body_value["hits"][0]["span"]["unit"],
-            json!("rift://source/project/src/lib.rs")
+            with_body_value["hits"][0]["range"], without_body_value["hits"][0]["range"],
+            "the range must not depend on include_body"
         );
+        assert_eq!(without_body_value["hits"][0]["path"], json!("src/lib.rs"));
         assert!(
-            without_body_value["hits"][0]["span"]["range"]["start"]
+            without_body_value["hits"][0]["range"]["start"]
                 .as_u64()
                 .is_some_and(|start| start
-                    < without_body_value["hits"][0]["span"]["range"]["end"]
+                    < without_body_value["hits"][0]["range"]["end"]
                         .as_u64()
                         .unwrap_or_default()),
-            "the span must name a real byte range: {without_body_value:#}"
+            "the range must name a real byte range: {without_body_value:#}"
         );
         Ok(())
     }
@@ -1890,7 +1935,7 @@ pub fn compute() -> i32 {
             symbol.get("origin").is_none(),
             "a project-authored symbol with no package must omit origin entirely: {symbol}"
         );
-        assert_eq!(value["hits"][0]["source"]["text"], "pub struct Beacon;");
+        assert_eq!(value["hits"][0]["source"], "pub struct Beacon;");
         assert!(
             value.get("warnings").is_none(),
             "a single-provider fixture with no disagreement raises no warning: {value}"
@@ -1943,8 +1988,8 @@ pub fn compute() -> i32 {
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
 
         let symbol = &value["hits"][0]["symbol"];
-        assert_eq!(symbol["language"], json!({ "name": "rust" }));
-        assert_eq!(symbol["kind"], json!("rust.function"));
+        assert_eq!(symbol["language"], json!("rust"));
+        assert_eq!(symbol["kind"], json!("function"));
         assert_eq!(symbol["facets"], json!(["value", "callable", "public"]));
         assert_eq!(symbol["visibility"], json!("pub"));
         assert_eq!(
@@ -1952,15 +1997,18 @@ pub fn compute() -> i32 {
             json!("rift://symbol/rust/src/lib.rs/Beacon")
         );
 
-        let node = &value["hits"][0]["node"];
-        assert_eq!(node["language"], json!({ "name": "rust" }));
-        assert_eq!(node["kind"], json!("rust.function_item"));
-        assert_eq!(node["facets"], json!(["declaration", "definition"]));
+        let node = value["hits"][0]["node"]
+            .as_str()
+            .ok_or("node must be the bare witnessed address string")?;
+        assert!(
+            node.starts_with("rift://node/rust/src/lib.rs@"),
+            "the address embeds the language, path, and range: {node}"
+        );
 
         let top_level: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
         let top_value = serde_json::to_value(service.get_symbol(&top_level)?)?;
         let beacon = &top_value["hits"][0]["symbol"];
-        assert_eq!(beacon["kind"], json!("rust.struct"));
+        assert_eq!(beacon["kind"], json!("struct"));
         assert_eq!(beacon["facets"], json!(["type", "public"]));
         assert!(
             beacon.get("container").is_none(),
@@ -2525,7 +2573,7 @@ pub fn compute() -> i32 {
         let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
         let item = nodes
             .iter()
-            .find(|node| node["kind"] == "rust.struct_item")
+            .find(|node| node["kind"] == "struct_item")
             .ok_or("fixture must witness the struct_item node")?;
         assert!(
             item["symbol"]
@@ -2550,7 +2598,7 @@ pub fn compute() -> i32 {
         let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
         let item = nodes
             .iter()
-            .find(|node| node["kind"] == "rust.struct_item")
+            .find(|node| node["kind"] == "struct_item")
             .ok_or("fixture must witness the struct_item node")?;
         assert!(
             item["symbol"]
@@ -2574,7 +2622,7 @@ pub fn compute() -> i32 {
         let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
         let impl_node = nodes
             .iter()
-            .find(|node| node["kind"] == "rust.impl_item")
+            .find(|node| node["kind"] == "impl_item")
             .ok_or("fixture must witness the impl_item node")?;
         assert!(
             impl_node.get("symbol").is_none(),
@@ -2622,15 +2670,15 @@ pub fn compute() -> i32 {
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "Route"}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let symbol = &value["hits"][0]["symbol"];
-        assert_eq!(symbol["language"], json!({ "name": "typescript" }));
-        assert_eq!(symbol["kind"], json!("typescript.interface"));
+        assert_eq!(symbol["language"], json!("typescript"));
+        assert_eq!(symbol["kind"], json!("interface"));
         assert_eq!(symbol["facets"], json!(["type", "public"]));
         assert_eq!(
             symbol["id"],
             json!("rift://symbol/typescript/src/routes.ts/Route")
         );
         assert_eq!(
-            value["hits"][0]["source"]["text"],
+            value["hits"][0]["source"],
             "interface Route {\n  path: string;\n}"
         );
         Ok(())
@@ -2657,21 +2705,18 @@ pub fn compute() -> i32 {
         let unfiltered: GetSymbolParams = serde_json::from_value(json!({"name": "beacon"}))?;
         assert_eq!(service.get_symbol(&unfiltered)?.hits.len(), 2);
         let filtered: GetSymbolParams =
-            serde_json::from_value(json!({"name": "beacon", "language": {"name": "rust"}}))?;
+            serde_json::from_value(json!({"name": "beacon", "language": "rust"}))?;
         let result = service.get_symbol(&filtered)?;
         let value = serde_json::to_value(&result)?;
         assert_eq!(result.hits.len(), 1);
-        assert_eq!(
-            value["hits"][0]["symbol"]["language"],
-            json!({"name": "rust"})
-        );
+        assert_eq!(value["hits"][0]["symbol"]["language"], json!("rust"));
         assert_eq!(
             value["pagination"],
             json!({"page_index": 0, "total_pages": 1})
         );
         let dialect_filtered: GetSymbolParams = serde_json::from_value(json!({
             "name": "beacon",
-            "language": {"name": "typescript", "dialect": "tsx"}
+            "language": "typescript:tsx"
         }))?;
         assert!(
             service.get_symbol(&dialect_filtered)?.hits.is_empty(),
@@ -2686,12 +2731,12 @@ pub fn compute() -> i32 {
         let (_directory, service) = multi_language_fixture()?;
         let params: GetSymbolParams = serde_json::from_value(json!({
             "name": "App",
-            "language": {"name": "typescript"}
+            "language": "typescript"
         }))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         assert_eq!(
             value["hits"][0]["symbol"]["language"],
-            json!({"name": "typescript", "dialect": "tsx"})
+            json!("typescript:tsx")
         );
         Ok(())
     }
@@ -2711,26 +2756,21 @@ pub fn compute() -> i32 {
         assert!(!nodes.is_empty());
         assert!(
             nodes.iter().all(|node| {
-                node["kind"]
+                node["language"]
                     .as_str()
-                    .is_some_and(|kind| kind.starts_with("typescript."))
+                    .is_some_and(|language| language.starts_with("typescript"))
             }),
-            "every wire kind composes from the language name: {nodes:#?}"
+            "every node carries the typescript language: {nodes:#?}"
         );
         assert!(
-            nodes
-                .iter()
-                .any(|node| node["kind"] == "typescript.jsx_element"),
+            nodes.iter().any(|node| node["kind"] == "jsx_element"),
             "position sits inside the JSX element: {nodes:#?}"
         );
         let jsx = nodes
             .iter()
-            .find(|node| node["kind"] == "typescript.jsx_element")
+            .find(|node| node["kind"] == "jsx_element")
             .ok_or("fixture must witness the jsx_element node")?;
-        assert_eq!(
-            jsx["language"],
-            json!({ "name": "typescript", "dialect": "tsx" })
-        );
+        assert_eq!(jsx["language"], json!("typescript:tsx"));
         assert_eq!(jsx["facets"], json!(["expression"]));
         assert!(
             jsx["id"]
@@ -2799,8 +2839,8 @@ pub fn compute() -> i32 {
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon Guide"}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let symbol = &value["hits"][0]["symbol"];
-        assert_eq!(symbol["language"], json!({ "name": "markdown" }));
-        assert_eq!(symbol["kind"], json!("markdown.heading"));
+        assert_eq!(symbol["language"], json!("markdown"));
+        assert_eq!(symbol["kind"], json!("heading"));
         assert!(
             symbol.get("facets").is_none(),
             "no facets must omit the member"
@@ -2810,7 +2850,7 @@ pub fn compute() -> i32 {
             json!("rift://symbol/markdown/src/guide.md/Beacon%20Guide")
         );
         assert_eq!(
-            value["hits"][0]["source"]["text"],
+            value["hits"][0]["source"],
             "# Beacon Guide\n\nHow the beacon works.\n"
         );
         Ok(())
@@ -2832,18 +2872,14 @@ pub fn compute() -> i32 {
         let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
         assert!(!nodes.is_empty());
         assert!(
-            nodes.iter().all(|node| {
-                node["kind"]
-                    .as_str()
-                    .is_some_and(|kind| kind.starts_with("markdown."))
-            }),
-            "every wire kind composes from the language name: {nodes:#?}"
+            nodes.iter().all(|node| node["language"] == "markdown"),
+            "every node carries the markdown language: {nodes:#?}"
         );
         let section = nodes
             .iter()
-            .find(|node| node["kind"] == "markdown.section")
+            .find(|node| node["kind"] == "section")
             .ok_or("position sits inside the heading's section")?;
-        assert_eq!(section["language"], json!({ "name": "markdown" }));
+        assert_eq!(section["language"], json!("markdown"));
         assert_eq!(section["facets"], json!(["declaration"]));
         let section_id = section["id"].as_str().unwrap_or_default();
         assert!(
@@ -2851,9 +2887,7 @@ pub fn compute() -> i32 {
             "a markdown node address files under the markdown segment: {section_id}"
         );
         assert!(
-            nodes
-                .iter()
-                .any(|node| node["kind"] == "markdown.paragraph"),
+            nodes.iter().any(|node| node["kind"] == "paragraph"),
             "position sits inside the prose paragraph: {nodes:#?}"
         );
         Ok(())
@@ -2910,8 +2944,8 @@ pub fn compute() -> i32 {
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "beacon settings"}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let symbol = &value["hits"][0]["symbol"];
-        assert_eq!(symbol["language"], json!({ "name": "json" }));
-        assert_eq!(symbol["kind"], json!("json.member"));
+        assert_eq!(symbol["language"], json!("json"));
+        assert_eq!(symbol["kind"], json!("member"));
         assert!(
             symbol.get("facets").is_none(),
             "no facets must omit the member"
@@ -2921,13 +2955,13 @@ pub fn compute() -> i32 {
             json!("rift://symbol/json/settings.json/beacon%20settings")
         );
         assert_eq!(
-            value["hits"][0]["source"]["text"],
+            value["hits"][0]["source"],
             "\"beacon settings\": {\"port\": 8080}"
         );
 
         let nested: GetSymbolParams = serde_json::from_value(json!({
             "name": "port",
-            "language": {"name": "json"}
+            "language": "json"
         }))?;
         let value = serde_json::to_value(service.get_symbol(&nested)?)?;
         assert_eq!(
@@ -2947,8 +2981,8 @@ pub fn compute() -> i32 {
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "beacon pipeline"}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let symbol = &value["hits"][0]["symbol"];
-        assert_eq!(symbol["language"], json!({ "name": "yaml" }));
-        assert_eq!(symbol["kind"], json!("yaml.mapping_entry"));
+        assert_eq!(symbol["language"], json!("yaml"));
+        assert_eq!(symbol["kind"], json!("mapping_entry"));
         assert!(
             symbol.get("facets").is_none(),
             "no facets must omit the member"
@@ -2958,7 +2992,7 @@ pub fn compute() -> i32 {
             json!("rift://symbol/yaml/pipeline.yaml/beacon%20pipeline")
         );
         assert_eq!(
-            value["hits"][0]["source"]["text"], "beacon pipeline:\n  retries: 3\n",
+            value["hits"][0]["source"], "beacon pipeline:\n  retries: 3\n",
             "the excerpt serves whole lines, so the pair's last line ends it"
         );
         Ok(())
@@ -2978,18 +3012,14 @@ pub fn compute() -> i32 {
         let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
         assert!(!nodes.is_empty());
         assert!(
-            nodes.iter().all(|node| {
-                node["kind"]
-                    .as_str()
-                    .is_some_and(|kind| kind.starts_with("json."))
-            }),
-            "every wire kind composes from the language name: {nodes:#?}"
+            nodes.iter().all(|node| node["language"] == "json"),
+            "every node carries the json language: {nodes:#?}"
         );
         let pair = nodes
             .iter()
-            .find(|node| node["kind"] == "json.pair")
+            .find(|node| node["kind"] == "pair")
             .ok_or("position sits inside the port member's pair")?;
-        assert_eq!(pair["language"], json!({ "name": "json" }));
+        assert_eq!(pair["language"], json!("json"));
         assert_eq!(pair["facets"], json!(["declaration"]));
         let pair_id = pair["id"].as_str().unwrap_or_default();
         assert!(
@@ -2997,7 +3027,7 @@ pub fn compute() -> i32 {
             "a JSON node address files under the json segment: {pair_id}"
         );
         assert!(
-            nodes.iter().any(|node| node["kind"] == "json.number"),
+            nodes.iter().any(|node| node["kind"] == "number"),
             "position sits inside the number value: {nodes:#?}"
         );
         Ok(())
@@ -3019,18 +3049,14 @@ pub fn compute() -> i32 {
         let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
         assert!(!nodes.is_empty());
         assert!(
-            nodes.iter().all(|node| {
-                node["kind"]
-                    .as_str()
-                    .is_some_and(|kind| kind.starts_with("yaml."))
-            }),
-            "every wire kind composes from the language name: {nodes:#?}"
+            nodes.iter().all(|node| node["language"] == "yaml"),
+            "every node carries the yaml language: {nodes:#?}"
         );
         let pair = nodes
             .iter()
-            .find(|node| node["kind"] == "yaml.block_mapping_pair")
+            .find(|node| node["kind"] == "block_mapping_pair")
             .ok_or("position sits inside the retries entry's pair")?;
-        assert_eq!(pair["language"], json!({ "name": "yaml" }));
+        assert_eq!(pair["language"], json!("yaml"));
         assert_eq!(pair["facets"], json!(["declaration"]));
         let pair_id = pair["id"].as_str().unwrap_or_default();
         assert!(
@@ -3203,7 +3229,7 @@ pub fn compute() -> i32 {
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "beacon"}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         assert_eq!(
-            value["hits"][0]["source"]["text"], "pub fn beacon() {}",
+            value["hits"][0]["source"], "pub fn beacon() {}",
             "the committed body answers, not the drifted working tree"
         );
         assert!(
@@ -3249,9 +3275,7 @@ pub fn compute() -> i32 {
         let value = serde_json::to_value(result)?;
         let nodes = value["nodes"].as_array().ok_or("nodes must be array")?;
         assert!(
-            nodes
-                .iter()
-                .any(|node| node["kind"] == "rust.function_item"),
+            nodes.iter().any(|node| node["kind"] == "function_item"),
             "position 8 sits inside the committed `pub fn beacon`"
         );
         Ok(())
@@ -3387,23 +3411,12 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    /// The wire kind composes from the language name alone: a dialect
-    /// separates identity segments, never the kind spelling.
+    /// The wire kind is the provider's own kind word alone: `language` rides beside
+    /// `kind` in every payload, so the wire kind carries no language prefix.
     #[test]
-    fn wire_kind_joins_the_language_name_and_kind_with_a_dot() {
-        let rust = Language {
-            name: "rust".to_owned(),
-            dialect: None,
-        };
-        assert_eq!(
-            super::wire_kind(&rust, "function_item").0,
-            "rust.function_item"
-        );
-        let dialect = Language {
-            name: "typescript".to_owned(),
-            dialect: Some("tsx".to_owned()),
-        };
-        assert_eq!(super::wire_kind(&dialect, "class").0, "typescript.class");
+    fn wire_kind_carries_the_provider_kind_word_unprefixed() {
+        assert_eq!(super::wire_kind("function_item").0, "function_item");
+        assert_eq!(super::wire_kind("class").0, "class");
     }
 
     #[test]

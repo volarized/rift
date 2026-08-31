@@ -2487,10 +2487,13 @@ mod tests {
         let result = get_symbol(&server, "external_modified")
             .await
             .map_err(|error| format!("external rename must reconcile: {error:?}"))?;
-        let unit = &result.hits[0].span.unit;
+        let path = result.hits[0]
+            .path
+            .as_ref()
+            .expect("a project declaration carries path");
         assert!(
-            unit.0.ends_with("/renamed.rs"),
-            "hit must resolve to the renamed path: {unit:?}"
+            path.0.ends_with("renamed.rs"),
+            "hit must resolve to the renamed path: {path:?}"
         );
 
         fs::remove_file(renamed)?;
@@ -3109,7 +3112,7 @@ mod tests {
         let structured = symbol
             .structured_content
             .ok_or("get_symbol must return structured content")?;
-        let excerpt = structured["hits"][0]["source"]["text"]
+        let excerpt = structured["hits"][0]["source"]
             .as_str()
             .ok_or("hit must carry source text")?;
         assert!(
@@ -3861,7 +3864,7 @@ pub fn beacon() -> u64 {
         assert!(
             body["languages"].as_array().is_some_and(|languages| {
                 languages.iter().any(|language| {
-                    language["language"]["name"] == serde_json::json!("rust")
+                    language["language"] == serde_json::json!("rust")
                         && language["enabled"] == serde_json::json!(true)
                         && language["syntax"] == serde_json::json!(true)
                 })
@@ -3872,7 +3875,7 @@ pub fn beacon() -> u64 {
             body["source"].as_array().is_some_and(|source| {
                 source.iter().any(|unit| {
                     unit["path"] == serde_json::json!("lib.rs")
-                        && unit["language"]["name"] == serde_json::json!("rust")
+                        && unit["language"] == serde_json::json!("rust")
                 })
             }),
             "{text}"
@@ -3913,7 +3916,7 @@ pub fn beacon() -> u64 {
         let language = |name: &str| {
             languages
                 .iter()
-                .find(|entry| entry["language"]["name"] == serde_json::json!(name))
+                .find(|entry| entry["language"] == serde_json::json!(name))
                 .expect("configured language is reported")
         };
 
@@ -4023,7 +4026,7 @@ pub fn beacon() -> u64 {
                     .find(|unit| unit["path"] == serde_json::json!("lib.rs"))
             })
             .expect("disabled Rust source must remain in the source catalog");
-        assert_eq!(rust["language"]["name"], serde_json::json!("rust"));
+        assert_eq!(rust["language"], serde_json::json!("rust"));
         Ok(())
     }
 

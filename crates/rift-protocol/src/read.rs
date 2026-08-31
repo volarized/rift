@@ -6,9 +6,18 @@
 
 use crate::configuration::Duration;
 use crate::schema;
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+/// The spelling [`Language::identity_segment`] and [`Language::from_identity_segment`]
+/// agree on: one lowercase language word, or two joined by `:`. The
+/// `[languages.<identity>]` configuration table key uses the same grammar.
+pub(crate) const LANGUAGE_IDENTITY_PATTERN: &str = r"^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$";
+/// Longest accepted language name or dialect word, in bytes.
+pub(crate) const LANGUAGE_WORD_BYTES_MAX: usize = 64;
+/// Longest accepted language identity segment: two words joined by one colon.
+pub(crate) const LANGUAGE_IDENTITY_BYTES_MAX: usize = LANGUAGE_WORD_BYTES_MAX * 2 + 1;
 
 // Search-specific models (`SearchParams`, `PathSelector`, and their neighbors) live in
 // `search` so this module stays below its size bound; re-exporting them here keeps every
@@ -140,56 +149,6 @@ impl Extensions {
     }
 }
 
-/// One file and the languages that read it.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-#[schemars(transform = schema::forbid_symlink_language_facts)]
-#[schemars(transform = schema::declare_file_empty_defaults)]
-pub struct File {
-    /// Project-relative source identity and the URI from which this record and its bytes
-    /// are read.
-    pub id: FileId,
-    /// Regular-file metadata or a symbolic-link target.
-    pub content: FileContent,
-    /// Distinct `Language` values in `regions`, sorted by name and dialect. A file holding
-    /// embedded languages advertises each of them. Absent when empty.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub languages: Vec<Language>,
-    /// Byte ranges parsed with each language grammar. Entries sort by start, end, language
-    /// name, and dialect with null first. Regions may overlap when two grammars parse the
-    /// same bytes. Absent when empty.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub regions: Vec<LanguageRegion>,
-    /// Whether Rift produced facts from this file. False where there is nothing to read,
-    /// and where no provider claims the path.
-    pub semantic: bool,
-}
-
-/// The bytes of a regular file or the target of a symbolic link.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "kind", deny_unknown_fields, rename_all = "snake_case")]
-pub enum FileContent {
-    /// A physical or generated file with bytes in it. Every node and symbol with readable
-    /// source comes from this kind.
-    Regular {
-        /// Size in bytes.
-        #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
-        size: u64,
-        /// Whether the file is executable.
-        executable: bool,
-    },
-    /// A symbolic link whose target is carried as canonical base64.
-    Symlink {
-        /// Canonical padded base64 of the raw target bytes. Rift does not follow the
-        /// target.
-        #[schemars(length(max = 5464))]
-        #[schemars(regex(
-            pattern = r"^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
-        ))]
-        target: String,
-    },
-}
-
 /// Identity of one file in the tree a request targets. The path after `rift://file/` is a
 /// `ProjectPath` in canonical percent-encoding. The server re-validates the decoded path
 /// wherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,
@@ -209,21 +168,31 @@ pub struct FileId(
 /// One declaration a `get_symbol` lookup found.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = schema::get_symbol_hit_addresses_one_location)]
 pub struct GetSymbolHit {
     /// The declaration that matched.
     pub symbol: Symbol,
-    /// Where the declaration lives: its source unit and byte range. Set whether or not
-    /// `include_body` was requested, so a caller can address the hit without reading its
-    /// body first.
-    pub span: SourceUnitSpan,
-    /// The declaration node, whose identity `replace_symbol` can act on. Absent when
-    /// source is unavailable or outside the project.
+    /// Project-relative path, present for a declaration that belongs to the project.
+    /// Exactly one of `path` and `unit` is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node: Option<Node>,
+    pub path: Option<ProjectPath>,
+    /// Source-catalog unit, present for a declaration that belongs to a dependency or the
+    /// standard library. Exactly one of `path` and `unit` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<SourceUnitId>,
+    /// Byte range of the declaration within `path` or `unit`.
+    pub range: TextRange,
+    /// The 1-based source line where the declaration begins.
+    #[schemars(range(min = 1_u64))]
+    pub line: u64,
+    /// The declaration node's identity, the full edit address `replace_node` accepts.
+    /// Absent when source is unavailable or outside the project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<NodeId>,
     /// The declaration source when the request asked for bodies and the provider can read
     /// it. Absent for source-less declarations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<SourceExcerpt>,
+    pub source: Option<String>,
     /// The symbol's timeline, present when the request asked for history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<SymbolHistory>,
@@ -237,9 +206,7 @@ pub struct GetSymbolHit {
 #[schemars(extend("examples" = [
     {
         "name": "ReadService",
-        "language": {
-            "name": "rust"
-        },
+        "language": "rust",
         "include_body": true,
         "include_history": true,
         "limit": 5,
@@ -309,11 +276,9 @@ fn default_get_symbol_params_page_index() -> u64 {
             {
                 "symbol": {
                     "id": "rift://symbol/rust/src/config.rs/load_config",
-                    "language": {
-                        "name": "rust"
-                    },
+                    "language": "rust",
                     "name": "load_config",
-                    "kind": "rust.function",
+                    "kind": "function",
                     "facets": [
                         "value",
                         "callable",
@@ -325,9 +290,7 @@ fn default_get_symbol_params_page_index() -> u64 {
                             "role": "return",
                             "origin": "declared",
                             "type": {
-                                "language": {
-                                    "name": "rust"
-                                },
+                                "language": "rust",
                                 "source": "Result<Config, ConfigError>"
                             }
                         }
@@ -344,9 +307,7 @@ fn default_get_symbol_params_page_index() -> u64 {
                                     "symbol": "rift://symbol/rust/src/config.rs/Config"
                                 }
                             ],
-                            "language": {
-                                "name": "rust"
-                            },
+                            "language": "rust",
                             "parameters": [
                                 {
                                     "name": "path",
@@ -355,9 +316,7 @@ fn default_get_symbol_params_page_index() -> u64 {
                                             "role": "parameter",
                                             "origin": "declared",
                                             "type": {
-                                                "language": {
-                                                    "name": "rust"
-                                                },
+                                                "language": "rust",
                                                 "source": "&Path"
                                             }
                                         }
@@ -371,9 +330,7 @@ fn default_get_symbol_params_page_index() -> u64 {
                                     "role": "return",
                                     "origin": "declared",
                                     "type": {
-                                        "language": {
-                                            "name": "rust"
-                                        },
+                                        "language": "rust",
                                         "source": "Result<Config, ConfigError>"
                                     }
                                 }
@@ -387,57 +344,14 @@ fn default_get_symbol_params_page_index() -> u64 {
                         }
                     ]
                 },
-                "span": {
-                    "unit": "rift://source/project/src/config.rs",
-                    "range": {
-                        "start": 162,
-                        "end": 355
-                    }
+                "path": "src/config.rs",
+                "line": 10,
+                "range": {
+                    "start": 162,
+                    "end": 355
                 },
-                "node": {
-                    "id": "rift://node/rust/src/config.rs@218-355#67ecfb36",
-                    "symbol": "rift://symbol/rust/src/config.rs/load_config",
-                    "unit": "rift://file/src/config.rs",
-                    "language": {
-                        "name": "rust"
-                    },
-                    "kind": "rust.function_item",
-                    "facets": [
-                        "declaration",
-                        "definition"
-                    ],
-                    "range": {
-                        "start": 218,
-                        "end": 355
-                    },
-                    "regions": [
-                        {
-                            "role": "name",
-                            "range": {
-                                "start": 225,
-                                "end": 236
-                            }
-                        },
-                        {
-                            "role": "body",
-                            "range": {
-                                "start": 281,
-                                "end": 355
-                            }
-                        }
-                    ],
-                    "parent": "rift://node/rust/src/config.rs@0-356#dcbef6dd"
-                },
-                "source": {
-                    "span": {
-                        "unit": "rift://source/project/src/config.rs",
-                        "range": {
-                            "start": 162,
-                            "end": 355
-                        }
-                    },
-                    "text": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
-                },
+                "node": "rift://node/rust/src/config.rs@218-355#67ecfb36",
+                "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
                 "history": {
                     "symbol": "rift://symbol/rust/src/config.rs/load_config",
                     "versions": [
@@ -476,21 +390,16 @@ pub struct GetSymbolResult {
 }
 
 /// A language name and its optional dialect. The pair is the identity facts are filed under,
-/// so `sql` and `sql:postgresql` are two languages with two symbol spaces.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+/// so `sql` and `sql:postgresql` are two languages with two symbol spaces. Serializes as one
+/// string: `name`, or `name:dialect` when a dialect is set.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct Language {
     /// The language name, such as `sql`, `json`, or `css`. Lowercase, so `TypeScript` and
     /// `typescript` cannot split one language into two identity spaces.
-    #[schemars(length(max = 64))]
-    #[schemars(regex(pattern = r"^[a-z][a-z0-9._-]*$"))]
-    #[schemars(example = &"rust")]
     pub name: String,
     /// A dialect whose syntax or semantics differ within the language, such as
     /// `postgresql`, `jsonc`, or `scss`. Lowercase, as `name` is.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(max = 64))]
-    #[schemars(regex(pattern = r"^[a-z][a-z0-9._-]*$"))]
     pub dialect: Option<String>,
 }
 
@@ -526,6 +435,38 @@ impl Language {
         Ok(Self {
             name: name.to_owned(),
             dialect: dialect.map(str::to_owned),
+        })
+    }
+}
+
+impl TryFrom<String> for Language {
+    type Error = LanguageIdentityError;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        Self::from_identity_segment(&text)
+    }
+}
+
+impl From<Language> for String {
+    fn from(language: Language) -> Self {
+        language.identity_segment()
+    }
+}
+
+impl JsonSchema for Language {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Language".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "pattern": LANGUAGE_IDENTITY_PATTERN,
+            "maxLength": LANGUAGE_IDENTITY_BYTES_MAX,
+            "examples": ["rust"],
+            "description": "A language name and its optional dialect, joined by `:`. \
+                            `sql` and `sql:postgresql` are two languages with two symbol \
+                            spaces."
         })
     }
 }
@@ -569,24 +510,12 @@ fn is_language_word(word: &str) -> bool {
         .next()
         .is_some_and(|first| first.is_ascii_lowercase());
     starts_lowercase
-        && word.len() <= 64
+        && word.len() <= LANGUAGE_WORD_BYTES_MAX
         && characters.all(|character| {
             character.is_ascii_lowercase()
                 || character.is_ascii_digit()
                 || matches!(character, '.' | '_' | '-')
         })
-}
-
-/// A byte range of one file and the language used to parse it. The owner of `App.svelte`
-/// can mark its script block as TypeScript. A generated file records ranges in its own byte
-/// coordinates.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct LanguageRegion {
-    /// The language grammar used for these bytes.
-    pub language: Language,
-    /// Offsets of the language region inside the file.
-    pub range: TextRange,
 }
 
 /// One node of a file's concrete syntax tree. It identifies a source range and
@@ -741,10 +670,8 @@ pub struct NodesParams {
             {
                 "id": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
                 "unit": "rift://file/src/config.rs",
-                "language": {
-                    "name": "rust"
-                },
-                "kind": "rust.source_file",
+                "language": "rust",
+                "kind": "source_file",
                 "range": {
                     "start": 0,
                     "end": 356
@@ -754,10 +681,8 @@ pub struct NodesParams {
                 "id": "rift://node/rust/src/config.rs@218-355#67ecfb36",
                 "symbol": "rift://symbol/rust/src/config.rs/load_config",
                 "unit": "rift://file/src/config.rs",
-                "language": {
-                    "name": "rust"
-                },
-                "kind": "rust.function_item",
+                "language": "rust",
+                "kind": "function_item",
                 "facets": [
                     "declaration",
                     "definition"
@@ -787,10 +712,8 @@ pub struct NodesParams {
             {
                 "id": "rift://node/rust/src/config.rs@281-355#4e554fa8",
                 "unit": "rift://file/src/config.rs",
-                "language": {
-                    "name": "rust"
-                },
-                "kind": "rust.block",
+                "language": "rust",
+                "kind": "block",
                 "range": {
                     "start": 281,
                     "end": 355
@@ -800,10 +723,8 @@ pub struct NodesParams {
             {
                 "id": "rift://node/rust/src/config.rs@334-353#4df4426e",
                 "unit": "rift://file/src/config.rs",
-                "language": {
-                    "name": "rust"
-                },
-                "kind": "rust.call_expression",
+                "language": "rust",
+                "kind": "call_expression",
                 "facets": [
                     "expression"
                 ],
@@ -816,10 +737,8 @@ pub struct NodesParams {
             {
                 "id": "rift://node/rust/src/config.rs@334-346#03f22dac",
                 "unit": "rift://file/src/config.rs",
-                "language": {
-                    "name": "rust"
-                },
-                "kind": "rust.identifier",
+                "language": "rust",
+                "kind": "identifier",
                 "range": {
                     "start": 334,
                     "end": 346
@@ -828,56 +747,11 @@ pub struct NodesParams {
             }
         ],
         "source": [
-            {
-                "span": {
-                    "unit": "rift://source/project/src/config.rs",
-                    "range": {
-                        "start": 0,
-                        "end": 356
-                    }
-                },
-                "text": "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n"
-            },
-            {
-                "span": {
-                    "unit": "rift://source/project/src/config.rs",
-                    "range": {
-                        "start": 218,
-                        "end": 355
-                    }
-                },
-                "text": "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
-            },
-            {
-                "span": {
-                    "unit": "rift://source/project/src/config.rs",
-                    "range": {
-                        "start": 281,
-                        "end": 355
-                    }
-                },
-                "text": "{\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
-            },
-            {
-                "span": {
-                    "unit": "rift://source/project/src/config.rs",
-                    "range": {
-                        "start": 334,
-                        "end": 353
-                    }
-                },
-                "text": "parse_config(&text)"
-            },
-            {
-                "span": {
-                    "unit": "rift://source/project/src/config.rs",
-                    "range": {
-                        "start": 334,
-                        "end": 346
-                    }
-                },
-                "text": "parse_config"
-            }
+            "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n",
+            "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
+            "{\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
+            "parse_config(&text)",
+            "parse_config"
         ]
     }
 ]))]
@@ -886,7 +760,7 @@ pub struct NodesResult {
     pub nodes: Vec<Node>,
     /// One excerpt per node in `nodes`, in the same order, each spanning that node's own
     /// range. Empty when `nodes` is empty.
-    pub source: Vec<SourceExcerpt>,
+    pub source: Vec<String>,
     /// Warnings attached to this result. Absent when there is nothing to warn about.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<ReadWarning>,
@@ -1626,22 +1500,15 @@ pub struct SymbolOrigin {
     pub package: Option<PackageIdentity>,
     /// Whether the declaration is authored, generated, or synthetic.
     pub source_kind: SourceKind,
-    /// Source-catalog unit containing the declaration, present only where `location` is
-    /// not `project` - a project declaration's unit already equals the hit's own path.
-    /// Absent when source is unavailable or the declaration is synthetic.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unit: Option<SourceUnitId>,
 }
 
-/// `SymbolOrigin`'s wire default: a project declaration, authored, with no package and no
-/// separate source-catalog unit. `Symbol.origin` omits itself from the wire when it equals
-/// this value.
+/// `SymbolOrigin`'s wire default: a project declaration, authored, with no package.
+/// `Symbol.origin` omits itself from the wire when it equals this value.
 fn default_symbol_origin() -> SymbolOrigin {
     SymbolOrigin {
         location: Some(SourceLocationKind::Project),
         package: None,
         source_kind: SourceKind::Authored,
-        unit: None,
     }
 }
 
@@ -1794,9 +1661,9 @@ pub struct TypeExpression {
 #[cfg(test)]
 mod tests {
     use super::{
-        Digest, Duration, FileId, GetSymbolParams, Language, PAGE_INDEX_DEFAULT,
-        REVISION_ID_BYTES_MAX, ReadWarning, RevisionId, RevisionIdViolation, SourceUnitId, Symbol,
-        SymbolId,
+        Digest, Duration, FileId, GetSymbolParams, LANGUAGE_IDENTITY_PATTERN, Language,
+        PAGE_INDEX_DEFAULT, REVISION_ID_BYTES_MAX, ReadWarning, RevisionId, RevisionIdViolation,
+        SourceUnitId, Symbol, SymbolId,
     };
     use schemars::schema_for;
     use serde_json::json;
@@ -1912,6 +1779,57 @@ mod tests {
         assert!(Language::from_identity_segment(&oversized).is_err());
     }
 
+    /// `Language` serializes as the same string [`Language::identity_segment`] renders,
+    /// on both a bare name and a `name:dialect` pair, and rejects the object shape the
+    /// type used to carry.
+    #[test]
+    fn language_round_trips_through_its_identity_segment_string() {
+        let rust = Language {
+            name: "rust".to_owned(),
+            dialect: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&rust).expect("serialize"),
+            json!("rust")
+        );
+        assert_eq!(
+            serde_json::from_value::<Language>(json!("rust")).expect("deserialize"),
+            rust
+        );
+        let dialect = Language {
+            name: "typescript".to_owned(),
+            dialect: Some("tsx".to_owned()),
+        };
+        assert_eq!(
+            serde_json::to_value(&dialect).expect("serialize"),
+            json!("typescript:tsx")
+        );
+        assert_eq!(
+            serde_json::from_value::<Language>(json!("typescript:tsx")).expect("deserialize"),
+            dialect
+        );
+        assert!(serde_json::from_value::<Language>(json!({"name": "rust"})).is_err());
+    }
+
+    /// The advertised schema pattern and length are the exact grammar
+    /// [`Language::from_identity_segment`] enforces.
+    #[test]
+    fn language_schema_pattern_equals_the_identity_segment_grammar() {
+        let schema = serde_json::to_value(schema_for!(Language)).expect("language schema");
+        assert_eq!(schema["type"], json!("string"));
+        assert_eq!(schema["pattern"], json!(LANGUAGE_IDENTITY_PATTERN));
+        assert_eq!(
+            schema["maxLength"],
+            json!(super::LANGUAGE_IDENTITY_BYTES_MAX)
+        );
+        assert!(!super::is_language_word(
+            &"a".repeat(super::LANGUAGE_WORD_BYTES_MAX + 1)
+        ));
+        assert!(super::is_language_word(
+            &"a".repeat(super::LANGUAGE_WORD_BYTES_MAX)
+        ));
+    }
+
     #[test]
     fn digest_schema_pattern_is_eight_lowercase_hex_characters() {
         let schema = serde_json::to_value(schema_for!(Digest)).expect("digest schema");
@@ -1930,9 +1848,9 @@ mod tests {
     #[test]
     fn unestablished_symbol_round_trips_with_a_dependency_origin() {
         let value = json!({
-            "language": { "name": "rust" },
+            "language": "rust",
             "name": "Beacon",
-            "kind": "rust.struct",
+            "kind": "struct",
             "facets": ["type"],
             "origin": {
                 "location": "dependency",
@@ -1961,9 +1879,9 @@ mod tests {
     #[test]
     fn symbol_origin_omits_itself_only_for_the_common_project_authored_case() {
         let common = json!({
-            "language": { "name": "rust" },
+            "language": "rust",
             "name": "Beacon",
-            "kind": "rust.struct",
+            "kind": "struct",
             "facets": ["type"]
         });
         let symbol: Symbol =

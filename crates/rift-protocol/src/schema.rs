@@ -48,12 +48,12 @@ macro_rules! property {
     }};
 }
 
-/// The form a `[languages.<identity>]` table key takes: a language name, or
-/// a name and a dialect joined by `:`. Acceptance decodes the key through
-/// [`Language::from_identity_segment`](crate::read::Language::from_identity_segment)
-/// and refuses anything else, so the schema states the same form for editors
-/// reading `rift.toml` before the server does.
-const LANGUAGE_IDENTITY_PATTERN: &str = r"^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$";
+// The form a `[languages.<identity>]` table key takes: a language name, or a name and a
+// dialect joined by `:`. Owned by `Language` (`crate::read::LANGUAGE_IDENTITY_PATTERN`),
+// since it is the same grammar `Language`'s own wire form advertises; acceptance decodes
+// the key through `Language::from_identity_segment` and refuses anything else, so the
+// schema states the same form for editors reading `rift.toml` before the server does.
+use crate::read::LANGUAGE_IDENTITY_PATTERN;
 
 /// The form an `[lsp.<name>]` table key takes: one language word, with no
 /// dialect. Acceptance refuses a name carrying `:`, because a process name
@@ -68,11 +68,6 @@ const HOOK_ID_PATTERN: &str = r"^[A-Za-z0-9._-]+$";
 /// `Duration` key.
 const RIFT_RANGE: &str = "rift:range";
 
-/// The serde tag property of [`FileContent`](crate::read::FileContent),
-/// pinned by [`tests::tagged_union_tags_exist_in_generated_schemas`].
-const FILE_CONTENT_TAG: &str = "kind";
-/// The tag value of its symlink variant, pinned by the same test.
-const FILE_CONTENT_SYMLINK: &str = "symlink";
 /// The serde tag property of [`SearchHitTarget`](crate::read::SearchHitTarget),
 /// pinned by [`tests::tagged_union_tags_exist_in_generated_schemas`].
 const SEARCH_HIT_TARGET_TAG: &str = "target";
@@ -592,40 +587,17 @@ pub fn error_limit_rides_limit_exceeded(schema: &mut Schema) {
     );
 }
 
-/// A symlink [`File`](crate::read::File) carries no language facts: languages
-/// and regions stay empty and `semantic` stays false.
-pub fn forbid_symlink_language_facts(schema: &mut Schema) {
-    use crate::read::File;
-    append(
-        schema,
-        when(
-            properties(vec![(
-                property!(File, content),
-                properties(vec![(
-                    FILE_CONTENT_TAG,
-                    json!({ keyword::CONST: FILE_CONTENT_SYMLINK }),
-                )]),
-            )]),
-            properties(vec![
-                (property!(File, languages), max_items(0)),
-                (property!(File, regions), max_items(0)),
-                (property!(File, semantic), constant(&false)),
-            ]),
-        ),
-    );
-}
-
-/// A [`SearchHit`] carries `span` and `line` together or not at all, and node
+/// A [`SearchHit`] carries `range` and `line` together or not at all, and node
 /// and file hits always carry both.
-pub fn pair_span_with_line(schema: &mut Schema) {
-    let span_and_line = [property!(SearchHit, span), property!(SearchHit, line)];
+pub fn pair_range_with_line(schema: &mut Schema) {
+    let range_and_line = [property!(SearchHit, range), property!(SearchHit, line)];
     append(
         schema,
         one_of(vec![
-            requires(&span_and_line),
+            requires(&range_and_line),
             not(any_of(vec![
-                requires(&span_and_line[..1]),
-                requires(&span_and_line[1..]),
+                requires(&range_and_line[..1]),
+                requires(&range_and_line[1..]),
             ])),
         ]),
     );
@@ -639,9 +611,19 @@ pub fn pair_span_with_line(schema: &mut Schema) {
                     json!({ keyword::ENUM: [SEARCH_HIT_NODE, SEARCH_HIT_FILE] }),
                 )]),
             )]),
-            requires(&span_and_line),
+            requires(&range_and_line),
         ),
     );
+}
+
+/// A [`GetSymbolHit`](crate::read::GetSymbolHit) addresses its declaration through
+/// exactly one of `path` (a project declaration) or `unit` (a dependency or standard
+/// library declaration).
+pub fn get_symbol_hit_addresses_one_location(schema: &mut Schema) {
+    use crate::read::GetSymbolHit;
+    let path = property!(GetSymbolHit, path);
+    let unit = property!(GetSymbolHit, unit);
+    append(schema, one_of(vec![requires(&[path]), requires(&[unit])]));
 }
 
 /// [`InsertSymbolParams`](crate::change::InsertSymbolParams) addresses exactly one
@@ -723,15 +705,6 @@ pub fn declare_insert_node_body_length(schema: &mut Schema) {
         property!(InsertNodeParams, body),
         keyword::MAX_LENGTH,
         json!(BODY_BYTES_MAX),
-    );
-}
-
-/// A [`File`](crate::read::File) states `default: []` on `languages` and `regions`.
-pub fn declare_file_empty_defaults(schema: &mut Schema) {
-    use crate::read::File;
-    declare_empty_array_defaults(
-        schema,
-        &[property!(File, languages), property!(File, regions)],
     );
 }
 
@@ -843,6 +816,20 @@ pub fn declare_search_result_empty_defaults(schema: &mut Schema) {
     declare_empty_array_defaults(schema, &[property!(SearchResult, warnings)]);
 }
 
+/// [`SearchHitTarget`](crate::read::SearchHitTarget)'s `file` arm states `default: []` on
+/// `languages`.
+pub fn declare_search_hit_target_file_empty_defaults(schema: &mut Schema) {
+    const SEARCH_HIT_TARGET_LANGUAGES: &str = "languages";
+    if let Some(arm) = tagged_union_arm(schema, SEARCH_HIT_TARGET_TAG, SEARCH_HIT_FILE) {
+        annotate_property_in(
+            arm,
+            SEARCH_HIT_TARGET_LANGUAGES,
+            keyword::DEFAULT,
+            json!([]),
+        );
+    }
+}
+
 /// A [`ChangeSummary`](crate::change::ChangeSummary) states `default: []` on `diagnostics`
 /// and `guarantees`. `files` carries its own `minItems: 1` and is never optional, so it
 /// states no default.
@@ -922,7 +909,7 @@ pub fn declare_workspace_hook_summary_empty_defaults(schema: &mut Schema) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::read::{File, FileContent, SearchHitTarget};
+    use crate::read::SearchHitTarget;
     use schemars::schema_for;
 
     fn schema_from(value: Value) -> Schema {
@@ -1165,11 +1152,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn get_symbol_hit_addresses_one_location_states_exclusive_composition() {
+        let mut schema = schema_from(json!({}));
+        get_symbol_hit_addresses_one_location(&mut schema);
+        assert_eq!(
+            schema.as_value(),
+            &json!({
+                "allOf": [
+                    {
+                        "oneOf": [
+                            { "required": ["path"] },
+                            { "required": ["unit"] }
+                        ]
+                    }
+                ]
+            })
+        );
+    }
+
     /// The `property!` macro proves a field exists on the struct; this test
     /// proves serde serves it under the same name, closing the rename gap.
     #[test]
     fn rule_properties_exist_in_model_schemas() {
-        let cases: [(&str, Value, &[&str]); 8] = [
+        let cases: [(&str, Value, &[&str]); 7] = [
             (
                 "CommandHook",
                 serde_json::to_value(schema_for!(crate::configuration::CommandHook))
@@ -1205,14 +1211,9 @@ mod tests {
                 &["anchor", "file", "position", "body", "create_missing"],
             ),
             (
-                "File",
-                serde_json::to_value(schema_for!(File)).expect("schema"),
-                &["content", "languages", "regions", "semantic"],
-            ),
-            (
                 "SearchHit",
                 serde_json::to_value(schema_for!(SearchHit)).expect("schema"),
-                &["hit", "span", "line"],
+                &["hit", "range", "line"],
             ),
         ];
         for (model, schema, names) in cases {
@@ -1265,14 +1266,6 @@ mod tests {
     /// the generated union schemas instead.
     #[test]
     fn tagged_union_tags_exist_in_generated_schemas() {
-        let file_content =
-            serde_json::to_value(schema_for!(FileContent)).expect("FileContent schema");
-        let content_tags = tag_values(&file_content, FILE_CONTENT_TAG);
-        assert!(
-            content_tags.iter().any(|tag| tag == FILE_CONTENT_SYMLINK),
-            "FileContent must serve a {FILE_CONTENT_SYMLINK} variant under tag \
-             {FILE_CONTENT_TAG}, got {content_tags:?}"
-        );
         let hit_target =
             serde_json::to_value(schema_for!(SearchHitTarget)).expect("SearchHitTarget schema");
         let target_tags = tag_values(&hit_target, SEARCH_HIT_TARGET_TAG);
@@ -1418,11 +1411,6 @@ mod tests {
         let object = json!({});
         assert_default_cases(vec![
             (
-                "File",
-                serde_json::to_value(schema_for!(crate::read::File)).expect("schema"),
-                vec![("languages", array.clone()), ("regions", array.clone())],
-            ),
-            (
                 "Node",
                 serde_json::to_value(schema_for!(crate::read::Node)).expect("schema"),
                 vec![
@@ -1504,6 +1492,35 @@ mod tests {
                 vec![("warnings", array)],
             ),
         ]);
+    }
+
+    /// `SearchHitTarget`'s `file` arm states `default: []` on `languages` and leaves it out
+    /// of that arm's `required` list.
+    #[test]
+    fn search_hit_target_file_arm_states_languages_default() {
+        let schema = serde_json::to_value(schema_for!(SearchHitTarget)).expect("schema");
+        let arms = schema[keyword::ONE_OF].as_array().expect("oneOf arms");
+        let file = arms
+            .iter()
+            .find(|arm| {
+                arm[keyword::PROPERTIES][SEARCH_HIT_TARGET_TAG][keyword::CONST]
+                    == json!(SEARCH_HIT_FILE)
+            })
+            .expect("a file arm");
+        assert_eq!(
+            file[keyword::PROPERTIES]["languages"][keyword::DEFAULT],
+            json!([]),
+            "{file:#}"
+        );
+        let required: Vec<String> = file[keyword::REQUIRED]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect();
+        assert!(!required.contains(&"languages".to_owned()), "{file:#}");
+        assert!(required.contains(&"size".to_owned()), "{file:#}");
     }
 
     #[test]

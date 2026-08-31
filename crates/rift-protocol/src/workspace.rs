@@ -193,7 +193,7 @@ mod tests {
         let value = serde_json::to_value(page()).expect("workspace page serializes");
 
         assert_eq!(value["configuration_revision"], json!("3f9a1c2e"));
-        assert_eq!(value["languages"][0]["language"]["dialect"], json!("tsx"));
+        assert_eq!(value["languages"][0]["language"], json!("typescript:tsx"));
         assert_eq!(
             value["languages"][0]["lsp"]["process"],
             json!("typescript:tsx")

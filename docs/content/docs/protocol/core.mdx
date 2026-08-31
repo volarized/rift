@@ -143,9 +143,11 @@ weigh - an index that lags the tree - arrives as a typed entry in `warnings`; th
 contract.
 
 [`SymbolOrigin`](/docs/protocol/reference#SymbolOrigin) keeps source location separate from
-source kind. Its optional unit connects a declaration to readable catalog source. Synthetic symbols
-have neither a location nor a unit; dependency and standard-library symbols can carry facts even
-when their provider cannot return source bytes.
+source kind. A synthetic symbol carries neither a location nor a package; dependency and
+standard-library symbols can carry facts even when their provider cannot return source bytes.
+The declaration's own source-catalog unit, where its location differs from the project, rides on
+the [`get_symbol`](/docs/protocol/mcp#tool-get_symbol) hit itself, addressed by `unit` beside the
+`path` a project declaration carries.
 
 ## History facts
 

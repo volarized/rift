@@ -323,7 +323,7 @@ async fn applied_patch_carries_the_provider_diagnostic() -> TestResult {
     assert_eq!(finding["reliability"], json!("recovered"));
     assert_eq!(
         finding["language"],
-        json!({ "name": "rust" }),
+        json!("rust"),
         "the provider language stamps the finding: {finding:#}"
     );
     assert_eq!(finding["span"]["unit"], json!("rift://file/caller.rs"));
