@@ -83,6 +83,10 @@ name = "live_typescript"
 path = "tests/live_typescript.rs"
 
 [[test]]
+name = "map_resource"
+path = "tests/map_resource.rs"
+
+[[test]]
 name = "move_file"
 path = "tests/move_file.rs"
 
