@@ -974,9 +974,8 @@ fn assembled_wire_symbol(matched: SymbolMatch<'_>, readable: &ReadableSymbol) ->
 }
 
 /// Builds the wire origin from `origin`'s internal location and source kind. `unit` stays
-/// off the wire for a project declaration, whose source-catalog unit already equals the
-/// hit's own `path`; every other location keeps it, since nothing else on the hit names
-/// it.
+/// off the wire for a project declaration; a dependency, stdlib, or external declaration
+/// keeps it, naming the source-catalog unit the declaration was read from.
 fn wire_symbol_origin(
     origin: &rift_core::ContributionOrigin,
     matched: SymbolMatch<'_>,
