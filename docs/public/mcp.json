@@ -135,7 +135,7 @@
             "properties": {
               "format": {
                 "$ref": "#/$defs/DocumentationFormat",
-                "description": "Which markup the text is written in, since whoever displays a doc comment is the one\nthat renders it."
+                "description": "Markup the comment text uses."
               },
               "text": {
                 "description": "The body of the comment, with the comment syntax stripped.",
@@ -478,7 +478,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The semantic ranking is still being built, so the answer was ranked lexically\nalone. A query that shares no token with the code it describes reaches nothing\nuntil every declaration carries a vector; the counts state how far that has got.\n`ready_in` is an estimate the server derives from how large the workspace is and\nhow much of it is embedded, not a measurement of this machine, so a caller may\nreport it and must not schedule against it.",
+                "description": "The semantic ranking is still being built, so the answer was ranked lexically alone.\n`prepared` and `total` state how many declarations already carry a vector, and\n`ready_in` is derived from workspace size and embedding progress.",
                 "properties": {
                   "code": {
                     "const": "semantic_index_preparing",
@@ -497,7 +497,7 @@
                   },
                   "ready_in": {
                     "$ref": "#/$defs/Duration",
-                    "description": "Estimated wait before the semantic ranking joins an answer. The server derives\nit from how large the workspace is and how much of it is embedded, not from\nthis machine's measured rate, so it is worth reporting and must not be\nscheduled against."
+                    "description": "Estimated wait before the semantic ranking joins an answer, not a measurement\nof this machine. A caller may report it and must not schedule against it."
                   },
                   "total": {
                     "description": "Declarations the published set holds.",
@@ -517,7 +517,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The semantic ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. The weights could not be acquired or the model could\nnot load; no retry is coming, and a caller that needs the semantic ranking fixes\nthe `[search.semantic]` configuration and starts the server again.",
+                "description": "The semantic ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. No retry is coming: fix the `[search.semantic]`\nconfiguration and start the server again.",
                 "properties": {
                   "code": {
                     "const": "semantic_ranking_unavailable",
@@ -537,7 +537,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The full-text tier is not answering, so the answer came from identifier matching\nalone. Ranking reaches what a name match reaches and no further, and a query\nphrased as prose finds nothing. The tier is read under the tree revision the answer\nwas computed from, so a tier holding another tree is recaptured rather than warned\nabout; this covers a tier that refused to load, or that holds no indexed tree at\nall, and will not answer without operator action - which a caller cannot otherwise\ntell from a tier that searched and found nothing.",
+                "description": "The full-text tier is not answering, so the answer came from identifier matching\nalone: a query phrased as prose finds nothing. The tier failed to load or holds no\nindexed tree, and will not answer without operator action.",
                 "properties": {
                   "code": {
                     "const": "lexical_ranking_unavailable",
@@ -582,7 +582,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "Contributions selected for one symbol's presentation disagree on at least one\nfield. The answer carries what normalization selected; the warning names the\nsymbol and every provider whose Contribution differed, so a caller can weigh\nwhether the difference matters to it.",
+                "description": "Contributions selected for one symbol's presentation disagree on at least one\nfield. The answer carries what normalization selected.",
                 "properties": {
                   "code": {
                     "const": "symbol_disagreement",
@@ -791,7 +791,7 @@
                     "type": "null"
                   }
                 ],
-                "description": "The symbol this one belongs to - the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method is written beside its type and a\nRust method inside an `impl` block, and both name the type here. Absent at the top\nlevel."
+                "description": "The symbol this one belongs to - the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method sits beside its type and a Rust\nmethod inside an `impl` block, both naming the type here; absent at the top level."
               },
               "document_local": {
                 "default": false,
@@ -857,7 +857,7 @@
                   "location": "project",
                   "source_kind": "authored"
                 },
-                "description": "Where the declaration belongs, how it was produced, and its source unit where that\ndiffers from the hit's own path. Absent when it says a project declaration,\nauthored, with no package - the common case."
+                "description": "Where the declaration belongs and how it was produced. Absent when it says a\nproject declaration, authored, with no package - the common case."
               },
               "signatures": {
                 "default": [],
@@ -1119,7 +1119,7 @@
             "properties": {
               "kind": {
                 "$ref": "#/$defs/SymbolVersionKind",
-                "description": "What the revision did to the symbol."
+                "description": "How the revision changed the symbol."
               },
               "path": {
                 "$ref": "#/$defs/ProjectPath",
@@ -1221,7 +1221,7 @@
               },
               "role": {
                 "$ref": "#/$defs/TypeBindingRole",
-                "description": "What this type is to the symbol that carries it."
+                "description": "The role this type plays for the symbol."
               },
               "type": {
                 "$ref": "#/$defs/TypeExpression",
@@ -1714,7 +1714,7 @@
               },
               "continuation": {
                 "$ref": "#/$defs/DiagnosticContinuation",
-                "description": "Whether the finding is an artefact of source that stops mid-way, which is the normal\nstate of a file the caller is halfway through writing."
+                "description": "Whether the finding is a mid-file artefact."
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
@@ -1747,7 +1747,7 @@
               },
               "reliability": {
                 "$ref": "#/$defs/DiagnosticReliability",
-                "description": "Whether the facts around this finding came off a clean parse."
+                "description": "How reliable the surrounding facts are."
               },
               "severity": {
                 "$ref": "#/$defs/Severity",
@@ -2087,17 +2087,17 @@
             "oneOf": [
               {
                 "const": "target_exists",
-                "description": "Wire value `target_exists`.",
+                "description": "Whether the addressed file or declaration exists.",
                 "type": "string"
               },
               {
                 "const": "source_unchanged",
-                "description": "Wire value `source_unchanged`.",
+                "description": "Whether the addressed bytes still match the witness or patch context supplied.",
                 "type": "string"
               },
               {
                 "const": "no_references",
-                "description": "Wire value `no_references`.",
+                "description": "Whether the addressed declaration has no standing references.",
                 "type": "string"
               },
               {
@@ -2765,7 +2765,7 @@
               },
               "continuation": {
                 "$ref": "#/$defs/DiagnosticContinuation",
-                "description": "Whether the finding is an artefact of source that stops mid-way, which is the normal\nstate of a file the caller is halfway through writing."
+                "description": "Whether the finding is a mid-file artefact."
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
@@ -2798,7 +2798,7 @@
               },
               "reliability": {
                 "$ref": "#/$defs/DiagnosticReliability",
-                "description": "Whether the facts around this finding came off a clean parse."
+                "description": "How reliable the surrounding facts are."
               },
               "severity": {
                 "$ref": "#/$defs/Severity",
@@ -3138,17 +3138,17 @@
             "oneOf": [
               {
                 "const": "target_exists",
-                "description": "Wire value `target_exists`.",
+                "description": "Whether the addressed file or declaration exists.",
                 "type": "string"
               },
               {
                 "const": "source_unchanged",
-                "description": "Wire value `source_unchanged`.",
+                "description": "Whether the addressed bytes still match the witness or patch context supplied.",
                 "type": "string"
               },
               {
                 "const": "no_references",
-                "description": "Wire value `no_references`.",
+                "description": "Whether the addressed declaration has no standing references.",
                 "type": "string"
               },
               {
@@ -3709,7 +3709,7 @@
               },
               "continuation": {
                 "$ref": "#/$defs/DiagnosticContinuation",
-                "description": "Whether the finding is an artefact of source that stops mid-way, which is the normal\nstate of a file the caller is halfway through writing."
+                "description": "Whether the finding is a mid-file artefact."
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
@@ -3742,7 +3742,7 @@
               },
               "reliability": {
                 "$ref": "#/$defs/DiagnosticReliability",
-                "description": "Whether the facts around this finding came off a clean parse."
+                "description": "How reliable the surrounding facts are."
               },
               "severity": {
                 "$ref": "#/$defs/Severity",
@@ -4082,17 +4082,17 @@
             "oneOf": [
               {
                 "const": "target_exists",
-                "description": "Wire value `target_exists`.",
+                "description": "Whether the addressed file or declaration exists.",
                 "type": "string"
               },
               {
                 "const": "source_unchanged",
-                "description": "Wire value `source_unchanged`.",
+                "description": "Whether the addressed bytes still match the witness or patch context supplied.",
                 "type": "string"
               },
               {
                 "const": "no_references",
-                "description": "Wire value `no_references`.",
+                "description": "Whether the addressed declaration has no standing references.",
                 "type": "string"
               },
               {
@@ -4847,7 +4847,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The semantic ranking is still being built, so the answer was ranked lexically\nalone. A query that shares no token with the code it describes reaches nothing\nuntil every declaration carries a vector; the counts state how far that has got.\n`ready_in` is an estimate the server derives from how large the workspace is and\nhow much of it is embedded, not a measurement of this machine, so a caller may\nreport it and must not schedule against it.",
+                "description": "The semantic ranking is still being built, so the answer was ranked lexically alone.\n`prepared` and `total` state how many declarations already carry a vector, and\n`ready_in` is derived from workspace size and embedding progress.",
                 "properties": {
                   "code": {
                     "const": "semantic_index_preparing",
@@ -4866,7 +4866,7 @@
                   },
                   "ready_in": {
                     "$ref": "#/$defs/Duration",
-                    "description": "Estimated wait before the semantic ranking joins an answer. The server derives\nit from how large the workspace is and how much of it is embedded, not from\nthis machine's measured rate, so it is worth reporting and must not be\nscheduled against."
+                    "description": "Estimated wait before the semantic ranking joins an answer, not a measurement\nof this machine. A caller may report it and must not schedule against it."
                   },
                   "total": {
                     "description": "Declarations the published set holds.",
@@ -4886,7 +4886,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The semantic ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. The weights could not be acquired or the model could\nnot load; no retry is coming, and a caller that needs the semantic ranking fixes\nthe `[search.semantic]` configuration and starts the server again.",
+                "description": "The semantic ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. No retry is coming: fix the `[search.semantic]`\nconfiguration and start the server again.",
                 "properties": {
                   "code": {
                     "const": "semantic_ranking_unavailable",
@@ -4906,7 +4906,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The full-text tier is not answering, so the answer came from identifier matching\nalone. Ranking reaches what a name match reaches and no further, and a query\nphrased as prose finds nothing. The tier is read under the tree revision the answer\nwas computed from, so a tier holding another tree is recaptured rather than warned\nabout; this covers a tier that refused to load, or that holds no indexed tree at\nall, and will not answer without operator action - which a caller cannot otherwise\ntell from a tier that searched and found nothing.",
+                "description": "The full-text tier is not answering, so the answer came from identifier matching\nalone: a query phrased as prose finds nothing. The tier failed to load or holds no\nindexed tree, and will not answer without operator action.",
                 "properties": {
                   "code": {
                     "const": "lexical_ranking_unavailable",
@@ -4951,7 +4951,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "Contributions selected for one symbol's presentation disagree on at least one\nfield. The answer carries what normalization selected; the warning names the\nsymbol and every provider whose Contribution differed, so a caller can weigh\nwhether the difference matters to it.",
+                "description": "Contributions selected for one symbol's presentation disagree on at least one\nfield. The answer carries what normalization selected.",
                 "properties": {
                   "code": {
                     "const": "symbol_disagreement",
@@ -5368,7 +5368,7 @@
               },
               "continuation": {
                 "$ref": "#/$defs/DiagnosticContinuation",
-                "description": "Whether the finding is an artefact of source that stops mid-way, which is the normal\nstate of a file the caller is halfway through writing."
+                "description": "Whether the finding is a mid-file artefact."
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
@@ -5401,7 +5401,7 @@
               },
               "reliability": {
                 "$ref": "#/$defs/DiagnosticReliability",
-                "description": "Whether the facts around this finding came off a clean parse."
+                "description": "How reliable the surrounding facts are."
               },
               "severity": {
                 "$ref": "#/$defs/Severity",
@@ -5741,17 +5741,17 @@
             "oneOf": [
               {
                 "const": "target_exists",
-                "description": "Wire value `target_exists`.",
+                "description": "Whether the addressed file or declaration exists.",
                 "type": "string"
               },
               {
                 "const": "source_unchanged",
-                "description": "Wire value `source_unchanged`.",
+                "description": "Whether the addressed bytes still match the witness or patch context supplied.",
                 "type": "string"
               },
               {
                 "const": "no_references",
-                "description": "Wire value `no_references`.",
+                "description": "Whether the addressed declaration has no standing references.",
                 "type": "string"
               },
               {
@@ -6313,7 +6313,7 @@
               },
               "continuation": {
                 "$ref": "#/$defs/DiagnosticContinuation",
-                "description": "Whether the finding is an artefact of source that stops mid-way, which is the normal\nstate of a file the caller is halfway through writing."
+                "description": "Whether the finding is a mid-file artefact."
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
@@ -6346,7 +6346,7 @@
               },
               "reliability": {
                 "$ref": "#/$defs/DiagnosticReliability",
-                "description": "Whether the facts around this finding came off a clean parse."
+                "description": "How reliable the surrounding facts are."
               },
               "severity": {
                 "$ref": "#/$defs/Severity",
@@ -6686,17 +6686,17 @@
             "oneOf": [
               {
                 "const": "target_exists",
-                "description": "Wire value `target_exists`.",
+                "description": "Whether the addressed file or declaration exists.",
                 "type": "string"
               },
               {
                 "const": "source_unchanged",
-                "description": "Wire value `source_unchanged`.",
+                "description": "Whether the addressed bytes still match the witness or patch context supplied.",
                 "type": "string"
               },
               {
                 "const": "no_references",
-                "description": "Wire value `no_references`.",
+                "description": "Whether the addressed declaration has no standing references.",
                 "type": "string"
               },
               {
@@ -7258,7 +7258,7 @@
               },
               "continuation": {
                 "$ref": "#/$defs/DiagnosticContinuation",
-                "description": "Whether the finding is an artefact of source that stops mid-way, which is the normal\nstate of a file the caller is halfway through writing."
+                "description": "Whether the finding is a mid-file artefact."
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
@@ -7291,7 +7291,7 @@
               },
               "reliability": {
                 "$ref": "#/$defs/DiagnosticReliability",
-                "description": "Whether the facts around this finding came off a clean parse."
+                "description": "How reliable the surrounding facts are."
               },
               "severity": {
                 "$ref": "#/$defs/Severity",
@@ -7631,17 +7631,17 @@
             "oneOf": [
               {
                 "const": "target_exists",
-                "description": "Wire value `target_exists`.",
+                "description": "Whether the addressed file or declaration exists.",
                 "type": "string"
               },
               {
                 "const": "source_unchanged",
-                "description": "Wire value `source_unchanged`.",
+                "description": "Whether the addressed bytes still match the witness or patch context supplied.",
                 "type": "string"
               },
               {
                 "const": "no_references",
-                "description": "Wire value `no_references`.",
+                "description": "Whether the addressed declaration has no standing references.",
                 "type": "string"
               },
               {
@@ -8205,7 +8205,7 @@
               },
               "continuation": {
                 "$ref": "#/$defs/DiagnosticContinuation",
-                "description": "Whether the finding is an artefact of source that stops mid-way, which is the normal\nstate of a file the caller is halfway through writing."
+                "description": "Whether the finding is a mid-file artefact."
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
@@ -8238,7 +8238,7 @@
               },
               "reliability": {
                 "$ref": "#/$defs/DiagnosticReliability",
-                "description": "Whether the facts around this finding came off a clean parse."
+                "description": "How reliable the surrounding facts are."
               },
               "severity": {
                 "$ref": "#/$defs/Severity",
@@ -8578,17 +8578,17 @@
             "oneOf": [
               {
                 "const": "target_exists",
-                "description": "Wire value `target_exists`.",
+                "description": "Whether the addressed file or declaration exists.",
                 "type": "string"
               },
               {
                 "const": "source_unchanged",
-                "description": "Wire value `source_unchanged`.",
+                "description": "Whether the addressed bytes still match the witness or patch context supplied.",
                 "type": "string"
               },
               {
                 "const": "no_references",
-                "description": "Wire value `no_references`.",
+                "description": "Whether the addressed declaration has no standing references.",
                 "type": "string"
               },
               {
@@ -9225,7 +9225,7 @@
               },
               "continuation": {
                 "$ref": "#/$defs/DiagnosticContinuation",
-                "description": "Whether the finding is an artefact of source that stops mid-way, which is the normal\nstate of a file the caller is halfway through writing."
+                "description": "Whether the finding is a mid-file artefact."
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
@@ -9258,7 +9258,7 @@
               },
               "reliability": {
                 "$ref": "#/$defs/DiagnosticReliability",
-                "description": "Whether the facts around this finding came off a clean parse."
+                "description": "How reliable the surrounding facts are."
               },
               "severity": {
                 "$ref": "#/$defs/Severity",
@@ -9598,17 +9598,17 @@
             "oneOf": [
               {
                 "const": "target_exists",
-                "description": "Wire value `target_exists`.",
+                "description": "Whether the addressed file or declaration exists.",
                 "type": "string"
               },
               {
                 "const": "source_unchanged",
-                "description": "Wire value `source_unchanged`.",
+                "description": "Whether the addressed bytes still match the witness or patch context supplied.",
                 "type": "string"
               },
               {
                 "const": "no_references",
-                "description": "Wire value `no_references`.",
+                "description": "Whether the addressed declaration has no standing references.",
                 "type": "string"
               },
               {
@@ -10245,7 +10245,7 @@
               },
               "continuation": {
                 "$ref": "#/$defs/DiagnosticContinuation",
-                "description": "Whether the finding is an artefact of source that stops mid-way, which is the normal\nstate of a file the caller is halfway through writing."
+                "description": "Whether the finding is a mid-file artefact."
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
@@ -10278,7 +10278,7 @@
               },
               "reliability": {
                 "$ref": "#/$defs/DiagnosticReliability",
-                "description": "Whether the facts around this finding came off a clean parse."
+                "description": "How reliable the surrounding facts are."
               },
               "severity": {
                 "$ref": "#/$defs/Severity",
@@ -10618,17 +10618,17 @@
             "oneOf": [
               {
                 "const": "target_exists",
-                "description": "Wire value `target_exists`.",
+                "description": "Whether the addressed file or declaration exists.",
                 "type": "string"
               },
               {
                 "const": "source_unchanged",
-                "description": "Wire value `source_unchanged`.",
+                "description": "Whether the addressed bytes still match the witness or patch context supplied.",
                 "type": "string"
               },
               {
                 "const": "no_references",
-                "description": "Wire value `no_references`.",
+                "description": "Whether the addressed declaration has no standing references.",
                 "type": "string"
               },
               {
@@ -11238,7 +11238,7 @@
             "properties": {
               "format": {
                 "$ref": "#/$defs/DocumentationFormat",
-                "description": "Which markup the text is written in, since whoever displays a doc comment is the one\nthat renders it."
+                "description": "Markup the comment text uses."
               },
               "text": {
                 "description": "The body of the comment, with the comment syntax stripped.",
@@ -11562,7 +11562,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The semantic ranking is still being built, so the answer was ranked lexically\nalone. A query that shares no token with the code it describes reaches nothing\nuntil every declaration carries a vector; the counts state how far that has got.\n`ready_in` is an estimate the server derives from how large the workspace is and\nhow much of it is embedded, not a measurement of this machine, so a caller may\nreport it and must not schedule against it.",
+                "description": "The semantic ranking is still being built, so the answer was ranked lexically alone.\n`prepared` and `total` state how many declarations already carry a vector, and\n`ready_in` is derived from workspace size and embedding progress.",
                 "properties": {
                   "code": {
                     "const": "semantic_index_preparing",
@@ -11581,7 +11581,7 @@
                   },
                   "ready_in": {
                     "$ref": "#/$defs/Duration",
-                    "description": "Estimated wait before the semantic ranking joins an answer. The server derives\nit from how large the workspace is and how much of it is embedded, not from\nthis machine's measured rate, so it is worth reporting and must not be\nscheduled against."
+                    "description": "Estimated wait before the semantic ranking joins an answer, not a measurement\nof this machine. A caller may report it and must not schedule against it."
                   },
                   "total": {
                     "description": "Declarations the published set holds.",
@@ -11601,7 +11601,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The semantic ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. The weights could not be acquired or the model could\nnot load; no retry is coming, and a caller that needs the semantic ranking fixes\nthe `[search.semantic]` configuration and starts the server again.",
+                "description": "The semantic ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. No retry is coming: fix the `[search.semantic]`\nconfiguration and start the server again.",
                 "properties": {
                   "code": {
                     "const": "semantic_ranking_unavailable",
@@ -11621,7 +11621,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The full-text tier is not answering, so the answer came from identifier matching\nalone. Ranking reaches what a name match reaches and no further, and a query\nphrased as prose finds nothing. The tier is read under the tree revision the answer\nwas computed from, so a tier holding another tree is recaptured rather than warned\nabout; this covers a tier that refused to load, or that holds no indexed tree at\nall, and will not answer without operator action - which a caller cannot otherwise\ntell from a tier that searched and found nothing.",
+                "description": "The full-text tier is not answering, so the answer came from identifier matching\nalone: a query phrased as prose finds nothing. The tier failed to load or holds no\nindexed tree, and will not answer without operator action.",
                 "properties": {
                   "code": {
                     "const": "lexical_ranking_unavailable",
@@ -11666,7 +11666,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "Contributions selected for one symbol's presentation disagree on at least one\nfield. The answer carries what normalization selected; the warning names the\nsymbol and every provider whose Contribution differed, so a caller can weigh\nwhether the difference matters to it.",
+                "description": "Contributions selected for one symbol's presentation disagree on at least one\nfield. The answer carries what normalization selected.",
                 "properties": {
                   "code": {
                     "const": "symbol_disagreement",
@@ -11762,7 +11762,7 @@
             "type": "object"
           },
           "RelationshipDerivation": {
-            "description": "How this edge was established. Every edge reaches Rift from a provider; this field\nrecords how much the provider knew. A consumer may act on `resolution` directly. Lower\nlevels require another check before rewriting.",
+            "description": "How this edge was established. Every edge reaches Rift from a provider, and this field\nrecords how much the provider knew: `syntax` and `heuristic` need another check before\nrewriting.",
             "oneOf": [
               {
                 "const": "resolution",
@@ -12054,7 +12054,7 @@
                 ]
               },
               "traversal_path": {
-                "description": "Shortest relationship path from `traversal.seed` to this hit. Present whenever the\ntraversal reached the hit, including a hit also matched lexically.",
+                "description": "Shortest relationship path to this hit, present when a traversal reached it,\nincluding a hit also matched lexically.",
                 "items": {
                   "$ref": "#/$defs/GraphHop"
                 },
@@ -12304,7 +12304,7 @@
                     "type": "null"
                   }
                 ],
-                "description": "The symbol this one belongs to - the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method is written beside its type and a\nRust method inside an `impl` block, and both name the type here. Absent at the top\nlevel."
+                "description": "The symbol this one belongs to - the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method sits beside its type and a Rust\nmethod inside an `impl` block, both naming the type here; absent at the top level."
               },
               "document_local": {
                 "default": false,
@@ -12370,7 +12370,7 @@
                   "location": "project",
                   "source_kind": "authored"
                 },
-                "description": "Where the declaration belongs, how it was produced, and its source unit where that\ndiffers from the hit's own path. Absent when it says a project declaration,\nauthored, with no package - the common case."
+                "description": "Where the declaration belongs and how it was produced. Absent when it says a\nproject declaration, authored, with no package - the common case."
               },
               "signatures": {
                 "default": [],
@@ -12639,7 +12639,7 @@
               },
               "role": {
                 "$ref": "#/$defs/TypeBindingRole",
-                "description": "What this type is to the symbol that carries it."
+                "description": "The role this type plays for the symbol."
               },
               "type": {
                 "$ref": "#/$defs/TypeExpression",
