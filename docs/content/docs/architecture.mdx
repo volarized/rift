@@ -232,6 +232,24 @@ The provider contract is the same in front of every shape, so a language can swa
 use one engine for facts and another for [edit plans](#edit-plans) - without changing any tool an
 agent calls. Syntax remains the fallback wherever semantic analysis has no answer.
 
+<VersionBadge version="v0.0.27" languages={["Rust"]} />
+
+The fallback reaches further than the grammar alone. The **binding provider** resolves name
+binding - which declarations a name in the source can refer to - from the scopes, definitions,
+references, and imports each syntax provider extracts in its one parse. It joins files through
+the language's module layout and publishes the resolutions as Contributions under the provider
+id `binding`.
+
+Resolution keeps the language's own precedence: a definition in the nearest scope shadows an
+outer one, an explicit import shadows a wildcard one, and equally ranked candidates all stay in
+the answer. A reference the syntax facts cannot place stays unresolved, and a language engine's
+facts join the same records through normalization.
+
+There is no engine to supervise: the provider runs inside the server during the index build,
+and the [`[providers.binding]`](/docs/configuration#providers) table bounds every phase of its
+work. A breached bound never fails the build - the revision publishes with the syntax facts
+alone.
+
 ### History
 
 The history source resolver reads the workspace's git objects in place, with no checkout or `git`

@@ -273,6 +273,20 @@ opens final document bytes and pulls diagnostics. That batch invalidates readine
 work. Fresh progress tokens, diagnostic refresh requests, and
 repeated full reports decide when those answers are settled.
 
+<VersionBadge version="v0.0.27" />
+
+The binding provider is the `rift-binding` crate, run in process by the index build. A syntax
+provider may extract binding facts - scopes, definitions, references, imports - in one walk
+over the tree its parse produced and attach them to its document. The Rust provider does, and
+supplies the `ModuleLayout` implementation the build resolves module paths through, fetched
+once per language from the provider registry.
+
+The build assembles every document's facts into one graph, links modules across units, resolves
+each reference on a bounded work queue with a per-step precedence rank, and publishes the
+resolutions beside the syntax publication. An item definition carries the same declaration
+binding as its syntax Contribution, the equivalence evidence normalization uses to join the
+two records.
+
 ## Hooks and configuration
 
 <VersionBadge version="v0.0.5" />

@@ -3415,7 +3415,7 @@ dependencies = [
 
 [[package]]
 name = "rift"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "axum",
  "clap",
@@ -3447,7 +3447,7 @@ dependencies = [
 
 [[package]]
 name = "rift-binding"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "rift-core",
  "rift-provider",
@@ -3457,7 +3457,7 @@ dependencies = [
 
 [[package]]
 name = "rift-core"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "percent-encoding",
  "rift-protocol",
@@ -3469,7 +3469,7 @@ dependencies = [
 
 [[package]]
 name = "rift-history"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "gix",
  "rift-core",
@@ -3480,7 +3480,7 @@ dependencies = [
 
 [[package]]
 name = "rift-index"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "ignore",
  "rift-binding",
@@ -3501,7 +3501,7 @@ dependencies = [
 
 [[package]]
 name = "rift-lsp"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "globset",
  "lsp-types",
@@ -3516,7 +3516,7 @@ dependencies = [
 
 [[package]]
 name = "rift-mcp"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "axum",
  "data-encoding",
@@ -3543,7 +3543,7 @@ dependencies = [
 
 [[package]]
 name = "rift-protocol"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "jsonschema",
  "schemars",
@@ -3554,7 +3554,7 @@ dependencies = [
 
 [[package]]
 name = "rift-provider"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "rift-core",
  "scip",
@@ -3564,7 +3564,7 @@ dependencies = [
 
 [[package]]
 name = "rift-search"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -3585,7 +3585,7 @@ dependencies = [
 
 [[package]]
 name = "rift-server"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "diffy",
  "lsp-types",
@@ -3610,7 +3610,7 @@ dependencies = [
 
 [[package]]
 name = "rift-syntax"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "rift-binding",
  "rift-core",
