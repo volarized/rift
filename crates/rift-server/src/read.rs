@@ -17,10 +17,10 @@ use rift_index::{
 };
 use rift_protocol::configuration::HistoryConfiguration;
 use rift_protocol::read::{
-    Digest, ExactKind, Extensions, FileId, GetSymbolHit, GetSymbolParams, GetSymbolResult,
-    Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, PackageIdentity, Pagination,
-    ProjectPath, ReadWarning, RevisionId, SourceLocationKind, SourceUnitId, Symbol, SymbolId,
-    SymbolOrigin, TextRange,
+    Digest, ExactKind, Extensions, FileId, GetSymbolHit, GetSymbolInclude, GetSymbolParams,
+    GetSymbolResult, Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, PackageIdentity,
+    Pagination, ProjectPath, ReadWarning, RevisionId, SourceLocationKind, SourceUnitId, Symbol,
+    SymbolId, SymbolOrigin, TextRange,
 };
 use rift_syntax::{ByteRange, SyntaxNode, SyntaxProvider, SyntaxSymbol, registry};
 use sha2::{Digest as _, Sha256};
@@ -783,7 +783,9 @@ impl ReadService {
             matches.retain(|matched| language_selects(language, matched.file.syntax().language()));
         }
         let (window, pagination) = page(matches, params.page_index, limit);
-        let mut timelines = if params.include_history {
+        let include_source = params.include.contains(&GetSymbolInclude::Source);
+        let include_history = params.include.contains(&GetSymbolInclude::History);
+        let mut timelines = if include_history {
             Some(self.symbol_timelines()?)
         } else {
             None
@@ -809,10 +811,8 @@ impl ReadService {
                 unit,
                 range: text_range(matched.symbol.range),
                 line: line::line_number_at(matched.file.source(), matched.symbol.range.start),
-                node: params.include_body.then(|| symbol_node(matched).id),
-                source: params
-                    .include_body
-                    .then(|| excerpt(matched.file, matched.symbol.range)),
+                node: include_source.then(|| symbol_node(matched).id),
+                source: include_source.then(|| excerpt(matched.file, matched.symbol.range)),
                 history,
             });
         }
@@ -1399,8 +1399,8 @@ mod tests {
     use rift_core::{LanguageFileSelections, SourceVisibility};
     use rift_protocol::configuration::{LanguageConfiguration, WorkspaceConfiguration};
     use rift_protocol::read::{
-        GetSymbolParams, Language, NodeFacet, NodesParams, NodesResult, ProjectPath, ReadWarning,
-        RevisionId,
+        GetSymbolInclude, GetSymbolParams, Language, NodeFacet, NodesParams, NodesResult,
+        ProjectPath, ReadWarning, RevisionId,
     };
     use rift_syntax::ByteRange;
     use serde_json::json;
@@ -1833,22 +1833,22 @@ pub fn compute() -> i32 {
     fn get_symbol_span_is_set_whether_or_not_the_body_was_requested() -> TestResult {
         let (_directory, service) = fixture()?;
         let with_body: GetSymbolParams =
-            serde_json::from_value(json!({ "name": "signal", "include_body": true }))?;
+            serde_json::from_value(json!({ "name": "signal", "include": ["source"] }))?;
         let without_body: GetSymbolParams =
-            serde_json::from_value(json!({ "name": "signal", "include_body": false }))?;
+            serde_json::from_value(json!({ "name": "signal", "include": [] }))?;
         let with_body_value = serde_json::to_value(service.get_symbol(&with_body)?)?;
         let without_body_value = serde_json::to_value(service.get_symbol(&without_body)?)?;
         assert!(
             without_body_value["hits"][0].get("source").is_none(),
-            "include_body: false must carry no source excerpt"
+            "include: [] must carry no source excerpt"
         );
         assert_eq!(
             with_body_value["hits"][0]["path"], without_body_value["hits"][0]["path"],
-            "the path must not depend on include_body"
+            "the path must not depend on include"
         );
         assert_eq!(
             with_body_value["hits"][0]["range"], without_body_value["hits"][0]["range"],
-            "the range must not depend on include_body"
+            "the range must not depend on include"
         );
         assert_eq!(without_body_value["hits"][0]["path"], json!("src/lib.rs"));
         assert!(
@@ -1984,7 +1984,7 @@ pub fn compute() -> i32 {
     fn symbol_and_node_wire_shape_is_unchanged() -> TestResult {
         let (_directory, service) = fixture()?;
         let params: GetSymbolParams =
-            serde_json::from_value(json!({"name": "signal", "include_body": true}))?;
+            serde_json::from_value(json!({"name": "signal", "include": ["source"]}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
 
         let symbol = &value["hits"][0]["symbol"];
@@ -2036,7 +2036,7 @@ pub fn compute() -> i32 {
     fn symbol_history_on_an_unversioned_workspace_is_a_history_fault() -> TestResult {
         let (_directory, service) = fixture()?;
         let mut params: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
-        params.include_history = true;
+        params.include = vec![GetSymbolInclude::History];
         let error = service
             .get_symbol(&params)
             .expect_err("a workspace without a repository cannot serve history");
@@ -2059,7 +2059,7 @@ pub fn compute() -> i32 {
             },
         )?;
         let mut params: GetSymbolParams = serde_json::from_value(json!({"name": "beacon"}))?;
-        params.include_history = true;
+        params.include = vec![GetSymbolInclude::History];
         let error = service
             .get_symbol(&params)
             .expect_err("a disabled history provider must refuse");
@@ -2108,7 +2108,7 @@ pub fn compute() -> i32 {
             HistoryConfiguration::default(),
         )?;
         let params: GetSymbolParams =
-            serde_json::from_value(json!({"name": "beacon", "include_history": true}))?;
+            serde_json::from_value(json!({"name": "beacon", "include": ["history"]}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let history = &value["hits"][0]["history"];
         assert_eq!(
@@ -2162,7 +2162,7 @@ pub fn compute() -> i32 {
         rift_history::fixture::git(directory.path(), &["tag", "grown", "main~2"]);
         let service = revision_service(directory.path(), "grown")?;
         let params: GetSymbolParams =
-            serde_json::from_value(json!({"name": "beacon", "include_history": true}))?;
+            serde_json::from_value(json!({"name": "beacon", "include": ["history"]}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let versions = value["hits"][0]["history"]["versions"]
             .as_array()
@@ -2194,6 +2194,37 @@ pub fn compute() -> i32 {
         assert!(
             value["hits"][0].get("history").is_none(),
             "an unrequested timeline never rides a hit"
+        );
+        Ok(())
+    }
+
+    /// `include: ["source", "history"]` carries both: the hit's node identity, source
+    /// excerpt, and timeline all ride the same answer.
+    #[test]
+    fn get_symbol_include_both_carries_source_and_history_together() -> TestResult {
+        let directory = timeline_fixture()?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let params: GetSymbolParams =
+            serde_json::from_value(json!({"name": "beacon", "include": ["source", "history"]}))?;
+        let value = serde_json::to_value(service.get_symbol(&params)?)?;
+        let hit = &value["hits"][0];
+        assert!(
+            !hit["node"].is_null(),
+            "include: [\"source\"] must carry node: {hit:#}"
+        );
+        assert!(
+            !hit["source"].is_null(),
+            "include: [\"source\"] must carry source: {hit:#}"
+        );
+        assert!(
+            !hit["history"].is_null(),
+            "include: [\"history\"] must carry history: {hit:#}"
         );
         Ok(())
     }
@@ -2807,7 +2838,7 @@ pub fn compute() -> i32 {
             HistoryConfiguration::default(),
         )?;
         let params: GetSymbolParams =
-            serde_json::from_value(json!({"name": "lookup", "include_history": true}))?;
+            serde_json::from_value(json!({"name": "lookup", "include": ["history"]}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let history = &value["hits"][0]["history"];
         assert_eq!(
@@ -2911,7 +2942,7 @@ pub fn compute() -> i32 {
         let history = HistoryConfiguration::default();
         let service =
             ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
-        let request = json!({"name": "Install", "include_history": true});
+        let request = json!({"name": "Install", "include": ["history"]});
         let params: GetSymbolParams = serde_json::from_value(request)?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let history = &value["hits"][0]["history"];
@@ -3088,7 +3119,7 @@ pub fn compute() -> i32 {
         let history = HistoryConfiguration::default();
         let service =
             ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
-        let request = json!({"name": "server", "include_history": true});
+        let request = json!({"name": "server", "include": ["history"]});
         let params: GetSymbolParams = serde_json::from_value(request)?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let history = &value["hits"][0]["history"];
@@ -3123,7 +3154,7 @@ pub fn compute() -> i32 {
         let history = HistoryConfiguration::default();
         let service =
             ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
-        let request = json!({"name": "retries", "include_history": true});
+        let request = json!({"name": "retries", "include": ["history"]});
         let params: GetSymbolParams = serde_json::from_value(request)?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let history = &value["hits"][0]["history"];
