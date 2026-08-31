@@ -2487,13 +2487,11 @@ mod tests {
         let result = get_symbol(&server, "external_modified")
             .await
             .map_err(|error| format!("external rename must reconcile: {error:?}"))?;
-        let unit = result.hits[0]
-            .symbol
-            .origin
-            .unit
-            .as_ref()
-            .ok_or("renamed symbol must retain source unit")?;
-        assert!(unit.0.ends_with("/renamed.rs"));
+        let unit = &result.hits[0].span.unit;
+        assert!(
+            unit.0.ends_with("/renamed.rs"),
+            "hit must resolve to the renamed path: {unit:?}"
+        );
 
         fs::remove_file(renamed)?;
         let result = get_symbol(&server, "external_modified")

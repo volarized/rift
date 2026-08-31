@@ -125,34 +125,6 @@
       "name": "get_symbol",
       "output_schema": {
         "$defs": {
-          "ContributionKey": {
-            "additionalProperties": false,
-            "description": "Identity of one immutable Contribution.",
-            "properties": {
-              "provider": {
-                "description": "Provider that published this Contribution.",
-                "maxLength": 4096,
-                "type": "string"
-              },
-              "publication": {
-                "description": "Provider publication containing this Contribution.",
-                "format": "uint64",
-                "minimum": 1,
-                "type": "integer"
-              },
-              "symbol": {
-                "description": "Provider-local symbol identity.",
-                "maxLength": 8192,
-                "type": "string"
-              }
-            },
-            "required": [
-              "provider",
-              "symbol",
-              "publication"
-            ],
-            "type": "object"
-          },
           "Digest": {
             "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
             "examples": [
@@ -780,6 +752,40 @@
                   "detail"
                 ],
                 "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "Contributions selected for one symbol's presentation disagree on at least one\nfield. The answer carries what normalization selected; the warning names the\nsymbol and every provider whose Contribution differed, so a caller can weigh\nwhether the difference matters to it.",
+                "properties": {
+                  "code": {
+                    "const": "symbol_disagreement",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "providers": {
+                    "description": "Providers whose Contribution carries a differing value for at least one\npresentation field, sorted and deduplicated.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "minItems": 1,
+                    "type": "array"
+                  },
+                  "symbol": {
+                    "$ref": "#/$defs/SymbolId",
+                    "description": "The symbol whose presentation facts disagree."
+                  }
+                },
+                "required": [
+                  "code",
+                  "symbol",
+                  "providers",
+                  "detail"
+                ],
+                "type": "object"
               }
             ]
           },
@@ -972,80 +978,28 @@
               }
             ]
           },
-          "SourceLocation": {
-            "description": "Where source belongs. Package ownership is separate from whether source was authored or\ngenerated.",
+          "SourceLocationKind": {
+            "description": "Which of the four places a declaration's source belongs, on `SymbolOrigin`. Package\nownership is the separate `package` field: a `project` declaration can carry one too,\nand `dependency` always does.",
             "oneOf": [
               {
-                "additionalProperties": false,
-                "description": "Source owned by the current workspace.",
-                "properties": {
-                  "kind": {
-                    "const": "project",
-                    "type": "string"
-                  },
-                  "package": {
-                    "anyOf": [
-                      {
-                        "$ref": "#/$defs/PackageIdentity"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "description": "Local package that owns the source, or absent when no package manifest assigns\none."
-                  }
-                },
-                "required": [
-                  "kind"
-                ],
-                "type": "object"
+                "const": "project",
+                "description": "Owned by the current workspace.",
+                "type": "string"
               },
               {
-                "additionalProperties": false,
-                "description": "Source owned by one resolved dependency.",
-                "properties": {
-                  "kind": {
-                    "const": "dependency",
-                    "type": "string"
-                  },
-                  "package": {
-                    "$ref": "#/$defs/PackageIdentity",
-                    "description": "Resolved dependency that owns the source."
-                  }
-                },
-                "required": [
-                  "kind",
-                  "package"
-                ],
-                "type": "object"
+                "const": "dependency",
+                "description": "Owned by one resolved dependency.",
+                "type": "string"
               },
               {
-                "additionalProperties": false,
-                "description": "Source installed with the language toolchain.",
-                "properties": {
-                  "kind": {
-                    "const": "stdlib",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "kind"
-                ],
-                "type": "object"
+                "const": "stdlib",
+                "description": "Installed with the language toolchain.",
+                "type": "string"
               },
               {
-                "additionalProperties": false,
-                "description": "Source outside the project, dependency graph, and standard library.",
-                "properties": {
-                  "kind": {
-                    "const": "external",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "kind"
-                ],
-                "type": "object"
+                "const": "external",
+                "description": "Outside the project, dependency graph, and standard library.",
+                "type": "string"
               }
             ]
           },
@@ -1090,22 +1044,6 @@
                 ],
                 "description": "The symbol this one belongs to - the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method is written beside its type and a\nRust method inside an `impl` block, and both name the type here. Absent at the top\nlevel."
               },
-              "contributions": {
-                "default": [],
-                "description": "Contributions selected for this request, in presentation order. Absent when empty.",
-                "items": {
-                  "$ref": "#/$defs/ContributionKey"
-                },
-                "type": "array"
-              },
-              "disagreements": {
-                "default": [],
-                "description": "Presentation differences retained after field selection. Absent when empty.",
-                "items": {
-                  "$ref": "#/$defs/SymbolDisagreement"
-                },
-                "type": "array"
-              },
               "document_local": {
                 "default": false,
                 "description": "Whether language semantics confine this symbol to the document that declares it. The\nprovider classifies locality from its language model; absent when `false`.",
@@ -1141,13 +1079,7 @@
                     "type": "null"
                   }
                 ],
-                "description": "Unique identifier of this Symbol across the whole workspace. Present only when\n`resolution` is `established`."
-              },
-              "index_revision": {
-                "description": "Captured index revision used to assemble this Symbol.",
-                "format": "uint64",
-                "minimum": 1,
-                "type": "integer"
+                "description": "Unique identifier of this Symbol across the whole workspace. Absent for an\nunestablished symbol: no accepted evidence, or more than one, established its\nidentity."
               },
               "kind": {
                 "$ref": "#/$defs/ExactKind",
@@ -1172,11 +1104,11 @@
               },
               "origin": {
                 "$ref": "#/$defs/SymbolOrigin",
-                "description": "Where the declaration belongs, how it was produced, and its source unit when\nreadable."
-              },
-              "resolution": {
-                "$ref": "#/$defs/SymbolResolution",
-                "description": "Whether normalization established one Symbol identity."
+                "default": {
+                  "location": "project",
+                  "source_kind": "authored"
+                },
+                "description": "Where the declaration belongs, how it was produced, and its source unit where that\ndiffers from the hit's own path. Absent when it says a project declaration,\nauthored, with no package - the common case."
               },
               "signatures": {
                 "default": [],
@@ -1203,31 +1135,9 @@
               }
             },
             "required": [
-              "index_revision",
-              "resolution",
               "language",
               "name",
-              "kind",
-              "origin"
-            ],
-            "type": "object"
-          },
-          "SymbolDisagreement": {
-            "additionalProperties": false,
-            "description": "One disagreement retained beside selected presentation facts.",
-            "properties": {
-              "contribution": {
-                "$ref": "#/$defs/ContributionKey",
-                "description": "Contribution carrying another value."
-              },
-              "field": {
-                "$ref": "#/$defs/SymbolPresentationField",
-                "description": "Presentation field that differs."
-              }
-            },
-            "required": [
-              "contribution",
-              "field"
+              "kind"
             ],
             "type": "object"
           },
@@ -1420,18 +1330,29 @@
           },
           "SymbolOrigin": {
             "additionalProperties": false,
-            "description": "Where a symbol belongs and how its declaration came to exist. Source location and\ngeneration are separate: generated code can belong to the project or to a dependency.",
+            "description": "Where a symbol belongs and how its declaration came to exist. Source location and\ngeneration are separate: generated code can belong to the project or to a dependency.\nAbsent from `Symbol` entirely when it says a project declaration, authored, with no\npackage.",
             "properties": {
               "location": {
                 "anyOf": [
                   {
-                    "$ref": "#/$defs/SourceLocation"
+                    "$ref": "#/$defs/SourceLocationKind"
                   },
                   {
                     "type": "null"
                   }
                 ],
-                "description": "Source ownership. Absent exactly when `source_kind` is `synthetic`."
+                "description": "Which of the four places the declaration belongs. Absent exactly when\n`source_kind` is `synthetic`."
+              },
+              "package": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/PackageIdentity"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The package that owns the declaration: present for `dependency`, and optionally\nfor `project`. Absent for `stdlib`, `external`, and a synthetic declaration."
               },
               "source_kind": {
                 "$ref": "#/$defs/SourceKind",
@@ -1446,78 +1367,13 @@
                     "type": "null"
                   }
                 ],
-                "description": "Source-catalog unit containing the declaration. Absent when source is unavailable\nor the declaration is synthetic."
+                "description": "Source-catalog unit containing the declaration, present only where `location` is\nnot `project` - a project declaration's unit already equals the hit's own path.\nAbsent when source is unavailable or the declaration is synthetic."
               }
             },
             "required": [
               "source_kind"
             ],
             "type": "object"
-          },
-          "SymbolPresentationField": {
-            "description": "Presentation field whose retained Contributions disagree.",
-            "oneOf": [
-              {
-                "const": "language",
-                "description": "Language differs.",
-                "type": "string"
-              },
-              {
-                "const": "name",
-                "description": "Short name differs.",
-                "type": "string"
-              },
-              {
-                "const": "qualified_name",
-                "description": "Provider-qualified name differs.",
-                "type": "string"
-              },
-              {
-                "const": "kind",
-                "description": "Exact kind differs.",
-                "type": "string"
-              },
-              {
-                "const": "container",
-                "description": "Containing symbol differs.",
-                "type": "string"
-              },
-              {
-                "const": "visibility",
-                "description": "Visibility differs.",
-                "type": "string"
-              },
-              {
-                "const": "document_local",
-                "description": "Document-local classification differs.",
-                "type": "string"
-              },
-              {
-                "const": "origin",
-                "description": "Origin differs.",
-                "type": "string"
-              }
-            ]
-          },
-          "SymbolResolution": {
-            "description": "Resolution state of one readable Symbol.",
-            "oneOf": [
-              {
-                "const": "established",
-                "description": "One identity anchor establishes Symbol identity.",
-                "type": "string"
-              },
-              {
-                "const": "unresolved",
-                "description": "No accepted evidence establishes Symbol identity.",
-                "type": "string"
-              },
-              {
-                "const": "conflicting",
-                "description": "More than one identity anchor applies.",
-                "type": "string"
-              }
-            ]
           },
           "SymbolVersion": {
             "additionalProperties": false,
@@ -1839,13 +1695,6 @@
                   "unit": "rift://source/project/src/config.rs"
                 },
                 "symbol": {
-                  "contributions": [
-                    {
-                      "provider": "syntax",
-                      "publication": 1,
-                      "symbol": "load_config"
-                    }
-                  ],
                   "documentation": [
                     {
                       "format": "markdown",
@@ -1858,20 +1707,11 @@
                     "public"
                   ],
                   "id": "rift://symbol/rust/src/config.rs/load_config",
-                  "index_revision": 1,
                   "kind": "rust.function",
                   "language": {
                     "name": "rust"
                   },
                   "name": "load_config",
-                  "origin": {
-                    "location": {
-                      "kind": "project"
-                    },
-                    "source_kind": "authored",
-                    "unit": "rift://source/project/src/config.rs"
-                  },
-                  "resolution": "established",
                   "signatures": [
                     {
                       "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
@@ -5496,6 +5336,40 @@
                 "required": [
                   "code",
                   "unit",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "Contributions selected for one symbol's presentation disagree on at least one\nfield. The answer carries what normalization selected; the warning names the\nsymbol and every provider whose Contribution differed, so a caller can weigh\nwhether the difference matters to it.",
+                "properties": {
+                  "code": {
+                    "const": "symbol_disagreement",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "providers": {
+                    "description": "Providers whose Contribution carries a differing value for at least one\npresentation field, sorted and deduplicated.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "minItems": 1,
+                    "type": "array"
+                  },
+                  "symbol": {
+                    "$ref": "#/$defs/SymbolId",
+                    "description": "The symbol whose presentation facts disagree."
+                  }
+                },
+                "required": [
+                  "code",
+                  "symbol",
+                  "providers",
                   "detail"
                 ],
                 "type": "object"
@@ -11950,34 +11824,6 @@
       "name": "search",
       "output_schema": {
         "$defs": {
-          "ContributionKey": {
-            "additionalProperties": false,
-            "description": "Identity of one immutable Contribution.",
-            "properties": {
-              "provider": {
-                "description": "Provider that published this Contribution.",
-                "maxLength": 4096,
-                "type": "string"
-              },
-              "publication": {
-                "description": "Provider publication containing this Contribution.",
-                "format": "uint64",
-                "minimum": 1,
-                "type": "integer"
-              },
-              "symbol": {
-                "description": "Provider-local symbol identity.",
-                "maxLength": 8192,
-                "type": "string"
-              }
-            },
-            "required": [
-              "provider",
-              "symbol",
-              "publication"
-            ],
-            "type": "object"
-          },
           "Digest": {
             "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
             "examples": [
@@ -12767,6 +12613,40 @@
                   "detail"
                 ],
                 "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "Contributions selected for one symbol's presentation disagree on at least one\nfield. The answer carries what normalization selected; the warning names the\nsymbol and every provider whose Contribution differed, so a caller can weigh\nwhether the difference matters to it.",
+                "properties": {
+                  "code": {
+                    "const": "symbol_disagreement",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "providers": {
+                    "description": "Providers whose Contribution carries a differing value for at least one\npresentation field, sorted and deduplicated.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "minItems": 1,
+                    "type": "array"
+                  },
+                  "symbol": {
+                    "$ref": "#/$defs/SymbolId",
+                    "description": "The symbol whose presentation facts disagree."
+                  }
+                },
+                "required": [
+                  "code",
+                  "symbol",
+                  "providers",
+                  "detail"
+                ],
+                "type": "object"
               }
             ]
           },
@@ -13137,11 +13017,6 @@
                 ],
                 "description": "Project-relative path of the hit, where the location is a project path. Absent for\na hit whose only location is a dependency or standard-library source unit."
               },
-              "score": {
-                "description": "How well this hit matched. Scores are comparable within one answer and nowhere\nelse.",
-                "format": "double",
-                "type": "number"
-              },
               "source": {
                 "description": "The source text around the hit, requested with `include: [\"source\"]`. Covers the\nhit's `span`; a caller that needs the range already has it there.",
                 "type": [
@@ -13174,8 +13049,7 @@
               }
             },
             "required": [
-              "hit",
-              "score"
+              "hit"
             ],
             "type": "object"
           },
@@ -13363,80 +13237,28 @@
               }
             ]
           },
-          "SourceLocation": {
-            "description": "Where source belongs. Package ownership is separate from whether source was authored or\ngenerated.",
+          "SourceLocationKind": {
+            "description": "Which of the four places a declaration's source belongs, on `SymbolOrigin`. Package\nownership is the separate `package` field: a `project` declaration can carry one too,\nand `dependency` always does.",
             "oneOf": [
               {
-                "additionalProperties": false,
-                "description": "Source owned by the current workspace.",
-                "properties": {
-                  "kind": {
-                    "const": "project",
-                    "type": "string"
-                  },
-                  "package": {
-                    "anyOf": [
-                      {
-                        "$ref": "#/$defs/PackageIdentity"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "description": "Local package that owns the source, or absent when no package manifest assigns\none."
-                  }
-                },
-                "required": [
-                  "kind"
-                ],
-                "type": "object"
+                "const": "project",
+                "description": "Owned by the current workspace.",
+                "type": "string"
               },
               {
-                "additionalProperties": false,
-                "description": "Source owned by one resolved dependency.",
-                "properties": {
-                  "kind": {
-                    "const": "dependency",
-                    "type": "string"
-                  },
-                  "package": {
-                    "$ref": "#/$defs/PackageIdentity",
-                    "description": "Resolved dependency that owns the source."
-                  }
-                },
-                "required": [
-                  "kind",
-                  "package"
-                ],
-                "type": "object"
+                "const": "dependency",
+                "description": "Owned by one resolved dependency.",
+                "type": "string"
               },
               {
-                "additionalProperties": false,
-                "description": "Source installed with the language toolchain.",
-                "properties": {
-                  "kind": {
-                    "const": "stdlib",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "kind"
-                ],
-                "type": "object"
+                "const": "stdlib",
+                "description": "Installed with the language toolchain.",
+                "type": "string"
               },
               {
-                "additionalProperties": false,
-                "description": "Source outside the project, dependency graph, and standard library.",
-                "properties": {
-                  "kind": {
-                    "const": "external",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "kind"
-                ],
-                "type": "object"
+                "const": "external",
+                "description": "Outside the project, dependency graph, and standard library.",
+                "type": "string"
               }
             ]
           },
@@ -13481,22 +13303,6 @@
                 ],
                 "description": "The symbol this one belongs to - the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method is written beside its type and a\nRust method inside an `impl` block, and both name the type here. Absent at the top\nlevel."
               },
-              "contributions": {
-                "default": [],
-                "description": "Contributions selected for this request, in presentation order. Absent when empty.",
-                "items": {
-                  "$ref": "#/$defs/ContributionKey"
-                },
-                "type": "array"
-              },
-              "disagreements": {
-                "default": [],
-                "description": "Presentation differences retained after field selection. Absent when empty.",
-                "items": {
-                  "$ref": "#/$defs/SymbolDisagreement"
-                },
-                "type": "array"
-              },
               "document_local": {
                 "default": false,
                 "description": "Whether language semantics confine this symbol to the document that declares it. The\nprovider classifies locality from its language model; absent when `false`.",
@@ -13532,13 +13338,7 @@
                     "type": "null"
                   }
                 ],
-                "description": "Unique identifier of this Symbol across the whole workspace. Present only when\n`resolution` is `established`."
-              },
-              "index_revision": {
-                "description": "Captured index revision used to assemble this Symbol.",
-                "format": "uint64",
-                "minimum": 1,
-                "type": "integer"
+                "description": "Unique identifier of this Symbol across the whole workspace. Absent for an\nunestablished symbol: no accepted evidence, or more than one, established its\nidentity."
               },
               "kind": {
                 "$ref": "#/$defs/ExactKind",
@@ -13563,11 +13363,11 @@
               },
               "origin": {
                 "$ref": "#/$defs/SymbolOrigin",
-                "description": "Where the declaration belongs, how it was produced, and its source unit when\nreadable."
-              },
-              "resolution": {
-                "$ref": "#/$defs/SymbolResolution",
-                "description": "Whether normalization established one Symbol identity."
+                "default": {
+                  "location": "project",
+                  "source_kind": "authored"
+                },
+                "description": "Where the declaration belongs, how it was produced, and its source unit where that\ndiffers from the hit's own path. Absent when it says a project declaration,\nauthored, with no package - the common case."
               },
               "signatures": {
                 "default": [],
@@ -13594,31 +13394,9 @@
               }
             },
             "required": [
-              "index_revision",
-              "resolution",
               "language",
               "name",
-              "kind",
-              "origin"
-            ],
-            "type": "object"
-          },
-          "SymbolDisagreement": {
-            "additionalProperties": false,
-            "description": "One disagreement retained beside selected presentation facts.",
-            "properties": {
-              "contribution": {
-                "$ref": "#/$defs/ContributionKey",
-                "description": "Contribution carrying another value."
-              },
-              "field": {
-                "$ref": "#/$defs/SymbolPresentationField",
-                "description": "Presentation field that differs."
-              }
-            },
-            "required": [
-              "contribution",
-              "field"
+              "kind"
             ],
             "type": "object"
           },
@@ -13789,18 +13567,29 @@
           },
           "SymbolOrigin": {
             "additionalProperties": false,
-            "description": "Where a symbol belongs and how its declaration came to exist. Source location and\ngeneration are separate: generated code can belong to the project or to a dependency.",
+            "description": "Where a symbol belongs and how its declaration came to exist. Source location and\ngeneration are separate: generated code can belong to the project or to a dependency.\nAbsent from `Symbol` entirely when it says a project declaration, authored, with no\npackage.",
             "properties": {
               "location": {
                 "anyOf": [
                   {
-                    "$ref": "#/$defs/SourceLocation"
+                    "$ref": "#/$defs/SourceLocationKind"
                   },
                   {
                     "type": "null"
                   }
                 ],
-                "description": "Source ownership. Absent exactly when `source_kind` is `synthetic`."
+                "description": "Which of the four places the declaration belongs. Absent exactly when\n`source_kind` is `synthetic`."
+              },
+              "package": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/PackageIdentity"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The package that owns the declaration: present for `dependency`, and optionally\nfor `project`. Absent for `stdlib`, `external`, and a synthetic declaration."
               },
               "source_kind": {
                 "$ref": "#/$defs/SourceKind",
@@ -13815,78 +13604,13 @@
                     "type": "null"
                   }
                 ],
-                "description": "Source-catalog unit containing the declaration. Absent when source is unavailable\nor the declaration is synthetic."
+                "description": "Source-catalog unit containing the declaration, present only where `location` is\nnot `project` - a project declaration's unit already equals the hit's own path.\nAbsent when source is unavailable or the declaration is synthetic."
               }
             },
             "required": [
               "source_kind"
             ],
             "type": "object"
-          },
-          "SymbolPresentationField": {
-            "description": "Presentation field whose retained Contributions disagree.",
-            "oneOf": [
-              {
-                "const": "language",
-                "description": "Language differs.",
-                "type": "string"
-              },
-              {
-                "const": "name",
-                "description": "Short name differs.",
-                "type": "string"
-              },
-              {
-                "const": "qualified_name",
-                "description": "Provider-qualified name differs.",
-                "type": "string"
-              },
-              {
-                "const": "kind",
-                "description": "Exact kind differs.",
-                "type": "string"
-              },
-              {
-                "const": "container",
-                "description": "Containing symbol differs.",
-                "type": "string"
-              },
-              {
-                "const": "visibility",
-                "description": "Visibility differs.",
-                "type": "string"
-              },
-              {
-                "const": "document_local",
-                "description": "Document-local classification differs.",
-                "type": "string"
-              },
-              {
-                "const": "origin",
-                "description": "Origin differs.",
-                "type": "string"
-              }
-            ]
-          },
-          "SymbolResolution": {
-            "description": "Resolution state of one readable Symbol.",
-            "oneOf": [
-              {
-                "const": "established",
-                "description": "One identity anchor establishes Symbol identity.",
-                "type": "string"
-              },
-              {
-                "const": "unresolved",
-                "description": "No accepted evidence establishes Symbol identity.",
-                "type": "string"
-              },
-              {
-                "const": "conflicting",
-                "description": "More than one identity anchor applies.",
-                "type": "string"
-              }
-            ]
           },
           "TextRange": {
             "additionalProperties": false,
@@ -14070,13 +13794,6 @@
               {
                 "hit": {
                   "symbol": {
-                    "contributions": [
-                      {
-                        "provider": "syntax",
-                        "publication": 1,
-                        "symbol": "load_config"
-                      }
-                    ],
                     "documentation": [
                       {
                         "format": "markdown",
@@ -14089,20 +13806,11 @@
                       "public"
                     ],
                     "id": "rift://symbol/rust/src/config.rs/load_config",
-                    "index_revision": 1,
                     "kind": "rust.function",
                     "language": {
                       "name": "rust"
                     },
                     "name": "load_config",
-                    "origin": {
-                      "location": {
-                        "kind": "project"
-                      },
-                      "source_kind": "authored",
-                      "unit": "rift://source/project/src/config.rs"
-                    },
-                    "resolution": "established",
                     "signatures": [
                       {
                         "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
@@ -14172,7 +13880,6 @@
                   "name"
                 ],
                 "path": "src/config.rs",
-                "score": 0.9,
                 "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
                 "span": {
                   "range": {
@@ -14205,7 +13912,6 @@
                   "content"
                 ],
                 "path": "src/lib.rs",
-                "score": 1.0,
                 "source": "    let config = load_config(&arguments.path)?;",
                 "span": {
                   "range": {

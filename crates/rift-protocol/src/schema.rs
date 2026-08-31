@@ -750,13 +750,11 @@ pub fn declare_symbol_empty_defaults(schema: &mut Schema) {
     declare_empty_array_defaults(
         schema,
         &[
-            property!(Symbol, contributions),
             property!(Symbol, facets),
             property!(Symbol, modifiers),
             property!(Symbol, types),
             property!(Symbol, signatures),
             property!(Symbol, documentation),
-            property!(Symbol, disagreements),
         ],
     );
     declare_empty_object_defaults(schema, &[property!(Symbol, extensions)]);
@@ -765,6 +763,17 @@ pub fn declare_symbol_empty_defaults(schema: &mut Schema) {
         property!(Symbol, document_local),
         keyword::DEFAULT,
         json!(false),
+    );
+    // `origin`'s own `#[serde(default = "default_symbol_origin", skip_serializing_if =
+    // "SymbolOrigin::is_common_default")]` hits the same schemars quirk
+    // `declare_empty_array_defaults` works around: the auto-embedded default is
+    // suppressed because it equals what the skip predicate matches, so the common-case
+    // value is stated here explicitly instead.
+    annotate_property(
+        schema,
+        property!(Symbol, origin),
+        keyword::DEFAULT,
+        json!({ "location": "project", "source_kind": "authored" }),
     );
 }
 
@@ -1426,15 +1435,17 @@ mod tests {
                 "Symbol",
                 serde_json::to_value(schema_for!(crate::read::Symbol)).expect("schema"),
                 vec![
-                    ("contributions", array.clone()),
                     ("facets", array.clone()),
                     ("modifiers", array.clone()),
                     ("types", array.clone()),
                     ("signatures", array.clone()),
                     ("documentation", array.clone()),
-                    ("disagreements", array.clone()),
                     ("extensions", object.clone()),
                     ("document_local", json!(false)),
+                    (
+                        "origin",
+                        json!({ "location": "project", "source_kind": "authored" }),
+                    ),
                 ],
             ),
             (

@@ -441,9 +441,9 @@ embeds the workspace again rather than mixing two spaces.
 known. The answer carries the declaration's body inline, so reading a function takes one call
 rather than a search followed by a file read.
 
-Each Symbol names its `index_revision`, `resolution`, applicable `contributions`, and retained
-`disagreements`. `id` is present when resolution is `established`; unresolved or conflicting
-Symbols keep provider-local Contribution identities without inventing a workspace `SymbolId`.
+A Symbol carries `id` when the index established one identity for the declaration; a symbol
+the providers could not settle answers without an `id`, and a retained provider disagreement
+lands as a `symbol_disagreement` entry in the result's `warnings`.
 
 Asking for history attaches the symbol's committed timeline to the same answer.
 

@@ -171,8 +171,9 @@ pub enum ResultOrder {
 pub struct SearchHit {
     /// What was found. A symbol, a node, or a file - whichever `target` allowed.
     pub hit: SearchHitTarget,
-    /// How well this hit matched. Scores are comparable within one answer and nowhere
-    /// else.
+    /// How well this hit matched, used only to order the page and merge duplicate hits.
+    /// Comparable within one answer and nowhere else. Never reaches the wire.
+    #[serde(skip)]
     pub score: f64,
     /// Which indexed fields produced the match. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -344,16 +345,7 @@ pub enum SearchParamsTarget {
                 "hit": {
                     "target": "symbol",
                     "symbol": {
-                        "index_revision": 1,
                         "id": "rift://symbol/rust/src/config.rs/load_config",
-                        "resolution": "established",
-                        "contributions": [
-                            {
-                                "provider": "syntax",
-                                "symbol": "load_config",
-                                "publication": 1
-                            }
-                        ],
                         "language": {
                             "name": "rust"
                         },
@@ -364,13 +356,6 @@ pub enum SearchParamsTarget {
                             "callable",
                             "public"
                         ],
-                        "origin": {
-                            "location": {
-                                "kind": "project"
-                            },
-                            "source_kind": "authored",
-                            "unit": "rift://source/project/src/config.rs"
-                        },
                         "visibility": "pub",
                         "types": [
                             {
@@ -440,7 +425,6 @@ pub enum SearchParamsTarget {
                         ]
                     }
                 },
-                "score": 0.9,
                 "matched_by": [
                     "name"
                 ],
@@ -473,7 +457,6 @@ pub enum SearchParamsTarget {
                         "semantic": true
                     }
                 },
-                "score": 1.0,
                 "matched_by": [
                     "content"
                 ],

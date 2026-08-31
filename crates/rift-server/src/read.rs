@@ -17,11 +17,10 @@ use rift_index::{
 };
 use rift_protocol::configuration::HistoryConfiguration;
 use rift_protocol::read::{
-    ContributionKey, Digest, ExactKind, Extensions, FileId, GetSymbolHit, GetSymbolParams,
-    GetSymbolResult, Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, Pagination,
-    ProjectPath, ReadWarning, RevisionId, SourceExcerpt, SourceUnitId, SourceUnitSpan, Symbol,
-    SymbolDisagreement, SymbolId, SymbolOrigin, SymbolPresentationField, SymbolResolution,
-    TextRange,
+    Digest, ExactKind, Extensions, FileId, GetSymbolHit, GetSymbolParams, GetSymbolResult,
+    Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, PackageIdentity, Pagination,
+    ProjectPath, ReadWarning, RevisionId, SourceExcerpt, SourceLocationKind, SourceUnitId,
+    SourceUnitSpan, Symbol, SymbolId, SymbolOrigin, TextRange,
 };
 use rift_syntax::{ByteRange, SyntaxNode, SyntaxProvider, SyntaxSymbol, registry};
 use sha2::{Digest as _, Sha256};
@@ -790,6 +789,7 @@ impl ReadService {
             None
         };
         let mut hits = Vec::with_capacity(window.len());
+        let mut disagreements = Vec::new();
         for matched in window {
             let history = match timelines.as_mut() {
                 Some(timelines) => Some(
@@ -798,8 +798,12 @@ impl ReadService {
                 ),
                 None => None,
             };
+            let (symbol, disagreement) = wire_symbol(&self.index, matched)?;
+            if let Some(warning) = disagreement {
+                disagreements.push(warning);
+            }
             hits.push(GetSymbolHit {
-                symbol: wire_symbol(&self.index, matched)?,
+                symbol,
                 span: source_span(matched.file.path(), matched.symbol.range),
                 node: params.include_body.then(|| symbol_node(matched)),
                 source: params
@@ -808,10 +812,12 @@ impl ReadService {
                 history,
             });
         }
+        let mut warnings = self.warnings();
+        warnings.extend(disagreements);
         Ok(GetSymbolResult {
             hits,
             pagination,
-            warnings: self.warnings(),
+            warnings,
         })
     }
 
@@ -921,12 +927,17 @@ fn symbol_node(matched: SymbolMatch<'_>) -> Node {
     )
 }
 
+/// Builds one hit's wire symbol, and the `symbol_disagreement` warning its retained
+/// presentation disagreements raise, when it has an established identity to name in
+/// one.
 pub(crate) fn wire_symbol(
     index: &WorkspaceIndex,
     matched: SymbolMatch<'_>,
-) -> Result<Symbol, ReadError> {
+) -> Result<(Symbol, Option<ReadWarning>), ReadError> {
     let readable = index.assembled_symbol(matched).map_err(ReadFault::index)?;
-    Ok(assembled_wire_symbol(matched, &readable))
+    let symbol = assembled_wire_symbol(matched, &readable);
+    let disagreement = symbol_disagreement_warning(readable.assembled());
+    Ok((symbol, disagreement))
 }
 
 fn assembled_wire_symbol(matched: SymbolMatch<'_>, readable: &ReadableSymbol) -> Symbol {
@@ -941,25 +952,14 @@ fn assembled_wire_symbol(matched: SymbolMatch<'_>, readable: &ReadableSymbol) ->
         }
     }
     Symbol {
-        index_revision: assembled.index_revision().get(),
         id: readable
             .identity()
             .map(|identity| SymbolId(identity.as_str().to_owned())),
-        resolution: wire_symbol_resolution(assembled.resolution()),
-        contributions: assembled
-            .contributions()
-            .iter()
-            .map(wire_contribution_key)
-            .collect(),
         language: facts.language().clone(),
         name: facts.name().to_owned(),
         kind: facts.kind().clone(),
         facets: facts.symbol_facets().to_vec(),
-        origin: SymbolOrigin {
-            location: assembled.origin().location().cloned(),
-            source_kind: assembled.origin().source_kind(),
-            unit: Some(source_unit_id(matched.file.path())),
-        },
+        origin: wire_symbol_origin(assembled.origin(), matched),
         container: assembled
             .container()
             .map(|container| SymbolId(container.as_str().to_owned())),
@@ -969,45 +969,81 @@ fn assembled_wire_symbol(matched: SymbolMatch<'_>, readable: &ReadableSymbol) ->
         signatures: facts.signatures_slice().to_vec(),
         documentation: facts.documentation_blocks().to_vec(),
         extensions: Extensions(extension_values),
-        disagreements: assembled
-            .disagreements()
-            .iter()
-            .map(|disagreement| SymbolDisagreement {
-                contribution: wire_contribution_key(disagreement.contribution()),
-                field: wire_presentation_field(disagreement.field()),
-            })
-            .collect(),
         document_local: facts.is_document_local(),
     }
 }
 
-fn wire_contribution_key(key: &rift_core::ContributionKey) -> ContributionKey {
-    ContributionKey {
-        provider: key.reference().provider().as_str().to_owned(),
-        symbol: key.reference().symbol().as_str().to_owned(),
-        publication: key.publication().get(),
+/// Builds the wire origin from `origin`'s internal location and source kind. `unit` stays
+/// off the wire for a project declaration; a dependency, stdlib, or external declaration
+/// keeps it, naming the source-catalog unit the declaration was read from.
+fn wire_symbol_origin(
+    origin: &rift_core::ContributionOrigin,
+    matched: SymbolMatch<'_>,
+) -> SymbolOrigin {
+    let location = origin.location();
+    SymbolOrigin {
+        location: location.map(wire_source_location_kind),
+        package: location.and_then(source_location_package),
+        source_kind: origin.source_kind(),
+        unit: match location {
+            Some(rift_core::SourceLocation::Project { .. }) | None => None,
+            Some(_) => Some(source_unit_id(matched.file.path())),
+        },
     }
 }
 
-fn wire_symbol_resolution(resolution: rift_core::SymbolResolution) -> SymbolResolution {
-    match resolution {
-        rift_core::SymbolResolution::Established => SymbolResolution::Established,
-        rift_core::SymbolResolution::Unresolved => SymbolResolution::Unresolved,
-        rift_core::SymbolResolution::Conflicting => SymbolResolution::Conflicting,
+fn wire_source_location_kind(location: &rift_core::SourceLocation) -> SourceLocationKind {
+    match location {
+        rift_core::SourceLocation::Project { .. } => SourceLocationKind::Project,
+        rift_core::SourceLocation::Dependency { .. } => SourceLocationKind::Dependency,
+        rift_core::SourceLocation::Stdlib {} => SourceLocationKind::Stdlib,
+        rift_core::SourceLocation::External {} => SourceLocationKind::External,
     }
 }
 
-fn wire_presentation_field(field: rift_provider::PresentationField) -> SymbolPresentationField {
-    match field {
-        rift_provider::PresentationField::Language => SymbolPresentationField::Language,
-        rift_provider::PresentationField::Name => SymbolPresentationField::Name,
-        rift_provider::PresentationField::QualifiedName => SymbolPresentationField::QualifiedName,
-        rift_provider::PresentationField::Kind => SymbolPresentationField::Kind,
-        rift_provider::PresentationField::Container => SymbolPresentationField::Container,
-        rift_provider::PresentationField::Visibility => SymbolPresentationField::Visibility,
-        rift_provider::PresentationField::DocumentLocal => SymbolPresentationField::DocumentLocal,
-        rift_provider::PresentationField::Origin => SymbolPresentationField::Origin,
+/// The package a location carries: present for `Project` when a manifest assigned one,
+/// always present for `Dependency`, and absent for `Stdlib` and `External`.
+fn source_location_package(location: &rift_core::SourceLocation) -> Option<PackageIdentity> {
+    match location {
+        rift_core::SourceLocation::Project { package } => package.clone(),
+        rift_core::SourceLocation::Dependency { package } => Some(package.clone()),
+        rift_core::SourceLocation::Stdlib {} | rift_core::SourceLocation::External {} => None,
     }
+}
+
+/// The `symbol_disagreement` warning one assembled symbol raises, when normalization
+/// retained a presentation disagreement and the symbol has an established identity to
+/// name in it. An unestablished symbol already says as much through its missing `id`;
+/// the warning adds nothing there, so it stays silent.
+fn symbol_disagreement_warning(assembled: &rift_provider::AssembledSymbol) -> Option<ReadWarning> {
+    if assembled.disagreements().is_empty() {
+        return None;
+    }
+    let identity = assembled.identity()?;
+    let providers: Vec<String> = assembled
+        .disagreements()
+        .iter()
+        .map(|disagreement| {
+            disagreement
+                .contribution()
+                .reference()
+                .provider()
+                .as_str()
+                .to_owned()
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let detail = format!(
+        "normalization selected one presentation for this symbol; {} disagree on at \
+         least one field",
+        providers.join(", "),
+    );
+    Some(ReadWarning::SymbolDisagreement {
+        symbol: SymbolId(identity.as_str().to_owned()),
+        providers,
+        detail,
+    })
 }
 
 pub(crate) fn excerpt(file: &IndexedFile, range: ByteRange) -> SourceExcerpt {
@@ -1832,7 +1868,7 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn symbol_read_returns_normalized_identity_and_contributions() -> TestResult {
+    fn symbol_read_returns_normalized_identity_and_omits_the_common_origin() -> TestResult {
         let (_directory, service) = fixture()?;
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
@@ -1840,22 +1876,6 @@ pub fn compute() -> i32 {
 
         assert_eq!(symbol["name"], "Beacon");
         assert_eq!(symbol["visibility"], "pub");
-        assert_eq!(symbol["resolution"], "established");
-        let index_revision = symbol["index_revision"]
-            .as_u64()
-            .expect("index revision is an integer");
-        assert_ne!(index_revision, 0);
-        assert_eq!(symbol["contributions"][0]["provider"], "syntax");
-        assert_eq!(symbol["contributions"][0]["publication"], index_revision);
-        assert!(
-            symbol["contributions"][0]["symbol"]
-                .as_str()
-                .is_some_and(|identity| !identity.is_empty())
-        );
-        assert!(
-            symbol.get("disagreements").is_none(),
-            "an established symbol with no disagreements must omit the member"
-        );
         assert!(
             symbol["facets"]
                 .as_array()
@@ -1866,10 +1886,14 @@ pub fn compute() -> i32 {
                 .as_str()
                 .is_some_and(|id| id.contains("/Beacon"))
         );
+        assert!(
+            symbol.get("origin").is_none(),
+            "a project-authored symbol with no package must omit origin entirely: {symbol}"
+        );
         assert_eq!(value["hits"][0]["source"]["text"], "pub struct Beacon;");
-        assert_eq!(
-            symbol["origin"]["unit"],
-            json!("rift://source/project/src/lib.rs")
+        assert!(
+            value.get("warnings").is_none(),
+            "a single-provider fixture with no disagreement raises no warning: {value}"
         );
         assert_eq!(
             value["pagination"],
@@ -2420,63 +2444,70 @@ pub fn compute() -> i32 {
         assert_eq!(context[1].value(), "worker panicked");
     }
 
+    /// Every internal `SourceLocation` variant maps to its wire `SourceLocationKind`.
     #[test]
-    fn wire_semantic_enums_map_every_internal_value() {
-        let resolutions = [
+    fn wire_source_location_kind_maps_every_internal_variant() {
+        let package = || rift_protocol::read::PackageIdentity {
+            manager: "cargo".to_owned(),
+            name: "beacon-core".to_owned(),
+            version: "0.1.0".to_owned(),
+        };
+        let cases = [
             (
-                rift_core::SymbolResolution::Established,
-                rift_protocol::read::SymbolResolution::Established,
+                rift_core::SourceLocation::Project { package: None },
+                rift_protocol::read::SourceLocationKind::Project,
             ),
             (
-                rift_core::SymbolResolution::Unresolved,
-                rift_protocol::read::SymbolResolution::Unresolved,
+                rift_core::SourceLocation::Dependency { package: package() },
+                rift_protocol::read::SourceLocationKind::Dependency,
             ),
             (
-                rift_core::SymbolResolution::Conflicting,
-                rift_protocol::read::SymbolResolution::Conflicting,
+                rift_core::SourceLocation::Stdlib {},
+                rift_protocol::read::SourceLocationKind::Stdlib,
+            ),
+            (
+                rift_core::SourceLocation::External {},
+                rift_protocol::read::SourceLocationKind::External,
             ),
         ];
-        for (internal, wire) in resolutions {
-            assert_eq!(super::wire_symbol_resolution(internal), wire);
+        for (internal, wire) in cases {
+            assert_eq!(super::wire_source_location_kind(&internal), wire);
         }
+    }
 
-        let fields = [
-            (
-                rift_provider::PresentationField::Language,
-                rift_protocol::read::SymbolPresentationField::Language,
-            ),
-            (
-                rift_provider::PresentationField::Name,
-                rift_protocol::read::SymbolPresentationField::Name,
-            ),
-            (
-                rift_provider::PresentationField::QualifiedName,
-                rift_protocol::read::SymbolPresentationField::QualifiedName,
-            ),
-            (
-                rift_provider::PresentationField::Kind,
-                rift_protocol::read::SymbolPresentationField::Kind,
-            ),
-            (
-                rift_provider::PresentationField::Container,
-                rift_protocol::read::SymbolPresentationField::Container,
-            ),
-            (
-                rift_provider::PresentationField::Visibility,
-                rift_protocol::read::SymbolPresentationField::Visibility,
-            ),
-            (
-                rift_provider::PresentationField::DocumentLocal,
-                rift_protocol::read::SymbolPresentationField::DocumentLocal,
-            ),
-            (
-                rift_provider::PresentationField::Origin,
-                rift_protocol::read::SymbolPresentationField::Origin,
-            ),
-        ];
-        for (internal, wire) in fields {
-            assert_eq!(super::wire_presentation_field(internal), wire);
-        }
+    /// `package` rides beside `Project` when a manifest assigned one and always beside
+    /// `Dependency`; `Stdlib` and `External` never carry one.
+    #[test]
+    fn source_location_package_is_present_for_project_and_dependency_alone() {
+        let package = rift_protocol::read::PackageIdentity {
+            manager: "cargo".to_owned(),
+            name: "beacon-core".to_owned(),
+            version: "0.1.0".to_owned(),
+        };
+        assert_eq!(
+            super::source_location_package(&rift_core::SourceLocation::Project { package: None }),
+            None
+        );
+        assert_eq!(
+            super::source_location_package(&rift_core::SourceLocation::Project {
+                package: Some(package.clone())
+            }),
+            Some(package.clone())
+        );
+        assert_eq!(
+            super::source_location_package(&rift_core::SourceLocation::Dependency {
+                package: package.clone()
+            }),
+            Some(package)
+        );
+        assert_eq!(
+            super::source_location_package(&rift_core::SourceLocation::Stdlib {}),
+            None
+        );
+        assert_eq!(
+            super::source_location_package(&rift_core::SourceLocation::External {}),
+            None
+        );
     }
 
     #[test]
@@ -3417,5 +3448,145 @@ pub fn compute() -> i32 {
                 "a withdrawn projection field must fail deserialization: {case}"
             );
         }
+    }
+
+    /// One contribution for the disagreement fixtures, anchored when `identity` is given.
+    fn disagreement_contribution(
+        provider_id: &str,
+        symbol: &str,
+        name: &str,
+        identity: Option<&str>,
+        equivalent_to: Option<(&str, &str)>,
+    ) -> rift_core::Contribution {
+        let facts = rift_core::PortableSymbolFacts::new(
+            rift_core::Language {
+                name: "rust".to_owned(),
+                dialect: None,
+            },
+            name,
+            format!("crate::{name}"),
+            rift_core::ExactKind("function".to_owned()),
+        );
+        let mut builder = rift_core::Contribution::builder(
+            rift_core::ContributionKey::new(
+                rift_core::ProviderId::new(provider_id).expect("provider"),
+                rift_core::ProviderRevision::new(1).expect("revision"),
+                rift_core::ProviderSymbolId::new(symbol).expect("provider symbol"),
+            ),
+            rift_core::SourceApplicability::Independent,
+            facts,
+            rift_core::ContributionOrigin::new(
+                Some(rift_core::SourceLocation::Project { package: None }),
+                rift_core::SourceKind::Authored,
+            )
+            .expect("origin"),
+        );
+        if let Some(identity) = identity {
+            builder = builder
+                .source(rift_core::DeclarationBinding::new(
+                    rift_core::SourceUnitId::parse("rift://source/rift.sources.project/src/lib.rs")
+                        .expect("source unit"),
+                    rift_core::SourceRange::new(0, 8).expect("range"),
+                    None,
+                ))
+                .identity_anchor(rift_core::SymbolId::new(identity).expect("identity"));
+        }
+        if let Some((provider_id, symbol)) = equivalent_to {
+            builder = builder.equivalence(vec![rift_core::EquivalenceEvidence::Explicit(
+                rift_core::ContributionReference::new(
+                    rift_core::ProviderId::new(provider_id).expect("provider"),
+                    rift_core::ProviderSymbolId::new(symbol).expect("provider symbol"),
+                ),
+            )]);
+        }
+        builder.build().expect("contribution")
+    }
+
+    /// Normalizes one two-provider graph whose contributions disagree on the name.
+    fn disagreeing_assembly(identity: Option<&str>) -> rift_provider::AssembledSymbol {
+        let limits = rift_provider::PublicationLimits::default();
+        let syntax = rift_provider::ProviderPublication::new(
+            rift_core::ProviderId::new("syntax").expect("provider"),
+            rift_core::ProviderRevision::new(1).expect("revision"),
+            vec![disagreement_contribution(
+                "syntax",
+                "syntax-beacon",
+                "Beacon",
+                identity,
+                None,
+            )],
+            limits,
+        )
+        .expect("syntax publication");
+        let binding = rift_provider::ProviderPublication::new(
+            rift_core::ProviderId::new("binding").expect("provider"),
+            rift_core::ProviderRevision::new(1).expect("revision"),
+            vec![disagreement_contribution(
+                "binding",
+                "binding-beacon",
+                "beacon",
+                None,
+                Some(("syntax", "syntax-beacon")),
+            )],
+            limits,
+        )
+        .expect("binding publication");
+        let set = rift_provider::PublicationSet::empty(limits)
+            .replaced(syntax)
+            .and_then(|set| set.replaced(binding))
+            .expect("publications");
+        let graph = rift_provider::Normalizer::normalize(
+            rift_core::IndexRevision::new(1).expect("index"),
+            rift_core::SourceRevision::new(1).expect("source"),
+            rift_core::TreeRevision::new(1).expect("tree"),
+            &std::sync::Arc::new(set),
+            None,
+        )
+        .expect("graph");
+        let record = graph
+            .records()
+            .iter()
+            .find(|record| record.contributions().len() == 2)
+            .expect("merged record")
+            .clone();
+        rift_provider::SymbolAssembler::assemble(
+            &graph,
+            &record,
+            &[rift_core::ProviderId::new("syntax").expect("provider")],
+        )
+        .expect("assembled symbol")
+    }
+
+    #[test]
+    fn a_retained_disagreement_becomes_one_symbol_disagreement_warning() {
+        let assembled = disagreeing_assembly(Some("symbol:beacon"));
+        assert!(
+            !assembled.disagreements().is_empty(),
+            "the two-provider fixture must disagree on the name"
+        );
+        let warning = super::symbol_disagreement_warning(&assembled)
+            .expect("an established disagreeing symbol warns");
+        let ReadWarning::SymbolDisagreement {
+            symbol,
+            providers,
+            detail,
+        } = warning
+        else {
+            panic!("the warning must carry the symbol_disagreement code");
+        };
+        assert_eq!(symbol.0, "symbol:beacon");
+        assert_eq!(
+            providers,
+            ["binding"],
+            "the warning names the providers whose presentation lost the selection"
+        );
+        assert!(detail.contains("binding"), "{detail}");
+    }
+
+    #[test]
+    fn a_disagreement_without_an_established_identity_stays_silent() {
+        let assembled = disagreeing_assembly(None);
+        assert!(!assembled.disagreements().is_empty());
+        assert_eq!(super::symbol_disagreement_warning(&assembled), None);
     }
 }
