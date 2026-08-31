@@ -351,8 +351,8 @@ async fn update_with(
                 .stage(staging.path(), latest_version.clone(), progress)
                 .await?;
             progress.report(UpdateStage::Installing);
-            progress.report(UpdateStage::Installed);
             let cleanup = publisher.publish(current_path, &candidate).await?;
+            progress.report(UpdateStage::Installed);
             Ok(UpdateOutcome::Updated {
                 from: current_version,
                 to: latest_version,
@@ -1151,6 +1151,21 @@ mod tests {
         }
     }
 
+    /// A publisher whose replacement always fails, as a read-only install directory's would.
+    struct RefusingPublisher;
+
+    impl Publisher for RefusingPublisher {
+        fn publish(
+            &self,
+            _current: &std::path::Path,
+            _candidate: &std::path::Path,
+        ) -> impl std::future::Future<Output = Result<OldBinaryCleanup, UpdateError>> {
+            std::future::ready(Err(super::archive_error(std::io::Error::other(
+                "the staged binary cannot replace the running one",
+            ))))
+        }
+    }
+
     fn version(value: &str) -> Version {
         Version::parse(value).expect("test version must parse")
     }
@@ -1268,6 +1283,36 @@ mod tests {
                 UpdateStage::Installing,
                 UpdateStage::Installed,
             ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_refused_publish_ends_at_installing() -> TestResult {
+        let source = FakeSource {
+            version: version("0.0.3"),
+            stage_calls: Cell::new(0),
+        };
+        let progress = RecordingProgress::default();
+        let current = std::env::current_exe()?;
+        let refused = update_with(
+            &source,
+            &RefusingPublisher,
+            &current,
+            version("0.0.2"),
+            &progress,
+        )
+        .await;
+        assert!(refused.is_err(), "a refused publish must fail the update");
+        let stages = progress.stages();
+        assert_eq!(
+            stages.last(),
+            Some(&UpdateStage::Installing),
+            "the last reported stage names the step that failed: {stages:?}"
+        );
+        assert!(
+            !stages.contains(&UpdateStage::Installed),
+            "a failed replacement never reports the binary installed: {stages:?}"
         );
         Ok(())
     }
