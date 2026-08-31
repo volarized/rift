@@ -399,6 +399,50 @@ mod tests {
     }
 
     #[test]
+    fn hubs_stop_at_the_bound_and_skip_candidates_with_no_portable_facts() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        let mut source = String::new();
+        for index in 0..25 {
+            source.push_str(&format!("pub fn callee_{index:02}() {{}}\n"));
+        }
+        source
+            .push_str("pub fn caller() {\n    let local = 1;\n    let doubled = local + local;\n");
+        for index in 0..25 {
+            source.push_str(&format!("    callee_{index:02}();\n"));
+        }
+        source.push_str("    assert!(doubled > 0);\n}\n");
+        fs::write(directory.path().join("src/lib.rs"), source)?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let map = service.workspace_map();
+
+        assert_eq!(
+            map.hubs.len(),
+            rift_protocol::map::MAP_HUBS_MAX,
+            "twenty-five referenced callees and a twice-referenced local exceed the bound"
+        );
+        assert!(
+            map.hubs
+                .iter()
+                .all(|hub| !hub.symbol.0.ends_with("/local") && !hub.symbol.0.ends_with("/doubled")),
+            "a local binding carries no portable facts and never ranks as a hub: hubs={:?}",
+            map.hubs
+        );
+        assert_eq!(
+            map.hubs[0].symbol.0, "rift://symbol/rust/src/lib.rs/callee_00",
+            "the twice-referenced local would rank first were it assemblable; the ranked \
+             callees follow in identity order"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn entry_points_lists_the_file_scope_main() -> TestResult {
         let (_directory, service) = fixture()?;
         let map = service.workspace_map();
