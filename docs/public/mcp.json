@@ -11017,7 +11017,7 @@
       }
     },
     {
-      "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies. `rev`\nsearches a version-control revision instead of the current tree. Use `get_symbol`\nwhen the declaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the search index's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate ranked units against one snapshot and merge them into\nresults computed from another.",
+      "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies, and by a\nbounded relationship `traversal` from one seed symbol. `rev` searches a\nversion-control revision instead of the current tree, and never combines with\n`traversal`. Use `get_symbol` when the declaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the search index's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate ranked units against one snapshot and merge them into\nresults computed from another.",
       "input_schema": {
         "$defs": {
           "PathPattern": {
@@ -11058,6 +11058,156 @@
               }
             },
             "type": "object"
+          },
+          "RelationshipFacet": {
+            "description": "One portable category an edge falls into. The local kinds `import` and `use` can share\nthe `imports` facet, which lets one query cross languages.",
+            "oneOf": [
+              {
+                "const": "contains",
+                "description": "The source contains the target within its scope.",
+                "type": "string"
+              },
+              {
+                "const": "declares",
+                "description": "The source declares the target.",
+                "type": "string"
+              },
+              {
+                "const": "augments",
+                "description": "The source adds to a declaration made elsewhere.",
+                "type": "string"
+              },
+              {
+                "const": "references",
+                "description": "The source mentions the target.",
+                "type": "string"
+              },
+              {
+                "const": "calls",
+                "description": "The source invokes the target.",
+                "type": "string"
+              },
+              {
+                "const": "constructs",
+                "description": "The source creates an instance of the target.",
+                "type": "string"
+              },
+              {
+                "const": "reads",
+                "description": "The source reads the target's value.",
+                "type": "string"
+              },
+              {
+                "const": "writes",
+                "description": "The source assigns to the target.",
+                "type": "string"
+              },
+              {
+                "const": "imports",
+                "description": "The source brings the target into scope.",
+                "type": "string"
+              },
+              {
+                "const": "exports",
+                "description": "The source exposes the target outside its unit.",
+                "type": "string"
+              },
+              {
+                "const": "extends",
+                "description": "The source inherits from the target.",
+                "type": "string"
+              },
+              {
+                "const": "implements",
+                "description": "The source fulfils the target's interface.",
+                "type": "string"
+              },
+              {
+                "const": "has_type",
+                "description": "The source is typed by the target.",
+                "type": "string"
+              },
+              {
+                "const": "overrides",
+                "description": "The source replaces the target inherited from a supertype.",
+                "type": "string"
+              },
+              {
+                "const": "aliases",
+                "description": "The source is another name for the target.",
+                "type": "string"
+              },
+              {
+                "const": "generates",
+                "description": "The source produces the target as generated code.",
+                "type": "string"
+              },
+              {
+                "const": "depends_on",
+                "description": "The source requires the target to build or run.",
+                "type": "string"
+              },
+              {
+                "const": "annotated_by",
+                "description": "The source carries the target as an annotation.",
+                "type": "string"
+              },
+              {
+                "const": "throws",
+                "description": "The source can raise the target.",
+                "type": "string"
+              },
+              {
+                "const": "catches",
+                "description": "The source handles the target when raised.",
+                "type": "string"
+              },
+              {
+                "const": "bounded_by",
+                "description": "The source's type parameter is constrained by the target.",
+                "type": "string"
+              },
+              {
+                "const": "instantiates",
+                "description": "The source applies concrete arguments to the generic target.",
+                "type": "string"
+              },
+              {
+                "const": "specializes",
+                "description": "The source is a specialization of the generic target.",
+                "type": "string"
+              },
+              {
+                "const": "overloads",
+                "description": "The source and target are separately dispatched forms of one name.",
+                "type": "string"
+              },
+              {
+                "const": "mixes_in",
+                "description": "The source incorporates the target as a mixin.",
+                "type": "string"
+              },
+              {
+                "const": "embeds",
+                "description": "The source embeds the target within its own definition.",
+                "type": "string"
+              },
+              {
+                "const": "tests",
+                "description": "The source exercises the target as a test.",
+                "type": "string"
+              },
+              {
+                "const": "configures",
+                "description": "The source supplies configuration for the target.",
+                "type": "string"
+              },
+              {
+                "const": "binds",
+                "description": "The source binds a name or value to the target.",
+                "type": "string"
+              }
+            ]
           },
           "ResultOrder": {
             "description": "The total order a paginated answer comes back in. Every order ends in the result's own\nidentity, so two results that tie never swap places between pages.",
@@ -11121,6 +11271,82 @@
                 "type": "string"
               }
             ]
+          },
+          "SearchTraversal": {
+            "additionalProperties": false,
+            "description": "A bounded relationship walk starting at one symbol. From `seed`, the server visits its\nneighbors, then their neighbors, up to `depth` hops, following `direction` and narrowed to\n`facets`; each reached symbol keeps the shortest path the walk found to it.",
+            "properties": {
+              "depth": {
+                "default": 1,
+                "description": "Hops the walk may take from `seed`. The server accepts 1 or 2. Omitted, 1.",
+                "format": "uint64",
+                "maximum": 2,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "direction": {
+                "$ref": "#/$defs/TraversalDirection",
+                "default": "outgoing",
+                "description": "Which edges the walk follows from each visited symbol. Omitted, `outgoing`."
+              },
+              "facets": {
+                "description": "Portable relationship facets eligible for the walk. Omitted or empty, every facet is\neligible.",
+                "items": {
+                  "$ref": "#/$defs/RelationshipFacet"
+                },
+                "maxItems": 29,
+                "type": "array"
+              },
+              "seed": {
+                "$ref": "#/$defs/SymbolId",
+                "description": "The declaration the walk starts at. The seed itself is never a hit."
+              },
+              "to": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/SymbolId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "When set, the answer keeps only the hit whose walk reaches this symbol, at its\nshortest path. A `to` the walk cannot reach within `depth` answers empty, not refused."
+              }
+            },
+            "required": [
+              "seed"
+            ],
+            "type": "object"
+          },
+          "SymbolId": {
+            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name.",
+            "examples": [
+              "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
+            ],
+            "maxLength": 8192,
+            "minLength": 17,
+            "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$",
+            "type": "string"
+          },
+          "TraversalDirection": {
+            "description": "Which edge direction a search traversal walks from each visited symbol.",
+            "oneOf": [
+              {
+                "const": "outgoing",
+                "description": "Walks edges leaving each visited symbol.",
+                "type": "string"
+              },
+              {
+                "const": "incoming",
+                "description": "Walks edges arriving at each visited symbol.",
+                "type": "string"
+              },
+              {
+                "const": "both",
+                "description": "Walks edges in both directions.",
+                "type": "string"
+              }
+            ]
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -11148,6 +11374,20 @@
             "order": "path",
             "query": "load_config",
             "target": "symbol"
+          },
+          {
+            "limit": 25,
+            "target": "symbol",
+            "traversal": {
+              "depth": 2,
+              "direction": "incoming",
+              "facets": [
+                "calls",
+                "references",
+                "imports"
+              ],
+              "seed": "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
+            }
           }
         ],
         "properties": {
@@ -11216,6 +11456,17 @@
             "$ref": "#/$defs/SearchParamsTarget",
             "default": "all",
             "description": "Which entity kinds may be returned - a kind selector, never the text to search for;\nthat is `query`. Omitted, every kind may match."
+          },
+          "traversal": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/SearchTraversal"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A bounded relationship walk, standing alone or beside `query`. A symbol the walk\nreaches becomes a hit tagged `relationship`; one also matched lexically keeps its\nlexical score and gains the walk's path. `target: \"file\"` never carries a walked hit,\nsince a traversal only reaches symbols. With no `query`, `relevance` orders hits by\nascending `distance`, then identity. Never combines with `rev`: the relationship\ngraph serves the current tree alone."
           }
         },
         "rift:since": "v0.0.6",

@@ -4,11 +4,12 @@
 
 use crate::read::{
     Language, NodeId, PAGE_INDEX_DEFAULT, Pagination, ProjectPath, ReadWarning, Relationship,
-    RevisionId, Symbol, TextRange,
+    RelationshipFacet, RevisionId, Symbol, SymbolId, TextRange,
 };
 use crate::schema;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use strum::VariantArray;
 
 /// One auditable step in a search traversal. `relationship` retains source-node evidence and
 /// derivation; `direction` records how the walk followed it.
@@ -247,8 +248,8 @@ pub enum SearchInclude {
     Score,
 }
 
-/// Criteria for one search. The caller supplies lexical `query`, and `paths` narrows the
-/// files eligible for it.
+/// Criteria for one search. The caller supplies a lexical `query`, a relationship
+/// `traversal`, or both; `paths` narrows the files eligible for either.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(extend("rift:since" = "v0.0.6"))]
@@ -275,6 +276,20 @@ pub enum SearchInclude {
         "query": "load_config",
         "order": "path",
         "limit": 10
+    },
+    {
+        "target": "symbol",
+        "traversal": {
+            "seed": "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService",
+            "direction": "incoming",
+            "depth": 2,
+            "facets": [
+                "calls",
+                "references",
+                "imports"
+            ]
+        },
+        "limit": 25
     }
 ]))]
 pub struct SearchParams {
@@ -314,6 +329,14 @@ pub struct SearchParams {
     /// refuses a revision search when the workspace has no version-control repository.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rev: Option<RevisionId>,
+    /// A bounded relationship walk, standing alone or beside `query`. A symbol the walk
+    /// reaches becomes a hit tagged `relationship`; one also matched lexically keeps its
+    /// lexical score and gains the walk's path. `target: "file"` never carries a walked hit,
+    /// since a traversal only reaches symbols. With no `query`, `relevance` orders hits by
+    /// ascending `distance`, then identity. Never combines with `rev`: the relationship
+    /// graph serves the current tree alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traversal: Option<SearchTraversal>,
 }
 
 fn default_search_params_target() -> SearchParamsTarget {
@@ -470,9 +493,75 @@ pub struct SearchResult {
     pub warnings: Vec<ReadWarning>,
 }
 
+/// Default `depth` for a search traversal: one hop, because a second hop can multiply weak
+/// edges.
+pub const SEARCH_TRAVERSAL_DEPTH_DEFAULT: u64 = 1;
+/// Least `depth` a search traversal accepts.
+pub const SEARCH_TRAVERSAL_DEPTH_MIN: u64 = 1;
+/// Most `depth` a search traversal accepts - the same bound `SearchHit.traversal_path`'s
+/// length and `SearchHit.distance`'s range carry, since a hop count and a path length name
+/// the same walk.
+pub const SEARCH_TRAVERSAL_DEPTH_MAX: u64 = 2;
+/// Most facets one `SearchTraversal.facets` list may carry: `RelationshipFacet`'s own variant
+/// count, so a list padded past every distinct facet is refused rather than accepted and
+/// silently deduplicated.
+pub const SEARCH_TRAVERSAL_FACETS_MAX: usize = RelationshipFacet::VARIANTS.len();
+
+/// A bounded relationship walk starting at one symbol. From `seed`, the server visits its
+/// neighbors, then their neighbors, up to `depth` hops, following `direction` and narrowed to
+/// `facets`; each reached symbol keeps the shortest path the walk found to it.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchTraversal {
+    /// The declaration the walk starts at. The seed itself is never a hit.
+    pub seed: SymbolId,
+    /// Which edges the walk follows from each visited symbol. Omitted, `outgoing`.
+    #[serde(default = "default_search_traversal_direction")]
+    pub direction: TraversalDirection,
+    /// Portable relationship facets eligible for the walk. Omitted or empty, every facet is
+    /// eligible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 29))]
+    pub facets: Vec<RelationshipFacet>,
+    /// Hops the walk may take from `seed`. The server accepts 1 or 2. Omitted, 1.
+    #[serde(default = "default_search_traversal_depth")]
+    #[schemars(range(min = 1_u64, max = 2_u64))]
+    pub depth: u64,
+    /// When set, the answer keeps only the hit whose walk reaches this symbol, at its
+    /// shortest path. A `to` the walk cannot reach within `depth` answers empty, not refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<SymbolId>,
+}
+
+fn default_search_traversal_direction() -> TraversalDirection {
+    TraversalDirection::Outgoing
+}
+
+fn default_search_traversal_depth() -> u64 {
+    SEARCH_TRAVERSAL_DEPTH_DEFAULT
+}
+
+/// Which edge direction a search traversal walks from each visited symbol.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TraversalDirection {
+    /// Walks edges leaving each visited symbol.
+    Outgoing,
+    /// Walks edges arriving at each visited symbol.
+    Incoming,
+    /// Walks edges in both directions.
+    Both,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PAGE_INDEX_DEFAULT, PathPattern, PathPatternViolation, SearchParams};
+    use super::{
+        PAGE_INDEX_DEFAULT, PathPattern, PathPatternViolation, SEARCH_TRAVERSAL_DEPTH_DEFAULT,
+        SEARCH_TRAVERSAL_DEPTH_MAX, SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX,
+        SearchHit, SearchParams, SearchTraversal, TraversalDirection,
+    };
     use serde_json::json;
 
     /// Attribute arguments and `#[serde(default = ...)]` functions are both compiled apart
@@ -542,5 +631,94 @@ mod tests {
                 "violation={violation:?}"
             );
         }
+    }
+
+    /// Attribute arguments and `#[serde(default = ...)]` functions are both compiled apart
+    /// from the schema; this pins the advertised defaults to the constants their default
+    /// functions return.
+    #[test]
+    fn search_traversal_schema_defaults_equal_the_enforced_constants() {
+        let schema = serde_json::to_value(schemars::schema_for!(SearchTraversal)).expect("schema");
+        let properties = &schema["properties"];
+        assert_eq!(properties["direction"]["default"], json!("outgoing"));
+        assert_eq!(
+            properties["depth"]["default"],
+            json!(SEARCH_TRAVERSAL_DEPTH_DEFAULT)
+        );
+    }
+
+    /// `#[schemars(length(max = ...))]` and `#[schemars(range(min = ..., max = ...))]` take
+    /// only literals, so this pins every literal this PR added back to the named constants
+    /// that state what they mean - a future facet or a hand-edited literal fails here first.
+    #[test]
+    fn search_traversal_schema_bounds_equal_the_enforced_constants() {
+        let schema = serde_json::to_value(schemars::schema_for!(SearchTraversal)).expect("schema");
+        let properties = &schema["properties"];
+        assert_eq!(
+            properties["facets"]["maxItems"],
+            json!(SEARCH_TRAVERSAL_FACETS_MAX)
+        );
+        assert_eq!(
+            properties["depth"]["minimum"],
+            json!(SEARCH_TRAVERSAL_DEPTH_MIN)
+        );
+        assert_eq!(
+            properties["depth"]["maximum"],
+            json!(SEARCH_TRAVERSAL_DEPTH_MAX)
+        );
+    }
+
+    /// A hop count and a path length name the same walk: `SearchTraversal.depth`,
+    /// `SearchHit.traversal_path`'s length, and `SearchHit.distance`'s range must all agree,
+    /// or a depth this schema accepts could mint a hit its own schema refuses.
+    #[test]
+    fn search_traversal_depth_bound_matches_the_shipped_hit_bounds() {
+        let hit_schema = serde_json::to_value(schemars::schema_for!(SearchHit)).expect("schema");
+        let hit_properties = &hit_schema["properties"];
+        assert_eq!(
+            hit_properties["traversal_path"]["minItems"],
+            json!(SEARCH_TRAVERSAL_DEPTH_MIN)
+        );
+        assert_eq!(
+            hit_properties["traversal_path"]["maxItems"],
+            json!(SEARCH_TRAVERSAL_DEPTH_MAX)
+        );
+        assert_eq!(
+            hit_properties["distance"]["minimum"],
+            json!(SEARCH_TRAVERSAL_DEPTH_MIN)
+        );
+        assert_eq!(
+            hit_properties["distance"]["maximum"],
+            json!(SEARCH_TRAVERSAL_DEPTH_MAX)
+        );
+    }
+
+    /// `deny_unknown_fields` refuses a request naming a field this model never served, such
+    /// as the withdrawn `intent` or `max_hops` PR #171 removed.
+    #[test]
+    fn search_traversal_rejects_an_unknown_field() {
+        let result: Result<SearchTraversal, _> = serde_json::from_value(json!({
+            "seed": "rift://symbol/rust/src/lib.rs/beacon",
+            "intent": "trace"
+        }));
+        assert!(
+            result.is_err(),
+            "an unknown traversal field must fail deserialization"
+        );
+    }
+
+    #[test]
+    fn search_params_with_traversal_and_no_query_parses() {
+        let params: SearchParams = serde_json::from_value(json!({
+            "traversal": {
+                "seed": "rift://symbol/rust/src/lib.rs/beacon"
+            }
+        }))
+        .expect("a traversal-only request must parse");
+        let traversal = params.traversal.expect("traversal must be present");
+        assert_eq!(traversal.direction, TraversalDirection::Outgoing);
+        assert_eq!(traversal.depth, SEARCH_TRAVERSAL_DEPTH_DEFAULT);
+        assert!(traversal.facets.is_empty());
+        assert!(traversal.to.is_none());
     }
 }

@@ -24,8 +24,10 @@ pub(crate) const LANGUAGE_IDENTITY_BYTES_MAX: usize = LANGUAGE_WORD_BYTES_MAX * 
 // existing `rift_protocol::read::SearchParams`-style path resolving.
 pub use crate::search::{
     GraphHop, HopDirection, MatchedField, PathPattern, PathPatternViolation, PathSelector,
-    ResultOrder, SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget,
-    SearchResult,
+    ResultOrder, SEARCH_TRAVERSAL_DEPTH_DEFAULT, SEARCH_TRAVERSAL_DEPTH_MAX,
+    SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX, SearchHit, SearchHitTarget,
+    SearchInclude, SearchParams, SearchParamsTarget, SearchResult, SearchTraversal,
+    TraversalDirection,
 };
 // Diagnostic-family models (`Diagnostic`, its context, and their neighbors) live in
 // `diagnostic` so this module stays below its size bound; re-exporting them here keeps every
@@ -1001,7 +1003,17 @@ pub enum RelationshipDerivation {
 /// One portable category an edge falls into. The local kinds `import` and `use` can share
 /// the `imports` facet, which lets one query cross languages.
 #[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    JsonSchema,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+    strum::VariantArray,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum RelationshipFacet {
