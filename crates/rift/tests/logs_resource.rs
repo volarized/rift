@@ -90,6 +90,14 @@ fn printed_timestamp(line: &str) -> &str {
     line.split_whitespace().next().unwrap_or_default()
 }
 
+/// Whether `stamp` ends with a signed `HH:MM` offset, as every rendered
+/// timestamp does now that the renderer always resolves a time zone.
+fn ends_with_a_numeric_offset(stamp: &str) -> bool {
+    stamp.len() >= 6
+        && matches!(stamp.as_bytes()[stamp.len() - 6], b'+' | b'-')
+        && stamp.as_bytes()[stamp.len() - 3] == b':'
+}
+
 /// Polls `transcript` for `needle`, bounded by [`RECORD_ATTEMPTS`] reads.
 ///
 /// The follower writes as it prints, so a read that has not seen the line yet
@@ -206,8 +214,8 @@ async fn the_logs_command_prints_the_recorded_set_oldest_first() -> TestResult {
     for line in &lines {
         let stamp = printed_timestamp(line).to_owned();
         assert!(
-            stamp.ends_with('Z'),
-            "every line opens with a timestamp: {line:?}"
+            ends_with_a_numeric_offset(&stamp),
+            "every line opens with a timestamp carrying a numeric offset: {line:?}"
         );
         assert!(stamp >= previous, "records print oldest first: {lines:?}");
         previous = stamp;
