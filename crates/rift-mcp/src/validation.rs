@@ -24,6 +24,7 @@ use rift_protocol::configuration::{
     LspConfiguration, SearchConfiguration, ServerConfiguration, WorkspaceConfiguration,
 };
 use rift_protocol::error as wire;
+use rift_protocol::map::WorkspaceMap;
 use rift_search::{Embedding, SearchError, SearchIndex};
 use rift_server::{
     CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, LspProcessKey, ReadError, ReadFault,
@@ -203,6 +204,9 @@ pub(crate) struct PublishedWorkspace {
     pub(crate) configuration: ConfigurationState,
     pub(crate) fingerprint: WorkspaceFingerprint,
     pub(crate) source_policy: Arc<WorkspaceSourcePolicy>,
+    /// Workspace orientation snapshot served by `rift://map`, computed once for this
+    /// publication and reused until the next one - a read costs a lookup, never a rebuild.
+    pub(crate) map: Arc<WorkspaceMap>,
     pub(crate) epoch: u64,
 }
 
@@ -1167,11 +1171,13 @@ fn whole_workspace_candidate(
     let source_policy = reads.source_policy_handle().unwrap_or_else(|| {
         unreachable!("a current-tree read service always compiles its source policy")
     });
+    let map = Arc::new(reads.workspace_map());
     Ok(PublishedWorkspace {
         fingerprint: reads.workspace_fingerprint().clone(),
         reads: Arc::new(reads),
         configuration,
         source_policy,
+        map,
         epoch,
     })
 }
@@ -1193,15 +1199,18 @@ fn shared_workspace_candidate(
             configuration,
             fingerprint: previous.fingerprint.clone(),
             source_policy: Arc::clone(&previous.source_policy),
+            map: Arc::clone(&previous.map),
             epoch,
         });
     }
     let reads = previous.reads.rebuilt(changes)?;
+    let map = Arc::new(reads.workspace_map());
     Ok(PublishedWorkspace {
         fingerprint: reads.workspace_fingerprint().clone(),
         reads: Arc::new(reads),
         configuration,
         source_policy: Arc::clone(&previous.source_policy),
+        map,
         epoch,
     })
 }

@@ -2889,6 +2889,7 @@ mod tests {
                 },
                 fingerprint: candidate.fingerprint.clone(),
                 source_policy: Arc::clone(&candidate.source_policy),
+                map: Arc::clone(&candidate.map),
                 epoch: 0,
             }),
             failure: None,
