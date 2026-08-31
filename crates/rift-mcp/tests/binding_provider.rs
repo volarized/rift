@@ -1,6 +1,6 @@
-//! Proves the binding provider reaches the caller-visible read surface:
-//! `get_symbol` lists a `binding` contribution beside `syntax` for a
-//! declaration another unit references.
+//! Proves the binding provider reaches the caller-visible read surface: `get_symbol`'s
+//! `helper` hit carries the binding provider's namespaced extension, published beside
+//! syntax's own facts for a declaration another unit references.
 
 mod hermetic_search;
 // `served_relative_workspace` is part of `workspace_client`'s shared surface; this
@@ -11,22 +11,15 @@ mod workspace_client;
 use serde_json::{Value, json};
 use workspace_client::{TestResult, call_retrying_acceptance, served_workspace, tool_request};
 
-/// The providers named by one hit's `contributions` list.
-fn contribution_providers(hit: &Value) -> Vec<&str> {
-    hit["symbol"]["contributions"]
-        .as_array()
-        .expect("hit carries a contributions list")
-        .iter()
-        .map(|contribution| {
-            contribution["provider"]
-                .as_str()
-                .expect("contribution names its provider")
-        })
-        .collect()
-}
+/// The reverse-domain key `crates/rift-binding/src/publish.rs`'s `BindingPublisher`
+/// carries its facts under (`BINDING_EXTENSION_KEY`). The binding provider is the only
+/// Contribution that publishes it, so its presence in `extensions` is what the wire
+/// still shows now that `contributions` left the wire: `Symbol.extensions` merges every
+/// selected Contribution's namespaced facts regardless of which fields it carries.
+const BINDING_EXTENSION_KEY: &str = "org.rift.binding";
 
 #[tokio::test]
-async fn get_symbol_lists_the_binding_provider_beside_syntax() -> TestResult {
+async fn get_symbol_shows_the_binding_provider_through_extensions() -> TestResult {
     let (_directory, client, _server_task) = served_workspace(
         &[
             (
@@ -51,16 +44,19 @@ async fn get_symbol_lists_the_binding_provider_beside_syntax() -> TestResult {
         .iter()
         .find(|hit| hit["symbol"]["name"] == json!("helper"))
         .ok_or("the helper declaration must be a hit")?;
-    let providers = contribution_providers(hit);
     assert!(
-        providers.contains(&"syntax"),
-        "the declaration keeps its syntax contribution: {providers:?}"
-    );
-    assert!(
-        providers.contains(&"binding"),
-        "the binding provider's definition joins the same record: {providers:?}"
+        has_binding_extension(hit),
+        "the binding provider's definition Contribution carries {BINDING_EXTENSION_KEY} \
+         in the merged extensions: {hit}"
     );
 
     client.cancel().await?;
     Ok(())
+}
+
+/// Whether one hit's symbol carries the binding provider's namespaced extension key.
+fn has_binding_extension(hit: &Value) -> bool {
+    hit["symbol"]["extensions"]
+        .get(BINDING_EXTENSION_KEY)
+        .is_some()
 }

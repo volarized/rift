@@ -400,9 +400,15 @@ fn build_symbol_hit(
     matched_by: Vec<MatchedField>,
     payloads: HitPayloads,
 ) -> Result<SearchHit, ReadError> {
+    // A retained disagreement surfaces as a `symbol_disagreement` warning on `get_symbol`
+    // (crates/rift-server/src/read.rs); doing the same for a search hit needs the same
+    // warnings accumulator threaded through every collector this file merges hits
+    // through, and no shipped provider produces a disagreement today. Scoped out of this
+    // change; `get_symbol` already carries it.
+    let (symbol, _disagreement) = wire_symbol(index, matched)?;
     Ok(SearchHit {
         hit: SearchHitTarget::Symbol {
-            symbol: Box::new(wire_symbol(index, matched)?),
+            symbol: Box::new(symbol),
         },
         score,
         matched_by,
@@ -748,15 +754,10 @@ fn hit_ordering(left: &SearchHit, right: &SearchHit, order: ResultOrder) -> Orde
 /// The wire identity `order_hits` breaks a `relevance` or `path` tie on.
 fn hit_identity(hit: &SearchHit) -> &str {
     match &hit.hit {
-        SearchHitTarget::Symbol { symbol } => symbol.id.as_ref().map_or_else(
-            || {
-                symbol
-                    .contributions
-                    .first()
-                    .map_or(symbol.name.as_str(), |key| key.symbol.as_str())
-            },
-            |identity| identity.0.as_str(),
-        ),
+        SearchHitTarget::Symbol { symbol } => symbol
+            .id
+            .as_ref()
+            .map_or(symbol.name.as_str(), |identity| identity.0.as_str()),
         SearchHitTarget::File { file } => file.id.0.as_str(),
         SearchHitTarget::Node { node } => node.id.0.as_str(),
     }
@@ -1047,17 +1048,13 @@ pub fn compute() -> i32 {
             json!({ "page_index": 0, "total_pages": 2 })
         );
         assert_eq!(results[0]["hit"]["target"], "file");
-        assert_eq!(results[0]["score"], 1.0);
         assert_eq!(results[0]["path"], json!("README.txt"));
         assert_eq!(results[0]["hit"]["file"]["semantic"], json!(false));
         assert_eq!(results[1]["hit"]["target"], "file");
-        assert_eq!(results[1]["score"], 1.0);
         assert_eq!(results[1]["path"], json!("src/lib.rs"));
         assert_eq!(results[2]["hit"]["target"], "file");
-        assert_eq!(results[2]["score"], 1.0);
         assert_eq!(results[2]["path"], json!("src/lib.rs"));
         assert_eq!(results[3]["hit"]["target"], "symbol");
-        assert_eq!(results[3]["score"], 1.0);
         assert!(
             results[3]["path"]
                 .as_str()

@@ -308,16 +308,7 @@ fn default_get_symbol_params_page_index() -> u64 {
         "hits": [
             {
                 "symbol": {
-                    "index_revision": 1,
                     "id": "rift://symbol/rust/src/config.rs/load_config",
-                    "resolution": "established",
-                    "contributions": [
-                        {
-                            "provider": "syntax",
-                            "symbol": "load_config",
-                            "publication": 1
-                        }
-                    ],
                     "language": {
                         "name": "rust"
                     },
@@ -328,13 +319,6 @@ fn default_get_symbol_params_page_index() -> u64 {
                         "callable",
                         "public"
                     ],
-                    "origin": {
-                        "location": {
-                            "kind": "project"
-                        },
-                        "source_kind": "authored",
-                        "unit": "rift://source/project/src/config.rs"
-                    },
                     "visibility": "pub",
                     "types": [
                         {
@@ -1058,6 +1042,21 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
+    /// Contributions selected for one symbol's presentation disagree on at least one
+    /// field. The answer carries what normalization selected; the warning names the
+    /// symbol and every provider whose Contribution differed, so a caller can weigh
+    /// whether the difference matters to it.
+    SymbolDisagreement {
+        /// The symbol whose presentation facts disagree.
+        symbol: SymbolId,
+        /// Providers whose Contribution carries a differing value for at least one
+        /// presentation field, sorted and deduplicated.
+        #[schemars(length(min = 1))]
+        providers: Vec<String>,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
 }
 
 /// One named part of a node. A language marks these out inside a declaration, so an
@@ -1364,7 +1363,9 @@ pub enum SourceKind {
 }
 
 /// Where source belongs. Package ownership is separate from whether source was authored or
-/// generated.
+/// generated. `rift-core`'s `ContributionOrigin` carries this exact type as its own
+/// working representation; no served tool schema reaches it, so it carries no wire
+/// examples of its own - [`SourceLocationKind`] is what a caller reads on `SymbolOrigin`.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "kind", deny_unknown_fields, rename_all = "snake_case")]
 pub enum SourceLocation {
@@ -1384,6 +1385,24 @@ pub enum SourceLocation {
     Stdlib {},
     /// Source outside the project, dependency graph, and standard library.
     External {},
+}
+
+/// Which of the four places a declaration's source belongs, on `SymbolOrigin`. Package
+/// ownership is the separate `package` field: a `project` declaration can carry one too,
+/// and `dependency` always does.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceLocationKind {
+    /// Owned by the current workspace.
+    Project,
+    /// Owned by one resolved dependency.
+    Dependency,
+    /// Installed with the language toolchain.
+    Stdlib,
+    /// Outside the project, dependency graph, and standard library.
+    External,
 }
 
 /// A byte range of one file.
@@ -1422,87 +1441,17 @@ pub struct SourceUnitSpan {
     pub range: TextRange,
 }
 
-/// Identity of one immutable Contribution.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ContributionKey {
-    /// Provider that published this Contribution.
-    #[schemars(length(max = 4096))]
-    pub provider: String,
-    /// Provider-local symbol identity.
-    #[schemars(length(max = 8192))]
-    pub symbol: String,
-    /// Provider publication containing this Contribution.
-    #[schemars(range(min = 1_u64))]
-    pub publication: u64,
-}
-
-/// Resolution state of one readable Symbol.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum SymbolResolution {
-    /// One identity anchor establishes Symbol identity.
-    Established,
-    /// No accepted evidence establishes Symbol identity.
-    Unresolved,
-    /// More than one identity anchor applies.
-    Conflicting,
-}
-
-/// Presentation field whose retained Contributions disagree.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum SymbolPresentationField {
-    /// Language differs.
-    Language,
-    /// Short name differs.
-    Name,
-    /// Provider-qualified name differs.
-    QualifiedName,
-    /// Exact kind differs.
-    Kind,
-    /// Containing symbol differs.
-    Container,
-    /// Visibility differs.
-    Visibility,
-    /// Document-local classification differs.
-    DocumentLocal,
-    /// Origin differs.
-    Origin,
-}
-
-/// One disagreement retained beside selected presentation facts.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SymbolDisagreement {
-    /// Contribution carrying another value.
-    pub contribution: ContributionKey,
-    /// Presentation field that differs.
-    pub field: SymbolPresentationField,
-}
-
 /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
 /// and is connected through Relationship.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::declare_symbol_empty_defaults)]
 pub struct Symbol {
-    /// Captured index revision used to assemble this Symbol.
-    #[schemars(range(min = 1_u64))]
-    pub index_revision: u64,
-    /// Unique identifier of this Symbol across the whole workspace. Present only when
-    /// `resolution` is `established`.
+    /// Unique identifier of this Symbol across the whole workspace. Absent for an
+    /// unestablished symbol: no accepted evidence, or more than one, established its
+    /// identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<SymbolId>,
-    /// Whether normalization established one Symbol identity.
-    pub resolution: SymbolResolution,
-    /// Contributions selected for this request, in presentation order. Absent when empty.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub contributions: Vec<ContributionKey>,
     /// The language this symbol belongs to.
     pub language: Language,
     /// The human-readable name, as written in the source: `parseConfig`. Rendered
@@ -1516,8 +1465,13 @@ pub struct Symbol {
     /// kinds `trait` and `interface` can both carry the `type` facet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub facets: Vec<SymbolFacet>,
-    /// Where the declaration belongs, how it was produced, and its source unit when
-    /// readable.
+    /// Where the declaration belongs, how it was produced, and its source unit where that
+    /// differs from the hit's own path. Absent when it says a project declaration,
+    /// authored, with no package - the common case.
+    #[serde(
+        default = "default_symbol_origin",
+        skip_serializing_if = "SymbolOrigin::is_common_default"
+    )]
     pub origin: SymbolOrigin,
     /// The symbol this one belongs to - the class that owns a method, the module that owns
     /// a function. Ownership is not lexical: a Go method is written beside its type and a
@@ -1551,9 +1505,6 @@ pub struct Symbol {
     /// emitted them. Absent when empty.
     #[serde(default, skip_serializing_if = "Extensions::is_empty")]
     pub extensions: Extensions,
-    /// Presentation differences retained after field selection. Absent when empty.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub disagreements: Vec<SymbolDisagreement>,
     /// Whether language semantics confine this symbol to the document that declares it. The
     /// provider classifies locality from its language model; absent when `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1660,18 +1611,46 @@ pub struct SymbolId(
 
 /// Where a symbol belongs and how its declaration came to exist. Source location and
 /// generation are separate: generated code can belong to the project or to a dependency.
+/// Absent from `Symbol` entirely when it says a project declaration, authored, with no
+/// package.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SymbolOrigin {
-    /// Source ownership. Absent exactly when `source_kind` is `synthetic`.
+    /// Which of the four places the declaration belongs. Absent exactly when
+    /// `source_kind` is `synthetic`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub location: Option<SourceLocation>,
+    pub location: Option<SourceLocationKind>,
+    /// The package that owns the declaration: present for `dependency`, and optionally
+    /// for `project`. Absent for `stdlib`, `external`, and a synthetic declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<PackageIdentity>,
     /// Whether the declaration is authored, generated, or synthetic.
     pub source_kind: SourceKind,
-    /// Source-catalog unit containing the declaration. Absent when source is unavailable
-    /// or the declaration is synthetic.
+    /// Source-catalog unit containing the declaration, present only where `location` is
+    /// not `project` - a project declaration's unit already equals the hit's own path.
+    /// Absent when source is unavailable or the declaration is synthetic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<SourceUnitId>,
+}
+
+/// `SymbolOrigin`'s wire default: a project declaration, authored, with no package and no
+/// separate source-catalog unit. `Symbol.origin` omits itself from the wire when it equals
+/// this value.
+fn default_symbol_origin() -> SymbolOrigin {
+    SymbolOrigin {
+        location: Some(SourceLocationKind::Project),
+        package: None,
+        source_kind: SourceKind::Authored,
+        unit: None,
+    }
+}
+
+impl SymbolOrigin {
+    /// Whether this is the common case a caller may assume when `Symbol.origin` is
+    /// absent: a project declaration, authored, with no package.
+    fn is_common_default(&self) -> bool {
+        self == &default_symbol_origin()
+    }
 }
 
 /// One revision that touched a symbol. The history provider parses the declaration at each
@@ -1817,7 +1796,7 @@ mod tests {
     use super::{
         Digest, Duration, FileId, GetSymbolParams, Language, PAGE_INDEX_DEFAULT,
         REVISION_ID_BYTES_MAX, ReadWarning, RevisionId, RevisionIdViolation, SourceUnitId, Symbol,
-        SymbolResolution,
+        SymbolId,
     };
     use schemars::schema_for;
     use serde_json::json;
@@ -1949,36 +1928,55 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_symbol_round_trips_with_contribution_identity() {
+    fn unestablished_symbol_round_trips_with_a_dependency_origin() {
         let value = json!({
-            "index_revision": 7,
-            "resolution": "unresolved",
-            "contributions": [{
-                "provider": "framework",
-                "symbol": "component:Beacon",
-                "publication": 3
-            }],
             "language": { "name": "rust" },
             "name": "Beacon",
             "kind": "rust.struct",
             "facets": ["type"],
             "origin": {
-                "location": { "kind": "project" },
+                "location": "dependency",
+                "package": { "manager": "cargo", "name": "beacon-core", "version": "0.1.0" },
                 "source_kind": "authored"
             }
         });
         let symbol: Symbol =
-            serde_json::from_value(value.clone()).expect("unresolved Symbol decodes");
-        assert_eq!(symbol.id, None);
-        assert_eq!(symbol.resolution, SymbolResolution::Unresolved);
-        assert_eq!(symbol.contributions[0].provider, "framework");
+            serde_json::from_value(value.clone()).expect("unestablished Symbol decodes");
+        assert_eq!(
+            symbol.id, None,
+            "no accepted evidence established an identity"
+        );
         assert_eq!(symbol.modifiers, Vec::<String>::new());
-        assert_eq!(symbol.disagreements, Vec::new());
         assert!(!symbol.document_local);
         assert_eq!(
-            serde_json::to_value(symbol).expect("unresolved Symbol encodes"),
+            serde_json::to_value(symbol).expect("unestablished Symbol encodes"),
             value,
-            "every empty collection and document_local's false stay off the wire"
+            "every empty collection, document_local's false, and a non-default origin stay stable"
+        );
+    }
+
+    /// `Symbol.origin` omits itself from the wire in the common case: a project
+    /// declaration, authored, with no package. Any other case - a dependency, a
+    /// package, a differing `source_kind` - keeps `origin` on the wire.
+    #[test]
+    fn symbol_origin_omits_itself_only_for_the_common_project_authored_case() {
+        let common = json!({
+            "language": { "name": "rust" },
+            "name": "Beacon",
+            "kind": "rust.struct",
+            "facets": ["type"]
+        });
+        let symbol: Symbol =
+            serde_json::from_value(common.clone()).expect("Symbol without origin decodes");
+        assert_eq!(
+            serde_json::to_value(&symbol).expect("serialize"),
+            common,
+            "an absent origin round-trips to the common default and stays absent"
+        );
+        assert_eq!(symbol.origin.source_kind, super::SourceKind::Authored);
+        assert_eq!(
+            symbol.origin.location,
+            Some(super::SourceLocationKind::Project)
         );
     }
 
@@ -2042,6 +2040,22 @@ mod tests {
                     "detail": "src/invalid.rs is not UTF-8 and is absent from the index",
                 }),
             ),
+            (
+                ReadWarning::SymbolDisagreement {
+                    symbol: SymbolId("rift://symbol/rust/src/lib.rs/Beacon".to_owned()),
+                    providers: vec!["binding".to_owned(), "syntax".to_owned()],
+                    detail: "normalization selected one presentation for this symbol; \
+                             binding, syntax disagree on at least one field"
+                        .to_owned(),
+                },
+                json!({
+                    "code": "symbol_disagreement",
+                    "symbol": "rift://symbol/rust/src/lib.rs/Beacon",
+                    "providers": ["binding", "syntax"],
+                    "detail": "normalization selected one presentation for this symbol; \
+                               binding, syntax disagree on at least one field",
+                }),
+            ),
         ];
         for (warning, wire) in cases {
             assert_eq!(serde_json::to_value(&warning).expect("serialize"), wire);
@@ -2064,6 +2078,7 @@ mod tests {
             "semantic_ranking_unavailable",
             "lexical_ranking_unavailable",
             "source_unavailable",
+            "symbol_disagreement",
         ] {
             assert!(
                 codes.contains(&json!({ "const": code, "type": "string" })),
