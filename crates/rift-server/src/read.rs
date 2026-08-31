@@ -16,6 +16,7 @@ use rift_index::{
     WorkspaceIndexLimits, WorkspaceIndexWarning, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::HistoryConfiguration;
+use rift_protocol::map::WorkspaceMap;
 use rift_protocol::read::{
     Digest, ExactKind, Extensions, FileId, GetSymbolHit, GetSymbolInclude, GetSymbolParams,
     GetSymbolResult, Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, PackageIdentity,
@@ -392,6 +393,14 @@ impl ReadService {
     #[must_use]
     pub fn workspace_digests(&self) -> WorkspaceDigests {
         self.index.digests()
+    }
+
+    /// Workspace orientation snapshot: language totals, the directory tree indexed files sit
+    /// under, the most-referenced symbols, entry points, and docs - computed once from this
+    /// snapshot's already-loaded index.
+    #[must_use]
+    pub fn workspace_map(&self) -> WorkspaceMap {
+        crate::map::build_workspace_map(&self.index, self.revisions.wire_index_tree_revision())
     }
 
     /// The visibility policy this snapshot reads the filesystem through.
@@ -1241,6 +1250,13 @@ impl CapturedRevisions {
     /// `DIGEST_WIRE_CHARS` lowercase hex characters.
     pub(crate) fn wire_tree_revision(&self) -> &str {
         &self.tree_revision[..DIGEST_WIRE_CHARS]
+    }
+
+    /// The published index's own tree revision, truncated to its wire form. Distinct from
+    /// [`Self::wire_tree_revision`], which truncates the tree revision a read captured at
+    /// request time - the two agree exactly when the index is not stale.
+    pub(crate) fn wire_index_tree_revision(&self) -> Digest {
+        wire_digest(&self.index_tree_revision)
     }
 }
 
