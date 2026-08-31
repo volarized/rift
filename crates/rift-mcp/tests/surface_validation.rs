@@ -121,8 +121,50 @@ fn corpus() -> Vec<(&'static str, Value)> {
     requests.extend(revision_read_corpus());
     requests.extend(insert_symbol_file_target_corpus());
     requests.extend(lexical_search_corpus());
+    // Ahead of `remove_corpus()`: that corpus removes `remove_watched.rs`'s `beacon_watched`,
+    // the declaration this corpus's seed and `to` both name.
+    requests.extend(traversal_search_corpus());
     requests.extend(remove_corpus());
     requests
+}
+
+/// `traversal` requests over the one real call edge the fixture already carries -
+/// `remove_caller.rs`'s `calls_watched` calling `remove_watched.rs`'s `beacon_watched` - so
+/// this corpus proves the new params without perturbing any other corpus entry's fixture
+/// source. Ordered ahead of `remove_corpus()`, which removes `beacon_watched`. `rev` combined
+/// with `traversal` is proven refused, not accepted, by
+/// `search_traversal_with_rev_refuses_capability_unavailable` below; a runtime refusal has no
+/// structured content to validate against this corpus's output schema.
+fn traversal_search_corpus() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "search",
+            json!({
+                "traversal": {
+                    "seed": "rift://symbol/rust/remove_caller.rs/calls_watched"
+                }
+            }),
+        ),
+        (
+            "search",
+            json!({
+                "traversal": {
+                    "seed": "rift://symbol/rust/remove_watched.rs/beacon_watched",
+                    "direction": "incoming",
+                    "depth": 2
+                }
+            }),
+        ),
+        (
+            "search",
+            json!({
+                "traversal": {
+                    "seed": "rift://symbol/rust/remove_caller.rs/calls_watched",
+                    "to": "rift://symbol/rust/remove_watched.rs/beacon_watched"
+                }
+            }),
+        ),
+    ]
 }
 
 /// `remove_symbol` requests with no language LSP binding: this fixture proves the
@@ -1002,6 +1044,44 @@ async fn rename_symbol_schema_rejects_invalid_requests() -> TestResult {
     client.cancel().await?;
     server_task.await?;
     Ok(())
+}
+
+/// `traversal` combined with `rev` is a schema-valid, runtime-refused request: the edge lane
+/// serves the current tree alone, so the server refuses `capability_unavailable` rather than
+/// answering. This is the one traversal case the schema-validating corpus above cannot carry,
+/// since a refusal produces no structured content to validate.
+#[tokio::test]
+async fn search_traversal_with_rev_refuses_capability_unavailable() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+    let request = tools_call_request(
+        "search",
+        &json!({
+            "rev": "main",
+            "traversal": {
+                "seed": "rift://symbol/rust/remove_caller.rs/calls_watched"
+            }
+        }),
+    )?;
+    let error = client
+        .call_tool(request)
+        .await
+        .expect_err("traversal combined with rev must be refused");
+    let rmcp::ServiceError::McpError(error) = error else {
+        return Err(format!("expected an McpError, found {error:?}").into());
+    };
+    assert_eq!(
+        error.data.as_ref().and_then(|data| data.get("code")),
+        Some(&json!("capability_unavailable")),
+        "{error:?}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+fn tools_call_request(name: &'static str, value: &Value) -> TestResult<CallToolRequestParams> {
+    Ok(CallToolRequestParams::new(name).with_arguments(arguments(value)?))
 }
 
 /// A hunk whose header counts disagree with its body applies, and the
