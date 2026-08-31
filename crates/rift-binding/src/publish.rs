@@ -514,8 +514,19 @@ fn contribution_refused(error: &ContributionError) -> BindingError {
     binding_error(BindingViolation::InvalidContribution, error.to_string())
 }
 
+/// Composes the outer refusal from the publication error's own evidence.
+///
+/// `error.to_string()` renders the inner carrier's action sentence too, and the
+/// outer carrier appends its own; carrying the full render as `detail` would
+/// print the action sentence twice. This keeps only the violation label and
+/// context entries the publication fault attached.
 fn publication_refused(error: &PublicationError) -> BindingError {
-    binding_error(BindingViolation::InvalidPublication, error.to_string())
+    let evidence: Vec<String> = error
+        .context()
+        .iter()
+        .map(|entry| format!("{} {}", entry.key(), entry.value()))
+        .collect();
+    binding_error(BindingViolation::InvalidPublication, evidence.join(", "))
 }
 
 fn adapter_refused(error: &AdapterError) -> BindingError {
@@ -854,6 +865,42 @@ mod tests {
         assert_eq!(
             error.fault().violation(),
             BindingViolation::PublicationWork(ExhaustedLimit::PublicationWork)
+        );
+    }
+
+    /// A refused publication states its evidence and the action sentence exactly once.
+    #[test]
+    fn test_publisher_publication_refusal_states_the_action_sentence_once() {
+        let mut fixture = Fixture::new();
+        let unit = fixture.unit("src/lib.rs");
+        let module = fixture.module(unit, None, 0, 100);
+        fixture.item(module, "run", 1, 9, VisibilitySpelling::Public);
+        let graph = fixture.build();
+        let limits = BindingLimits::default();
+        let (linked, resolutions) = linked_and_resolved(&graph, &limits);
+        let publication_limits = PublicationLimits::new(1, 1, 1).expect("tiny publication limits");
+        let publisher = BindingPublisher::new(
+            ProviderRevision::new(1).expect("revision"),
+            SourceRevision::new(1).expect("source revision"),
+            TreeRevision::new(1).expect("tree revision"),
+            limits,
+            publication_limits,
+        )
+        .expect("publisher");
+        let error = publisher
+            .publish(&graph, &linked, &resolutions)
+            .expect_err("scope and definition contributions cross the tiny per-provider bound");
+        assert_eq!(
+            error.fault().violation(),
+            BindingViolation::InvalidPublication
+        );
+        let text = error.to_string();
+        assert!(text.contains("provider_contribution_limit"), "{text}");
+        assert!(text.contains("contributions"), "{text}");
+        assert_eq!(
+            text.matches("correct the reported field").count(),
+            1,
+            "the action sentence must render exactly once: {text}"
         );
     }
 
