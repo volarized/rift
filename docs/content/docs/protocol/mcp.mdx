@@ -93,7 +93,11 @@ refuses every revision read.
 
 <VersionBadge version="v0.0.13" />
 
-`include_history` applies to project symbols and attaches their version-control timeline as a
+`include` selects the optional fields a hit carries: `source` - the node identity and
+declaration excerpt - and `history` - the version-control timeline. An omitted `include`
+defaults to `["source"]`; an explicit empty list carries neither.
+
+`include: ["history"]` attaches the symbol's version-control timeline as a
 [`SymbolHistory`](/docs/protocol/reference#SymbolHistory). The server follows first parents
 from the served revision along the declaration's current path, bounded by the `max_revisions`
 key in [`[providers.history]`](/docs/configuration#providers), and classifies what each
@@ -114,8 +118,8 @@ request. A request whose `paths.force_include` matches more than that refuses wi
 `limit_exceeded` rather than searching a silently truncated set.
 
 The top-level `include` field is a separate selector: it requests extra payload per hit instead
-of narrowing which files are searched, and `source` - the excerpt around the hit - is its only
-served member.
+of narrowing which files are searched. `source` attaches the excerpt around the hit; `score`
+attaches the fused ranking value used to order the page, comparable only within this one answer.
 
 This request narrows the search to the tests tree, then reaches one file the workspace's
 `[source]` policy excludes from the index:
@@ -209,6 +213,10 @@ a file no provider claims, as this one does.
 The hit above carries no `source`: a request pays that lookup only when `include` names it.
 `include: ["source"]` attaches the excerpt as `source` on every hit; an omitted `include` returns
 the hit's symbol or file, `path`, `range`, and `line` alone, as both hits above do.
+
+A hit's `score` follows the same rule: absent unless `include` names it. `include: ["score"]`
+attaches the fused ranking value that ordered the page, comparable only within this one
+answer.
 
 <McpTool name="nodes" />
 
