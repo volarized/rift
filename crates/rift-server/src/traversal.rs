@@ -786,6 +786,24 @@ mod tests {
     }
 
     #[test]
+    fn search_traversal_paths_selector_drops_a_reached_symbol_outside_it() -> TestResult {
+        let (_directory, service) = live_call_graph_fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "traversal": {
+                "seed": "rift://symbol/rust/lib.rs/root"
+            },
+            "paths": { "include": ["elsewhere/**"] }
+        }))?;
+        let result = service.search(&params, &[])?;
+        assert!(
+            result.results.is_empty(),
+            "every walked hit lives outside the selected paths: {:?}",
+            result.results
+        );
+        Ok(())
+    }
+
+    #[test]
     fn search_traversal_to_keeps_only_the_reached_target_at_its_shortest_path() -> TestResult {
         let (_directory, service) = live_call_graph_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
