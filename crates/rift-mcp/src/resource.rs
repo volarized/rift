@@ -7,6 +7,7 @@
 //! reads refuse.
 
 use rift_index::{LOG_LEVELS, LOG_PAGE_RECORDS_MAX, LogQuery, StoredLogRecord};
+use rift_protocol::map::WorkspaceMap;
 use rift_protocol::workspace::WorkspaceResourcePage;
 use rmcp::ErrorData;
 use rmcp::model::{ReadResourceResult, Resource, ResourceContents, ResourceTemplate};
@@ -22,6 +23,8 @@ pub(crate) const LOGS_COMPONENT_PREFIX: &str = "rift://logs/component/";
 pub(crate) const LOGS_LEVEL_TEMPLATE: &str = "rift://logs/level/{level}";
 /// The template a client expands to reach one component.
 pub(crate) const LOGS_COMPONENT_TEMPLATE: &str = "rift://logs/component/{component}";
+/// The workspace orientation snapshot.
+pub(crate) const MAP_URI: &str = "rift://map";
 /// The first workspace resource page.
 pub(crate) const WORKSPACE_URI: &str = "rift://workspace";
 /// The template a client expands to reach one workspace resource page.
@@ -47,6 +50,14 @@ pub(crate) fn declared_resources() -> Vec<Resource> {
             .with_description(
                 "The server's effective language and hook configuration, with one page of the \
                  captured source catalog.",
+            )
+            .with_mime_type(RESOURCE_MEDIA_TYPE),
+        Resource::new(MAP_URI, "map")
+            .with_title("Workspace map")
+            .with_description(
+                "Workspace orientation snapshot - language totals, the directory tree, the \
+                 most-referenced symbols, entry points, and docs - computed once when the \
+                 index publishes and served from cache until the next one.",
             )
             .with_mime_type(RESOURCE_MEDIA_TYPE),
     ]
@@ -184,6 +195,15 @@ pub(crate) fn rendered_workspace(uri: &str, page: &WorkspaceResourcePage) -> Rea
     ])
 }
 
+/// The typed answer one `rift://map` read returns: the cached snapshot, serialized as is.
+pub(crate) fn rendered_map(uri: &str, map: &WorkspaceMap) -> ReadResourceResult {
+    let body = serde_json::to_string(map)
+        .unwrap_or_else(|error| unreachable!("the workspace map serializes: {error}"));
+    ReadResourceResult::new(vec![
+        ResourceContents::text(body, uri).with_mime_type(RESOURCE_MEDIA_TYPE),
+    ])
+}
+
 /// One stored record as the wire carries it. `fields` is embedded as the object
 /// it was rendered from when it parses, and as text when it does not, so a
 /// reader never has to unquote JSON out of a string.
@@ -206,11 +226,12 @@ fn rendered_record(stored: &StoredLogRecord) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        LOGS_COMPONENT_PREFIX, LOGS_LEVEL_PREFIX, LOGS_URI, WORKSPACE_TEMPLATE, WORKSPACE_URI,
-        declared_resources, declared_templates, is_workspace_uri, log_query, logs_unavailable,
-        rendered_logs, rendered_workspace, workspace_page_index,
+        LOGS_COMPONENT_PREFIX, LOGS_LEVEL_PREFIX, LOGS_URI, MAP_URI, WORKSPACE_TEMPLATE,
+        WORKSPACE_URI, declared_resources, declared_templates, is_workspace_uri, log_query,
+        logs_unavailable, rendered_logs, rendered_map, rendered_workspace, workspace_page_index,
     };
     use rift_index::{LOG_PAGE_RECORDS_MAX, LogRecord, LogStore, StoredLogRecord};
+    use rift_protocol::map::WorkspaceMap;
     use rift_protocol::read::{Digest, Pagination};
     use rift_protocol::workspace::WorkspaceResourcePage;
     use rmcp::model::ResourceContents;
@@ -407,15 +428,52 @@ mod tests {
         }
     }
 
+    /// Empty map under one revision, computed by nothing this test builds.
+    fn empty_map() -> WorkspaceMap {
+        WorkspaceMap {
+            revision: Digest("3f9a1c2e".to_owned()),
+            languages: Vec::new(),
+            modules: Vec::new(),
+            hubs: Vec::new(),
+            entry_points: Vec::new(),
+            docs: Vec::new(),
+            pagination: Pagination {
+                page_index: 0,
+                total_pages: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn rendered_map_answer_carries_typed_json() {
+        let rendered = rendered_map(MAP_URI, &empty_map());
+        let body: Value = serde_json::from_str(&text(&rendered)).expect("the body is JSON");
+
+        assert_eq!(body["revision"], "3f9a1c2e");
+        assert!(
+            body.get("languages").is_none(),
+            "empty collections are omitted"
+        );
+        match rendered.contents.first() {
+            Some(ResourceContents::TextResourceContents { uri, mime_type, .. }) => {
+                assert_eq!(uri, MAP_URI);
+                assert_eq!(mime_type.as_deref(), Some("application/json"));
+            }
+            other => unreachable!("a map read answers with text, not {other:?}"),
+        }
+    }
+
     #[test]
     fn the_published_surface_names_the_log_family() {
         let resources = declared_resources();
         let templates = declared_templates();
 
-        assert_eq!(resources.len(), 2);
+        assert_eq!(resources.len(), 3);
         assert_eq!(resources[0].uri, LOGS_URI);
         assert_eq!(resources[1].uri, WORKSPACE_URI);
         assert!(resources[1].description.is_some());
+        assert_eq!(resources[2].uri, MAP_URI);
+        assert!(resources[2].description.is_some());
         assert_eq!(templates.len(), 3);
         assert!(templates[..2].iter().all(|template| {
             template.uri_template.starts_with("rift://logs/")
