@@ -11364,7 +11364,7 @@
                     "type": "null"
                   }
                 ],
-                "description": "When set, the answer keeps only the hit whose walk reaches this symbol, at its\nshortest path. A `to` the walk cannot reach within `depth` answers empty, not refused."
+                "description": "When set, the answer keeps only the hit whose walk reaches this symbol. That hit's\npath is the shortest one the walk found. A `to` the walk cannot reach within `depth`\nanswers empty, not refused."
               }
             },
             "required": [

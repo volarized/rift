@@ -527,8 +527,9 @@ pub struct SearchTraversal {
     #[serde(default = "default_search_traversal_depth")]
     #[schemars(range(min = 1_u64, max = 2_u64))]
     pub depth: u64,
-    /// When set, the answer keeps only the hit whose walk reaches this symbol, at its
-    /// shortest path. A `to` the walk cannot reach within `depth` answers empty, not refused.
+    /// When set, the answer keeps only the hit whose walk reaches this symbol. That hit's
+    /// path is the shortest one the walk found. A `to` the walk cannot reach within `depth`
+    /// answers empty, not refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<SymbolId>,
 }
@@ -694,7 +695,7 @@ mod tests {
     }
 
     /// `deny_unknown_fields` refuses a request naming a field this model never served, such
-    /// as the withdrawn `intent` or `max_hops` PR #171 removed.
+    /// as the withdrawn `intent` or `max_hops` fields.
     #[test]
     fn search_traversal_rejects_an_unknown_field() {
         let result: Result<SearchTraversal, _> = serde_json::from_value(json!({

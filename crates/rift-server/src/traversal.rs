@@ -72,7 +72,9 @@ pub(crate) fn collect_traversal_hits(
 ) -> Result<bool, ReadError> {
     let store = reads.relationships();
     if store.is_empty() && !reads.index().binding_enabled() {
-        return Err(ReadFault::unsupported("binding"));
+        return Err(ReadFault::unsupported(
+            "relationship traversal (providers.binding disabled)",
+        ));
     }
     let seed = resolve_traversal_seed(reads, &traversal.seed)?;
     let walk = walk_traversal(store, &seed, traversal);

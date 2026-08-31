@@ -314,11 +314,12 @@ values such as `calls`, `references`, and `imports`; an empty or omitted list fo
 facet. `target: "file"` never carries a walked hit, since a traversal only reaches symbols.
 
 A workspace with the binding provider disabled, and no relationship data left from an earlier
-build, refuses `capability_unavailable` naming `binding`: the graph this walk needs was never
-built. `traversal` never combines with `rev` - the relationship graph serves the current tree
-alone - and refuses `capability_unavailable` the same way. A `seed` that resolves to neither a
-graph node nor a lexical declaration refuses `resource_not_found`; one that resolves but carries
-no edges answers an empty result set, since an isolated declaration is a legitimate answer.
+build, refuses `capability_unavailable` naming `relationship traversal (providers.binding
+disabled)`: the graph this walk needs was never built. `traversal` never combines with `rev` -
+the relationship graph serves the current tree alone - and refuses `capability_unavailable`
+the same way. A `seed` that resolves to neither a graph node nor a lexical declaration refuses
+`resource_not_found`; one that resolves but carries no edges answers an empty result set, since
+an isolated declaration is a legitimate answer.
 
 A walk the server stops at its node bound attaches a `traversal_truncated` entry to
 `warnings`, naming how many symbols it visited: hits reachable beyond the bound are missing,
