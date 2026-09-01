@@ -75,6 +75,19 @@ pub fn schema_document() -> String {
     rendered
 }
 
+/// Returns the served tool listing `RiftMcp` runs, sorted by name.
+///
+/// `RiftMcp::tool_router` is `pub(crate)`, so this is the one path a
+/// consumer outside this crate has to the same [`rmcp::model::Tool`] values
+/// [`schema_document`] serializes. `rift install claude` reads each tool's
+/// name, description, and JSON Schema straight from these typed values to
+/// generate its Claude Code skill, rather than round-tripping the exported
+/// document back through JSON.
+#[must_use]
+pub fn tool_listing() -> Vec<rmcp::model::Tool> {
+    RiftMcp::tool_router().list_all()
+}
+
 /// Renders the JSON Schema of `rift.toml`, derived from
 /// [`WorkspaceConfiguration`](rift_protocol::configuration::WorkspaceConfiguration),
 /// so an editor can validate the file and refuse unknown keys before the
