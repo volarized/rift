@@ -3,10 +3,11 @@
 use std::path::{Path, PathBuf};
 
 use super::{
-    ResolutionBuilder, RunFailure, RunFailureCause, first_line, package_identity, run_failure,
-    run_to_success, rust_language, toolchain_command,
+    RunFailure, RunFailureCause, first_line, package_identity, run_failure, run_to_success,
+    rust_language, toolchain_command,
 };
-use crate::catalog::{CatalogEntry, PackageLocation};
+use crate::catalog::{CatalogEntry, PackageLocation, STDLIB_MANAGER};
+use crate::manifest::ResolutionBuilder;
 use crate::resolver::Inspector;
 
 /// The Rust compiler executable, resolved on the inspector's `PATH`.
@@ -15,8 +16,6 @@ const RUSTC_PROGRAM: &str = "rustc";
 const SYSROOT_ARGUMENTS: [&str; 2] = ["--print", "sysroot"];
 /// The `rustc` arguments printing the toolchain's version line.
 const VERSION_ARGUMENTS: [&str; 1] = ["--version"];
-/// The package namespace of a toolchain's standard library.
-const STDLIB_MANAGER: &str = "stdlib";
 /// The standard library's package name under `STDLIB_MANAGER`.
 const STDLIB_PACKAGE_NAME: &str = "rust";
 /// The standard library source below a sysroot, present with the `rust-src` component.
