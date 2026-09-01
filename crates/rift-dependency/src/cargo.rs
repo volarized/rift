@@ -341,7 +341,6 @@ mod tests {
     use crate::catalog::PackageLocation;
     use crate::fixture::RecordedInspector;
     use crate::resolver::PACKAGES_MAX;
-    use crate::resolvers::resolvers;
 
     #[test]
     fn test_cargo_resolver_identity_names_cargo_and_rust() {
