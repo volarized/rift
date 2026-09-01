@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rift_lsp::{EngineError, EngineLaunch, EngineSession, Framing, PositionEncoding};
 use ruff_db::Db as _;
@@ -80,6 +80,7 @@ pub(crate) async fn started_session(
 /// sends `exit`.
 async fn serve(transport: tokio::io::DuplexStream, root: PathBuf) {
     let (mut reader, mut writer) = tokio::io::split(transport);
+    let documents: DocumentStore = Arc::new(Mutex::new(HashMap::new()));
     let mut framing = Framing::new();
     let mut buffer = vec![0_u8; 16 * 1024];
     loop {
@@ -98,8 +99,10 @@ async fn serve(transport: tokio::io::DuplexStream, root: PathBuf) {
                 return;
             };
             let root = root.clone();
+            let documents = Arc::clone(&documents);
             let handled =
-                tokio::task::spawn_blocking(move || handle_message(&message, &root)).await;
+                tokio::task::spawn_blocking(move || handle_message(&message, &root, &documents))
+                    .await;
             let Ok(outcome) = handled else {
                 return;
             };
@@ -129,8 +132,30 @@ enum Handled {
     Exit,
 }
 
+/// One request's conversion context: the root spellings and the document
+/// text the session sent for the addressed URI, when it opened one.
+struct Exchange<'request> {
+    spelled_root: &'request Path,
+    canonical_root: &'request Path,
+    sent_text: Option<&'request str>,
+}
+
+impl Exchange<'_> {
+    /// The text every position and range converts against: the document the
+    /// session sent, or the database's own view when nothing is open.
+    fn conversion_text<'own>(&'own self, database_text: &'own str) -> &'own str {
+        self.sent_text.unwrap_or(database_text)
+    }
+}
+
+/// The open documents by URI, holding the text the session sent: answers
+/// convert every range against the peer's own document, so a span decodes
+/// on the server side even while its published index still trails the
+/// change the exchange follows.
+type DocumentStore = Arc<Mutex<HashMap<String, String>>>;
+
 /// Answers one JSON-RPC message from the session.
-fn handle_message(message: &Value, root: &Path) -> Handled {
+fn handle_message(message: &Value, root: &Path, documents: &DocumentStore) -> Handled {
     let method = message.get("method").and_then(Value::as_str).unwrap_or("");
     let id = message.get("id").cloned();
     let params = message.get("params").cloned().unwrap_or(Value::Null);
@@ -139,15 +164,34 @@ fn handle_message(message: &Value, root: &Path) -> Handled {
         (_, None) => {
             if method == "textDocument/didOpen" {
                 opened_document(root, &params);
+                if let (Some(uri), Some(sent)) = (
+                    params.pointer("/textDocument/uri").and_then(Value::as_str),
+                    params.pointer("/textDocument/text").and_then(Value::as_str),
+                ) && let Ok(mut documents) = documents.lock()
+                {
+                    documents.insert(uri.to_owned(), sent.to_owned());
+                }
+            }
+            if method == "textDocument/didClose"
+                && let Some(uri) = params.pointer("/textDocument/uri").and_then(Value::as_str)
+                && let Ok(mut documents) = documents.lock()
+            {
+                documents.remove(uri);
             }
             Handled::Silent
         }
         ("initialize", Some(id)) => Handled::Reply(reply(&id, &initialize_result())),
         ("shutdown", Some(id)) => Handled::Reply(reply(&id, &Value::Null)),
-        ("textDocument/prepareRename", Some(id)) => answered(&id, root, &params, prepare_rename),
-        ("textDocument/rename", Some(id)) => answered(&id, root, &params, rename),
-        ("textDocument/references", Some(id)) => answered(&id, root, &params, references),
-        ("textDocument/diagnostic", Some(id)) => answered(&id, root, &params, pulled_diagnostics),
+        ("textDocument/prepareRename", Some(id)) => {
+            answered(&id, root, documents, &params, prepare_rename)
+        }
+        ("textDocument/rename", Some(id)) => answered(&id, root, documents, &params, rename),
+        ("textDocument/references", Some(id)) => {
+            answered(&id, root, documents, &params, references)
+        }
+        ("textDocument/diagnostic", Some(id)) => {
+            answered(&id, root, documents, &params, pulled_diagnostics)
+        }
         (_, Some(id)) => Handled::Reply(error_reply(
             &id,
             METHOD_NOT_FOUND,
@@ -160,10 +204,22 @@ fn handle_message(message: &Value, root: &Path) -> Handled {
 fn answered(
     id: &Value,
     root: &Path,
+    documents: &DocumentStore,
     params: &Value,
-    answer: fn(&mut ProjectDatabase, &Path, &Path, &Value) -> Result<Value, String>,
+    answer: fn(&mut ProjectDatabase, &Exchange<'_>, &Value) -> Result<Value, String>,
 ) -> Handled {
-    let outcome = with_database(root, |db, canonical| answer(db, root, canonical, params));
+    let sent = params
+        .pointer("/textDocument/uri")
+        .and_then(Value::as_str)
+        .and_then(|uri| documents.lock().ok()?.get(uri).cloned());
+    let outcome = with_database(root, |db, canonical| {
+        let exchange = Exchange {
+            spelled_root: root,
+            canonical_root: canonical,
+            sent_text: sent.as_deref(),
+        };
+        answer(db, &exchange, params)
+    });
     Handled::Reply(match outcome {
         Ok(result) => reply(id, &result),
         Err(detail) => error_reply(id, INTERNAL_ERROR, &detail),
@@ -363,8 +419,7 @@ fn range_at(text: &str, range: TextRange) -> Result<Value, String> {
 /// Answers `textDocument/prepareRename`: the renameable range, or `null`.
 fn prepare_rename(
     database: &mut ProjectDatabase,
-    _root: &Path,
-    _canonical_root: &Path,
+    exchange: &Exchange<'_>,
     params: &Value,
 ) -> Result<Value, String> {
     let file = file_at(
@@ -374,12 +429,10 @@ fn prepare_rename(
     database.project().open_file(database, file);
     let program_file = database.program_file(file);
     let text = source_text(database, file);
-    let offset = offset_at(
-        text.as_str(),
-        params.pointer("/position").unwrap_or(&Value::Null),
-    )?;
+    let text = exchange.conversion_text(text.as_str());
+    let offset = offset_at(text, params.pointer("/position").unwrap_or(&Value::Null))?;
     match ty_ide::can_rename(database, program_file, offset) {
-        Some(range) => range_at(text.as_str(), range),
+        Some(range) => range_at(text, range),
         None => Ok(Value::Null),
     }
 }
@@ -388,8 +441,7 @@ fn prepare_rename(
 /// reference, or `null` when nothing renameable is declared at the position.
 fn rename(
     database: &mut ProjectDatabase,
-    root: &Path,
-    canonical_root: &Path,
+    exchange: &Exchange<'_>,
     params: &Value,
 ) -> Result<Value, String> {
     let file = file_at(
@@ -399,10 +451,8 @@ fn rename(
     database.project().open_file(database, file);
     let program_file = database.program_file(file);
     let text = source_text(database, file);
-    let offset = offset_at(
-        text.as_str(),
-        params.pointer("/position").unwrap_or(&Value::Null),
-    )?;
+    let text = exchange.conversion_text(text.as_str());
+    let offset = offset_at(text, params.pointer("/position").unwrap_or(&Value::Null))?;
     let new_name = params
         .pointer("/newName")
         .and_then(Value::as_str)
@@ -415,13 +465,8 @@ fn rename(
     };
     let mut changes: serde_json::Map<String, Value> = serde_json::Map::new();
     for target in &targets {
-        let Some((uri, edit_range)) = target_location(
-            database,
-            root,
-            canonical_root,
-            target.file(),
-            target.range(),
-        )?
+        let Some((uri, edit_range)) =
+            target_location(database, exchange, target.file(), target.range())?
         else {
             continue;
         };
@@ -439,8 +484,7 @@ fn rename(
 /// Answers `textDocument/references`.
 fn references(
     database: &mut ProjectDatabase,
-    root: &Path,
-    canonical_root: &Path,
+    exchange: &Exchange<'_>,
     params: &Value,
 ) -> Result<Value, String> {
     let file = file_at(
@@ -450,10 +494,8 @@ fn references(
     database.project().open_file(database, file);
     let program_file = database.program_file(file);
     let text = source_text(database, file);
-    let offset = offset_at(
-        text.as_str(),
-        params.pointer("/position").unwrap_or(&Value::Null),
-    )?;
+    let text = exchange.conversion_text(text.as_str());
+    let offset = offset_at(text, params.pointer("/position").unwrap_or(&Value::Null))?;
     let include_declaration = params
         .pointer("/context/includeDeclaration")
         .and_then(Value::as_bool)
@@ -465,13 +507,9 @@ fn references(
     };
     let mut locations = Vec::new();
     for target in &targets {
-        if let Some((uri, range)) = target_location(
-            database,
-            root,
-            canonical_root,
-            target.file(),
-            target.range(),
-        )? {
+        if let Some((uri, range)) =
+            target_location(database, exchange, target.file(), target.range())?
+        {
             locations.push(json!({ "uri": uri, "range": range }));
         }
     }
@@ -485,8 +523,7 @@ fn references(
 /// included.
 fn target_location(
     database: &ProjectDatabase,
-    spelled_root: &Path,
-    canonical_root: &Path,
+    exchange: &Exchange<'_>,
     file: File,
     range: TextRange,
 ) -> Result<Option<(String, Value)>, String> {
@@ -495,10 +532,10 @@ fn target_location(
     };
     let spelled = system_path
         .as_std_path()
-        .strip_prefix(canonical_root)
+        .strip_prefix(exchange.canonical_root)
         .map_or_else(
             |_| system_path.as_std_path().to_path_buf(),
-            |relative| spelled_root.join(relative),
+            |relative| exchange.spelled_root.join(relative),
         );
     let uri = path_to_uri(&spelled);
     let text = source_text(database, file);
@@ -509,8 +546,7 @@ fn target_location(
 /// Answers the `textDocument/diagnostic` pull with one full report.
 fn pulled_diagnostics(
     database: &mut ProjectDatabase,
-    _root: &Path,
-    _canonical_root: &Path,
+    exchange: &Exchange<'_>,
     params: &Value,
 ) -> Result<Value, String> {
     let file = file_at(
@@ -519,6 +555,7 @@ fn pulled_diagnostics(
     )?;
     database.project().open_file(database, file);
     let text = source_text(database, file);
+    let text = exchange.conversion_text(text.as_str());
     let mut items = Vec::new();
     for diagnostic in database.check_file(file) {
         let severity = match diagnostic.severity() {
@@ -529,7 +566,7 @@ fn pulled_diagnostics(
         let range = diagnostic
             .primary_span()
             .and_then(|span| span.range())
-            .map(|range| range_at(text.as_str(), range))
+            .map(|range| range_at(text, range))
             .transpose()?
             .unwrap_or_else(|| {
                 json!({
@@ -550,6 +587,10 @@ fn pulled_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_documents() -> DocumentStore {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
 
     #[test]
     fn test_uri_and_path_spell_each_other_with_escapes_kept() {
@@ -584,7 +625,9 @@ mod tests {
             "method": "textDocument/hover",
             "params": {},
         });
-        let Handled::Reply(reply) = handle_message(&message, Path::new("/tree")) else {
+        let Handled::Reply(reply) =
+            handle_message(&message, Path::new("/tree"), &empty_documents())
+        else {
             panic!("an unserved request must reply");
         };
         assert_eq!(reply["id"], 7);
@@ -600,12 +643,12 @@ mod tests {
     fn test_notifications_stay_silent_and_exit_ends_the_loop() {
         let initialized = serde_json::json!({ "jsonrpc": "2.0", "method": "initialized" });
         assert!(matches!(
-            handle_message(&initialized, Path::new("/tree")),
+            handle_message(&initialized, Path::new("/tree"), &empty_documents()),
             Handled::Silent
         ));
         let exit = serde_json::json!({ "jsonrpc": "2.0", "method": "exit" });
         assert!(matches!(
-            handle_message(&exit, Path::new("/tree")),
+            handle_message(&exit, Path::new("/tree"), &empty_documents()),
             Handled::Exit
         ));
     }
@@ -613,7 +656,9 @@ mod tests {
     #[test]
     fn test_shutdown_answers_null() {
         let shutdown = serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "shutdown" });
-        let Handled::Reply(reply) = handle_message(&shutdown, Path::new("/tree")) else {
+        let Handled::Reply(reply) =
+            handle_message(&shutdown, Path::new("/tree"), &empty_documents())
+        else {
             panic!("shutdown must reply");
         };
         assert_eq!(reply["result"], Value::Null);
@@ -639,7 +684,8 @@ mod tests {
                 "position": { "line": 0, "character": 4 },
             },
         });
-        let Handled::Reply(reply) = handle_message(&message, directory.path()) else {
+        let Handled::Reply(reply) = handle_message(&message, directory.path(), &empty_documents())
+        else {
             panic!("prepareRename must reply");
         };
         assert!(
@@ -659,7 +705,8 @@ mod tests {
             "method": "textDocument/diagnostic",
             "params": { "textDocument": { "uri": path_to_uri(&path) } },
         });
-        let Handled::Reply(reply) = handle_message(&message, directory.path()) else {
+        let Handled::Reply(reply) = handle_message(&message, directory.path(), &empty_documents())
+        else {
             panic!("the pull must reply");
         };
         assert!(
