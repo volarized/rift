@@ -13,6 +13,9 @@ use crate::resolver::{DIRECTORY_ENTRIES_MAX, Inspector};
 
 /// The lockfile `source` prefix of a package fetched from a registry.
 const REGISTRY_SOURCE_PREFIX: &str = "registry+";
+/// The lockfile `source` prefix of a package fetched from a registry over the sparse
+/// protocol; its source is unpacked to the same cache directory.
+const SPARSE_SOURCE_PREFIX: &str = "sparse+";
 /// The lockfile `source` prefix of a package fetched from a git repository.
 const GIT_SOURCE_PREFIX: &str = "git+";
 /// The environment variable naming Cargo's home directory.
@@ -87,7 +90,7 @@ enum LockedSource<'a> {
 
 /// Classifies one lockfile `source`; a source of any other kind is not cataloged.
 fn locked_source(source: &str) -> Option<LockedSource<'_>> {
-    if source.starts_with(REGISTRY_SOURCE_PREFIX) {
+    if source.starts_with(REGISTRY_SOURCE_PREFIX) || source.starts_with(SPARSE_SOURCE_PREFIX) {
         Some(LockedSource::Registry)
     } else if source.starts_with(GIT_SOURCE_PREFIX) {
         Some(LockedSource::Git(source))
@@ -237,7 +240,7 @@ mod tests {
 
     use super::super::fixture::{
         CARGO_HOME, INDEX_DIRECTORY, REGISTRY_SOURCE, ROOT, RUFF_REVISION, RUFF_SOURCE,
-        WORKSPACE_LOCKFILE, entry, project, resolve,
+        WORKSPACE_LOCKFILE, entry, names, project, resolve,
     };
     use super::{CargoCache, git_source_parts};
     use crate::fixture::RecordedInspector;
@@ -377,6 +380,42 @@ mod tests {
             inspector.asked,
             ["exists /cargo-home/git/checkouts/tool-abc/ab12"],
             "a checkout of another repository is never probed"
+        );
+    }
+
+    #[test]
+    fn test_resolve_sparse_registry_source_is_cataloged_like_a_registry_one() {
+        let lockfile =
+            WORKSPACE_LOCKFILE.replace(REGISTRY_SOURCE, "sparse+https://index.crates.io/");
+        let mut inspector = RecordedInspector::default()
+            .with_file(format!("{ROOT}/Cargo.lock"), lockfile)
+            .with_environment("CARGO_HOME", CARGO_HOME)
+            .with_directory(format!(
+                "{CARGO_HOME}/registry/src/{INDEX_DIRECTORY}/serde-1.0.228"
+            ));
+
+        let resolution = resolve(&["Cargo.toml"], &mut inspector);
+
+        assert_eq!(
+            entry(&resolution, "serde").source_root(),
+            Some(Path::new(
+                "/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_resolve_source_of_another_kind_is_not_cataloged() {
+        let lockfile = WORKSPACE_LOCKFILE.replace(REGISTRY_SOURCE, "directory+/vendor");
+        let mut inspector =
+            RecordedInspector::default().with_file(format!("{ROOT}/Cargo.lock"), lockfile);
+
+        let resolution = resolve(&["Cargo.toml"], &mut inspector);
+
+        let listed = names(&resolution);
+        assert!(
+            !listed.iter().any(|name| name.contains("serde")),
+            "a directory source is neither registry nor git: {listed:?}"
         );
     }
 }

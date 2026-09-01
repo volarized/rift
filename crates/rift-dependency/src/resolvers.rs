@@ -41,3 +41,36 @@ pub fn is_claimed_manifest(path: &ProjectPath) -> bool {
         .iter()
         .any(|resolver| resolver.manifest_file_name() == file_name)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resolver::ResolverName;
+
+    #[test]
+    fn test_is_claimed_manifest_matches_by_file_name_at_any_depth() {
+        assert!(is_claimed_manifest(&ProjectPath("Cargo.toml".to_owned())));
+        assert!(is_claimed_manifest(&ProjectPath(
+            "crates/rift-core/Cargo.toml".to_owned()
+        )));
+        assert!(!is_claimed_manifest(&ProjectPath("Cargo.lock".to_owned())));
+        assert!(!is_claimed_manifest(&ProjectPath("src/lib.rs".to_owned())));
+    }
+
+    #[test]
+    fn test_resolvers_lists_every_shipped_resolver_in_run_order() {
+        let claimed: Vec<(ResolverName, &str)> = resolvers()
+            .iter()
+            .map(|resolver| (resolver.name(), resolver.manifest_file_name()))
+            .collect();
+        assert_eq!(
+            claimed,
+            [
+                (ResolverName::Cargo, "Cargo.toml"),
+                (ResolverName::Uv, "pyproject.toml"),
+                (ResolverName::Npm, "package.json"),
+                (ResolverName::Bun, "package.json"),
+            ]
+        );
+    }
+}
