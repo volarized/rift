@@ -263,53 +263,51 @@ mod tests {
         }
     }
 
-    /// A definition claiming the rust extension beside the real one, for the
-    /// duplicate-extension invariant.
+    /// One definition shape for every invariant fixture: which identity it
+    /// claims, which extensions, and which identity its provider files
+    /// under, so each refusal test states only the fact it breaks.
     #[derive(Debug)]
-    struct RustExtensionTwice;
+    struct StubDefinition {
+        shipped: ShippedLanguage,
+        extensions: &'static [&'static str],
+        provider_language: ShippedLanguage,
+    }
 
-    impl crate::language::LanguageDefinition for RustExtensionTwice {
+    impl crate::language::LanguageDefinition for StubDefinition {
         fn shipped(&self) -> ShippedLanguage {
-            ShippedLanguage::Json
+            self.shipped
         }
 
         fn extensions(&self) -> &'static [&'static str] {
-            &["rs"]
+            self.extensions
         }
 
         fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
             Box::new(StubProvider {
-                language: ShippedLanguage::Json.language(),
+                language: self.provider_language.language(),
             })
         }
     }
 
-    /// A definition whose provider files facts under another identity, for
-    /// the identity invariant.
-    #[derive(Debug)]
-    struct MismatchedIdentity;
+    /// A definition claiming the rust extension beside the real one.
+    static RUST_EXTENSION_TWICE: StubDefinition = StubDefinition {
+        shipped: ShippedLanguage::Json,
+        extensions: &["rs"],
+        provider_language: ShippedLanguage::Json,
+    };
 
-    impl crate::language::LanguageDefinition for MismatchedIdentity {
-        fn shipped(&self) -> ShippedLanguage {
-            ShippedLanguage::Json
-        }
-
-        fn extensions(&self) -> &'static [&'static str] {
-            &["stub"]
-        }
-
-        fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
-            Box::new(StubProvider {
-                language: ShippedLanguage::Yaml.language(),
-            })
-        }
-    }
+    /// A definition whose provider files facts under another identity.
+    static MISMATCHED_IDENTITY: StubDefinition = StubDefinition {
+        shipped: ShippedLanguage::Json,
+        extensions: &["stub"],
+        provider_language: ShippedLanguage::Yaml,
+    };
 
     #[test]
     #[should_panic(expected = "language definitions must claim distinct extensions")]
     fn test_assemble_refuses_two_definitions_claiming_one_extension() {
         let rust = crate::language::definitions()[0];
-        SyntaxRegistry::assemble(&[rust, &RustExtensionTwice]);
+        SyntaxRegistry::assemble(&[rust, &RUST_EXTENSION_TWICE]);
     }
 
     #[test]
@@ -332,6 +330,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "a definition's provider must file facts under")]
     fn test_assemble_refuses_a_provider_filing_under_another_identity() {
-        SyntaxRegistry::assemble(&[&MismatchedIdentity]);
+        SyntaxRegistry::assemble(&[&MISMATCHED_IDENTITY]);
     }
 }
