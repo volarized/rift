@@ -48,6 +48,11 @@ pub(crate) fn toml_engine_configuration() -> String {
 /// immediately - it has no background project load to announce over
 /// `$/progress` the way rust-analyzer does - so the suite makes one call
 /// with no warm-up loop.
+///
+/// The retry table is wider than the default: without progress tokens,
+/// settlement leans on the table alone, and a full instrumented workspace
+/// run starves tombi's first analysis past the default budget. The table
+/// spells what an operator on a saturated machine would configure.
 pub(crate) fn fixture() -> EngineFixture {
     EngineFixture {
         placement: LspPlacement::Inline,
@@ -55,6 +60,7 @@ pub(crate) fn fixture() -> EngineFixture {
         program: TOMBI_PROGRAM,
         arguments: vec![TOMBI_LSP_ARGUMENT],
         languages: vec!["toml"],
-        extra_toml: String::new(),
+        extra_toml: "retry = { attempts = 12, delay = \"250ms\", delay_limit = \"2s\" }\n"
+            .to_owned(),
     }
 }
