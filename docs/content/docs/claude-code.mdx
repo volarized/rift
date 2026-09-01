@@ -76,8 +76,13 @@ indexes. `rift steer` catches that first call and redirects it.
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Grep|Glob",
-        "hooks": [{ "type": "command", "command": "rift steer" }]
+        "hooks": [
+          {
+            "command": "rift steer",
+            "type": "command"
+          }
+        ],
+        "matcher": "Grep|Glob"
       }
     ]
   }

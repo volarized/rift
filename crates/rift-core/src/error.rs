@@ -276,7 +276,7 @@ const fn cli_guidance(code: CliCode) -> (&'static str, RetryDirective, &'static 
         CliCode::InstallSettingsUnparsable => (
             "the target settings.json could not be read as a JSON hook document",
             RetryDirective::OperatorAction,
-            "fix or remove the file, then retry `rift install claude`",
+            "fix or remove the file, then run the same `rift install` command again",
         ),
     }
 }

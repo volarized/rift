@@ -12,6 +12,7 @@
 //! agent that triggered it.
 
 use std::borrow::Cow;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read as _};
@@ -406,27 +407,36 @@ fn claim_marker(root: &Path, session_id: &str) -> io::Result<bool> {
 }
 
 /// Keeps only the newest [`STEER_MARKERS_MAX`] session markers under
-/// `.rift/steer/`, deleting older ones by modification time. Best-effort: a
-/// failure to list or remove a marker is swallowed, since pruning must
-/// never turn a successful denial into a failed one.
+/// `.rift/steer/`, deleting older ones by modification time; a tie in
+/// modification time breaks by file name so the prune order never depends
+/// on `read_dir`'s enumeration order. Best-effort: a failure to list or
+/// remove a marker is swallowed, since pruning must never turn a successful
+/// denial into a failed one.
 fn prune_markers(root: &Path) {
     let directory = root.join(RIFT_STATE_DIRECTORY).join(STEER_STATE_DIRECTORY);
     let Ok(entries) = fs::read_dir(&directory) else {
         return;
     };
-    let mut markers: Vec<(PathBuf, SystemTime)> = entries
+    let mut markers: Vec<(PathBuf, SystemTime, OsString)> = entries
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let modified = entry.metadata().ok()?.modified().ok()?;
-            Some((entry.path(), modified))
+            let name = entry.file_name();
+            Some((entry.path(), modified, name))
         })
         .collect();
     if markers.len() <= STEER_MARKERS_MAX {
         return;
     }
-    markers.sort_by_key(|(_, modified)| *modified);
+    markers.sort_by(
+        |(_, left_modified, left_name), (_, right_modified, right_name)| {
+            left_modified
+                .cmp(right_modified)
+                .then_with(|| left_name.cmp(right_name))
+        },
+    );
     let excess = markers.len() - STEER_MARKERS_MAX;
-    for (path, _) in markers.into_iter().take(excess) {
+    for (path, ..) in markers.into_iter().take(excess) {
         let _ = fs::remove_file(path);
     }
 }
@@ -438,9 +448,9 @@ mod tests {
 
     use super::{
         Decision, EnvironmentFacts, KernelInput, QualifyingTool, RIFT_STATE_DIRECTORY,
-        STEER_STATE_DIRECTORY, claim_marker, decide, deny_reason, discover_workspace_root,
-        is_valid_session_id, parse_hook_call, prune_markers, read_steering_disabled,
-        truncate_pattern,
+        STEER_MARKERS_MAX, STEER_STATE_DIRECTORY, claim_marker, decide, deny_reason,
+        discover_workspace_root, is_valid_session_id, parse_hook_call, prune_markers,
+        read_steering_disabled, truncate_pattern,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -676,6 +686,41 @@ mod tests {
             "the oldest marker must be pruned: {remaining:?}"
         );
         assert!(remaining.contains(&"session-064".to_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn prune_markers_breaks_a_modification_time_tie_by_file_name() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let steer_directory = root.join(RIFT_STATE_DIRECTORY).join(STEER_STATE_DIRECTORY);
+        fs::create_dir_all(&steer_directory)?;
+        let base = SystemTime::now() - Duration::from_secs(1_000);
+        for name in ["session-b", "session-a"] {
+            let file = fs::File::create(steer_directory.join(name))?;
+            file.set_modified(base)?;
+        }
+        for index in 0..(STEER_MARKERS_MAX as u64 - 1) {
+            let path = steer_directory.join(format!("session-newer-{index:03}"));
+            let file = fs::File::create(&path)?;
+            file.set_modified(base + Duration::from_secs(index + 1))?;
+        }
+        prune_markers(root);
+        let remaining: Vec<String> = fs::read_dir(&steer_directory)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(remaining.len(), STEER_MARKERS_MAX);
+        assert!(
+            !remaining.contains(&"session-a".to_owned()),
+            "the lexicographically-first marker tied on modification time must be pruned: \
+             {remaining:?}"
+        );
+        assert!(
+            remaining.contains(&"session-b".to_owned()),
+            "the lexicographically-later marker tied on modification time must survive: \
+             {remaining:?}"
+        );
         Ok(())
     }
 }

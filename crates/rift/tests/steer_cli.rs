@@ -20,6 +20,10 @@ fn run_steer(root: &Path, stdin: &str, env: &[(&str, &str)]) -> TestResult<Outpu
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Inherits the rest of the ambient environment (PATH, dyld on macOS); only
+    // RIFT_STEER is scrubbed so an operator's own exported kill switch cannot
+    // flip a test's deny/allow expectation out from under its explicit `env` pair.
+    command.env_remove("RIFT_STEER");
     for (key, value) in env {
         command.env(key, value);
     }
