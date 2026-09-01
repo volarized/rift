@@ -191,6 +191,7 @@ pub struct NormalizedGraph {
     publications: Arc<PublicationSet>,
     records: Vec<SymbolRecord>,
     records_by_contribution: BTreeMap<ContributionReference, usize>,
+    contribution_positions: BTreeMap<ContributionKey, usize>,
     candidates: Vec<AssociationCandidate>,
     references: Vec<NormalizedReference>,
     relationships: Vec<NormalizedRelationship>,
@@ -247,17 +248,16 @@ impl NormalizedGraph {
         self.record_for(reference).and_then(SymbolRecord::identity)
     }
 
-    /// Returns captured Contribution by immutable key.
+    /// Returns captured Contribution by immutable key, through the position
+    /// index assembly built: the workspace map resolves a contribution per
+    /// record and per reference, and a scan per lookup made one map build
+    /// cost O(records x contributions).
     #[must_use]
     pub fn contribution(&self, key: &ContributionKey) -> Option<&Contribution> {
+        let position = *self.contribution_positions.get(key)?;
         self.publications
             .provider(key.reference().provider())
-            .and_then(|publication| {
-                publication
-                    .contributions()
-                    .iter()
-                    .find(|contribution| contribution.key() == key)
-            })
+            .and_then(|publication| publication.contributions().get(position))
     }
 
     /// Returns normalized References.
@@ -744,6 +744,7 @@ fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, ContributionErr
         &records_by_contribution,
     );
 
+    let contribution_positions = contribution_positions(&publications);
     Ok(NormalizedGraph {
         index_revision,
         source_revision,
@@ -751,10 +752,24 @@ fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, ContributionErr
         publications,
         records,
         records_by_contribution,
+        contribution_positions,
         candidates,
         references,
         relationships,
     })
+}
+
+/// Positions every publication's contributions by key, once per assembled
+/// graph. Each key already names its provider, so the position within that
+/// provider's contribution list is the only fact a lookup still needs.
+fn contribution_positions(publications: &PublicationSet) -> BTreeMap<ContributionKey, usize> {
+    let mut positions = BTreeMap::new();
+    for publication in publications.publications() {
+        for (position, contribution) in publication.contributions().iter().enumerate() {
+            positions.insert(contribution.key().clone(), position);
+        }
+    }
+    positions
 }
 
 #[derive(Debug)]
@@ -981,6 +996,78 @@ mod tests {
             previous,
         )
         .expect("normalized graph")
+    }
+
+    /// Every published contribution resolves through the position index by
+    /// its own exact key, and a key the set never published answers `None`
+    /// instead of a neighbor at the same position.
+    #[test]
+    fn contribution_lookup_answers_each_published_key_and_refuses_foreign_ones() {
+        let set = publications(vec![
+            publication(
+                "syntax",
+                1,
+                vec![
+                    exact(
+                        "syntax",
+                        1,
+                        "one",
+                        1,
+                        binding("src/lib.rs", 0),
+                        None,
+                        vec![],
+                    ),
+                    exact(
+                        "syntax",
+                        1,
+                        "two",
+                        2,
+                        binding("src/lib.rs", 8),
+                        None,
+                        vec![],
+                    ),
+                ],
+            ),
+            publication(
+                "native",
+                1,
+                vec![exact(
+                    "native",
+                    1,
+                    "one",
+                    1,
+                    binding("src/lib.rs", 0),
+                    None,
+                    vec![],
+                )],
+            ),
+        ]);
+        let graph = normalize(&set, 1, None);
+        for provider_publication in set.publications() {
+            for contribution in provider_publication.contributions() {
+                let answered = graph
+                    .contribution(contribution.key())
+                    .expect("every published key resolves");
+                assert_eq!(
+                    answered.key(),
+                    contribution.key(),
+                    "the lookup answers the exact key it was asked for"
+                );
+            }
+        }
+        let unpublished = exact(
+            "syntax",
+            2,
+            "one",
+            1,
+            binding("src/lib.rs", 0),
+            None,
+            vec![],
+        );
+        assert!(
+            graph.contribution(unpublished.key()).is_none(),
+            "a key the set never published resolves to nothing"
+        );
     }
 
     #[test]
