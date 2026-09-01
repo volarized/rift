@@ -16,6 +16,12 @@ const SPINNER_TICK: Duration = Duration::from_millis(80);
 ///
 /// Named so the terminal-width regression test in this module's `tests`
 /// draws the exact production text, which carries a double-width emoji.
+///
+/// Every stage glyph is a single-codepoint emoji: indicatif measures a drawn
+/// line one `char` at a time, so an emoji built with a variation selector
+/// (U+FE0F) measures one column short of what a terminal renders, and the
+/// line indicatif pads to the terminal width then wraps onto a second row,
+/// leaving one stale line behind per redraw.
 const CHECKING_RELEASE_MESSAGE: &str = "🔍 Checking the latest rift release...";
 /// Download line drawn when the response declared the archive's size.
 const SIZED_DOWNLOAD_TEMPLATE: &str = "{msg}  [{bar}]  {bytes} / {total_bytes}";
@@ -92,7 +98,7 @@ impl UpdateProgress for TerminalProgress {
             } => line.download(received_bytes, total_bytes),
             UpdateStage::Verifying => {
                 let downloaded = rendered_bytes(line.received_bytes.unwrap_or(0));
-                line.finish(format!("⬇️  Downloaded {downloaded}"));
+                line.finish(format!("📥 Downloaded {downloaded}"));
                 line.start("🔐 Verifying the checksum...");
             }
             UpdateStage::Extracting => {
@@ -145,8 +151,8 @@ fn download_bar(latest: Option<&Version>, total_bytes: Option<u64>) -> ProgressB
         None => ProgressBar::no_length().with_style(stage_style(UNSIZED_DOWNLOAD_TEMPLATE)),
     };
     bar.set_message(match latest {
-        Some(version) => format!("⬇️  Downloading rift v{version}"),
-        None => "⬇️  Downloading rift".to_owned(),
+        Some(version) => format!("📥 Downloading rift v{version}"),
+        None => "📥 Downloading rift".to_owned(),
     });
     bar
 }
@@ -304,7 +310,7 @@ mod tests {
     fn a_sized_download_draws_received_and_total_bytes() {
         let bar = download_bar(Some(&Version::new(0, 0, 26)), Some(45_100_000));
         let drawn = drawn_line(&bar, 12_300_000);
-        assert!(drawn.contains("⬇️  Downloading rift v0.0.26"), "{drawn}");
+        assert!(drawn.contains("📥 Downloading rift v0.0.26"), "{drawn}");
         assert!(drawn.contains("12.3 MB / 45.1 MB"), "{drawn}");
     }
 
@@ -312,7 +318,7 @@ mod tests {
     fn an_unsized_download_draws_a_byte_counter() {
         let bar = download_bar(None, None);
         let drawn = drawn_line(&bar, 640_000);
-        assert!(drawn.contains("⬇️  Downloading rift"), "{drawn}");
+        assert!(drawn.contains("📥 Downloading rift"), "{drawn}");
         assert!(drawn.contains("640 KB"), "{drawn}");
     }
 
@@ -352,6 +358,35 @@ mod tests {
     /// the wide-char undercount defect this test guards against pads the
     /// drawn line past what a real terminal can show without wrapping.
     const NARROW_TERMINAL_WIDTH: u16 = 40;
+
+    /// A terminal wide enough that a download frame fits on one row, so any
+    /// frame drawn past this width is over-padding, never content wrapping.
+    const WIDE_TERMINAL_WIDTH: u16 = 120;
+
+    #[test]
+    fn a_download_frame_never_pads_past_the_terminal_width() {
+        let bar = download_bar(Some(&Version::new(0, 0, 30)), Some(14_100_000));
+        let terminal = RecordingTerminal::new(WIDE_TERMINAL_WIDTH);
+        bar.set_draw_target(ProgressDrawTarget::term_like(Box::new(terminal.clone())));
+        bar.set_position(1_365);
+        bar.force_draw();
+
+        // indicatif pads every drawn line to the terminal width and relies on
+        // the terminal wrapping at that width instead of writing a newline. A
+        // frame measuring wider than the terminal wraps onto a second row the
+        // next redraw never clears, so the bar leaves one stale line behind
+        // per redraw.
+        let frames = terminal.frames();
+        assert!(!frames.is_empty(), "the bar must draw at least one frame");
+        for frame in &frames {
+            let drawn_width = frame.width();
+            assert!(
+                drawn_width <= usize::from(WIDE_TERMINAL_WIDTH),
+                "a drawn frame must fit the terminal: width={WIDE_TERMINAL_WIDTH}, \
+                 drawn_width={drawn_width}, frame={frame:?}"
+            );
+        }
+    }
 
     #[test]
     fn a_double_width_stage_message_never_overflows_a_narrow_terminal() {
