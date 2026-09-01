@@ -354,4 +354,35 @@ mod tests {
         assert_eq!(catalog.inputs().count(), 0);
         assert!(!catalog.is_degraded());
     }
+
+    #[test]
+    fn test_output_of_reports_a_killed_run_as_overstayed() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let run = BoundedRun {
+            exit: Ok(std::process::ExitStatus::from_raw(9)),
+            timed_out: true,
+            stdout: rift_core::CapturedStream::default(),
+            stderr: rift_core::CapturedStream::default(),
+        };
+
+        let failure = output_of("cargo", run).expect_err("a killed run has no output");
+
+        assert_eq!(failure.program, "cargo");
+        assert!(failure.reason.starts_with("overstayed "), "{failure}");
+        assert!(failure.reason.ends_with("s and was killed"), "{failure}");
+    }
+
+    #[test]
+    fn test_output_of_reports_an_unobservable_run_with_the_io_text() {
+        let run = BoundedRun {
+            exit: Err(std::io::Error::other("lost the child")),
+            timed_out: false,
+            stdout: rift_core::CapturedStream::default(),
+            stderr: rift_core::CapturedStream::default(),
+        };
+
+        let failure = output_of("cargo", run).expect_err("an unobserved run has no output");
+
+        assert_eq!(failure.reason, "waiting on the process: lost the child");
+    }
 }

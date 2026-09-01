@@ -414,12 +414,6 @@ impl ReadService {
         )
     }
 
-    /// The packages this snapshot's toolchains resolved, keyed by identity.
-    #[must_use]
-    pub fn dependency_catalog(&self) -> &DependencyCatalog {
-        &self.catalog
-    }
-
     /// The symbol reference adjacency built from this snapshot's normalized graph: which
     /// symbols reference which, in both directions.
     #[must_use]
@@ -521,9 +515,6 @@ impl ReadService {
     /// resolution otherwise. A degraded catalog is also resolved again, since the machine
     /// may have gained the toolchain or the cache the resolvers missed.
     fn catalog_after(&self, changes: &PathChanges) -> Result<Arc<DependencyCatalog>, ReadError> {
-        let Some(source_policy) = &self.source_policy else {
-            return Ok(Arc::clone(&self.catalog));
-        };
         let touches_input = changes.paths().any(|path| {
             let path = project_path(path);
             self.catalog.depends_on(&path) || rift_dependency::is_claimed_manifest(&path)
@@ -531,10 +522,11 @@ impl ReadService {
         if !touches_input && !self.catalog.is_degraded() {
             return Ok(Arc::clone(&self.catalog));
         }
-        Ok(Arc::new(resolved_catalog(
-            self.index.root(),
-            source_policy,
-        )?))
+        let source_policy = self.source_policy.as_deref().unwrap_or_else(|| {
+            unreachable!("a current-tree read service always compiles its source policy")
+        });
+        let catalog = resolved_catalog(self.index.root(), source_policy)?;
+        Ok(Arc::new(catalog))
     }
 
     /// Builds one in-memory snapshot of the workspace at a version-control
