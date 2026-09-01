@@ -531,10 +531,6 @@ mod tests {
             self.inner.language()
         }
 
-        fn extensions(&self) -> &'static [&'static str] {
-            self.inner.extensions()
-        }
-
         fn source_bytes_max(&self) -> usize {
             self.inner.source_bytes_max()
         }

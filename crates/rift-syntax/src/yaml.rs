@@ -319,9 +319,6 @@ pub struct YamlSyntaxProvider {
 }
 
 impl YamlSyntaxProvider {
-    /// File extensions this provider parses, without their leading dot.
-    pub const SOURCE_EXTENSIONS: &'static [&'static str] = &["yaml", "yml"];
-
     /// Default maximum bytes this provider accepts from one YAML source.
     pub const SOURCE_BYTES_MAX_DEFAULT: usize = 4 * 1_024 * 1_024;
 
@@ -355,10 +352,6 @@ impl Default for YamlSyntaxProvider {
 impl SyntaxProvider for YamlSyntaxProvider {
     fn language(&self) -> &Language {
         &self.language
-    }
-
-    fn extensions(&self) -> &'static [&'static str] {
-        Self::SOURCE_EXTENSIONS
     }
 
     fn source_bytes_max(&self) -> usize {
@@ -496,11 +489,10 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_declares_language_extensions_and_byte_bound() {
+    fn test_provider_declares_language_and_byte_bound() {
         let provider = YamlSyntaxProvider::default();
         assert_eq!(provider.language().name, "yaml");
         assert_eq!(provider.language().dialect, None);
-        assert_eq!(provider.extensions(), ["yaml", "yml"]);
         assert_eq!(
             provider.source_bytes_max(),
             YamlSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT

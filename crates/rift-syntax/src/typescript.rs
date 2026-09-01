@@ -35,13 +35,6 @@ impl TypeScriptDialect {
         TypeScriptSyntaxProvider::new(self, TYPESCRIPT_SYNTAX_LIMITS_DEFAULT)
     }
 
-    const fn extensions(self) -> &'static [&'static str] {
-        match self {
-            Self::TypeScript => &["ts"],
-            Self::Tsx => &["tsx"],
-        }
-    }
-
     fn language(self) -> Language {
         Language {
             name: "typescript".to_owned(),
@@ -110,10 +103,6 @@ impl SyntaxProvider for TypeScriptSyntaxProvider {
         &self.language
     }
 
-    fn extensions(&self) -> &'static [&'static str] {
-        self.dialect.extensions()
-    }
-
     fn source_bytes_max(&self) -> usize {
         self.limits.source_bytes_max()
     }
@@ -156,11 +145,10 @@ mod tests {
     }
 
     #[test]
-    fn test_providers_declare_language_dialect_extensions_and_byte_bound() {
+    fn test_providers_declare_language_dialect_and_byte_bound() {
         let typescript = TypeScriptDialect::TypeScript.provider();
         assert_eq!(typescript.language().name, "typescript");
         assert_eq!(typescript.language().dialect, None);
-        assert_eq!(typescript.extensions(), ["ts"]);
         assert_eq!(
             typescript.source_bytes_max(),
             TypeScriptSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT
@@ -169,7 +157,6 @@ mod tests {
         let tsx = TypeScriptDialect::Tsx.provider();
         assert_eq!(tsx.language().name, "typescript");
         assert_eq!(tsx.language().dialect.as_deref(), Some("tsx"));
-        assert_eq!(tsx.extensions(), ["tsx"]);
     }
 
     #[test]

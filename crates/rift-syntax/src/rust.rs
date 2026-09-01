@@ -336,10 +336,6 @@ pub struct RustSyntaxProvider {
 }
 
 impl RustSyntaxProvider {
-    /// File extensions this provider parses, without their leading dot. The workspace walk
-    /// includes a file as source only when some shipped provider declares its extension.
-    pub const SOURCE_EXTENSIONS: &'static [&'static str] = &["rs"];
-
     /// Default maximum bytes this provider accepts from one Rust source.
     pub const SOURCE_BYTES_MAX_DEFAULT: usize = 4 * 1_024 * 1_024;
 
@@ -373,10 +369,6 @@ impl Default for RustSyntaxProvider {
 impl SyntaxProvider for RustSyntaxProvider {
     fn language(&self) -> &Language {
         &self.language
-    }
-
-    fn extensions(&self) -> &'static [&'static str] {
-        Self::SOURCE_EXTENSIONS
     }
 
     fn source_bytes_max(&self) -> usize {
@@ -832,11 +824,10 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_declares_language_extensions_and_byte_bound() {
+    fn test_provider_declares_language_and_byte_bound() {
         let provider = RustSyntaxProvider::default();
         assert_eq!(provider.language().name, "rust");
         assert_eq!(provider.language().dialect, None);
-        assert_eq!(provider.extensions(), ["rs"]);
         assert_eq!(
             provider.source_bytes_max(),
             RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT

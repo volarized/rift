@@ -179,9 +179,6 @@ pub struct JsonSyntaxProvider {
 }
 
 impl JsonSyntaxProvider {
-    /// File extensions this provider parses, without their leading dot.
-    pub const SOURCE_EXTENSIONS: &'static [&'static str] = &["json"];
-
     /// Default maximum bytes this provider accepts from one JSON source.
     pub const SOURCE_BYTES_MAX_DEFAULT: usize = 4 * 1_024 * 1_024;
 
@@ -215,10 +212,6 @@ impl Default for JsonSyntaxProvider {
 impl SyntaxProvider for JsonSyntaxProvider {
     fn language(&self) -> &Language {
         &self.language
-    }
-
-    fn extensions(&self) -> &'static [&'static str] {
-        Self::SOURCE_EXTENSIONS
     }
 
     fn source_bytes_max(&self) -> usize {
@@ -332,11 +325,10 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_declares_language_extensions_and_byte_bound() {
+    fn test_provider_declares_language_and_byte_bound() {
         let provider = JsonSyntaxProvider::default();
         assert_eq!(provider.language().name, "json");
         assert_eq!(provider.language().dialect, None);
-        assert_eq!(provider.extensions(), ["json"]);
         assert_eq!(
             provider.source_bytes_max(),
             JsonSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT

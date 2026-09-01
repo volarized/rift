@@ -24,7 +24,7 @@ use rift_lsp::session::{
 use rift_protocol::change::{
     ChangeResult, MoveFileParams, OperationPreconditionKind, PreconditionValue, RefusalReason,
 };
-use rift_protocol::read::{Diagnostic, DiagnosticCode, Severity};
+use rift_protocol::read::{Diagnostic, DiagnosticCode, Language, Severity};
 
 use crate::engine::{EnginePool, EngineSlot};
 use crate::read::{ReadError, ReadFault, ReadService};
@@ -379,6 +379,7 @@ fn refused_invisible_destination(
 }
 
 /// What the engine phase produced for one move.
+#[derive(Debug)]
 enum EngineProposal {
     /// The engine contributed no reference updates; the reason rides the
     /// applied move as its warning.
@@ -421,7 +422,11 @@ async fn engine_proposal(
             ReferencesNotUpdated::NoLanguageClaimed,
         ));
     };
-    let language = crate::rename::segment_language(language_segment);
+    let Ok(language) = Language::from_identity_segment(language_segment) else {
+        return Ok(EngineProposal::Nothing(ReferencesNotUpdated::NoEngine {
+            language_segment: language_segment.to_owned(),
+        }));
+    };
     let Some(slot) = engines.engine_for(&language) else {
         return Ok(EngineProposal::Nothing(ReferencesNotUpdated::NoEngine {
             language_segment: language_segment.to_owned(),
@@ -628,6 +633,33 @@ mod tests {
             MoveResolution::Refused(result) => result,
             MoveResolution::Planned(plan) => panic!("expected a refusal, got plan {plan:?}"),
         }
+    }
+
+    /// A language segment no identity spells is a language no engine claims:
+    /// the proposal answers the same warning an unserved language does.
+    #[tokio::test]
+    async fn engine_proposal_answers_no_engine_for_a_segment_no_identity_spells() {
+        let engines = EnginePool::new(
+            Path::new("/rift-test-root"),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        let from = CoreProjectPath::new("lib.rs").expect("fixture path");
+        let to = CoreProjectPath::new("beacon.rs").expect("fixture path");
+        let proposal = engine_proposal(
+            &engines,
+            &from,
+            &to,
+            Some("rust::tsx"),
+            "pub fn beacon() {}",
+        )
+        .await
+        .expect("a malformed segment answers, never fails");
+        let EngineProposal::Nothing(ReferencesNotUpdated::NoEngine { language_segment }) = proposal
+        else {
+            panic!("expected the no-engine warning, got {proposal:?}");
+        };
+        assert_eq!(language_segment, "rust::tsx");
     }
 
     /// One framed JSON-RPC message.
