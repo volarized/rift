@@ -23,6 +23,8 @@ use rift_syntax::{
     source_unit,
 };
 
+use crate::relationship::RelationshipStore;
+
 /// Whether name binding runs during an index build, and under which bounds.
 ///
 /// The default policy runs the binding provider under [`BindingLimits::default`];
@@ -103,6 +105,7 @@ fn accepted_bound(value: u64) -> usize {
 #[derive(Debug)]
 pub(crate) struct WorkspaceSemantics {
     graph: NormalizedGraph,
+    relationships: RelationshipStore,
     syntax_provider: ProviderId,
 }
 
@@ -155,8 +158,10 @@ impl WorkspaceSemantics {
             &publications,
             previous,
         )?;
+        let relationships = RelationshipStore::build(&graph);
         Ok(Self {
             graph,
+            relationships,
             syntax_provider: ProviderId::new(SYNTAX_PROVIDER_ID)
                 .map_err(SyntaxPublicationError::Identity)?,
         })
@@ -165,6 +170,11 @@ impl WorkspaceSemantics {
     /// Returns captured normalized graph.
     pub(crate) const fn graph(&self) -> &NormalizedGraph {
         &self.graph
+    }
+
+    /// Returns the symbol reference adjacency built from this revision's graph.
+    pub(crate) const fn relationships(&self) -> &RelationshipStore {
+        &self.relationships
     }
 
     /// Assembles readable symbol for syntax provider-local identity.

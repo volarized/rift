@@ -11,8 +11,8 @@ use rift_core::{
 };
 use rift_history::{HistoryError, Repository};
 use rift_index::{
-    BindingPolicy, FileDigest, IndexedFile, PathChanges, ReadableSymbol, SymbolMatch,
-    WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError,
+    BindingPolicy, FileDigest, IndexedFile, PathChanges, ReadableSymbol, RelationshipStore,
+    SymbolMatch, WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError,
     WorkspaceIndexLimits, WorkspaceIndexWarning, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::HistoryConfiguration;
@@ -401,6 +401,13 @@ impl ReadService {
     #[must_use]
     pub fn workspace_map(&self) -> WorkspaceMap {
         crate::map::build_workspace_map(&self.index, self.revisions.wire_index_tree_revision())
+    }
+
+    /// The symbol reference adjacency built from this snapshot's normalized graph: which
+    /// symbols reference which, in both directions.
+    #[must_use]
+    pub fn relationships(&self) -> &RelationshipStore {
+        self.index.relationships()
     }
 
     /// The visibility policy this snapshot reads the filesystem through.
@@ -1423,7 +1430,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        BindingPolicy, HistoryConfiguration, ReadFault, ReadService, WorkspaceIndexLimits, file_id,
+        BindingPolicy, HistoryConfiguration, ReadFault, ReadService, WorkspaceIndex,
+        WorkspaceIndexLimits, file_id,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -1527,6 +1535,49 @@ mod tests {
             HistoryConfiguration::default(),
         )?;
         Ok((directory, service))
+    }
+
+    /// `ReadService::relationships` is a pass-through onto the underlying index's own
+    /// store: an independently built [`WorkspaceIndex`] over the identical source must
+    /// report the same adjacency the service serves.
+    #[test]
+    fn relationships_pass_through_serves_the_same_edges_the_index_holds() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("src"))?;
+        fs::write(
+            directory.path().join("src/lib.rs"),
+            "pub fn alpha() {}\npub fn beta() { alpha(); }\n",
+        )?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let independent_index = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+        )?;
+
+        let beta = rift_core::SymbolId::new("rift://symbol/rust/src/lib.rs/beta")?;
+        let alpha = rift_core::SymbolId::new("rift://symbol/rust/src/lib.rs/alpha")?;
+        let served = service.relationships().outgoing(&beta);
+        assert_eq!(served, independent_index.relationships().outgoing(&beta));
+        assert_eq!(served.len(), 1);
+        assert_eq!(served[0].from(), &beta);
+        assert_eq!(served[0].to(), &alpha);
+        assert_eq!(
+            served[0].facet(),
+            rift_protocol::read::RelationshipFacet::Calls
+        );
+        assert_eq!(
+            service.relationships().incoming(&alpha),
+            independent_index.relationships().incoming(&alpha)
+        );
+        Ok(())
     }
 
     const DOCUMENTED_SOURCE: &str = "/// A beacon.\n#[derive(Debug)]\npub struct Beacon;\n";
