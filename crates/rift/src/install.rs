@@ -727,4 +727,35 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn install_faults_project_their_registry_identity_context_and_source() {
+        use std::error::Error as _;
+        use std::io;
+        use std::path::Path;
+
+        let denied = || io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        let write = super::write_error(Path::new("skill/SKILL.md"), denied());
+        assert_eq!(write.descriptor().code(), "install_write_failed");
+        assert!(write.to_string().contains("skill/SKILL.md"), "{write}");
+        assert!(write.source().is_some(), "{write}");
+
+        let remove = super::remove_error(Path::new("skill"), denied());
+        assert_eq!(remove.descriptor().code(), "install_remove_failed");
+        assert!(remove.to_string().contains("skill"), "{remove}");
+        assert!(remove.source().is_some(), "{remove}");
+
+        let home = super::Error::new(InstallFault::HomeDirectoryUnresolved);
+        assert_eq!(home.descriptor().code(), "install_home_unresolved");
+        assert!(home.to_string().contains("USERPROFILE"), "{home}");
+        assert!(home.source().is_none(), "{home}");
+
+        let template = super::Error::new(InstallFault::TemplateToolMissing { name: "search" });
+        assert_eq!(
+            template.descriptor().code(),
+            "install_template_missing_tool"
+        );
+        assert!(template.to_string().contains("search"), "{template}");
+        assert!(template.source().is_none(), "{template}");
+    }
 }

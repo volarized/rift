@@ -275,6 +275,17 @@ mod tests {
     }
 
     #[test]
+    fn install_cli_error_preserves_message_source_and_descriptor() {
+        let install = rift_core::Error::new(super::install::InstallFault::HomeDirectoryUnresolved);
+        let code = install.descriptor().code();
+        assert_eq!(code, "install_home_unresolved");
+        let error = CliError::Install(install);
+        assert_eq!(error.descriptor().code(), code);
+        assert!(error.to_string().contains("USERPROFILE"), "{error}");
+        assert!(error.source().is_some());
+    }
+
+    #[test]
     fn cli_error_descriptor_matches_wrapped_error() {
         let update = super::update::error_for_test();
         let update_code = update.descriptor().code();
