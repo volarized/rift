@@ -356,12 +356,28 @@ mod tests {
     fn test_resolvers_lists_every_shipped_resolver_in_run_order() {
         let listed: Vec<ResolverName> =
             resolvers().iter().map(|resolver| resolver.name()).collect();
-        assert_eq!(listed, [ResolverName::Cargo, ResolverName::Uv]);
+        assert_eq!(
+            listed,
+            [
+                ResolverName::Cargo,
+                ResolverName::Uv,
+                ResolverName::Npm,
+                ResolverName::Bun
+            ]
+        );
         let claimed: Vec<&str> = resolvers()
             .iter()
             .map(|resolver| resolver.manifest_file_name())
             .collect();
-        assert_eq!(claimed, ["Cargo.toml", "pyproject.toml"]);
+        assert_eq!(
+            claimed,
+            [
+                "Cargo.toml",
+                "pyproject.toml",
+                "package.json",
+                "package.json"
+            ]
+        );
     }
 
     #[test]
