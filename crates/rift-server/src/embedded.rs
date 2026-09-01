@@ -724,6 +724,226 @@ mod tests {
         );
     }
 
+    /// References answer across files with the caller's own spellings, and
+    /// a position resolving no symbol answers the empty list.
+    #[test]
+    fn test_references_answer_across_files_and_empty_off_symbol() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        std::fs::write(
+            directory.path().join("a.py"),
+            "def helper():\n    return 1\n",
+        )
+        .expect("fixture a");
+        std::fs::write(
+            directory.path().join("b.py"),
+            "from a import helper\n\nhelper()\n",
+        )
+        .expect("fixture b");
+        let uri = path_to_uri(&directory.path().join("a.py"));
+        let request = |position: Value| {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "textDocument/references",
+                "params": {
+                    "textDocument": { "uri": uri },
+                    "position": position,
+                    "context": { "includeDeclaration": false },
+                },
+            })
+        };
+        let message = request(serde_json::json!({ "line": 0, "character": 4 }));
+        let Handled::Reply(reply) = handle_message(&message, directory.path(), &empty_documents())
+        else {
+            panic!("references must reply");
+        };
+        let locations = reply["result"].as_array().expect("a location list");
+        assert!(
+            locations.iter().any(|location| location["uri"]
+                .as_str()
+                .is_some_and(|uri| uri.ends_with("b.py"))),
+            "the import and call in b.py are among the references: {reply:#}"
+        );
+        assert!(
+            locations.iter().all(|location| {
+                location["uri"]
+                    .as_str()
+                    .is_some_and(|uri| uri.starts_with(&path_to_uri(directory.path())))
+            }),
+            "answers echo the caller's own root spelling: {reply:#}"
+        );
+
+        let off_symbol = request(serde_json::json!({ "line": 1, "character": 0 }));
+        let Handled::Reply(reply) =
+            handle_message(&off_symbol, directory.path(), &empty_documents())
+        else {
+            panic!("references must reply");
+        };
+        assert_eq!(
+            reply["result"],
+            serde_json::json!([]),
+            "a position resolving no symbol answers the empty list"
+        );
+    }
+
+    /// The rename refusal arms: a request without `newName` errs, and a
+    /// position ty cannot rename answers `null` for prepare and rename both.
+    #[test]
+    fn test_rename_refusals_answer_error_and_null() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let path = directory.path().join("a.py");
+        std::fs::write(&path, "def helper():\n    return 1\n").expect("fixture");
+        let uri = path_to_uri(&path);
+        let nameless = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "textDocument/rename",
+            "params": {
+                "textDocument": { "uri": uri },
+                "position": { "line": 0, "character": 4 },
+            },
+        });
+        let Handled::Reply(reply) = handle_message(&nameless, directory.path(), &empty_documents())
+        else {
+            panic!("rename must reply");
+        };
+        assert_eq!(reply["error"]["code"], INTERNAL_ERROR, "{reply:#}");
+
+        for method in ["textDocument/prepareRename", "textDocument/rename"] {
+            let keyword = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": method,
+                "params": {
+                    "textDocument": { "uri": uri },
+                    "position": { "line": 0, "character": 0 },
+                    "newName": "renamed",
+                },
+            });
+            let Handled::Reply(reply) =
+                handle_message(&keyword, directory.path(), &empty_documents())
+            else {
+                panic!("{method} must reply");
+            };
+            assert_eq!(
+                reply["result"],
+                Value::Null,
+                "`def` is not renameable: {method}, {reply:#}"
+            );
+        }
+    }
+
+    /// The serve loop over a raw transport: initialize answers a framed
+    /// reply, an unknown notification stays silent, unreadable bytes end
+    /// the loop, and `exit` ends it cleanly.
+    #[tokio::test]
+    async fn test_serve_answers_frames_and_ends_on_exit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut session, engine) = tokio::io::duplex(64 * 1024);
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let served = tokio::spawn(serve(engine, directory.path().to_path_buf()));
+
+        let initialize =
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.as_slice();
+        session
+            .write_all(&Framing::frame(initialize))
+            .await
+            .expect("initialize writes");
+        session
+            .write_all(&Framing::frame(
+                br#"{"jsonrpc":"2.0","method":"initialized"}"#.as_slice(),
+            ))
+            .await
+            .expect("initialized writes");
+        let mut framing = Framing::new();
+        let mut buffer = [0_u8; 4096];
+        let answer = loop {
+            let read = session.read(&mut buffer).await.expect("the reply arrives");
+            let mut messages = framing.feed(&buffer[..read]).expect("framed reply");
+            if let Some(payload) = messages.pop() {
+                break serde_json::from_slice::<Value>(&payload).expect("reply parses");
+            }
+        };
+        assert_eq!(answer["id"], 1);
+        assert_eq!(
+            answer["result"]["capabilities"]["positionEncoding"],
+            "utf-8"
+        );
+
+        session
+            .write_all(&Framing::frame(
+                br#"{"jsonrpc":"2.0","method":"exit"}"#.as_slice(),
+            ))
+            .await
+            .expect("exit writes");
+        served.await.expect("the loop ends on exit");
+    }
+
+    /// Unreadable payload bytes end the loop instead of answering garbage.
+    #[tokio::test]
+    async fn test_serve_ends_on_unreadable_bytes() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut session, engine) = tokio::io::duplex(4 * 1024);
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let served = tokio::spawn(serve(engine, directory.path().to_path_buf()));
+        session
+            .write_all(&Framing::frame(b"not json".as_slice()))
+            .await
+            .expect("garbage writes");
+        served.await.expect("the loop ends on unreadable bytes");
+    }
+
+    /// A project marker routes database construction through hermetic
+    /// discovery, and the pull still answers findings from that tree.
+    #[test]
+    fn test_a_pyproject_marker_routes_through_hermetic_discovery() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        std::fs::write(
+            directory.path().join("pyproject.toml"),
+            "[project]\nname = \"beacon\"\nversion = \"0.0.1\"\n",
+        )
+        .expect("marker");
+        let path = directory.path().join("service.py");
+        std::fs::write(&path, "count: int = \"eight\"\n").expect("fixture");
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "textDocument/diagnostic",
+            "params": { "textDocument": { "uri": path_to_uri(&path) } },
+        });
+        let Handled::Reply(reply) = handle_message(&message, directory.path(), &empty_documents())
+        else {
+            panic!("the pull must reply");
+        };
+        let items = reply["result"]["items"].as_array().expect("items");
+        assert!(
+            items
+                .iter()
+                .any(|item| item["code"] == serde_json::json!("invalid-assignment")),
+            "discovery keeps the tree's own findings: {reply:#}"
+        );
+    }
+
+    /// A didOpen before any request feeds no database (none exists yet),
+    /// and the first request builds one from disk regardless.
+    #[test]
+    fn test_did_open_before_any_database_stays_silent() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let path = directory.path().join("early.py");
+        std::fs::write(&path, "x = 1\n").expect("fixture");
+        let open = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": { "textDocument": { "uri": path_to_uri(&path), "text": "x = 1\n" } },
+        });
+        assert!(matches!(
+            handle_message(&open, directory.path(), &empty_documents()),
+            Handled::Silent
+        ));
+    }
+
     #[test]
     fn test_offset_and_range_conversions_speak_utf8_positions() {
         let text = "alpha\ndef beacon():\n    pass\n";

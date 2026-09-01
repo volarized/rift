@@ -4090,6 +4090,37 @@ mod tests {
         ));
     }
 
+    /// Every engine-selection violation names the keys the operator has to
+    /// reconcile.
+    #[test]
+    fn test_engine_selection_evidence_names_the_lsp_and_its_keys() {
+        let conflict = ConfigurationViolation::LspEngineSelectionConflict {
+            lsp: "ty".to_owned(),
+        };
+        assert_eq!(
+            conflict.evidence(),
+            vec![
+                ("lsp", "ty".to_owned()),
+                ("fields", "command, embedded".to_owned()),
+            ]
+        );
+        let missing = ConfigurationViolation::LspEngineMissing {
+            lsp: "ty".to_owned(),
+        };
+        assert_eq!(missing.evidence(), conflict.evidence());
+        let extras = ConfigurationViolation::LspEmbeddedExtras {
+            lsp: "ty".to_owned(),
+            field: "environment",
+        };
+        assert_eq!(
+            extras.evidence(),
+            vec![
+                ("lsp", "ty".to_owned()),
+                ("field", "environment".to_owned())
+            ]
+        );
+    }
+
     /// One engine per LSP table: naming both `command` and `embedded`
     /// selects twice, naming neither selects nothing runnable, and an
     /// embedded table refuses the spawned-process keys beside it.
