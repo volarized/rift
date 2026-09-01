@@ -407,6 +407,8 @@ mod tests {
             &mut inspector,
         );
 
+        assert_eq!(ProbeResolver.manager(), "probe");
+        assert_eq!(ProbeResolver.language(), rust());
         assert_eq!(catalog.entries().len(), 2);
         let inputs: Vec<&str> = catalog.inputs().map(|path| path.0.as_str()).collect();
         assert_eq!(inputs, ["probe.toml", "tools/probe.toml"]);
