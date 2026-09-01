@@ -279,7 +279,10 @@ The binding provider is the `rift-binding` crate, run in process by the index bu
 provider may extract binding facts - scopes, definitions, references, imports - in one walk
 over the tree its parse produced and attach them to its document. The Rust provider does, and
 supplies the `ModuleLayout` implementation the build resolves module paths through, fetched
-once per language from the provider registry.
+once per language from the provider registry. The registry itself assembles from one shipped
+definition list in `rift-syntax`: each entry names a language's identity, the file extensions
+it claims, and the provider parsing it, so adding a language is one definition plus one list
+entry.
 
 The build assembles every document's facts into one graph, links modules across units, resolves
 each reference on a bounded work queue with a per-step precedence rank, and publishes the
