@@ -229,6 +229,11 @@ async fn happy_engine_negotiates_renames_and_serves_diagnostics() {
         .expect("the didOpen publish was retained");
     assert_eq!(published.len(), 1);
     assert_eq!(published[0].message, "published diagnostic");
+    assert_eq!(
+        session.published_diagnostics_version(&document),
+        None,
+        "the scripted publish names no version, so none is retained"
+    );
 
     let prepared = session
         .prepare_rename(
@@ -273,6 +278,73 @@ async fn happy_engine_negotiates_renames_and_serves_diagnostics() {
     session.close(&document).await.expect("didClose is sent");
     let stderr = session.shutdown().await;
     assert_eq!(stderr.total_bytes, 0);
+    join(engine_task).await;
+}
+
+/// A publish naming a version is retained under it, and a later publish
+/// for the same document overwrites both the diagnostics and the version.
+#[tokio::test]
+async fn published_diagnostics_version_tracks_the_latest_publish() {
+    let (_workspace, mut session, engine_task) = started(|mut engine| async move {
+        engine.handshake(full_capabilities()).await;
+        let opened = engine.next_message().await;
+        assert_eq!(opened["method"], json!("textDocument/didOpen"));
+        let uri = opened["params"]["textDocument"]["uri"]
+            .as_str()
+            .expect("uri")
+            .to_owned();
+        engine
+            .notify(
+                "textDocument/publishDiagnostics",
+                json!({"uri": uri, "diagnostics": [diagnostic("first")], "version": 3}),
+            )
+            .await;
+        let (id, _params) = engine.expect_request("textDocument/diagnostic").await;
+        engine
+            .respond(&id, json!({"kind": "full", "items": []}))
+            .await;
+        engine
+            .notify(
+                "textDocument/publishDiagnostics",
+                json!({"uri": uri, "diagnostics": [diagnostic("second")], "version": 7}),
+            )
+            .await;
+        let (id, _params) = engine.expect_request("textDocument/diagnostic").await;
+        engine
+            .respond(&id, json!({"kind": "full", "items": []}))
+            .await;
+    })
+    .await;
+
+    let document = path("src/lib.rs");
+    session
+        .open(&document, "rust", "fn a() {}\n".to_owned())
+        .await
+        .expect("didOpen is sent");
+
+    session
+        .pull_diagnostics(&document)
+        .await
+        .expect("the first pull answers, reading the queued publish along the way");
+    assert_eq!(session.published_diagnostics_version(&document), Some(3));
+
+    session
+        .pull_diagnostics(&document)
+        .await
+        .expect("the second pull answers, reading the newer publish along the way");
+    assert_eq!(
+        session.published_diagnostics_version(&document),
+        Some(7),
+        "a later publish overwrites the version its predecessor named"
+    );
+    assert_eq!(
+        session
+            .published_diagnostics(&document)
+            .expect("the second publish was retained")[0]
+            .message,
+        "second"
+    );
+
     join(engine_task).await;
 }
 
