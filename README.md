@@ -52,7 +52,9 @@ Run `rift install claude` from a codebase to write a Claude Code skill at `.clau
 teaching the agent to reach for Rift's tools. The skill is regenerated from the served tool
 surface, so its tool names track whatever this build serves; rerun the command after an upgrade.
 Pass `--user` to install under the operator's home directory instead of the workspace, and
-`--remove` to delete the generated skill.
+`--remove` to delete the generated skill. The command also writes a `PreToolUse` hook that runs
+`rift steer`, redirecting the agent's first `Grep` or `Glob` call in a session to the rift search
+tool; set `RIFT_STEER=0` to disable it.
 
 ## Update
 

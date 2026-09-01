@@ -61,6 +61,48 @@ The skill also points the agent at [`rift://map`](/docs/protocol/mcp#resource-ma
 read in an unfamiliar repository, and at [`rift://logs`](/docs/protocol/mcp#resource-logs) when a
 refusal alone doesn't say why.
 
+## Steering
+
+<VersionBadge version="v0.0.29" />
+
+A skill changes what an agent reaches for; habit still wins the first time it needs to search.
+Claude Code agents call `Grep` and `Glob` from training, even in a workspace `rift mcp` already
+indexes. `rift steer` catches that first call and redirects it.
+
+`rift install claude` writes a `PreToolUse` hook alongside the skill:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Grep|Glob",
+        "hooks": [{ "type": "command", "command": "rift steer" }]
+      }
+    ]
+  }
+}
+```
+
+Claude Code runs `rift steer` before the first `Grep` or `Glob` call in a session and pipes it
+the tool call as JSON on stdin. In a workspace Rift has indexed and version control tracks, that
+first call is denied: the reason names the [`search`](/docs/protocol/mcp#tool-search) call that
+answers the same question, [`get_symbol`](/docs/protocol/mcp#tool-get_symbol) for a known name,
+and [`rift://map`](/docs/protocol/mcp#resource-map) for orientation.
+
+The same `Grep` or `Glob` call passes if the agent retries it, and every later call in that
+session passes without a prompt. `rift steer` marks the session with a file under
+`.rift/steer/`, so it denies at most once per session.
+
+Every other case passes without a prompt too: a workspace with no index yet, one with no version
+control, and a session that already saw its one redirect.
+
+Set `RIFT_STEER=0` in the environment Claude Code runs in to disable the hook entirely; every
+call then passes.
+
+`rift install claude --remove` strips the hook entry from `.claude/settings.json`, leaving every
+other entry in the file untouched.
+
 ## Regeneration
 
 `rift install claude` reads the same tool router `rift mcp` serves, so the skill's tool names
