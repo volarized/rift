@@ -46,6 +46,14 @@ pub enum CliCode {
     ServerStopFailed,
     /// Recorded server logs could not be read.
     ServerLogsUnavailable,
+    /// The operator's home directory could not be resolved for a user-scope install.
+    InstallHomeUnresolved,
+    /// A generated Claude Code skill names a tool the served MCP surface does not have.
+    InstallTemplateMissingTool,
+    /// A generated Claude Code skill could not be written.
+    InstallWriteFailed,
+    /// A generated Claude Code skill could not be removed.
+    InstallRemoveFailed,
 }
 
 /// Stable machine-readable error identity: a wire code or a CLI-only code.
@@ -241,6 +249,26 @@ const fn cli_guidance(code: CliCode) -> (&'static str, RetryDirective, &'static 
             "the workspace's recorded server logs could not be read",
             RetryDirective::OperatorAction,
             "ensure no other process holds `.rift/db` exclusively and retry",
+        ),
+        CliCode::InstallHomeUnresolved => (
+            "the operator's home directory could not be resolved",
+            RetryDirective::OperatorAction,
+            "set HOME (or USERPROFILE on Windows) and retry `rift install claude --user`",
+        ),
+        CliCode::InstallTemplateMissingTool => (
+            "the generated Claude Code skill names a tool the served MCP surface does not have",
+            RetryDirective::Never,
+            "rebuild rift so the binary and its served tool surface match, then retry `rift install claude`",
+        ),
+        CliCode::InstallWriteFailed => (
+            "the generated Claude Code skill could not be written",
+            RetryDirective::OperatorAction,
+            "ensure the target directory is writable and retry `rift install claude`",
+        ),
+        CliCode::InstallRemoveFailed => (
+            "the generated Claude Code skill could not be removed",
+            RetryDirective::OperatorAction,
+            "ensure the target directory is writable and retry `rift install claude --remove`",
         ),
     }
 }

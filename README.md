@@ -46,6 +46,14 @@ MCP. Later reads include edits made through Rift or another filesystem tool, suc
 This repository's `.mcp.json` runs the local build through Cargo. An installed client configuration
 uses `rift` as command and `["mcp"]` as arguments.
 
+## Claude Code
+
+Run `rift install claude` from a codebase to write a Claude Code skill at `.claude/skills/rift/`
+teaching the agent to reach for Rift's tools. The skill is regenerated from the served tool
+surface, so its tool names track whatever this build serves; rerun the command after an upgrade.
+Pass `--user` to install under the operator's home directory instead of the workspace, and
+`--remove` to delete the generated skill.
+
 ## Update
 
 ```sh

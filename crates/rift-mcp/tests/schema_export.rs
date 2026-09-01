@@ -309,3 +309,26 @@ fn schema_document_is_deterministic_and_sorted_by_name() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn tool_listing_matches_the_exported_document_and_stays_sorted() -> TestResult {
+    let tools = schema::tool_listing();
+    assert!(!tools.is_empty());
+    let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted, "tool_listing must be sorted by name");
+
+    let document: Value = serde_json::from_str(&schema::schema_document())?;
+    let exported_names: Vec<&str> = document["tools"]
+        .as_array()
+        .ok_or("tools must be an array")?
+        .iter()
+        .map(|tool| tool["name"].as_str().ok_or("tool name must be a string"))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        names, exported_names,
+        "tool_listing must name the same tools schema_document exports"
+    );
+    Ok(())
+}

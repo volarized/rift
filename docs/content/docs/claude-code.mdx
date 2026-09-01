@@ -1,0 +1,68 @@
+---
+title: Claude Code
+---
+
+<VersionBadge version="v0.0.29" />
+
+Claude Code decides which tool to call from a skill's description and its supporting files.
+Without one naming Rift's tools, an agent falls back to grepping the repository even when a
+`rift mcp` server already indexes it. `rift install claude` writes that skill.
+
+## Install
+
+Run this from a codebase Rift serves:
+
+```sh
+rift install claude
+```
+
+The command writes `SKILL.md` and a `references/tools.md` sidecar under `.claude/skills/rift/`
+in the current workspace. Claude Code reads `SKILL.md`'s frontmatter to decide when to load the
+skill, and loads the sidecar on demand for each tool's parameters.
+
+Pass `--user` to write under the operator's home directory instead of the workspace, so every
+project the operator opens with Claude Code picks up the skill:
+
+```sh
+rift install claude --user
+```
+
+Pass `--remove` to delete the generated skill from either scope:
+
+```sh
+rift install claude --remove
+rift install claude --user --remove
+```
+
+## What the skill teaches
+
+The generated `SKILL.md` carries a decision table pointing the agent at the tool that answers
+its situation:
+
+- [`search`](/docs/protocol/mcp#tool-search) answers when the target is unknown.
+- [`get_symbol`](/docs/protocol/mcp#tool-get_symbol) answers when the declaration name is known.
+- [`nodes`](/docs/protocol/mcp#tool-nodes) answers when the syntax structure at one position is
+  needed.
+- `search` with a `traversal` block answers a symbol's neighbors, its impact (who breaks when it
+  changes), or a path between two symbols.
+- The edit tools - [`patch`](/docs/protocol/mcp#tool-patch),
+  [`replace_node`](/docs/protocol/mcp#tool-replace_node),
+  [`insert_node`](/docs/protocol/mcp#tool-insert_node),
+  [`insert_symbol`](/docs/protocol/mcp#tool-insert_symbol),
+  [`replace_symbol`](/docs/protocol/mcp#tool-replace_symbol),
+  [`rename_symbol`](/docs/protocol/mcp#tool-rename_symbol),
+  [`remove_node`](/docs/protocol/mcp#tool-remove_node),
+  [`remove_symbol`](/docs/protocol/mcp#tool-remove_symbol), and
+  [`move_file`](/docs/protocol/mcp#tool-move_file) - answer when the code needs to change, over
+  raw file writes: the server recomputes each address's witness before writing and runs the
+  workspace's configured [hooks](/docs/configuration#hooks).
+
+The skill also points the agent at [`rift://map`](/docs/protocol/mcp#resource-map) as the first
+read in an unfamiliar repository, and at [`rift://logs`](/docs/protocol/mcp#resource-logs) when a
+refusal alone doesn't say why.
+
+## Regeneration
+
+`rift install claude` reads the same tool router `rift mcp` serves, so the skill's tool names
+can never drift from what this build actually serves. Rerun the command after every upgrade; it
+overwrites the previous skill with the current one.
