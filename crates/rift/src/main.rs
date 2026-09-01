@@ -3,6 +3,7 @@
 mod install;
 mod progress;
 mod server;
+mod steer;
 mod update;
 use std::fmt;
 use std::path::Path;
@@ -47,6 +48,8 @@ enum CliCommand {
         #[arg(long)]
         remove: bool,
     },
+    /// Answer one Claude Code `PreToolUse` hook call from stdin.
+    Steer,
     /// Delete the backup binary left behind by a Windows self-update.
     ///
     /// Windows cannot delete a running executable, so after replacement the
@@ -182,6 +185,7 @@ enum CliOutcome {
     Server(server::ServerOutcome),
     Update(update::UpdateOutcome),
     Install(install::InstallOutcome),
+    Steer(steer::SteerOutcome),
 }
 
 impl fmt::Display for CliOutcome {
@@ -190,6 +194,7 @@ impl fmt::Display for CliOutcome {
             Self::Server(outcome) => outcome.fmt(formatter),
             Self::Update(outcome) => outcome.fmt(formatter),
             Self::Install(outcome) => outcome.fmt(formatter),
+            Self::Steer(outcome) => outcome.fmt(formatter),
         }
     }
 }
@@ -224,6 +229,7 @@ async fn run(
             .map(CliOutcome::Install)
             .map(Some)
             .map_err(CliError::Install),
+        Some(CliCommand::Steer) => Ok(Some(CliOutcome::Steer(steer::run()))),
         #[cfg(windows)]
         Some(CliCommand::__CleanupUpdate { parent_pid }) => {
             let _ = parent_pid;
@@ -318,7 +324,7 @@ mod tests {
                 .get_subcommands()
                 .map(clap::Command::get_name)
                 .collect::<Vec<_>>(),
-            ["mcp", "server", "update", "install", "help"]
+            ["mcp", "server", "update", "install", "steer", "help"]
         );
     }
 
@@ -490,6 +496,7 @@ mod tests {
             ["rift", "server", "status"].as_slice(),
             ["rift", "server", "logs", "--follow"].as_slice(),
             ["rift", "update"].as_slice(),
+            ["rift", "steer"].as_slice(),
         ] {
             let command = Cli::try_parse_from(arguments).expect("command must parse");
             assert!(
@@ -547,6 +554,16 @@ mod tests {
         assert!(
             Cli::try_parse_from(["rift", "install"]).is_err(),
             "install without a target must fail"
+        );
+    }
+
+    #[test]
+    fn steer_command_accepts_no_extra_arguments() {
+        let parsed = Cli::try_parse_from(["rift", "steer"]).expect("steer must parse");
+        assert!(matches!(parsed.command, Some(CliCommand::Steer)));
+        assert!(
+            Cli::try_parse_from(["rift", "steer", "--session-id", "abc"]).is_err(),
+            "steer reads the hook call from stdin, not flags"
         );
     }
 }

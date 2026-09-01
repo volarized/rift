@@ -54,6 +54,9 @@ pub enum CliCode {
     InstallWriteFailed,
     /// A generated Claude Code skill could not be removed.
     InstallRemoveFailed,
+    /// The target `.claude/settings.json` could not be read or does not parse as a JSON
+    /// document the steering hook merge can act on.
+    InstallSettingsUnparsable,
 }
 
 /// Stable machine-readable error identity: a wire code or a CLI-only code.
@@ -269,6 +272,11 @@ const fn cli_guidance(code: CliCode) -> (&'static str, RetryDirective, &'static 
             "the generated Claude Code skill could not be removed",
             RetryDirective::OperatorAction,
             "ensure the target directory is writable and retry `rift install claude --remove`",
+        ),
+        CliCode::InstallSettingsUnparsable => (
+            "the target settings.json could not be read as a JSON hook document",
+            RetryDirective::OperatorAction,
+            "fix or remove the file, then run the same `rift install` command again",
         ),
     }
 }
