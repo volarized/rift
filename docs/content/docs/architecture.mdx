@@ -177,7 +177,7 @@ The server invalidates a changed path's syntax facts and search-index entries.
 
 ### Semantics
 
-<VersionBadge version="v0.0.14" languages={["Rust", "TypeScript"]} />
+<VersionBadge version="v0.0.14" languages={["Rust", "TypeScript", "Python"]} />
 
 A grammar shows how one file is written; it cannot say which other files reference a declaration
 in it. Resolving that is a **language engine**'s job - an external language server Rift starts
@@ -192,6 +192,11 @@ inline LSP process for an exact language identity:
 [typescript-language-server](https://github.com/typescript-language-server/typescript-language-server)
 for `typescript` and a separate `typescript:tsx` entry. Both TypeScript entries can select the
 same named process.
+
+An entry may select the embedded [ty](https://github.com/astral-sh/ty) engine instead of a
+spawned process: the build links it in, and it serves Python over an in-memory transport
+through the same session contract a spawned engine gets, so rename, references, and
+diagnostics run identically over both.
 
 The server starts an engine on the first request for a language it serves and keeps the session
 for later requests, because a language server pays for its project load once and answers from it
