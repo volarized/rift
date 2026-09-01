@@ -1252,8 +1252,8 @@ mod tests {
                 delay_limit: rift_protocol::configuration::Duration::from_millis(1),
             },
         );
-        let rift_protocol::configuration::CommandInput::ProgramAndArguments(command) =
-            &mut engine.command
+        let Some(rift_protocol::configuration::CommandInput::ProgramAndArguments(command)) =
+            engine.command.as_mut()
         else {
             unreachable!("references engine uses a command list")
         };

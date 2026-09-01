@@ -1935,7 +1935,8 @@ mod tests {
         assert_eq!(
             definitions
                 .get(&key)
-                .map(|configuration| configuration.command.program()),
+                .and_then(|configuration| configuration.command.as_ref())
+                .map(rift_protocol::configuration::CommandInput::program),
             Some("uvx"),
             "an accepted LSP definition is served"
         );
