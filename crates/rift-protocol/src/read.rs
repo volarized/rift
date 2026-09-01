@@ -229,6 +229,11 @@ pub enum GetSymbolInclude {
         "name": "Deserialize",
         "limit": 10,
         "page_index": 1
+    },
+    {
+        "name": "spawn",
+        "scope": "all",
+        "limit": 5
     }
 ]))]
 pub struct GetSymbolParams {
@@ -240,6 +245,12 @@ pub struct GetSymbolParams {
     /// Narrows the answer to one language. Omitted searches every served language.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<Language>,
+    /// Which declarations the lookup searches: the project tree, the cataloged
+    /// dependency packages, or both. Omitted, `project`. The server refuses a scope
+    /// beyond `project` together with `rev`, since dependencies are served for the
+    /// current tree alone.
+    #[serde(default)]
+    pub scope: SearchScope,
     /// Optional hit fields to attach: `source`, `history`. Omitted defaults to
     /// `["source"]`; an explicit empty list carries neither.
     #[serde(default = "default_get_symbol_params_include")]
@@ -854,6 +865,11 @@ pub struct ProjectPath(
     pub String,
 );
 
+/// Most `dependency_package_skipped` and `dependency_resolver_degraded` warnings one
+/// answer carries together: skipped packages first in identity order, then degraded
+/// resolvers in resolver order, cut here.
+pub const DEPENDENCY_WARNINGS_MAX: usize = 8;
+
 /// One warning attached to a read result. The answer stands; the warning carries evidence
 /// of a condition the caller weighs before relying on it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -935,6 +951,38 @@ pub enum ReadWarning {
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
         detail: String,
+    },
+    /// Cataloged packages with a source root are still being indexed, so a `dependencies`
+    /// or `all` answer holds their declarations only once the index reaches them. The
+    /// answer is served from the packages indexed so far. Rides only an answer whose
+    /// `scope` reaches dependencies.
+    DependencyIndexPending {
+        /// Packages cataloged with a source root and not yet indexed.
+        pending: u64,
+    },
+    /// The dependency index refused one cataloged package, so none of its declarations
+    /// answers. Rides only an answer whose `scope` reaches dependencies; at most
+    /// `DEPENDENCY_WARNINGS_MAX` of this warning and `dependency_resolver_degraded`
+    /// together ride one answer, this one first, in package identity order.
+    DependencyPackageSkipped {
+        /// The package the index refused.
+        package: PackageIdentity,
+        /// Why the index refused it - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        reason: String,
+    },
+    /// One dependency resolver answered less than its toolchain would have, so the
+    /// catalog may miss packages. Rides only an answer whose `scope` reaches
+    /// dependencies; at most `DEPENDENCY_WARNINGS_MAX` of this warning and
+    /// `dependency_package_skipped` together ride one answer, this one after every
+    /// skipped package, in resolver order.
+    DependencyResolverDegraded {
+        /// The resolver that degraded, by its manager name: `cargo`, `uv`, `npm`, or `bun`.
+        #[schemars(length(max = 128))]
+        resolver: String,
+        /// What the resolver could not do - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        reason: String,
     },
 }
 
@@ -1150,6 +1198,23 @@ fn revision_id_violation(value: &str) -> Option<RevisionIdViolation> {
         bytes if !bytes.iter().all(accepted) => Some(RevisionIdViolation::CharsetForbidden),
         _ => None,
     }
+}
+
+/// Which declarations a `get_symbol` lookup searches.
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchScope {
+    /// The project tree the server serves.
+    #[default]
+    Project,
+    /// The packages the dependency resolvers cataloged, answered from their public
+    /// declarations alone.
+    Dependencies,
+    /// Both: hits merge by rank; at equal rank a project hit orders before a dependency
+    /// hit.
+    All,
 }
 
 /// How much a `Diagnostic` matters, in the provider's own judgement. Providers map their
@@ -1675,8 +1740,8 @@ pub struct TypeExpression {
 mod tests {
     use super::{
         Digest, Duration, FileId, GetSymbolParams, LANGUAGE_IDENTITY_PATTERN, Language,
-        PAGE_INDEX_DEFAULT, REVISION_ID_BYTES_MAX, ReadWarning, RevisionId, RevisionIdViolation,
-        SourceUnitId, Symbol, SymbolId,
+        PAGE_INDEX_DEFAULT, PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning, RevisionId,
+        RevisionIdViolation, SearchScope, SourceUnitId, Symbol, SymbolId,
     };
     use schemars::schema_for;
     use serde_json::json;
@@ -1717,6 +1782,18 @@ mod tests {
         assert_eq!(
             schema["properties"]["include"]["default"],
             json!(["source"])
+        );
+    }
+
+    /// `scope` takes serde's `default`, which reads the enum's own `Default`; this pins
+    /// the advertised default to the `project` member that impl selects.
+    #[test]
+    fn get_symbol_params_schema_scope_default_is_project() {
+        let schema = serde_json::to_value(schema_for!(GetSymbolParams)).expect("schema");
+        assert_eq!(schema["properties"]["scope"]["default"], json!("project"));
+        assert_eq!(
+            serde_json::to_value(SearchScope::default()).expect("serialize"),
+            json!("project")
         );
     }
 
@@ -2013,6 +2090,39 @@ mod tests {
                                binding, syntax disagree on at least one field",
                 }),
             ),
+            (
+                ReadWarning::DependencyIndexPending { pending: 3 },
+                json!({
+                    "code": "dependency_index_pending",
+                    "pending": 3,
+                }),
+            ),
+            (
+                ReadWarning::DependencyPackageSkipped {
+                    package: PackageIdentity {
+                        manager: "cargo".to_owned(),
+                        name: "helper".to_owned(),
+                        version: "0.1.0".to_owned(),
+                    },
+                    reason: "cargo/helper@0.1.0 exceeds package_bytes_max".to_owned(),
+                },
+                json!({
+                    "code": "dependency_package_skipped",
+                    "package": { "manager": "cargo", "name": "helper", "version": "0.1.0" },
+                    "reason": "cargo/helper@0.1.0 exceeds package_bytes_max",
+                }),
+            ),
+            (
+                ReadWarning::DependencyResolverDegraded {
+                    resolver: "cargo".to_owned(),
+                    reason: "cargo is not on PATH; the lockfile alone was read".to_owned(),
+                },
+                json!({
+                    "code": "dependency_resolver_degraded",
+                    "resolver": "cargo",
+                    "reason": "cargo is not on PATH; the lockfile alone was read",
+                }),
+            ),
         ];
         for (warning, wire) in cases {
             assert_eq!(serde_json::to_value(&warning).expect("serialize"), wire);
@@ -2036,6 +2146,9 @@ mod tests {
             "lexical_ranking_unavailable",
             "source_unavailable",
             "symbol_disagreement",
+            "dependency_index_pending",
+            "dependency_package_skipped",
+            "dependency_resolver_degraded",
         ] {
             assert!(
                 codes.contains(&json!({ "const": code, "type": "string" })),
