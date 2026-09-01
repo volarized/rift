@@ -234,6 +234,97 @@ A hit's `score` follows the same rule: absent unless `include` names it. `includ
 attaches the fused ranking value that ordered the page, comparable only within this one
 answer.
 
+### Traversal [#search-traversal]
+
+<VersionBadge version="v0.0.29" languages={["Rust"]} />
+
+`traversal` walks the relationship graph `[providers.binding]` builds: a bounded search from
+one `seed`, following `direction` and narrowed to `facets`, up to `depth` hops. `seed` and the
+optional `to` are declaration [`SymbolId`](/docs/protocol/reference#SymbolId) values, the same
+identity a `get_symbol` or `search` hit already carries.
+
+`traversal` stands alone as a pure graph walk or rides beside `query`; a symbol both lanes
+reach keeps its lexical `score` and gains the walk's `traversal_path`, and its `matched_by`
+carries both entries.
+
+Three shapes cover most questions:
+
+- **Neighbors** - `seed` alone, `direction` and `depth` at their defaults (`outgoing`, 1): what
+  this symbol calls, imports, or otherwise references directly.
+- **Impact** - `direction: "incoming"`: what would change if this symbol did, read the other
+  way round.
+- **Path** - `to` set: whether, and by which shortest route, the walk reaches one named symbol.
+
+Each reached symbol becomes a hit tagged `matched_by: ["relationship"]`, carrying `distance` -
+the path length - and `traversal_path`, the [`GraphHop`](/docs/protocol/reference#GraphHop) list
+from `seed` to the hit. Every `GraphHop` carries the
+[`Relationship`](/docs/protocol/reference#Relationship) it followed and the direction it
+followed it in; `seed` itself is never a hit.
+
+This impact query asks what calls `resolve_traversal_seed`:
+
+**Request:**
+
+```json
+{
+  "traversal": {
+    "seed": "rift://symbol/rust/crates/rift-server/src/search.rs/resolve_traversal_seed",
+    "direction": "incoming"
+  }
+}
+```
+
+**Search hit:**
+
+```json
+{
+  "hit": {
+    "target": "symbol",
+    "symbol": {
+      "id": "rift://symbol/rust/crates/rift-server/src/search.rs/collect_traversal_hits",
+      "language": "rust",
+      "name": "collect_traversal_hits",
+      "kind": "function",
+      "facets": ["value", "callable"],
+      "visibility": "private"
+    }
+  },
+  "matched_by": ["relationship"],
+  "range": { "start": 29305, "end": 31111 },
+  "line": 779,
+  "path": "crates/rift-server/src/search.rs",
+  "traversal_path": [
+    {
+      "relationship": {
+        "from": "rift://symbol/rust/crates/rift-server/src/search.rs/collect_traversal_hits",
+        "kind": "calls",
+        "facets": ["calls"],
+        "to": "rift://symbol/rust/crates/rift-server/src/search.rs/resolve_traversal_seed",
+        "derivation": "resolution"
+      },
+      "direction": "incoming"
+    }
+  ],
+  "distance": 1
+}
+```
+
+`facets` narrows the walk to [`RelationshipFacet`](/docs/protocol/reference#RelationshipFacet)
+values such as `calls`, `references`, and `imports`; an empty or omitted list follows every
+facet. `target: "file"` never carries a walked hit, since a traversal only reaches symbols.
+
+A workspace with the binding provider disabled, and no relationship data left from an earlier
+build, refuses `capability_unavailable` naming `relationship traversal (providers.binding
+disabled)`: the graph this walk needs was never built. `traversal` never combines with `rev` -
+the relationship graph serves the current tree alone - and refuses `capability_unavailable`
+the same way. A `seed` that resolves to neither a graph node nor a lexical declaration refuses
+`resource_not_found`; one that resolves but carries no edges answers an empty result set, since
+an isolated declaration is a legitimate answer.
+
+A walk the server stops at its node bound attaches a `traversal_truncated` entry to
+`warnings`, naming how many symbols it visited: hits reachable beyond the bound are missing,
+and a tighter `facets` list, a smaller `depth`, or a less-connected `seed` fits the walk under it.
+
 <McpTool name="nodes" />
 
 Each identity carries the witness a later

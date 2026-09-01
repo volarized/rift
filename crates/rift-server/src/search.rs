@@ -1,6 +1,7 @@
 //! `search` tool execution: lexical symbol and content-line search over syntax-indexed and
-//! `[search.text]` files alike, narrowed or extended by a request's `paths` selector.
-//! Extracted from `read` so that module stays below its size bound.
+//! `[search.text]` files alike, narrowed or extended by a request's `paths` selector. Extracted
+//! from `read` so that module stays below its size bound. The bounded relationship `traversal`
+//! lane lives in the sibling `traversal` module.
 
 use std::cmp::Ordering;
 use std::path::Path;
@@ -23,6 +24,7 @@ use crate::read::{
     ReadError, ReadFault, ReadService, accepted_limit, excerpt, page, project_path, text_range,
     validate_common, wire_symbol,
 };
+use crate::traversal::{collect_traversal_hits, traversal_truncation_warning, validate_traversal};
 
 impl ReadService {
     /// Searches indexed declarations and source lines, optionally narrowed or extended by
@@ -43,11 +45,11 @@ impl ReadService {
         if self.revision().is_some() && force_include_requested(params) {
             return Err(ReadFault::unsupported("force_include at a revision"));
         }
-        let query = params
-            .query
-            .as_deref()
-            .ok_or_else(|| ReadFault::invalid("query", "missing"))?;
-        if query.is_empty() {
+        let query = params.query.as_deref();
+        if query.is_none() && params.traversal.is_none() {
+            return Err(ReadFault::invalid("query", "missing"));
+        }
+        if query.is_some_and(str::is_empty) {
             return Err(ReadFault::invalid("query", "empty"));
         }
         let limit = accepted_limit(params.limit.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))?;
@@ -55,11 +57,6 @@ impl ReadService {
         let selector = params.paths.as_ref();
         let matcher = path_matcher(root, selector)?;
         let payloads = HitPayloads::requested(params);
-        let criteria = SearchCriteria {
-            query,
-            target: params.target,
-            payloads,
-        };
         // The whole candidate pool is collected up to the index's own `results_max` bound -
         // bounded work whatever the page size - then ordered and truncated to that same
         // bound, so `pagination.total_pages` counts the full result set and every page is
@@ -67,33 +64,56 @@ impl ReadService {
         let fetch_limit = self.index().results_max();
 
         let mut results = Vec::new();
-        collect_indexed_hits(
-            self.index(),
-            matcher.as_ref(),
-            root,
-            criteria,
-            fetch_limit,
-            &mut results,
-        )?;
-        if results.len() < fetch_limit
-            && let Some(selector) = selector
-        {
-            collect_force_include_hits(
+        if let Some(query) = query {
+            let criteria = SearchCriteria {
+                query,
+                target: params.target,
+                payloads,
+            };
+            collect_indexed_hits(
                 self.index(),
-                selector,
+                matcher.as_ref(),
+                root,
                 criteria,
                 fetch_limit,
                 &mut results,
             )?;
+            if results.len() < fetch_limit
+                && let Some(selector) = selector
+            {
+                collect_force_include_hits(
+                    self.index(),
+                    selector,
+                    criteria,
+                    fetch_limit,
+                    &mut results,
+                )?;
+            }
+            collect_ranked_hits(
+                self.index(),
+                matcher.as_ref(),
+                root,
+                criteria,
+                ranked,
+                &mut results,
+            )?;
         }
-        collect_ranked_hits(
-            self.index(),
-            matcher.as_ref(),
-            root,
-            criteria,
-            ranked,
-            &mut results,
-        )?;
+        let mut traversal_truncated = false;
+        if let Some(traversal) = params.traversal.as_ref()
+            && matches!(
+                params.target,
+                SearchParamsTarget::All | SearchParamsTarget::Symbol
+            )
+        {
+            traversal_truncated = collect_traversal_hits(
+                self,
+                matcher.as_ref(),
+                root,
+                traversal,
+                payloads,
+                &mut results,
+            )?;
+        }
         order_hits(&mut results, params.order);
         results.truncate(fetch_limit);
         let (mut results, pagination) = page(results, params.page_index, limit);
@@ -105,7 +125,13 @@ impl ReadService {
         Ok(SearchResult {
             results,
             pagination,
-            warnings: self.warnings(),
+            warnings: {
+                let mut warnings = self.warnings();
+                if traversal_truncated {
+                    warnings.push(traversal_truncation_warning());
+                }
+                warnings
+            },
         })
     }
 
@@ -179,7 +205,7 @@ fn force_include_requested(params: &SearchParams) -> bool {
 /// Which extra payload `params.include` asked to attach to every hit, derived once per
 /// request: `source` attaches the excerpt, `score` attaches the fused ranking value.
 #[derive(Clone, Copy, Debug, Default)]
-struct HitPayloads {
+pub(crate) struct HitPayloads {
     source: bool,
     score: bool,
 }
@@ -204,10 +230,16 @@ struct SearchCriteria<'a> {
     payloads: HitPayloads,
 }
 
-fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
+pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
     validate_common(params.rev.is_some())?;
     if let Some(selector) = params.paths.as_ref() {
         validate_path_selector(selector)?;
+    }
+    if let Some(traversal) = params.traversal.as_ref() {
+        validate_traversal(traversal)?;
+        if params.rev.is_some() {
+            return Err(ReadFault::unsupported("traversal at a revision"));
+        }
     }
     Ok(())
 }
@@ -257,7 +289,7 @@ fn pattern_strings(patterns: &[PathPattern]) -> Vec<String> {
 }
 
 /// Whether `path` (project-relative) passes `matcher`, absent a matcher including every path.
-fn includes(matcher: Option<&PathMatcher>, root: &Path, path: &ProjectPath) -> bool {
+pub(crate) fn includes(matcher: Option<&PathMatcher>, root: &Path, path: &ProjectPath) -> bool {
     matcher.is_none_or(|matcher| matcher.includes(&root.join(path.as_str())))
 }
 
@@ -399,7 +431,7 @@ fn symbol_search_hit(
 /// this: both surface the same declaration, differing only in score and which indexed field
 /// produced the match. The excerpt behind `source` is sliced only when `payloads` asked for
 /// it, so a request that omits `include` never pays that lookup.
-fn build_symbol_hit(
+pub(crate) fn build_symbol_hit(
     index: &WorkspaceIndex,
     matched: SymbolMatch<'_>,
     score: f64,
@@ -557,7 +589,7 @@ fn collect_ranked_hits(
 /// Resolves one ranked symbol unit's identity back to its declaration in `index`. `path`
 /// narrows the search to the one file the unit named, so this stays a scan of that file's
 /// own symbols rather than the whole index.
-fn resolve_symbol<'a>(
+pub(crate) fn resolve_symbol<'a>(
     index: &'a WorkspaceIndex,
     path: &ProjectPath,
     identity: &str,
@@ -614,6 +646,28 @@ fn locate_query_line(content: &str, query: &str) -> (u64, ByteRange, String) {
     (1, ByteRange { start: 0, end }, content.to_owned())
 }
 
+/// Finds `results`' existing hit for `file`/`symbol`'s wire identity, if a lexical or
+/// traversal-walk lane already placed one. `merge_symbol_hit` and the traversal module's
+/// `merge_traversal_hit` share this: both recompute the same identity and must not create two
+/// hits for one symbol.
+pub(crate) fn find_symbol_hit_mut<'a>(
+    results: &'a mut [SearchHit],
+    file: &IndexedFile,
+    symbol: &SyntaxSymbol,
+) -> Option<&'a mut SearchHit> {
+    let identity = SymbolId(rift_core::symbol_identity(
+        &file.syntax().language().identity_segment(),
+        file.path().as_str(),
+        &symbol.qualified_name,
+    ));
+    results.iter_mut().find(|hit| {
+        matches!(
+            &hit.hit,
+            SearchHitTarget::Symbol { symbol } if symbol.id.as_ref() == Some(&identity)
+        )
+    })
+}
+
 /// Merges one resolved ranked symbol unit: an identifier-matched hit for the same symbol
 /// keeps its place and absorbs `score`; otherwise the ranked hit joins `results` new.
 fn merge_symbol_hit(
@@ -624,18 +678,7 @@ fn merge_symbol_hit(
     score: f64,
     payloads: HitPayloads,
 ) -> Result<(), ReadError> {
-    let identity = SymbolId(rift_core::symbol_identity(
-        &file.syntax().language().identity_segment(),
-        file.path().as_str(),
-        &symbol.qualified_name,
-    ));
-    let existing = results.iter_mut().find(|hit| {
-        matches!(
-            &hit.hit,
-            SearchHitTarget::Symbol { symbol } if symbol.id.as_ref() == Some(&identity)
-        )
-    });
-    if let Some(existing) = existing {
+    if let Some(existing) = find_symbol_hit_mut(results, file, symbol) {
         absorb_ranked_match(existing, score);
         return Ok(());
     }
@@ -1440,30 +1483,37 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    /// `filter` and `traversal` left the served schema; a request naming either is refused as
-    /// an unknown field, alone or alongside `paths`, rather than accepted and ignored.
+    /// `filter` left the served schema; a request naming it is refused as an unknown field,
+    /// alone or alongside `paths`. `traversal` is this PR's return: a well-formed request
+    /// carrying it parses, alone or alongside `paths` and `query`.
     #[test]
-    fn search_filter_and_traversal_are_refused_as_unknown_fields_alone_and_with_paths() {
+    fn search_filter_stays_refused_and_traversal_now_parses_alone_and_with_paths() {
         let filter = json!({
             "kind": "field",
             "field": {"field": "name", "op": "eq", "value": "Beacon"}
         });
-        let traversal = json!({
-            "seed": "rift://symbol/rust/src/lib.rs/Beacon",
-            "intent": "trace"
-        });
+        let traversal = json!({"seed": "rift://symbol/rust/src/lib.rs/Beacon"});
         let paths = json!({"include": ["src/lib.rs"]});
-        let cases = [
-            json!({"query": "Beacon", "filter": filter}),
-            json!({"query": "Beacon", "traversal": traversal}),
-            json!({"query": "Beacon", "filter": filter, "paths": paths}),
-            json!({"query": "Beacon", "traversal": traversal, "paths": paths}),
+        let refused = [
+            json!({"query": "Beacon", "filter": filter.clone()}),
+            json!({"query": "Beacon", "filter": filter, "paths": paths.clone()}),
         ];
-        for case in cases {
+        for case in refused {
             let result: Result<SearchParams, _> = serde_json::from_value(case.clone());
             assert!(
                 result.is_err(),
                 "a withdrawn field must fail deserialization: {case}"
+            );
+        }
+        let accepted = [
+            json!({"traversal": traversal.clone()}),
+            json!({"query": "Beacon", "traversal": traversal, "paths": paths}),
+        ];
+        for case in accepted {
+            let result: Result<SearchParams, _> = serde_json::from_value(case.clone());
+            assert!(
+                result.is_ok(),
+                "a well-formed traversal request must parse: {case} ({result:?})"
             );
         }
     }

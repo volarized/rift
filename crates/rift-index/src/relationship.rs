@@ -276,6 +276,13 @@ impl RelationshipStore {
         self.dropped_edges == 0
     }
 
+    /// Whether this store holds no edges at all. `outgoing` and `incoming` always gain an
+    /// entry together per edge, so one map empty means both are.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.outgoing.is_empty()
+    }
+
     /// Edges building skipped once the cap was crossed.
     #[must_use]
     pub const fn dropped_edges(&self) -> u64 {

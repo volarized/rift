@@ -980,9 +980,10 @@ impl RiftMcp {
     }
 
     /// Searches indexed declarations and source lines by lexical `query`, merged with
-    /// full-text matches from included `[search.text]` files and declaration bodies. `rev`
-    /// searches a version-control revision instead of the current tree. Use `get_symbol`
-    /// when the declaration name is known.
+    /// full-text matches from included `[search.text]` files and declaration bodies, and by a
+    /// bounded relationship `traversal` from one seed symbol. `rev` searches a
+    /// version-control revision instead of the current tree, and never combines with
+    /// `traversal`. Use `get_symbol` when the declaration name is known.
     ///
     /// For a current-tree search, the published workspace is resolved exactly once and
     /// threaded through both the search index's revision check and the executed
