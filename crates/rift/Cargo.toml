@@ -80,5 +80,9 @@ name = "server_cli"
 path = "tests/server_cli.rs"
 
 [[test]]
+name = "steer_cli"
+path = "tests/steer_cli.rs"
+
+[[test]]
 name = "update_cli"
 path = "tests/update_cli.rs"
