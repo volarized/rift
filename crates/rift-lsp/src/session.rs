@@ -382,6 +382,19 @@ impl PulledDiagnostics {
     }
 }
 
+/// One document's most recently published diagnostics, and the version
+/// the engine said they describe.
+///
+/// `textDocument/publishDiagnostics` carries an optional `version`; an
+/// engine that omits it is retained with `version: None`, indistinguishable
+/// from a document no publish has named at all - both mean no version
+/// evidence, never evidence the document is current.
+#[derive(Clone, Debug, PartialEq)]
+struct PublishedReport {
+    diagnostics: Vec<Diagnostic>,
+    version: Option<i32>,
+}
+
 /// Maps an LSP file event to its registered watcher flag.
 fn watch_kind(change: FileChangeType) -> Option<WatchKind> {
     match change {
@@ -525,7 +538,7 @@ pub struct EngineSession {
     capabilities: Capabilities,
     root: TreeRoot,
     request_timeout: Duration,
-    published: BTreeMap<ProjectPath, Vec<Diagnostic>>,
+    published: BTreeMap<ProjectPath, PublishedReport>,
     progress: WorkProgress,
     diagnostic_refresh_revision: u64,
     empty_answers: EmptyAnswers,
@@ -1004,7 +1017,22 @@ impl EngineSession {
     /// Diagnostics the engine published for one document, if any arrived.
     #[must_use]
     pub fn published_diagnostics(&self, path: &ProjectPath) -> Option<&[Diagnostic]> {
-        self.published.get(path).map(Vec::as_slice)
+        self.published
+            .get(path)
+            .map(|report| report.diagnostics.as_slice())
+    }
+
+    /// The document version the most recent publish for `path` named, when
+    /// the engine sent one.
+    ///
+    /// `textDocument/publishDiagnostics` carries an optional `version`. A
+    /// `None` here covers two different facts the same way: no publish has
+    /// arrived for `path` at all, or the engine's publish omitted the
+    /// field. Either way there is no version evidence, and a caller must
+    /// never read `None` as proof the document is current.
+    #[must_use]
+    pub fn published_diagnostics_version(&self, path: &ProjectPath) -> Option<i32> {
+        self.published.get(path)?.version
     }
 
     /// Sends one classified `workspace/didChangeWatchedFiles` batch.
@@ -1319,7 +1347,12 @@ impl EngineSession {
         let Ok(path) = self.root.project_path(&published.uri) else {
             return;
         };
-        retain_published(&mut self.published, path, published.diagnostics);
+        retain_published(
+            &mut self.published,
+            path,
+            published.diagnostics,
+            published.version,
+        );
     }
 
     /// Records what one `$/progress` notification says about its token.
@@ -1451,22 +1484,30 @@ impl EngineSession {
     }
 }
 
-/// Retains one document's published diagnostics under the record bounds.
+/// Retains one document's published diagnostics and named version under
+/// the record bounds.
 ///
-/// A publish replaces the document's earlier entry; a publish for a new
-/// document is dropped once [`PUBLISHED_DOCUMENTS_MAX`] documents are
-/// retained, and each entry keeps at most `DOCUMENT_DIAGNOSTICS_MAX`
-/// items.
+/// A publish replaces the document's earlier entry, version included; a
+/// publish for a new document is dropped once [`PUBLISHED_DOCUMENTS_MAX`]
+/// documents are retained, and each entry keeps at most
+/// `DOCUMENT_DIAGNOSTICS_MAX` items.
 fn retain_published(
-    record: &mut BTreeMap<ProjectPath, Vec<Diagnostic>>,
+    record: &mut BTreeMap<ProjectPath, PublishedReport>,
     path: ProjectPath,
     mut diagnostics: Vec<Diagnostic>,
+    version: Option<i32>,
 ) {
     if !record.contains_key(&path) && record.len() >= PUBLISHED_DOCUMENTS_MAX {
         return;
     }
     diagnostics.truncate(DOCUMENT_DIAGNOSTICS_MAX);
-    record.insert(path, diagnostics);
+    record.insert(
+        path,
+        PublishedReport {
+            diagnostics,
+            version,
+        },
+    );
 }
 
 /// Whether one will-rename answer proposes no edit at all.
@@ -1886,13 +1927,14 @@ mod tests {
             |index: usize| ProjectPath::new(format!("src/file_{index}.rs")).expect("fixture path");
         let item = Diagnostic::default();
         for index in 0..PUBLISHED_DOCUMENTS_MAX {
-            retain_published(&mut record, path(index), vec![item.clone()]);
+            retain_published(&mut record, path(index), vec![item.clone()], None);
         }
         assert_eq!(record.len(), PUBLISHED_DOCUMENTS_MAX);
         retain_published(
             &mut record,
             path(PUBLISHED_DOCUMENTS_MAX),
             vec![item.clone()],
+            None,
         );
         assert_eq!(
             record.len(),
@@ -1903,11 +1945,17 @@ mod tests {
             &mut record,
             path(0),
             vec![item.clone(); DOCUMENT_DIAGNOSTICS_MAX + 10],
+            Some(3),
         );
         assert_eq!(
-            record.get(&path(0)).map(Vec::len),
+            record.get(&path(0)).map(|report| report.diagnostics.len()),
             Some(DOCUMENT_DIAGNOSTICS_MAX),
             "a retained document is replaced and truncated at the bound"
+        );
+        assert_eq!(
+            record.get(&path(0)).and_then(|report| report.version),
+            Some(3),
+            "a retained document keeps the version its publish named"
         );
     }
 
