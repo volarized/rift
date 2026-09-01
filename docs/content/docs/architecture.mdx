@@ -185,6 +185,46 @@ lockfiles, toolchains, installed packages, or generated-source metadata. Fact pr
 that catalog. A parser such as tree-sitter can describe syntax in a supplied file, but cannot infer
 which package owns it or which generator produced it.
 
+### Dependency index
+
+<VersionBadge version="v0.0.32" languages={["Rust", "Python", "TypeScript"]} />
+
+The catalog says where each package's source sits; the dependency index reads it. For every
+cataloged package with a source root, the index selects the files that spell the package's
+API and keeps the declarations a caller outside the package can use:
+
+- Rust - every `.rs` file below the root; `pub` declarations, and the items of a `pub` trait
+- Python - every `.pyi` stub when the package ships any, else every `.py` module; names
+  without a leading underscore
+- TypeScript - every `.d.ts` declaration file; every member but `private` and `protected`
+  ones
+
+Directories named `tests`, `benches`, `examples`, `target`, `node_modules`, `__pycache__`,
+and `.git`, and any whose name ends in `tests`, are left out of every walk, and so is every
+symlink. The same syntax providers that parse the project's files parse these, so a
+dependency declaration is a [`Symbol`](/docs/protocol/reference#Symbol) like any other and
+answers a [`get_symbol`](/docs/protocol/mcp#get_symbol-scope) lookup whose `scope` reaches
+dependencies.
+
+The index is bounded per package and in total, and the bounds are fixed in this release:
+`package_files_max` (2,000 selected files), `package_bytes_max` (4 MiB of selected source),
+`directory_depth_max` (16 directories below the root), `walk_entries_max` (50,000 directory
+entries examined), and `total_bytes_max` (256 MiB across every indexed package). A package
+that crosses one is skipped, and a lookup reports it as `dependency_package_skipped` naming
+the bound that refused it. The Rust standard library the Cargo resolver catalogs from the
+toolchain's `rust-src` holds more than `package_files_max` files, so it is skipped in this
+release.
+
+Indexing runs behind the answers. Each publication hands its catalog to the dependency lane,
+which builds one package at a time on the worker pool: direct dependencies first, then the
+standard library, then transitive dependencies. A lookup issued meanwhile answers from the
+packages built so far and reports the rest as `dependency_index_pending`.
+
+A package's declarations are built once and never revalidated: its source is what the package
+manager resolved, and nothing in the workspace moves it. A lockfile change re-catalogs on the
+next publication and re-plans the index: packages the new catalog no longer lists leave it,
+arrivals queue, and a package still cataloged keeps its build, or its refusal.
+
 ## Providers
 
 Providers analyze cataloged source at different depths and publish immutable `Contribution`
