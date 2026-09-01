@@ -27,8 +27,8 @@ use rift_protocol::error as wire;
 use rift_protocol::map::WorkspaceMap;
 use rift_search::{Embedding, SearchError, SearchIndex};
 use rift_server::{
-    CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, LspProcessKey, ReadError, ReadFault,
-    ReadService, load_configuration,
+    CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, DependencyStore, LspProcessKey, ReadError,
+    ReadFault, ReadService, load_configuration,
 };
 use rmcp::ErrorData;
 use sha2::{Digest as _, Sha256};
@@ -37,6 +37,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
+use crate::dependency::DependencyLane;
 use crate::failure::WireFailure;
 use crate::server::{BlockingExecutor, ChangeLane};
 
@@ -302,6 +303,10 @@ pub(crate) struct IndexSupervisorContext {
     /// index open there is no store to commit to, and `search` reports the tier
     /// unavailable for the life of this server.
     pub(crate) lexical: Option<LexicalLane>,
+    /// The dependency index every candidate's read service answers from.
+    pub(crate) dependencies: Arc<DependencyStore>,
+    /// The dependency lane, handed each published catalog.
+    pub(crate) dependency_lane: DependencyLane,
 }
 
 /// The last acceptance of the workspace's `rift.toml`, kept with the file
@@ -989,13 +994,17 @@ pub(crate) async fn initial_workspace(
     limits: WorkspaceIndexLimits,
     validation: &IndexValidation,
     blocking: &BlockingExecutor,
+    dependencies: &Arc<DependencyStore>,
 ) -> Result<(Arc<PublishedWorkspace>, LexicalWrite), ReadError> {
+    let dependencies = Arc::clone(dependencies);
     initial_workspace_with(
         root,
         limits,
         validation,
         blocking,
-        build_workspace_candidate,
+        move |root, limits, request| {
+            build_workspace_candidate(root, limits, request, &dependencies)
+        },
     )
     .await
 }
@@ -1102,16 +1111,20 @@ pub(crate) enum WorkspaceCandidate {
 /// file, its `[source]` policy, and its acceptance with the publication it was resolved
 /// against; a full request scans the workspace. Either way the acceptance is verified
 /// against `rift.toml` after the read, so a candidate built under configuration that moved
-/// underneath it is reported as changed rather than published.
+/// underneath it is reported as changed rather than published. Either way the candidate's
+/// read service answers dependency-scoped lookups from `dependencies`.
 pub(crate) fn build_workspace_candidate(
     root: &Path,
     limits: WorkspaceIndexLimits,
     request: &RebuildRequest,
+    dependencies: &Arc<DependencyStore>,
 ) -> Result<WorkspaceCandidate, ReadError> {
     let configuration = ConfigurationState::accept(root);
     let change_set = request.change_set(root, &configuration);
     let candidate = match &change_set {
-        ChangeSet::Full => whole_workspace_candidate(root, limits, configuration, request.epoch)?,
+        ChangeSet::Full => {
+            whole_workspace_candidate(root, limits, configuration, request.epoch, dependencies)?
+        }
         ChangeSet::Incremental(changes) => {
             let previous = request
                 .previous
@@ -1154,6 +1167,7 @@ fn whole_workspace_candidate(
     limits: WorkspaceIndexLimits,
     configuration: ConfigurationState,
     epoch: u64,
+    dependencies: &Arc<DependencyStore>,
 ) -> Result<PublishedWorkspace, ReadError> {
     let visibility = configuration.source_visibility();
     let text_inclusion = configuration.text_inclusion();
@@ -1167,7 +1181,8 @@ fn whole_workspace_candidate(
         &languages,
         binding,
         configuration.history_configuration(),
-    )?;
+    )?
+    .with_dependencies(Arc::clone(dependencies));
     let source_policy = reads.source_policy_handle().unwrap_or_else(|| {
         unreachable!("a current-tree read service always compiles its source policy")
     });
@@ -1184,9 +1199,10 @@ fn whole_workspace_candidate(
 
 /// Replaces the files `changes` names and shares every other file with `previous`.
 ///
-/// Index-owned configuration and the compiled source policy carry over unchanged. Other
-/// accepted configuration may change without rebuilding source files. An empty change set
-/// still produces a candidate because current-tree requests wait for its observation epoch.
+/// Index-owned configuration, the compiled source policy, and the dependency store carry
+/// over unchanged. Other accepted configuration may change without rebuilding source
+/// files. An empty change set still produces a candidate because current-tree requests
+/// wait for its observation epoch.
 fn shared_workspace_candidate(
     previous: &PublishedWorkspace,
     changes: &PathChanges,
@@ -1514,9 +1530,10 @@ pub(crate) enum RebuildOutcome {
 
 /// Owns native watcher and reconciles coalesced invalidations until shutdown.
 ///
-/// A published rebuild hands its snapshot to the population lane and moves on to the next
-/// batch. The supervisor awaiting a pass itself would hold the whole reconciliation loop
-/// for as long as that pass ran, and the filesystem does not stop moving meanwhile.
+/// A published rebuild hands its catalog to the dependency lane and its snapshot to the
+/// population lane, then moves on to the next batch. The supervisor awaiting a pass itself
+/// would hold the whole reconciliation loop for as long as that pass ran, and the filesystem
+/// does not stop moving meanwhile.
 pub(crate) async fn run_index_supervisor(
     _watcher: notify::RecommendedWatcher,
     mut invalidations: mpsc::Receiver<()>,
@@ -1564,8 +1581,11 @@ pub(crate) async fn run_index_supervisor(
             .await;
         match result {
             Ok(RebuildOutcome::Published) => {
+                let (current, _) = published.read().await.snapshot();
+                context
+                    .dependency_lane
+                    .request(Arc::clone(current.reads.dependency_catalog()));
                 if let Some(lane) = population.as_ref() {
-                    let (current, _) = published.read().await.snapshot();
                     lane.request(current);
                 }
             }
@@ -1637,6 +1657,7 @@ pub(crate) async fn rebuild_workspace(
     let captured_state = Arc::clone(&published);
     let captured_validation = Arc::clone(&validation);
     let change_lane = Arc::clone(&context.change_lane);
+    let dependencies = Arc::clone(&context.dependencies);
     let captured = blocking
         .run("filesystem index rebuild", move || {
             capture_rebuild(
@@ -1646,6 +1667,7 @@ pub(crate) async fn rebuild_workspace(
                 &change_lane,
                 &captured_validation,
                 request,
+                &dependencies,
             )
         })
         .await?;
@@ -1699,8 +1721,11 @@ pub(crate) fn capture_rebuild(
     change_lane: &ChangeLane,
     validation: &IndexValidation,
     request: RebuildRequest,
+    dependencies: &Arc<DependencyStore>,
 ) -> Result<CapturedRebuild, ReadError> {
-    change_lane.run(|| capture_rebuild_serialized(root, limits, published, validation, request))
+    change_lane.run(|| {
+        capture_rebuild_serialized(root, limits, published, validation, request, dependencies)
+    })
 }
 
 /// Captures one candidate with the mutation lane already held.
@@ -1710,6 +1735,7 @@ pub(crate) fn capture_rebuild_serialized(
     published: &RwLock<IndexState>,
     validation: &IndexValidation,
     request: RebuildRequest,
+    dependencies: &Arc<DependencyStore>,
 ) -> Result<CapturedRebuild, ReadError> {
     capture_rebuild_with(
         root,
@@ -1717,7 +1743,7 @@ pub(crate) fn capture_rebuild_serialized(
         published,
         validation,
         request,
-        build_workspace_candidate,
+        |root, limits, request| build_workspace_candidate(root, limits, request, dependencies),
     )
 }
 
@@ -1886,6 +1912,7 @@ mod tests {
         RebuildOutcome, RebuildRequest, WorkspaceCandidate, build_workspace_candidate,
         publish_rebuild, publish_rebuild_after, record_rebuild_failure,
     };
+    use crate::dependency::{DependencyLane, empty_dependency_store};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -1894,6 +1921,7 @@ mod tests {
             root,
             WorkspaceIndexLimits::default(),
             &RebuildRequest::initial(epoch),
+            &empty_dependency_store(),
         )? {
             WorkspaceCandidate::Stable { published, .. } => Ok(published),
             WorkspaceCandidate::ConfigurationChanged => {
@@ -2537,6 +2565,7 @@ mod tests {
             &state,
             &validation,
             request,
+            &empty_dependency_store(),
         )?;
         assert!(matches!(outcome, super::CapturedRebuild::Superseded));
 
@@ -2568,7 +2597,12 @@ mod tests {
         let WorkspaceCandidate::Stable {
             published: candidate,
             ..
-        } = build_workspace_candidate(directory.path(), WorkspaceIndexLimits::default(), &request)?
+        } = build_workspace_candidate(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &request,
+            &empty_dependency_store(),
+        )?
         else {
             return Err("a stable fixture must build a stable candidate".into());
         };
@@ -2599,7 +2633,12 @@ mod tests {
         let WorkspaceCandidate::Stable {
             published: candidate,
             ..
-        } = build_workspace_candidate(directory.path(), WorkspaceIndexLimits::default(), &request)?
+        } = build_workspace_candidate(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &request,
+            &empty_dependency_store(),
+        )?
         else {
             return Err("a stable fixture must build a stable candidate".into());
         };
@@ -2640,6 +2679,7 @@ mod tests {
                 directory.path(),
                 WorkspaceIndexLimits::default(),
                 &request,
+                &empty_dependency_store(),
             )?
             else {
                 return Err("a stable configuration change must build a candidate".into());
@@ -2687,6 +2727,7 @@ mod tests {
                 directory.path(),
                 WorkspaceIndexLimits::default(),
                 &request,
+                &empty_dependency_store(),
             )?
             else {
                 return Err("a stable configuration change must build a candidate".into());
@@ -2819,6 +2860,7 @@ mod tests {
             &state,
             &validation,
             RebuildRequest::initial(7),
+            &empty_dependency_store(),
         )?;
         assert!(matches!(outcome, super::CapturedRebuild::Superseded));
         Ok(())
@@ -2867,6 +2909,7 @@ mod tests {
             .map_err(|error| format!("watcher must start: {error:?}"))?;
         let blocking = crate::server::BlockingExecutor::isolated(1, 60_000);
         blocking.operations.close();
+        let dependencies = empty_dependency_store();
         let supervisor = tokio::spawn(super::run_index_supervisor(
             watcher,
             invalidations,
@@ -2879,6 +2922,8 @@ mod tests {
                 blocking,
                 population: None,
                 lexical: None,
+                dependencies: Arc::clone(&dependencies),
+                dependency_lane: DependencyLane::spawn_isolated(&dependencies),
             },
         ));
         let notified = validation.changed.notified();
@@ -2926,6 +2971,7 @@ mod tests {
         }));
         let watcher = super::workspace_watcher(directory.path(), &validation)
             .map_err(|error| format!("watcher must start: {error:?}"))?;
+        let dependencies = empty_dependency_store();
         let supervisor = tokio::spawn(super::run_index_supervisor(
             watcher,
             invalidations,
@@ -2938,6 +2984,8 @@ mod tests {
                 blocking: crate::server::BlockingExecutor::isolated(2, 60_000),
                 population: None,
                 lexical: None,
+                dependencies: Arc::clone(&dependencies),
+                dependency_lane: DependencyLane::spawn_isolated(&dependencies),
             },
         ));
         let notified = validation.changed.notified();
@@ -2976,7 +3024,7 @@ mod tests {
                 // Every capture observes one more filesystem event, so no
                 // attempt ever sees a stable epoch.
                 moving.observe_whole_workspace()?;
-                super::build_workspace_candidate(root, limits, epoch)
+                super::build_workspace_candidate(root, limits, epoch, &empty_dependency_store())
             },
         )
         .await
@@ -3079,6 +3127,7 @@ mod tests {
         lexical: Option<LexicalLane>,
     ) -> Result<RebuildOutcome, rift_server::ReadError> {
         let request = validation.take_pending();
+        let dependencies = empty_dependency_store();
         let context = super::IndexSupervisorContext {
             root: root.to_path_buf(),
             limits: WorkspaceIndexLimits::default(),
@@ -3088,6 +3137,8 @@ mod tests {
             blocking: BlockingExecutor::for_configuration(&ServerConfiguration::default()),
             population: None,
             lexical,
+            dependencies: Arc::clone(&dependencies),
+            dependency_lane: DependencyLane::spawn_isolated(&dependencies),
         };
         super::rebuild_workspace(&context, request).await
     }
@@ -3246,7 +3297,12 @@ mod tests {
         let WorkspaceCandidate::Stable {
             published: second,
             change_set,
-        } = build_workspace_candidate(directory.path(), WorkspaceIndexLimits::default(), &request)?
+        } = build_workspace_candidate(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &request,
+            &empty_dependency_store(),
+        )?
         else {
             return Err("a stable fixture must build a stable candidate".into());
         };
@@ -3557,6 +3613,7 @@ mod tests {
             .await
             .expect("held placeholder must occupy the one blocking slot");
 
+        let dependencies = empty_dependency_store();
         let supervisor = tokio::spawn(super::run_index_supervisor(
             watcher,
             invalidations,
@@ -3569,6 +3626,8 @@ mod tests {
                 blocking: blocking.clone(),
                 population: None,
                 lexical: None,
+                dependencies: Arc::clone(&dependencies),
+                dependency_lane: DependencyLane::spawn_isolated(&dependencies),
             },
         ));
 

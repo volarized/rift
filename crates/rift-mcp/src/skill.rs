@@ -99,6 +99,11 @@ const DECISION_TABLE: &[DecisionRow] = &[
         note: None,
     },
     DecisionRow {
+        situation: "A dependency's public declaration is needed.",
+        tools: &["get_symbol"],
+        note: Some("with `scope: \"dependencies\"`, or `\"all\"` to list the project's own first"),
+    },
+    DecisionRow {
         situation: "The syntax structure at one position is needed.",
         tools: &["nodes"],
         note: None,

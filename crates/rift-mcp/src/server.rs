@@ -5,8 +5,10 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use rift_core::{ProjectPath as CoreProjectPath, SourceVisibility};
+use rift_dependency::DependencyCatalog;
 use rift_index::{
-    LexicalIndexLimits, LogStore, PathChanges, WorkspaceIndexLimits, capture_digests_with_languages,
+    DependencyIndex, DependencyIndexLimits, LexicalIndexLimits, LogStore, PathChanges,
+    WorkspaceIndexLimits, capture_digests_with_languages,
 };
 use rift_protocol::change::{
     ChangeResult, ChangeSummary, GuaranteeEvidence, InsertNodeParams, InsertSymbolParams,
@@ -33,9 +35,9 @@ use rift_search::{
     SearchIndexLimits, SemanticReadiness,
 };
 use rift_server::{
-    ChangeService, EnginePool, HookSnapshot, HookStatus, LspProcessKey, MoveResolution, ReadError,
-    ReadFault, ReadService, RemoveResolution, RenameResolution, plan_move, plan_remove_node,
-    plan_remove_symbol, plan_rename,
+    ChangeService, DependencyStore, EnginePool, HookSnapshot, HookStatus, LspProcessKey,
+    MoveResolution, ReadError, ReadFault, ReadService, RemoveResolution, RenameResolution,
+    plan_move, plan_remove_node, plan_remove_symbol, plan_rename,
 };
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{
@@ -49,6 +51,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
+use crate::dependency::DependencyLane;
 use crate::failure::{WireFailure, hook_failure_diagnostic, stale_snapshot_diagnostic};
 use crate::resource;
 use crate::storage::WorkspaceStorage;
@@ -710,6 +713,12 @@ pub struct RiftMcp {
     /// The lexical lane, absent exactly when [`Self::search_index`] is. A rebuild commits
     /// through it before its snapshot becomes current.
     lexical: Option<LexicalLane>,
+    /// The dependency index every published snapshot answers a dependency-scoped
+    /// lookup from. The lane fills it behind the answers.
+    dependencies: Arc<DependencyStore>,
+    /// The dependency lane. A publication hands its catalog here and returns, rather
+    /// than awaiting the package builds itself.
+    dependency_lane: DependencyLane,
     /// The workspace's recorded diagnostics, absent when the store could not be
     /// opened at startup; `rift://logs` then answers with that reason rather
     /// than refusing. The handle is the read side alone: the drain task that
@@ -735,6 +744,16 @@ impl SerializedChange {
             candidate: None,
         }
     }
+}
+
+/// The search tier one server opens at startup: the index, the lanes over it, and the
+/// model acquisition the semantic ranking waits on. Every part is absent when the index
+/// could not be opened.
+struct SearchTier {
+    acquisition: Option<ModelAcquisition>,
+    search_index: Option<Arc<SearchIndex>>,
+    lexical: Option<LexicalLane>,
+    population: Option<PopulationLane>,
 }
 
 /// Candidate one landed change built for publication and diagnostics.
@@ -820,58 +839,41 @@ impl RiftMcp {
         let blocking =
             BlockingExecutor::for_configuration(&startup_configuration.server_configuration());
         let (validation, invalidations) = IndexValidation::new(limits.files_max());
-        let watch_root = root.clone();
-        let watch_validation = Arc::clone(&validation);
-        let watcher = blocking
-            .run("workspace watch setup", move || {
-                workspace_watcher(&watch_root, &watch_validation)
-            })
-            .instrument(tracing::info_span!(
-                "index.watch",
-                component = "index",
-                operation = "watch.setup"
-            ))
-            .await?;
+        let watcher = Self::start_watcher(&root, &validation, &blocking).await?;
+        let dependencies = Arc::new(DependencyStore::new(DependencyIndex::planned(
+            &DependencyCatalog::default(),
+            DependencyIndexLimits::default(),
+        )));
         let (published, lexical_write) =
-            initial_workspace(&root, limits, &validation, &blocking).await?;
+            initial_workspace(&root, limits, &validation, &blocking, &dependencies).await?;
+        let dependency_lane = Self::spawn_dependency_lane(
+            &dependencies,
+            &published,
+            &blocking,
+            validation.cancellation.clone(),
+        )?;
         // Direct construction delays the database open until the initial scan proves the
         // workspace root. A serving process supplies the owner it opened for foreground log
         // capture; that path creates `.rift` only below an already-existing root.
         let storage = Self::resolve_storage(&root, storage).await;
-        let search_configuration = startup_configuration.search_configuration();
-        // While `rift.toml` is invalid every request is refused until it is fixed, and the
-        // table naming the model is the very part that could not be read. Acquiring the
-        // shipped default would spend a download on a server that answers nothing, so the
-        // tier waits for a workspace whose configuration was accepted.
-        let acquisition = startup_configuration
-            .is_accepted()
-            .then(|| model_acquisition(&search_configuration.semantic, &root))
-            .flatten();
-        let search_limits = search_index_limits(&search_configuration, acquisition.as_ref());
-        let search_index = open_search_index(&storage, search_limits);
+        let SearchTier {
+            acquisition,
+            search_index,
+            lexical,
+            population,
+        } = Self::open_search_tier(
+            &startup_configuration,
+            &root,
+            &storage,
+            &validation,
+            &published,
+            lexical_write,
+        )
+        .await?;
         // The log store shares the database owner without depending on index readiness. Its
         // reads use committed WAL snapshots, so `rift://logs` can answer while a rebuild is
         // still preparing the next publication.
         let logs = storage.logs();
-        // The lexical set commits before this snapshot becomes current, so the first
-        // request to reach the server reads rows stamped with the tree revision it
-        // captured. Embedding does not: the population lane runs the run's first pass
-        // afterwards, which establishes the vector set, because a store found on disk was
-        // written by an earlier process, possibly under another model. Awaiting that pass
-        // here held the first answer for around fifteen seconds on a real workspace.
-        let lexical = search_index
-            .as_ref()
-            .map(|index| LexicalLane::spawn(Arc::clone(index), validation.cancellation.clone()));
-        if let Some(lane) = lexical.as_ref() {
-            lane.commit(lexical_write, published.reads.tree_revision())
-                .await?;
-        }
-        let population = search_index
-            .as_ref()
-            .map(|index| PopulationLane::spawn(Arc::clone(index), validation.cancellation.clone()));
-        if let Some(lane) = population.as_ref() {
-            lane.request(Arc::clone(&published));
-        }
         let published = Arc::new(RwLock::new(IndexState {
             current: published,
             failure: None,
@@ -889,6 +891,8 @@ impl RiftMcp {
                 blocking: blocking.clone(),
                 population: population.clone(),
                 lexical: lexical.clone(),
+                dependencies: Arc::clone(&dependencies),
+                dependency_lane: dependency_lane.clone(),
             },
         ));
         let mut task = validation.task.lock().await;
@@ -921,9 +925,103 @@ impl RiftMcp {
             search_index,
             population,
             lexical,
+            dependencies,
+            dependency_lane,
             logs,
             engines,
             tool_router: Self::tool_router(),
+        })
+    }
+
+    /// Starts the filesystem watcher over `root` on the worker pool.
+    async fn start_watcher(
+        root: &Path,
+        validation: &Arc<IndexValidation>,
+        blocking: &BlockingExecutor,
+    ) -> Result<notify::RecommendedWatcher, ReadError> {
+        let watch_root = root.to_path_buf();
+        let watch_validation = Arc::clone(validation);
+        blocking
+            .run("workspace watch setup", move || {
+                workspace_watcher(&watch_root, &watch_validation)
+            })
+            .instrument(tracing::info_span!(
+                "index.watch",
+                component = "index",
+                operation = "watch.setup"
+            ))
+            .await
+    }
+
+    /// Plans the dependency store over the initial publication's catalog and spawns the
+    /// lane that fills it.
+    ///
+    /// The store is planned before anything is served, so a lookup answered ahead of the
+    /// lane's first pass reports the packages still pending rather than an empty catalog.
+    fn spawn_dependency_lane(
+        dependencies: &Arc<DependencyStore>,
+        published: &PublishedWorkspace,
+        blocking: &BlockingExecutor,
+        cancellation: CancellationToken,
+    ) -> Result<DependencyLane, ReadError> {
+        dependencies
+            .write()?
+            .retain_catalog(published.reads.dependency_catalog());
+        let lane = DependencyLane::spawn(
+            Arc::clone(dependencies),
+            DependencyIndexLimits::default(),
+            blocking.clone(),
+            cancellation,
+        );
+        lane.request(Arc::clone(published.reads.dependency_catalog()));
+        Ok(lane)
+    }
+
+    /// Opens the search tier over `storage` and commits the initial lexical write.
+    ///
+    /// The lexical set commits before the snapshot becomes current, so the first request
+    /// to reach the server reads rows stamped with the tree revision it captured.
+    /// Embedding does not: the population lane runs the run's first pass afterwards, which
+    /// establishes the vector set, because a store found on disk was written by an earlier
+    /// process, possibly under another model. Awaiting that pass here held the first answer
+    /// for around fifteen seconds on a real workspace.
+    async fn open_search_tier(
+        startup_configuration: &ConfigurationState,
+        root: &Path,
+        storage: &WorkspaceStorage,
+        validation: &IndexValidation,
+        published: &Arc<PublishedWorkspace>,
+        lexical_write: LexicalWrite,
+    ) -> Result<SearchTier, ReadError> {
+        let search_configuration = startup_configuration.search_configuration();
+        // While `rift.toml` is invalid every request is refused until it is fixed, and the
+        // table naming the model is the very part that could not be read. Acquiring the
+        // shipped default would spend a download on a server that answers nothing, so the
+        // tier waits for a workspace whose configuration was accepted.
+        let acquisition = startup_configuration
+            .is_accepted()
+            .then(|| model_acquisition(&search_configuration.semantic, root))
+            .flatten();
+        let search_limits = search_index_limits(&search_configuration, acquisition.as_ref());
+        let search_index = open_search_index(storage, search_limits);
+        let lexical = search_index
+            .as_ref()
+            .map(|index| LexicalLane::spawn(Arc::clone(index), validation.cancellation.clone()));
+        if let Some(lane) = lexical.as_ref() {
+            lane.commit(lexical_write, published.reads.tree_revision())
+                .await?;
+        }
+        let population = search_index
+            .as_ref()
+            .map(|index| PopulationLane::spawn(Arc::clone(index), validation.cancellation.clone()));
+        if let Some(lane) = population.as_ref() {
+            lane.request(Arc::clone(published));
+        }
+        Ok(SearchTier {
+            acquisition,
+            search_index,
+            lexical,
+            population,
         })
     }
 
@@ -976,8 +1074,10 @@ impl RiftMcp {
     /// carries the declaration and its source excerpt unless `include` omits
     /// `source`. `include: ["history"]` adds each hit's version-control timeline,
     /// walked from the served revision. `rev` serves the lookup from a
-    /// version-control revision instead of the current tree. Use `search` when
-    /// the name is not exactly known.
+    /// version-control revision instead of the current tree. `scope` reaches
+    /// past the project tree: `dependencies` answers from the public
+    /// declarations of the cataloged packages alone, `all` from both, project
+    /// hits first. Use `search` when the name is not exactly known.
     #[tool]
     async fn get_symbol(
         &self,
@@ -1570,6 +1670,7 @@ impl RiftMcp {
         let validation = Arc::clone(&self.validation);
         let changes = Arc::clone(&self.changes);
         let change_lane = Arc::clone(&self.change_lane);
+        let dependencies = Arc::clone(&self.dependencies);
         let outcome = self
             .blocking
             .run("workspace change", move || {
@@ -1580,6 +1681,7 @@ impl RiftMcp {
                         &published,
                         &validation,
                         &changes,
+                        &dependencies,
                         operation,
                     )
                 })
@@ -1597,8 +1699,12 @@ impl RiftMcp {
             .as_ref()
             .filter(|publication| publication.published)
             .map(|publication| &publication.snapshot);
-        if let (Some(lane), Some(next)) = (self.population.as_ref(), published_next) {
-            lane.request(Arc::clone(next));
+        if let Some(next) = published_next {
+            self.dependency_lane
+                .request(Arc::clone(next.reads.dependency_catalog()));
+            if let Some(lane) = self.population.as_ref() {
+                lane.request(Arc::clone(next));
+            }
         }
         if let Json(ChangeResult::Applied { summary }) = &mut result
             && let Some(publication) = publication.as_ref()
@@ -1690,6 +1796,7 @@ impl RiftMcp {
         published: &RwLock<IndexState>,
         validation: &IndexValidation,
         changes: &ChangeService,
+        dependencies: &Arc<DependencyStore>,
         operation: impl FnOnce(&ReadService, &ChangeService) -> Result<ChangeResult, ReadError>,
     ) -> Result<SerializedChange, ReadError> {
         let state = published.blocking_read();
@@ -1733,6 +1840,7 @@ impl RiftMcp {
                 &configuration,
                 &current,
                 summary,
+                dependencies,
             )
         } else {
             None
@@ -1751,6 +1859,7 @@ impl RiftMcp {
         configuration: &WorkspaceConfiguration,
         current: &Arc<PublishedWorkspace>,
         summary: &mut ChangeSummary,
+        dependencies: &Arc<DependencyStore>,
     ) -> Option<AppliedCandidate> {
         let observed = match changed_paths_to_reparse(root, current, configuration, summary) {
             Some(paths) => validation.observe_paths(paths),
@@ -1772,7 +1881,7 @@ impl RiftMcp {
         let mut request = validation.take_pending();
         request.previous = Some(Arc::clone(current));
         let epoch = request.epoch;
-        let candidate = match build_workspace_candidate(root, limits, &request) {
+        let candidate = match build_workspace_candidate(root, limits, &request, dependencies) {
             Ok(WorkspaceCandidate::Stable {
                 published,
                 change_set,
@@ -2183,6 +2292,7 @@ mod tests {
     use serde_json::json;
     use sha2::{Digest as _, Sha256};
 
+    use crate::dependency::empty_dependency_store;
     use crate::validation::RebuildRequest;
 
     use super::{BlockingExecutor, ChangeLane, Parameters, RiftMcp};
@@ -2233,6 +2343,7 @@ mod tests {
             root,
             WorkspaceIndexLimits::default(),
             &RebuildRequest::initial(epoch),
+            &empty_dependency_store(),
         )? {
             WorkspaceCandidate::Stable { published, .. } => Ok(published),
             WorkspaceCandidate::ConfigurationChanged => {
@@ -2904,6 +3015,7 @@ mod tests {
             &published,
             &validation,
             &changes,
+            &empty_dependency_store(),
             |_, _| {
                 operation_called.store(true, Ordering::SeqCst);
                 panic!("invalid configuration must stop before operation")
@@ -3523,6 +3635,7 @@ pub fn beacon() -> u64 {
             &published,
             &validation,
             &changes,
+            &empty_dependency_store(),
             |_, _| panic!("a moved index must refuse before the operation runs"),
         )?;
         assert!(outcome.candidate.is_none());
@@ -3558,6 +3671,7 @@ pub fn beacon() -> u64 {
             &published,
             &validation,
             &changes,
+            &empty_dependency_store(),
             |_, _| {
                 Ok(ChangeResult::Applied {
                     summary: ChangeSummary {
@@ -3602,6 +3716,7 @@ pub fn beacon() -> u64 {
             &published,
             &validation,
             &changes,
+            &empty_dependency_store(),
             move |_, _| {
                 let moved = "[providers.history]\nenabled = false\n";
                 fs::write(root.join("rift.toml"), moved).map_err(|error| {
@@ -3661,6 +3776,7 @@ pub fn beacon() -> u64 {
             &published,
             &validation,
             &changes,
+            &empty_dependency_store(),
             move |_, _| {
                 let nested = root.join("nested");
                 let root_gitignore = root.join(".gitignore");

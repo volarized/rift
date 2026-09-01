@@ -4046,6 +4046,7 @@ dependencies = [
  "notify",
  "reqwest",
  "rift-core",
+ "rift-dependency",
  "rift-history",
  "rift-index",
  "rift-protocol",
