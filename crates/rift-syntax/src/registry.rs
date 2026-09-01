@@ -158,7 +158,7 @@ mod tests {
     fn test_provider_for_extension_serves_rust_and_refuses_unclaimed() {
         let provider = provider_for_extension("rs").expect("the rust provider claims rs");
         assert_eq!(provider.language(), &rust());
-        assert!(provider_for_extension("py").is_none());
+        assert!(provider_for_extension("rb").is_none());
     }
 
     #[test]
@@ -166,7 +166,7 @@ mod tests {
         let provider = provider_for_language(&rust()).expect("the rust provider serves rust");
         assert_eq!(provider.language(), &rust());
         let unserved = Language {
-            name: "python".to_owned(),
+            name: "ruby".to_owned(),
             dialect: None,
         };
         assert!(provider_for_language(&unserved).is_none());
@@ -177,7 +177,7 @@ mod tests {
         assert_eq!(
             source_file_extensions(),
             [
-                "rs", "js", "jsx", "ts", "tsx", "md", "json", "yaml", "yml", "toml"
+                "rs", "js", "jsx", "ts", "tsx", "md", "json", "yaml", "yml", "toml", "py", "pyi"
             ]
         );
     }

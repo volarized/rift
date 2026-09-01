@@ -61,6 +61,11 @@ fn fixtures_for(language: &Language) -> ProviderFixtures {
             header: None,
             documentation: None,
         },
+        ("python", _) => ProviderFixtures {
+            neither: "BEACON = 1\n",
+            header: Some("def beacon():\n    return 1\n"),
+            documentation: Some("def beacon():\n    \"Beacon docs.\"\n    return 1\n"),
+        },
         (name, dialect) => panic!(
             "a registered provider has no signature/documentation fixture: \
              language={name}, dialect={dialect:?}"
