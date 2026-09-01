@@ -926,6 +926,76 @@ mod tests {
         );
     }
 
+    /// Once a database exists, a didOpen classifies the document against
+    /// it: changed content invalidates, a new file registers, and a
+    /// vanished file is removed - the next pull answers the new state.
+    #[test]
+    fn test_did_open_feeds_the_database_changed_created_and_deleted_states() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let path = directory.path().join("service.py");
+        std::fs::write(&path, "count: int = 1\n").expect("fixture");
+        let uri = path_to_uri(&path);
+        let pull = |id: i64, uri: &str| {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "textDocument/diagnostic",
+                "params": { "textDocument": { "uri": uri } },
+            })
+        };
+        let items = |reply: &Handled| -> usize {
+            let Handled::Reply(reply) = reply else {
+                panic!("the pull must reply");
+            };
+            reply["result"]["items"]
+                .as_array()
+                .map_or(usize::MAX, Vec::len)
+        };
+        let documents = empty_documents();
+
+        let clean = handle_message(&pull(1, &uri), directory.path(), &documents);
+        assert_eq!(items(&clean), 0, "the clean file pulls no findings");
+
+        std::fs::write(&path, "count: int = \"eight\"\n").expect("changed fixture");
+        let open = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": { "textDocument": { "uri": uri, "text": "count: int = \"eight\"\n" } },
+        });
+        assert!(matches!(
+            handle_message(&open, directory.path(), &documents),
+            Handled::Silent
+        ));
+        let changed = handle_message(&pull(2, &uri), directory.path(), &documents);
+        assert_eq!(items(&changed), 1, "the changed content pulls its finding");
+
+        let created_path = directory.path().join("fresh.py");
+        std::fs::write(&created_path, "flag: bool = 7\n").expect("created fixture");
+        let created_uri = path_to_uri(&created_path);
+        let open_created = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": { "textDocument": { "uri": created_uri, "text": "flag: bool = 7\n" } },
+        });
+        assert!(matches!(
+            handle_message(&open_created, directory.path(), &documents),
+            Handled::Silent
+        ));
+        let created = handle_message(&pull(3, &created_uri), directory.path(), &documents);
+        assert_eq!(items(&created), 1, "the created file pulls its finding");
+
+        std::fs::remove_file(&created_path).expect("fixture removal");
+        let open_gone = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": { "textDocument": { "uri": created_uri, "text": "" } },
+        });
+        assert!(matches!(
+            handle_message(&open_gone, directory.path(), &documents),
+            Handled::Silent
+        ));
+    }
+
     /// A didOpen before any request feeds no database (none exists yet),
     /// and the first request builds one from disk regardless.
     #[test]
