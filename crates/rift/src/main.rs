@@ -1,5 +1,6 @@
 //! Rift CLI.
 
+mod install;
 mod progress;
 mod server;
 mod update;
@@ -35,6 +36,17 @@ enum CliCommand {
     },
     /// Replace current Rift binary with latest official release.
     Update,
+    /// Generate or remove a coding agent's Rift skill.
+    Install {
+        /// Which agent's skill to generate.
+        target: install::InstallTarget,
+        /// Install under the operator's home directory instead of this workspace.
+        #[arg(long)]
+        user: bool,
+        /// Delete the generated skill instead of writing it.
+        #[arg(long)]
+        remove: bool,
+    },
     /// Delete the backup binary left behind by a Windows self-update.
     ///
     /// Windows cannot delete a running executable, so after replacement the
@@ -127,6 +139,7 @@ enum CliError {
     Mcp(rift_mcp::ProxyServeError),
     Server(server::ServerCommandError),
     Update(update::UpdateError),
+    Install(install::InstallError),
 }
 
 impl CliError {
@@ -136,6 +149,7 @@ impl CliError {
             Self::Mcp(error) => error.descriptor(),
             Self::Server(error) => error.descriptor(),
             Self::Update(error) => error.descriptor(),
+            Self::Install(error) => error.descriptor(),
         }
     }
 }
@@ -146,6 +160,7 @@ impl fmt::Display for CliError {
             Self::Mcp(error) => error.fmt(formatter),
             Self::Server(error) => error.fmt(formatter),
             Self::Update(error) => error.fmt(formatter),
+            Self::Install(error) => error.fmt(formatter),
         }
     }
 }
@@ -156,6 +171,7 @@ impl std::error::Error for CliError {
             Self::Mcp(error) => Some(error),
             Self::Server(error) => Some(error),
             Self::Update(error) => Some(error),
+            Self::Install(error) => Some(error),
         }
     }
 }
@@ -165,6 +181,7 @@ impl std::error::Error for CliError {
 enum CliOutcome {
     Server(server::ServerOutcome),
     Update(update::UpdateOutcome),
+    Install(install::InstallOutcome),
 }
 
 impl fmt::Display for CliOutcome {
@@ -172,6 +189,7 @@ impl fmt::Display for CliOutcome {
         match self {
             Self::Server(outcome) => outcome.fmt(formatter),
             Self::Update(outcome) => outcome.fmt(formatter),
+            Self::Install(outcome) => outcome.fmt(formatter),
         }
     }
 }
@@ -198,6 +216,14 @@ async fn run(
             .map(CliOutcome::Update)
             .map(Some)
             .map_err(CliError::Update),
+        Some(CliCommand::Install {
+            target,
+            user,
+            remove,
+        }) => install::run(target, user, remove)
+            .map(CliOutcome::Install)
+            .map(Some)
+            .map_err(CliError::Install),
         #[cfg(windows)]
         Some(CliCommand::__CleanupUpdate { parent_pid }) => {
             let _ = parent_pid;
@@ -281,7 +307,7 @@ mod tests {
                 .get_subcommands()
                 .map(clap::Command::get_name)
                 .collect::<Vec<_>>(),
-            ["mcp", "server", "update", "help"]
+            ["mcp", "server", "update", "install", "help"]
         );
     }
 
@@ -475,5 +501,41 @@ mod tests {
         let error = Cli::try_parse_from(["rift", "serve"])
             .expect_err("unknown operational command must fail");
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn install_command_parses_target_scope_and_removal() {
+        let parsed =
+            Cli::try_parse_from(["rift", "install", "claude"]).expect("install claude must parse");
+        let rendered = format!("{parsed:?}");
+        let Some(CliCommand::Install {
+            target,
+            user,
+            remove,
+        }) = parsed.command
+        else {
+            panic!("install must parse into the install subcommand: {rendered}");
+        };
+        assert!(matches!(target, super::install::InstallTarget::Claude));
+        assert!(!user);
+        assert!(!remove);
+
+        let scoped = Cli::try_parse_from(["rift", "install", "claude", "--user", "--remove"])
+            .expect("install claude --user --remove must parse");
+        let scoped_rendered = format!("{scoped:?}");
+        let Some(CliCommand::Install { user, remove, .. }) = scoped.command else {
+            panic!("install must parse into the install subcommand: {scoped_rendered}");
+        };
+        assert!(user);
+        assert!(remove);
+
+        assert!(
+            Cli::try_parse_from(["rift", "install", "codex"]).is_err(),
+            "codex is not a served install target yet"
+        );
+        assert!(
+            Cli::try_parse_from(["rift", "install"]).is_err(),
+            "install without a target must fail"
+        );
     }
 }
