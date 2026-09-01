@@ -2039,7 +2039,7 @@ pub fn compute() -> i32 {
     fn search_finds_every_explicitly_included_utf8_file() -> TestResult {
         let directory = tempfile::tempdir()?;
         let files = [
-            ("history.py", "python_catalog_marker"),
+            ("history.lua", "lua_catalog_marker"),
             ("worker.go", "go_catalog_marker"),
             ("notes.unknown", "unknown_catalog_marker"),
             ("buildfile", "extensionless_catalog_marker"),
