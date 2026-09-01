@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use rift_core::{Error, ErrorCode, ErrorName};
 use rift_lsp::session::{EngineError, EngineFault, EngineLaunch, EngineSession};
-use rift_protocol::configuration::LspConfiguration;
+use rift_protocol::configuration::{CommandInput, EmbeddedEngine, LspConfiguration};
 use rift_protocol::read::Language;
 use rift_protocol::retry::RestartPolicy;
 use rift_protocol::workspace::LspState;
@@ -713,7 +713,25 @@ impl EngineSlot {
                 return Err(reported.unwrap_or_else(|| Error::new(EngineFault::Ended)));
             }
             self.report_state(LspState::Starting);
-            match EngineSession::start(self.launch(), &self.workspace_root).await {
+            let started = match (
+                self.configuration.embedded,
+                self.configuration.command.as_ref(),
+            ) {
+                (Some(engine), _) => {
+                    crate::embedded::started_session(
+                        self.embedded_launch(engine),
+                        &self.workspace_root,
+                    )
+                    .await
+                }
+                (None, Some(command)) => {
+                    EngineSession::start(self.launch(command), &self.workspace_root).await
+                }
+                (None, None) => unreachable!(
+                    "acceptance refuses an LSP table naming neither command nor embedded"
+                ),
+            };
+            match started {
                 Ok(session) => {
                     self.report_readiness(session.readiness());
                     return Ok(session);
@@ -727,13 +745,37 @@ impl EngineSlot {
         }
     }
 
-    /// The launch derived from this accepted LSP process configuration.
-    fn launch(&self) -> EngineLaunch {
+    /// The launch derived from this accepted LSP process configuration;
+    /// `command` is the program the session spawns.
+    fn launch(&self, command: &CommandInput) -> EngineLaunch {
         EngineLaunch {
-            program: self.configuration.command.program().to_owned(),
-            arguments: self.configuration.command.arguments().to_vec(),
+            program: command.program().to_owned(),
+            arguments: command.arguments().to_vec(),
             environment: self.configuration.environment.clone(),
             initialization_options: self.configuration.initialization_options.clone(),
+            startup_timeout: Duration::from_millis(
+                self.configuration.startup_timeout.milliseconds(),
+            ),
+            request_timeout: Duration::from_millis(
+                self.configuration.request_timeout.milliseconds(),
+            ),
+            stderr_capture_bytes: usize::try_from(self.configuration.output_limit.bytes())
+                .unwrap_or(usize::MAX),
+        }
+    }
+
+    /// The launch for an embedded engine: the engine's name stands in for
+    /// a program, and the session's bounds come from the accepted table.
+    /// Acceptance refuses `environment` and `initialization_options`
+    /// beside `embedded`, so both stay empty here.
+    fn embedded_launch(&self, engine: EmbeddedEngine) -> EngineLaunch {
+        EngineLaunch {
+            program: match engine {
+                EmbeddedEngine::Ty => "ty".to_owned(),
+            },
+            arguments: Vec::new(),
+            environment: BTreeMap::new(),
+            initialization_options: None,
             startup_timeout: Duration::from_millis(
                 self.configuration.startup_timeout.milliseconds(),
             ),
@@ -779,6 +821,15 @@ mod tests {
         }
     }
 
+    /// The spawned program a test fixture's table names.
+    fn fixture_program(configuration: &LspConfiguration) -> &str {
+        configuration
+            .command
+            .as_ref()
+            .expect("the fixture names a command")
+            .program()
+    }
+
     fn language(name: &str, dialect: Option<&str>) -> Language {
         Language {
             name: name.to_owned(),
@@ -813,7 +864,7 @@ mod tests {
             .engine_for(&language("python", None))
             .expect("python is served");
         assert_eq!(python.name(), "ty");
-        assert_eq!(python.configuration().command.program(), "uvx");
+        assert_eq!(fixture_program(python.configuration()), "uvx");
         let tsx = built
             .engine_for(&language("typescript", Some("tsx")))
             .expect("the tsx dialect segment is served");
@@ -849,6 +900,8 @@ mod tests {
                 .expect("python binding")
                 .configuration()
                 .command
+                .as_ref()
+                .expect("the fixture names a command")
                 .program(),
             "shared"
         );
@@ -858,6 +911,8 @@ mod tests {
                 .expect("rust binding")
                 .configuration()
                 .command
+                .as_ref()
+                .expect("the fixture names a command")
                 .program(),
             "inline"
         );
@@ -1140,16 +1195,21 @@ mod tests {
     #[test]
     fn launch_carries_the_accepted_table_verbatim() {
         let mut configuration = table("uvx");
-        configuration.command = CommandInput::ProgramAndArguments(vec![
+        configuration.command = Some(CommandInput::ProgramAndArguments(vec![
             "uvx".to_owned(),
             "ty".to_owned(),
             "server".to_owned(),
-        ]);
+        ]));
         let built = pool(vec![("ty", configuration, &["python"])]);
         let slot = built
             .engine_for(&language("python", None))
             .expect("python is served");
-        let launch = slot.launch();
+        let launch = slot.launch(
+            slot.configuration()
+                .command
+                .as_ref()
+                .expect("the fixture names a command"),
+        );
         assert_eq!(launch.program, "uvx");
         assert_eq!(launch.arguments, ["ty", "server"]);
         assert_eq!(launch.startup_timeout, Duration::from_secs(10));

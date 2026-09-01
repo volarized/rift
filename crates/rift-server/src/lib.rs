@@ -3,6 +3,7 @@
 mod change;
 mod configuration;
 mod diagnose;
+mod embedded;
 mod engine;
 mod history;
 mod hook;

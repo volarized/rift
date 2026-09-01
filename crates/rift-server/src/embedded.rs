@@ -36,7 +36,7 @@ use ruff_text_size::{TextRange, TextSize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ty_project::watch::{ChangeEvent, ChangedKind, CreatedKind, DeletedKind};
-use ty_project::{ProjectDatabase, ProjectMetadata, SemanticDb as _};
+use ty_project::{Db as _, ProjectDatabase, ProjectMetadata, SemanticDb as _};
 
 /// Bytes the in-memory transport buffers per direction before a writer waits.
 const DUPLEX_BYTES: usize = 256 * 1024;
@@ -82,54 +82,39 @@ async fn serve(transport: tokio::io::DuplexStream, root: PathBuf) {
     let (mut reader, mut writer) = tokio::io::split(transport);
     let mut framing = Framing::new();
     let mut buffer = vec![0_u8; 16 * 1024];
-    let mut collected: usize = 0;
     loop {
-        let payload = loop {
-            match framing.frame() {
-                Ok(Some(payload)) => break Some(payload),
-                Ok(None) => {}
-                Err(_) => break None,
+        let read = match reader.read(&mut buffer).await {
+            Ok(0) | Err(_) => return,
+            Ok(read) => read,
+        };
+        let Ok(messages) = framing.feed(&buffer[..read]) else {
+            return;
+        };
+        for payload in messages {
+            if payload.len() > PAYLOAD_BYTES_MAX {
+                return;
             }
-            let read = match reader.read(&mut buffer).await {
-                Ok(0) | Err(_) => break None,
-                Ok(read) => read,
+            let Ok(message) = serde_json::from_slice::<Value>(&payload) else {
+                return;
             };
-            collected = collected.saturating_add(read);
-            if collected > PAYLOAD_BYTES_MAX.saturating_mul(4) {
-                break None;
-            }
-            if framing.feed(&buffer[..read]).is_err() {
-                break None;
-            }
-        };
-        let Some(payload) = payload else {
-            return;
-        };
-        collected = 0;
-        let Ok(message) = serde_json::from_slice::<Value>(&payload) else {
-            return;
-        };
-        let root = root.clone();
-        let handled =
-            tokio::task::spawn_blocking(move || handle_message(&message, &root)).await;
-        let outcome = match handled {
-            Ok(outcome) => outcome,
-            Err(_) => return,
-        };
-        match outcome {
-            Handled::Reply(reply) => {
-                let Ok(body) = serde_json::to_vec(&reply) else {
-                    return;
-                };
-                let frame = format!("Content-Length: {}\r\n\r\n", body.len());
-                if writer.write_all(frame.as_bytes()).await.is_err()
-                    || writer.write_all(&body).await.is_err()
-                {
-                    return;
+            let root = root.clone();
+            let handled =
+                tokio::task::spawn_blocking(move || handle_message(&message, &root)).await;
+            let Ok(outcome) = handled else {
+                return;
+            };
+            match outcome {
+                Handled::Reply(reply) => {
+                    let Ok(body) = serde_json::to_vec(&reply) else {
+                        return;
+                    };
+                    if writer.write_all(&Framing::frame(&body)).await.is_err() {
+                        return;
+                    }
                 }
+                Handled::Silent => {}
+                Handled::Exit => return,
             }
-            Handled::Silent => {}
-            Handled::Exit => return,
         }
     }
 }
@@ -157,39 +142,39 @@ fn handle_message(message: &Value, root: &Path) -> Handled {
             }
             Handled::Silent
         }
-        ("initialize", Some(id)) => Handled::Reply(reply(id, initialize_result())),
-        ("shutdown", Some(id)) => Handled::Reply(reply(id, Value::Null)),
-        ("textDocument/prepareRename", Some(id)) => answered(id, root, &params, prepare_rename),
-        ("textDocument/rename", Some(id)) => answered(id, root, &params, rename),
-        ("textDocument/references", Some(id)) => answered(id, root, &params, references),
-        ("textDocument/diagnostic", Some(id)) => answered(id, root, &params, pulled_diagnostics),
+        ("initialize", Some(id)) => Handled::Reply(reply(&id, &initialize_result())),
+        ("shutdown", Some(id)) => Handled::Reply(reply(&id, &Value::Null)),
+        ("textDocument/prepareRename", Some(id)) => answered(&id, root, &params, prepare_rename),
+        ("textDocument/rename", Some(id)) => answered(&id, root, &params, rename),
+        ("textDocument/references", Some(id)) => answered(&id, root, &params, references),
+        ("textDocument/diagnostic", Some(id)) => answered(&id, root, &params, pulled_diagnostics),
         (_, Some(id)) => Handled::Reply(error_reply(
-            id,
+            &id,
             METHOD_NOT_FOUND,
-            format!("the embedded ty engine does not serve {method}"),
+            &format!("the embedded ty engine does not serve {method}"),
         )),
     }
 }
 
 /// Runs one answer against the tree's database and wraps it as a reply.
 fn answered(
-    id: Value,
+    id: &Value,
     root: &Path,
     params: &Value,
-    answer: fn(&ProjectDatabase, &Path, &Value) -> Result<Value, String>,
+    answer: fn(&mut ProjectDatabase, &Path, &Path, &Value) -> Result<Value, String>,
 ) -> Handled {
-    let outcome = with_database(root, |db, root| answer(db, root, params));
+    let outcome = with_database(root, |db, canonical| answer(db, root, canonical, params));
     Handled::Reply(match outcome {
-        Ok(result) => reply(id, result),
-        Err(detail) => error_reply(id, INTERNAL_ERROR, detail),
+        Ok(result) => reply(id, &result),
+        Err(detail) => error_reply(id, INTERNAL_ERROR, &detail),
     })
 }
 
-fn reply(id: Value, result: Value) -> Value {
+fn reply(id: &Value, result: &Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
-fn error_reply(id: Value, code: i64, message: String) -> Value {
+fn error_reply(id: &Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
@@ -224,7 +209,7 @@ fn databases() -> &'static Mutex<HashMap<PathBuf, ProjectDatabase>> {
 /// process; every answer extracts owned data before returning.
 fn with_database<T>(
     tree_root: &Path,
-    answer: impl FnOnce(&ProjectDatabase, &Path) -> Result<T, String>,
+    answer: impl FnOnce(&mut ProjectDatabase, &Path) -> Result<T, String>,
 ) -> Result<T, String> {
     let root = tree_root
         .canonicalize()
@@ -268,19 +253,19 @@ fn opened_document(root: &Path, params: &Value) {
     let Some(path) = params
         .pointer("/textDocument/uri")
         .and_then(Value::as_str)
-        .and_then(|uri| uri_to_path(uri))
+        .and_then(uri_to_path)
     else {
         return;
     };
     let Ok(root) = root.canonicalize() else {
         return;
     };
+    let path = path.canonicalize().unwrap_or(path);
     let Ok(system_path) = SystemPathBuf::from_path_buf(path.clone()) else {
         return;
     };
-    let mut databases = match databases().lock() {
-        Ok(databases) => databases,
-        Err(_) => return,
+    let Ok(mut databases) = databases().lock() else {
+        return;
     };
     let Some(database) = databases.get_mut(&root) else {
         return;
@@ -290,7 +275,11 @@ fn opened_document(root: &Path, params: &Value) {
             path: system_path,
             kind: DeletedKind::Any,
         }
-    } else if database.files().try_system(database, &system_path).is_some() {
+    } else if database
+        .files()
+        .try_system(database, &system_path)
+        .is_some()
+    {
         ChangeEvent::Changed {
             path: system_path,
             kind: ChangedKind::FileContent,
@@ -311,10 +300,13 @@ fn file_at(database: &ProjectDatabase, uri: &Value) -> Result<File, String> {
         .as_str()
         .and_then(uri_to_path)
         .ok_or_else(|| format!("unreadable document uri: {uri}"))?;
+    let path = path
+        .canonicalize()
+        .map_err(|error| format!("document {}: {error}", path.display()))?;
     let system_path = SystemPathBuf::from_path_buf(path)
         .map_err(|path| format!("document path is not UTF-8: {}", path.display()))?;
     system_path_to_file(database, &system_path)
-        .map_err(|error| format!("document {}: {error:?}", system_path))
+        .map_err(|error| format!("document {system_path}: {error:?}"))
 }
 
 /// The filesystem path one `file://` URI spells.
@@ -369,11 +361,23 @@ fn range_at(text: &str, range: TextRange) -> Result<Value, String> {
 }
 
 /// Answers `textDocument/prepareRename`: the renameable range, or `null`.
-fn prepare_rename(database: &ProjectDatabase, _root: &Path, params: &Value) -> Result<Value, String> {
-    let file = file_at(database, params.pointer("/textDocument/uri").unwrap_or(&Value::Null))?;
+fn prepare_rename(
+    database: &mut ProjectDatabase,
+    _root: &Path,
+    _canonical_root: &Path,
+    params: &Value,
+) -> Result<Value, String> {
+    let file = file_at(
+        database,
+        params.pointer("/textDocument/uri").unwrap_or(&Value::Null),
+    )?;
+    database.project().open_file(database, file);
     let program_file = database.program_file(file);
     let text = source_text(database, file);
-    let offset = offset_at(text.as_str(), params.pointer("/position").unwrap_or(&Value::Null))?;
+    let offset = offset_at(
+        text.as_str(),
+        params.pointer("/position").unwrap_or(&Value::Null),
+    )?;
     match ty_ide::can_rename(database, program_file, offset) {
         Some(range) => range_at(text.as_str(), range),
         None => Ok(Value::Null),
@@ -382,11 +386,23 @@ fn prepare_rename(database: &ProjectDatabase, _root: &Path, params: &Value) -> R
 
 /// Answers `textDocument/rename`: the workspace edit renaming every
 /// reference, or `null` when nothing renameable is declared at the position.
-fn rename(database: &ProjectDatabase, _root: &Path, params: &Value) -> Result<Value, String> {
-    let file = file_at(database, params.pointer("/textDocument/uri").unwrap_or(&Value::Null))?;
+fn rename(
+    database: &mut ProjectDatabase,
+    root: &Path,
+    canonical_root: &Path,
+    params: &Value,
+) -> Result<Value, String> {
+    let file = file_at(
+        database,
+        params.pointer("/textDocument/uri").unwrap_or(&Value::Null),
+    )?;
+    database.project().open_file(database, file);
     let program_file = database.program_file(file);
     let text = source_text(database, file);
-    let offset = offset_at(text.as_str(), params.pointer("/position").unwrap_or(&Value::Null))?;
+    let offset = offset_at(
+        text.as_str(),
+        params.pointer("/position").unwrap_or(&Value::Null),
+    )?;
     let new_name = params
         .pointer("/newName")
         .and_then(Value::as_str)
@@ -399,7 +415,13 @@ fn rename(database: &ProjectDatabase, _root: &Path, params: &Value) -> Result<Va
     };
     let mut changes: serde_json::Map<String, Value> = serde_json::Map::new();
     for target in &targets {
-        let Some((uri, edit_range)) = target_location(database, target.file(), target.range())?
+        let Some((uri, edit_range)) = target_location(
+            database,
+            root,
+            canonical_root,
+            target.file(),
+            target.range(),
+        )?
         else {
             continue;
         };
@@ -415,11 +437,23 @@ fn rename(database: &ProjectDatabase, _root: &Path, params: &Value) -> Result<Va
 }
 
 /// Answers `textDocument/references`.
-fn references(database: &ProjectDatabase, _root: &Path, params: &Value) -> Result<Value, String> {
-    let file = file_at(database, params.pointer("/textDocument/uri").unwrap_or(&Value::Null))?;
+fn references(
+    database: &mut ProjectDatabase,
+    root: &Path,
+    canonical_root: &Path,
+    params: &Value,
+) -> Result<Value, String> {
+    let file = file_at(
+        database,
+        params.pointer("/textDocument/uri").unwrap_or(&Value::Null),
+    )?;
+    database.project().open_file(database, file);
     let program_file = database.program_file(file);
     let text = source_text(database, file);
-    let offset = offset_at(text.as_str(), params.pointer("/position").unwrap_or(&Value::Null))?;
+    let offset = offset_at(
+        text.as_str(),
+        params.pointer("/position").unwrap_or(&Value::Null),
+    )?;
     let include_declaration = params
         .pointer("/context/includeDeclaration")
         .and_then(Value::as_bool)
@@ -431,7 +465,13 @@ fn references(database: &ProjectDatabase, _root: &Path, params: &Value) -> Resul
     };
     let mut locations = Vec::new();
     for target in &targets {
-        if let Some((uri, range)) = target_location(database, target.file(), target.range())? {
+        if let Some((uri, range)) = target_location(
+            database,
+            root,
+            canonical_root,
+            target.file(),
+            target.range(),
+        )? {
             locations.push(json!({ "uri": uri, "range": range }));
         }
     }
@@ -439,16 +479,28 @@ fn references(database: &ProjectDatabase, _root: &Path, params: &Value) -> Resul
 }
 
 /// One reference target as a `file://` URI and UTF-8 range; `None` for a
-/// target outside the filesystem, such as a vendored stub.
+/// target outside the filesystem, such as a vendored stub. The canonical
+/// workspace prefix swaps back to the root spelling the session addressed,
+/// so an answer echoes the caller's own paths, symlinked temp roots
+/// included.
 fn target_location(
     database: &ProjectDatabase,
+    spelled_root: &Path,
+    canonical_root: &Path,
     file: File,
     range: TextRange,
 ) -> Result<Option<(String, Value)>, String> {
     let Some(system_path) = file.path(database).as_system_path() else {
         return Ok(None);
     };
-    let uri = path_to_uri(system_path.as_std_path());
+    let spelled = system_path
+        .as_std_path()
+        .strip_prefix(canonical_root)
+        .map_or_else(
+            |_| system_path.as_std_path().to_path_buf(),
+            |relative| spelled_root.join(relative),
+        );
+    let uri = path_to_uri(&spelled);
     let text = source_text(database, file);
     let range = range_at(text.as_str(), range)?;
     Ok(Some((uri, range)))
@@ -456,11 +508,16 @@ fn target_location(
 
 /// Answers the `textDocument/diagnostic` pull with one full report.
 fn pulled_diagnostics(
-    database: &ProjectDatabase,
+    database: &mut ProjectDatabase,
     _root: &Path,
+    _canonical_root: &Path,
     params: &Value,
 ) -> Result<Value, String> {
-    let file = file_at(database, params.pointer("/textDocument/uri").unwrap_or(&Value::Null))?;
+    let file = file_at(
+        database,
+        params.pointer("/textDocument/uri").unwrap_or(&Value::Null),
+    )?;
+    database.project().open_file(database, file);
     let text = source_text(database, file);
     let mut items = Vec::new();
     for diagnostic in database.check_file(file) {
@@ -488,4 +545,152 @@ fn pulled_diagnostics(
         }));
     }
     Ok(json!({ "kind": "full", "items": items }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_uri_and_path_spell_each_other_with_escapes_kept() {
+        let path = Path::new("/workspace/py sources/module one.py");
+        let uri = path_to_uri(path);
+        assert_eq!(uri, "file:///workspace/py%20sources/module%20one.py");
+        assert_eq!(uri_to_path(&uri), Some(path.to_path_buf()));
+        assert_eq!(uri_to_path("http://example"), None);
+    }
+
+    #[test]
+    fn test_initialize_advertises_utf8_rename_references_and_the_pull() {
+        let capabilities = initialize_result();
+        assert_eq!(capabilities["capabilities"]["positionEncoding"], "utf-8");
+        assert_eq!(
+            capabilities["capabilities"]["renameProvider"]["prepareProvider"],
+            true
+        );
+        assert_eq!(capabilities["capabilities"]["referencesProvider"], true);
+        assert!(capabilities["capabilities"]["diagnosticProvider"].is_object());
+        assert!(
+            capabilities["capabilities"].get("workspace").is_none(),
+            "no file-operation capability is declared, so moves warn"
+        );
+    }
+
+    #[test]
+    fn test_an_unserved_method_answers_method_not_found() {
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "textDocument/hover",
+            "params": {},
+        });
+        let Handled::Reply(reply) = handle_message(&message, Path::new("/tree")) else {
+            panic!("an unserved request must reply");
+        };
+        assert_eq!(reply["id"], 7);
+        assert_eq!(reply["error"]["code"], METHOD_NOT_FOUND);
+        assert!(
+            reply["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("textDocument/hover")),
+        );
+    }
+
+    #[test]
+    fn test_notifications_stay_silent_and_exit_ends_the_loop() {
+        let initialized = serde_json::json!({ "jsonrpc": "2.0", "method": "initialized" });
+        assert!(matches!(
+            handle_message(&initialized, Path::new("/tree")),
+            Handled::Silent
+        ));
+        let exit = serde_json::json!({ "jsonrpc": "2.0", "method": "exit" });
+        assert!(matches!(
+            handle_message(&exit, Path::new("/tree")),
+            Handled::Exit
+        ));
+    }
+
+    #[test]
+    fn test_shutdown_answers_null() {
+        let shutdown = serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "shutdown" });
+        let Handled::Reply(reply) = handle_message(&shutdown, Path::new("/tree")) else {
+            panic!("shutdown must reply");
+        };
+        assert_eq!(reply["result"], Value::Null);
+    }
+
+    /// The diagnostic pull reports ty's finding for a file on disk, end to
+    /// end through the message handler: database build, file resolution,
+    /// check, and range rendering.
+    /// prepareRename answers the declaration's own range for a plain
+    /// function, so the engine-backed rename path is reachable.
+    #[test]
+    fn test_prepare_rename_answers_a_range_for_a_function_name() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let path = directory.path().join("service.py");
+        std::fs::write(&path, "def serve(port: int) -> int:\n    return port\n")
+            .expect("fixture file");
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/prepareRename",
+            "params": {
+                "textDocument": { "uri": path_to_uri(&path) },
+                "position": { "line": 0, "character": 4 },
+            },
+        });
+        let Handled::Reply(reply) = handle_message(&message, directory.path()) else {
+            panic!("prepareRename must reply");
+        };
+        assert!(
+            reply["result"].is_object(),
+            "a function name is renameable: {reply:#}"
+        );
+    }
+
+    #[test]
+    fn test_the_diagnostic_pull_reports_an_invalid_assignment() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let path = directory.path().join("service.py");
+        std::fs::write(&path, "count: int = \"eight\"\n").expect("fixture file");
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "textDocument/diagnostic",
+            "params": { "textDocument": { "uri": path_to_uri(&path) } },
+        });
+        let Handled::Reply(reply) = handle_message(&message, directory.path()) else {
+            panic!("the pull must reply");
+        };
+        assert!(
+            reply.get("error").is_none(),
+            "the pull answers a report: {reply:#}"
+        );
+        let items = reply["result"]["items"]
+            .as_array()
+            .expect("a full report carries items");
+        assert!(
+            items
+                .iter()
+                .any(|item| item["code"] == serde_json::json!("invalid-assignment")),
+            "ty reports the invalid assignment: {reply:#}"
+        );
+    }
+
+    #[test]
+    fn test_offset_and_range_conversions_speak_utf8_positions() {
+        let text = "alpha\ndef beacon():\n    pass\n";
+        let offset = offset_at(text, &serde_json::json!({ "line": 1, "character": 4 }))
+            .expect("a position inside the document resolves");
+        assert_eq!(usize::from(offset), 10);
+        let range = range_at(text, TextRange::new(TextSize::from(10), TextSize::from(16)))
+            .expect("a range inside the document renders");
+        assert_eq!(range["start"]["line"], 1);
+        assert_eq!(range["start"]["character"], 4);
+        assert_eq!(range["end"]["character"], 10);
+        assert!(
+            offset_at(text, &serde_json::json!({ "line" : 9, "character": 0 })).is_err(),
+            "a position past the document refuses"
+        );
+    }
 }
