@@ -290,6 +290,70 @@ The bare URI selects page zero. `rift://workspace?page_index=1` selects another 
 holds at most 1000 source units; language and hook summaries repeat so every page can be read
 alone. A page past the end returns an empty `source` list with the true page count.
 
+### Map [#resource-map]
+
+<VersionBadge version="v0.0.29" />
+
+`rift://map` reads a workspace orientation snapshot: a starting picture for an agent new to the
+codebase, computed once when the index publishes and served from cache after that, so a read
+costs a lookup. The answer carries:
+
+- `revision` - an eight-character [`Digest`](/docs/protocol/reference#Digest) of the indexed
+  tree the map was computed from
+- `languages` - per-language file and symbol counts, sorted by language spelling
+- `modules` - the directory tree indexed files sit under, each entry's file and symbol counts
+  inclusive of its descendants, folded three directories deep
+- `hubs` - the most-referenced symbols, ranked by reference count descending
+- `entry_points` - symbols where execution starts
+- `docs` - markdown files, in path order
+- `pagination` - always page zero of one, the whole map on one page
+
+<VersionBadge version="v0.0.29" languages={["Rust"]} />
+
+`hubs` and `entry_points` need facts only the Rust provider currently supplies. `hubs` ranks
+[`SymbolId`](/docs/protocol/reference#SymbolId)s by the reference counts the
+[binding provider](/docs/architecture#semantics) resolves; `entry_points` lists symbols
+carrying the `entrypoint` [`SymbolFacet`](/docs/protocol/reference#SymbolFacet) - a file-scope
+`fn main`, not one nested in a module, an `impl` block, or another function. Both stay empty for
+a workspace with no such facts.
+
+**Request:** `rift://map`
+
+**Response:**
+
+```json
+{
+  "revision": "3f9a1c2e",
+  "languages": [
+    { "language": "rust", "files": 191, "symbols": 3204 }
+  ],
+  "modules": [
+    {
+      "path": "crates",
+      "files": 191,
+      "symbols": 3204,
+      "children": [
+        {
+          "path": "crates/rift-server",
+          "files": 16,
+          "symbols": 418
+        }
+      ]
+    }
+  ],
+  "hubs": [
+    {
+      "symbol": "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService",
+      "kind": "struct",
+      "references": 87
+    }
+  ],
+  "entry_points": ["rift://symbol/rust/crates/rift/src/main.rs/main"],
+  "docs": ["README.md"],
+  "pagination": { "page_index": 0, "total_pages": 1 }
+}
+```
+
 ### Planned resources
 
 <VersionBadge version="planned" />

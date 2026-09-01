@@ -6,6 +6,7 @@ mod diagnose;
 mod engine;
 mod history;
 mod hook;
+mod map;
 mod move_file;
 mod patch;
 mod publish;

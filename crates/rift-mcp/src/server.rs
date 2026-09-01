@@ -2017,6 +2017,14 @@ impl RiftMcp {
         };
         Ok(resource::rendered_workspace(uri, &page))
     }
+
+    /// Answers the `rift://map` read from the current publication's cached snapshot: a
+    /// serialize of the `Arc` [`PublishedWorkspace::map`] already carries, never a
+    /// recomputation - the map is rebuilt once per publication.
+    async fn read_map(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
+        let current = Arc::clone(&self.published.read().await.current);
+        Ok(resource::rendered_map(uri, &current.map))
+    }
 }
 
 fn workspace_languages(
@@ -2132,6 +2140,8 @@ impl ServerHandler for RiftMcp {
             Box::pin(self.read_workspace(&request.uri))
                 .await
                 .map(Into::into)
+        } else if request.uri == resource::MAP_URI {
+            self.read_map(&request.uri).await.map(Into::into)
         } else {
             self.read_logs(&request.uri).await.map(Into::into)
         }
@@ -2889,6 +2899,7 @@ mod tests {
                 },
                 fingerprint: candidate.fingerprint.clone(),
                 source_policy: Arc::clone(&candidate.source_policy),
+                map: Arc::clone(&candidate.map),
                 epoch: 0,
             }),
             failure: None,

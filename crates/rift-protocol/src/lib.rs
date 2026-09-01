@@ -11,6 +11,7 @@ pub mod configuration;
 pub mod diagnostic;
 pub mod error;
 pub mod lock;
+pub mod map;
 pub mod read;
 pub mod retry;
 pub mod schema;
