@@ -3975,6 +3975,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rift-dependency"
+version = "0.0.31"
+dependencies = [
+ "rift-core",
+ "rift-protocol",
+ "serde",
+ "serde_json",
+ "strum",
+ "toml",
+]
+
+[[package]]
 name = "rift-history"
 version = "0.0.31"
 dependencies = [

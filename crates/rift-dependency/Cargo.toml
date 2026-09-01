@@ -1,0 +1,19 @@
+[package]
+name = "rift-dependency"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Dependency discovery for Rift: resolvers that catalog what a workspace's toolchains resolved"
+
+[lints]
+workspace = true
+
+[dependencies]
+rift-core.workspace = true
+rift-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+strum.workspace = true
+toml.workspace = true
