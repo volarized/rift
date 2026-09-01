@@ -4,7 +4,7 @@ format:
     cargo fmt --all --check
 
 generate:
-    cargo run -q -p rift-mcp --bin rift-schema-export -- docs
+    cargo run -q -p rift-mcp --bin rift-schema-export -- docs plugins/claude
     printf '$ rift --help\n' > docs/public/cli-help.txt
     cargo run -q -p rift -- --help >> docs/public/cli-help.txt
     printf '\n$ rift server --help\n' >> docs/public/cli-help.txt
@@ -15,7 +15,7 @@ generate:
 generate-check:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo run -q -p rift-mcp --bin rift-schema-export -- --check docs
+    cargo run -q -p rift-mcp --bin rift-schema-export -- --check docs plugins/claude
     fresh="$(mktemp)"
     trap 'rm -f "$fresh"' EXIT
     printf '$ rift --help\n' > "$fresh"
@@ -40,7 +40,8 @@ check:
 # scanner itself is not among them: it spells the banned characters.
 dashes:
     uv run --script scripts/check_dashes.py \
-        docs/content docs/src/app crates README.md docs/public .github
+        docs/content docs/src/app crates README.md docs/public .github \
+        plugins .claude-plugin
 
 
 clippy:

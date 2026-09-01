@@ -6,7 +6,8 @@
 //! response schemas derived from the `rift_protocol` wire models.
 //! [`configuration_schema_document`] derives the `rift.toml` schema from the
 //! same crate's configuration model. The `rift-schema-export` binary writes
-//! both documents into the docs; the rest of this module is the binary's
+//! both documents into the docs and the Claude Code plugin's generated
+//! files into the plugin directory; the rest of this module is the binary's
 //! logic, kept here so it is testable.
 
 use std::error::Error;
@@ -19,6 +20,7 @@ use rift_core::{ErrorCode, ErrorDescriptor, ErrorName};
 use serde_json::json;
 
 use crate::RiftMcp;
+use crate::skill::{self, SkillForm};
 
 /// One-line summary rendered at the top of the exported document.
 const DOCUMENT_DESCRIPTION: &str =
@@ -38,8 +40,22 @@ const SCHEMA_DOCUMENT_PATH: &str = "public/mcp.json";
 /// site's own origin rather than the repository host.
 const CONFIGURATION_SCHEMA_PATH: &str = "public/rift.schema.json";
 
+/// Directory the plugin export lands in when no second argument names one:
+/// the repository's Claude Code plugin, listed by the marketplace manifest
+/// at `.claude-plugin/marketplace.json`.
+const PLUGIN_DIR_DEFAULT: &str = "plugins/claude";
+
+/// Path of the generated plugin manifest below the plugin directory.
+const PLUGIN_MANIFEST_PATH: &str = ".claude-plugin/plugin.json";
+
+/// Path of the generated `SKILL.md` below the plugin directory.
+const PLUGIN_SKILL_PATH: &str = "skills/rift/SKILL.md";
+
+/// Path of the generated tools reference below the plugin directory.
+const PLUGIN_TOOLS_PATH: &str = "skills/rift/references/tools.md";
+
 /// Usage line appended to argument errors.
-const USAGE: &str = "usage: rift-schema-export [--check] [OUTPUT_DIR]";
+const USAGE: &str = "usage: rift-schema-export [--check] [OUTPUT_DIR] [PLUGIN_DIR]";
 
 /// Command to run when the committed document is out of date.
 const REGENERATE_COMMAND: &str = "cargo run -p rift-mcp --bin rift-schema-export";
@@ -114,10 +130,15 @@ pub enum ExportError {
         /// The argument as given.
         argument: String,
     },
-    /// A second positional argument followed the output directory.
+    /// A third positional argument followed the plugin directory.
     ExtraArgument {
         /// The argument as given.
         argument: String,
+    },
+    /// The skill decision table names a tool the served surface lacks.
+    TemplateToolMissing {
+        /// The missing tool's name.
+        name: &'static str,
     },
     /// The document to check against could not be read.
     CheckUnreadable {
@@ -150,8 +171,13 @@ impl fmt::Display for ExportError {
             ),
             Self::ExtraArgument { argument } => write!(
                 formatter,
-                "unexpected extra argument `{argument}`: expected at most one output \
-                 directory; {USAGE}"
+                "unexpected extra argument `{argument}`: expected at most an output \
+                 directory and a plugin directory; {USAGE}"
+            ),
+            Self::TemplateToolMissing { name } => write!(
+                formatter,
+                "the skill decision table names `{name}` but the served surface does not \
+                 carry it; align the table in the skill module with the tool router"
             ),
             Self::CheckUnreadable { path, source } => write!(
                 formatter,
@@ -179,9 +205,10 @@ impl Error for ExportError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::CheckUnreadable { source, .. } | Self::WriteFailed { source, .. } => Some(source),
-            Self::UnknownFlag { .. } | Self::ExtraArgument { .. } | Self::CheckMismatch { .. } => {
-                None
-            }
+            Self::UnknownFlag { .. }
+            | Self::ExtraArgument { .. }
+            | Self::TemplateToolMissing { .. }
+            | Self::CheckMismatch { .. } => None,
         }
     }
 }
@@ -193,6 +220,9 @@ impl ExportError {
         match self {
             Self::UnknownFlag { .. } | Self::ExtraArgument { .. } => {
                 ErrorName::Wire(ErrorCode::InvalidRequest).descriptor()
+            }
+            Self::TemplateToolMissing { .. } => {
+                ErrorName::Cli(rift_core::CliCode::InstallTemplateMissingTool).descriptor()
             }
             Self::CheckUnreadable { .. } | Self::WriteFailed { .. } => {
                 ErrorName::Wire(ErrorCode::StorageFailure).descriptor()
@@ -211,6 +241,8 @@ pub struct ExportRequest {
     check: bool,
     /// Directory holding the schema document.
     output_dir: PathBuf,
+    /// Directory holding the Claude Code plugin's generated files.
+    plugin_dir: PathBuf,
 }
 
 /// Parses `rift-schema-export` arguments, without the program name.
@@ -224,43 +256,68 @@ where
 {
     let mut check = false;
     let mut output_dir: Option<PathBuf> = None;
+    let mut plugin_dir: Option<PathBuf> = None;
     for argument in arguments {
         if argument == "--check" {
             check = true;
         } else if argument.starts_with('-') {
             return Err(ExportError::UnknownFlag { argument });
-        } else if output_dir.is_some() {
-            return Err(ExportError::ExtraArgument { argument });
-        } else {
+        } else if output_dir.is_none() {
             output_dir = Some(PathBuf::from(argument));
+        } else if plugin_dir.is_none() {
+            plugin_dir = Some(PathBuf::from(argument));
+        } else {
+            return Err(ExportError::ExtraArgument { argument });
         }
     }
     Ok(ExportRequest {
         check,
         output_dir: output_dir.unwrap_or_else(|| PathBuf::from(OUTPUT_DIR_DEFAULT)),
+        plugin_dir: plugin_dir.unwrap_or_else(|| PathBuf::from(PLUGIN_DIR_DEFAULT)),
     })
 }
 
-/// Writes both schema documents, or with `--check` proves the committed
-/// copies match what the server derives.
+/// Writes the schema documents and the plugin's generated files, or with
+/// `--check` proves the committed copies match what the server derives.
 ///
 /// # Errors
 ///
-/// Returns [`ExportError`] when a document cannot be read, differs, or
-/// cannot be written.
+/// Returns [`ExportError`] when the decision table names a tool the served
+/// surface lacks, or a document cannot be read, differs, or cannot be
+/// written.
 pub fn run(request: &ExportRequest) -> Result<(), ExportError> {
+    let tools = tool_listing();
+    let generated = skill::generate(&tools, SkillForm::Plugin)
+        .map_err(|missing| ExportError::TemplateToolMissing { name: missing.name })?;
     let documents = [
-        (SCHEMA_DOCUMENT_PATH, schema_document()),
-        (CONFIGURATION_SCHEMA_PATH, configuration_schema_document()),
+        (
+            request.output_dir.join(SCHEMA_DOCUMENT_PATH),
+            schema_document(),
+        ),
+        (
+            request.output_dir.join(CONFIGURATION_SCHEMA_PATH),
+            configuration_schema_document(),
+        ),
+        (
+            request.plugin_dir.join(PLUGIN_MANIFEST_PATH),
+            skill::plugin_manifest(),
+        ),
+        (
+            request.plugin_dir.join(PLUGIN_SKILL_PATH),
+            generated.skill_md,
+        ),
+        (
+            request.plugin_dir.join(PLUGIN_TOOLS_PATH),
+            generated.tools_md,
+        ),
     ];
     if request.check {
-        for (relative_path, document) in &documents {
-            check_document(&request.output_dir.join(relative_path), document)?;
+        for (document_path, document) in &documents {
+            check_document(document_path, document)?;
         }
         return Ok(());
     }
-    for (relative_path, document) in &documents {
-        let document_path = request.output_dir.join(relative_path);
+    for (document_path, document) in &documents {
         let parent = document_path
             .parent()
             .unwrap_or(request.output_dir.as_path());
@@ -268,7 +325,7 @@ pub fn run(request: &ExportRequest) -> Result<(), ExportError> {
             path: parent.to_path_buf(),
             source,
         })?;
-        fs::write(&document_path, document).map_err(|source| ExportError::WriteFailed {
+        fs::write(document_path, document).map_err(|source| ExportError::WriteFailed {
             path: document_path.clone(),
             source,
         })?;

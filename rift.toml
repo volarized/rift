@@ -5,8 +5,9 @@ include = []
 # Agent worktrees and local tooling state hold full copies of the source tree; keep them out of
 # the index even if gitignore inheritance is ever disabled. `docs/public` holds the artifacts
 # `just generate` exports from the Rust models and from `rift --help`, so every hit in them
-# restates something the same answer already carries.
-exclude = [".claude/**", ".agents/**", "docs/public/**"]
+# restates something the same answer already carries; the generated plugin skill under
+# `plugins/claude` restates the served tool descriptions the same way.
+exclude = [".claude/**", ".agents/**", "docs/public/**", "plugins/claude/skills/**"]
 respect_gitignore = true
 
 # The name binding provider and the semantic ranking both run by default; the explicit
