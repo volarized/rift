@@ -52,11 +52,17 @@ mod tests {
     }
 
     #[test]
-    fn test_resolvers_lists_the_cargo_resolver_over_cargo_toml() {
+    fn test_resolvers_lists_every_shipped_resolver_in_run_order() {
         let claimed: Vec<(ResolverName, &str)> = resolvers()
             .iter()
             .map(|resolver| (resolver.name(), resolver.manifest_file_name()))
             .collect();
-        assert_eq!(claimed, [(ResolverName::Cargo, "Cargo.toml")]);
+        assert_eq!(
+            claimed,
+            [
+                (ResolverName::Cargo, "Cargo.toml"),
+                (ResolverName::Uv, "pyproject.toml"),
+            ]
+        );
     }
 }
