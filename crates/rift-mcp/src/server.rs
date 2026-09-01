@@ -21,8 +21,8 @@ use rift_protocol::configuration::{
 use rift_protocol::error as wire;
 use rift_protocol::lock::ProductIdentity;
 use rift_protocol::read::{
-    DiagnosticCode, Digest, GetSymbolParams, GetSymbolResult, Language, NodesParams, NodesResult,
-    Pagination, ProjectPath, ReadWarning, SearchParams, SearchResult,
+    Digest, GetSymbolParams, GetSymbolResult, Language, NodesParams, NodesResult, Pagination,
+    ProjectPath, ReadWarning, SearchParams, SearchResult,
 };
 use rift_protocol::workspace::{
     WORKSPACE_SOURCE_UNITS_MAX, WorkspaceHookSummary, WorkspaceLanguageSummary,
@@ -747,9 +747,18 @@ struct AppliedCandidate {
     epoch: u64,
 }
 
+/// What one landed change published, and the snapshot its diagnostics pull against.
 struct AppliedPublication {
     previous: Arc<PublishedWorkspace>,
-    published: Option<Arc<PublishedWorkspace>>,
+    /// The change's own snapshot: the tree the change lane built over the applied
+    /// write. Engine diagnostics pull against it whether or not it became the current
+    /// publication: a concurrent rebuild that superseded it may have scanned the tree
+    /// before the write landed, so the current publication can predate the change.
+    snapshot: Arc<PublishedWorkspace>,
+    /// Whether `snapshot` became the current publication. Only a published snapshot is
+    /// handed to the population lane; a superseded one is embedded by the rebuild that
+    /// superseded it.
+    published: bool,
     change_set: rift_index::ChangeSet,
 }
 
@@ -1586,23 +1595,23 @@ impl RiftMcp {
         };
         let published_next = publication
             .as_ref()
-            .and_then(|publication| publication.published.as_ref());
+            .filter(|publication| publication.published)
+            .map(|publication| &publication.snapshot);
         if let (Some(lane), Some(next)) = (self.population.as_ref(), published_next) {
             lane.request(Arc::clone(next));
         }
         if let Json(ChangeResult::Applied { summary }) = &mut result
             && let Some(publication) = publication.as_ref()
-            && let Some(snapshot) = self.diagnostics_snapshot(published_next, summary).await
         {
             if publication.previous.configuration.has_validation_hooks() {
                 self.engines.shutdown().await;
             }
-            let engines = self.engine_pool_for(&snapshot).await;
+            let engines = self.engine_pool_for(&publication.snapshot).await;
             summary.diagnostics.extend(
                 rift_server::engine_change_set_diagnostics(
                     &engines,
                     &publication.previous.reads,
-                    &snapshot.reads,
+                    &publication.snapshot.reads,
                     &publication.change_set,
                 )
                 .await,
@@ -1611,7 +1620,11 @@ impl RiftMcp {
         Ok(result)
     }
 
-    /// Commits one landed change and returns its diagnostic snapshots.
+    /// Commits one landed change and returns what it published.
+    ///
+    /// A change whose rebuild failed returns nothing: its summary already carries the
+    /// stale-snapshot warning, and current-tree reads refuse until a fresh snapshot
+    /// publishes.
     async fn publish_applied_change(
         &self,
         candidate: AppliedCandidate,
@@ -1652,13 +1665,15 @@ impl RiftMcp {
                 );
                 Some(AppliedPublication {
                     previous,
-                    published: Some(published),
+                    snapshot: published,
+                    published: true,
                     change_set,
                 })
             }
             Ok(RebuildOutcome::Superseded) => Some(AppliedPublication {
                 previous,
-                published: None,
+                snapshot: published,
+                published: false,
                 change_set,
             }),
             Err(error) => {
@@ -1666,33 +1681,6 @@ impl RiftMcp {
                 None
             }
         }
-    }
-
-    /// The snapshot engine diagnostics pull against after one applied
-    /// change: the change's own publication, or the currently published
-    /// workspace when a concurrent rebuild superseded it - the change lane
-    /// serialized the write, so that snapshot holds the changed tree, plus
-    /// whatever external writes landed after it. A change whose rebuild
-    /// failed pulls nothing: its summary already carries the stale-snapshot
-    /// warning, and current-tree reads refuse until a fresh snapshot
-    /// publishes.
-    async fn diagnostics_snapshot(
-        &self,
-        published_next: Option<&Arc<PublishedWorkspace>>,
-        summary: &ChangeSummary,
-    ) -> Option<Arc<PublishedWorkspace>> {
-        if let Some(next) = published_next {
-            return Some(Arc::clone(next));
-        }
-        let stale = DiagnosticCode::SnapshotStale.code();
-        let rebuild_failed = summary
-            .diagnostics
-            .iter()
-            .any(|finding| finding.code.as_deref() == Some(stale.as_str()));
-        if rebuild_failed {
-            return None;
-        }
-        Some(Arc::clone(&self.published.read().await.current))
     }
 
     /// One serialized change result and its new workspace snapshot.
