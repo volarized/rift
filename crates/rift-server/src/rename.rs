@@ -191,32 +191,21 @@ struct RenameTarget {
 }
 
 /// The engine slot claiming the address's language segment, or the
-/// capability refusal naming the unserved language.
+/// capability refusal naming the unserved language. A segment no language
+/// identity spells serves no engine, so it meets the same refusal.
 fn claimed_engine<'pool>(
     engines: &'pool EnginePool,
     address: &SymbolAddress,
 ) -> Result<&'pool EngineSlot, PlanEnd> {
-    let language = segment_language(&address.language_segment);
-    engines.engine_for(&language).ok_or_else(|| {
+    let no_engine = || {
         PlanEnd::Refused(unsupported_refusal(format!(
             "semantic rename (no engine configured for language {})",
             address.language_segment
         )))
-    })
-}
-
-/// The `Language` one identity segment spells: `name` or `name:dialect`.
-pub(crate) fn segment_language(segment: &str) -> Language {
-    match segment.split_once(':') {
-        Some((name, dialect)) => Language {
-            name: name.to_owned(),
-            dialect: Some(dialect.to_owned()),
-        },
-        None => Language {
-            name: segment.to_owned(),
-            dialect: None,
-        },
-    }
+    };
+    let language =
+        Language::from_identity_segment(&address.language_segment).map_err(|_| no_engine())?;
+    engines.engine_for(&language).ok_or_else(no_engine)
 }
 
 /// Resolves the address to its single declaration, keeping the shared
@@ -1448,20 +1437,23 @@ mod tests {
     }
 
     #[test]
-    fn segment_language_parses_bare_names_and_dialects() {
-        assert_eq!(
-            segment_language("rust"),
-            Language {
-                name: "rust".to_owned(),
-                dialect: None
-            }
+    fn claimed_engine_refuses_a_segment_no_language_identity_spells() {
+        let engines = EnginePool::new(
+            Path::new("/rift-test-root"),
+            BTreeMap::new(),
+            BTreeMap::new(),
         );
-        assert_eq!(
-            segment_language("typescript:tsx"),
-            Language {
-                name: "typescript".to_owned(),
-                dialect: Some("tsx".to_owned())
-            }
+        let malformed = SymbolAddress {
+            language_segment: "rust::tsx".to_owned(),
+            path: project_path("lib.rs"),
+            qualified_name: "beacon".to_owned(),
+        };
+        let Err(PlanEnd::Refused(refusal)) = claimed_engine(&engines, &malformed) else {
+            panic!("a segment no language identity spells must refuse");
+        };
+        assert!(
+            format!("{refusal:?}").contains("rust::tsx"),
+            "the refusal names the segment: {refusal:?}"
         );
     }
 
@@ -1613,7 +1605,7 @@ mod tests {
     fn target_over(source: &str) -> RenameTarget {
         RenameTarget {
             path: project_path("lib.rs"),
-            language: segment_language("rust"),
+            language: Language::from_identity_segment("rust").expect("fixture language"),
             old_name: "beacon".to_owned(),
             name_offset: 0,
             indexed_source: source.to_owned(),

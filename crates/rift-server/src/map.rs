@@ -18,6 +18,7 @@ use rift_protocol::map::{
 use rift_protocol::read::{Digest, Language, Pagination, ProjectPath, SymbolFacet, SymbolId};
 use rift_protocol::workspace::{WORKSPACE_LANGUAGE_SUMMARIES_MAX, WORKSPACE_SOURCE_UNITS_MAX};
 use rift_provider::{NormalizedGraph, NormalizedTarget, SymbolAssembler};
+use rift_syntax::ShippedLanguage;
 
 use crate::read::project_path;
 
@@ -281,9 +282,10 @@ fn syntax_provider_id() -> ProviderId {
 
 /// Markdown-language files, in path order, capped at [`MAP_DOCS_MAX`].
 fn docs(index: &WorkspaceIndex) -> Vec<ProjectPath> {
+    let markdown = ShippedLanguage::Markdown.language();
     let mut paths: Vec<ProjectPath> = index
         .files()
-        .filter(|file| file.syntax().language().name == "markdown")
+        .filter(|file| file.syntax().language() == &markdown)
         .map(|file| project_path(file.path()))
         .collect();
     paths.sort();
