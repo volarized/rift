@@ -23,11 +23,6 @@ pub struct JavaScriptSyntaxProvider {
 }
 
 impl JavaScriptSyntaxProvider {
-    /// File extensions this provider parses, without their leading dot. The
-    /// pinned grammar parses JSX, so `jsx` files need no dialect of their
-    /// own.
-    pub const SOURCE_EXTENSIONS: &'static [&'static str] = &["js", "jsx"];
-
     /// Default maximum bytes this provider accepts from one JavaScript
     /// source.
     pub const SOURCE_BYTES_MAX_DEFAULT: usize = 4 * 1_024 * 1_024;
@@ -62,10 +57,6 @@ impl Default for JavaScriptSyntaxProvider {
 impl SyntaxProvider for JavaScriptSyntaxProvider {
     fn language(&self) -> &Language {
         &self.language
-    }
-
-    fn extensions(&self) -> &'static [&'static str] {
-        Self::SOURCE_EXTENSIONS
     }
 
     fn source_bytes_max(&self) -> usize {
@@ -120,11 +111,10 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_declares_language_extensions_and_byte_bound() {
+    fn test_provider_declares_language_and_byte_bound() {
         let provider = JavaScriptSyntaxProvider::default();
         assert_eq!(provider.language().name, "javascript");
         assert_eq!(provider.language().dialect, None);
-        assert_eq!(provider.extensions(), ["js", "jsx"]);
         assert_eq!(
             provider.source_bytes_max(),
             JavaScriptSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT

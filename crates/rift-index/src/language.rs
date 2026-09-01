@@ -86,8 +86,8 @@ impl WorkspaceLanguagePolicy {
     ) -> Result<Self, WorkspaceIndexError> {
         let mut languages = Vec::new();
         let mut shipped = BTreeSet::new();
-        for provider in registry::providers() {
-            let identity = provider.language().identity_segment();
+        for (definition, provider) in registry::shipped_languages() {
+            let identity = definition.shipped().language().identity_segment();
             shipped.insert(identity.clone());
             let configured = selections
                 .entries()
@@ -98,7 +98,7 @@ impl WorkspaceLanguagePolicy {
                 .and_then(LanguageFileSelection::include)
                 .map_or_else(
                     || {
-                        provider
+                        definition
                             .extensions()
                             .iter()
                             .map(|extension| format!("**/*.{extension}"))
@@ -624,8 +624,8 @@ mod tests {
     #[test]
     fn test_absent_language_table_keeps_every_shipped_provider_and_pattern() {
         let policy = policy(&WorkspaceConfiguration::default());
-        for provider in registry::providers() {
-            let identity = provider.language().identity_segment();
+        for (definition, _provider) in registry::shipped_languages() {
+            let identity = definition.shipped().language().identity_segment();
             let entry = policy
                 .languages()
                 .iter()
@@ -633,7 +633,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("shipped provider {identity} must have an entry"));
             assert!(entry.enabled(), "{identity} must stay enabled");
             assert!(entry.has_syntax(), "{identity} must keep its provider");
-            let expected: Vec<String> = provider
+            let expected: Vec<String> = definition
                 .extensions()
                 .iter()
                 .map(|extension| format!("**/*.{extension}"))

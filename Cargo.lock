@@ -3621,6 +3621,7 @@ dependencies = [
  "rift-protocol",
  "rift-provider",
  "serde",
+ "strum",
  "tree-sitter",
  "tree-sitter-javascript",
  "tree-sitter-json",

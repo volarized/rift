@@ -113,12 +113,6 @@ pub trait SyntaxProvider: std::fmt::Debug + Send + Sync {
     /// The language identity this provider files facts under.
     fn language(&self) -> &Language;
 
-    /// File extensions this provider claims, without their leading dot.
-    /// Extensions are unique across the registry: the workspace walk
-    /// includes a file as source exactly when some provider claims its
-    /// extension.
-    fn extensions(&self) -> &'static [&'static str];
-
     /// Maximum source bytes this provider accepts in one analysis.
     fn source_bytes_max(&self) -> usize;
 

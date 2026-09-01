@@ -331,9 +331,6 @@ pub struct TomlSyntaxProvider {
 }
 
 impl TomlSyntaxProvider {
-    /// File extensions this provider parses, without their leading dot.
-    pub const SOURCE_EXTENSIONS: &'static [&'static str] = &["toml"];
-
     /// Default maximum bytes this provider accepts from one TOML source.
     pub const SOURCE_BYTES_MAX_DEFAULT: usize = 4 * 1_024 * 1_024;
 
@@ -367,10 +364,6 @@ impl Default for TomlSyntaxProvider {
 impl SyntaxProvider for TomlSyntaxProvider {
     fn language(&self) -> &Language {
         &self.language
-    }
-
-    fn extensions(&self) -> &'static [&'static str] {
-        Self::SOURCE_EXTENSIONS
     }
 
     fn source_bytes_max(&self) -> usize {
@@ -530,11 +523,10 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_declares_language_extensions_and_byte_bound() {
+    fn test_provider_declares_language_and_byte_bound() {
         let provider = TomlSyntaxProvider::default();
         assert_eq!(provider.language().name, "toml");
         assert_eq!(provider.language().dialect, None);
-        assert_eq!(provider.extensions(), ["toml"]);
         assert_eq!(
             provider.source_bytes_max(),
             TomlSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT
