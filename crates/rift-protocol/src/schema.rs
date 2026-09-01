@@ -996,6 +996,24 @@ mod tests {
         }
     }
 
+    /// Acceptance takes exactly one of `command` and `embedded` per LSP
+    /// table, so the schema refuses both, neither, and admits each alone.
+    #[test]
+    fn test_lsp_schema_selects_exactly_one_engine() {
+        use crate::configuration::LspConfiguration;
+
+        let schema = serde_json::to_value(schema_for!(LspConfiguration)).expect("lsp schema");
+        let validator = jsonschema::validator_for(&schema).expect("lsp validator");
+        assert!(validator.is_valid(&json!({ "command": "tool" })));
+        assert!(validator.is_valid(&json!({ "embedded": "ty" })));
+        assert!(!validator.is_valid(&json!({ "command": "tool", "embedded": "ty" })));
+        assert!(!validator.is_valid(&json!({})));
+        assert!(
+            !validator.is_valid(&json!({ "embedded": "rust-analyzer" })),
+            "the embedded enumeration admits only engines this build links in"
+        );
+    }
+
     /// A hook `id` and an LSP `initialization_options` object are refused by
     /// acceptance, so the schema states the same two rules.
     #[test]

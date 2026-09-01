@@ -2024,6 +2024,10 @@ impl ConfigurationViolation {
     /// The violation's evidence as stable key-value pairs, for error
     /// context.
     #[must_use]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per catalog violation; the match grows with the catalog"
+    )]
     pub fn evidence(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::LimitOutOfRange {
@@ -2104,13 +2108,7 @@ impl ConfigurationViolation {
             Self::LspInitializationOptionsNotObject { lsp } => {
                 vec![("lsp", lsp.clone())]
             }
-            Self::LspEngineSelectionConflict { lsp } => {
-                vec![
-                    ("lsp", lsp.clone()),
-                    ("fields", "command, embedded".to_owned()),
-                ]
-            }
-            Self::LspEngineMissing { lsp } => {
+            Self::LspEngineSelectionConflict { lsp } | Self::LspEngineMissing { lsp } => {
                 vec![
                     ("lsp", lsp.clone()),
                     ("fields", "command, embedded".to_owned()),
@@ -4089,6 +4087,77 @@ mod tests {
         assert!(matches!(
             configuration.validate(),
             Err(ConfigurationViolation::LanguageIdentityInvalid { .. })
+        ));
+    }
+
+    /// One engine per LSP table: naming both `command` and `embedded`
+    /// selects twice, naming neither selects nothing runnable, and an
+    /// embedded table refuses the spawned-process keys beside it.
+    #[test]
+    fn test_lsp_engine_selection_accepts_exactly_one_engine() {
+        let embedded_only = LspConfiguration {
+            command: None,
+            embedded: Some(EmbeddedEngine::Ty),
+            ..lsp()
+        };
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration
+            .lsp
+            .insert("ty".to_owned(), embedded_only.clone());
+        configuration.validate().expect("an embedded table accepts");
+
+        configuration.lsp.insert(
+            "ty".to_owned(),
+            LspConfiguration {
+                embedded: Some(EmbeddedEngine::Ty),
+                ..lsp()
+            },
+        );
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LspEngineSelectionConflict { .. })
+        ));
+
+        configuration.lsp.insert(
+            "ty".to_owned(),
+            LspConfiguration {
+                command: None,
+                ..lsp()
+            },
+        );
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LspEngineMissing { .. })
+        ));
+
+        configuration.lsp.insert(
+            "ty".to_owned(),
+            LspConfiguration {
+                environment: BTreeMap::from([("TY_LOG".to_owned(), "debug".to_owned())]),
+                ..embedded_only.clone()
+            },
+        );
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LspEmbeddedExtras {
+                field: "environment",
+                ..
+            })
+        ));
+
+        configuration.lsp.insert(
+            "ty".to_owned(),
+            LspConfiguration {
+                initialization_options: Some(json!({})),
+                ..embedded_only
+            },
+        );
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LspEmbeddedExtras {
+                field: "initialization_options",
+                ..
+            })
         ));
     }
 

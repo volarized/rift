@@ -365,6 +365,16 @@
       "pattern": "^(?:0|[1-9][0-9]*)(?:ms|s|m|h|d)$",
       "type": "string"
     },
+    "EmbeddedEngine": {
+      "description": "One engine this build links in, served in process without a command.",
+      "oneOf": [
+        {
+          "const": "ty",
+          "description": "The ty type checker, serving Python semantics in process.",
+          "type": "string"
+        }
+      ]
+    },
     "ExecutionConfiguration": {
       "additionalProperties": false,
       "description": "The `[execution]` table. Exact language entries enable execution; this\ntable owns the workspace-wide bounds.",
@@ -661,11 +671,45 @@
     },
     "LspConfiguration": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "command"
+              ]
+            },
+            {
+              "required": [
+                "embedded"
+              ]
+            }
+          ]
+        }
+      ],
       "description": "One external LSP process Rift may start.",
       "properties": {
         "command": {
-          "$ref": "#/$defs/CommandInput",
-          "description": "Executable and literal arguments. Rift starts it directly without a shell."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommandInput"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Executable and literal arguments. Rift starts it directly without a\nshell. Exactly one of `command` and `embedded` is present."
+        },
+        "embedded": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EmbeddedEngine"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Engine linked into the server, run in process in place of a spawned\ncommand. Exactly one of `command` and `embedded` is present, and an\nembedded engine takes no `environment` and no\n`initialization_options`."
         },
         "environment": {
           "additionalProperties": {
@@ -725,9 +769,6 @@
           }
         }
       },
-      "required": [
-        "command"
-      ],
       "type": "object"
     },
     "PathPattern": {
