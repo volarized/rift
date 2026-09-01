@@ -162,7 +162,7 @@ pub async fn classified_engine_change_diagnostics(
         {
             let source = document.source.as_deref().unwrap_or_default();
             match pulled_diagnostics(slot, &document.path, &document.language, source).await {
-                Ok((items, encoding, _readiness, _refresh_revision)) => {
+                Ok((items, encoding, _readiness, _refresh_revision, _published_version)) => {
                     let unit = file_id(&document.path);
                     let index = LineIndex::new(source);
                     let remaining = ENGINE_DIAGNOSTICS_PER_CHANGE_MAX - findings.len();
@@ -210,12 +210,27 @@ fn unready_paths<'record>(
 }
 
 /// Opens, pulls, and closes one document through one engine slot.
+///
+/// The version evidence [`EngineSlot::request_settled`]'s stale-report gate
+/// reads is whatever the engine most recently published for `path` - see
+/// [`pull_on_session`] - independent of the pull answer's own content. A
+/// publish still naming the exchange's previous open keeps this exchange
+/// retrying instead of settling on a report that describes it.
 async fn pulled_diagnostics(
     slot: &EngineSlot,
     path: &CoreProjectPath,
     language: &Language,
     source: &str,
-) -> Result<(PulledDiagnostics, PositionEncoding, EngineReadiness, u64), EngineError> {
+) -> Result<
+    (
+        PulledDiagnostics,
+        PositionEncoding,
+        EngineReadiness,
+        u64,
+        Option<i32>,
+    ),
+    EngineError,
+> {
     let open_path = path.clone();
     let open_language = language.name.clone();
     let open_source = source.to_owned();
@@ -239,15 +254,31 @@ async fn pulled_diagnostics(
             })
         },
         |answer| (answer.0.is_full(), answer.0.items().is_empty()),
+        |answer| answer.4,
     )
     .await
 }
 
 /// Opens, pulls, and closes one document.
+///
+/// The returned version is the engine's most recent
+/// `textDocument/publishDiagnostics` for `path`, when it named one -
+/// evidence for [`EngineSlot::request_settled`]'s stale-report gate, not a
+/// property of the pull answer itself: `textDocument/diagnostic` reports
+/// carry no version of their own.
 async fn pull_on_session(
     session: &mut EngineSession,
     path: &CoreProjectPath,
-) -> Result<(PulledDiagnostics, PositionEncoding, EngineReadiness, u64), EngineError> {
+) -> Result<
+    (
+        PulledDiagnostics,
+        PositionEncoding,
+        EngineReadiness,
+        u64,
+        Option<i32>,
+    ),
+    EngineError,
+> {
     if !session.capabilities().pull_diagnostics {
         return Err(rift_core::Error::new(EngineFault::CapabilityAbsent {
             capability: DocumentDiagnosticRequest::METHOD.to_owned(),
@@ -257,7 +288,14 @@ async fn pull_on_session(
     let pulled = session.pull_diagnostics(path).await;
     let readiness = session.readiness();
     let refresh_revision = session.diagnostic_refresh_revision();
-    Ok((pulled?, encoding, readiness, refresh_revision))
+    let published_version = session.published_diagnostics_version(path);
+    Ok((
+        pulled?,
+        encoding,
+        readiness,
+        refresh_revision,
+        published_version,
+    ))
 }
 
 async fn notify_engine_changes(
@@ -391,6 +429,7 @@ fn unready_warning(engine: &str, language: &Language, paths: &[ProjectPath]) -> 
 #[cfg(test)]
 mod tests {
     use lsp_types::{Position, Range};
+    use rift_lsp::uri::TreeRoot;
 
     use super::*;
 
@@ -1154,6 +1193,197 @@ mod tests {
             "the cap is reached before path a's queued unready warning is appended: \
              {findings:#?}"
         );
+        engines.shutdown().await;
+        drop(directory);
+    }
+
+    /// One document URI under a fixture root, computed the same way the
+    /// session itself composes one, so a scripted publish can name it.
+    fn fixture_document_uri(root: &std::path::Path, path: &CoreProjectPath) -> String {
+        TreeRoot::new(root)
+            .expect("the fixture root converts")
+            .document_uri(path)
+            .expect("the fixture path converts")
+            .as_str()
+            .to_owned()
+    }
+
+    /// One `textDocument/publishDiagnostics` notification frame naming
+    /// `message` under `version`, when given.
+    fn publish_frame(uri: &str, message: &str, version: Option<i32>) -> String {
+        let mut params = serde_json::json!({
+            "uri": uri,
+            "diagnostics": [{
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 1},
+                },
+                "message": message,
+            }],
+        });
+        if let Some(version) = version {
+            params["version"] = serde_json::json!(version);
+        }
+        framed(
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": params,
+            })
+            .to_string(),
+        )
+    }
+
+    /// One `textDocument/diagnostic` full-report response frame under `id`,
+    /// carrying one finding named `message`.
+    fn pull_response_frame(id: u64, message: &str) -> String {
+        framed(
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "kind": "full",
+                    "items": [{
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 1},
+                        },
+                        "message": message,
+                    }],
+                },
+            })
+            .to_string(),
+        )
+    }
+
+    /// A stale-versioned publish - naming the version one below the
+    /// exchange's own open - repeated across two pulls never settles: the
+    /// version gate discards both before `diagnostic_settlement` runs, so
+    /// neither becomes `repeated`'s prior answer. A later publish naming
+    /// the current open version passes the gate, and the pull that follows
+    /// it settles exactly as an unconfirmed engine's stable report always
+    /// has - two equal reports at the retry bound.
+    #[tokio::test]
+    async fn a_stale_versioned_publish_never_settles_and_a_current_version_report_wins() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        std::fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")
+            .expect("fixture file writes");
+        let reads = ReadService::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )
+        .expect("fixture workspace indexes");
+        let document = CoreProjectPath::new("lib.rs").expect("fixture path");
+        let uri = fixture_document_uri(directory.path(), &document);
+
+        let capabilities = framed(
+            r#"{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"diagnosticProvider":{"identifier":"fake","interFileDependencies":false,"workspaceDiagnostics":false}}}}"#,
+        );
+        // The exchange's one `open()` call sets document_version() to 1;
+        // `0` is therefore one open behind it - the previous open's version
+        // on a session that has only ever opened this document once.
+        let stale_publish = publish_frame(&uri, "stale finding", Some(0));
+        let current_publish = publish_frame(&uri, "current finding", Some(1));
+        let script = format!(
+            "printf '%s' '{capabilities}{stale_publish}{}{}{current_publish}{}{}'; sleep 0.2",
+            pull_response_frame(1, "stale finding"),
+            pull_response_frame(2, "stale finding"),
+            pull_response_frame(3, "current finding"),
+            pull_response_frame(4, "current finding"),
+        );
+        let engine = rift_protocol::configuration::LspConfiguration {
+            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                script,
+            ]),
+            environment: BTreeMap::new(),
+            initialization_options: None,
+            startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            output_limit: rift_protocol::configuration::ByteSize::from_bytes(4_096),
+            retry: rift_protocol::retry::RetryPolicy {
+                attempts: 4,
+                delay: rift_protocol::configuration::Duration::from_millis(1),
+                delay_limit: rift_protocol::configuration::Duration::from_millis(1),
+            },
+            restart: rift_protocol::retry::RestartPolicy::default(),
+        };
+        let engines = engine_pool(directory.path(), engine);
+        let changes = added_changes(&reads, &[ProjectPath("lib.rs".to_owned())]);
+        let findings =
+            classified_engine_change_diagnostics(&engines, &reads, &reads, &changes).await;
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert_eq!(
+            findings[0].message, "current finding",
+            "the stale-versioned reports never became the settled answer"
+        );
+        engines.shutdown().await;
+        drop(directory);
+    }
+
+    /// A publish naming no version carries no version evidence, so the
+    /// stale-report gate never fires and settlement proceeds exactly as it
+    /// did before the gate existed: two equal empty full reports settle
+    /// clean.
+    #[tokio::test]
+    async fn a_version_less_publish_settles_exactly_as_before() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        std::fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")
+            .expect("fixture file writes");
+        let reads = ReadService::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )
+        .expect("fixture workspace indexes");
+        let document = CoreProjectPath::new("lib.rs").expect("fixture path");
+        let uri = fixture_document_uri(directory.path(), &document);
+
+        let capabilities = framed(
+            r#"{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"diagnosticProvider":{"identifier":"fake","interFileDependencies":false,"workspaceDiagnostics":false}}}}"#,
+        );
+        let publish = framed(&format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{{"uri":"{uri}","diagnostics":[]}}}}"#
+        ));
+        let empty_pull = |id: u64| {
+            framed(&format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"kind":"full","items":[]}}}}"#
+            ))
+        };
+        let script = format!(
+            "printf '%s' '{capabilities}{publish}{}{}'; sleep 0.2",
+            empty_pull(1),
+            empty_pull(2),
+        );
+        let engine = rift_protocol::configuration::LspConfiguration {
+            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                script,
+            ]),
+            environment: BTreeMap::new(),
+            initialization_options: None,
+            startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            request_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
+            output_limit: rift_protocol::configuration::ByteSize::from_bytes(4_096),
+            retry: rift_protocol::retry::RetryPolicy {
+                attempts: 2,
+                delay: rift_protocol::configuration::Duration::from_millis(1),
+                delay_limit: rift_protocol::configuration::Duration::from_millis(1),
+            },
+            restart: rift_protocol::retry::RestartPolicy::default(),
+        };
+        let engines = engine_pool(directory.path(), engine);
+        let changes = added_changes(&reads, &[ProjectPath("lib.rs".to_owned())]);
+        let findings =
+            classified_engine_change_diagnostics(&engines, &reads, &reads, &changes).await;
+        assert!(findings.is_empty(), "{findings:#?}");
         engines.shutdown().await;
         drop(directory);
     }
