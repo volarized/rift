@@ -165,7 +165,7 @@ pub(super) fn run(
 /// below creates whatever is missing.
 fn resolve_scope_root(scope: InstallScope) -> Result<PathBuf, InstallError> {
     match scope {
-        InstallScope::Project => Ok(PathBuf::from(".")),
+        InstallScope::Project => Ok(Path::new(".").to_path_buf()),
         InstallScope::User => home_directory(&|name| std::env::var_os(name))
             .ok_or_else(|| Error::new(InstallFault::HomeDirectoryUnresolved)),
     }
@@ -378,11 +378,21 @@ fn parameters_markdown(input_schema: &serde_json::Map<String, Value>) -> String 
         let gloss = schema
             .get("description")
             .and_then(|value| value.as_str())
-            .and_then(|text| text.lines().next())
-            .unwrap_or("");
+            .map(first_sentence)
+            .unwrap_or_default();
         let _ = writeln!(rendered, "- `{name}`{marker} - {gloss}");
     }
     rendered
+}
+
+/// The first sentence of one schema description, its source line wraps joined. Field doc
+/// comments wrap prose across lines mid-sentence, so a first-line cut truncates the gloss.
+fn first_sentence(text: &str) -> String {
+    let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match joined.find(". ") {
+        Some(end) => joined[..=end].to_owned(),
+        None => joined,
+    }
 }
 
 /// Writes the generated skill under `skill_root`, replacing whatever was
@@ -563,6 +573,28 @@ mod tests {
                     tool.name
                 );
             }
+        }
+    }
+
+    #[test]
+    fn first_sentence_joins_wrapped_lines_before_cutting() {
+        let wrapped = "Optional hit fields to attach: `source`, `history`. Omitted defaults to\n`[\"source\"]`; an explicit empty list carries neither.";
+        assert_eq!(
+            super::first_sentence(wrapped),
+            "Optional hit fields to attach: `source`, `history`.",
+        );
+        assert_eq!(super::first_sentence("One sentence."), "One sentence.");
+    }
+
+    #[test]
+    fn parameter_glosses_end_at_a_sentence_boundary() {
+        let tools = rift_mcp::schema::tool_listing();
+        let rendered = tools_markdown(&tools);
+        for line in rendered.lines().filter(|line| line.starts_with("- `")) {
+            assert!(
+                line.ends_with('.'),
+                "a parameter gloss must be a whole sentence: {line}"
+            );
         }
     }
 
