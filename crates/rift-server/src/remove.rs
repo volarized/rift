@@ -1165,11 +1165,14 @@ mod tests {
         retry: rift_protocol::retry::RetryPolicy,
     ) -> rift_protocol::configuration::LspConfiguration {
         rift_protocol::configuration::LspConfiguration {
-            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
-                "sh".to_owned(),
-                "-c".to_owned(),
-                script,
-            ]),
+            command: Some(
+                rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    script,
+                ]),
+            ),
+            embedded: None,
             environment: std::collections::BTreeMap::new(),
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
@@ -1249,8 +1252,8 @@ mod tests {
                 delay_limit: rift_protocol::configuration::Duration::from_millis(1),
             },
         );
-        let rift_protocol::configuration::CommandInput::ProgramAndArguments(command) =
-            &mut engine.command
+        let Some(rift_protocol::configuration::CommandInput::ProgramAndArguments(command)) =
+            engine.command.as_mut()
         else {
             unreachable!("references engine uses a command list")
         };

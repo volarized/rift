@@ -686,13 +686,16 @@ mod tests {
             "printf '%s' '{capabilities}{register}{references}{progress_begin}{progress_end}{empty}{pull}{shutdown}' & exec cat > \"$1\""
         );
         let engine = rift_protocol::configuration::LspConfiguration {
-            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
-                "sh".to_owned(),
-                "-c".to_owned(),
-                script,
-                "rift-engine".to_owned(),
-                transcript.display().to_string(),
-            ]),
+            command: Some(
+                rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    script,
+                    "rift-engine".to_owned(),
+                    transcript.display().to_string(),
+                ]),
+            ),
+            embedded: None,
             environment: BTreeMap::new(),
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
@@ -843,13 +846,16 @@ mod tests {
             empty_pull(2),
         );
         let engine = rift_protocol::configuration::LspConfiguration {
-            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
-                "sh".to_owned(),
-                "-c".to_owned(),
-                script,
-                "rift-engine".to_owned(),
-                transcript.display().to_string(),
-            ]),
+            command: Some(
+                rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    script,
+                    "rift-engine".to_owned(),
+                    transcript.display().to_string(),
+                ]),
+            ),
+            embedded: None,
             environment: BTreeMap::new(),
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
@@ -928,11 +934,14 @@ mod tests {
             empty(2),
         );
         let engine = rift_protocol::configuration::LspConfiguration {
-            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
-                "sh".to_owned(),
-                "-c".to_owned(),
-                script,
-            ]),
+            command: Some(
+                rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    script,
+                ]),
+            ),
+            embedded: None,
             environment: BTreeMap::new(),
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
@@ -988,11 +997,14 @@ mod tests {
             empty(1) + &empty(2),
         );
         let engine = rift_protocol::configuration::LspConfiguration {
-            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
-                "sh".to_owned(),
-                "-c".to_owned(),
-                script,
-            ]),
+            command: Some(
+                rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    script,
+                ]),
+            ),
+            embedded: None,
             environment: BTreeMap::new(),
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
@@ -1048,11 +1060,14 @@ mod tests {
         let empty_pull = framed(r#"{"jsonrpc":"2.0","id":1,"result":{"kind":"full","items":[]}}"#);
         let script = format!("printf '%s' '{capabilities}{progress_begin}{empty_pull}'; sleep 0.2");
         let engine = rift_protocol::configuration::LspConfiguration {
-            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
-                "sh".to_owned(),
-                "-c".to_owned(),
-                script,
-            ]),
+            command: Some(
+                rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    script,
+                ]),
+            ),
+            embedded: None,
             environment: BTreeMap::new(),
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
@@ -1142,11 +1157,14 @@ mod tests {
             empty_pull(2),
         );
         let engine = rift_protocol::configuration::LspConfiguration {
-            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
-                "sh".to_owned(),
-                "-c".to_owned(),
-                script,
-            ]),
+            command: Some(
+                rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    script,
+                ]),
+            ),
+            embedded: None,
             environment: BTreeMap::new(),
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
@@ -1295,11 +1313,14 @@ mod tests {
             pull_response_frame(4, "current finding"),
         );
         let engine = rift_protocol::configuration::LspConfiguration {
-            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
-                "sh".to_owned(),
-                "-c".to_owned(),
-                script,
-            ]),
+            command: Some(
+                rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    script,
+                ]),
+            ),
+            embedded: None,
             environment: BTreeMap::new(),
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
@@ -1362,11 +1383,14 @@ mod tests {
             empty_pull(2),
         );
         let engine = rift_protocol::configuration::LspConfiguration {
-            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
-                "sh".to_owned(),
-                "-c".to_owned(),
-                script,
-            ]),
+            command: Some(
+                rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    script,
+                ]),
+            ),
+            embedded: None,
             environment: BTreeMap::new(),
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),

@@ -1708,11 +1708,14 @@ mod tests {
         );
         let script = format!("printf '%s' '{capabilities}{declined}{declined_again}'; sleep 0.2");
         let engine = rift_protocol::configuration::LspConfiguration {
-            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
-                "sh".to_owned(),
-                "-c".to_owned(),
-                script,
-            ]),
+            command: Some(
+                rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    script,
+                ]),
+            ),
+            embedded: None,
             environment: BTreeMap::new(),
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),

@@ -187,6 +187,19 @@ command = ["node_modules/.bin/typescript-language-server", "--stdio"]
 useSyntaxServer = "never"
 ```
 
+An entry may select the embedded engine instead of a spawned command. The build links the
+engine in, so nothing is installed or started beside the server:
+
+```toml
+[languages.python.lsp]
+embedded = "ty"
+```
+
+`embedded` names an engine this build carries; `ty` serves Python. Exactly one of `command`
+and `embedded` is present, and an embedded engine takes no `environment` and no
+`initialization_options`: both configure a spawned process, so a table naming them beside
+`embedded` is refused rather than silently ignored.
+
 `command` accepts a program string without whitespace or a nonempty list holding the program and
 its literal arguments. The list holds one program and at most 64 arguments; each argument holds
 at most 4096 bytes. Rift starts the command directly without a shell. Absolute programs are

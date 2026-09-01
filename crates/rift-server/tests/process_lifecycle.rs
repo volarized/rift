@@ -71,11 +71,12 @@ impl std::ops::DerefMut for ProcessFixture {
 /// Process fixture resolving `sh -c script`, bound to `languages`.
 fn table(script: String, languages: &[&str]) -> ProcessFixture {
     let configuration = LspConfiguration {
-        command: CommandInput::ProgramAndArguments(vec![
+        command: Some(CommandInput::ProgramAndArguments(vec![
             SHELL_PROGRAM.to_owned(),
             "-c".to_owned(),
             script,
-        ]),
+        ])),
+        embedded: None,
         environment: BTreeMap::new(),
         initialization_options: None,
         startup_timeout: Duration::from_millis(10_000),
@@ -168,7 +169,7 @@ pub(crate) fn retrying(mut configuration: ProcessFixture, attempts: u64) -> Proc
 /// fails before a process exists.
 pub(crate) fn absent_program(languages: &[&str]) -> ProcessFixture {
     let mut absent = table(String::new(), languages);
-    absent.command = CommandInput::Program("rift_absent_engine".to_owned());
+    absent.command = Some(CommandInput::Program("rift_absent_engine".to_owned()));
     absent
 }
 
@@ -176,7 +177,9 @@ pub(crate) fn absent_program(languages: &[&str]) -> ProcessFixture {
 /// exists, and refused the same way every time.
 pub(crate) fn absolute_program(languages: &[&str]) -> ProcessFixture {
     let mut absolute = table(String::new(), languages);
-    absolute.command = CommandInput::Program("/usr/bin/rift_absent_engine".to_owned());
+    absolute.command = Some(CommandInput::Program(
+        "/usr/bin/rift_absent_engine".to_owned(),
+    ));
     absolute
 }
 

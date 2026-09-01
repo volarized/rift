@@ -55,6 +55,10 @@ name = "configuration_admission"
 path = "tests/configuration_admission.rs"
 
 [[test]]
+name = "embedded_python"
+path = "tests/embedded_python.rs"
+
+[[test]]
 name = "error_contract"
 path = "tests/error_contract.rs"
 

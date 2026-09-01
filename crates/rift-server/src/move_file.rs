@@ -694,11 +694,14 @@ mod tests {
             "printf '%s' '{capabilities}{progress_begin}{progress_end}{no_edit}{no_edit_again}'; sleep 0.2"
         );
         let engine = rift_protocol::configuration::LspConfiguration {
-            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
-                "sh".to_owned(),
-                "-c".to_owned(),
-                script,
-            ]),
+            command: Some(
+                rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    script,
+                ]),
+            ),
+            embedded: None,
             environment: BTreeMap::new(),
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),
@@ -776,11 +779,14 @@ mod tests {
         let no_edit = framed(r#"{"jsonrpc":"2.0","id":1,"result":null}"#);
         let script = format!("printf '%s' '{capabilities}{no_edit}'; sleep 0.2");
         let engine = rift_protocol::configuration::LspConfiguration {
-            command: rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
-                "sh".to_owned(),
-                "-c".to_owned(),
-                script,
-            ]),
+            command: Some(
+                rift_protocol::configuration::CommandInput::ProgramAndArguments(vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    script,
+                ]),
+            ),
+            embedded: None,
             environment: BTreeMap::new(),
             initialization_options: None,
             startup_timeout: rift_protocol::configuration::Duration::from_millis(10_000),

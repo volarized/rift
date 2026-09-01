@@ -78,6 +78,14 @@ unicode-normalization = "0.1.24"
 unicode-width = "0.2.2"
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
+# Embedded ty: git dependencies pinned to the ruff submodule sha of ty release
+# 0.0.71. ty_project and ty_ide are unpublished, so git is the only route.
+ty_project = { git = "https://github.com/astral-sh/ruff", rev = "2b0d21094e2a55491bff60c07fd6f8803876cae5" }
+ty_ide = { git = "https://github.com/astral-sh/ruff", rev = "2b0d21094e2a55491bff60c07fd6f8803876cae5" }
+ruff_db = { git = "https://github.com/astral-sh/ruff", rev = "2b0d21094e2a55491bff60c07fd6f8803876cae5", features = ["os"] }
+ruff_text_size = { git = "https://github.com/astral-sh/ruff", rev = "2b0d21094e2a55491bff60c07fd6f8803876cae5" }
+ty_python_core = { git = "https://github.com/astral-sh/ruff", rev = "2b0d21094e2a55491bff60c07fd6f8803876cae5" }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 unreachable_pub = "warn"

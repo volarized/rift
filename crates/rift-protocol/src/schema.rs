@@ -520,6 +520,20 @@ pub fn declare_lsp_ranges(schema: &mut Schema) {
     );
 }
 
+/// An [`LspConfiguration`](crate::configuration::LspConfiguration) selects
+/// exactly one engine: a spawned `command`, or an `embedded` engine served
+/// in process. Acceptance enforces the same rule, together with the
+/// embedded exclusions the field docs state.
+pub fn lsp_selects_one_engine(schema: &mut Schema) {
+    use crate::configuration::LspConfiguration;
+    let command = property!(LspConfiguration, command);
+    let embedded = property!(LspConfiguration, embedded);
+    append(
+        schema,
+        one_of(vec![requires(&[command]), requires(&[embedded])]),
+    );
+}
+
 /// A [`RetryPolicy`](crate::retry::RetryPolicy) states its `Duration`
 /// bounds as `rift:range` on their keys: schema validation alone cannot
 /// compare `"250ms"` against a ceiling, so the server enforces the bounds
@@ -980,6 +994,24 @@ mod tests {
                 "the lsp key pattern must admit one language word and no dialect: {key}"
             );
         }
+    }
+
+    /// Acceptance takes exactly one of `command` and `embedded` per LSP
+    /// table, so the schema refuses both, neither, and admits each alone.
+    #[test]
+    fn test_lsp_schema_selects_exactly_one_engine() {
+        use crate::configuration::LspConfiguration;
+
+        let schema = serde_json::to_value(schema_for!(LspConfiguration)).expect("lsp schema");
+        let validator = jsonschema::validator_for(&schema).expect("lsp validator");
+        assert!(validator.is_valid(&json!({ "command": "tool" })));
+        assert!(validator.is_valid(&json!({ "embedded": "ty" })));
+        assert!(!validator.is_valid(&json!({ "command": "tool", "embedded": "ty" })));
+        assert!(!validator.is_valid(&json!({})));
+        assert!(
+            !validator.is_valid(&json!({ "embedded": "rust-analyzer" })),
+            "the embedded enumeration admits only engines this build links in"
+        );
     }
 
     /// A hook `id` and an LSP `initialization_options` object are refused by
