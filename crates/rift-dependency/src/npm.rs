@@ -857,8 +857,8 @@ mod tests {
             }
         })
         .to_string();
-        let mut inspector = RecordedInspector::default()
-            .with_file(format!("{ROOT}/package-lock.json"), rootless);
+        let mut inspector =
+            RecordedInspector::default().with_file(format!("{ROOT}/package-lock.json"), rootless);
 
         let resolution = resolve(&["package.json"], &mut inspector);
 
