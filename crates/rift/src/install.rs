@@ -1,10 +1,8 @@
-//! `rift install claude` - generates and removes the Claude Code skill
-//! teaching agents to reach for Rift's tools, and merges the `rift steer`
-//! `PreToolUse` hook into `.claude/settings.json`.
+//! `rift install claude` - writes and removes the Claude Code skill, and
+//! merges the `rift steer` `PreToolUse` hook into `.claude/settings.json`.
 //!
-//! [`generate`] is the sans-I/O core for the skill: the served tool listing
-//! in, a [`GeneratedSkill`] out, deterministic and checked against the
-//! listing so the skill can never name a tool the server does not serve.
+//! The skill's content comes from [`rift_mcp::skill::generate`], the
+//! sans-I/O core shared with the repository's Claude Code plugin export.
 //! [`merge_steer_hook`] is the sans-I/O core for the hook: an existing
 //! settings document in, the merged or stripped document out, never
 //! touching anything the steering hook does not own. The rest of this
@@ -13,29 +11,19 @@
 
 use std::error::Error as StdError;
 use std::ffi::OsString;
-use std::fmt::{self, Write as _};
+use std::fmt;
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 use rift_core::{CliCode, Error, ErrorContext, ErrorName, Fault};
-use rmcp::model::Tool;
+use rift_mcp::skill::{GeneratedSkill, SKILL_NAME, SkillForm, TOOLS_REFERENCE_FILE};
 use serde_json::{Map, Value, json};
 
-/// Directory name the generated skill lands in, below `.claude/skills`.
-const SKILL_NAME: &str = "rift";
-/// Sidecar file carrying every served tool's parameters.
-const TOOLS_REFERENCE_FILE: &str = "tools.md";
-/// Frontmatter `description`: Claude Code reads this to decide when to load
-/// the skill, so it leads with the trigger case.
-const SKILL_DESCRIPTION: &str = "Use when finding, reading, or editing code in a workspace \
-    Rift serves: structured search across declarations and source text, symbol reads by exact \
-    name, syntax inspection, and witnessed edits that recompute their address before writing \
-    and run the workspace's configured hooks.";
-
 /// Which agent's skill `rift install` generates. A single variant today;
-/// [`generate`] and the filesystem shell below are already keyed on it, so a
-/// second target is an added match arm, not a rewrite. Variants carry no
+/// [`rift_mcp::skill::generate`] and the filesystem shell below are already
+/// keyed on it, so a second target is an added match arm, not a rewrite.
+/// Variants carry no
 /// documentation of their own: clap renders a value's doc comment as
 /// per-value help, which turns the whole command's help into its long form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -245,7 +233,10 @@ pub(super) fn run(
         remove_skill(scope, skill_root)?
     } else {
         let tools = rift_mcp::schema::tool_listing();
-        let generated = generate(&tools)?;
+        let generated =
+            rift_mcp::skill::generate(&tools, SkillForm::Installed).map_err(|missing| {
+                Error::new(InstallFault::TemplateToolMissing { name: missing.name })
+            })?;
         write_skill(scope, skill_root, &generated)?
     };
     Ok(InstallOutcome { skill, hook })
@@ -272,220 +263,6 @@ fn home_directory(lookup: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> 
     set("HOME")
         .or_else(|| set("USERPROFILE"))
         .map(PathBuf::from)
-}
-
-/// The whole content of the generated skill: `SKILL.md` and its
-/// `references/tools.md` sidecar.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct GeneratedSkill {
-    pub(super) skill_md: String,
-    pub(super) tools_md: String,
-}
-
-/// One row of the "which tool" decision table: a situation, the tools that
-/// answer it, and an optional qualifier rendered after the tool names.
-struct DecisionRow {
-    situation: &'static str,
-    tools: &'static [&'static str],
-    note: Option<&'static str>,
-}
-
-/// The decision table [`skill_markdown`] renders. Every tool name here is the
-/// single source [`generate`] checks against the served surface, so the
-/// table and the check can never name different tools.
-const DECISION_TABLE: &[DecisionRow] = &[
-    DecisionRow {
-        situation: "The target is unknown.",
-        tools: &["search"],
-        note: None,
-    },
-    DecisionRow {
-        situation: "The declaration name is known.",
-        tools: &["get_symbol"],
-        note: None,
-    },
-    DecisionRow {
-        situation: "The syntax structure at one position is needed.",
-        tools: &["nodes"],
-        note: None,
-    },
-    DecisionRow {
-        situation: "A symbol's neighbors, its impact (who breaks when it changes), or a path \
-                    between two symbols is needed.",
-        tools: &["search"],
-        note: Some("with a `traversal` block"),
-    },
-    DecisionRow {
-        situation: "Code needs to change.",
-        tools: &[
-            "patch",
-            "replace_node",
-            "insert_node",
-            "insert_symbol",
-            "replace_symbol",
-            "rename_symbol",
-            "remove_node",
-            "remove_symbol",
-            "move_file",
-        ],
-        note: Some(
-            "over raw file writes: the server recomputes witnesses and runs the workspace's \
-             configured hooks",
-        ),
-    },
-];
-
-/// Generates the skill from the served tool listing.
-///
-/// Pure and deterministic: the same listing produces byte-identical output.
-///
-/// # Errors
-///
-/// Returns [`InstallError`] naming the missing tool when [`DECISION_TABLE`]
-/// names a tool the listing does not carry - the same no-drift check the
-/// exported schema document enforces on the tool surface itself.
-pub(super) fn generate(tools: &[Tool]) -> Result<GeneratedSkill, InstallError> {
-    for name in DECISION_TABLE
-        .iter()
-        .flat_map(|row| row.tools.iter().copied())
-    {
-        if !tools.iter().any(|tool| tool.name.as_ref() == name) {
-            return Err(Error::new(InstallFault::TemplateToolMissing { name }));
-        }
-    }
-    Ok(GeneratedSkill {
-        skill_md: skill_markdown(),
-        tools_md: tools_markdown(tools),
-    })
-}
-
-/// Renders `SKILL.md`: frontmatter Claude Code reads to decide when to load
-/// the skill, then the decision table and the reasons behind it.
-fn skill_markdown() -> String {
-    let mut rendered = String::new();
-    rendered.push_str("---\n");
-    rendered.push_str("name: rift\n");
-    let _ = writeln!(rendered, "description: {SKILL_DESCRIPTION}");
-    rendered.push_str("---\n\n");
-    rendered.push_str("# Rift\n\n");
-    rendered.push_str(
-        "Rift indexes this workspace's source and serves it over MCP: structured search, \
-         symbol reads by exact name, syntax inspection, and edits that carry their own \
-         address so a stale one refuses instead of splicing into moved code.\n\n",
-    );
-    rendered.push_str(
-        "Start an unfamiliar repository at `rift://map`; it names the served languages and \
-         the workspace's own layout before any tool call.\n\n",
-    );
-    rendered.push_str("## Which tool\n\n");
-    rendered.push_str("| Situation | Tool |\n");
-    rendered.push_str("| --- | --- |\n");
-    for row in DECISION_TABLE {
-        rendered.push_str(&decision_row_markdown(row));
-    }
-    rendered.push('\n');
-    rendered.push_str(
-        "The edit tools apply through the server, which recomputes each address's witness \
-         before writing and refuses when the source moved since the address was read. Prefer \
-         them over writing files directly: a raw write bypasses that check and the \
-         workspace's configured hooks.\n\n",
-    );
-    rendered.push_str("## When a call refuses\n\n");
-    rendered.push_str(
-        "Read `rift://logs` when a refusal alone does not say why; it carries the \
-         workspace's own recorded diagnostics.\n\n",
-    );
-    let _ = writeln!(
-        rendered,
-        "See [references/{TOOLS_REFERENCE_FILE}](references/{TOOLS_REFERENCE_FILE}) for every \
-         served tool's parameters."
-    );
-    rendered
-}
-
-/// One decision-table row as a markdown table line.
-fn decision_row_markdown(row: &DecisionRow) -> String {
-    let tools = row
-        .tools
-        .iter()
-        .map(|tool| format!("`{tool}`"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let cell = match row.note {
-        Some(note) => format!("{tools} ({note})"),
-        None => tools,
-    };
-    format!("| {} | {cell} |\n", row.situation)
-}
-
-/// Renders `references/tools.md`: one section per served tool, name-sorted
-/// the same way `schema_document` sorts the exported document.
-fn tools_markdown(tools: &[Tool]) -> String {
-    let mut sorted: Vec<&Tool> = tools.iter().collect();
-    sorted.sort_by(|left, right| left.name.cmp(&right.name));
-    let mut rendered = String::from("# Rift MCP tools\n\n");
-    rendered.push_str(
-        "Generated from the served tool surface. Regenerate with `rift install claude` \
-         (or `rift install claude --user`).\n\n",
-    );
-    for tool in sorted {
-        rendered.push_str(&tool_section_markdown(tool));
-    }
-    rendered
-}
-
-/// One tool's section: its name, its served description verbatim, and its
-/// top-level parameters.
-fn tool_section_markdown(tool: &Tool) -> String {
-    let description = tool.description.as_deref().unwrap_or_default();
-    format!(
-        "## {name}\n\n{description}\n\n{parameters}\n",
-        name = tool.name,
-        parameters = parameters_markdown(&tool.input_schema)
-    )
-}
-
-/// The tool's top-level parameters as a bullet list: name, whether required,
-/// and the first line of the schema's own description.
-fn parameters_markdown(input_schema: &serde_json::Map<String, Value>) -> String {
-    let Some(properties) = input_schema
-        .get("properties")
-        .and_then(|value| value.as_object())
-    else {
-        return "No parameters.\n".to_owned();
-    };
-    let required: Vec<&str> = input_schema
-        .get("required")
-        .and_then(|value| value.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|value| value.as_str())
-        .collect();
-    let mut rendered = String::from("Parameters:\n\n");
-    for (name, schema) in properties {
-        let marker = if required.contains(&name.as_str()) {
-            " (required)"
-        } else {
-            ""
-        };
-        let gloss = schema
-            .get("description")
-            .and_then(|value| value.as_str())
-            .map(first_sentence)
-            .unwrap_or_default();
-        let _ = writeln!(rendered, "- `{name}`{marker} - {gloss}");
-    }
-    rendered
-}
-
-/// The first sentence of one schema description, its source line wraps joined. Field doc
-/// comments wrap prose across lines mid-sentence, so a first-line cut truncates the gloss.
-fn first_sentence(text: &str) -> String {
-    let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    match joined.find(". ") {
-        Some(end) => joined[..=end].to_owned(),
-        None => joined,
-    }
 }
 
 /// Writes the generated skill under `skill_root`, replacing whatever was
@@ -750,164 +527,15 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use serde_json::{Value, json};
+    use rift_mcp::skill::{SKILL_NAME, SkillForm, TOOLS_REFERENCE_FILE, generate};
+    use serde_json::json;
 
     use super::{
-        DECISION_TABLE, HOOK_COMMAND, InstallFault, InstallScope, SKILL_DESCRIPTION, SKILL_NAME,
-        SettingsShape, SkillOutcome, TOOLS_REFERENCE_FILE, generate, home_directory,
-        merge_steer_hook, parameters_markdown, remove_skill, skill_markdown, tools_markdown,
-        write_skill,
+        HOOK_COMMAND, InstallFault, InstallScope, SettingsShape, SkillOutcome, home_directory,
+        merge_steer_hook, remove_skill, write_skill,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-
-    /// Highest line count `SKILL.md` may reach; Claude Code loads the sidecar on demand.
-    const SKILL_MD_LINES_MAX: usize = 500;
-    /// Highest combined length of the frontmatter `description` and an optional
-    /// `when_to_use` (unused here) Claude Code reads before truncating.
-    const FRONTMATTER_DESCRIPTION_BYTES_MAX: usize = 1_536;
-
-    #[test]
-    fn generate_is_deterministic() {
-        let tools = rift_mcp::schema::tool_listing();
-        let first =
-            generate(&tools).expect("the served surface must carry every decision-table tool");
-        let second =
-            generate(&tools).expect("the served surface must carry every decision-table tool");
-        assert_eq!(
-            first, second,
-            "generate must be byte-identical across calls"
-        );
-    }
-
-    #[test]
-    fn every_decision_table_tool_exists_in_the_served_surface() {
-        let tools = rift_mcp::schema::tool_listing();
-        generate(&tools).expect("every decision-table tool name must exist in the served surface");
-    }
-
-    #[test]
-    fn generate_refuses_a_decision_table_tool_the_surface_lacks() {
-        let tools: Vec<_> = rift_mcp::schema::tool_listing()
-            .into_iter()
-            .filter(|tool| tool.name != "search")
-            .collect();
-        let error = generate(&tools)
-            .expect_err("a decision-table tool missing from the surface must refuse");
-        assert!(matches!(
-            error.fault(),
-            InstallFault::TemplateToolMissing { name: "search" }
-        ));
-        assert_eq!(error.descriptor().code(), "install_template_missing_tool");
-    }
-
-    #[test]
-    fn skill_markdown_stays_under_the_line_cap() {
-        let line_count = skill_markdown().lines().count();
-        assert!(
-            line_count < SKILL_MD_LINES_MAX,
-            "SKILL.md has {line_count} lines"
-        );
-    }
-
-    #[test]
-    fn frontmatter_description_stays_under_the_combined_cap() {
-        assert!(SKILL_DESCRIPTION.len() <= FRONTMATTER_DESCRIPTION_BYTES_MAX);
-    }
-
-    #[test]
-    fn frontmatter_is_a_leading_yaml_block_naming_rift() {
-        let rendered = skill_markdown();
-        let mut lines = rendered.lines();
-        assert_eq!(lines.next(), Some("---"));
-        assert_eq!(lines.next(), Some("name: rift"));
-        let description_line = lines
-            .next()
-            .expect("frontmatter carries a description line");
-        assert!(description_line.starts_with("description: "));
-        assert_eq!(lines.next(), Some("---"));
-    }
-
-    #[test]
-    fn decision_table_lists_only_real_tool_names() {
-        assert!(!DECISION_TABLE.is_empty());
-        for row in DECISION_TABLE {
-            assert!(!row.tools.is_empty(), "{}", row.situation);
-        }
-    }
-
-    #[test]
-    fn tools_markdown_carries_every_tools_own_description_verbatim() {
-        let tools = rift_mcp::schema::tool_listing();
-        let rendered = tools_markdown(&tools);
-        for tool in &tools {
-            assert!(
-                rendered.contains(&format!("## {}", tool.name)),
-                "missing heading for {}",
-                tool.name
-            );
-            if let Some(description) = &tool.description {
-                assert!(
-                    rendered.contains(description.as_ref()),
-                    "missing verbatim description for {}",
-                    tool.name
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn first_sentence_joins_wrapped_lines_before_cutting() {
-        let wrapped = "Optional hit fields to attach: `source`, `history`. Omitted defaults to\n`[\"source\"]`; an explicit empty list carries neither.";
-        assert_eq!(
-            super::first_sentence(wrapped),
-            "Optional hit fields to attach: `source`, `history`.",
-        );
-        assert_eq!(super::first_sentence("One sentence."), "One sentence.");
-    }
-
-    #[test]
-    fn parameter_glosses_end_at_a_sentence_boundary() {
-        let tools = rift_mcp::schema::tool_listing();
-        let rendered = tools_markdown(&tools);
-        for line in rendered.lines().filter(|line| line.starts_with("- `")) {
-            assert!(
-                line.ends_with('.'),
-                "a parameter gloss must be a whole sentence: {line}"
-            );
-        }
-    }
-
-    #[test]
-    fn parameters_markdown_marks_required_fields_and_first_description_line() {
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "The lookup name.\nMore detail on a second line."
-                },
-                "limit": {"type": "integer", "description": "Bound on the page size."}
-            },
-            "required": ["name"]
-        });
-        let Value::Object(schema) = schema else {
-            unreachable!("json! object literal always serializes to Value::Object")
-        };
-        let rendered = parameters_markdown(&schema);
-        assert!(rendered.contains("- `name` (required) - The lookup name."));
-        assert!(!rendered.contains("More detail on a second line."));
-        assert!(rendered.contains("- `limit` - Bound on the page size."));
-    }
-
-    #[test]
-    fn parameters_markdown_names_a_tool_with_no_properties() {
-        let schema = serde_json::json!({"type": "object"});
-        let Value::Object(schema) = schema else {
-            unreachable!("json! object literal always serializes to Value::Object")
-        };
-        assert_eq!(parameters_markdown(&schema), "No parameters.\n");
-    }
 
     #[test]
     fn home_directory_prefers_home_then_userprofile_and_treats_empty_as_unset() {
@@ -947,7 +575,7 @@ mod tests {
             .join(".claude")
             .join("skills")
             .join(SKILL_NAME);
-        let generated = generate(&rift_mcp::schema::tool_listing())?;
+        let generated = generate(&rift_mcp::schema::tool_listing(), SkillForm::Installed)?;
         write_skill(InstallScope::Project, skill_root.clone(), &generated)?;
         let skill_md = fs::read_to_string(skill_root.join("SKILL.md"))?;
         let tools_md =
@@ -991,7 +619,7 @@ mod tests {
         std::os::unix::fs::symlink(&real_skills, &claude_skills)?;
 
         let skill_root = claude_skills.join(SKILL_NAME);
-        let generated = generate(&rift_mcp::schema::tool_listing())?;
+        let generated = generate(&rift_mcp::schema::tool_listing(), SkillForm::Installed)?;
         write_skill(InstallScope::Project, skill_root, &generated)?;
 
         assert!(

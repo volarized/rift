@@ -9,6 +9,7 @@ mod proxy;
 mod resource;
 pub mod schema;
 mod server;
+pub mod skill;
 mod spawn;
 mod storage;
 mod transport;
