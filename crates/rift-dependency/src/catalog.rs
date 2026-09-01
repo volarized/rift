@@ -371,4 +371,135 @@ mod tests {
         assert!(!catalog.is_degraded());
         assert_eq!(catalog.inputs().count(), 0);
     }
+
+    /// A resolver claiming `probe.toml` that answers one entry per manifest it was handed.
+    #[derive(Debug)]
+    struct ProbeResolver;
+
+    impl DependencyResolver for ProbeResolver {
+        fn name(&self) -> ResolverName {
+            ResolverName::Cargo
+        }
+
+        fn manager(&self) -> &'static str {
+            "probe"
+        }
+
+        fn language(&self) -> Language {
+            rust()
+        }
+
+        fn manifest_file_name(&self) -> &'static str {
+            "probe.toml"
+        }
+
+        fn resolve(
+            &self,
+            request: &ResolutionRequest<'_>,
+            _inspector: &mut dyn Inspector,
+        ) -> Resolution {
+            let entries = request
+                .manifests
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    let identity = identity(&format!("package-{index:04}"), "1.0.0");
+                    CatalogEntry::new(identity, PackageLocation::Dependency, rust())
+                })
+                .collect();
+            Resolution {
+                entries,
+                inputs: request.manifests.to_vec(),
+                degradations: Vec::new(),
+            }
+        }
+    }
+
+    fn probe_manifests(count: usize) -> Vec<ProjectPath> {
+        (0..count)
+            .map(|index| ProjectPath(format!("packages/p{index:04}/probe.toml")))
+            .collect()
+    }
+
+    #[test]
+    fn test_resolve_catalog_hands_each_resolver_its_claimed_manifests() {
+        let visible = vec![
+            ProjectPath("probe.toml".to_owned()),
+            ProjectPath("src/lib.rs".to_owned()),
+            ProjectPath("tools/probe.toml".to_owned()),
+        ];
+        let mut inspector = crate::fixture::RecordedInspector::default();
+
+        let catalog = resolve_catalog(
+            Path::new("/workspace"),
+            &visible,
+            &[&ProbeResolver],
+            &mut inspector,
+        );
+
+        assert_eq!(catalog.entries().len(), 2);
+        let inputs: Vec<&str> = catalog.inputs().map(|path| path.0.as_str()).collect();
+        assert_eq!(inputs, ["probe.toml", "tools/probe.toml"]);
+        assert!(!catalog.is_degraded());
+    }
+
+    #[test]
+    fn test_resolve_catalog_skips_a_resolver_with_no_claimed_manifest() {
+        let visible = vec![ProjectPath("Cargo.toml".to_owned())];
+        let mut inspector = crate::fixture::RecordedInspector::default();
+
+        let catalog = resolve_catalog(
+            Path::new("/workspace"),
+            &visible,
+            &[&ProbeResolver],
+            &mut inspector,
+        );
+
+        assert!(catalog.entries().is_empty());
+        assert_eq!(catalog.inputs().count(), 0);
+        assert!(!catalog.is_degraded());
+    }
+
+    #[test]
+    fn test_resolve_catalog_reads_exactly_manifests_max_without_a_drop() {
+        let visible = probe_manifests(MANIFESTS_MAX);
+        let mut inspector = crate::fixture::RecordedInspector::default();
+
+        let catalog = resolve_catalog(
+            Path::new("/workspace"),
+            &visible,
+            &[&ProbeResolver],
+            &mut inspector,
+        );
+
+        assert_eq!(catalog.entries().len(), MANIFESTS_MAX);
+        assert!(!catalog.is_degraded());
+    }
+
+    #[test]
+    fn test_resolve_catalog_drops_the_manifest_past_the_bound_and_reports_it() {
+        let visible = probe_manifests(MANIFESTS_MAX + 1);
+        let mut inspector = crate::fixture::RecordedInspector::default();
+
+        let catalog = resolve_catalog(
+            Path::new("/workspace"),
+            &visible,
+            &[&ProbeResolver],
+            &mut inspector,
+        );
+
+        assert_eq!(catalog.entries().len(), MANIFESTS_MAX);
+        assert_eq!(catalog.inputs().count(), MANIFESTS_MAX);
+        assert_eq!(
+            catalog.degradations(),
+            [Degradation {
+                resolver: ResolverName::Cargo,
+                reason: format!(
+                    "1 of {} probe.toml manifests were not read: at most {MANIFESTS_MAX} are \
+                     read per workspace",
+                    MANIFESTS_MAX + 1
+                ),
+            }]
+        );
+    }
 }
