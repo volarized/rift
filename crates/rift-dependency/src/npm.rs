@@ -869,4 +869,4 @@ mod tests {
         );
         assert!(resolution.degradations.is_empty());
     }
-}\n
+}
