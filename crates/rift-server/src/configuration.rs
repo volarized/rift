@@ -263,7 +263,15 @@ download_timeout = "5m"
             .iter()
             .map(|pattern| pattern.0.as_str())
             .collect();
-        assert_eq!(excluded, [".claude/**", ".agents/**", "docs/public/**"]);
+        assert_eq!(
+            excluded,
+            [
+                ".claude/**",
+                ".agents/**",
+                "docs/public/**",
+                "plugins/claude/skills/**"
+            ]
+        );
         assert!(configuration.source.respect_gitignore);
         assert_eq!(configuration.hooks.len(), 2);
         assert_eq!(configuration.hooks[0].id, "format");

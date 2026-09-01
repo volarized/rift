@@ -1,0 +1,14 @@
+{
+  "name": "rift",
+  "owner": {
+    "name": "volar.sh",
+    "email": "contact@volar.sh",
+    "url": "https://volar.sh"
+  },
+  "plugins": [
+    {
+      "name": "rift",
+      "source": "./plugins/claude"
+    }
+  ]
+}

@@ -34,6 +34,32 @@ rift install claude --remove
 rift install claude --user --remove
 ```
 
+## Install as a plugin
+
+<VersionBadge version="v0.0.31" />
+
+The repository doubles as a Claude Code plugin marketplace, so the skill installs without the
+`rift` CLI:
+
+```sh
+/plugin marketplace add volarized/rift
+/plugin install rift@rift
+```
+
+The plugin ships the same generated skill plus an `.mcp.json` naming the `rift mcp` server, so
+one install covers every project the operator opens. The plugin's server entry is additive and
+scoped to the plugin: Claude Code leaves the operator's own `.mcp.json` and settings untouched,
+and uninstalling the plugin removes the entry with it.
+
+The `rift` executable is still what serves the tools. When it is missing, Claude Code skips the
+plugin's server entry and the skill's own install section names the installer commands; the
+[quickstart](/docs) carries the same commands.
+
+The steering hook stays with `rift install claude`: the plugin carries the skill and the server
+entry alone. A workspace already carrying a `rift` entry written by `rift install claude` runs a
+second proxy beside the plugin's; both reach the same workspace server. Keep one: remove the
+project entry or disable the plugin for that project.
+
 ## What the skill teaches
 
 The generated `SKILL.md` carries a decision table pointing the agent at the tool that answers

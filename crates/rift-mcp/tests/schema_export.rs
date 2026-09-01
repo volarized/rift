@@ -6,11 +6,30 @@ use std::fs;
 use std::process::Command;
 
 use rift_mcp::schema::{self, ExportError};
+use rift_mcp::skill::{self, SkillForm};
 use serde_json::Value;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 const REGENERATE_COMMAND: &str = "cargo run -p rift-mcp --bin rift-schema-export";
+
+/// A write request keeping both export roots inside `directory`, so no test
+/// touches the checkout's own committed artifacts through the defaults.
+fn write_request(directory: &tempfile::TempDir) -> TestResult<schema::ExportRequest> {
+    Ok(schema::parse_arguments([
+        directory.path().display().to_string(),
+        directory.path().join("plugin").display().to_string(),
+    ])?)
+}
+
+/// The `--check` counterpart of [`write_request`].
+fn check_request(directory: &tempfile::TempDir) -> TestResult<schema::ExportRequest> {
+    Ok(schema::parse_arguments([
+        "--check".to_owned(),
+        directory.path().display().to_string(),
+        directory.path().join("plugin").display().to_string(),
+    ])?)
+}
 
 #[test]
 fn run_without_arguments_writes_default_output_directory() -> TestResult {
@@ -24,24 +43,29 @@ fn run_without_arguments_writes_default_output_directory() -> TestResult {
     assert_eq!(written, schema::schema_document());
     let configuration = fs::read_to_string(directory.path().join("docs/public/rift.schema.json"))?;
     assert_eq!(configuration, schema::configuration_schema_document());
+    let manifest = fs::read_to_string(
+        directory
+            .path()
+            .join("plugins/claude/.claude-plugin/plugin.json"),
+    )?;
+    assert_eq!(manifest, skill::plugin_manifest());
 
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.starts_with("wrote "));
     assert!(stdout.contains("docs/public/mcp.json"));
     assert!(stdout.contains("docs/public/rift.schema.json"));
+    assert!(stdout.contains("SKILL.md"));
     Ok(())
 }
 
 #[test]
 fn check_fails_when_configuration_schema_is_stale() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let write_request = schema::parse_arguments([directory.path().display().to_string()])?;
-    schema::run(&write_request)?;
+    schema::run(&write_request(&directory)?)?;
     fs::write(directory.path().join("public/rift.schema.json"), "{}")?;
 
-    let check_request =
-        schema::parse_arguments(["--check".to_owned(), directory.path().display().to_string()])?;
-    let error = schema::run(&check_request).expect_err("stale configuration schema must fail");
+    let error =
+        schema::run(&check_request(&directory)?).expect_err("stale configuration schema must fail");
     let ExportError::CheckMismatch { path } = error else {
         panic!("expected CheckMismatch, got {error:?}");
     };
@@ -95,8 +119,7 @@ fn run_with_unknown_flag_prints_error_and_fails() -> TestResult {
 #[test]
 fn run_with_explicit_directory_writes_document_there() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let request = schema::parse_arguments([directory.path().display().to_string()])?;
-    schema::run(&request)?;
+    schema::run(&write_request(&directory)?)?;
 
     let written = fs::read_to_string(directory.path().join("public/mcp.json"))?;
     assert_eq!(written, schema::schema_document());
@@ -104,27 +127,56 @@ fn run_with_explicit_directory_writes_document_there() -> TestResult {
 }
 
 #[test]
+fn plugin_export_writes_the_generated_manifest_and_skill() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    schema::run(&write_request(&directory)?)?;
+
+    let plugin = directory.path().join("plugin");
+    let manifest = fs::read_to_string(plugin.join(".claude-plugin/plugin.json"))?;
+    assert_eq!(manifest, skill::plugin_manifest());
+    let generated = skill::generate(&schema::tool_listing(), SkillForm::Plugin)?;
+    let skill_md = fs::read_to_string(plugin.join("skills/rift/SKILL.md"))?;
+    assert_eq!(skill_md, generated.skill_md);
+    let tools_md = fs::read_to_string(plugin.join("skills/rift/references/tools.md"))?;
+    assert_eq!(tools_md, generated.tools_md);
+    Ok(())
+}
+
+#[test]
+fn check_fails_when_the_plugin_manifest_is_stale() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    schema::run(&write_request(&directory)?)?;
+    fs::write(
+        directory.path().join("plugin/.claude-plugin/plugin.json"),
+        "{}",
+    )?;
+
+    let error =
+        schema::run(&check_request(&directory)?).expect_err("a stale plugin manifest must fail");
+    let ExportError::CheckMismatch { path } = error else {
+        panic!("expected CheckMismatch, got {error:?}");
+    };
+    assert!(path.ends_with("plugin.json"));
+    Ok(())
+}
+
+#[test]
 fn check_succeeds_when_document_matches_served_surface() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let write_request = schema::parse_arguments([directory.path().display().to_string()])?;
-    schema::run(&write_request)?;
+    schema::run(&write_request(&directory)?)?;
 
-    let check_request =
-        schema::parse_arguments(["--check".to_owned(), directory.path().display().to_string()])?;
-    schema::run(&check_request)?;
+    schema::run(&check_request(&directory)?)?;
     Ok(())
 }
 
 #[test]
 fn check_fails_when_document_is_stale() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let write_request = schema::parse_arguments([directory.path().display().to_string()])?;
-    schema::run(&write_request)?;
+    schema::run(&write_request(&directory)?)?;
     fs::write(directory.path().join("public/mcp.json"), "{}")?;
 
-    let check_request =
-        schema::parse_arguments(["--check".to_owned(), directory.path().display().to_string()])?;
-    let error = schema::run(&check_request).expect_err("stale document must fail check");
+    let error =
+        schema::run(&check_request(&directory)?).expect_err("stale document must fail check");
     assert!(matches!(error, ExportError::CheckMismatch { .. }));
     assert!(std::error::Error::source(&error).is_none());
     Ok(())
@@ -133,9 +185,8 @@ fn check_fails_when_document_is_stale() -> TestResult {
 #[test]
 fn check_fails_when_document_is_missing() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let check_request =
-        schema::parse_arguments(["--check".to_owned(), directory.path().display().to_string()])?;
-    let error = schema::run(&check_request).expect_err("missing document must fail check");
+    let error =
+        schema::run(&check_request(&directory)?).expect_err("missing document must fail check");
     assert!(matches!(error, ExportError::CheckUnreadable { .. }));
     assert!(std::error::Error::source(&error).is_some());
     Ok(())
@@ -157,17 +208,21 @@ fn parse_arguments_rejects_unknown_flag() {
 
 #[test]
 fn descriptor_codes_match_registry_per_variant() {
-    let extra = schema::parse_arguments(["first".to_owned(), "second".to_owned()])
-        .expect_err("second directory must fail");
+    let extra =
+        schema::parse_arguments(["first".to_owned(), "second".to_owned(), "third".to_owned()])
+            .expect_err("a third positional argument must fail");
     assert_eq!(extra.descriptor().code(), "invalid_request");
+    let missing = ExportError::TemplateToolMissing { name: "search" };
+    assert_eq!(missing.descriptor().code(), "install_template_missing_tool");
+    assert!(missing.to_string().contains("`search`"));
+    assert!(std::error::Error::source(&missing).is_none());
 }
 
 #[test]
 fn check_unreadable_descriptor_is_storage_failure() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let check_request =
-        schema::parse_arguments(["--check".to_owned(), directory.path().display().to_string()])?;
-    let error = schema::run(&check_request).expect_err("missing document must fail check");
+    let error =
+        schema::run(&check_request(&directory)?).expect_err("missing document must fail check");
     assert_eq!(error.descriptor().code(), "storage_failure");
     Ok(())
 }
@@ -177,7 +232,10 @@ fn write_failed_descriptor_is_storage_failure() -> TestResult {
     let directory = tempfile::tempdir()?;
     let blocked = directory.path().join("blocked");
     fs::write(&blocked, "not a directory")?;
-    let request = schema::parse_arguments([blocked.join("nested").display().to_string()])?;
+    let request = schema::parse_arguments([
+        blocked.join("nested").display().to_string(),
+        directory.path().join("plugin").display().to_string(),
+    ])?;
     let error = schema::run(&request).expect_err("writing under a file must fail");
     assert_eq!(error.descriptor().code(), "storage_failure");
     Ok(())
@@ -186,27 +244,26 @@ fn write_failed_descriptor_is_storage_failure() -> TestResult {
 #[test]
 fn check_mismatch_descriptor_is_artifact_stale() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let write_request = schema::parse_arguments([directory.path().display().to_string()])?;
-    schema::run(&write_request)?;
+    schema::run(&write_request(&directory)?)?;
     fs::write(directory.path().join("public/mcp.json"), "{}")?;
 
-    let check_request =
-        schema::parse_arguments(["--check".to_owned(), directory.path().display().to_string()])?;
-    let error = schema::run(&check_request).expect_err("stale document must fail check");
+    let error =
+        schema::run(&check_request(&directory)?).expect_err("stale document must fail check");
     assert_eq!(error.descriptor().code(), "artifact_stale");
     Ok(())
 }
 
 #[test]
-fn parse_arguments_rejects_second_output_directory() {
-    let error = schema::parse_arguments(["first".to_owned(), "second".to_owned()])
-        .expect_err("second directory must fail");
+fn parse_arguments_rejects_a_third_positional_argument() {
+    let error =
+        schema::parse_arguments(["first".to_owned(), "second".to_owned(), "third".to_owned()])
+            .expect_err("a third positional argument must fail");
     let message = error.to_string();
     let ExportError::ExtraArgument { argument } = error else {
         panic!("expected ExtraArgument, got {error:?}");
     };
-    assert_eq!(argument, "second");
-    assert!(message.contains("second"));
+    assert_eq!(argument, "third");
+    assert!(message.contains("third"));
     assert!(message.contains("usage: rift-schema-export"));
 }
 
@@ -218,17 +275,15 @@ fn check_error_messages_name_path_and_regenerate_command() -> TestResult {
         .join("public/mcp.json")
         .display()
         .to_string();
-    let check_request =
-        schema::parse_arguments(["--check".to_owned(), directory.path().display().to_string()])?;
+    let check = check_request(&directory)?;
 
-    let missing = schema::run(&check_request).expect_err("missing document must fail check");
+    let missing = schema::run(&check).expect_err("missing document must fail check");
     assert!(missing.to_string().contains(&document_path));
     assert!(missing.to_string().contains(REGENERATE_COMMAND));
 
-    let write_request = schema::parse_arguments([directory.path().display().to_string()])?;
-    schema::run(&write_request)?;
+    schema::run(&write_request(&directory)?)?;
     fs::write(directory.path().join("public/mcp.json"), "{}")?;
-    let mismatch = schema::run(&check_request).expect_err("stale document must fail check");
+    let mismatch = schema::run(&check).expect_err("stale document must fail check");
     assert!(mismatch.to_string().contains(&document_path));
     assert!(mismatch.to_string().contains(REGENERATE_COMMAND));
     Ok(())
@@ -239,7 +294,10 @@ fn write_failed_names_path_and_usage() -> TestResult {
     let directory = tempfile::tempdir()?;
     let blocked = directory.path().join("blocked");
     fs::write(&blocked, "not a directory")?;
-    let request = schema::parse_arguments([blocked.join("nested").display().to_string()])?;
+    let request = schema::parse_arguments([
+        blocked.join("nested").display().to_string(),
+        directory.path().join("plugin").display().to_string(),
+    ])?;
 
     let error = schema::run(&request).expect_err("writing under a file must fail");
     assert!(matches!(error, ExportError::WriteFailed { .. }));
@@ -252,7 +310,7 @@ fn write_failed_names_path_and_usage() -> TestResult {
 fn write_failed_when_document_path_is_a_directory() -> TestResult {
     let directory = tempfile::tempdir()?;
     fs::create_dir_all(directory.path().join("public/mcp.json"))?;
-    let request = schema::parse_arguments([directory.path().display().to_string()])?;
+    let request = write_request(&directory)?;
 
     let error = schema::run(&request).expect_err("writing over a directory must fail");
     assert!(matches!(error, ExportError::WriteFailed { .. }));
