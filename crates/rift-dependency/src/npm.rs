@@ -846,4 +846,27 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn test_resolve_lockfile_without_a_root_entry_catalogs_nothing_as_direct() {
+        let rootless = json!({
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "node_modules/chalk": { "version": "4.1.2" }
+            }
+        })
+        .to_string();
+        let mut inspector = RecordedInspector::default()
+            .with_file(format!("{ROOT}/package-lock.json"), rootless);
+
+        let resolution = resolve(&["package.json"], &mut inspector);
+
+        assert_eq!(names(&resolution), ["npm/chalk@4.1.2"]);
+        assert!(
+            resolution.entries.iter().all(|entry| !entry.is_direct()),
+            "no root entry declares anything directly"
+        );
+        assert!(resolution.degradations.is_empty());
+    }
 }
