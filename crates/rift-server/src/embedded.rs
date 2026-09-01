@@ -50,6 +50,11 @@ const PAYLOAD_BYTES_MAX: usize = 8 * 1024 * 1024;
 const METHOD_NOT_FOUND: i64 = -32601;
 /// JSON-RPC error code for a request this engine could not complete.
 const INTERNAL_ERROR: i64 = -32603;
+/// JSON-RPC error code LSP names `ContentModified`: the document moved
+/// between the peer's view and this engine's, so the same request is worth
+/// sending again once the views converge. The session classifies it as a
+/// re-request signal, never a terminal refusal.
+const CONTENT_MODIFIED: i64 = -32801;
 
 /// Starts one embedded ty session for `workspace_root`.
 ///
@@ -132,6 +137,23 @@ enum Handled {
     Exit,
 }
 
+/// Why one answer could not be produced.
+#[derive(Debug)]
+enum AnswerRefusal {
+    /// The request does not decode, or the database refused: the peer has
+    /// something to correct before asking again.
+    Invalid(String),
+    /// The document moved between the peer's view and this engine's: the
+    /// same request is worth sending again once the views converge.
+    Moved(String),
+}
+
+impl From<String> for AnswerRefusal {
+    fn from(detail: String) -> Self {
+        Self::Invalid(detail)
+    }
+}
+
 /// One request's conversion context: the root spellings and the document
 /// text the session sent for the addressed URI, when it opened one.
 struct Exchange<'request> {
@@ -206,7 +228,7 @@ fn answered(
     root: &Path,
     documents: &DocumentStore,
     params: &Value,
-    answer: fn(&mut ProjectDatabase, &Exchange<'_>, &Value) -> Result<Value, String>,
+    answer: fn(&mut ProjectDatabase, &Exchange<'_>, &Value) -> Result<Value, AnswerRefusal>,
 ) -> Handled {
     let sent = params
         .pointer("/textDocument/uri")
@@ -222,7 +244,13 @@ fn answered(
     });
     Handled::Reply(match outcome {
         Ok(result) => reply(id, &result),
-        Err(detail) => error_reply(id, INTERNAL_ERROR, &detail),
+        Err(refusal) => {
+            let (code, detail) = match refusal {
+                AnswerRefusal::Invalid(detail) => (INTERNAL_ERROR, detail),
+                AnswerRefusal::Moved(detail) => (CONTENT_MODIFIED, detail),
+            };
+            error_reply(id, code, &detail)
+        }
     })
 }
 
@@ -265,17 +293,19 @@ fn databases() -> &'static Mutex<HashMap<PathBuf, ProjectDatabase>> {
 /// process; every answer extracts owned data before returning.
 fn with_database<T>(
     tree_root: &Path,
-    answer: impl FnOnce(&mut ProjectDatabase, &Path) -> Result<T, String>,
-) -> Result<T, String> {
-    let root = tree_root
-        .canonicalize()
-        .map_err(|error| format!("tree root {}: {error}", tree_root.display()))?;
-    let mut databases = databases()
-        .lock()
-        .map_err(|_| "the embedded ty database cache is poisoned".to_owned())?;
+    answer: impl FnOnce(&mut ProjectDatabase, &Path) -> Result<T, AnswerRefusal>,
+) -> Result<T, AnswerRefusal> {
+    let root = tree_root.canonicalize().map_err(|error| {
+        AnswerRefusal::Invalid(format!("tree root {}: {error}", tree_root.display()))
+    })?;
+    let mut databases = databases().lock().map_err(|_| {
+        AnswerRefusal::Invalid("the embedded ty database cache is poisoned".to_owned())
+    })?;
     let database = match databases.entry(root.clone()) {
         Entry::Occupied(entry) => entry.into_mut(),
-        Entry::Vacant(entry) => entry.insert(built_database(&root)?),
+        Entry::Vacant(entry) => {
+            entry.insert(built_database(&root).map_err(AnswerRefusal::Invalid)?)
+        }
     };
     answer(database, &root)
 }
@@ -351,18 +381,19 @@ fn opened_document(root: &Path, params: &Value) {
 
 /// The ty file behind one `file://` URI, refused as text when it cannot
 /// resolve.
-fn file_at(database: &ProjectDatabase, uri: &Value) -> Result<File, String> {
+fn file_at(database: &ProjectDatabase, uri: &Value) -> Result<File, AnswerRefusal> {
     let path = uri
         .as_str()
         .and_then(uri_to_path)
-        .ok_or_else(|| format!("unreadable document uri: {uri}"))?;
+        .ok_or_else(|| AnswerRefusal::Invalid(format!("unreadable document uri: {uri}")))?;
     let path = path
         .canonicalize()
-        .map_err(|error| format!("document {}: {error}", path.display()))?;
-    let system_path = SystemPathBuf::from_path_buf(path)
-        .map_err(|path| format!("document path is not UTF-8: {}", path.display()))?;
+        .map_err(|error| AnswerRefusal::Moved(format!("document {}: {error}", path.display())))?;
+    let system_path = SystemPathBuf::from_path_buf(path).map_err(|path| {
+        AnswerRefusal::Invalid(format!("document path is not UTF-8: {}", path.display()))
+    })?;
     system_path_to_file(database, &system_path)
-        .map_err(|error| format!("document {system_path}: {error:?}"))
+        .map_err(|error| AnswerRefusal::Moved(format!("document {system_path}: {error:?}")))
 }
 
 /// The filesystem path one `file://` URI spells.
@@ -394,25 +425,30 @@ fn path_to_uri(path: &Path) -> String {
 }
 
 /// The byte offset one LSP position addresses in `text`.
-fn offset_at(text: &str, position: &Value) -> Result<TextSize, String> {
+fn offset_at(text: &str, position: &Value) -> Result<TextSize, AnswerRefusal> {
     let position: lsp_types::Position = serde_json::from_value(position.clone())
-        .map_err(|error| format!("unreadable position: {error}"))?;
+        .map_err(|error| AnswerRefusal::Invalid(format!("unreadable position: {error}")))?;
     let index = rift_lsp::LineIndex::new(text);
     let offset = index
         .byte_offset(PositionEncoding::Utf8, position)
-        .map_err(|error| format!("position outside the document: {error}"))?;
-    TextSize::try_from(offset).map_err(|error| format!("offset width: {error}"))
+        .map_err(|error| AnswerRefusal::Moved(format!("position outside the document: {error}")))?;
+    TextSize::try_from(offset)
+        .map_err(|error| AnswerRefusal::Invalid(format!("offset width: {error}")))
 }
 
 /// The LSP range one byte range spells in `text`, in UTF-8 positions.
-fn range_at(text: &str, range: TextRange) -> Result<Value, String> {
+fn range_at(text: &str, range: TextRange) -> Result<Value, AnswerRefusal> {
     let index = rift_lsp::LineIndex::new(text);
     let start = index
         .position(PositionEncoding::Utf8, usize::from(range.start()))
-        .map_err(|error| format!("range start outside the document: {error}"))?;
+        .map_err(|error| {
+            AnswerRefusal::Moved(format!("range start outside the document: {error}"))
+        })?;
     let end = index
         .position(PositionEncoding::Utf8, usize::from(range.end()))
-        .map_err(|error| format!("range end outside the document: {error}"))?;
+        .map_err(|error| {
+            AnswerRefusal::Moved(format!("range end outside the document: {error}"))
+        })?;
     Ok(json!({ "start": start, "end": end }))
 }
 
@@ -421,7 +457,7 @@ fn prepare_rename(
     database: &mut ProjectDatabase,
     exchange: &Exchange<'_>,
     params: &Value,
-) -> Result<Value, String> {
+) -> Result<Value, AnswerRefusal> {
     let file = file_at(
         database,
         params.pointer("/textDocument/uri").unwrap_or(&Value::Null),
@@ -443,7 +479,7 @@ fn rename(
     database: &mut ProjectDatabase,
     exchange: &Exchange<'_>,
     params: &Value,
-) -> Result<Value, String> {
+) -> Result<Value, AnswerRefusal> {
     let file = file_at(
         database,
         params.pointer("/textDocument/uri").unwrap_or(&Value::Null),
@@ -456,7 +492,7 @@ fn rename(
     let new_name = params
         .pointer("/newName")
         .and_then(Value::as_str)
-        .ok_or_else(|| "rename carries no newName".to_owned())?;
+        .ok_or_else(|| AnswerRefusal::Invalid("rename carries no newName".to_owned()))?;
     if ty_ide::can_rename(database, program_file, offset).is_none() {
         return Ok(Value::Null);
     }
@@ -486,7 +522,7 @@ fn references(
     database: &mut ProjectDatabase,
     exchange: &Exchange<'_>,
     params: &Value,
-) -> Result<Value, String> {
+) -> Result<Value, AnswerRefusal> {
     let file = file_at(
         database,
         params.pointer("/textDocument/uri").unwrap_or(&Value::Null),
@@ -526,7 +562,7 @@ fn target_location(
     exchange: &Exchange<'_>,
     file: File,
     range: TextRange,
-) -> Result<Option<(String, Value)>, String> {
+) -> Result<Option<(String, Value)>, AnswerRefusal> {
     let Some(system_path) = file.path(database).as_system_path() else {
         return Ok(None);
     };
@@ -548,7 +584,7 @@ fn pulled_diagnostics(
     database: &mut ProjectDatabase,
     exchange: &Exchange<'_>,
     params: &Value,
-) -> Result<Value, String> {
+) -> Result<Value, AnswerRefusal> {
     let file = file_at(
         database,
         params.pointer("/textDocument/uri").unwrap_or(&Value::Null),
