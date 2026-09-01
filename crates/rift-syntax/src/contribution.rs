@@ -73,6 +73,73 @@ impl From<PublicationError> for SyntaxPublicationError {
     }
 }
 
+/// Where one document's declarations are filed: origin, source unit, and identity path.
+///
+/// `unit` is the [`SourceUnitId`] every declaration's binding names, and
+/// `identity_path` is the path segment each [`SymbolId`] embeds after the
+/// language. The project placement files a document under
+/// `rift://source/project/<path>` with the path itself as the identity path;
+/// a dependency placement names the package's own unit and embeds
+/// `<manager>/<name>@<version>/<path>` instead.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocumentPlacement {
+    origin: ContributionOrigin,
+    unit: SourceUnitId,
+    identity_path: String,
+}
+
+impl DocumentPlacement {
+    /// Files declarations under `unit`, embedding `identity_path` in every symbol identity.
+    #[must_use]
+    pub fn new(
+        origin: ContributionOrigin,
+        unit: SourceUnitId,
+        identity_path: impl Into<String>,
+    ) -> Self {
+        Self {
+            origin,
+            unit,
+            identity_path: identity_path.into(),
+        }
+    }
+
+    /// The project placement: `rift://source/project/<path>` with the path itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyntaxPublicationError`] when the document's path breaks
+    /// source-unit rules.
+    pub fn project(document: &SyntaxDocument) -> Result<Self, SyntaxPublicationError> {
+        let origin = ContributionOrigin::new(
+            Some(SourceLocation::Project { package: None }),
+            SourceKind::Authored,
+        )?;
+        Ok(Self::new(
+            origin,
+            source_unit(document)?,
+            document.path().as_str(),
+        ))
+    }
+
+    /// Where the declarations came from.
+    #[must_use]
+    pub const fn origin(&self) -> &ContributionOrigin {
+        &self.origin
+    }
+
+    /// The source unit every declaration's binding names.
+    #[must_use]
+    pub const fn unit(&self) -> &SourceUnitId {
+        &self.unit
+    }
+
+    /// The path segment every symbol identity embeds after the language.
+    #[must_use]
+    pub fn identity_path(&self) -> &str {
+        &self.identity_path
+    }
+}
+
 /// Collects syntax documents into one atomic provider publication.
 #[derive(Debug)]
 pub struct SyntaxPublicationBuilder {
@@ -107,9 +174,10 @@ impl SyntaxPublicationBuilder {
         })
     }
 
-    /// Adds every declaration from one syntax document.
+    /// Adds every declaration from one project-tree syntax document.
     ///
-    /// Document either contributes every declaration or changes nothing.
+    /// The project placement is [`DocumentPlacement::project`]; the document
+    /// either contributes every declaration or changes nothing.
     ///
     /// # Errors
     ///
@@ -119,12 +187,31 @@ impl SyntaxPublicationBuilder {
         &mut self,
         document: &SyntaxDocument,
     ) -> Result<(), SyntaxPublicationError> {
-        let source_unit = source_unit(document)?;
+        let placement = DocumentPlacement::project(document)?;
+        self.add_document_placed(document, &placement)
+    }
+
+    /// Adds every declaration from one syntax document under `placement`.
+    ///
+    /// Each declaration's binding names the placement's unit, its identity
+    /// embeds the placement's identity path, and its origin is the placement's.
+    /// Document either contributes every declaration or changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyntaxPublicationError`] when one symbol identity or one
+    /// Contribution is invalid.
+    pub fn add_document_placed(
+        &mut self,
+        document: &SyntaxDocument,
+        placement: &DocumentPlacement,
+    ) -> Result<(), SyntaxPublicationError> {
+        let language_segment = document.language().identity_segment();
         let mut additions = Vec::with_capacity(document.symbols().len());
         for symbol in document.symbols() {
             let identity = symbol_identity(
-                &document.language().identity_segment(),
-                document.path().as_str(),
+                &language_segment,
+                placement.identity_path(),
                 &symbol.qualified_name,
             );
             let identity = SymbolId::new(identity)?;
@@ -142,18 +229,15 @@ impl SyntaxPublicationBuilder {
                 facts = facts.visibility(visibility.clone());
             }
             if let Some(container) = &symbol.container {
-                let container_identity = symbol_identity(
-                    &document.language().identity_segment(),
-                    document.path().as_str(),
-                    container,
-                );
+                let container_identity =
+                    symbol_identity(&language_segment, placement.identity_path(), container);
                 facts = facts.container(ContributionReference::new(
                     self.provider.clone(),
                     ProviderSymbolId::new(container_identity)?,
                 ));
             }
             let source = rift_core::DeclarationBinding::new(
-                source_unit.clone(),
+                placement.unit().clone(),
                 SourceRange::new(symbol.item_range.start, symbol.item_range.end)?,
                 None,
             );
@@ -164,10 +248,7 @@ impl SyntaxPublicationBuilder {
                     tree_revision: self.tree_revision,
                 },
                 facts,
-                ContributionOrigin::new(
-                    Some(SourceLocation::Project { package: None }),
-                    SourceKind::Authored,
-                )?,
+                placement.origin().clone(),
             )
             .source(source)
             .identity_anchor(identity)
@@ -303,5 +384,88 @@ mod tests {
         builder.add_document(&document).expect("document");
         let publication = builder.build().expect("publication");
         assert_eq!(publication.contributions().len(), 1);
+    }
+
+    /// A dependency placement files the unit and identity under the package,
+    /// and the container reference embeds the same identity path.
+    #[test]
+    fn test_add_document_placed_files_declarations_under_the_supplied_unit_and_path() {
+        use rift_core::{
+            ContributionOrigin, SourceKind, SourceLocation, SourcePath, SourceResolverId,
+            SourceUnitId,
+        };
+        use rift_protocol::read::PackageIdentity;
+
+        use super::DocumentPlacement;
+
+        let provider = RustSyntaxProvider::default();
+        let path = ProjectPath::new("src/lib.rs").expect("path");
+        let document = provider
+            .analyze(SyntaxSource {
+                path: &path,
+                text: "pub fn spawn() {}\npub struct Runtime; impl Runtime { pub fn new() {} }",
+            })
+            .expect("syntax document");
+        let package = PackageIdentity {
+            manager: "cargo".to_owned(),
+            name: "tokio".to_owned(),
+            version: "1.53.1".to_owned(),
+        };
+        let origin = ContributionOrigin::new(
+            Some(SourceLocation::Dependency {
+                package: package.clone(),
+            }),
+            SourceKind::Authored,
+        )
+        .expect("origin");
+        let unit = SourceUnitId::new(
+            SourceResolverId::new("cargo").expect("resolver"),
+            SourcePath::new("tokio@1.53.1/src/lib.rs").expect("unit key"),
+        )
+        .expect("unit");
+        let placement = DocumentPlacement::new(origin, unit, "cargo/tokio@1.53.1/src/lib.rs");
+        let mut builder = SyntaxPublicationBuilder::new(
+            publication(1),
+            source_revision(1),
+            tree_revision(1),
+            rift_provider::PublicationLimits::default(),
+        )
+        .expect("builder");
+        builder
+            .add_document_placed(&document, &placement)
+            .expect("document");
+        let publication = builder.build().expect("publication");
+        let named = |name: &str| {
+            publication
+                .contributions()
+                .iter()
+                .find(|contribution| {
+                    contribution
+                        .facts()
+                        .is_some_and(|facts| facts.name() == name)
+                })
+                .unwrap_or_else(|| panic!("publication holds {name}"))
+        };
+        let spawn = named("spawn");
+        assert_eq!(
+            spawn.identity_anchor().map(SymbolId::as_str),
+            Some("rift://symbol/rust/cargo/tokio@1.53.1/src/lib.rs/spawn")
+        );
+        assert_eq!(
+            spawn.source().map(|binding| binding.unit().to_string()),
+            Some("rift://source/cargo/tokio@1.53.1/src/lib.rs".to_owned())
+        );
+        assert_eq!(
+            spawn.origin().location(),
+            Some(&SourceLocation::Dependency { package })
+        );
+        assert_eq!(
+            named("new")
+                .facts()
+                .expect("portable facts")
+                .container_reference()
+                .map(|reference| reference.symbol().as_str()),
+            Some("rift://symbol/rust/cargo/tokio@1.53.1/src/lib.rs/Runtime")
+        );
     }
 }
