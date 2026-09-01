@@ -49,6 +49,7 @@ scip = "0.9.0"
 semver = "1.0.28"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+serde_json_lenient = "0.2.4"
 strum = { version = "0.28.0", features = ["derive"] }
 sha2 = "=0.10.9"
 tar = "0.4.46"
