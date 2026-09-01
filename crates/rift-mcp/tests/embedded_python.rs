@@ -14,8 +14,7 @@ mod workspace_client;
 
 use serde_json::{Value, json};
 use workspace_client::{
-    TestResult, call_retrying_acceptance, served_relative_workspace, served_workspace,
-    tool_request,
+    TestResult, call_retrying_acceptance, served_relative_workspace, served_workspace, tool_request,
 };
 
 /// The rename runs under a root spelled relative to the process working
@@ -29,6 +28,10 @@ const SERVICE: &str = "def serve(port: int) -> int:\n    return port\n\n\nvalue 
 /// Appends an assignment binding a string to an `int` annotation, ty's
 /// `invalid-assignment` violation.
 const INVALID_ASSIGNMENT_PATCH: &str = "--- a/service.py\n+++ b/service.py\n@@ -3,3 +3,4 @@\n \n \n value = serve(8080)\n+count: int = \"eight\"\n";
+
+/// Appends one comment: a follow-up change whose engine exchange opens the
+/// settled document carrying the earlier violation.
+const COMMENT_PATCH: &str = "--- a/service.py\n+++ b/service.py\n@@ -4,3 +4,4 @@\n \n value = serve(8080)\n count: int = \"eight\"\n+# beacon comment\n";
 
 /// The workspace's Python entry: the embedded ty engine, under the widened
 /// retry table a no-progress engine leans on.
@@ -59,6 +62,26 @@ async fn applied_patch_carries_the_embedded_ty_diagnostic() -> TestResult {
 
     let introduce = tool_request("patch", &json!({ "patch": INVALID_ASSIGNMENT_PATCH }));
     let structured = call_retrying_acceptance(&client, introduce).await?;
+    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
+
+    // A read returning is the proof the change published: the follow-up
+    // change below then opens current bytes for its engine exchange, so the
+    // asserted finding cannot race the index lane the way a diagnose right
+    // behind the write can.
+    let published = tool_request(
+        "search",
+        &json!({ "query": "eight", "target": "file", "limit": 1 }),
+    );
+    let answer = call_retrying_acceptance(&client, published).await?;
+    assert!(
+        answer["results"]
+            .as_array()
+            .is_some_and(|hits| !hits.is_empty()),
+        "the applied change publishes before the follow-up: {answer:#}"
+    );
+
+    let follow_up = tool_request("patch", &json!({ "patch": COMMENT_PATCH }));
+    let structured = call_retrying_acceptance(&client, follow_up).await?;
     assert_eq!(structured["status"], json!("applied"), "{structured:#}");
 
     let findings = coded_findings(&structured, "invalid-assignment");
