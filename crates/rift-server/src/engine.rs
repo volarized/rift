@@ -767,7 +767,8 @@ mod tests {
 
     fn table(program: &str) -> LspConfiguration {
         LspConfiguration {
-            command: CommandInput::Program(program.to_owned()),
+            command: Some(CommandInput::Program(program.to_owned())),
+            embedded: None,
             environment: BTreeMap::new(),
             initialization_options: Some(serde_json::json!({ "engine": "fake" })),
             startup_timeout: ConfiguredDuration::from_millis(10_000),

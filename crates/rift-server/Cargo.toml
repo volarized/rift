@@ -36,6 +36,12 @@ toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+ty_project.workspace = true
+ty_ide.workspace = true
+ruff_db.workspace = true
+ruff_text_size.workspace = true
+ty_python_core.workspace = true
+
 [dev-dependencies]
 rift-history = { workspace = true, features = ["fixtures"] }
 schemars.workspace = true

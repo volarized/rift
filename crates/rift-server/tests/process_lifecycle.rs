@@ -71,11 +71,12 @@ impl std::ops::DerefMut for ProcessFixture {
 /// Process fixture resolving `sh -c script`, bound to `languages`.
 fn table(script: String, languages: &[&str]) -> ProcessFixture {
     let configuration = LspConfiguration {
-        command: CommandInput::ProgramAndArguments(vec![
+        command: Some(CommandInput::ProgramAndArguments(vec![
             SHELL_PROGRAM.to_owned(),
             "-c".to_owned(),
             script,
-        ]),
+        ])),
+        embedded: None,
         environment: BTreeMap::new(),
         initialization_options: None,
         startup_timeout: Duration::from_millis(10_000),

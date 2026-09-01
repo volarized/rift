@@ -520,6 +520,20 @@ pub fn declare_lsp_ranges(schema: &mut Schema) {
     );
 }
 
+/// An [`LspConfiguration`](crate::configuration::LspConfiguration) selects
+/// exactly one engine: a spawned `command`, or an `embedded` engine served
+/// in process. Acceptance enforces the same rule, together with the
+/// embedded exclusions the field docs state.
+pub fn lsp_selects_one_engine(schema: &mut Schema) {
+    use crate::configuration::LspConfiguration;
+    let command = property!(LspConfiguration, command);
+    let embedded = property!(LspConfiguration, embedded);
+    append(
+        schema,
+        one_of(vec![requires(&[command]), requires(&[embedded])]),
+    );
+}
+
 /// A [`RetryPolicy`](crate::retry::RetryPolicy) states its `Duration`
 /// bounds as `rift:range` on their keys: schema validation alone cannot
 /// compare `"250ms"` against a ceiling, so the server enforces the bounds
