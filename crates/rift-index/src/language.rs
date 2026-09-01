@@ -354,7 +354,7 @@ mod tests {
         let mut configuration = WorkspaceConfiguration::default();
         configuration
             .languages
-            .insert("python".to_owned(), LanguageConfiguration::default());
+            .insert("ruby".to_owned(), LanguageConfiguration::default());
         let error = WorkspaceLanguagePolicy::build(
             Path::new("/workspace"),
             &LanguageFileSelections::from(&configuration),
@@ -453,7 +453,7 @@ mod tests {
     /// entry names a language this build ships or one it does not.
     #[test]
     fn test_an_invalid_include_pattern_refuses_for_a_shipped_and_an_unshipped_language() {
-        for identity in ["rust", "python"] {
+        for identity in ["rust", "ruby"] {
             let mut configuration = WorkspaceConfiguration::default();
             configuration.languages.insert(
                 identity.to_owned(),
@@ -568,16 +568,16 @@ mod tests {
     fn test_an_unshipped_language_keeps_its_paths_in_the_text_lane() {
         let mut configuration = WorkspaceConfiguration::default();
         configuration.languages.insert(
-            "python".to_owned(),
+            "ruby".to_owned(),
             LanguageConfiguration {
-                include: Some(vec![rift_protocol::read::PathPattern("**/*.py".to_owned())]),
+                include: Some(vec![rift_protocol::read::PathPattern("**/*.rb".to_owned())]),
                 ..LanguageConfiguration::default()
             },
         );
         let policy = policy(&configuration);
         assert!(
             matches!(
-                policy.classifies(Path::new("src/main.py")),
+                policy.classifies(Path::new("src/main.rb")),
                 Ok(Some(ClassifiedPath::Text))
             ),
             "a language with no shipped grammar still reaches lexical search"

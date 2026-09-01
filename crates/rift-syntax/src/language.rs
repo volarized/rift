@@ -12,6 +12,7 @@ use crate::javascript::JavaScriptSyntaxProvider;
 use crate::json::JsonSyntaxProvider;
 use crate::markdown::MarkdownSyntaxProvider;
 use crate::provider::SyntaxProvider;
+use crate::python::PythonSyntaxProvider;
 use crate::rust::RustSyntaxProvider;
 use crate::toml::TomlSyntaxProvider;
 use crate::typescript::TypeScriptDialect;
@@ -40,6 +41,8 @@ pub enum ShippedLanguage {
     Yaml,
     /// TOML.
     Toml,
+    /// Python.
+    Python,
 }
 
 impl ShippedLanguage {
@@ -55,6 +58,7 @@ impl ShippedLanguage {
             Self::Json => ("json", None),
             Self::Yaml => ("yaml", None),
             Self::Toml => ("toml", None),
+            Self::Python => ("python", None),
         };
         Language {
             name: name.to_owned(),
@@ -112,6 +116,7 @@ pub fn definitions() -> &'static [&'static dyn LanguageDefinition] {
         &JsonDefinition,
         &YamlDefinition,
         &TomlDefinition,
+        &PythonDefinition,
     ]
 }
 
@@ -257,6 +262,24 @@ impl LanguageDefinition for TomlDefinition {
 
     fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
         Box::new(TomlSyntaxProvider::default())
+    }
+}
+
+/// Python: `py` sources and `pyi` stubs under one grammar.
+#[derive(Debug)]
+struct PythonDefinition;
+
+impl LanguageDefinition for PythonDefinition {
+    fn shipped(&self) -> ShippedLanguage {
+        ShippedLanguage::Python
+    }
+
+    fn extensions(&self) -> &'static [&'static str] {
+        &["py", "pyi"]
+    }
+
+    fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
+        Box::new(PythonSyntaxProvider::default())
     }
 }
 

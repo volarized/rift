@@ -3903,11 +3903,11 @@ pub fn beacon() -> u64 {
     async fn workspace_resource_reports_named_inline_and_disabled_languages() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        fs::write(directory.path().join("script.py"), "print('beacon')\n")?;
+        fs::write(directory.path().join("script.rb"), "puts 'beacon'\n")?;
         super::hermetic_workspace(
             directory.path(),
             "[lsp.shared]\ncommand = \"language-server\"\n\
-             [languages.python]\ninclude = [\"**/*.py\"]\nexecution = true\nlsp = \"shared\"\n\
+             [languages.ruby]\ninclude = [\"**/*.rb\"]\nexecution = true\nlsp = \"shared\"\n\
              [languages.rust.lsp]\ncommand = \"rust-analyzer\"\n\
              [languages.toml]\nenabled = false\nexecution = true\nlsp = \"shared\"\n",
         )?;
@@ -3941,15 +3941,15 @@ pub fn beacon() -> u64 {
             "execution stays off until its own entry enables it"
         );
 
-        let python = language("python");
+        let ruby = language("ruby");
         assert_eq!(
-            python["execution"],
+            ruby["execution"],
             serde_json::json!(true),
             "an enabled entry carries its own execution permission"
         );
-        assert_eq!(python["syntax"], serde_json::json!(false));
-        assert_eq!(python["lsp"]["process"], serde_json::json!("shared"));
-        assert_eq!(python["lsp"]["state"], serde_json::json!("stopped"));
+        assert_eq!(ruby["syntax"], serde_json::json!(false));
+        assert_eq!(ruby["lsp"]["process"], serde_json::json!("shared"));
+        assert_eq!(ruby["lsp"]["state"], serde_json::json!("stopped"));
 
         let toml = language("toml");
         assert_eq!(toml["enabled"], serde_json::json!(false));
