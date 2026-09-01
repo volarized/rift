@@ -444,13 +444,16 @@ fn prune_markers(root: &Path) {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
     use std::time::{Duration, SystemTime};
+
+    use serde_json::json;
 
     use super::{
         Decision, EnvironmentFacts, KernelInput, QualifyingTool, RIFT_STATE_DIRECTORY,
-        STEER_MARKERS_MAX, STEER_STATE_DIRECTORY, claim_marker, decide, deny_reason,
-        discover_workspace_root, is_valid_session_id, parse_hook_call, prune_markers,
-        read_steering_disabled, truncate_pattern,
+        STEER_MARKERS_MAX, STEER_STATE_DIRECTORY, WORKSPACE_ROOT_WALK_DEPTH_MAX, claim_marker,
+        decide, deny_reason, discover_workspace_root, finalize_denial, is_valid_session_id,
+        parse_hook_call, prune_markers, read_steering_disabled, truncate_pattern,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -604,6 +607,26 @@ mod tests {
     }
 
     #[test]
+    fn truncate_pattern_backs_off_when_the_cut_lands_mid_character() {
+        // "€" is 3 bytes; DENY_PATTERN_BYTES_MAX (256) is not a multiple of 3,
+        // so the naive cut at byte 256 lands mid-character and must back off
+        // to the nearest char boundary at byte 255.
+        let long = "€".repeat(100);
+        let truncated = truncate_pattern(&long);
+        assert!(truncated.ends_with("..."));
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+        assert_eq!(truncated.len(), 255 + "...".len());
+    }
+
+    #[test]
+    fn qualifying_tool_from_name_maps_glob() {
+        assert_eq!(
+            QualifyingTool::from_name("Glob"),
+            Some(QualifyingTool::Glob)
+        );
+    }
+
+    #[test]
     fn deny_reason_names_only_tools_the_served_surface_has() {
         let tools = rift_mcp::schema::tool_listing();
         for name in ["search", "get_symbol"] {
@@ -645,6 +668,93 @@ mod tests {
     fn discover_workspace_root_answers_none_when_no_ancestor_has_rift() -> TestResult {
         let directory = tempfile::tempdir()?;
         assert_eq!(discover_workspace_root(directory.path()), None);
+        Ok(())
+    }
+
+    #[test]
+    fn discover_workspace_root_answers_none_when_the_climb_bound_is_exhausted() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        // Nest well past the climb bound so every parent within the bound
+        // exists (no early `parent()` exhaustion) and none carries `.rift`.
+        let mut nested = directory.path().to_path_buf();
+        for index in 0..(WORKSPACE_ROOT_WALK_DEPTH_MAX + 4) {
+            nested = nested.join(format!("d{index}"));
+        }
+        fs::create_dir_all(&nested)?;
+        assert_eq!(discover_workspace_root(&nested), None);
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_denial_allows_when_the_workspace_root_is_missing() {
+        let outcome = finalize_denial(None, Some("session-x"), "reason");
+        assert_eq!(
+            outcome.0["hookSpecificOutput"]["permissionDecision"],
+            json!("allow")
+        );
+    }
+
+    #[test]
+    fn finalize_denial_allows_when_the_session_id_is_missing() {
+        let outcome = finalize_denial(Some(Path::new("/does-not-matter")), None, "reason");
+        assert_eq!(
+            outcome.0["hookSpecificOutput"]["permissionDecision"],
+            json!("allow")
+        );
+    }
+
+    #[test]
+    fn finalize_denial_allows_when_a_concurrent_call_already_claimed_the_marker() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        // Simulate the race: a concurrent call already created the marker
+        // before this call reaches `finalize_denial`.
+        assert!(claim_marker(root, "session-race")?);
+
+        let outcome = finalize_denial(Some(root), Some("session-race"), "reason");
+        assert_eq!(
+            outcome.0["hookSpecificOutput"]["permissionDecision"],
+            json!("allow")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_denial_allows_when_claiming_the_marker_fails() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        // A regular file where `.rift` must be a directory blocks marker
+        // creation with an io error.
+        fs::write(root.join(RIFT_STATE_DIRECTORY), b"not a directory")?;
+
+        let outcome = finalize_denial(Some(root), Some("session-blocked"), "reason");
+        assert_eq!(
+            outcome.0["hookSpecificOutput"]["permissionDecision"],
+            json!("allow")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn claim_marker_propagates_an_open_failure_that_is_not_already_exists() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        // The marker's parent directory does not exist, so the open call
+        // fails with a real error distinct from `AlreadyExists`.
+        let result = claim_marker(root, "missing-parent/marker");
+        assert!(
+            result.is_err(),
+            "opening under a missing directory must fail: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prune_markers_is_a_no_op_when_the_steer_directory_does_not_exist() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        prune_markers(root);
+        assert!(!root.join(RIFT_STATE_DIRECTORY).exists());
         Ok(())
     }
 

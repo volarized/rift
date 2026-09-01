@@ -12,6 +12,10 @@ use std::process::{Command, Output, Stdio};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+/// Mirrors `steer::HOOK_STDIN_BYTES_MAX`; not importable across the
+/// integration-test crate boundary.
+const HOOK_STDIN_BYTES_MAX: usize = 1_048_576;
+
 fn run_steer(root: &Path, stdin: &str, env: &[(&str, &str)]) -> TestResult<Output> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_rift"));
     command
@@ -132,6 +136,39 @@ fn a_workspace_without_an_index_answers_allow() -> TestResult {
     let payload = hook_payload("Grep", "TODO", "session-delta", root);
 
     let output = run_steer(root, &payload, &[])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        decision(&output)?["hookSpecificOutput"]["permissionDecision"],
+        "allow"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_non_qualifying_tool_with_valid_json_answers_allow() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    indexed_workspace(root)?;
+    let payload = hook_payload("Write", "TODO", "session-epsilon", root);
+
+    let output = run_steer(root, &payload, &[])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        decision(&output)?["hookSpecificOutput"]["permissionDecision"],
+        "allow"
+    );
+    assert!(!root.join(".rift").join("steer").exists());
+    Ok(())
+}
+
+#[test]
+fn stdin_over_the_byte_bound_answers_allow_with_exit_zero() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    indexed_workspace(root)?;
+    let oversized = "a".repeat(HOOK_STDIN_BYTES_MAX + 1);
+
+    let output = run_steer(root, &oversized, &[])?;
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
         decision(&output)?["hookSpecificOutput"]["permissionDecision"],

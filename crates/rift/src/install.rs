@@ -1048,6 +1048,22 @@ mod tests {
     }
 
     #[test]
+    fn settings_shape_display_renders_exact_operator_facing_text() {
+        assert_eq!(
+            SettingsShape::RootNotObject.to_string(),
+            "the document's top level is not a JSON object"
+        );
+        assert_eq!(
+            SettingsShape::HooksNotObject.to_string(),
+            "the `hooks` key is not a JSON object"
+        );
+        assert_eq!(
+            SettingsShape::PreToolUseNotArray.to_string(),
+            "the `hooks.PreToolUse` key is not a JSON array"
+        );
+    }
+
+    #[test]
     fn add_steer_hook_creates_the_group_in_a_fresh_document() {
         let (merged, changed) = merge_steer_hook(json!({}), false).expect("must merge");
         assert!(changed);
@@ -1156,6 +1172,34 @@ mod tests {
     }
 
     #[test]
+    fn strip_steer_hook_on_a_hooks_object_with_no_pretooluse_key_is_a_no_op() {
+        let (stripped, changed) = merge_steer_hook(json!({"hooks": {}}), true).expect("must merge");
+        assert!(!changed);
+        assert_eq!(stripped, json!({"hooks": {}}));
+    }
+
+    #[test]
+    fn strip_steer_hook_keeps_a_group_with_no_hooks_field() {
+        let existing = json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "NoHooksField"},
+                    {
+                        "matcher": "Grep|Glob",
+                        "hooks": [{"type": "command", "command": HOOK_COMMAND}],
+                    },
+                ],
+            },
+        });
+        let (stripped, changed) = merge_steer_hook(existing, true).expect("must merge");
+        assert!(changed);
+        let groups = stripped["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("PreToolUse must stay an array");
+        assert_eq!(groups, &vec![json!({"matcher": "NoHooksField"})]);
+    }
+
+    #[test]
     fn merge_steer_hook_refuses_a_non_object_root() {
         assert_eq!(
             merge_steer_hook(json!([1, 2]), false),
@@ -1177,5 +1221,38 @@ mod tests {
             merge_steer_hook(json!({"hooks": {"PreToolUse": "nope"}}), false),
             Err(SettingsShape::PreToolUseNotArray)
         );
+    }
+
+    #[test]
+    fn strip_path_refuses_a_hooks_key_that_is_not_an_object() {
+        assert_eq!(
+            merge_steer_hook(json!({"hooks": 5}), true),
+            Err(SettingsShape::HooksNotObject)
+        );
+    }
+
+    #[test]
+    fn strip_path_refuses_a_pretooluse_key_that_is_not_an_array() {
+        assert_eq!(
+            merge_steer_hook(json!({"hooks": {"PreToolUse": "nope"}}), true),
+            Err(SettingsShape::PreToolUseNotArray)
+        );
+    }
+
+    #[test]
+    fn read_settings_refuses_an_io_failure_that_is_not_a_missing_file() -> TestResult {
+        use std::error::Error as _;
+
+        let directory = tempfile::tempdir()?;
+        // A directory where a file is expected: `read_to_string` fails with an
+        // error other than `NotFound`.
+        let settings_path = directory.path().join("settings.json");
+        fs::create_dir(&settings_path)?;
+
+        let error = super::read_settings(&settings_path)
+            .expect_err("reading a directory as settings.json must refuse");
+        assert_eq!(error.descriptor().code(), "install_settings_unparsable");
+        assert!(error.source().is_some(), "{error}");
+        Ok(())
     }
 }
