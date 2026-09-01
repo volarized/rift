@@ -507,6 +507,18 @@ impl EngineSlot {
     /// session returns or exhausts its retry table. A replacement session
     /// receives its own begin call.
     ///
+    /// `answer_version` reads the document version one answer names, when it
+    /// names one at all - `textDocument/publishDiagnostics` carries an
+    /// optional `version`, and a caller may ride that alongside an answer
+    /// for the same document even when the answer's own wire shape carries
+    /// no version of its own. An answer whose named version differs from
+    /// the version this exchange opened the document with describes the
+    /// engine's previous open: it is discarded before settlement runs, so
+    /// it never becomes the returned answer and never counts toward
+    /// `repeated`, and the exchange keeps waiting for a report of its own
+    /// open. An answer naming no version - most engines never publish one -
+    /// is judged exactly as it was before this gate existed.
+    ///
     /// # Errors
     ///
     /// Returns operation failure, retry refusal, unready exhaustion, start
@@ -521,6 +533,7 @@ impl EngineSlot {
         ) -> SessionFuture<'session, Result<T, EngineError>>,
         finish: impl for<'session> FnMut(&'session mut EngineSession) -> SessionFuture<'session, ()>,
         mut report_state: impl FnMut(&T) -> (bool, bool),
+        mut answer_version: impl FnMut(&T) -> Option<i32>,
     ) -> Result<T, EngineError> {
         let mut previous = None;
         self.request_deciding(
@@ -528,6 +541,11 @@ impl EngineSlot {
             operation,
             finish,
             |session, session_generation, answer, final_attempt| {
+                let stale = answer_version(&answer)
+                    .is_some_and(|version| version != session.document_version());
+                if stale {
+                    return Answer::Retry(Transient::Unready);
+                }
                 let repeated = previous.as_ref().is_some_and(|(prior_generation, prior)| {
                     *prior_generation == session_generation && prior == &answer
                 });
