@@ -659,7 +659,9 @@ fn strip_steer_hook(root: &mut Map<String, Value>) -> Result<bool, SettingsShape
 }
 
 /// Removes the steering hook from every group's own `hooks` list, dropping a
-/// group left with none. Returns whether anything changed.
+/// group only when this pass empties it (it held only the steering hook). A
+/// group whose `hooks` list already arrived empty survives untouched.
+/// Returns whether anything changed.
 fn strip_steer_groups(groups: &mut Vec<Value>) -> bool {
     let mut changed = false;
     groups.retain_mut(|group| {
@@ -668,8 +670,10 @@ fn strip_steer_groups(groups: &mut Vec<Value>) -> bool {
         };
         let before = hooks.len();
         hooks.retain(|hook| !hook_runs_steer(hook));
-        changed |= hooks.len() != before;
-        !hooks.is_empty()
+        let after = hooks.len();
+        changed |= after != before;
+        let emptied_this_pass = before > 0 && after == 0;
+        !emptied_this_pass
     });
     changed
 }
@@ -1120,6 +1124,27 @@ mod tests {
             .expect("the sibling group must survive");
         assert_eq!(hooks.len(), 1);
         assert_eq!(hooks[0]["command"], json!("echo also"));
+    }
+
+    #[test]
+    fn strip_steer_hook_keeps_a_group_that_arrived_with_no_hooks() {
+        let existing = json!({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Grep|Glob",
+                        "hooks": [{"type": "command", "command": HOOK_COMMAND}],
+                    },
+                    {"matcher": "Weird", "hooks": []},
+                ],
+            },
+        });
+        let (stripped, changed) = merge_steer_hook(existing, true).expect("must merge");
+        assert!(changed);
+        let groups = stripped["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("PreToolUse must stay an array");
+        assert_eq!(groups, &vec![json!({"matcher": "Weird", "hooks": []})]);
     }
 
     #[test]
