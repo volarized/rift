@@ -5,11 +5,13 @@ use rift_protocol::read::ProjectPath;
 use crate::cargo::CargoResolver;
 use crate::catalog::file_name;
 use crate::resolver::DependencyResolver;
+use crate::uv::UvResolver;
 
 static CARGO: CargoResolver = CargoResolver::new();
+static UV: UvResolver = UvResolver::new();
 
 /// The shipped list, in run order.
-static RESOLVERS: [&dyn DependencyResolver; 1] = [&CARGO];
+static RESOLVERS: [&dyn DependencyResolver; 2] = [&CARGO, &UV];
 
 /// Every shipped dependency resolver, in the order [`resolve_catalog`] runs them.
 ///
