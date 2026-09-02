@@ -2594,15 +2594,12 @@ mod tests {
             previous: Some(Arc::clone(&previous)),
         };
 
+        let limits = WorkspaceIndexLimits::default();
+        let store = empty_dependency_store();
         let WorkspaceCandidate::Stable {
             published: candidate,
             ..
-        } = build_workspace_candidate(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &request,
-            &empty_dependency_store(),
-        )?
+        } = build_workspace_candidate(directory.path(), limits, &request, &store)?
         else {
             return Err("a stable fixture must build a stable candidate".into());
         };
@@ -2630,15 +2627,12 @@ mod tests {
             previous: Some(Arc::clone(&previous)),
         };
 
+        let limits = WorkspaceIndexLimits::default();
+        let store = empty_dependency_store();
         let WorkspaceCandidate::Stable {
             published: candidate,
             ..
-        } = build_workspace_candidate(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &request,
-            &empty_dependency_store(),
-        )?
+        } = build_workspace_candidate(directory.path(), limits, &request, &store)?
         else {
             return Err("a stable fixture must build a stable candidate".into());
         };
@@ -3294,15 +3288,12 @@ mod tests {
             work: super::PendingWork::naming([rift_core::ProjectPath::new("moved.rs")?]),
             previous: Some(Arc::clone(&first)),
         };
+        let limits = WorkspaceIndexLimits::default();
+        let store = empty_dependency_store();
         let WorkspaceCandidate::Stable {
             published: second,
             change_set,
-        } = build_workspace_candidate(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &request,
-            &empty_dependency_store(),
-        )?
+        } = build_workspace_candidate(directory.path(), limits, &request, &store)?
         else {
             return Err("a stable fixture must build a stable candidate".into());
         };

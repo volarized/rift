@@ -846,12 +846,9 @@ impl RiftMcp {
         )));
         let (published, lexical_write) =
             initial_workspace(&root, limits, &validation, &blocking, &dependencies).await?;
-        let dependency_lane = Self::spawn_dependency_lane(
-            &dependencies,
-            &published,
-            &blocking,
-            validation.cancellation.clone(),
-        )?;
+        let cancellation = validation.cancellation.clone();
+        let dependency_lane =
+            Self::spawn_dependency_lane(&dependencies, &published, &blocking, cancellation)?;
         // Direct construction delays the database open until the initial scan proves the
         // workspace root. A serving process supplies the owner it opened for foreground log
         // capture; that path creates `.rift` only below an already-existing root.
