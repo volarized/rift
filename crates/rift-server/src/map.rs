@@ -10,10 +10,11 @@ use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::SourceUnitId as CoreSourceUnitId;
 use rift_core::SymbolId as CoreSymbolId;
 use rift_core::{Contribution, ProviderId, SymbolRecord};
+use rift_dependency::DependencyCatalog;
 use rift_index::WorkspaceIndex;
 use rift_protocol::map::{
-    MAP_DOCS_MAX, MAP_ENTRY_POINTS_MAX, MAP_HUBS_MAX, MAP_MODULE_DEPTH_MAX, MapHub, MapLanguage,
-    MapModule, WorkspaceMap,
+    MAP_DOCS_MAX, MAP_ENTRY_POINTS_MAX, MAP_HUBS_MAX, MAP_MODULE_DEPTH_MAX, MAP_PACKAGES_MAX,
+    MapHub, MapLanguage, MapModule, WorkspaceMap,
 };
 use rift_protocol::read::{Digest, Language, Pagination, ProjectPath, SymbolFacet, SymbolId};
 use rift_protocol::workspace::{WORKSPACE_LANGUAGE_SUMMARIES_MAX, WORKSPACE_SOURCE_UNITS_MAX};
@@ -29,13 +30,17 @@ struct FileSymbolCounts {
     symbols: u64,
 }
 
-/// Builds the workspace orientation snapshot from one already-loaded index.
+/// Builds the workspace orientation snapshot from one already-loaded index and catalog.
 ///
 /// Runs once over `index.files()`, once over `index.text_files()`, once over
-/// `graph.records()`, and once over `graph.references()` - each already bounded by the
-/// workspace's configured index and binding limits, so this stays proportional to the index
-/// this revision already built.
-pub(crate) fn build_workspace_map(index: &WorkspaceIndex, revision: Digest) -> WorkspaceMap {
+/// `graph.records()`, once over `graph.references()`, and once over the catalog's entries -
+/// each already bounded by the workspace's configured index and binding limits and the
+/// resolvers' package bound, so this stays proportional to what this revision already built.
+pub(crate) fn build_workspace_map(
+    index: &WorkspaceIndex,
+    catalog: &DependencyCatalog,
+    revision: Digest,
+) -> WorkspaceMap {
     let graph = index.normalized_graph();
     let unit_paths = source_unit_paths(index);
     let mut language_counts: BTreeMap<String, (Language, FileSymbolCounts)> = BTreeMap::new();
@@ -87,6 +92,11 @@ pub(crate) fn build_workspace_map(index: &WorkspaceIndex, revision: Digest) -> W
         .collect();
     languages.truncate(WORKSPACE_LANGUAGE_SUMMARIES_MAX);
 
+    let packages = catalog
+        .direct_packages()
+        .take(MAP_PACKAGES_MAX)
+        .cloned()
+        .collect();
     WorkspaceMap {
         revision,
         languages,
@@ -94,6 +104,7 @@ pub(crate) fn build_workspace_map(index: &WorkspaceIndex, revision: Digest) -> W
         hubs: hubs(graph),
         entry_points: entry_points(graph),
         docs: docs(index),
+        packages,
         pagination: Pagination {
             page_index: 0,
             total_pages: 1,

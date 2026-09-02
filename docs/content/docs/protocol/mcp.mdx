@@ -397,6 +397,9 @@ costs a lookup. The answer carries:
 - `hubs` - the most-referenced symbols, ranked by reference count descending
 - `entry_points` - symbols where execution starts
 - `docs` - markdown files, in path order
+- `packages` - the packages the workspace's manifests declare directly, as their package
+  managers resolved them, in `manager`, `name`, `version` order; a transitive dependency is
+  cataloged but not listed
 - `pagination` - always page zero of one, the whole map on one page
 
 <VersionBadge version="v0.0.29" languages={["Rust"]} />
@@ -407,6 +410,14 @@ costs a lookup. The answer carries:
 carrying the `entrypoint` [`SymbolFacet`](/docs/protocol/reference#SymbolFacet) - a file-scope
 `fn main`, not one nested in a module, an `impl` block, or another function. Both stay empty for
 a workspace with no such facts.
+
+<VersionBadge version="v0.0.32" languages={["Rust"]} />
+
+`packages` lists what the [dependency resolvers](/docs/architecture#source-discovery) cataloged:
+the Cargo resolver reads the resolved graph from `cargo metadata`, and falls back to the
+workspace's `Cargo.lock` when `cargo` is not on the server's `PATH`. Each entry is a
+[`PackageIdentity`](/docs/protocol/reference#PackageIdentity). The list follows the lockfile:
+a `Cargo.lock` rewritten while the server runs is re-cataloged on the next publication.
 
 **Request:** `rift://map`
 
@@ -441,6 +452,9 @@ a workspace with no such facts.
   ],
   "entry_points": ["rift://symbol/rust/crates/rift/src/main.rs/main"],
   "docs": ["README.md"],
+  "packages": [
+    { "manager": "cargo", "name": "tokio", "version": "1.53.1" }
+  ],
   "pagination": { "page_index": 0, "total_pages": 1 }
 }
 ```

@@ -9,6 +9,7 @@ use rift_core::{
     Error, ErrorCode, ErrorContext, ErrorName, Fault, LanguageFileSelections, SourceVisibility,
     TextFileInclusion, line,
 };
+use rift_dependency::DependencyCatalog;
 use rift_history::{HistoryError, Repository};
 use rift_index::{
     BindingPolicy, FileDigest, IndexedFile, PathChanges, ReadableSymbol, RelationshipStore,
@@ -295,6 +296,10 @@ pub struct ReadService {
     /// tree, `None` for a revision snapshot, which has no filesystem tree to be
     /// visible in.
     source_policy: Option<Arc<WorkspaceSourcePolicy>>,
+    /// The packages the workspace's toolchains resolved, shared across incremental
+    /// rebuilds until a resolution input changes. Empty for a revision snapshot, which
+    /// has no toolchain to ask.
+    catalog: Arc<DependencyCatalog>,
 }
 
 impl ReadService {
@@ -374,6 +379,7 @@ impl ReadService {
             ReadFault::index(source)
         })?;
         let revisions = captured_revisions(&index);
+        let catalog = Arc::new(resolved_catalog(root, &source_policy)?);
         span.record("files_count", index.file_count());
         span.record("tree_revision", revisions.wire_tree_revision());
         span.record("outcome", "ok");
@@ -383,6 +389,7 @@ impl ReadService {
             revision: None,
             history,
             source_policy: Some(Arc::new(source_policy)),
+            catalog,
         })
     }
 
@@ -400,7 +407,11 @@ impl ReadService {
     /// snapshot's already-loaded index.
     #[must_use]
     pub fn workspace_map(&self) -> WorkspaceMap {
-        crate::map::build_workspace_map(&self.index, self.revisions.wire_index_tree_revision())
+        crate::map::build_workspace_map(
+            &self.index,
+            &self.catalog,
+            self.revisions.wire_index_tree_revision(),
+        )
     }
 
     /// The symbol reference adjacency built from this snapshot's normalized graph: which
@@ -485,6 +496,7 @@ impl ReadService {
             ReadFault::index(source)
         })?;
         let revisions = captured_revisions(&index);
+        let catalog = self.catalog_after(changes)?;
         span.record("files_count", index.file_count());
         span.record("tree_revision", revisions.wire_tree_revision());
         span.record("outcome", "ok");
@@ -494,7 +506,27 @@ impl ReadService {
             revision: self.revision.clone(),
             history: self.history.clone(),
             source_policy: self.source_policy.clone(),
+            catalog,
         })
+    }
+
+    /// The catalog an incremental rebuild over `changes` carries: the standing one while
+    /// no changed path is a resolution input or a manifest a resolver claims, a fresh
+    /// resolution otherwise. A degraded catalog is also resolved again, since the machine
+    /// may have gained the toolchain or the cache the resolvers missed.
+    fn catalog_after(&self, changes: &PathChanges) -> Result<Arc<DependencyCatalog>, ReadError> {
+        let touches_input = changes.paths().any(|path| {
+            let path = project_path(path);
+            self.catalog.depends_on(&path) || rift_dependency::is_claimed_manifest(&path)
+        });
+        if !touches_input && !self.catalog.is_degraded() {
+            return Ok(Arc::clone(&self.catalog));
+        }
+        let source_policy = self.source_policy.as_deref().unwrap_or_else(|| {
+            unreachable!("a current-tree read service always compiles its source policy")
+        });
+        let catalog = resolved_catalog(self.index.root(), source_policy)?;
+        Ok(Arc::new(catalog))
     }
 
     /// Builds one in-memory snapshot of the workspace at a version-control
@@ -562,6 +594,7 @@ impl ReadService {
             revision: Some(RevisionId(resolved.commit_id())),
             history,
             source_policy: None,
+            catalog: Arc::new(DependencyCatalog::default()),
         })
     }
 
@@ -1271,6 +1304,23 @@ impl CapturedRevisions {
 const TREE_REVISION_PATH_SEPARATOR: u8 = 0;
 /// Separates adjacent files in tree-revision material.
 const TREE_REVISION_FILE_SEPARATOR: u8 = 0xff;
+
+/// Resolves the dependency catalog over every path `source_policy` makes visible.
+///
+/// The walk is the policy's own, so a manifest the `[source]` policy or `.gitignore`
+/// hides reaches no resolver.
+fn resolved_catalog(
+    root: &Path,
+    source_policy: &WorkspaceSourcePolicy,
+) -> Result<DependencyCatalog, ReadError> {
+    let visible: Vec<ProjectPath> = source_policy
+        .visible_paths()
+        .map_err(ReadFault::index)?
+        .iter()
+        .map(project_path)
+        .collect();
+    Ok(crate::dependency::resolve_workspace_catalog(root, &visible))
+}
 
 /// The revisions one read service captures at build time. The captured tree
 /// and the indexed tree both derive from the one index the service holds, so

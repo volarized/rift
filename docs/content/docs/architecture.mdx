@@ -139,9 +139,27 @@ its port, pid, and version, a stale `.rift/server.json`, or no server - and chan
 Before Rift analyzes code, source resolvers discover what belongs to the project and what its
 toolchain already resolved. The built-in project resolver catalogs workspace files.
 
-Language and package-manager resolvers inspect manifests, lockfiles, installed packages,
-standard libraries, and generated-source registries. They do not download dependencies or change
-the environment.
+Dependency resolvers catalog what the workspace's package managers resolved. Each resolver
+claims one manifest file name, and every visible manifest with that name reaches it:
+
+- the Cargo resolver claims `Cargo.toml`, runs `cargo metadata --locked --offline` for each
+  top-level manifest, and catalogs every package outside the workspace members with the
+  directory its source was unpacked to; it also asks `rustc` for its sysroot and catalogs the
+  standard library source there
+
+A resolver never downloads a package and never writes to the tree: `--locked` refuses to
+rewrite the lockfile, and `--offline` refuses the network. When `cargo` is not on the server's
+`PATH`, or exits with an error because `Cargo.lock` no longer matches `Cargo.toml`, the resolver
+answers from the lockfile alone and probes the machine's package cache for each package's
+source. That answer lists what the lockfile pins, so it can over-approximate what the active feature
+set compiles; a package the cache does not hold is cataloged without a source root.
+
+The catalog keys each package by its
+[`PackageIdentity`](/docs/protocol/reference#PackageIdentity): the package manager, the name,
+and the resolved version. Two versions of one package are two entries. Its inputs are the
+manifests and lockfiles the resolvers read, so a change to any of them re-catalogs on the next
+publication while every other file change leaves the catalog untouched. `rift://map` lists the
+packages the manifests declare directly.
 
 Each readable file becomes a [`SourceUnit`](/docs/protocol/reference#SourceUnit) in the
 source catalog. Its `location` says whether it belongs to the project, a dependency, the standard
