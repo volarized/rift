@@ -10,12 +10,15 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use rift_core::line::{lines_inclusive, without_ending};
-use rift_protocol::read::{Language, PackageIdentity, ProjectPath};
+use rift_protocol::read::{Language, ProjectPath};
 use serde::Deserialize;
 
-use crate::catalog::{CatalogEntry, PackageLocation, Resolution};
+use crate::catalog::{CatalogEntry, Resolution, package_identity};
+use crate::manifest::{
+    ResolutionBuilder, file_beside, manifest_directory_path, top_level_manifests,
+};
 use crate::resolver::{
-    CommandOutput, DependencyResolver, Inspector, PACKAGES_MAX, ResolutionRequest, ResolverName,
+    CommandOutput, DependencyResolver, Inspector, ResolutionRequest, ResolverName,
     TOOLCHAIN_OUTPUT_BYTES_MAX, ToolchainCommand,
 };
 
@@ -87,110 +90,11 @@ impl DependencyResolver for CargoResolver {
             answer.input(manifest.clone());
         }
         for manifest in top_level_manifests(request.manifests) {
-            answer.input(lockfile_beside(manifest));
+            answer.input(file_beside(manifest, CARGO_LOCK_FILE_NAME));
             resolve_manifest(request.root, manifest, inspector, &mut answer);
         }
         toolchain::resolve_stdlib(request.root, inspector, &mut answer);
         answer.build()
-    }
-}
-
-/// One resolution being assembled, refusing entries past `PACKAGES_MAX` and counting them.
-#[derive(Default)]
-struct ResolutionBuilder {
-    resolution: Resolution,
-    dropped_count: usize,
-}
-
-impl ResolutionBuilder {
-    /// Records one visible workspace path the answer depends on.
-    fn input(&mut self, path: ProjectPath) {
-        self.resolution.inputs.push(path);
-    }
-
-    /// Records one thing the resolver could not do.
-    fn degradation(&mut self, reason: String) {
-        self.resolution.degradations.push(reason);
-    }
-
-    /// Takes one entry, or counts it dropped once `PACKAGES_MAX` entries stand.
-    fn entry(&mut self, entry: CatalogEntry) {
-        if self.resolution.entries.len() < PACKAGES_MAX {
-            self.resolution.entries.push(entry);
-        } else {
-            self.dropped_count += 1;
-        }
-    }
-
-    /// Takes every entry in order, under the same bound as `entry`.
-    fn entries(&mut self, entries: impl IntoIterator<Item = CatalogEntry>) {
-        for entry in entries {
-            self.entry(entry);
-        }
-    }
-
-    /// The finished resolution: entries in identity order, the drop reported last.
-    fn build(mut self) -> Resolution {
-        if self.dropped_count > 0 {
-            let total = self.resolution.entries.len() + self.dropped_count;
-            self.degradation(format!(
-                "{} of {total} packages were not cataloged: at most {PACKAGES_MAX} are \
-                 cataloged per workspace",
-                self.dropped_count
-            ));
-        }
-        self.resolution.entries.sort_by(|left, right| {
-            identity_order(left.identity()).cmp(&identity_order(right.identity()))
-        });
-        self.resolution
-    }
-}
-
-/// The manifests with no other listed manifest in an ancestor directory, in path order.
-fn top_level_manifests(manifests: &[ProjectPath]) -> Vec<&ProjectPath> {
-    manifests
-        .iter()
-        .filter(|manifest| {
-            let directory = manifest_directory(manifest);
-            !manifests
-                .iter()
-                .any(|other| is_ancestor_directory(manifest_directory(other), directory))
-        })
-        .collect()
-}
-
-/// The directory holding a manifest, project-relative; empty for the workspace root.
-fn manifest_directory(manifest: &ProjectPath) -> &str {
-    manifest
-        .0
-        .rsplit_once('/')
-        .map_or("", |(directory, _)| directory)
-}
-
-/// Whether `ancestor` is a proper ancestor directory of `directory`.
-fn is_ancestor_directory(ancestor: &str, directory: &str) -> bool {
-    if ancestor == directory {
-        return false;
-    }
-    ancestor.is_empty()
-        || directory
-            .strip_prefix(ancestor)
-            .is_some_and(|rest| rest.starts_with('/'))
-}
-
-/// The absolute directory holding a manifest.
-fn manifest_directory_path(root: &Path, manifest: &ProjectPath) -> PathBuf {
-    match manifest_directory(manifest) {
-        "" => root.to_path_buf(),
-        directory => root.join(directory),
-    }
-}
-
-/// The `Cargo.lock` project path beside a manifest.
-fn lockfile_beside(manifest: &ProjectPath) -> ProjectPath {
-    match manifest_directory(manifest) {
-        "" => ProjectPath(CARGO_LOCK_FILE_NAME.to_owned()),
-        directory => ProjectPath(format!("{directory}/{CARGO_LOCK_FILE_NAME}")),
     }
 }
 
@@ -393,9 +297,9 @@ fn metadata_entries(metadata: &Metadata) -> Vec<CatalogEntry> {
         .iter()
         .filter(|package| !members.contains(package.id.as_str()))
         .map(|package| {
-            dependency_entry(
-                &package.name,
-                &package.version,
+            CatalogEntry::dependency(
+                package_identity(CARGO_MANAGER, &package.name, &package.version),
+                rust_language(),
                 package.manifest_path.parent().map(Path::to_path_buf),
                 direct.contains(package.id.as_str()),
             )
@@ -414,44 +318,12 @@ fn member_dependencies<'a>(metadata: &'a Metadata, members: &BTreeSet<&str>) -> 
         .collect()
 }
 
-/// One dependency entry, with its source root when a cache holds it.
-fn dependency_entry(
-    name: &str,
-    version: &str,
-    source_root: Option<PathBuf>,
-    declared_directly: bool,
-) -> CatalogEntry {
-    let identity = package_identity(CARGO_MANAGER, name, version);
-    let mut entry = CatalogEntry::new(identity, PackageLocation::Dependency, rust_language());
-    if let Some(source_root) = source_root {
-        entry = entry.with_source_root(source_root);
-    }
-    if declared_directly {
-        entry = entry.declared_directly();
-    }
-    entry
-}
-
-/// One package identity from its three borrowed parts.
-fn package_identity(manager: &str, name: &str, version: &str) -> PackageIdentity {
-    PackageIdentity {
-        manager: manager.to_owned(),
-        name: name.to_owned(),
-        version: version.to_owned(),
-    }
-}
-
 /// The Rust language, with no dialect.
 fn rust_language() -> Language {
     Language {
         name: RUST_LANGUAGE_NAME.to_owned(),
         dialect: None,
     }
-}
-
-/// The order entries sort in: manager, then name, then version.
-fn identity_order(identity: &PackageIdentity) -> (&str, &str, &str) {
-    (&identity.manager, &identity.name, &identity.version)
 }
 
 #[cfg(test)]
@@ -466,8 +338,9 @@ mod tests {
         workspace_metadata,
     };
     use super::*;
+    use crate::catalog::PackageLocation;
     use crate::fixture::RecordedInspector;
-    use crate::resolvers::resolvers;
+    use crate::resolver::PACKAGES_MAX;
 
     #[test]
     fn test_cargo_resolver_identity_names_cargo_and_rust() {
@@ -476,13 +349,6 @@ mod tests {
         assert_eq!(resolver.manager(), "cargo");
         assert_eq!(resolver.language().identity_segment(), "rust");
         assert_eq!(resolver.manifest_file_name(), "Cargo.toml");
-    }
-
-    #[test]
-    fn test_resolvers_lists_one_cargo_resolver() {
-        let listed: Vec<ResolverName> =
-            resolvers().iter().map(|resolver| resolver.name()).collect();
-        assert_eq!(listed, [ResolverName::Cargo]);
     }
 
     #[test]
@@ -818,30 +684,5 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first.entries.len(), 5);
-    }
-
-    #[test]
-    fn test_top_level_manifests_keeps_only_uncovered_directories() {
-        let manifests = [
-            project("Cargo.toml"),
-            project("crates/a/Cargo.toml"),
-            project("tools/x/Cargo.toml"),
-        ];
-        let top_level: Vec<&str> = top_level_manifests(&manifests)
-            .into_iter()
-            .map(|manifest| manifest.0.as_str())
-            .collect();
-        assert_eq!(top_level, ["Cargo.toml"]);
-
-        let siblings = [
-            project("crates/a/Cargo.toml"),
-            project("crates/ab/Cargo.toml"),
-            project("crates/a/nested/Cargo.toml"),
-        ];
-        let top_level: Vec<&str> = top_level_manifests(&siblings)
-            .into_iter()
-            .map(|manifest| manifest.0.as_str())
-            .collect();
-        assert_eq!(top_level, ["crates/a/Cargo.toml", "crates/ab/Cargo.toml"]);
     }
 }

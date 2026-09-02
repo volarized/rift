@@ -45,6 +45,23 @@ impl CatalogEntry {
         }
     }
 
+    /// One dependency entry with its source root and whether a manifest declares it.
+    #[must_use]
+    pub const fn dependency(
+        identity: PackageIdentity,
+        language: Language,
+        source_root: Option<PathBuf>,
+        declared_directly: bool,
+    ) -> Self {
+        Self {
+            identity,
+            location: PackageLocation::Dependency,
+            source_root,
+            direct: declared_directly,
+            language,
+        }
+    }
+
     /// Records the directory holding the package's source on this machine.
     #[must_use]
     pub fn with_source_root(mut self, source_root: PathBuf) -> Self {
@@ -244,6 +261,19 @@ pub fn resolve_catalog(
 pub(crate) fn file_name(path: &ProjectPath) -> &str {
     path.0.rsplit('/').next().unwrap_or(path.0.as_str())
 }
+
+/// One package identity from its three borrowed parts.
+#[must_use]
+pub(crate) fn package_identity(manager: &str, name: &str, version: &str) -> PackageIdentity {
+    PackageIdentity {
+        manager: manager.to_owned(),
+        name: name.to_owned(),
+        version: version.to_owned(),
+    }
+}
+
+/// The package namespace of a toolchain's standard library, whatever the language.
+pub(crate) const STDLIB_MANAGER: &str = "stdlib";
 
 fn identity_key(identity: &PackageIdentity) -> (String, String, String) {
     (

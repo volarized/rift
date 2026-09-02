@@ -1,15 +1,15 @@
 //! The lockfile path: the registry and git packages `Cargo.lock` states, rooted in Cargo's caches.
 
 use std::collections::BTreeSet;
-use std::fmt;
 use std::path::{Path, PathBuf};
 
 use rift_protocol::read::ProjectPath;
 use serde::Deserialize;
 
-use super::{CARGO_LOCK_FILE_NAME, ResolutionBuilder, dependency_entry};
-use crate::catalog::CatalogEntry;
-use crate::resolver::{DIRECTORY_ENTRIES_MAX, FileObservation, Inspector, LOCKFILE_BYTES_MAX};
+use super::{CARGO_LOCK_FILE_NAME, CARGO_MANAGER, rust_language};
+use crate::catalog::{CatalogEntry, package_identity};
+use crate::manifest::{LockfileFailure, ResolutionBuilder, read_lockfile};
+use crate::resolver::{DIRECTORY_ENTRIES_MAX, Inspector};
 
 /// The lockfile `source` prefix of a package fetched from a registry.
 const REGISTRY_SOURCE_PREFIX: &str = "registry+";
@@ -52,36 +52,6 @@ struct LockedPackage {
     dependencies: Vec<String>,
 }
 
-/// Why the lockfile beside a manifest answered nothing.
-#[derive(Debug)]
-enum LockfileFailure {
-    /// No lockfile stands beside the manifest.
-    Absent,
-    /// The lockfile holds more bytes than `LOCKFILE_BYTES_MAX`.
-    OverBound { bytes: u64 },
-    /// The lockfile is not the TOML document Cargo writes; carries the parser's message.
-    Unparsable(String),
-}
-
-impl fmt::Display for LockfileFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Absent => write!(formatter, "no {CARGO_LOCK_FILE_NAME} beside it"),
-            Self::OverBound { bytes } => write!(
-                formatter,
-                "{CARGO_LOCK_FILE_NAME} holds {bytes} bytes, past the {LOCKFILE_BYTES_MAX} \
-                 byte bound"
-            ),
-            Self::Unparsable(message) => {
-                write!(
-                    formatter,
-                    "{CARGO_LOCK_FILE_NAME} could not be parsed: {message}"
-                )
-            }
-        }
-    }
-}
-
 /// Catalogs the registry and git packages the `Cargo.lock` beside a manifest states.
 pub(super) fn resolve_lockfile(
     directory: &Path,
@@ -89,7 +59,8 @@ pub(super) fn resolve_lockfile(
     inspector: &mut dyn Inspector,
     answer: &mut ResolutionBuilder,
 ) {
-    match read_lockfile(directory, inspector) {
+    let observed = read_lockfile(directory, CARGO_LOCK_FILE_NAME, inspector);
+    match observed.and_then(|bytes| parse_lockfile(&bytes)) {
         Ok(lockfile) => {
             let cache = CargoCache::observe(inspector);
             answer.entries(lockfile_entries(&lockfile, &cache, inspector));
@@ -101,19 +72,11 @@ pub(super) fn resolve_lockfile(
     }
 }
 
-/// Reads and parses the `Cargo.lock` in `directory`, within `LOCKFILE_BYTES_MAX`.
-fn read_lockfile(
-    directory: &Path,
-    inspector: &mut dyn Inspector,
-) -> Result<Lockfile, LockfileFailure> {
-    let path = directory.join(CARGO_LOCK_FILE_NAME);
-    let bytes = match inspector.read_file(&path, LOCKFILE_BYTES_MAX) {
-        FileObservation::Absent => return Err(LockfileFailure::Absent),
-        FileObservation::OverBound { bytes } => return Err(LockfileFailure::OverBound { bytes }),
-        FileObservation::Bytes(bytes) => bytes,
-    };
-    toml::from_slice(&bytes)
-        .map_err(|error| LockfileFailure::Unparsable(error.message().to_owned()))
+/// Parses `Cargo.lock` bytes, naming the parser's message when they are not its document.
+fn parse_lockfile(bytes: &[u8]) -> Result<Lockfile, LockfileFailure> {
+    toml::from_slice(bytes).map_err(|error| {
+        LockfileFailure::unparsable(CARGO_LOCK_FILE_NAME, error.message().to_owned())
+    })
 }
 
 /// Where a locked package's bytes came from, read from its `source` prefix.
@@ -157,9 +120,9 @@ fn lockfile_entries(
             }
             LockedSource::Git(source) => cache.git_root(inspector, source),
         };
-        entries.push(dependency_entry(
-            &package.name,
-            &package.version,
+        entries.push(CatalogEntry::dependency(
+            package_identity(CARGO_MANAGER, &package.name, &package.version),
+            rust_language(),
             source_root,
             direct.contains(package.name.as_str()),
         ));
