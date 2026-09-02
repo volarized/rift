@@ -48,6 +48,10 @@ pub enum ResolverName {
     Cargo,
     /// Python distributions, as `uv.lock` pins them and the workspace environment holds them.
     Uv,
+    /// npm packages, as `package-lock.json` pins them and `node_modules` holds them.
+    Npm,
+    /// npm packages, as `bun.lock` pins them and `node_modules` holds them.
+    Bun,
 }
 
 impl ResolverName {
@@ -57,6 +61,8 @@ impl ResolverName {
         match self {
             Self::Cargo => "cargo",
             Self::Uv => "uv",
+            Self::Npm => "npm",
+            Self::Bun => "bun",
         }
     }
 }

@@ -2,21 +2,27 @@
 
 use rift_protocol::read::ProjectPath;
 
+use crate::bun::BunResolver;
 use crate::cargo::CargoResolver;
 use crate::catalog::file_name;
+use crate::npm::NpmResolver;
 use crate::resolver::DependencyResolver;
 use crate::uv::UvResolver;
 
 static CARGO: CargoResolver = CargoResolver::new();
 static UV: UvResolver = UvResolver::new();
+static NPM: NpmResolver = NpmResolver::new();
+static BUN: BunResolver = BunResolver::new();
 
 /// The shipped list, in run order.
-static RESOLVERS: [&dyn DependencyResolver; 2] = [&CARGO, &UV];
+static RESOLVERS: [&dyn DependencyResolver; 4] = [&CARGO, &UV, &NPM, &BUN];
 
 /// Every shipped dependency resolver, in the order [`resolve_catalog`] runs them.
 ///
 /// Each resolver claims one manifest file name, so two resolvers never read one
 /// manifest; the list order only decides the order their entries are assembled in.
+/// npm and Bun both claim `package.json`; each reads on when its own lockfile stands
+/// beside the manifest, so one manifest still reaches one resolver's answer.
 ///
 /// [`resolve_catalog`]: crate::resolve_catalog
 #[must_use]
@@ -62,6 +68,8 @@ mod tests {
             [
                 (ResolverName::Cargo, "Cargo.toml"),
                 (ResolverName::Uv, "pyproject.toml"),
+                (ResolverName::Npm, "package.json"),
+                (ResolverName::Bun, "package.json"),
             ]
         );
     }
