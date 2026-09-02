@@ -2951,10 +2951,8 @@ pub fn compute() -> i32 {
     fn helper_package() -> TestResult<PackageIndex> {
         let root = tempfile::tempdir()?;
         fs::create_dir(root.path().join("src"))?;
-        fs::write(
-            root.path().join("src/lib.rs"),
-            "pub fn helper_beacon() {}\nfn helper_private() {}\npub fn beacon() {}\n",
-        )?;
+        let source = "pub fn helper_beacon() {}\nfn helper_private() {}\npub fn beacon() {}\n";
+        fs::write(root.path().join("src/lib.rs"), source)?;
         let entry = helper_entry(root.path());
         let files = package_files(&entry, &DependencyIndexLimits::default())?;
         Ok(PackageIndex::build(&entry, &files, 1)?)
@@ -2983,13 +2981,12 @@ pub fn compute() -> i32 {
         let directory = tempfile::tempdir()?;
         fs::create_dir(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), source)?;
-        let service = ReadService::build(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::default(),
-            HistoryConfiguration::default(),
-        )?;
+        let visibility = SourceVisibility::default();
+        let text_inclusion = rift_core::TextFileInclusion::default();
+        let history = HistoryConfiguration::default();
+        let limits = WorkspaceIndexLimits::default();
+        let root = directory.path();
+        let service = ReadService::build(root, limits, &visibility, &text_inclusion, history)?;
         Ok((directory, service))
     }
 
@@ -3013,9 +3010,8 @@ pub fn compute() -> i32 {
     }
 
     fn scoped(name: &str, scope: &str) -> TestResult<GetSymbolParams> {
-        Ok(serde_json::from_value(
-            json!({"name": name, "scope": scope, "limit": 10}),
-        )?)
+        let request = json!({"name": name, "scope": scope, "limit": 10});
+        Ok(serde_json::from_value(request)?)
     }
 
     /// An omitted `scope` answers the project index alone: the helper's declaration does
@@ -3070,9 +3066,8 @@ pub fn compute() -> i32 {
             result.warnings
         );
 
-        let params: GetSymbolParams = serde_json::from_value(
-            json!({"name": "helper_beacon", "scope": "dependencies", "include": []}),
-        )?;
+        let request = json!({"name": "helper_beacon", "scope": "dependencies", "include": []});
+        let params: GetSymbolParams = serde_json::from_value(request)?;
         let without_source = service.get_symbol(&params)?;
         assert_eq!(without_source.hits[0].source, None);
         Ok(())
@@ -3123,9 +3118,8 @@ pub fn compute() -> i32 {
         assert_eq!(result.hits[1].symbol.name, "beacon");
         assert_eq!(result.hits[2].unit, Some(helper_unit()));
         assert_eq!(result.hits[2].symbol.name, "helper_beacon");
-        let params: GetSymbolParams = serde_json::from_value(
-            json!({"name": "beacon", "scope": "all", "limit": 1, "page_index": 1}),
-        )?;
+        let request = json!({"name": "beacon", "scope": "all", "limit": 1, "page_index": 1});
+        let params: GetSymbolParams = serde_json::from_value(request)?;
         let second = service.get_symbol(&params)?;
         assert_eq!(
             second.pagination,
@@ -3164,6 +3158,22 @@ pub fn compute() -> i32 {
                 ("helper_beacon", true)
             ]
         );
+        Ok(())
+    }
+
+    /// `language` narrows both sides of an `all` answer: `rust` keeps the helper's hits
+    /// beside the project's, and a language neither side is filed under answers empty.
+    #[test]
+    fn get_symbol_language_narrows_the_dependency_hits_too() -> TestResult {
+        let (_directory, service) = dependency_fixture()?;
+        let rust = json!({"name": "beacon", "scope": "all", "language": "rust"});
+        let python = json!({"name": "beacon", "scope": "all", "language": "python"});
+
+        let selected = service.get_symbol(&serde_json::from_value(rust)?)?;
+        let filtered = service.get_symbol(&serde_json::from_value(python)?)?;
+
+        assert_eq!(selected.hits.len(), 3, "{:?}", selected.hits);
+        assert!(filtered.hits.is_empty(), "{:?}", filtered.hits);
         Ok(())
     }
 
@@ -3353,6 +3363,32 @@ pub fn compute() -> i32 {
             "a poisoned lock carries no source"
         );
         assert!(store.write().is_err(), "the write side is poisoned too");
+    }
+
+    /// A package index failure keeps its own wire identity and evidence through the read
+    /// fault, and stays reachable as the fault's source. An absent root is an unreadable
+    /// walk, so the identity carried through is `storage_failure`.
+    #[test]
+    fn a_dependency_fault_keeps_the_package_failure_as_its_source() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let entry = helper_entry(&root.path().join("absent"));
+        let failure = package_files(&entry, &DependencyIndexLimits::default())
+            .err()
+            .ok_or("a missing root refuses the walk")?;
+        let expected_name = failure.name();
+        let expected_context = failure.context();
+        let expected_text = failure.to_string();
+
+        let error = ReadFault::dependency(failure);
+
+        assert!(matches!(error.fault(), ReadFault::Dependency(_)));
+        assert_eq!(error.name(), expected_name);
+        assert_eq!(error.descriptor().code(), "storage_failure");
+        assert_eq!(error.context(), expected_context);
+        let source =
+            std::error::Error::source(&error).ok_or("a dependency fault carries a source")?;
+        assert_eq!(source.to_string(), expected_text);
+        Ok(())
     }
 
     #[test]
