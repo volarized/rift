@@ -10,19 +10,21 @@ use rift_core::ProjectPath;
 use rift_core::constants::{FORCE_INCLUDE_FILES_MAX, SEARCH_RESULTS_DEFAULT};
 use rift_core::line;
 use rift_index::{
-    IndexedFile, LexicalChange, LexicalUnit, LexicalUnitKind, PathChanges, PathMatcher,
-    SymbolMatch, SymbolMatchRank, TextSourceFile, WorkspaceIndex,
+    DependencyIndex, DependencySymbolMatch, IndexedFile, LexicalChange, LexicalUnit,
+    LexicalUnitKind, PathChanges, PathMatcher, SymbolMatch, SymbolMatchRank, TextSourceFile,
+    WorkspaceIndex,
 };
 use rift_protocol::read::{
-    MatchedField, PathPattern, PathSelector, ResultOrder, SearchHit, SearchHitTarget,
-    SearchInclude, SearchParams, SearchParamsTarget, SearchResult, SymbolId,
+    MatchedField, PathPattern, PathSelector, ProjectPath as WireProjectPath, ResultOrder,
+    SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget, SearchResult,
+    SearchScope, SourceUnitId, Symbol, SymbolId,
 };
 use rift_search::{Declaration, DescribedUnit, RankedUnit};
 use rift_syntax::{ByteRange, SyntaxSymbol};
 
 use crate::read::{
-    ReadError, ReadFault, ReadService, accepted_limit, excerpt, page, project_path, text_range,
-    validate_common, wire_symbol,
+    ReadError, ReadFault, ReadService, accepted_limit, dependency_symbol, dependency_warnings,
+    excerpt, page, project_path, text_range, validate_common, wire_symbol,
 };
 use crate::traversal::{collect_traversal_hits, traversal_truncation_warning, validate_traversal};
 
@@ -31,17 +33,22 @@ impl ReadService {
     /// `params.paths`, merged with `ranked` from the caller's search index - the lexical
     /// and semantic rankings already fused into one score. `ranked` is empty when that
     /// index is unavailable or its stamped revision no longer matches what is published -
-    /// the caller decides that, this method only merges what it is handed.
+    /// the caller decides that, this method only merges what it is handed. `params.scope`
+    /// selects what the lexical `query` runs over: the project lanes, the attached
+    /// dependency index, or both, ordered together by `params.order`.
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] for an invalid `paths` glob or a `force_include` bound crossed.
+    /// Returns [`ReadError`] for an invalid `paths` glob, a `force_include` bound crossed,
+    /// a scope beyond `project` beside a revision, `dependencies` beside `traversal`, and
+    /// a poisoned dependency index.
     pub fn search(
         &self,
         params: &SearchParams,
         ranked: &[RankedUnit],
     ) -> Result<SearchResult, ReadError> {
         validate_search(params)?;
+        self.validate_dependency_scope(params.scope, params.rev.as_ref())?;
         if self.revision().is_some() && force_include_requested(params) {
             return Err(ReadFault::unsupported("force_include at a revision"));
         }
@@ -62,6 +69,7 @@ impl ReadService {
         // bound, so `pagination.total_pages` counts the full result set and every page is
         // one window of the same ordering.
         let fetch_limit = self.index().results_max();
+        let dependencies = self.dependency_index(params.scope)?;
 
         let mut results = Vec::new();
         if let Some(query) = query {
@@ -70,33 +78,31 @@ impl ReadService {
                 target: params.target,
                 payloads,
             };
-            collect_indexed_hits(
-                self.index(),
-                matcher.as_ref(),
-                root,
-                criteria,
-                fetch_limit,
-                &mut results,
-            )?;
-            if results.len() < fetch_limit
-                && let Some(selector) = selector
-            {
-                collect_force_include_hits(
+            if params.scope != SearchScope::Dependencies {
+                collect_indexed_hits(
                     self.index(),
-                    selector,
+                    matcher.as_ref(),
+                    root,
                     criteria,
                     fetch_limit,
                     &mut results,
                 )?;
+                if results.len() < fetch_limit
+                    && let Some(selector) = selector
+                {
+                    collect_force_include_hits(
+                        self.index(),
+                        selector,
+                        criteria,
+                        fetch_limit,
+                        &mut results,
+                    )?;
+                }
+                let index = self.index();
+                let matcher = matcher.as_ref();
+                collect_ranked_hits(index, matcher, root, criteria, ranked, &mut results)?;
             }
-            collect_ranked_hits(
-                self.index(),
-                matcher.as_ref(),
-                root,
-                criteria,
-                ranked,
-                &mut results,
-            )?;
+            collect_dependency_hits(dependencies.as_deref(), criteria, fetch_limit, &mut results)?;
         }
         let mut traversal_truncated = false;
         if let Some(traversal) = params.traversal.as_ref()
@@ -129,6 +135,12 @@ impl ReadService {
                 let mut warnings = self.warnings();
                 if traversal_truncated {
                     warnings.push(traversal_truncation_warning());
+                }
+                if params.scope != SearchScope::Project {
+                    warnings.extend(dependency_warnings(
+                        dependencies.as_deref(),
+                        self.dependency_catalog(),
+                    ));
                 }
                 warnings
             },
@@ -239,6 +251,14 @@ pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
         validate_traversal(traversal)?;
         if params.rev.is_some() {
             return Err(ReadFault::unsupported("traversal at a revision"));
+        }
+        // The `all` scope still walks the project graph beside the package
+        // declarations; `dependencies` alone leaves the walk nothing to run over.
+        if params.scope == SearchScope::Dependencies {
+            return Err(ReadFault::invalid(
+                "traversal",
+                "the relationship graph serves the project alone",
+            ));
         }
     }
     Ok(())
@@ -418,6 +438,53 @@ fn collect_force_include_hits(
     Ok(())
 }
 
+/// Public declarations from the cataloged packages: `index` answers `query` up to
+/// `fetch_limit`, ranked as the project index ranks, and each match becomes a symbol hit
+/// addressed by `unit`. A `file` target answers nothing here, since a package contributes
+/// declarations alone. No index - the scope stays at the project, or no store is
+/// attached - contributes nothing.
+fn collect_dependency_hits(
+    index: Option<&DependencyIndex>,
+    criteria: SearchCriteria<'_>,
+    fetch_limit: usize,
+    results: &mut Vec<SearchHit>,
+) -> Result<(), ReadError> {
+    let Some(index) = index else {
+        return Ok(());
+    };
+    let SearchCriteria {
+        query,
+        target,
+        payloads,
+    } = criteria;
+    if target == SearchParamsTarget::File {
+        return Ok(());
+    }
+    for found in index.symbols(query, fetch_limit) {
+        results.push(dependency_symbol_hit(found, payloads)?);
+    }
+    Ok(())
+}
+
+/// Builds one dependency symbol hit's wire shape: the assembly [`build_symbol_hit`] gives
+/// a project declaration, addressed by `unit` in place of `path`, at the identifier
+/// rank's score.
+fn dependency_symbol_hit(
+    found: DependencySymbolMatch<'_>,
+    payloads: HitPayloads,
+) -> Result<SearchHit, ReadError> {
+    let matched = found.matched;
+    let (symbol, unit) = dependency_symbol(found)?;
+    Ok(assembled_symbol_hit(
+        symbol,
+        matched,
+        (None, Some(unit)),
+        symbol_match_score(matched.rank),
+        vec![MatchedField::Name],
+        payloads,
+    ))
+}
+
 fn symbol_search_hit(
     index: &WorkspaceIndex,
     matched: SymbolMatch<'_>,
@@ -429,8 +496,8 @@ fn symbol_search_hit(
 
 /// Builds one symbol hit's wire shape. `symbol_search_hit` and `merge_symbol_hit` share
 /// this: both surface the same declaration, differing only in score and which indexed field
-/// produced the match. The excerpt behind `source` is sliced only when `payloads` asked for
-/// it, so a request that omits `include` never pays that lookup.
+/// produced the match; `dependency_symbol_hit` shares the assembly below it, addressed by
+/// `unit` rather than `path`.
 pub(crate) fn build_symbol_hit(
     index: &WorkspaceIndex,
     matched: SymbolMatch<'_>,
@@ -444,7 +511,28 @@ pub(crate) fn build_symbol_hit(
     // through, and no shipped provider produces a disagreement today. Scoped out of this
     // change; `get_symbol` already carries it.
     let (symbol, _disagreement) = wire_symbol(index, matched)?;
-    Ok(SearchHit {
+    Ok(assembled_symbol_hit(
+        symbol,
+        matched,
+        (Some(project_path(matched.file.path())), None),
+        score,
+        matched_by,
+        payloads,
+    ))
+}
+
+/// One symbol hit over `matched`'s declaration bytes: `symbol` already assembled, addressed
+/// by exactly one of `path` and `unit`. The excerpt behind `source` is sliced only when
+/// `payloads` asked for it, so a request that omits `include` never pays that lookup.
+fn assembled_symbol_hit(
+    symbol: Symbol,
+    matched: SymbolMatch<'_>,
+    (path, unit): (Option<WireProjectPath>, Option<SourceUnitId>),
+    score: f64,
+    matched_by: Vec<MatchedField>,
+    payloads: HitPayloads,
+) -> SearchHit {
+    SearchHit {
         hit: SearchHitTarget::Symbol {
             symbol: Box::new(symbol),
         },
@@ -458,10 +546,11 @@ pub(crate) fn build_symbol_hit(
             matched.file.source(),
             matched.symbol.range.start,
         )),
-        path: Some(project_path(matched.file.path())),
+        path,
+        unit,
         traversal_path: None,
         distance: None,
-    })
+    }
 }
 
 /// Builds one file hit wire value.
@@ -485,6 +574,7 @@ fn file_search_hit(
         range: Some(text_range(range)),
         line: Some(u64::try_from(line_index).unwrap_or(u64::MAX)),
         path: Some(project_path(file.path())),
+        unit: None,
         traversal_path: None,
         distance: None,
     }
@@ -518,6 +608,7 @@ fn text_search_hit(
         range: Some(text_range(range)),
         line: Some(u64::try_from(line_index).unwrap_or(u64::MAX)),
         path: Some(project_path(file.path())),
+        unit: None,
         traversal_path: None,
         distance: None,
     }
@@ -755,6 +846,7 @@ fn ranked_file_hit(
         range: Some(text_range(range)),
         line: Some(line_number),
         path: Some(project_path(file.path())),
+        unit: None,
         traversal_path: None,
         distance: None,
     }
@@ -764,6 +856,9 @@ fn ranked_file_hit(
 /// identity so the result does not depend on the arrival order of lexical matches, which
 /// carries no guaranteed order of its own, and so two results that tie never swap places
 /// between pages.
+///
+/// `path` order lists every project path first, then the dependency hits, which carry
+/// `unit` in its place, in unit order, so a mixed `all` answer never interleaves the two.
 fn order_hits(results: &mut [SearchHit], order: ResultOrder) {
     results.sort_by(|left, right| hit_ordering(left, right, order));
 }
@@ -777,7 +872,10 @@ fn hit_ordering(left: &SearchHit, right: &SearchHit, order: ResultOrder) -> Orde
             .then_with(|| hit_identity(left).cmp(hit_identity(right))),
         ResultOrder::Path => left
             .path
-            .cmp(&right.path)
+            .is_none()
+            .cmp(&right.path.is_none())
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.unit.cmp(&right.unit))
             .then_with(|| hit_identity(left).cmp(hit_identity(right))),
         ResultOrder::Identity => hit_identity(left).cmp(hit_identity(right)),
     }
@@ -801,13 +899,15 @@ fn hit_identity(hit: &SearchHit) -> &str {
 mod tests {
     use std::error::Error;
     use std::fs;
+    use std::sync::Arc;
 
     use rift_core::SourceVisibility;
     use rift_core::constants::READ_RESULTS_MAX_DEFAULT;
     use rift_index::{LexicalIndexLimits, LexicalUnitKind, WorkspaceIndexLimits};
     use rift_protocol::configuration::HistoryConfiguration;
     use rift_protocol::read::{
-        MatchedField, NodeId, ResultOrder, SearchParams, SearchParamsTarget,
+        MatchedField, NodeId, PackageIdentity, ReadWarning, ResultOrder, SearchParams,
+        SearchParamsTarget, SourceLocationKind, SourceUnitId,
     };
     use rift_search::{RankedUnit, SearchIndex, SearchIndexLimits};
     use serde_json::json;
@@ -817,6 +917,8 @@ mod tests {
         ByteRange, ReadFault, ReadService, SearchHit, SearchHitTarget, SymbolMatchRank,
         symbol_match_score,
     };
+    use crate::read::DependencyStore;
+    use crate::read::tests::{empty_dependency_index, helper_store, helper_unit, project_fixture};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -2712,6 +2814,7 @@ pub fn compute() -> i32 {
             range: None,
             line: None,
             path: Some(rift_protocol::read::ProjectPath(path.to_owned())),
+            unit: None,
             traversal_path: None,
             distance: None,
         }
@@ -2796,9 +2899,17 @@ pub fn compute() -> i32 {
             range: None,
             line: None,
             path: path.map(|path| rift_protocol::read::ProjectPath(path.to_owned())),
+            unit: None,
             traversal_path: None,
             distance: None,
         }
+    }
+
+    /// A node hit addressed by `unit` alone, the location shape a dependency hit takes.
+    fn node_hit_stub_with_unit(id: &str, unit: &str, score: f64) -> SearchHit {
+        let mut hit = node_hit_stub(id, score);
+        hit.unit = Some(SourceUnitId(unit.to_owned()));
+        hit
     }
 
     /// `hit_identity`'s `Node` arm never runs through the live `search` path - a `target:
@@ -2818,5 +2929,295 @@ pub fn compute() -> i32 {
             ids,
             ["rift://file/z.rs", "rift://node/rust/lib.rs@0-1#00000000",]
         );
+    }
+
+    /// `path` order lists every project path before any unit, then the units in their own
+    /// order, then identity.
+    #[test]
+    fn order_hits_path_lists_project_paths_before_units_and_units_in_unit_order() {
+        let mut results = vec![
+            node_hit_stub_with_unit(
+                "rift://node/rust/lib.rs@0-1#00000000",
+                "rift://source/cargo/zeta@1.0.0/src/lib.rs",
+                0.5,
+            ),
+            file_hit_stub("z.rs", 0.5),
+            node_hit_stub_with_unit(
+                "rift://node/rust/lib.rs@2-3#00000000",
+                "rift://source/cargo/alpha@1.0.0/src/lib.rs",
+                0.5,
+            ),
+        ];
+        super::order_hits(&mut results, ResultOrder::Path);
+        let located: Vec<(Option<&str>, Option<&str>)> = results
+            .iter()
+            .map(|hit| {
+                (
+                    hit.path.as_ref().map(|path| path.0.as_str()),
+                    hit.unit.as_ref().map(|unit| unit.0.as_str()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            located,
+            [
+                (Some("z.rs"), None),
+                (None, Some("rift://source/cargo/alpha@1.0.0/src/lib.rs")),
+                (None, Some("rift://source/cargo/zeta@1.0.0/src/lib.rs")),
+            ]
+        );
+    }
+
+    /// The project `beacon` beside a store holding the built helper package: the fixture
+    /// `get_symbol`'s scope tests share.
+    fn dependency_fixture() -> TestResult<(TempDir, ReadService)> {
+        let (directory, service) = project_fixture("pub fn beacon() {}\n")?;
+        Ok((directory, service.with_dependencies(helper_store()?)))
+    }
+
+    /// Each hit's declaration name and whether it is addressed by `unit`, in answer order.
+    fn located_names(result: &rift_protocol::read::SearchResult) -> Vec<(String, bool)> {
+        result
+            .results
+            .iter()
+            .map(|hit| {
+                let SearchHitTarget::Symbol { symbol } = &hit.hit else {
+                    panic!("a symbol hit was expected: {hit:?}");
+                };
+                (symbol.name.clone(), hit.unit.is_some())
+            })
+            .collect()
+    }
+
+    /// An omitted `scope` runs the project lanes alone: the helper's declaration does not
+    /// answer, the project `beacon` answers by path, and no dependency warning rides.
+    #[test]
+    fn search_default_scope_answers_the_project_alone() -> TestResult {
+        let (_directory, service) = dependency_fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({"query": "helper_beacon"}))?;
+        let result = service.search(&params, &[])?;
+        assert!(result.results.is_empty(), "{:?}", result.results);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+
+        let params: SearchParams =
+            serde_json::from_value(json!({"query": "beacon", "target": "symbol"}))?;
+        let result = service.search(&params, &[])?;
+        assert_eq!(located_names(&result), [("beacon".to_owned(), false)]);
+        assert_eq!(
+            result.results[0].path,
+            Some(rift_protocol::read::ProjectPath("src/lib.rs".to_owned()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn search_dependencies_scope_answers_the_helper_declaration_by_unit() -> TestResult {
+        let (_directory, service) = dependency_fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "helper_beacon",
+            "scope": "dependencies",
+            "include": ["source", "score"]
+        }))?;
+
+        let result = service.search(&params, &[])?;
+
+        assert_eq!(result.results.len(), 1, "{:?}", result.results);
+        let hit = &result.results[0];
+        assert_eq!(hit.unit, Some(helper_unit()));
+        assert_eq!(hit.path, None);
+        assert_eq!(hit.matched_by, [MatchedField::Name]);
+        assert_eq!(
+            hit.score,
+            Some(symbol_match_score(SymbolMatchRank::QualifiedExact))
+        );
+        assert_eq!(hit.line, Some(1));
+        assert!(
+            hit.source
+                .as_deref()
+                .is_some_and(|source| source.contains("pub fn helper_beacon")),
+            "{hit:?}"
+        );
+        assert!(hit.traversal_path.is_none() && hit.distance.is_none());
+        let SearchHitTarget::Symbol { symbol } = &hit.hit else {
+            panic!("a symbol hit was expected: {hit:?}");
+        };
+        assert_eq!(symbol.name, "helper_beacon");
+        assert_eq!(symbol.origin.location, Some(SourceLocationKind::Dependency));
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        Ok(())
+    }
+
+    /// `dependencies` skips every project lane: the project's own `beacon` never answers,
+    /// the helper's exact `beacon` orders above its substring `helper_beacon`, and a
+    /// `file` target answers empty since a package contributes declarations alone.
+    #[test]
+    fn search_dependencies_scope_skips_the_project_lanes() -> TestResult {
+        let (_directory, service) = dependency_fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "beacon",
+            "scope": "dependencies",
+            "include": ["score"]
+        }))?;
+
+        let result = service.search(&params, &[])?;
+
+        assert_eq!(
+            located_names(&result),
+            [
+                ("beacon".to_owned(), true),
+                ("helper_beacon".to_owned(), true)
+            ]
+        );
+        assert!(result.results.iter().all(|hit| hit.path.is_none()));
+        let scores: Vec<Option<f64>> = result.results.iter().map(|hit| hit.score).collect();
+        assert_eq!(
+            scores,
+            [
+                Some(symbol_match_score(SymbolMatchRank::QualifiedExact)),
+                Some(symbol_match_score(SymbolMatchRank::Substring)),
+            ]
+        );
+
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "beacon",
+            "scope": "dependencies",
+            "target": "file"
+        }))?;
+        let result = service.search(&params, &[])?;
+        assert!(result.results.is_empty(), "{:?}", result.results);
+        assert_eq!(result.pagination.total_pages, 0);
+        Ok(())
+    }
+
+    /// Under `all`, relevance orders both sides by score: the helper's exact `beacon`
+    /// above the project's prefix match `beacon_tower`, above the helper's substring
+    /// match `helper_beacon`.
+    #[test]
+    fn search_all_scope_orders_project_and_package_hits_by_score() -> TestResult {
+        let (_directory, service) = project_fixture("pub fn beacon_tower() {}\n")?;
+        let service = service.with_dependencies(helper_store()?);
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "beacon",
+            "scope": "all",
+            "target": "symbol"
+        }))?;
+
+        let result = service.search(&params, &[])?;
+
+        assert_eq!(
+            located_names(&result),
+            [
+                ("beacon".to_owned(), true),
+                ("beacon_tower".to_owned(), false),
+                ("helper_beacon".to_owned(), true),
+            ]
+        );
+        Ok(())
+    }
+
+    /// Under `all` with `path` order, the project hit lists first and the two helper hits
+    /// follow in identity order within their one unit.
+    #[test]
+    fn search_all_scope_path_order_lists_the_project_hit_before_the_package_hits() -> TestResult {
+        let (_directory, service) = project_fixture("pub fn beacon_tower() {}\n")?;
+        let service = service.with_dependencies(helper_store()?);
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "beacon",
+            "scope": "all",
+            "target": "symbol",
+            "order": "path"
+        }))?;
+
+        let result = service.search(&params, &[])?;
+
+        assert_eq!(
+            located_names(&result),
+            [
+                ("beacon_tower".to_owned(), false),
+                ("beacon".to_owned(), true),
+                ("helper_beacon".to_owned(), true),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn search_dependencies_scope_with_traversal_refuses_naming_traversal() -> TestResult {
+        let (_directory, service) = dependency_fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "beacon",
+            "scope": "dependencies",
+            "traversal": { "seed": "rift://symbol/rust/src/lib.rs/beacon" }
+        }))?;
+
+        let error = service
+            .search(&params, &[])
+            .expect_err("the relationship graph serves the project alone");
+
+        assert!(
+            matches!(
+                error.fault(),
+                ReadFault::Invalid {
+                    field: "traversal",
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert_eq!(error.descriptor().code(), "invalid_request");
+        Ok(())
+    }
+
+    #[test]
+    fn search_rev_with_a_dependency_scope_refuses_naming_scope() -> TestResult {
+        let (_directory, service) = dependency_fixture()?;
+        for scope in ["dependencies", "all"] {
+            let params: SearchParams =
+                serde_json::from_value(json!({"query": "beacon", "scope": scope, "rev": "main"}))?;
+
+            let error = service
+                .search(&params, &[])
+                .expect_err("rev pairs with the project scope alone");
+
+            assert!(
+                matches!(error.fault(), ReadFault::Invalid { field: "scope", .. }),
+                "scope {scope}: {error}"
+            );
+            assert_eq!(error.descriptor().code(), "invalid_request");
+        }
+        Ok(())
+    }
+
+    /// The dependency warnings ride a `search` answer whose scope reaches dependencies,
+    /// the same way they ride `get_symbol`'s, and no other.
+    #[test]
+    fn search_dependency_scope_warns_a_skipped_package() -> TestResult {
+        let mut index = empty_dependency_index();
+        let zeta = PackageIdentity {
+            manager: "cargo".to_owned(),
+            name: "zeta".to_owned(),
+            version: "1.0.0".to_owned(),
+        };
+        index.skip(zeta.clone(), "zeta refused".to_owned());
+        let (_directory, service) = project_fixture("pub fn beacon() {}\n")?;
+        let service = service.with_dependencies(Arc::new(DependencyStore::new(index)));
+
+        for scope in ["dependencies", "all"] {
+            let params: SearchParams =
+                serde_json::from_value(json!({"query": "beacon", "scope": scope}))?;
+            let result = service.search(&params, &[])?;
+            assert_eq!(
+                result.warnings,
+                [ReadWarning::DependencyPackageSkipped {
+                    package: zeta.clone(),
+                    reason: "zeta refused".to_owned(),
+                }],
+                "scope {scope}"
+            );
+        }
+        let params: SearchParams = serde_json::from_value(json!({"query": "beacon"}))?;
+        let result = service.search(&params, &[])?;
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        Ok(())
     }
 }

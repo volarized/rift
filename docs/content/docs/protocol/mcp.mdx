@@ -63,8 +63,8 @@ Three more warnings cover the search ranking tiers:
 A `symbol_disagreement` warning names a symbol whose selected presentation and at least one
 provider's own facts disagree.
 
-Three warnings ride a `get_symbol` answer whose `scope` reaches dependencies, and no other
-answer:
+Three warnings ride a `get_symbol` or `search` answer whose `scope` reaches dependencies, and
+no other answer:
 
 - `dependency_index_pending` - `pending` cataloged packages with a source root are not yet
   indexed. The answer is served from the packages indexed so far, and holds the rest's
@@ -396,6 +396,71 @@ an isolated declaration is a legitimate answer.
 A walk the server stops at its node bound attaches a `traversal_truncated` entry to
 `warnings`, naming how many symbols it visited: hits reachable beyond the bound are missing,
 and a tighter `facets` list, a smaller `depth`, or a less-connected `seed` fits the walk under it.
+
+### Dependency scope [#search-scope]
+
+<VersionBadge version="v0.0.32" languages={["Rust", "Python", "TypeScript"]} />
+
+`scope` selects what `query` runs over, with the three values
+[`get_symbol`](#get_symbol-scope) takes. `project`, the default, runs the lanes above: the
+indexed declarations and lines, the `paths.force_include` files, the ranked tier, and
+`traversal`. `dependencies` runs none of them and answers from the public declarations of the
+packages the [dependency index](/docs/architecture#dependency-index) holds, ranked the way the
+project index ranks a name. `all` runs both and orders the two sides together under `order`:
+by score under `relevance`; under `path`, every project path first, then the dependency hits
+in unit order.
+
+A dependency hit is a `symbol` hit tagged `matched_by: ["name"]`, addressed by `unit` in place
+of `path` - the [`SourceUnitId`](/docs/protocol/reference#SourceUnitId) of the package file -
+with `range` and `line` inside that unit, and `source` when `include` names it. A package
+contributes declarations alone, so `target: "file"` answers nothing from it.
+
+The server refuses `rev` together with a scope beyond `project` as `invalid_request`, since
+the dependency index serves the current tree alone, and refuses `traversal` together with
+`dependencies` the same way, since the relationship graph serves the project alone; `all`
+still walks the project graph. The three dependency warnings under [Reads](#reads) ride a
+`search` answer whose `scope` reaches dependencies, as they ride a `get_symbol` answer.
+
+This search reaches the `helper` crate the `get_symbol` lookup above reaches:
+
+**Request:**
+
+```json
+{ "query": "helper_beacon", "scope": "dependencies" }
+```
+
+**Response:**
+
+```json
+{
+  "results": [
+    {
+      "hit": {
+        "target": "symbol",
+        "symbol": {
+          "id": "rift://symbol/rust/cargo/helper@0.1.0/src/lib.rs/helper_beacon",
+          "language": "rust",
+          "name": "helper_beacon",
+          "kind": "function",
+          "facets": ["value", "callable", "public"],
+          "visibility": "pub",
+          "signatures": [{ "display": "pub fn helper_beacon()", "language": "rust" }],
+          "origin": {
+            "location": "dependency",
+            "package": { "manager": "cargo", "name": "helper", "version": "0.1.0" },
+            "source_kind": "authored"
+          }
+        }
+      },
+      "matched_by": ["name"],
+      "range": { "start": 0, "end": 25 },
+      "line": 1,
+      "unit": "rift://source/cargo/helper@0.1.0/src/lib.rs"
+    }
+  ],
+  "pagination": { "page_index": 0, "total_pages": 1 }
+}
+```
 
 <McpTool name="nodes" />
 

@@ -4,7 +4,7 @@
 
 use crate::read::{
     Language, NodeId, PAGE_INDEX_DEFAULT, Pagination, ProjectPath, ReadWarning, Relationship,
-    RelationshipFacet, RevisionId, Symbol, SymbolId, TextRange,
+    RelationshipFacet, RevisionId, SearchScope, SourceUnitId, Symbol, SymbolId, TextRange,
 };
 use crate::schema;
 use schemars::JsonSchema;
@@ -184,7 +184,7 @@ pub struct SearchHit {
     /// hit's `range`; a caller that needs the range already has it there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// Byte range of the hit within `path`. Absent for a symbol whose source is
+    /// Byte range of the hit within `path` or `unit`. Absent for a symbol whose source is
     /// unavailable or synthetic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range: Option<TextRange>,
@@ -192,10 +192,15 @@ pub struct SearchHit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1_u64))]
     pub line: Option<u64>,
-    /// Project-relative path of the hit, where the location is a project path. Absent for
-    /// a hit whose only location is a dependency or standard-library source unit.
+    /// Project-relative path of the hit, present for a file hit and for a symbol hit whose
+    /// declaration belongs to the project. A dependency or standard-library declaration
+    /// carries `unit` in its place.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<ProjectPath>,
+    /// Source-catalog unit of a dependency or standard-library declaration. A symbol hit
+    /// carries exactly one of `path` and `unit`; a file hit carries `path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<SourceUnitId>,
     /// Shortest relationship path to this hit, present when a traversal reached it,
     /// including a hit also matched lexically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -290,6 +295,12 @@ pub enum SearchInclude {
             ]
         },
         "limit": 25
+    },
+    {
+        "target": "symbol",
+        "query": "spawn_blocking",
+        "scope": "dependencies",
+        "limit": 10
     }
 ]))]
 pub struct SearchParams {
@@ -306,6 +317,14 @@ pub struct SearchParams {
     /// server-defined and comparable within one answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
+    /// Which declarations `query` searches: the project tree, the public declarations of
+    /// the cataloged dependency packages, or both. Omitted, `project`. A package
+    /// contributes symbol hits alone. The server refuses a scope beyond `project`
+    /// together with `rev`, since dependencies are served for the current tree alone,
+    /// and `dependencies` together with `traversal`, since the relationship graph serves
+    /// the project alone.
+    #[serde(default)]
+    pub scope: SearchScope,
     /// Files eligible for the search, selected by project-relative globs. Omitted selects
     /// every visible file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -561,7 +580,7 @@ mod tests {
     use super::{
         PAGE_INDEX_DEFAULT, PathPattern, PathPatternViolation, SEARCH_TRAVERSAL_DEPTH_DEFAULT,
         SEARCH_TRAVERSAL_DEPTH_MAX, SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX,
-        SearchHit, SearchParams, SearchTraversal, TraversalDirection,
+        SearchHit, SearchParams, SearchScope, SearchTraversal, TraversalDirection,
     };
     use serde_json::json;
 
@@ -574,6 +593,19 @@ mod tests {
         assert_eq!(
             schema["properties"]["page_index"]["default"],
             json!(PAGE_INDEX_DEFAULT)
+        );
+    }
+
+    /// `scope` takes serde's `default`, which reads the enum's own `Default`; this pins
+    /// the advertised default to the `project` member that impl selects, the default
+    /// `get_symbol` advertises for the same field.
+    #[test]
+    fn search_params_schema_scope_default_is_project() {
+        let schema = serde_json::to_value(schemars::schema_for!(SearchParams)).expect("schema");
+        assert_eq!(schema["properties"]["scope"]["default"], json!("project"));
+        assert_eq!(
+            serde_json::to_value(SearchScope::default()).expect("serialize"),
+            json!("project")
         );
     }
 
