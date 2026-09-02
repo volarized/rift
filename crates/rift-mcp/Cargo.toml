@@ -26,6 +26,7 @@ rmcp = { workspace = true, features = [
     "transport-streamable-http-server",
 ] }
 rift-core.workspace = true
+rift-dependency.workspace = true
 rift-index.workspace = true
 rift-protocol.workspace = true
 rift-search.workspace = true
@@ -53,6 +54,10 @@ path = "tests/binding_provider.rs"
 [[test]]
 name = "configuration_admission"
 path = "tests/configuration_admission.rs"
+
+[[test]]
+name = "dependency_index"
+path = "tests/dependency_index.rs"
 
 [[test]]
 name = "embedded_python"

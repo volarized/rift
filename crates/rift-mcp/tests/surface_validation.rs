@@ -34,6 +34,13 @@ fn corpus() -> Vec<(&'static str, Value)> {
         ("get_symbol", json!({ "name": "beacon_one" })),
         ("get_symbol", json!({ "name": "beacon", "limit": 1 })),
         ("get_symbol", json!({ "name": "beacon", "include": [] })),
+        // The fixture's path dependency `helper` answers these: a hit served from
+        // the dependency index carries `unit` in place of `path`.
+        (
+            "get_symbol",
+            json!({ "name": "helper_beacon", "scope": "dependencies" }),
+        ),
+        ("get_symbol", json!({ "name": "beacon", "scope": "all" })),
         // The fixture's committed baseline serves the timeline: one
         // `introduced` version from the walk's first commit.
         (
@@ -504,11 +511,21 @@ fn assert_no_bare_sha256_digest(value: &Value, context: &str) {
 /// `lexical_ranking_unavailable`: that warning is reserved for a tier that will not answer
 /// without operator action, and one that fired in ordinary operation would be one every
 /// caller learned to ignore.
+///
+/// A `get_symbol` request whose `scope` reaches dependencies runs after the lane has
+/// indexed the fixture's helper, so no warning names the helper. The machine's toolchain
+/// decides what else the catalog holds: a standard library cataloged with a source root is
+/// reported pending while the lane walks it and skipped once the walk crosses the index's
+/// bounds, so such a request may carry the dependency warnings and no other.
 fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
     let context = format!("{name} result");
+    let reaches_dependencies = matches!(request["scope"].as_str(), Some("dependencies" | "all"));
     assert_no_bare_sha256_digest(structured, &context);
-    assert_source_unit_ids_use_project_resolver(structured, &context);
-    if matches!(name, "get_symbol" | "nodes") {
+    assert_source_unit_ids_use_served_resolvers(structured, &context, reaches_dependencies);
+    if reaches_dependencies {
+        assert_dependency_warnings_only(structured);
+    }
+    if matches!(name, "get_symbol" | "nodes") && !reaches_dependencies {
         assert!(
             structured.get("warnings").is_none(),
             "a live {name} result must omit warnings when there is nothing to warn about: \
@@ -526,10 +543,12 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
                 expects_source,
                 "a hit carries source exactly when the request includes it: {request:#} {hit:#}"
             );
+            // A dependency hit is never an edit target, so it carries no node address.
+            let addressable = hit.get("unit").is_none();
             assert_eq!(
                 hit.get("node").is_some(),
-                expects_source,
-                "the node address rides with source: {request:#} {hit:#}"
+                expects_source && addressable,
+                "the node address rides with source on a project hit: {request:#} {hit:#}"
             );
             if !expects_history {
                 assert!(
@@ -593,39 +612,120 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
     }
 }
 
-/// Walks `value`, proving every `rift://source/` identity uses the project resolver: the
-/// only source resolver this release serves.
-fn assert_source_unit_ids_use_project_resolver(value: &Value, context: &str) {
+/// Every warning on a dependency-scoped answer is one of the dependency warnings, and
+/// none reports the fixture's helper skipped.
+fn assert_dependency_warnings_only(structured: &Value) {
+    for warning in structured["warnings"].as_array().into_iter().flatten() {
+        assert!(
+            matches!(
+                warning["code"].as_str(),
+                Some(
+                    "dependency_index_pending"
+                        | "dependency_package_skipped"
+                        | "dependency_resolver_degraded"
+                )
+            ),
+            "a dependency-scoped answer warns of the dependency index alone: {warning:#}"
+        );
+        assert_ne!(
+            warning["package"]["name"],
+            json!("helper"),
+            "the indexed helper is never reported skipped: {warning:#}"
+        );
+    }
+}
+
+/// Walks `value`, proving every `rift://source/` identity uses a resolver the request can
+/// reach: the project resolver always, and the Cargo resolver when the request's `scope`
+/// reaches the cataloged packages.
+fn assert_source_unit_ids_use_served_resolvers(
+    value: &Value,
+    context: &str,
+    reaches_dependencies: bool,
+) {
     match value {
         Value::String(text) => {
             if let Some(rest) = text.strip_prefix("rift://source/") {
+                let served = rest.starts_with("project/")
+                    || (reaches_dependencies && rest.starts_with("cargo/"));
                 assert!(
-                    rest.starts_with("project/"),
-                    "{context} source-unit id must use the project resolver: {text}"
+                    served,
+                    "{context} source-unit id must use a served resolver: {text}"
                 );
             }
         }
         Value::Array(items) => {
             for item in items {
-                assert_source_unit_ids_use_project_resolver(item, context);
+                assert_source_unit_ids_use_served_resolvers(item, context, reaches_dependencies);
             }
         }
         Value::Object(map) => {
             for item in map.values() {
-                assert_source_unit_ids_use_project_resolver(item, context);
+                assert_source_unit_ids_use_served_resolvers(item, context, reaches_dependencies);
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 }
 
+/// The fixture's directories: the served workspace and, beside it, the helper crate its
+/// manifest depends on by path.
+struct FixtureDirectories {
+    workspace: tempfile::TempDir,
+    /// Held for the life of the server: the catalog roots the helper here.
+    _helper: tempfile::TempDir,
+}
+
+/// The helper crate the fixture depends on: two public declarations and a private one,
+/// so the corpus can prove a hit answered from the dependency index.
+const HELPER_SOURCE: &str =
+    "pub fn helper_beacon() {}\nfn helper_private() {}\npub fn beacon() {}\n";
+
+/// A v4 lockfile naming the fixture and its path dependency, which
+/// `cargo metadata --locked --offline` accepts as it stands.
+const LOCK_WITH_HELPER: &str = "\
+# This file is automatically @generated by Cargo.
+# It is not intended for manual editing.
+version = 4
+
+[[package]]
+name = \"fixture\"
+version = \"0.1.0\"
+dependencies = [
+ \"helper\",
+]
+
+[[package]]
+name = \"helper\"
+version = \"0.1.0\"
+";
+
 /// Builds the shared fixture workspace and serves it to one client.
 async fn served_fixture() -> TestResult<(
-    tempfile::TempDir,
+    FixtureDirectories,
     rmcp::service::RunningService<rmcp::RoleClient, ()>,
     tokio::task::JoinHandle<()>,
 )> {
+    let helper = tempfile::tempdir()?;
+    fs::create_dir_all(helper.path().join("src"))?;
+    fs::write(
+        helper.path().join("Cargo.toml"),
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )?;
+    fs::write(helper.path().join("src/lib.rs"), HELPER_SOURCE)?;
     let directory = tempfile::tempdir()?;
+    // The manifest names the helper by path, spelled as a TOML literal string so no
+    // separator needs escaping; `cargo metadata` catalogs it as a direct dependency
+    // rooted in its own directory.
+    fs::write(
+        directory.path().join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+             [lib]\npath = \"lib.rs\"\n\n[dependencies]\nhelper = {{ path = '{}' }}\n",
+            helper.path().display()
+        ),
+    )?;
+    fs::write(directory.path().join("Cargo.lock"), LOCK_WITH_HELPER)?;
     fs::write(
         directory.path().join("lib.rs"),
         "pub fn beacon_one() {}\npub fn beacon_two() {}\npub fn beacon_three() {}\n",
@@ -684,7 +784,14 @@ async fn served_fixture() -> TestResult<(
         service.waiting().await.expect("server must stop cleanly");
     });
     let client = ().serve(client_transport).await?;
-    Ok((directory, client, server_task))
+    Ok((
+        FixtureDirectories {
+            workspace: directory,
+            _helper: helper,
+        },
+        client,
+        server_task,
+    ))
 }
 
 /// Result-arm coverage the corpus walk accumulates: every arm a result
@@ -698,11 +805,19 @@ struct CorpusArms {
     applied_with_findings: usize,
     refusal_reasons: BTreeSet<String>,
     precondition_kinds: BTreeSet<String>,
+    dependency_units: usize,
 }
 
 impl CorpusArms {
-    /// Records which change-status arms one structured result proves.
+    /// Records which change-status arms one structured result proves, and how many hits
+    /// answered from the dependency index.
     fn observe(&mut self, structured: &Value) {
+        self.dependency_units += structured["hits"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|hit| hit.get("unit").is_some())
+            .count();
         match structured["status"].as_str() {
             Some("applied") => {
                 self.applied_changes += 1;
@@ -754,6 +869,11 @@ impl CorpusArms {
             self.precondition_kinds.contains("target_exists"),
             "the corpus must prove the target_exists precondition; proven: {:?}",
             self.precondition_kinds
+        );
+        assert!(
+            self.dependency_units > 0,
+            "the corpus must prove a get_symbol hit answered from the dependency index, \
+             carrying unit in place of path"
         );
     }
 }
@@ -807,9 +927,41 @@ async fn call_tool_retrying_acceptance(
     Err("the server kept refusing a retryable corpus request".into())
 }
 
+/// Most lookups the walk issues while the dependency lane still indexes the helper.
+const INDEX_ATTEMPTS_MAX: usize = 60;
+/// Pause between two of those lookups.
+const INDEX_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Waits until the dependency lane has indexed the fixture's helper, so the corpus's
+/// dependency-scoped requests answer from a held package rather than a pending one.
+async fn helper_indexed(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+) -> TestResult {
+    let request = json!({ "name": "helper_beacon", "scope": "dependencies" });
+    for _attempt in 0..INDEX_ATTEMPTS_MAX {
+        let result = call_tool_retrying_acceptance(
+            client,
+            CallToolRequestParams::new("get_symbol").with_arguments(arguments(&request)?),
+        )
+        .await?;
+        let structured = result
+            .structured_content
+            .ok_or("get_symbol must return structured content")?;
+        if structured["hits"]
+            .as_array()
+            .is_some_and(|hits| !hits.is_empty())
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(INDEX_POLL).await;
+    }
+    Err("the dependency lane never indexed the fixture's helper within the poll bound".into())
+}
+
 #[tokio::test]
 async fn every_tool_result_validates_against_served_output_schema() -> TestResult {
     let (_directory, client, server_task) = served_fixture().await?;
+    helper_indexed(&client).await?;
     let tools = client.list_all_tools().await?;
 
     let advertised: BTreeSet<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
@@ -1350,7 +1502,7 @@ async fn live_witnessed_remove_node_round_trips_and_validates() -> TestResult {
         "an unreferenced declaration removes cleanly: {removed:#}"
     );
     assert_eq!(
-        fs::read_to_string(directory.path().join("remove_lonely.rs"))?,
+        fs::read_to_string(directory.workspace.path().join("remove_lonely.rs"))?,
         "",
         "the sole declaration leaves the file empty: {removed:#}"
     );

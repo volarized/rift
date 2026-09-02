@@ -43,6 +43,7 @@ EXPECTED_EDGES = {
     "rift-lsp -> rift-core",
     "rift-lsp -> rift-provider",
     "rift-mcp -> rift-core",
+    "rift-mcp -> rift-dependency",
     "rift-mcp -> rift-history",
     "rift-mcp -> rift-index",
     "rift-mcp -> rift-protocol",
