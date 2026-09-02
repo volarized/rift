@@ -438,7 +438,7 @@ mod tests {
         assert!(index.skipped().is_empty(), "{:?}", index.skipped());
         let package = index.package(&helper()).ok_or("the helper is held")?;
         assert_eq!(package.file_count(), 1);
-        assert_eq!(package.entry().identity(), &helper());
+        assert_eq!(package.identity(), &helper());
         drop(index);
 
         cancellation.cancel();
