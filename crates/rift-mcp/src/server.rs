@@ -24,7 +24,7 @@ use rift_protocol::error as wire;
 use rift_protocol::lock::ProductIdentity;
 use rift_protocol::read::{
     Digest, GetSymbolParams, GetSymbolResult, Language, NodesParams, NodesResult, Pagination,
-    ProjectPath, ReadWarning, SearchParams, SearchResult,
+    ProjectPath, ReadWarning, SearchParams, SearchResult, SearchScope,
 };
 use rift_protocol::workspace::{
     WORKSPACE_SOURCE_UNITS_MAX, WorkspaceHookSummary, WorkspaceLanguageSummary,
@@ -1092,7 +1092,9 @@ impl RiftMcp {
     /// full-text matches from included `[search.text]` files and declaration bodies, and by a
     /// bounded relationship `traversal` from one seed symbol. `rev` searches a
     /// version-control revision instead of the current tree, and never combines with
-    /// `traversal`. Use `get_symbol` when the declaration name is known.
+    /// `traversal`. `scope` reaches past the project tree: `dependencies` answers `query`
+    /// from the public declarations of the cataloged packages alone, `all` from both,
+    /// ordered together. Use `get_symbol` when the declaration name is known.
     ///
     /// For a current-tree search, the published workspace is resolved exactly once and
     /// threaded through both the search index's revision check and the executed
@@ -1152,12 +1154,16 @@ impl RiftMcp {
     /// `lexical_ranking_unavailable` and leave identifier search to answer alone, because
     /// both wait on an operator rather than on a pass already under way. A query-term limit
     /// the index refuses surfaces as this request's own `limit_exceeded` error, never a
-    /// silent degrade.
+    /// silent degrade. A `dependencies` scope never consults the index: the ranked lane
+    /// serves the project alone, so nothing about it rides that answer.
     async fn ranking(
         &self,
         params: &SearchParams,
         published: &PublishedWorkspace,
     ) -> Result<Option<SearchRanking>, ErrorData> {
+        if params.scope == SearchScope::Dependencies {
+            return Ok(Some(SearchRanking::default()));
+        }
         let Some(index) = self.search_index.as_ref() else {
             return Ok(Some(SearchRanking::unavailable(
                 "the workspace search database could not be opened, so the answer was ranked \

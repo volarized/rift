@@ -122,6 +122,7 @@ fn corpus() -> Vec<(&'static str, Value)> {
             }),
         ),
     ];
+    requests.extend(dependency_scope_search_corpus());
     requests.extend(node_write_corpus());
     requests.extend(patch_corpus());
     requests.extend(move_file_corpus());
@@ -133,6 +134,32 @@ fn corpus() -> Vec<(&'static str, Value)> {
     requests.extend(traversal_search_corpus());
     requests.extend(remove_corpus());
     requests
+}
+
+/// `scope` on `search` reaches the same helper `get_symbol`'s scoped requests reach: a
+/// dependency hit carries `unit` in place of `path`, `all` merges it with the project
+/// hits, and a `file` target answers empty from the package side since a package
+/// contributes declarations alone. Ordered ahead of every write corpus, so the project
+/// `beacon` declarations the `all` request merges still stand where the fixture put them.
+fn dependency_scope_search_corpus() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "search",
+            json!({ "query": "helper_beacon", "scope": "dependencies" }),
+        ),
+        (
+            "search",
+            json!({ "query": "beacon", "scope": "all", "include": ["source"] }),
+        ),
+        (
+            "search",
+            json!({
+                "query": "beacon",
+                "scope": "dependencies",
+                "target": "file"
+            }),
+        ),
+    ]
 }
 
 /// `traversal` requests over the one real call edge the fixture already carries -
@@ -498,8 +525,8 @@ fn assert_no_bare_sha256_digest(value: &Value, context: &str) {
 }
 
 /// Proves one tool result carries no oversized digest and no non-project source-unit
-/// resolver, that every `search` hit names its project-relative path, and that a read
-/// result warns only what it is entitled to.
+/// resolver, that every `search` hit names exactly one location, and that a read result
+/// warns only what it is entitled to.
 ///
 /// `get_symbol` and `nodes` carry empty `warnings`: the live server resolves one published
 /// workspace per request, so no request can observe a lagging index, and neither tool
@@ -512,11 +539,12 @@ fn assert_no_bare_sha256_digest(value: &Value, context: &str) {
 /// without operator action, and one that fired in ordinary operation would be one every
 /// caller learned to ignore.
 ///
-/// A `get_symbol` request whose `scope` reaches dependencies runs after the lane has
-/// indexed the fixture's helper, so no warning names the helper. The machine's toolchain
-/// decides what else the catalog holds: a standard library cataloged with a source root is
-/// reported pending while the lane walks it and skipped once the walk crosses the index's
-/// bounds, so such a request may carry the dependency warnings and no other.
+/// A `get_symbol` or `search` request whose `scope` reaches dependencies runs after the
+/// lane has indexed the fixture's helper, so no warning names the helper. The machine's
+/// toolchain decides what else the catalog holds: a standard library cataloged with a
+/// source root is reported pending while the lane walks it and skipped once the walk
+/// crosses the index's bounds, so such a request may carry the dependency warnings and no
+/// other.
 fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
     let context = format!("{name} result");
     let reaches_dependencies = matches!(request["scope"].as_str(), Some("dependencies" | "all"));
@@ -580,10 +608,18 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
             .as_array()
             .is_some_and(|include| include.iter().any(|value| value == "score"));
         for hit in results {
+            // A symbol hit is addressed by exactly one of `path` and `unit`; a file hit
+            // by `path` alone.
             assert!(
-                !hit["path"].is_null(),
-                "a search hit's path must not be null: {hit:#}"
+                hit.get("path").is_some() != hit.get("unit").is_some(),
+                "a search hit carries exactly one of path and unit: {hit:#}"
             );
+            if hit["hit"]["target"] == json!("file") {
+                assert!(
+                    hit.get("path").is_some(),
+                    "a file hit carries its project path: {hit:#}"
+                );
+            }
             if source_requested {
                 assert!(
                     !hit["source"].is_null(),
@@ -806,18 +842,15 @@ struct CorpusArms {
     refusal_reasons: BTreeSet<String>,
     precondition_kinds: BTreeSet<String>,
     dependency_units: usize,
+    search_dependency_units: usize,
 }
 
 impl CorpusArms {
     /// Records which change-status arms one structured result proves, and how many hits
-    /// answered from the dependency index.
+    /// answered from the dependency index, on a `get_symbol` and a `search` answer alike.
     fn observe(&mut self, structured: &Value) {
-        self.dependency_units += structured["hits"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|hit| hit.get("unit").is_some())
-            .count();
+        self.dependency_units += dependency_unit_count(&structured["hits"]);
+        self.search_dependency_units += dependency_unit_count(&structured["results"]);
         match structured["status"].as_str() {
             Some("applied") => {
                 self.applied_changes += 1;
@@ -875,7 +908,21 @@ impl CorpusArms {
             "the corpus must prove a get_symbol hit answered from the dependency index, \
              carrying unit in place of path"
         );
+        assert!(
+            self.search_dependency_units > 0,
+            "the corpus must prove a search hit answered from the dependency index, \
+             carrying unit in place of path"
+        );
     }
+}
+
+/// How many of `rows`, the hits of one paginated answer, carry `unit` in place of `path`.
+fn dependency_unit_count(rows: &Value) -> usize {
+    rows.as_array()
+        .into_iter()
+        .flatten()
+        .filter(|hit| hit.get("unit").is_some())
+        .count()
 }
 
 /// Compiles one input and one output validator per advertised tool.

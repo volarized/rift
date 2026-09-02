@@ -1,5 +1,6 @@
-//! `scope` on `get_symbol` end to end: a served workspace whose `Cargo.toml` names a
-//! path dependency, and the lookups that reach that package's public declarations.
+//! `scope` on `get_symbol` and `search` end to end: a served workspace whose `Cargo.toml`
+//! names a path dependency, and the lookups that reach that package's public
+//! declarations.
 //!
 //! The dependency lane indexes the package behind the answers, so a lookup issued before
 //! its pass ends answers empty and carries `dependency_index_pending`; every suite here
@@ -96,6 +97,45 @@ async fn get_symbol(
     arguments: Value,
 ) -> TestResult<Value> {
     call_retrying_acceptance(client, tool_request("get_symbol", &arguments)).await
+}
+
+/// One `search` answer for `arguments`.
+async fn search(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    arguments: Value,
+) -> TestResult<Value> {
+    call_retrying_acceptance(client, tool_request("search", &arguments)).await
+}
+
+/// The wire `ErrorData` one refused `search` carries. The caller has already proven the
+/// workspace answers, so the refusal is the request's own rather than acceptance's.
+async fn refused_search(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    arguments: Value,
+) -> TestResult<Value> {
+    let error = client
+        .call_tool(tool_request("search", &arguments))
+        .await
+        .expect_err("the request must be refused");
+    let rmcp::ServiceError::McpError(data) = error else {
+        panic!("expected protocol-level McpError, got {error:?}");
+    };
+    Ok(data.data.ok_or("wire error data must be present")?)
+}
+
+/// Each symbol hit's declaration name and whether it is addressed by `unit`.
+fn located_names(answer: &Value) -> Vec<(String, bool)> {
+    answer["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|hit| {
+            hit["hit"]["symbol"]["name"]
+                .as_str()
+                .map(str::to_owned)
+                .map(|name| (name, hit.get("unit").is_some()))
+        })
+        .collect()
 }
 
 /// The `code` of every warning the answer carries.
@@ -261,6 +301,159 @@ async fn the_all_scope_lists_the_project_hit_before_the_package_hit() -> TestRes
     assert_eq!(hits[0]["symbol"]["name"], json!("beacon"), "{answer:#}");
     assert_eq!(hits[1]["unit"], json!(HELPER_UNIT), "{answer:#}");
     assert_eq!(hits[1]["symbol"]["name"], json!("beacon"), "{answer:#}");
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_dependency_scoped_search_answers_the_package_declaration_by_unit() -> TestResult {
+    let workspace = served_dependent_workspace().await?;
+    let (_directory, client, server_task) = workspace.served;
+    helper_indexed(&client).await?;
+
+    let answer = search(
+        &client,
+        json!({ "query": "helper_beacon", "scope": "dependencies" }),
+    )
+    .await?;
+
+    let results = answer["results"].as_array().ok_or("results are an array")?;
+    assert_eq!(results.len(), 1, "{answer:#}");
+    let hit = &results[0];
+    assert_one_location(hit);
+    assert_eq!(hit["unit"], json!(HELPER_UNIT), "{hit:#}");
+    assert_eq!(hit["matched_by"], json!(["name"]), "{hit:#}");
+    assert_eq!(hit["hit"]["target"], json!("symbol"), "{hit:#}");
+    assert_eq!(
+        hit["hit"]["symbol"]["name"],
+        json!("helper_beacon"),
+        "{hit:#}"
+    );
+    assert_eq!(
+        hit["hit"]["symbol"]["origin"]["location"],
+        json!("dependency"),
+        "{hit:#}"
+    );
+    assert_eq!(hit["line"], json!(1), "{hit:#}");
+    assert!(
+        hit.get("source").is_none() && hit.get("score").is_none(),
+        "an omitted include attaches neither excerpt nor score: {hit:#}"
+    );
+    assert!(
+        hit.get("traversal_path").is_none() && hit.get("distance").is_none(),
+        "a lexical hit carries no walk: {hit:#}"
+    );
+    assert!(
+        answer["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|warning| warning["package"]["name"] != json!("helper")),
+        "an indexed package is never reported skipped: {answer:#}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_all_scope_search_answers_project_and_package_hits() -> TestResult {
+    let workspace = served_dependent_workspace().await?;
+    let (_directory, client, server_task) = workspace.served;
+    helper_indexed(&client).await?;
+
+    let answer = search(
+        &client,
+        json!({
+            "query": "beacon",
+            "scope": "all",
+            "target": "symbol",
+            "include": ["source"],
+            "limit": 10
+        }),
+    )
+    .await?;
+
+    let located = located_names(&answer);
+    for expected in [
+        ("beacon".to_owned(), false),
+        ("beacon".to_owned(), true),
+        ("helper_beacon".to_owned(), true),
+    ] {
+        assert!(located.contains(&expected), "{expected:?} {answer:#}");
+    }
+    let results = answer["results"].as_array().ok_or("results are an array")?;
+    for hit in results {
+        assert_one_location(hit);
+        assert!(hit["source"].is_string(), "{hit:#}");
+    }
+    let project = results
+        .iter()
+        .find(|hit| hit.get("path").is_some())
+        .ok_or("the project hit is addressed by path")?;
+    assert_eq!(project["path"], json!("src/lib.rs"), "{project:#}");
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_dependency_scoped_search_with_traversal_refuses_invalid_request() -> TestResult {
+    let workspace = served_dependent_workspace().await?;
+    let (_directory, client, server_task) = workspace.served;
+    search(&client, json!({ "query": "beacon" })).await?;
+
+    let wire = refused_search(
+        &client,
+        json!({
+            "query": "beacon",
+            "scope": "dependencies",
+            "traversal": { "seed": "rift://symbol/rust/src/lib.rs/beacon" }
+        }),
+    )
+    .await?;
+
+    assert_eq!(wire["code"], json!("invalid_request"), "{wire:#}");
+    assert!(
+        wire["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("traversal")),
+        "the refusal names the field: {wire:#}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_revision_search_with_a_dependency_scope_refuses_invalid_request() -> TestResult {
+    let workspace = served_dependent_workspace().await?;
+    let (directory, client, server_task) = workspace.served;
+    // A committed baseline, so `main` resolves and the scope rule is what refuses; the
+    // workspace database stays out of the commit.
+    fs::write(directory.path().join(".gitignore"), ".rift/\n")?;
+    rift_history::fixture::init(directory.path());
+    rift_history::fixture::commit_all(directory.path(), "fixture baseline");
+    search(&client, json!({ "query": "beacon" })).await?;
+
+    let wire = refused_search(
+        &client,
+        json!({ "query": "beacon", "scope": "all", "rev": "main" }),
+    )
+    .await?;
+
+    assert_eq!(wire["code"], json!("invalid_request"), "{wire:#}");
+    assert!(
+        wire["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("scope")),
+        "the refusal names the field: {wire:#}"
+    );
 
     client.cancel().await?;
     server_task.await?;
