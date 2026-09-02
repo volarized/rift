@@ -15,7 +15,7 @@ Start an unfamiliar repository at `rift://map`; it names the served languages an
 | --- | --- |
 | The target is unknown. | `search` |
 | The declaration name is known. | `get_symbol` |
-| A dependency's public declaration is needed. | `get_symbol` (with `scope: "dependencies"`, or `"all"` to list the project's own first) |
+| A dependency's public declaration is needed. | `get_symbol`, `search` (with `scope: "dependencies"`, or `"all"` to answer the project's own too) |
 | The syntax structure at one position is needed. | `nodes` |
 | A symbol's neighbors, its impact (who breaks when it changes), or a path between two symbols is needed. | `search` (with a `traversal` block) |
 | Code needs to change. | `patch`, `replace_node`, `insert_node`, `insert_symbol`, `replace_symbol`, `rename_symbol`, `remove_node`, `remove_symbol`, `move_file` (over raw file writes: the server recomputes witnesses and runs the workspace's configured hooks) |
