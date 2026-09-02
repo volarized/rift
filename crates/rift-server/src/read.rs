@@ -922,13 +922,8 @@ impl ReadService {
     pub fn get_symbol(&self, params: &GetSymbolParams) -> Result<GetSymbolResult, ReadError> {
         validate_common(params.rev.is_some())?;
         let limit = accepted_limit(params.limit)?;
+        self.validate_dependency_scope(params.scope, params.rev.as_ref())?;
         let reaches_dependencies = params.scope != SearchScope::Project;
-        if reaches_dependencies && (params.rev.is_some() || self.revision.is_some()) {
-            return Err(ReadFault::invalid(
-                "scope",
-                "dependencies are served for the current tree alone",
-            ));
-        }
         // Each index's whole ranked match set is collected up to the project index's
         // own `results_max` bound, so `pagination.total_pages` counts the full result
         // set the pages divide.
@@ -941,10 +936,7 @@ impl ReadService {
                 .map_err(ReadFault::index)?;
             candidates.extend(project.into_iter().map(RankedMatch::Project));
         }
-        let dependencies = match &self.dependencies {
-            Some(store) if reaches_dependencies => Some(store.read()?),
-            _ => None,
-        };
+        let dependencies = self.dependency_index(params.scope)?;
         if let Some(index) = dependencies.as_deref() {
             let found = index.symbols(&params.name, results_max);
             candidates.extend(found.into_iter().map(RankedMatch::Dependency));
@@ -989,6 +981,47 @@ impl ReadService {
             pagination,
             warnings,
         })
+    }
+
+    /// Refuses a `scope` that reaches dependencies on a revision read - one the
+    /// request's `rev` names, or the revision this snapshot already serves - since the
+    /// dependency index serves the current tree alone. `get_symbol` and `search` share
+    /// the rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] naming `scope` for a scope beyond `project` beside a
+    /// revision.
+    pub(crate) fn validate_dependency_scope(
+        &self,
+        scope: SearchScope,
+        rev: Option<&RevisionId>,
+    ) -> Result<(), ReadError> {
+        if scope != SearchScope::Project && (rev.is_some() || self.revision.is_some()) {
+            return Err(ReadFault::invalid(
+                "scope",
+                "dependencies are served for the current tree alone",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The dependency index an answer whose `scope` reaches dependencies reads, held on
+    /// the read side for the life of the answer. None for the project scope, and for a
+    /// service with no store attached, which answers as an empty index with nothing
+    /// pending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when a holder panicked with the lock held.
+    pub(crate) fn dependency_index(
+        &self,
+        scope: SearchScope,
+    ) -> Result<Option<RwLockReadGuard<'_, DependencyIndex>>, ReadError> {
+        match &self.dependencies {
+            Some(store) if scope != SearchScope::Project => store.read().map(Some),
+            _ => Ok(None),
+        }
     }
 
     /// One `get_symbol` hit from the project index, with the `symbol_disagreement`
@@ -1087,14 +1120,13 @@ impl<'a> RankedMatch<'a> {
     }
 }
 
-/// One `get_symbol` hit from a cataloged package: the symbol assembled through the
-/// package graph, addressed by its source unit alone, with no node identity and no
-/// history. `assembled_symbol` refuses a match whose file the package does not hold,
-/// so the unit read after it always answers.
-fn dependency_hit(
+/// One dependency match's wire symbol and the source unit its file is served under: the
+/// symbol assembled through the package graph, the unit read from the package.
+/// `assembled_symbol` refuses a match whose file the package does not hold, so the unit
+/// read after it always answers. `get_symbol` and `search` share this assembly.
+pub(crate) fn dependency_symbol(
     found: DependencySymbolMatch<'_>,
-    include_source: bool,
-) -> Result<GetSymbolHit, ReadError> {
+) -> Result<(Symbol, SourceUnitId), ReadError> {
     let matched = found.matched;
     let readable = found
         .package
@@ -1106,10 +1138,25 @@ fn dependency_hit(
             matched.file.path().as_str()
         )
     });
+    Ok((
+        assembled_wire_symbol(&readable),
+        SourceUnitId(unit.to_string()),
+    ))
+}
+
+/// One `get_symbol` hit from a cataloged package: the symbol assembled through the
+/// package graph, addressed by its source unit alone, with no node identity and no
+/// history.
+fn dependency_hit(
+    found: DependencySymbolMatch<'_>,
+    include_source: bool,
+) -> Result<GetSymbolHit, ReadError> {
+    let matched = found.matched;
+    let (symbol, unit) = dependency_symbol(found)?;
     Ok(GetSymbolHit {
-        symbol: assembled_wire_symbol(&readable),
+        symbol,
         path: None,
-        unit: Some(SourceUnitId(unit.to_string())),
+        unit: Some(unit),
         range: text_range(matched.symbol.range),
         line: line::line_number_at(matched.file.source(), matched.symbol.range.start),
         node: None,
@@ -1128,7 +1175,7 @@ fn identity_key(identity: &PackageIdentity) -> (&str, &str, &str) {
 /// [`DEPENDENCY_WARNINGS_MAX`] of `dependency_package_skipped` in identity order and
 /// `dependency_resolver_degraded` in resolver order together, skipped packages first.
 /// No index answers as an empty one with nothing pending.
-fn dependency_warnings(
+pub(crate) fn dependency_warnings(
     index: Option<&DependencyIndex>,
     catalog: &DependencyCatalog,
 ) -> Vec<ReadWarning> {
@@ -1716,7 +1763,7 @@ pub(crate) fn symbol_for_range(file: &IndexedFile, range: ByteRange) -> Option<&
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::error::Error;
     use std::fs;
     use std::sync::Arc;
@@ -2884,7 +2931,7 @@ pub fn compute() -> i32 {
         identity("cargo", "helper", "0.1.0")
     }
 
-    fn helper_unit() -> SourceUnitId {
+    pub(crate) fn helper_unit() -> SourceUnitId {
         SourceUnitId("rift://source/cargo/helper@0.1.0/src/lib.rs".to_owned())
     }
 
@@ -2913,7 +2960,7 @@ pub fn compute() -> i32 {
         Ok(PackageIndex::build(&entry, &files, 1)?)
     }
 
-    fn empty_dependency_index() -> DependencyIndex {
+    pub(crate) fn empty_dependency_index() -> DependencyIndex {
         DependencyIndex::planned(
             &DependencyCatalog::default(),
             DependencyIndexLimits::default(),
@@ -2932,7 +2979,7 @@ pub fn compute() -> i32 {
     }
 
     /// One project whose `src/lib.rs` holds `source` alone.
-    fn project_fixture(source: &str) -> TestResult<(TempDir, ReadService)> {
+    pub(crate) fn project_fixture(source: &str) -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
         fs::create_dir(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), source)?;
@@ -2952,7 +2999,7 @@ pub fn compute() -> i32 {
     }
 
     /// A store holding the built helper package alone.
-    fn helper_store() -> TestResult<Arc<DependencyStore>> {
+    pub(crate) fn helper_store() -> TestResult<Arc<DependencyStore>> {
         let mut index = empty_dependency_index();
         index.insert(helper_package()?)?;
         Ok(Arc::new(DependencyStore::new(index)))
