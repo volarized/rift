@@ -159,12 +159,6 @@ impl DependencyIndex {
         index
     }
 
-    /// The bounds this index holds packages under.
-    #[must_use]
-    pub const fn limits(&self) -> &DependencyIndexLimits {
-        &self.limits
-    }
-
     /// Holds one built package, replacing an earlier build of the same identity.
     ///
     /// # Errors

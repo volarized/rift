@@ -111,12 +111,6 @@ impl PackageIndex {
         })
     }
 
-    /// The catalog entry this index was built from.
-    #[must_use]
-    pub const fn entry(&self) -> &CatalogEntry {
-        &self.entry
-    }
-
     /// The package as its manager identifies it.
     #[must_use]
     pub const fn identity(&self) -> &PackageIdentity {
@@ -274,7 +268,7 @@ fn source_location(entry: &CatalogEntry) -> SourceLocation {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use rift_core::{ErrorCode, ErrorName, SourceLocation};
+    use rift_core::{ErrorCode, ErrorName, PathError, SourceLocation, SourceUnitIdError};
     use rift_dependency::{CatalogEntry, PackageLocation};
     use rift_syntax::ShippedLanguage;
 
@@ -470,5 +464,121 @@ mod tests {
 
         assert_eq!(violation_of(&error), PackageIndexViolation::Provider);
         assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn test_package_index_language_without_visibility_rules_answers_every_declaration() {
+        let entry = CatalogEntry::dependency(
+            identity("npm", "docs", "1.0.0"),
+            language(ShippedLanguage::Markdown),
+            None,
+            true,
+        );
+        let files = PackageFiles::new(vec![text("README.md", "# Guide\n\n## Install\n")], 0);
+
+        let package = PackageIndex::build(&entry, &files, 1).expect("package builds");
+        let matches = package.symbols("", 10);
+
+        assert_eq!(names(&matches), ["Guide", "Guide > Install"]);
+    }
+
+    #[test]
+    fn test_package_index_assembled_symbol_refuses_a_match_from_a_file_it_does_not_hold() {
+        let alpha = rust_package("alpha", "pub fn spawn() {}\n");
+        let entry = CatalogEntry::dependency(
+            identity("cargo", "beta", "1.0.0"),
+            language(ShippedLanguage::Rust),
+            None,
+            false,
+        );
+        let files = PackageFiles::new(vec![text("src/main.rs", "pub fn other() {}\n")], 0);
+        let beta = PackageIndex::build(&entry, &files, 1).expect("package builds");
+        let spawn = alpha.symbols("spawn", 1)[0];
+
+        let error = beta
+            .assembled_symbol(spawn)
+            .expect_err("a file another package holds");
+
+        assert_eq!(violation_of(&error), PackageIndexViolation::SymbolMissing);
+        assert_eq!(error.fault().package(), &identity("cargo", "beta", "1.0.0"));
+        assert_eq!(error.fault().path(), Some(Path::new("src/lib.rs")));
+    }
+
+    #[test]
+    fn test_package_index_assembled_symbol_refuses_a_declaration_its_graph_does_not_hold() {
+        let alpha = rust_package("alpha", "pub fn spawn() {}\n");
+        let beta = rust_package("beta", "pub fn other() {}\n");
+        let spawn = alpha.symbols("spawn", 1)[0];
+
+        let error = beta
+            .assembled_symbol(spawn)
+            .expect_err("a declaration another package's graph holds");
+
+        assert_eq!(violation_of(&error), PackageIndexViolation::SymbolMissing);
+        assert_eq!(error.fault().path(), None);
+        assert!(
+            error
+                .to_string()
+                .contains("identity rift://symbol/rust/cargo/beta@1.0.0/src/lib.rs/spawn"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_package_index_refuses_a_file_whose_parse_fails() {
+        let entry = CatalogEntry::new(
+            tokio(),
+            PackageLocation::Dependency,
+            language(ShippedLanguage::Rust),
+        );
+        let deep = format!("fn deep() {}{}", "{".repeat(600), "}".repeat(600));
+        let files = PackageFiles::new(vec![text("src/lib.rs", &deep)], 0);
+
+        let error =
+            PackageIndex::build(&entry, &files, 1).expect_err("nesting past the depth bound");
+
+        assert_eq!(violation_of(&error), PackageIndexViolation::Syntax);
+        assert_eq!(error.fault().path(), Some(Path::new("src/lib.rs")));
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn test_package_index_refuses_a_name_that_spells_no_source_path() {
+        let entry = CatalogEntry::new(
+            identity("cargo", "vendor\\tokio", "1.53.1"),
+            PackageLocation::Dependency,
+            language(ShippedLanguage::Rust),
+        );
+        let files = PackageFiles::new(vec![text("src/lib.rs", "pub fn spawn() {}\n")], 0);
+
+        let error = PackageIndex::build(&entry, &files, 1).expect_err("a backslash in the name");
+
+        assert_eq!(violation_of(&error), PackageIndexViolation::Identity);
+        assert_eq!(error.fault().path(), Some(Path::new("src/lib.rs")));
+        assert!(
+            std::error::Error::source(&error)
+                .is_some_and(|source| source.downcast_ref::<PathError>().is_some()),
+            "the source path refusal is the cause"
+        );
+    }
+
+    #[test]
+    fn test_package_index_refuses_an_identity_whose_unit_exceeds_the_bound() {
+        let entry = CatalogEntry::new(
+            identity("cargo", "tokio", &"#".repeat(2_800)),
+            PackageLocation::Dependency,
+            language(ShippedLanguage::Rust),
+        );
+        let files = PackageFiles::new(vec![text("src/lib.rs", "pub fn spawn() {}\n")], 0);
+
+        let error = PackageIndex::build(&entry, &files, 1).expect_err("a unit past the byte bound");
+
+        assert_eq!(violation_of(&error), PackageIndexViolation::Identity);
+        assert_eq!(error.fault().path(), Some(Path::new("src/lib.rs")));
+        assert!(
+            std::error::Error::source(&error)
+                .is_some_and(|source| source.downcast_ref::<SourceUnitIdError>().is_some()),
+            "the source unit refusal is the cause"
+        );
     }
 }

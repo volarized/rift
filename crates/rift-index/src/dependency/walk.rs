@@ -499,16 +499,12 @@ fn package_walk(root: &Path, directory_depth_max: usize) -> Walk {
 
 /// The root always; below it, nothing symlinked and no skipped directory name.
 fn package_walk_includes(entry: &DirEntry) -> bool {
-    if entry.depth() == 0 {
-        return true;
-    }
-    if entry.path_is_symlink() {
-        return false;
-    }
-    !entry
+    let is_root = entry.depth() == 0;
+    let skipped = entry
         .file_name()
         .to_str()
-        .is_some_and(is_skipped_directory_name)
+        .is_some_and(is_skipped_directory_name);
+    is_root || (!entry.path_is_symlink() && !skipped)
 }
 
 /// Whether `name` names a directory the walk leaves out.
@@ -849,5 +845,149 @@ mod tests {
             ["elsewhere/other.rs", "src/lib.rs"],
             "the symlinked file and directory are left out; the real file stays"
         );
+    }
+
+    #[test]
+    fn test_package_files_refuses_a_walked_path_that_is_no_project_path() {
+        let root = tempfile::tempdir().expect("package root");
+        write(root.path(), ".rift/lib.rs", b"pub fn hidden() {}\n");
+        let entry = rooted(tokio(), ShippedLanguage::Rust, root.path());
+
+        let error = package_files(&entry, &DependencyIndexLimits::default())
+            .expect_err("the rift state directory is no project path");
+
+        assert_eq!(violation_of(&error), PackageIndexViolation::InvalidPath);
+        assert_eq!(error.name(), ErrorName::Wire(ErrorCode::UnsupportedPath));
+        assert_eq!(
+            error.fault().path(),
+            Some(root.path().join(".rift/lib.rs").as_path())
+        );
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_package_files_refuses_a_single_file_root_that_is_no_project_path() {
+        let root = tempfile::tempdir().expect("package root");
+        write(root.path(), "six\\.py", b"def public(): ...\n");
+        let entry = rooted(
+            identity("uv", "six", "1.17.0"),
+            ShippedLanguage::Python,
+            &root.path().join("six\\.py"),
+        );
+
+        let error = package_files(&entry, &DependencyIndexLimits::default())
+            .expect_err("a backslash in the file name");
+
+        assert_eq!(violation_of(&error), PackageIndexViolation::InvalidPath);
+        assert_eq!(
+            error.fault().path(),
+            Some(root.path().join("six\\.py").as_path())
+        );
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_package_files_leaves_out_an_entry_that_is_neither_file_nor_directory() {
+        let root = tempfile::tempdir().expect("package root");
+        write(root.path(), "src/lib.rs", b"pub fn spawn() {}\n");
+        let _socket =
+            std::os::unix::net::UnixListener::bind(root.path().join("s.rs")).expect("socket file");
+        let entry = rooted(tokio(), ShippedLanguage::Rust, root.path());
+
+        let files = package_files(&entry, &DependencyIndexLimits::default()).expect("selected");
+
+        assert_eq!(sorted_paths(&files), ["src/lib.rs"]);
+    }
+
+    /// APFS refuses a file name outside UTF-8 with `EILSEQ`, so Linux alone hosts the fixture.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_package_files_refuses_a_file_whose_name_is_not_utf8() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+        let root = tempfile::tempdir().expect("package root");
+        write(root.path(), "src/lib.rs", b"pub fn spawn() {}\n");
+        let odd = root
+            .path()
+            .join("src")
+            .join(OsStr::from_bytes(b"caf\xe9.rs"));
+        std::fs::write(&odd, b"pub fn odd() {}\n").expect("fixture file");
+        let entry = rooted(tokio(), ShippedLanguage::Rust, root.path());
+
+        let error = package_files(&entry, &DependencyIndexLimits::default())
+            .expect_err("a file name outside UTF-8");
+
+        assert_eq!(violation_of(&error), PackageIndexViolation::InvalidPath);
+        assert_eq!(error.fault().path(), Some(odd.as_path()));
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    /// APFS refuses a file name outside UTF-8 with `EILSEQ`, so Linux alone hosts the fixture.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_package_files_refuses_a_single_file_root_whose_name_is_not_utf8() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+        let directory = tempfile::tempdir().expect("package root");
+        let root = directory.path().join(OsStr::from_bytes(b"caf\xe9.py"));
+        std::fs::write(&root, b"def public(): ...\n").expect("fixture file");
+        let entry = rooted(
+            identity("uv", "six", "1.17.0"),
+            ShippedLanguage::Python,
+            &root,
+        );
+
+        let error = package_files(&entry, &DependencyIndexLimits::default())
+            .expect_err("a root name outside UTF-8");
+
+        assert_eq!(violation_of(&error), PackageIndexViolation::InvalidPath);
+        assert_eq!(error.fault().path(), Some(root.as_path()));
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_package_files_refuses_an_unreadable_directory_naming_the_root() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().expect("package root");
+        write(root.path(), "src/lib.rs", b"pub fn spawn() {}\n");
+        let locked = root.path().join("src");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("fixture permissions set");
+        let entry = rooted(tokio(), ShippedLanguage::Rust, root.path());
+
+        let error = package_files(&entry, &DependencyIndexLimits::default());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+            .expect("fixture permissions restore");
+        let error = error.expect_err("a directory this process cannot read");
+
+        assert_eq!(violation_of(&error), PackageIndexViolation::Unreadable);
+        assert_eq!(error.name(), ErrorName::Wire(ErrorCode::StorageFailure));
+        assert_eq!(error.fault().path(), Some(root.path()));
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_package_files_refuses_an_unreadable_file_naming_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().expect("package root");
+        write(root.path(), "src/lib.rs", b"pub fn spawn() {}\n");
+        let locked = root.path().join("src/lib.rs");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("fixture permissions set");
+        let entry = rooted(tokio(), ShippedLanguage::Rust, root.path());
+
+        let error = package_files(&entry, &DependencyIndexLimits::default());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644))
+            .expect("fixture permissions restore");
+        let error = error.expect_err("a file this process cannot read");
+
+        assert_eq!(violation_of(&error), PackageIndexViolation::Unreadable);
+        assert_eq!(error.name(), ErrorName::Wire(ErrorCode::StorageFailure));
+        assert_eq!(error.fault().path(), Some(locked.as_path()));
+        assert!(std::error::Error::source(&error).is_some());
     }
 }

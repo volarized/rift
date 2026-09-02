@@ -110,10 +110,8 @@ impl DocumentPlacement {
     /// Returns [`SyntaxPublicationError`] when the document's path breaks
     /// source-unit rules.
     pub fn project(document: &SyntaxDocument) -> Result<Self, SyntaxPublicationError> {
-        let origin = ContributionOrigin::new(
-            Some(SourceLocation::Project { package: None }),
-            SourceKind::Authored,
-        )?;
+        let location = SourceLocation::Project { package: None };
+        let origin = ContributionOrigin::new(Some(location), SourceKind::Authored)?;
         Ok(Self::new(
             origin,
             source_unit(document)?,
