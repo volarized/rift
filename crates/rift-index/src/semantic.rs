@@ -8,8 +8,8 @@ use rift_binding::{
 };
 use rift_core::{
     ContributionError, ContributionOrigin, ContributionReference, IndexRevision, ProviderId,
-    ProviderRevision, ProviderSymbolId, RevisionError, SourceKind, SourceLocation, SourceRevision,
-    SourceUnitId, SourceUnitIdError, TreeRevision,
+    ProviderRevision, ProviderSymbolId, RevisionError, SourceRevision, SourceUnitId,
+    SourceUnitIdError, TreeRevision,
 };
 use rift_protocol::configuration::BindingConfiguration;
 use rift_protocol::read::Language;
@@ -19,8 +19,8 @@ use rift_provider::{
     PublicationSet, SymbolAssembler,
 };
 use rift_syntax::{
-    SYNTAX_PROVIDER_ID, SyntaxDocument, SyntaxPublicationBuilder, SyntaxPublicationError, registry,
-    source_unit,
+    DocumentPlacement, SYNTAX_PROVIDER_ID, SyntaxDocument, SyntaxPublicationBuilder,
+    SyntaxPublicationError, registry,
 };
 
 use crate::relationship::RelationshipStore;
@@ -41,6 +41,12 @@ impl BindingPolicy {
     #[must_use]
     pub const fn new(enabled: bool, limits: BindingLimits) -> Self {
         Self { enabled, limits }
+    }
+
+    /// The policy under which no binding provider runs, as a dependency package builds.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self::new(false, BindingLimits::default())
     }
 
     /// Whether the binding provider runs at all.
@@ -101,6 +107,15 @@ fn accepted_bound(value: u64) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX).max(1)
 }
 
+/// One syntax document and the placement its declarations are filed under.
+#[derive(Debug)]
+pub(crate) struct PlacedDocument<'a> {
+    /// The parsed document.
+    pub(crate) document: &'a SyntaxDocument,
+    /// The unit, origin, and identity path its declarations carry.
+    pub(crate) placement: DocumentPlacement,
+}
+
 /// Contribution graph captured by one workspace index publication.
 #[derive(Debug)]
 pub(crate) struct WorkspaceSemantics {
@@ -112,15 +127,40 @@ pub(crate) struct WorkspaceSemantics {
 impl WorkspaceSemantics {
     /// Builds syntax and binding publications and one normalized graph over one file set.
     ///
-    /// `project_paths` is every path the index holds, indexed and text files alike:
-    /// each language provider derives its module layout from that set, so manifest
-    /// files such as `Cargo.toml` reach the layout. The binding provider publishes
-    /// beside syntax when `binding` enables it and at least one document carries
-    /// binding facts. A binding failure - an exhausted limit, a refused publication,
-    /// a refused refinement - never fails the build: the revision publishes with the
-    /// syntax publication alone and the failure lands in the server log.
+    /// Every document takes the project placement, [`DocumentPlacement::project`];
+    /// the build itself is [`Self::build_placed`]. `project_paths` is every path the
+    /// index holds, indexed and text files alike: each language provider derives its
+    /// module layout from that set, so manifest files such as `Cargo.toml` reach the
+    /// layout.
     pub(crate) fn build<'a>(
         documents: impl IntoIterator<Item = &'a SyntaxDocument>,
+        project_paths: &[&str],
+        revision: u64,
+        previous: Option<&NormalizedGraph>,
+        binding: &BindingPolicy,
+    ) -> Result<Self, WorkspaceSemanticError> {
+        let placed = documents
+            .into_iter()
+            .map(|document| {
+                Ok(PlacedDocument {
+                    document,
+                    placement: DocumentPlacement::project(document)?,
+                })
+            })
+            .collect::<Result<Vec<_>, SyntaxPublicationError>>()?;
+        Self::build_placed(&placed, project_paths, revision, previous, binding)
+    }
+
+    /// Builds the publications and one normalized graph over documents the caller placed.
+    ///
+    /// The binding provider publishes beside syntax when `binding` enables it and at
+    /// least one document carries binding facts; a dependency package builds under
+    /// [`BindingPolicy::disabled`] with an empty `project_paths`. A binding failure -
+    /// an exhausted limit, a refused publication, a refused refinement - never fails
+    /// the build: the revision publishes with the syntax publication alone and the
+    /// failure lands in the server log.
+    pub(crate) fn build_placed(
+        documents: &[PlacedDocument<'_>],
         project_paths: &[&str],
         revision: u64,
         previous: Option<&NormalizedGraph>,
@@ -131,21 +171,20 @@ impl WorkspaceSemantics {
         let tree_revision = TreeRevision::new(revision)?;
         let provider_revision = ProviderRevision::new(revision)?;
         let limits = publication_limits(binding)?;
-        let documents: Vec<&SyntaxDocument> = documents.into_iter().collect();
         let mut builder = SyntaxPublicationBuilder::new(
             provider_revision,
             source_revision,
             tree_revision,
             limits,
         )?;
-        for document in &documents {
-            builder.add_document(document)?;
+        for placed in documents {
+            builder.add_document_placed(placed.document, &placed.placement)?;
         }
         let publication = builder.build()?;
         let publications = PublicationSet::empty(limits).replaced(publication)?;
         let publications = Arc::new(with_binding(
             publications,
-            &documents,
+            documents,
             project_paths,
             binding,
             (provider_revision, source_revision, tree_revision),
@@ -222,7 +261,7 @@ fn publication_limits(
 /// caller handed in.
 fn with_binding(
     publications: PublicationSet,
-    documents: &[&SyntaxDocument],
+    documents: &[PlacedDocument<'_>],
     project_paths: &[&str],
     binding: &BindingPolicy,
     revisions: (ProviderRevision, SourceRevision, TreeRevision),
@@ -259,7 +298,7 @@ fn with_binding(
 /// publishes no empty binding publication.
 fn binding_replaced(
     publications: &PublicationSet,
-    documents: &[&SyntaxDocument],
+    documents: &[PlacedDocument<'_>],
     project_paths: &[&str],
     limits: &BindingLimits,
     revisions: (ProviderRevision, SourceRevision, TreeRevision),
@@ -336,23 +375,23 @@ fn refined_unit_facts(
 
 /// Every document's binding facts, refined under its language's module layout.
 fn binding_units(
-    documents: &[&SyntaxDocument],
+    documents: &[PlacedDocument<'_>],
     project_paths: &[&str],
     limits: &BindingLimits,
 ) -> Result<Vec<(SourceUnitId, ContributionOrigin, UnitBindingFacts)>, WorkspaceSemanticError> {
     let mut layouts = ModuleLayouts::new(project_paths);
     let mut units = Vec::new();
-    for document in documents {
-        let Some(facts) = document.binding() else {
+    for placed in documents {
+        let Some(facts) = placed.document.binding() else {
             continue;
         };
-        let layout = layouts.layout_for(document.language());
-        let facts = refined_unit_facts(layout, document.path().as_str(), facts, limits)?;
-        let origin = ContributionOrigin::new(
-            Some(SourceLocation::Project { package: None }),
-            SourceKind::Authored,
-        )?;
-        units.push((source_unit(document)?, origin, facts));
+        let layout = layouts.layout_for(placed.document.language());
+        let facts = refined_unit_facts(layout, placed.document.path().as_str(), facts, limits)?;
+        units.push((
+            placed.placement.unit().clone(),
+            placed.placement.origin().clone(),
+            facts,
+        ));
     }
     Ok(units)
 }
