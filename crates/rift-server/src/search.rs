@@ -98,14 +98,9 @@ impl ReadService {
                         &mut results,
                     )?;
                 }
-                collect_ranked_hits(
-                    self.index(),
-                    matcher.as_ref(),
-                    root,
-                    criteria,
-                    ranked,
-                    &mut results,
-                )?;
+                let index = self.index();
+                let matcher = matcher.as_ref();
+                collect_ranked_hits(index, matcher, root, criteria, ranked, &mut results)?;
             }
             collect_dependency_hits(dependencies.as_deref(), criteria, fetch_limit, &mut results)?;
         }
