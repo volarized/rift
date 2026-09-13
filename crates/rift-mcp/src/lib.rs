@@ -21,11 +21,16 @@ pub use election::{
     document_path, probe, read_serving, serve_elected, serve_elected_with_storage,
 };
 pub use http::{HttpServeError, HttpServeFault, HttpServer, serve_http};
-pub use logs::{LOG_QUEUE_RECORDS, LogDrain, LogSink, log_capture, logs_configuration};
+pub use logs::{
+    LOG_QUEUE_RECORDS, LogDrain, LogSink, PANIC_PAYLOAD_BYTES_MAX, install_panic_hook, log_capture,
+    logs_configuration,
+};
 pub use proxy::{ProxyFault, ProxyServeError, serve_proxy};
 pub use server::RiftMcp;
 pub use spawn::{
-    PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, spawn_detached_server,
+    BoundedStderr, BoundedWriter, PRESENCE_POLL_INTERVAL, SERVER_STDERR_BYTES_MAX,
+    SERVER_STDERR_FILE_NAME, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, SpawnedServer,
+    spawn_detached_server, stderr_file_path,
 };
 pub use storage::WorkspaceStorage;
 
