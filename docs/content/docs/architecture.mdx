@@ -762,9 +762,9 @@ the retry schedule. A
 `workspace/diagnostic/refresh` request invalidates earlier pull evidence. An answer that still
 changes at the bound is unready, never proof of clean bytes.
 
-When the whole budget is spent while announced work remains outstanding, a rename or a move fails
-`temporarily_unavailable` with the tree untouched, so the caller can send the same request again
-once the engine has loaded.
+When the whole budget is spent while announced work remains outstanding, a rename, a move, or a
+removal fails `temporarily_unavailable` with the tree untouched, so the caller can send the same
+request again once the engine has loaded.
 
 ### Rename a declaration
 
