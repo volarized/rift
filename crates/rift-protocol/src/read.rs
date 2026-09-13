@@ -784,7 +784,7 @@ pub struct NodesResult {
 }
 
 /// One package as its package manager identifies it.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackageIdentity {
     /// Package manager or ecosystem name.

@@ -40,8 +40,8 @@ pub use semantic::{
     ContributionFault, ContributionKey, ContributionOrigin, ContributionReference,
     ContributionRelationship, ContributionViolation, DeclarationBinding, Documentation,
     DocumentationFormat, EquivalenceEvidence, ExactKind, ExtensionKey, ExtensionValue, Extensions,
-    Language, NodeId, PROVIDER_SYMBOL_ID_BYTES_MAX, PortableSymbolFacts, ReferenceRole,
-    RelationshipKind, SemanticReference, Signature, SourceApplicability, SourceKind,
+    Language, NodeId, PROVIDER_SYMBOL_ID_BYTES_MAX, PackageIdentity, PortableSymbolFacts,
+    ReferenceRole, RelationshipKind, SemanticReference, Signature, SourceApplicability, SourceKind,
     SourceLocation, SourceRange, SymbolFacet, SymbolRecord, SymbolResolution, TypeBinding,
 };
 
