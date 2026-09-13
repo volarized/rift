@@ -20,4 +20,4 @@ pub use correlation::{Correlation, CorrelationError, CorrelationFault, RequestId
 pub use framing::{Framing, FramingError, FramingFault};
 pub use position::{LineIndex, PositionError, PositionFault};
 pub use session::{EngineError, EngineFault, EngineLaunch, EngineSession};
-pub use uri::{TreeRoot, UriError, UriFault};
+pub use uri::{EngineAddress, EngineRoots, PackageRoot, TreeRoot, UriError, UriFault};
