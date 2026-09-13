@@ -26,6 +26,7 @@ use rift_protocol::configuration::{
 use rift_protocol::dependencies::DependenciesConfiguration;
 use rift_protocol::error as wire;
 use rift_protocol::map::WorkspaceMap;
+use rift_protocol::source::SourceConfiguration;
 use rift_search::{Embedding, SearchError, SearchIndex};
 use rift_server::{
     CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, DependencyStore, LspProcessKey, ReadError,
@@ -362,6 +363,30 @@ impl ConfigurationState {
             .unwrap_or_default()
     }
 
+    /// The `[source]` table from the last acceptance, or the default table while
+    /// `rift.toml` is invalid.
+    pub(crate) fn source_configuration(&self) -> SourceConfiguration {
+        self.accepted
+            .as_ref()
+            .map(|configuration| configuration.source.clone())
+            .unwrap_or_default()
+    }
+
+    /// The bounds the index builds under: `base` with its file count and aggregate byte
+    /// bounds replaced by the `[source]` table's `files` and `workspace_size`. The
+    /// per-file, depth, and result bounds stay as `base` carries them.
+    pub(crate) fn index_limits(
+        &self,
+        base: WorkspaceIndexLimits,
+    ) -> Result<WorkspaceIndexLimits, ReadError> {
+        let source = self.source_configuration();
+        let files_max = usize::try_from(source.files).unwrap_or(usize::MAX);
+        let workspace_bytes_max =
+            usize::try_from(source.workspace_size.bytes()).unwrap_or(usize::MAX);
+        base.with_workspace_bounds(files_max, workspace_bytes_max)
+            .map_err(|error| ReadError::from(ReadFault::Index(error)))
+    }
+
     /// The `[source]` policy from the last acceptance, or the default policy
     /// while `rift.toml` is invalid.
     pub(crate) fn source_visibility(&self) -> SourceVisibility {
@@ -395,7 +420,7 @@ impl ConfigurationState {
     /// `[dependencies]` table: the read service resolves its catalog under the table's
     /// resolution policy and gates dependency-scoped lookups on its switch.
     fn index_configuration_differs(&self, other: &Self) -> bool {
-        self.source_visibility() != other.source_visibility()
+        self.source_configuration() != other.source_configuration()
             || self.text_inclusion() != other.text_inclusion()
             || self.language_file_selections() != other.language_file_selections()
             || self.binding_configuration() != other.binding_configuration()
@@ -1186,6 +1211,7 @@ fn whole_workspace_candidate(
     dependencies: &Arc<DependencyStore>,
 ) -> Result<PublishedWorkspace, ReadError> {
     let visibility = configuration.source_visibility();
+    let limits = configuration.index_limits(limits)?;
     let text_inclusion = configuration.text_inclusion();
     let languages = configuration.language_file_selections();
     let binding = BindingPolicy::from(&configuration.binding_configuration());

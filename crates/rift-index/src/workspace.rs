@@ -15,9 +15,10 @@ use rift_core::constants::{
 };
 use rift_core::{
     CompositionId, Error, ErrorCode, ErrorContext, ErrorName, Fault, LanguageFileSelections,
-    PortableSymbolFacts, ProjectPath, ProviderId, SourceVisibility, SymbolId, TextFileInclusion,
-    fault_label, symbol_identity,
+    LimitEvidence, PortableSymbolFacts, ProjectPath, ProviderId, SourceVisibility, SymbolId,
+    TextFileInclusion, fault_label, symbol_identity,
 };
+use rift_protocol::source::{SOURCE_FILES_FIELD, SOURCE_WORKSPACE_SIZE_FIELD};
 use rift_provider::{
     AssembledSymbol, Component, CompositionBuilder, NormalizedGraph, ProviderComposition,
 };
@@ -32,7 +33,7 @@ use crate::change_set::{FileDigest, PathChanges, WorkspaceDigests};
 use crate::chunk::text_chunks;
 use crate::glob::PathMatcher;
 use crate::language::{ClassifiedPath, LanguagePolicyError, WorkspaceLanguagePolicy};
-use crate::lexical::{LexicalUnit, LexicalUnitKind};
+use crate::lexical::{LexicalUnit, LexicalUnitKind, LimitBreach};
 use crate::relationship::RelationshipStore;
 use crate::semantic::{BindingPolicy, WorkspaceSemantics};
 
@@ -90,6 +91,26 @@ impl WorkspaceIndexLimits {
         ]
     }
 
+    /// The same per-file, depth, and result bounds under the `[source]` table's own
+    /// `files` and `workspace_size`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] when either bound is zero.
+    pub fn with_workspace_bounds(
+        self,
+        files_max: usize,
+        workspace_bytes_max: usize,
+    ) -> Result<Self, WorkspaceIndexError> {
+        Self::new(
+            files_max,
+            self.file_bytes_max,
+            workspace_bytes_max,
+            self.directory_depth_max,
+            self.results_max,
+        )
+    }
+
     /// Returns maximum result count accepted per query.
     #[must_use]
     pub const fn results_max(self) -> usize {
@@ -140,11 +161,11 @@ pub enum WorkspaceIndexViolation {
     InvalidRoot,
     /// Directory depth exceeds bound.
     TooDeep,
-    /// Rust source count exceeds bound.
+    /// Source file count exceeds the `[source] files` bound.
     TooManyFiles,
-    /// One Rust source exceeds byte bound.
+    /// One source file exceeds its language's per-file byte bound.
     FileTooLarge,
-    /// Aggregate Rust source bytes exceed bound.
+    /// Aggregate source bytes exceed the `[source] workspace_size` bound.
     WorkspaceTooLarge,
     /// Workspace path is not UTF-8 or canonical project syntax.
     InvalidPath,
@@ -172,12 +193,15 @@ pub enum WorkspaceIndexViolation {
 }
 
 /// One workspace indexing failure: its violation, the offending path when
-/// known, and the underlying cause (I/O, UTF-8, syntax).
+/// known, the underlying cause (I/O, UTF-8, syntax), and - for a `[source]`
+/// bound - the typed bound it crossed, boxed so every `Result` carrying this
+/// fault inline keeps the size it was sized for.
 #[derive(Debug)]
 pub struct WorkspaceIndexFault {
     violation: WorkspaceIndexViolation,
     path: Option<PathBuf>,
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    limit: Option<Box<LimitBreach>>,
 }
 
 impl WorkspaceIndexFault {
@@ -282,6 +306,9 @@ impl Fault for WorkspaceIndexFault {
         if let Some(path) = &self.path {
             context.push(ErrorContext::new("path", path.display().to_string()));
         }
+        if let Some(breach) = &self.limit {
+            context.extend(breach.context());
+        }
         if let Some(error) = self.history_source() {
             context.extend(error.context());
         }
@@ -305,6 +332,10 @@ impl Fault for WorkspaceIndexFault {
             .as_deref()
             .map(|source| source as &(dyn std::error::Error + 'static))
     }
+
+    fn limit_evidence(&self) -> Option<LimitEvidence> {
+        self.limit.as_deref().map(LimitBreach::evidence)
+    }
 }
 
 /// Opaque workspace indexing failure.
@@ -315,6 +346,7 @@ pub(crate) fn index_error(violation: WorkspaceIndexViolation) -> WorkspaceIndexE
         violation,
         path: None,
         source: None,
+        limit: None,
     })
 }
 
@@ -326,6 +358,25 @@ pub(crate) fn index_error_at(
         violation,
         path: Some(path.to_path_buf()),
         source: None,
+        limit: None,
+    })
+}
+
+/// A `[source]` bound refusal: the violation, the path that crossed the bound, and the
+/// typed bound - `field`, `observed`, `maximum` - the wire evidence and the rendered
+/// context both derive from.
+pub(crate) fn index_error_over_limit(
+    violation: WorkspaceIndexViolation,
+    path: &Path,
+    field: &'static str,
+    observed: usize,
+    maximum: usize,
+) -> WorkspaceIndexError {
+    Error::new(WorkspaceIndexFault {
+        violation,
+        path: Some(path.to_path_buf()),
+        source: None,
+        limit: Some(Box::new(LimitBreach::from_counts(field, observed, maximum))),
     })
 }
 
@@ -338,6 +389,7 @@ pub(crate) fn index_error_caused_by(
         violation,
         path: path.map(Path::to_path_buf),
         source: Some(Box::new(source)),
+        limit: None,
     })
 }
 
@@ -743,9 +795,12 @@ impl WorkspaceSourcePolicy {
                 continue;
             }
             if paths.len() >= self.limits.files_max {
-                return Err(index_error_at(
+                return Err(index_error_over_limit(
                     WorkspaceIndexViolation::TooManyFiles,
                     entry.path(),
+                    SOURCE_FILES_FIELD,
+                    paths.len().saturating_add(1),
+                    self.limits.files_max,
                 ));
             }
             let relative = entry.path().strip_prefix(&self.root).map_err(|error| {
@@ -866,17 +921,22 @@ impl WorkspaceSourcePolicy {
         Ok(Some(FileDigest::of(&bytes)))
     }
 
-    /// Captures every visible regular file's content digest.
+    /// Captures every visible regular file's content digest. A file the index leaves out
+    /// under the per-file byte bound is absent from the capture, as it is from the index.
     ///
     /// # Errors
     ///
-    /// Returns [`WorkspaceIndexError`] for reads or configured-bound failures.
+    /// Returns [`WorkspaceIndexError`] for a read that fails or a walk past the file count
+    /// bound.
     pub fn visible_digests(&self) -> Result<WorkspaceDigests, WorkspaceIndexError> {
         let mut digests = Vec::new();
         for path in self.visible_paths()? {
             let absolute = self.root.join(path.as_str());
-            if let Some(digest) = self.visible_digest(&absolute)? {
-                digests.push((path, digest));
+            match self.visible_digest(&absolute) {
+                Ok(Some(digest)) => digests.push((path, digest)),
+                Ok(None) => {}
+                Err(error) if error.fault().left_out_file(path.clone()).is_some() => {}
+                Err(error) => return Err(error),
             }
         }
         Ok(WorkspaceDigests::new(digests))
@@ -1039,7 +1099,7 @@ impl LeftOutFileState {
 /// The files one build holds and the files it left out, gathered before the index is
 /// assembled over them.
 #[derive(Default)]
-struct IndexContents {
+pub(crate) struct IndexContents {
     files: BTreeMap<ProjectPath, Arc<IndexedFile>>,
     text_files: BTreeMap<ProjectPath, Arc<TextSourceFile>>,
     left_out: BTreeMap<ProjectPath, LeftOutFileState>,
@@ -1070,11 +1130,17 @@ impl IndexContents {
         contents
     }
 
+    /// Files this build holds so far, syntax-indexed or text alone; every held file
+    /// sits in `text_files`.
+    pub(crate) fn held_count(&self) -> usize {
+        self.text_files.len()
+    }
+
     /// Holds one cataloged file a provider claims: in both maps when its syntax facts fit
     /// the provider's bounds. A file the provider refuses under one of its bounds keeps
     /// only its digests, so a capture of the tree still agrees with the index, and
     /// `warnings` names it.
-    fn hold_source_file(
+    pub(crate) fn hold_source_file(
         &mut self,
         text_file: TextSourceFile,
         context_path: &Path,
@@ -1095,13 +1161,13 @@ impl IndexContents {
     }
 
     /// Holds one cataloged file no provider claims.
-    fn hold_text_file(&mut self, text_file: TextSourceFile) {
+    pub(crate) fn hold_text_file(&mut self, text_file: TextSourceFile) {
         self.text_files
             .insert(text_file.path().clone(), Arc::new(text_file));
     }
 
     /// Records one file the catalog read left out.
-    fn leave_out(&mut self, warning: WorkspaceIndexWarning) {
+    pub(crate) fn leave_out(&mut self, warning: WorkspaceIndexWarning) {
         self.warnings.push(warning);
     }
 
@@ -1356,22 +1422,22 @@ impl WorkspaceIndex {
 
     /// Assembles an index from files another source already accepted - the
     /// revision build, whose bytes come from git objects instead of a
-    /// directory walk. Revision reads carry no text files: `text_inclusion` is kept only
-    /// so a future revision-text feature can reuse this constructor unchanged. No
-    /// configuration reaches a revision build, so the binding provider runs under
-    /// the default [`BindingPolicy`].
+    /// directory walk. No configuration reaches a revision build, so the
+    /// binding provider runs under the default [`BindingPolicy`].
     pub(crate) fn from_parts(
         root: PathBuf,
-        files: Vec<IndexedFile>,
-        text_files: Vec<TextSourceFile>,
+        contents: IndexContents,
         composition: ProviderComposition,
         limits: WorkspaceIndexLimits,
         language: Arc<WorkspaceLanguagePolicy>,
         text_inclusion: TextFileInclusion,
     ) -> Result<Self, WorkspaceIndexError> {
-        let files = keyed_by_path(files, IndexedFile::path);
-        let text_files = keyed_by_path(text_files, TextSourceFile::path);
-        let left_out = BTreeMap::new();
+        let IndexContents {
+            files,
+            text_files,
+            left_out,
+            warnings,
+        } = contents.sorted();
         let fingerprint = WorkspaceFingerprint::from_files(&files, &text_files, &left_out);
         let binding = BindingPolicy::default();
         let semantics = WorkspaceSemantics::build(
@@ -1394,7 +1460,7 @@ impl WorkspaceIndex {
             fingerprint,
             binding,
             semantics,
-            warnings: Vec::new(),
+            warnings,
         })
     }
 
@@ -1814,8 +1880,11 @@ impl WorkspaceIndex {
         }
         Self::from_parts(
             self.root.clone(),
-            files,
-            text_files,
+            IndexContents {
+                files: keyed_by_path(files, IndexedFile::path),
+                text_files: keyed_by_path(text_files, TextSourceFile::path),
+                ..IndexContents::default()
+            },
             self.composition.clone(),
             self.limits,
             Arc::clone(&self.language),
@@ -2036,7 +2105,13 @@ fn discover(
         };
         let total = discovered.source.len() + discovered.text.len();
         if total >= limits.files_max {
-            return Err(index_error_at(WorkspaceIndexViolation::TooManyFiles, path));
+            return Err(index_error_over_limit(
+                WorkspaceIndexViolation::TooManyFiles,
+                path,
+                SOURCE_FILES_FIELD,
+                total.saturating_add(1),
+                limits.files_max,
+            ));
         }
         match class {
             ClassifiedPath::Source(provider) => {
@@ -2084,7 +2159,13 @@ impl GitignoreChain {
                 continue;
             }
             if ignore_files >= limits.files_max {
-                return Err(index_error_at(WorkspaceIndexViolation::TooManyFiles, path));
+                return Err(index_error_over_limit(
+                    WorkspaceIndexViolation::TooManyFiles,
+                    path,
+                    SOURCE_FILES_FIELD,
+                    ignore_files.saturating_add(1),
+                    limits.files_max,
+                ));
             }
             ignore_files += 1;
             layers.push(compiled_gitignore(path)?);
@@ -2225,9 +2306,12 @@ fn capture_path_class(
             .checked_add(bytes.len())
             .ok_or_else(|| index_error_at(WorkspaceIndexViolation::WorkspaceTooLarge, path))?;
         if *workspace_bytes > limits.workspace_bytes_max() {
-            return Err(index_error_at(
+            return Err(index_error_over_limit(
                 WorkspaceIndexViolation::WorkspaceTooLarge,
                 path,
+                SOURCE_WORKSPACE_SIZE_FIELD,
+                *workspace_bytes,
+                limits.workspace_bytes_max(),
             ));
         }
         let project_path = project_path_below(root, path)?;
@@ -2474,9 +2558,12 @@ pub(crate) fn included_file(
         .checked_add(bytes.len())
         .ok_or_else(|| index_error_at(WorkspaceIndexViolation::WorkspaceTooLarge, context_path))?;
     if *workspace_bytes > limits.workspace_bytes_max {
-        return Err(index_error_at(
+        return Err(index_error_over_limit(
             WorkspaceIndexViolation::WorkspaceTooLarge,
             context_path,
+            SOURCE_WORKSPACE_SIZE_FIELD,
+            *workspace_bytes,
+            limits.workspace_bytes_max,
         ));
     }
     let source = source_utf8(bytes, context_path)?;
@@ -2581,9 +2668,12 @@ pub(crate) fn included_text_file(
         .checked_add(bytes.len())
         .ok_or_else(|| index_error_at(WorkspaceIndexViolation::WorkspaceTooLarge, context_path))?;
     if *workspace_bytes > limits.workspace_bytes_max {
-        return Err(index_error_at(
+        return Err(index_error_over_limit(
             WorkspaceIndexViolation::WorkspaceTooLarge,
             context_path,
+            SOURCE_WORKSPACE_SIZE_FIELD,
+            *workspace_bytes,
+            limits.workspace_bytes_max,
         ));
     }
     let content = source_utf8(bytes, context_path)?;
@@ -5545,6 +5635,99 @@ mod tests {
         assert_eq!(
             error.fault().violation(),
             WorkspaceIndexViolation::WorkspaceTooLarge
+        );
+    }
+
+    #[test]
+    fn test_visible_digests_leave_out_a_file_past_the_per_file_bound() {
+        let directory = tempfile::tempdir().expect("workspace");
+        fs::write(directory.path().join("small.txt"), "kept\n").expect("small file");
+        fs::write(directory.path().join("large.txt"), "x".repeat(64)).expect("large file");
+        let limits = WorkspaceIndexLimits::new(8, 16, 1_024, 8, 8).expect("bounds");
+        let policy = WorkspaceSourcePolicy::build(
+            directory.path(),
+            limits,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("source policy");
+        let digests = policy
+            .visible_digests()
+            .expect("a file past the per-file bound is absent, never a refusal");
+        let paths: Vec<&str> = digests.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(paths, ["small.txt"]);
+        let large = policy
+            .visible_digest(&directory.path().join("large.txt"))
+            .expect_err("a single-file digest read still refuses the oversized file");
+        assert_eq!(
+            large.fault().violation(),
+            WorkspaceIndexViolation::FileTooLarge
+        );
+    }
+
+    #[test]
+    fn test_with_workspace_bounds_replaces_the_two_source_bounds_alone() {
+        let base = WorkspaceIndexLimits::new(8, 16, 1_024, 4, 32).expect("bounds");
+        let bounded = base
+            .with_workspace_bounds(2_000, 4_096)
+            .expect("positive bounds");
+        assert_eq!(bounded.files_max(), 2_000);
+        assert_eq!(bounded.workspace_bytes_max(), 4_096);
+        assert_eq!(bounded.file_bytes_max(), 16);
+        assert_eq!(bounded.directory_depth_max(), 4);
+        assert_eq!(bounded.results_max(), 32);
+        let zero = base
+            .with_workspace_bounds(0, 4_096)
+            .expect_err("a zero bound refuses");
+        assert_eq!(zero.fault().violation(), WorkspaceIndexViolation::ZeroLimit);
+    }
+
+    #[test]
+    fn test_source_bound_refusals_name_the_configuration_key() {
+        let directory = tempfile::tempdir().expect("workspace");
+        fs::write(directory.path().join("one.rs"), "pub fn one() {}\n").expect("source");
+        fs::write(directory.path().join("two.rs"), "pub fn two() {}\n").expect("source");
+        let one_file = WorkspaceIndexLimits::new(1, 1_000, 2_000, 4, 5).expect("limits");
+        let files = WorkspaceIndex::build(
+            directory.path(),
+            one_file,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect_err("two files refuse a one-file bound");
+        assert_eq!(
+            files.fault().violation(),
+            WorkspaceIndexViolation::TooManyFiles
+        );
+        let rendered = files.to_string();
+        assert!(
+            rendered.contains("field source.files") && rendered.contains("maximum 1"),
+            "{rendered}"
+        );
+        assert_eq!(
+            files
+                .fault()
+                .limit_evidence()
+                .map(|evidence| evidence.field),
+            Some("source.files".to_owned())
+        );
+
+        let ten_bytes = WorkspaceIndexLimits::new(5, 1_000, 10, 4, 5).expect("limits");
+        let bytes = WorkspaceIndex::build(
+            directory.path(),
+            ten_bytes,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect_err("sixteen bytes refuse a ten-byte bound");
+        assert_eq!(
+            bytes.fault().violation(),
+            WorkspaceIndexViolation::WorkspaceTooLarge
+        );
+        let rendered = bytes.to_string();
+        assert!(
+            rendered.contains("field source.workspace_size") && rendered.contains("maximum 10"),
+            "{rendered}"
         );
     }
 

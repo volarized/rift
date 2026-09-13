@@ -23,8 +23,8 @@ use rift_protocol::map::WorkspaceMap;
 use rift_protocol::read::{
     DEPENDENCY_WARNINGS_MAX, Digest, ExactKind, Extensions, FileId, GetSymbolHit, GetSymbolInclude,
     GetSymbolParams, GetSymbolResult, Language, Node, NodeFacet, NodeId, NodesParams, NodesResult,
-    PackageIdentity, Pagination, ProjectPath, ReadWarning, RevisionId, SearchScope,
-    SourceLocationKind, SourceUnitId, Symbol, SymbolId, SymbolOrigin, TextRange,
+    PackageIdentity, Pagination, ProjectPath, ReadWarning, RevisionId, SOURCE_WARNINGS_MAX,
+    SearchScope, SourceLocationKind, SourceUnitId, Symbol, SymbolId, SymbolOrigin, TextRange,
 };
 use rift_syntax::{ByteRange, SyntaxNode, SyntaxProvider, SyntaxSymbol, registry};
 use sha2::{Digest as _, Sha256};
@@ -744,11 +744,11 @@ impl ReadService {
 
     /// Returns the warnings every answer from this service carries: one
     /// `stale_index` when the published index lags the captured tree, one
-    /// `source_unavailable` for each file the index omitted because its
-    /// bytes are not UTF-8, and none of either when nothing applies.
+    /// `source_unavailable` for each file the index left out, bounded by
+    /// [`SOURCE_WARNINGS_MAX`], and none of either when nothing applies.
     pub(crate) fn warnings(&self) -> Vec<ReadWarning> {
         let mut warnings = self.revisions.warnings();
-        warnings.extend(self.index.warnings().iter().map(wire_index_warning));
+        warnings.extend(source_warnings(self.index.warnings()));
         warnings
     }
 
@@ -1518,13 +1518,33 @@ pub(crate) fn file_id(path: &CoreProjectPath) -> FileId {
 fn wire_index_warning(warning: &WorkspaceIndexWarning) -> ReadWarning {
     let path = warning.path();
     ReadWarning::SourceUnavailable {
-        unit: file_id(path),
+        unit: Some(file_id(path)),
         detail: format!(
             "{path} {reason}, so the file is absent from the index",
             path = path.as_str(),
             reason = warning.reason(),
         ),
     }
+}
+
+/// The `source_unavailable` warnings one answer carries for the files the index left
+/// out: the first [`SOURCE_WARNINGS_MAX`] in project-path order, the order the index
+/// keeps them in, then - when more were left out - one more counting the rest, which
+/// `rift://logs` names one by one.
+fn source_warnings(left_out: &[WorkspaceIndexWarning]) -> Vec<ReadWarning> {
+    let mut warnings: Vec<ReadWarning> = left_out
+        .iter()
+        .take(SOURCE_WARNINGS_MAX)
+        .map(wire_index_warning)
+        .collect();
+    let rest = left_out.len().saturating_sub(SOURCE_WARNINGS_MAX);
+    if rest > 0 {
+        warnings.push(ReadWarning::SourceUnavailable {
+            unit: None,
+            detail: format!("{rest} more files are absent from the index; rift://logs names each"),
+        });
+    }
+    warnings
 }
 
 /// Mints the project resolver's source-unit identity: the resolver name, then the
@@ -1801,7 +1821,7 @@ pub(crate) mod tests {
     use rift_protocol::read::{
         DEPENDENCY_WARNINGS_MAX, GetSymbolInclude, GetSymbolParams, Language, NodeFacet,
         NodesParams, NodesResult, PackageIdentity, Pagination, ProjectPath, ReadWarning,
-        RevisionId, SearchScope, SourceLocationKind, SourceUnitId,
+        RevisionId, SOURCE_WARNINGS_MAX, SearchScope, SourceLocationKind, SourceUnitId,
     };
     use rift_syntax::{ByteRange, ShippedLanguage};
     use serde_json::json;
@@ -2907,7 +2927,7 @@ pub fn compute() -> i32 {
         let invalid_path = rift_core::ProjectPath::new("src/invalid.rs")?;
         assert!(
             kept.warnings.contains(&ReadWarning::SourceUnavailable {
-                unit: file_id(&invalid_path),
+                unit: Some(file_id(&invalid_path)),
                 detail: "src/invalid.rs holds bytes that are not valid UTF-8, so the file is \
                          absent from the index"
                     .to_owned(),
@@ -2937,12 +2957,68 @@ pub fn compute() -> i32 {
         let invalid_path = rift_core::ProjectPath::new("src/invalid.rs")?;
         assert!(
             result.warnings.contains(&ReadWarning::SourceUnavailable {
-                unit: file_id(&invalid_path),
+                unit: Some(file_id(&invalid_path)),
                 detail: "src/invalid.rs holds bytes that are not valid UTF-8, so the file is \
                          absent from the index"
                     .to_owned(),
             }),
             "get_symbol's answer names the skipped file too: {:?}",
+            result.warnings
+        );
+        Ok(())
+    }
+
+    /// Nine files the index leaves out produce eight `source_unavailable` warnings in
+    /// project-path order and one more counting the rest; eight produce eight alone.
+    #[test]
+    fn source_warnings_are_bounded_per_answer_with_one_counting_the_rest() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub struct Beacon;\n")?;
+        for index in 0..=SOURCE_WARNINGS_MAX {
+            fs::write(directory.path().join(format!("invalid-{index}.rs")), [0xff])?;
+        }
+        let service = nodes_service(directory.path(), &SourceVisibility::default())?;
+        let params: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
+        let result = service.get_symbol(&params)?;
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.warnings.len(), SOURCE_WARNINGS_MAX + 1);
+        let named: Vec<&str> = result
+            .warnings
+            .iter()
+            .filter_map(|warning| match warning {
+                ReadWarning::SourceUnavailable {
+                    unit: Some(unit), ..
+                } => Some(unit.0.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(named.len(), SOURCE_WARNINGS_MAX);
+        assert!(
+            named.windows(2).all(|pair| pair[0] < pair[1]),
+            "the named files come in project-path order: {named:?}"
+        );
+        assert_eq!(
+            result.warnings.last(),
+            Some(&ReadWarning::SourceUnavailable {
+                unit: None,
+                detail: "1 more files are absent from the index; rift://logs names each".to_owned(),
+            })
+        );
+
+        fs::remove_file(
+            directory
+                .path()
+                .join(format!("invalid-{SOURCE_WARNINGS_MAX}.rs")),
+        )?;
+        let service = nodes_service(directory.path(), &SourceVisibility::default())?;
+        let result = service.get_symbol(&params)?;
+        assert_eq!(result.warnings.len(), SOURCE_WARNINGS_MAX);
+        assert!(
+            result.warnings.iter().all(|warning| matches!(
+                warning,
+                ReadWarning::SourceUnavailable { unit: Some(_), .. }
+            )),
+            "exactly the bound leaves no count warning: {:?}",
             result.warnings
         );
         Ok(())
@@ -4330,6 +4406,43 @@ pub fn compute() -> i32 {
         assert!(
             value.get("warnings").is_none(),
             "a live get_symbol result must omit warnings when there is nothing to warn about"
+        );
+        Ok(())
+    }
+
+    /// A committed file the syntax provider refuses under its depth bound is left out of
+    /// the revision index the way the workspace scan leaves it out, so `get_symbol` at
+    /// the revision still answers from the file beside it and names the refused one.
+    #[test]
+    fn revision_read_leaves_out_a_file_past_a_syntax_bound_and_serves_the_rest() -> TestResult {
+        let directory = committed_fixture()?;
+        let deep = format!(
+            "pub fn deep() -> i32 {{ {open}1{close} }}\n",
+            open = "(".repeat(600),
+            close = ")".repeat(600),
+        );
+        fs::write(directory.path().join("src/deep.rs"), deep)?;
+        rift_history::fixture::commit_all(
+            directory.path(),
+            "commit a source past the syntax depth bound",
+        );
+        let service = revision_service(directory.path(), "HEAD")?;
+        let params: GetSymbolParams =
+            serde_json::from_value(json!({"name": "beacon", "rev": "HEAD"}))?;
+        let result = service.get_symbol(&params)?;
+        assert_eq!(
+            result.hits.len(),
+            1,
+            "the committed declaration beside the refused file answers"
+        );
+        let deep_path = rift_core::ProjectPath::new("src/deep.rs")?;
+        assert!(
+            result.warnings.iter().any(|warning| matches!(
+                warning,
+                ReadWarning::SourceUnavailable { unit: Some(unit), .. } if *unit == file_id(&deep_path)
+            )),
+            "the answer names the refused file: {:?}",
+            result.warnings
         );
         Ok(())
     }

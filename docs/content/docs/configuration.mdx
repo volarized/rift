@@ -96,6 +96,8 @@ workspace whose index will not settle still answers `rift://logs`.
 include = []
 exclude = []
 respect_gitignore = true
+files = 100000
+workspace_size = "512mb"
 ```
 
 Empty `include` includes every file `exclude` and `.gitignore` leave standing; a match in `exclude`
@@ -105,6 +107,11 @@ parent-directory ignore sources.
 
 `.git`, `.rift`, and `target` stay invisible whatever this table says: no `include`, `exclude`,
 or `.gitignore` entry can make the server serve them.
+
+`files` bounds how many files the index holds, 1000 to 5000000, and `workspace_size` bounds the
+bytes they hold together, 16mb to 64gb. The server refuses to index a workspace past either bound
+and names the key in the refusal; a change to either key rebuilds the index, as a change to
+`include` or `exclude` does.
 
 `source` shapes what the index walks: a file it excludes stops reaching `search` and
 [`get_symbol`](/docs/protocol/mcp#tool-get_symbol) results. A single `search` request can still

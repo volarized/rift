@@ -428,10 +428,39 @@ pub enum LexicalIndexViolation {
 /// rendered `observed`/`maximum` context both derive from this one typed value, so they
 /// cannot drift apart the way reparsing rendered text back into numbers could.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LimitBreach {
+pub(crate) struct LimitBreach {
     field: &'static str,
     observed: u64,
     maximum: u64,
+}
+
+impl LimitBreach {
+    /// A breach minted from two in-memory counts, widened the way [`limit_count`] widens.
+    pub(crate) fn from_counts(field: &'static str, observed: usize, maximum: usize) -> Self {
+        Self {
+            field,
+            observed: limit_count(observed),
+            maximum: limit_count(maximum),
+        }
+    }
+
+    /// The rendered `field`, `observed`, and `maximum` context a limit fault carries.
+    pub(crate) fn context(&self) -> [ErrorContext; 3] {
+        [
+            ErrorContext::new("field", self.field),
+            ErrorContext::new("observed", self.observed.to_string()),
+            ErrorContext::new("maximum", self.maximum.to_string()),
+        ]
+    }
+
+    /// The wire evidence: the bound in force and what the request would have needed.
+    pub(crate) fn evidence(&self) -> LimitEvidence {
+        LimitEvidence {
+            field: self.field.to_owned(),
+            limit: self.maximum,
+            required: self.observed,
+        }
+    }
 }
 
 /// One lexical indexing failure: its violation, the offending path when
@@ -479,10 +508,8 @@ impl Fault for LexicalIndexFault {
         if let Some(path) = &self.path {
             context.push(ErrorContext::new("path", path.display().to_string()));
         }
-        if let Some(breach) = self.limit {
-            context.push(ErrorContext::new("field", breach.field));
-            context.push(ErrorContext::new("observed", breach.observed.to_string()));
-            context.push(ErrorContext::new("maximum", breach.maximum.to_string()));
+        if let Some(breach) = &self.limit {
+            context.extend(breach.context());
         }
         context
     }
@@ -494,11 +521,7 @@ impl Fault for LexicalIndexFault {
     }
 
     fn limit_evidence(&self) -> Option<LimitEvidence> {
-        self.limit.map(|breach| LimitEvidence {
-            field: breach.field.to_owned(),
-            limit: breach.maximum,
-            required: breach.observed,
-        })
+        self.limit.as_ref().map(LimitBreach::evidence)
     }
 }
 
