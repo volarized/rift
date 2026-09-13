@@ -109,7 +109,7 @@ fn document_path(root: &Path) -> PathBuf {
 fn serving_document(root: &Path) -> Option<ServerLock> {
     match probe(root) {
         ServerPresence::Serving(lock) => Some(lock),
-        ServerPresence::Stale(_) | ServerPresence::Absent => None,
+        ServerPresence::Starting | ServerPresence::Stale(_) | ServerPresence::Absent => None,
     }
 }
 
