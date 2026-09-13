@@ -52,8 +52,9 @@ const LOGS_PAGE_RECORDS_DEFAULT: u64 = 500;
 /// Bytes `logs.capture` may hold, at most.
 pub const LOGS_CAPTURE_BYTES_MAX: usize = 512;
 /// The filter the log store captures under by default: the same targets the
-/// stderr diagnostics carry.
-const LOGS_CAPTURE_DEFAULT: &str = "rift=info,rift_mcp=info,rift_server=info";
+/// stderr diagnostics carry, and the index's own warnings, which name each
+/// file a build left out.
+const LOGS_CAPTURE_DEFAULT: &str = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn";
 
 /// Bytes one submitted execution block may hold, at most.
 pub const EXECUTION_CODE_BYTES_MAX: u64 = 32 << 10;
@@ -952,11 +953,12 @@ impl Default for SearchConfiguration {
 }
 
 impl SearchConfiguration {
-    /// The ranking-weight pair, then the `[search.semantic]` and
-    /// `[search.text]` tables' own rules, then this table's numeric bounds,
+    /// The ranking-weight pair, then the `[search.lexical]`, `[search.semantic]`,
+    /// and `[search.text]` tables' own rules, then this table's numeric bounds,
     /// in key order.
     fn violation(&self) -> Option<ConfigurationViolation> {
         search_weights_violation(self.lexical.weight, self.semantic.weight)
+            .or_else(|| self.lexical.violation())
             .or_else(|| self.semantic.violation())
             .or_else(|| self.text.violation())
             .or_else(|| {
@@ -1077,7 +1079,7 @@ fn is_repository_word(word: &str) -> bool {
 }
 
 /// The `[search.lexical]` table: what the lexical ranking contributes to a
-/// fused score.
+/// fused score, and how many units the lexical index holds.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LexicalSearchConfiguration {
@@ -1088,13 +1090,32 @@ pub struct LexicalSearchConfiguration {
     #[schemars(range(min = 0.0, max = 1.0))]
     #[serde(default = "default_lexical_weight")]
     pub weight: f64,
+    /// Most units the lexical index holds: one per indexed file, text chunk,
+    /// and declaration, 1000 to 50000000. A workspace past it refuses its
+    /// rebuild naming this key.
+    #[schemars(range(min = 1_000, max = 50_000_000))]
+    #[serde(default = "default_lexical_units_max")]
+    pub units_max: u64,
 }
 
 impl Default for LexicalSearchConfiguration {
     fn default() -> Self {
         Self {
             weight: LEXICAL_WEIGHT_DEFAULT,
+            units_max: LEXICAL_UNITS_MAX_DEFAULT,
         }
+    }
+}
+
+impl LexicalSearchConfiguration {
+    /// This table's numeric bounds, in key order.
+    fn violation(&self) -> Option<ConfigurationViolation> {
+        first_out_of_range([(
+            "search.lexical.units_max",
+            self.units_max,
+            LEXICAL_UNITS_MAX_MIN,
+            LEXICAL_UNITS_MAX_MAX,
+        )])
     }
 }
 
@@ -1334,6 +1355,19 @@ const SEMANTIC_MAX_VECTORS_DEFAULT: u64 = 200_000;
 
 fn default_lexical_weight() -> f64 {
     LEXICAL_WEIGHT_DEFAULT
+}
+
+/// `search.lexical.units_max` accepted, at least.
+pub const LEXICAL_UNITS_MAX_MIN: u64 = 1_000;
+/// `search.lexical.units_max` accepted, at most.
+pub const LEXICAL_UNITS_MAX_MAX: u64 = 50_000_000;
+/// `search.lexical.units_max` when the key is absent: one unit per indexed
+/// file, text chunk, and declaration, so a workspace of some hundred
+/// thousand files fits.
+pub const LEXICAL_UNITS_MAX_DEFAULT: u64 = 1_000_000;
+
+fn default_lexical_units_max() -> u64 {
+    LEXICAL_UNITS_MAX_DEFAULT
 }
 
 fn default_semantic_weight() -> f64 {
@@ -2830,6 +2864,7 @@ mod tests {
         assert_eq!(semantic.candidates_per_file, 3);
         assert_eq!(semantic.max_vectors, 200_000);
         assert_eq!(configuration.search.pool_slots, 4);
+        assert_eq!(configuration.search.lexical.units_max, 1_000_000);
         assert_eq!(configuration.search.fusion_k, 60);
         assert_eq!(
             configuration.search.busy_timeout,
@@ -3610,6 +3645,28 @@ mod tests {
     }
 
     #[test]
+    fn test_search_lexical_units_max_bounds_are_enforced() {
+        let mut configuration = WorkspaceConfiguration::default();
+        for units_max in [LEXICAL_UNITS_MAX_MIN - 1, LEXICAL_UNITS_MAX_MAX + 1] {
+            configuration.search.lexical.units_max = units_max;
+            assert!(
+                matches!(
+                    configuration.validate(),
+                    Err(ConfigurationViolation::LimitOutOfRange {
+                        field: "search.lexical.units_max",
+                        ..
+                    })
+                ),
+                "units_max {units_max} must be refused"
+            );
+        }
+        for units_max in [LEXICAL_UNITS_MAX_MIN, LEXICAL_UNITS_MAX_MAX] {
+            configuration.search.lexical.units_max = units_max;
+            assert_eq!(configuration.validate(), Ok(()));
+        }
+    }
+
+    #[test]
     fn test_search_text_rejects_unknown_keys_and_schema_has_declared_keys() {
         let unknown = json!({ "search": { "text": { "extensions": ["md"] } } });
         assert!(
@@ -3761,6 +3818,21 @@ mod tests {
                 "semantic weight max",
                 &semantic["weight"]["maximum"],
                 json!(1.0),
+            ),
+            (
+                "lexical units max min",
+                &lexical["units_max"]["minimum"],
+                json!(LEXICAL_UNITS_MAX_MIN),
+            ),
+            (
+                "lexical units max max",
+                &lexical["units_max"]["maximum"],
+                json!(LEXICAL_UNITS_MAX_MAX),
+            ),
+            (
+                "lexical units max default",
+                &lexical["units_max"]["default"],
+                json!(LEXICAL_UNITS_MAX_DEFAULT),
             ),
         ];
         assert_schema_bounds(&cases);
