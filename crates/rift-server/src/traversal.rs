@@ -758,6 +758,7 @@ mod tests {
             &LanguageFileSelections::default(),
             BindingPolicy::from(&configuration),
             HistoryConfiguration::default(),
+            rift_protocol::dependencies::DependenciesConfiguration::default(),
         )?;
         Ok((directory, service))
     }

@@ -18,6 +18,7 @@ use rift_index::{
     WorkspaceIndexLimits, WorkspaceIndexWarning, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::HistoryConfiguration;
+use rift_protocol::dependencies::DependenciesConfiguration;
 use rift_protocol::map::WorkspaceMap;
 use rift_protocol::read::{
     DEPENDENCY_WARNINGS_MAX, Digest, ExactKind, Extensions, FileId, GetSymbolHit, GetSymbolInclude,
@@ -28,6 +29,7 @@ use rift_protocol::read::{
 use rift_syntax::{ByteRange, SyntaxNode, SyntaxProvider, SyntaxSymbol, registry};
 use sha2::{Digest as _, Sha256};
 
+use crate::dependency::ResolutionPolicy;
 use crate::history::SymbolTimelines;
 
 /// One read-service failure: what was asked, and why it cannot be served.
@@ -314,6 +316,9 @@ pub type ReadError = Error<ReadFault>;
 
 /// The lock a poisoned dependency index names.
 const DEPENDENCY_INDEX_LOCK: &str = "dependency index";
+/// The capability a scope beyond `project` names while `[dependencies]` turns the
+/// index off.
+const DEPENDENCY_SCOPE_DISABLED: &str = "dependency scope ([dependencies] enabled = false)";
 
 /// The dependency index one lane builds and every read service answers from, behind
 /// one lock. The lane holds the write side for one package build at a time; a lookup
@@ -372,6 +377,9 @@ pub struct ReadService {
     /// The dependency index a `dependencies` or `all` lookup answers from. Absent,
     /// those scopes answer as from an empty index with nothing pending.
     dependencies: Option<Arc<DependencyStore>>,
+    /// The accepted `[dependencies]` table: whether a scope beyond `project` is
+    /// served, and how the catalog is resolved.
+    dependency_configuration: DependenciesConfiguration,
 }
 
 impl ReadService {
@@ -398,6 +406,7 @@ impl ReadService {
             &LanguageFileSelections::default(),
             BindingPolicy::default(),
             history,
+            DependenciesConfiguration::default(),
         )
     }
 
@@ -405,11 +414,17 @@ impl ReadService {
     ///
     /// `binding` reaches the workspace index unchanged: it decides whether the
     /// binding provider publishes beside syntax, and under which bounds.
+    /// `dependencies` decides how the catalog is resolved and whether a scope
+    /// beyond `project` is served.
     ///
     /// # Errors
     ///
     /// Returns [`ReadError`] when configuration or root cannot be indexed
     /// within bounds.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per accepted table the snapshot is built under"
+    )]
     pub fn build_with_languages(
         root: &Path,
         limits: WorkspaceIndexLimits,
@@ -418,6 +433,7 @@ impl ReadService {
         languages: &LanguageFileSelections,
         binding: BindingPolicy,
         history: HistoryConfiguration,
+        dependencies: DependenciesConfiguration,
     ) -> Result<Self, ReadError> {
         let span = tracing::info_span!(
             "index.build",
@@ -451,7 +467,8 @@ impl ReadService {
             ReadFault::index(source)
         })?;
         let revisions = captured_revisions(&index);
-        let catalog = Arc::new(resolved_catalog(root, &source_policy)?);
+        let policy = ResolutionPolicy::from(&dependencies);
+        let catalog = Arc::new(resolved_catalog(root, &source_policy, policy)?);
         span.record("files_count", index.file_count());
         span.record("tree_revision", revisions.wire_tree_revision());
         span.record("outcome", "ok");
@@ -463,6 +480,7 @@ impl ReadService {
             source_policy: Some(Arc::new(source_policy)),
             catalog,
             dependencies: None,
+            dependency_configuration: dependencies,
         })
     }
 
@@ -581,6 +599,7 @@ impl ReadService {
             source_policy: self.source_policy.clone(),
             catalog,
             dependencies: self.dependencies.clone(),
+            dependency_configuration: self.dependency_configuration.clone(),
         })
     }
 
@@ -599,7 +618,8 @@ impl ReadService {
         let source_policy = self.source_policy.as_deref().unwrap_or_else(|| {
             unreachable!("a current-tree read service always compiles its source policy")
         });
-        let catalog = resolved_catalog(self.index.root(), source_policy)?;
+        let policy = ResolutionPolicy::from(&self.dependency_configuration);
+        let catalog = resolved_catalog(self.index.root(), source_policy, policy)?;
         Ok(Arc::new(catalog))
     }
 
@@ -670,6 +690,7 @@ impl ReadService {
             source_policy: None,
             catalog: Arc::new(DependencyCatalog::default()),
             dependencies: None,
+            dependency_configuration: DependenciesConfiguration::default(),
         })
     }
 
@@ -706,6 +727,12 @@ impl ReadService {
     #[must_use]
     pub const fn dependency_catalog(&self) -> &Arc<DependencyCatalog> {
         &self.catalog
+    }
+
+    /// The accepted `[dependencies]` table this snapshot was built under.
+    #[must_use]
+    pub const fn dependency_configuration(&self) -> &DependenciesConfiguration {
+        &self.dependency_configuration
     }
 
     /// Replaces the resolved catalog, so a test can hand the service a degraded one.
@@ -916,9 +943,9 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] for a scope beyond `project` beside `rev`, for a poisoned
-    /// dependency index, and for symbol history the workspace's version control cannot
-    /// serve.
+    /// Returns [`ReadError`] for a scope beyond `project` under `[dependencies]`
+    /// `enabled = false` or beside `rev`, for a poisoned dependency index, and for
+    /// symbol history the workspace's version control cannot serve.
     pub fn get_symbol(&self, params: &GetSymbolParams) -> Result<GetSymbolResult, ReadError> {
         validate_common(params.rev.is_some())?;
         let limit = accepted_limit(params.limit)?;
@@ -983,21 +1010,27 @@ impl ReadService {
         })
     }
 
-    /// Refuses a `scope` that reaches dependencies on a revision read - one the
-    /// request's `rev` names, or the revision this snapshot already serves - since the
-    /// dependency index serves the current tree alone. `get_symbol` and `search` share
-    /// the rule.
+    /// Refuses a `scope` that reaches dependencies while the `[dependencies]` table
+    /// turns the index off, and on a revision read - one the request's `rev` names, or
+    /// the revision this snapshot already serves - since the dependency index serves
+    /// the current tree alone. `get_symbol` and `search` share both rules.
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] naming `scope` for a scope beyond `project` beside a
-    /// revision.
+    /// Returns [`ReadError`] as `capability_unavailable` for a scope beyond `project`
+    /// under `enabled = false`, and naming `scope` for one beside a revision.
     pub(crate) fn validate_dependency_scope(
         &self,
         scope: SearchScope,
         rev: Option<&RevisionId>,
     ) -> Result<(), ReadError> {
-        if scope != SearchScope::Project && (rev.is_some() || self.revision.is_some()) {
+        if scope == SearchScope::Project {
+            return Ok(());
+        }
+        if !self.dependency_configuration.enabled {
+            return Err(ReadFault::unsupported(DEPENDENCY_SCOPE_DISABLED));
+        }
+        if rev.is_some() || self.revision.is_some() {
             return Err(ReadFault::invalid(
                 "scope",
                 "dependencies are served for the current tree alone",
@@ -1603,13 +1636,15 @@ const TREE_REVISION_PATH_SEPARATOR: u8 = 0;
 /// Separates adjacent files in tree-revision material.
 const TREE_REVISION_FILE_SEPARATOR: u8 = 0xff;
 
-/// Resolves the dependency catalog over every path `source_policy` makes visible.
+/// Resolves the dependency catalog over every path `source_policy` makes visible,
+/// running toolchains under `policy`.
 ///
 /// The walk is the policy's own, so a manifest the `[source]` policy or `.gitignore`
 /// hides reaches no resolver.
 fn resolved_catalog(
     root: &Path,
     source_policy: &WorkspaceSourcePolicy,
+    policy: ResolutionPolicy,
 ) -> Result<DependencyCatalog, ReadError> {
     let visible: Vec<ProjectPath> = source_policy
         .visible_paths()
@@ -1617,7 +1652,9 @@ fn resolved_catalog(
         .iter()
         .map(project_path)
         .collect();
-    Ok(crate::dependency::resolve_workspace_catalog(root, &visible))
+    Ok(crate::dependency::resolve_workspace_catalog(
+        root, &visible, policy,
+    ))
 }
 
 /// The revisions one read service captures at build time. The captured tree
@@ -1770,7 +1807,9 @@ pub(crate) mod tests {
 
     use rift_core::{LanguageFileSelections, SourceVisibility};
     use rift_dependency::{CatalogEntry, DependencyCatalog, Resolution, ResolverName};
-    use rift_index::{DependencyIndex, DependencyIndexLimits, PackageIndex, package_files};
+    use rift_index::{
+        DependencyIndex, DependencyIndexLimits, PackageIndex, PackageSelection, package_files,
+    };
     use rift_protocol::configuration::{LanguageConfiguration, WorkspaceConfiguration};
     use rift_protocol::read::{
         DEPENDENCY_WARNINGS_MAX, GetSymbolInclude, GetSymbolParams, Language, NodeFacet,
@@ -1782,8 +1821,8 @@ pub(crate) mod tests {
     use tempfile::TempDir;
 
     use super::{
-        BindingPolicy, DependencyStore, HistoryConfiguration, ReadFault, ReadService,
-        WorkspaceIndex, WorkspaceIndexLimits, file_id,
+        BindingPolicy, DependenciesConfiguration, DependencyStore, HistoryConfiguration, ReadFault,
+        ReadService, WorkspaceIndex, WorkspaceIndexLimits, file_id,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -1804,6 +1843,7 @@ pub(crate) mod tests {
             languages,
             BindingPolicy::default(),
             HistoryConfiguration::default(),
+            DependenciesConfiguration::default(),
         )
     }
 
@@ -2962,6 +3002,7 @@ pub fn compute() -> i32 {
         DependencyIndex::planned(
             &DependencyCatalog::default(),
             DependencyIndexLimits::default(),
+            PackageSelection::default(),
         )
     }
 
@@ -3197,6 +3238,55 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
+    /// `[dependencies] enabled = false` refuses every scope beyond `project` as a
+    /// capability the operator can turn on; the project scope still answers.
+    #[test]
+    fn get_symbol_dependency_scope_with_the_index_disabled_is_unsupported() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        let disabled = DependenciesConfiguration {
+            enabled: false,
+            ..DependenciesConfiguration::default()
+        };
+        let service = ReadService::build_with_languages(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+            BindingPolicy::default(),
+            HistoryConfiguration::default(),
+            disabled.clone(),
+        )?
+        .with_dependencies(helper_store()?);
+        assert_eq!(service.dependency_configuration(), &disabled);
+        for scope in ["dependencies", "all"] {
+            let params: GetSymbolParams =
+                serde_json::from_value(json!({"name": "beacon", "scope": scope}))?;
+
+            let error = service
+                .get_symbol(&params)
+                .expect_err("a disabled dependency index refuses the scope");
+
+            let ReadFault::Unsupported { capability } = error.fault() else {
+                panic!(
+                    "scope {scope}: expected Unsupported, got {:?}",
+                    error.fault()
+                );
+            };
+            assert_eq!(
+                capability,
+                "dependency scope ([dependencies] enabled = false)"
+            );
+            assert_eq!(error.descriptor().code(), "capability_unavailable");
+        }
+        let params: GetSymbolParams = serde_json::from_value(json!({"name": "beacon"}))?;
+        let answer = service.get_symbol(&params)?;
+        assert_eq!(answer.hits.len(), 1, "the project scope still answers");
+        Ok(())
+    }
+
     /// A planned index over a rooted, unbuilt entry counts it pending; the project's own
     /// hit still answers under `all`.
     #[test]
@@ -3210,7 +3300,11 @@ pub fn compute() -> i32 {
                 degradations: Vec::new(),
             },
         )]);
-        let index = DependencyIndex::planned(&catalog, DependencyIndexLimits::default());
+        let index = DependencyIndex::planned(
+            &catalog,
+            DependencyIndexLimits::default(),
+            PackageSelection::default(),
+        );
         let (_directory, service) = beacon_fixture()?;
         let service = service.with_dependencies(Arc::new(DependencyStore::new(index)));
 

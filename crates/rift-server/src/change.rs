@@ -1559,6 +1559,7 @@ mod tests {
             &LanguageFileSelections::from(configuration),
             rift_index::BindingPolicy::default(),
             HistoryConfiguration::default(),
+            rift_protocol::dependencies::DependenciesConfiguration::default(),
         )
     }
 

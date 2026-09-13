@@ -40,8 +40,8 @@ impl ReadService {
     /// # Errors
     ///
     /// Returns [`ReadError`] for an invalid `paths` glob, a `force_include` bound crossed,
-    /// a scope beyond `project` beside a revision, `dependencies` beside `traversal`, and
-    /// a poisoned dependency index.
+    /// a scope beyond `project` under `[dependencies]` `enabled = false` or beside a
+    /// revision, `dependencies` beside `traversal`, and a poisoned dependency index.
     pub fn search(
         &self,
         params: &SearchParams,
@@ -3190,6 +3190,56 @@ pub fn compute() -> i32 {
             );
             assert_eq!(error.descriptor().code(), "invalid_request");
         }
+        Ok(())
+    }
+
+    /// `[dependencies] enabled = false` refuses a search whose scope reaches dependencies
+    /// the way it refuses the `get_symbol` lookup; the project scope still answers.
+    #[test]
+    fn search_dependency_scope_with_the_index_disabled_is_unsupported() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        let disabled = rift_protocol::dependencies::DependenciesConfiguration {
+            enabled: false,
+            ..rift_protocol::dependencies::DependenciesConfiguration::default()
+        };
+        let service = ReadService::build_with_languages(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            &rift_core::LanguageFileSelections::default(),
+            rift_index::BindingPolicy::default(),
+            HistoryConfiguration::default(),
+            disabled,
+        )?
+        .with_dependencies(helper_store()?);
+        for scope in ["dependencies", "all"] {
+            let params: SearchParams =
+                serde_json::from_value(json!({"query": "beacon", "scope": scope}))?;
+
+            let error = service
+                .search(&params, &[])
+                .expect_err("a disabled dependency index refuses the scope");
+
+            assert!(
+                matches!(error.fault(), ReadFault::Unsupported { .. }),
+                "scope {scope}: {error}"
+            );
+            assert_eq!(error.descriptor().code(), "capability_unavailable");
+        }
+        let params: SearchParams = serde_json::from_value(json!({"query": "beacon"}))?;
+        let answer = service.search(&params, &[])?;
+        assert!(
+            !answer.results.is_empty(),
+            "the project scope still answers"
+        );
+        assert!(
+            answer.results.iter().all(|hit| hit.path.is_some()),
+            "every project hit is addressed by path: {:?}",
+            answer.results
+        );
         Ok(())
     }
 
