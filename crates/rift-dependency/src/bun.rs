@@ -117,9 +117,16 @@ fn resolve_manifest(
 }
 
 /// Parses the JSONC document Bun writes: comments and trailing commas are accepted.
+///
+/// The document is read into a [`Value`] first. The lenient reader accepts a trailing comma
+/// only through a map or sequence visitor, and a field this resolver does not declare, such
+/// as `overrides`, is otherwise skipped by a reader that refuses the comma before its `}`.
 fn parse_lockfile(bytes: &[u8]) -> Result<BunLock, LockfileFailure> {
-    serde_json_lenient::from_slice(bytes)
-        .map_err(|error| LockfileFailure::unparsable(BUN_LOCK_FILE_NAME, error.to_string()))
+    let unparsable = |error: serde_json_lenient::Error| {
+        LockfileFailure::unparsable(BUN_LOCK_FILE_NAME, error.to_string())
+    };
+    let document: Value = serde_json_lenient::from_slice(bytes).map_err(unparsable)?;
+    serde_json_lenient::from_value(document).map_err(unparsable)
 }
 
 /// The `bun.lock` document, the fields this resolver reads.
@@ -746,6 +753,17 @@ mod tests {
 
         assert_eq!(names(&resolution), ["npm/dep@1.0.0"]);
         assert!(entry(&resolution, "dep@1.0.0").is_direct());
+        assert!(resolution.degradations.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_trailing_comma_inside_an_undeclared_field_parses() {
+        let text = "{\n  \"lockfileVersion\": 1,\n  \"workspaces\": { \"\": { \"dependencies\":                     { \"dep\": \"^1.0.0\" } } },\n  \"overrides\": {\n    \"sharp\": \"^0.35.4\",\n  },\n                      \"packages\": {\n    \"dep\": [\"dep@1.0.0\", \"\", {}, \"\"]\n  }\n}\n";
+        let mut inspector = root_inspector(text);
+
+        let resolution = resolve(&["package.json"], &mut inspector);
+
+        assert_eq!(names(&resolution), ["npm/dep@1.0.0"]);
         assert!(resolution.degradations.is_empty());
     }
 
