@@ -1516,33 +1516,14 @@ pub(crate) fn file_id(path: &CoreProjectPath) -> FileId {
 
 /// Projects one index-build warning onto its wire form.
 fn wire_index_warning(warning: &WorkspaceIndexWarning) -> ReadWarning {
-    let (path, detail) = match warning {
-        WorkspaceIndexWarning::InvalidUtf8Source(path) => (
-            path,
-            format!(
-                "{path}'s bytes are not valid UTF-8, so the file is absent from the index",
-                path = path.as_str(),
-            ),
-        ),
-        WorkspaceIndexWarning::BinarySource(path) => (
-            path,
-            format!(
-                "{path} contains a NUL byte, so the file is absent from the index",
-                path = path.as_str(),
-            ),
-        ),
-        WorkspaceIndexWarning::FileTooLarge(path) => (
-            path,
-            format!(
-                "{path} exceeds the file byte limit, so the file is absent from the index",
-                path = path.as_str(),
-            ),
-        ),
-    };
-
+    let path = warning.path();
     ReadWarning::SourceUnavailable {
         unit: file_id(path),
-        detail,
+        detail: format!(
+            "{path} {reason}, so the file is absent from the index",
+            path = path.as_str(),
+            reason = warning.reason(),
+        ),
     }
 }
 
@@ -2867,8 +2848,8 @@ pub fn compute() -> i32 {
         assert!(
             kept.warnings.contains(&ReadWarning::SourceUnavailable {
                 unit: file_id(&invalid_path),
-                detail: "src/invalid.rs's bytes are not valid UTF-8, so the file is absent \
-                         from the index"
+                detail: "src/invalid.rs holds bytes that are not valid UTF-8, so the file is \
+                         absent from the index"
                     .to_owned(),
             }),
             "the valid file still serves and its result names the skipped one: {:?}",
@@ -2897,8 +2878,8 @@ pub fn compute() -> i32 {
         assert!(
             result.warnings.contains(&ReadWarning::SourceUnavailable {
                 unit: file_id(&invalid_path),
-                detail: "src/invalid.rs's bytes are not valid UTF-8, so the file is absent \
-                         from the index"
+                detail: "src/invalid.rs holds bytes that are not valid UTF-8, so the file is \
+                         absent from the index"
                     .to_owned(),
             }),
             "get_symbol's answer names the skipped file too: {:?}",

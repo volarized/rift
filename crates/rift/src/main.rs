@@ -17,7 +17,7 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::{EnvFilter, Layer as _};
 
 /// Default filter keeps dependency diagnostics out of MCP stderr.
-const DEFAULT_TRACING_FILTER: &str = "rift=info,rift_mcp=info,rift_server=info";
+const DEFAULT_TRACING_FILTER: &str = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn";
 
 #[derive(Debug, Parser)]
 #[command(name = "rift", version, about = "agentic development toolkit")]

@@ -293,8 +293,9 @@ fn absolute_root(root: &Path) -> Result<PathBuf, ReadError> {
     Ok(segments.iter().collect())
 }
 
-/// Sizes the lexical search index's connection pool and busy-wait budget from one accepted
-/// `[search]` table, keeping this release's fixed unit, query-term, and match-count bounds.
+/// Sizes the lexical search index's unit bound, connection pool, and busy-wait budget from
+/// one accepted `[search]` table, keeping this release's fixed unit-byte, query-term, and
+/// match-count bounds.
 fn lexical_index_limits(search: &SearchConfiguration) -> LexicalIndexLimits {
     let defaults = LexicalIndexLimits::default();
     // Acceptance bounds pool_slots to 1..=SEARCH_POOL_SLOTS_MAX and busy_timeout to
@@ -311,7 +312,7 @@ fn lexical_index_limits(search: &SearchConfiguration) -> LexicalIndexLimits {
     )
     .unwrap_or(1_000);
     LexicalIndexLimits::new(
-        defaults.units_max(),
+        LexicalIndexLimits::accepted_units_max(search.lexical.units_max),
         defaults.unit_bytes_max(),
         defaults.query_terms_max(),
         defaults.matches_max(),
@@ -4174,6 +4175,83 @@ pub fn beacon() -> u64 {
         };
         let body: serde_json::Value = serde_json::from_str(text)?;
         assert!(body["records"].is_array(), "{text}");
+        Ok(())
+    }
+
+    /// Parenthesis nesting past the shipped syntax depth bound of 512.
+    const DEEP_NESTING: usize = 600;
+
+    /// A Rust source whose syntax tree runs deeper than the provider accepts.
+    fn deep_source() -> String {
+        format!(
+            "pub fn deep() -> i32 {{ {open}1{close} }}\n",
+            open = "(".repeat(DEEP_NESTING),
+            close = ")".repeat(DEEP_NESTING),
+        )
+    }
+
+    /// The project paths the hits on one search page name.
+    fn hit_paths(answer: &serde_json::Value) -> Vec<&str> {
+        answer["results"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|hit| hit["path"].as_str())
+            .collect()
+    }
+
+    /// The build runs on the blocking pool, so only a process-wide subscriber sees its
+    /// records; the sink captures under the workspace's own `[logs] capture` default, the
+    /// filter a served workspace records under.
+    #[tokio::test]
+    async fn a_file_past_a_syntax_bound_is_named_in_the_logs_and_the_rest_serves() -> TestResult {
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(directory.path().join("src/deep.rs"), deep_source())?;
+        super::hermetic_workspace(directory.path(), "")?;
+
+        let (sink, drain) = crate::logs::log_capture();
+        let capture = crate::logs::logs_configuration(directory.path()).capture;
+        let filter = tracing_subscriber::EnvFilter::try_new(&capture)?;
+        let subscriber = tracing_subscriber::registry().with(sink.with_filter(filter));
+        tracing::subscriber::set_global_default(subscriber)?;
+
+        let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
+        let store = storage.logs().ok_or("the log store must open")?;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let drain_task = tokio::spawn(drain.run(store, 10_000, cancellation.clone()));
+        let server =
+            RiftMcp::build_with_storage(directory.path(), WorkspaceIndexLimits::default(), storage)
+                .await?;
+
+        let kept = serde_json::to_value(run_search(&server, "beacon").await?)?;
+        assert!(hit_paths(&kept).contains(&"src/lib.rs"), "{kept:#}");
+        let absent = serde_json::to_value(run_search(&server, "deep").await?)?;
+        assert!(
+            !hit_paths(&absent).contains(&"src/deep.rs"),
+            "the deep file answers no search: {absent:#}"
+        );
+
+        cancellation.cancel();
+        drain_task.await?;
+        let logs = server.read_logs("rift://logs").await?;
+        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = logs
+            .contents
+            .first()
+            .ok_or("a log read answers with one content")?
+        else {
+            return Err("a log read answers with text".into());
+        };
+        assert!(
+            text.contains("file left out of the index")
+                && text.contains("src/deep.rs")
+                && text.contains("too_deep"),
+            "the logs must name the left-out file and its bound: {text}"
+        );
         Ok(())
     }
 
