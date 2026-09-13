@@ -69,7 +69,7 @@ agent meets can be explained without an operator reading the server's terminal:
 [logs]
 retention_records = 50000
 page_records = 500
-capture = "rift=info,rift_mcp=info,rift_server=info"
+capture = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn"
 ```
 
 - `retention_records` caps the records the store keeps, 100 to 1000000; a write past the cap
@@ -590,6 +590,20 @@ the workspace must not fetch model weights:
 [search.semantic]
 disabled = true
 ```
+
+<VersionBadge version="v0.0.32" />
+
+`[search.lexical].units_max` bounds how many units the lexical index holds, one per indexed
+file, text chunk, and declaration, 1000 to 50000000:
+
+```toml
+[search.lexical]
+units_max = 1000000
+```
+
+A workspace past it refuses its rebuild: a read then answers `temporarily_unavailable` naming
+`units_max`, the observed count, and the maximum. Raise the key, or narrow
+[`[source]`](/docs/configuration#source) so fewer files reach the index.
 
 ## Hooks
 

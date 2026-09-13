@@ -3732,7 +3732,7 @@ mod tests {
             .expect_err("a range naming no syntax node must error");
         assert_eq!(error.descriptor().code(), "invalid_request");
         assert!(
-            error.to_string().contains("outside the addressed file"),
+            error.to_string().contains("names no syntax node"),
             "message must name the range, not a witness mismatch: {error}"
         );
         let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
@@ -4171,29 +4171,151 @@ mod tests {
         Ok(())
     }
 
+    /// The source `lib.rs` shrinks to once the address below was minted from a longer file.
+    const SHRUNK_SOURCE: &str = "pub fn beacon() {}\n";
+
+    /// A workspace whose `lib.rs` held two declarations when the returned address was
+    /// minted for the second, then shrank to [`SHRUNK_SOURCE`] and was reindexed: the
+    /// address's range now reaches past the file's end, exactly what a listing kept across
+    /// another agent's edit looks like.
+    fn shrunk_fixture() -> TestResult<(tempfile::TempDir, ReadService, ChangeService, NodeId)> {
+        let (directory, reads, _changes) = fixture("pub fn beacon() {}\npub fn late() {}\n")?;
+        let listing = reads.nodes(NodesParams {
+            path: ProjectPath("lib.rs".to_owned()),
+            position: SHRUNK_SOURCE.len() as u64 + 3,
+            rev: None,
+        })?;
+        let index = listing
+            .source
+            .iter()
+            .position(|excerpt| excerpt == "pub fn late() {}")
+            .ok_or("no listed node's excerpt matches the second declaration")?;
+        let address = listing.nodes[index].id.clone();
+        fs::write(directory.path().join("lib.rs"), SHRUNK_SOURCE)?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let changes = ChangeService::new(directory.path());
+        Ok((directory, reads, changes, address))
+    }
+
+    /// The refusal a shrunk file answers: `source_unchanged` failed, `expected` the
+    /// address's own witness, `observed` the file's current byte length.
+    fn assert_shrunk_refusal(result: ChangeResult, address: &NodeId) -> TestResult {
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("a range past the shrunk file must refuse: {result:?}");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        let precondition = &preconditions[0];
+        assert_eq!(
+            precondition.kind,
+            OperationPreconditionKind::SourceUnchanged
+        );
+        let (_, witness) = address
+            .0
+            .rsplit_once('#')
+            .ok_or("a listed node id must carry a witness")?;
+        assert_eq!(
+            precondition.expected,
+            PreconditionValue::Text {
+                value: witness.to_owned()
+            }
+        );
+        assert_eq!(
+            precondition.observed,
+            PreconditionValue::Text {
+                value: format!("outside the file's {} bytes", SHRUNK_SOURCE.len())
+            }
+        );
+        Ok(())
+    }
+
+    /// An address minted before the file shrank below its range is drift, the same as a
+    /// stale witness: `replace_node` refuses `source_unchanged` naming the file's current
+    /// length, never `invalid_request`.
     #[test]
-    fn replace_node_span_beyond_the_file_fails_as_invalid() -> TestResult {
+    fn replace_node_against_a_file_that_shrank_below_the_address_refuses_source_unchanged()
+    -> TestResult {
+        let (directory, reads, changes, address) = shrunk_fixture()?;
+        let result = changes.replace_node(
+            &reads,
+            &ReplaceNodeParams {
+                node: address.clone(),
+                region: None,
+                body: "pub fn late() -> u8 { 7 }".to_owned().into(),
+            },
+        )?;
+        assert_shrunk_refusal(result, &address)?;
+        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(untouched, SHRUNK_SOURCE);
+        Ok(())
+    }
+
+    /// `insert_node` resolves its anchor through the same proof, so a shrunk file refuses
+    /// it the same way.
+    #[test]
+    fn insert_node_against_a_file_that_shrank_below_the_anchor_refuses_source_unchanged()
+    -> TestResult {
+        let (directory, reads, changes, address) = shrunk_fixture()?;
+        let result = changes.insert_node(
+            &reads,
+            &rift_protocol::change::InsertNodeParams {
+                anchor: address.clone(),
+                position: InsertPosition::After,
+                body: "pub fn later() {}".to_owned().into(),
+            },
+        )?;
+        assert_shrunk_refusal(result, &address)?;
+        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(untouched, SHRUNK_SOURCE);
+        Ok(())
+    }
+
+    /// A range inside the file whose bytes no longer hash to the witness is drift even
+    /// when no node has that exact range any more: the digest form answers, as it does
+    /// for a range that still names a node.
+    #[test]
+    fn replace_node_with_a_stale_witness_on_a_range_naming_no_node_refuses_source_unchanged()
+    -> TestResult {
         let source = "pub fn beacon() {}\n";
         let (directory, reads, changes) = fixture(source)?;
-        let end = source.len() as u64 + 10;
-        // A forged witness for a range wholly past the file: no legitimate listing could
-        // ever carry this address, so resolution must refuse before the witness even
-        // matters.
-        let witness = digest_hex8("");
-        let error = changes
-            .replace_node(
-                &reads,
-                &ReplaceNodeParams {
-                    node: NodeId(format!("rift://node/rust/lib.rs@0-{end}#{witness}")),
-                    region: None,
-                    body: "pub fn beacon() -> u8 { 7 }".to_owned().into(),
-                },
-            )
-            .expect_err("a span past the file end must error");
-        assert_eq!(error.descriptor().code(), "invalid_request");
-        assert!(
-            error.to_string().contains("outside the addressed file"),
-            "message must name the span fault: {error}"
+        let start = source.find("beacon").expect("fixture names beacon");
+        let end = start + "bea".len();
+        let result = changes.replace_node(
+            &reads,
+            &ReplaceNodeParams {
+                node: NodeId(format!("rift://node/rust/lib.rs@{start}-{end}#00000000")),
+                region: None,
+                body: "x".to_owned().into(),
+            },
+        )?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("a stale witness must refuse: {result:?}");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::SourceUnchanged
+        );
+        assert_eq!(
+            preconditions[0].observed,
+            PreconditionValue::Text {
+                value: digest_hex8(&source[start..end])
+            }
         );
         let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
         assert_eq!(untouched, source);
@@ -4223,7 +4345,7 @@ mod tests {
             .expect_err("a range naming no syntax node must error");
         assert_eq!(error.descriptor().code(), "invalid_request");
         assert!(
-            error.to_string().contains("outside the addressed file"),
+            error.to_string().contains("names no syntax node"),
             "message must name the range, not a witness mismatch: {error}"
         );
         let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;

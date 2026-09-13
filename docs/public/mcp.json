@@ -587,7 +587,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A claimed file's bytes are not valid UTF-8, so the index omits it: it answers no\nsearch or lookup, and addressing it directly still refuses `content_unavailable`.\nEvery other file in the workspace stays available.",
+                "description": "A claimed file is left out of the index - its bytes are not valid UTF-8, or it\ncrosses a per-file bound - so it answers no search or lookup, and addressing it\ndirectly still refuses `content_unavailable`. Every other file in the workspace\nstays available.",
                 "properties": {
                   "code": {
                     "const": "source_unavailable",
@@ -5127,7 +5127,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A claimed file's bytes are not valid UTF-8, so the index omits it: it answers no\nsearch or lookup, and addressing it directly still refuses `content_unavailable`.\nEvery other file in the workspace stays available.",
+                "description": "A claimed file is left out of the index - its bytes are not valid UTF-8, or it\ncrosses a per-file bound - so it answers no search or lookup, and addressing it\ndirectly still refuses `content_unavailable`. Every other file in the workspace\nstays available.",
                 "properties": {
                   "code": {
                     "const": "source_unavailable",
@@ -12313,7 +12313,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A claimed file's bytes are not valid UTF-8, so the index omits it: it answers no\nsearch or lookup, and addressing it directly still refuses `content_unavailable`.\nEvery other file in the workspace stays available.",
+                "description": "A claimed file is left out of the index - its bytes are not valid UTF-8, or it\ncrosses a per-file bound - so it answers no search or lookup, and addressing it\ndirectly still refuses `content_unavailable`. Every other file in the workspace\nstays available.",
                 "properties": {
                   "code": {
                     "const": "source_unavailable",

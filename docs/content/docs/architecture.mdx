@@ -461,6 +461,15 @@ publication the store already answers for. What a caller is told about is a tier
 answer at all - one that refused to load, or holds no indexed tree - which raises
 `lexical_ranking_unavailable`.
 
+<VersionBadge version="v0.0.32" />
+
+A file past the per-file byte bound, or one its syntax provider refuses under a node or depth
+bound, is left out of the index: it answers no search or lookup, counts nowhere in
+[`rift://map`](/docs/protocol/mcp#resource-map), and is named in
+[`rift://logs`](/docs/protocol/mcp#resource-logs) with the bound it crossed. One minified
+bundle therefore never blocks the workspace. The [`[source]`](/docs/configuration#source)
+exclusion remains the way to keep such files out of the walk altogether.
+
 ### Search
 
 [`search`](/docs/protocol/mcp#tool-search) is for reads where the exact name isn't known.
@@ -762,9 +771,9 @@ the retry schedule. A
 `workspace/diagnostic/refresh` request invalidates earlier pull evidence. An answer that still
 changes at the bound is unready, never proof of clean bytes.
 
-When the whole budget is spent while announced work remains outstanding, a rename or a move fails
-`temporarily_unavailable` with the tree untouched, so the caller can send the same request again
-once the engine has loaded.
+When the whole budget is spent while announced work remains outstanding, a rename, a move, or a
+removal fails `temporarily_unavailable` with the tree untouched, so the caller can send the same
+request again once the engine has loaded.
 
 ### Rename a declaration
 

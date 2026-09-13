@@ -749,8 +749,10 @@ condition, and the warning names it by the engine's own URI.
 
 An engine that answers with no references before confirming its own readiness is a third case:
 that answer looks the same as one from an engine that checked and found nothing, so the removal
-refuses `temporarily_unavailable` instead of applying. `force` overrides this refusal too,
-carrying a warning that the engine's readiness was unconfirmed.
+refuses `temporarily_unavailable` instead of applying. An engine that could not answer the check
+at all - still loading on every attempt, or a failed request - refuses the same
+`temporarily_unavailable`, so the removal never applies on an unproven check. `force` overrides
+both refusals, carrying a warning that names the engine and why the check did not run to a verdict.
 
 <McpTool name="remove_node" />
 
@@ -802,6 +804,10 @@ still standing. A `replace_node` whose listing went stale shows the shape:
   ]
 }
 ```
+
+A node address whose range the file no longer holds - the file shrank below it since the
+listing - refuses the same way, with `observed` naming the file's current length in place of a
+digest: `outside the file's 120 bytes`.
 
 **Applied**, when final bytes differ from original bytes after transform hooks. At least one path
 changed. The result's `summary` carries change `id`, the `files` the change wrote, diagnostics, and

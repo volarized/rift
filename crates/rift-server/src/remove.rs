@@ -3,12 +3,14 @@
 //! Each removal resolves the span its `replace_` neighbour resolves, widens it over the
 //! separator that followed, and rewrites the file without those bytes. Before it
 //! writes, the server asks the language engine configured for the declaration what still
-//! references it: a standing reference refuses unless `force` overrides the refusal, and an
-//! engine that cannot answer the question at all is not the same as one that answered it
-//! clean, so the two stay distinguishable on the result. An empty answer from an engine that
-//! has never confirmed its own readiness is a third case, distinct from both: it refuses
-//! unless `force` overrides it too, because nothing tells that answer apart from the answer
-//! of an engine that has not read the file yet.
+//! references it: a standing reference refuses unless `force` overrides the refusal. An
+//! empty answer from an engine that has never confirmed its own readiness refuses unless
+//! `force` overrides it too, because nothing tells that answer apart from the answer of an
+//! engine that has not read the file yet; so does an engine that did not answer at all -
+//! still loading on every attempt, or a failed request - because nothing was checked. Only
+//! a declaration no engine can check - none configured for its language, or one that does
+//! not advertise references - applies unchecked, and the result carries a warning saying
+//! why.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -303,6 +305,21 @@ async fn concluded_plan(
             "remove reference check",
             "the engine has not confirmed it is ready",
         ))),
+        ReferenceCheck::Unanswered { engine, detail } if force => Ok(built_plan(
+            target,
+            widened,
+            addresses,
+            Some(unchecked_diagnostic(&NotChecked::Unanswered {
+                engine,
+                detail,
+            })),
+        )),
+        ReferenceCheck::Unanswered { engine, detail } => {
+            Err(PlanEnd::Failed(ReadFault::unavailable(
+                "remove reference check",
+                NotChecked::Unanswered { engine, detail }.detail(),
+            )))
+        }
         ReferenceCheck::NotChecked(reason) => Ok(built_plan(
             target,
             widened,
@@ -364,11 +381,15 @@ enum ReferenceCheck {
     /// readiness: nothing distinguishes that answer from the answer of an engine that has
     /// not read the file yet, so it is not proof the declaration is unreferenced.
     Unconfirmed { engine: String },
-    /// No check ran, or the one that did could not be read as an answer.
+    /// The engine did not answer the request - it was still loading when the retry
+    /// schedule was spent, or the request itself failed - so nothing was checked. `detail`
+    /// is the engine failure's own rendering.
+    Unanswered { engine: String, detail: String },
+    /// No check could run: the removal applies, and the result says why.
     NotChecked(NotChecked),
 }
 
-/// Why a removal's reference check did not run to a verdict.
+/// Why a removal applied without its reference check running to a verdict.
 enum NotChecked {
     /// The address names no declaration - `remove_node` targeting a node no symbol covers.
     NodeNamesNoSymbol,
@@ -376,8 +397,8 @@ enum NotChecked {
     NoEngine { language_segment: String },
     /// The engine does not advertise `textDocument/references`.
     CapabilityAbsent { engine: String },
-    /// The engine failed to answer the request.
-    RequestFailed { engine: String },
+    /// The engine did not answer the request; `force` let the removal proceed anyway.
+    Unanswered { engine: String, detail: String },
     /// The engine answered with no references while it had never confirmed its own
     /// readiness; `force` let the removal proceed anyway.
     Unconfirmed { engine: String },
@@ -396,8 +417,8 @@ impl NotChecked {
             Self::CapabilityAbsent { engine } => {
                 format!("engine {engine} does not advertise textDocument/references")
             }
-            Self::RequestFailed { engine } => {
-                format!("engine {engine} did not answer the reference check")
+            Self::Unanswered { engine, detail } => {
+                format!("engine {engine} did not answer the reference check: {detail}")
             }
             Self::Unconfirmed { engine } => format!(
                 "engine {engine} answered with no references and has announced no work of \
@@ -407,11 +428,12 @@ impl NotChecked {
     }
 }
 
-/// Runs the reference check for one removal target, downgrading every engine failure - a
-/// spawn, a timeout, a protocol fault, the capability itself being absent - to the
-/// not-checked case rather than failing the request: a removal the engine cannot check is
-/// still a removal the caller asked for, and the not-checked warning says why the tree was
-/// not proven clean.
+/// Runs the reference check for one removal target. A declaration no engine can check - no
+/// engine for its language, or one without the references capability - is the not-checked
+/// case, and the removal applies with a warning saying why the tree was not proven clean.
+/// Every other engine failure - a spawn, a timeout, a protocol fault, a retry schedule
+/// spent while the engine was still loading - is [`ReferenceCheck::Unanswered`]: the check
+/// ran and reached no verdict, so the removal refuses unless `force` overrides it.
 async fn checked_references(
     workspace_root: &Path,
     catalog: &DependencyCatalog,
@@ -450,9 +472,10 @@ async fn checked_references(
                     engine,
                 }))
             } else {
-                Ok(ReferenceCheck::NotChecked(NotChecked::RequestFailed {
+                Ok(ReferenceCheck::Unanswered {
                     engine,
-                }))
+                    detail: error.to_string(),
+                })
             }
         }
     }
@@ -966,10 +989,11 @@ mod tests {
                 "does not advertise textDocument/references",
             ),
             (
-                NotChecked::RequestFailed {
+                NotChecked::Unanswered {
                     engine: "fake".to_owned(),
+                    detail: "attempts 8".to_owned(),
                 },
-                "did not answer the reference check",
+                "did not answer the reference check: attempts 8",
             ),
             (
                 NotChecked::Unconfirmed {
@@ -1094,34 +1118,71 @@ mod tests {
         listing.nodes[0].id.0.clone()
     }
 
+    /// An address minted before `lib.rs` shrank below its range refuses the way
+    /// `replace_node` refuses the identical address: `source_unchanged` failed, with the
+    /// file's current length as the observed value. The two tools must agree.
     #[tokio::test]
-    async fn plan_remove_node_with_a_forged_out_of_bounds_range_fails_untouched() {
-        let source = "pub fn beacon() {}\n";
-        let (directory, reads, engines) = workspace(&[("lib.rs", source)]);
-        let end = source.len() as u64 + 10;
-        // A forged witness for a range wholly past the file, exactly what `replace_node`
-        // refuses for the identical address: the two tools must agree.
-        let witness = crate::read::digest_hex8("");
-        let error = plan_remove_node(
+    async fn plan_remove_node_against_a_file_that_shrank_below_the_address_refuses_source_unchanged()
+     {
+        let shrunk = "pub fn beacon() {}\n";
+        let (directory, reads, engines) =
+            workspace(&[("lib.rs", "pub fn beacon() {}\npub fn late() {}\n")]);
+        let address = listed_node_id(&reads, "lib.rs", shrunk.len() as u64 + 3);
+        std::fs::write(directory.path().join("lib.rs"), shrunk).expect("fixture file shrinks");
+        let reads = ReadService::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )
+        .expect("shrunk workspace indexes");
+        let resolution = plan_remove_node(
             &reads,
             &engines,
             directory.path(),
             &RemoveNodeParams {
-                node: NodeId(format!("rift://node/rust/lib.rs@0-{end}#{witness}")),
+                node: NodeId(address.clone()),
                 force: false,
             },
         )
         .await
-        .expect_err("a range past the file end must error");
-        assert_eq!(error.descriptor().code(), "invalid_request");
-        assert!(
-            error.to_string().contains("outside the addressed file"),
-            "message must name the span fault: {error}"
+        .expect("a shrunk file is a typed refusal, not an error");
+        let RemoveResolution::Refused(result) = resolution else {
+            panic!("a shrunk file must refuse: {resolution:?}");
+        };
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("a shrunk file must refuse with preconditions");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::SourceUnchanged
+        );
+        let (_, witness) = address
+            .rsplit_once('#')
+            .expect("a listed node id carries a witness");
+        assert_eq!(
+            preconditions[0].expected,
+            PreconditionValue::Text {
+                value: witness.to_owned()
+            }
+        );
+        assert_eq!(
+            preconditions[0].observed,
+            PreconditionValue::Text {
+                value: format!("outside the file's {} bytes", shrunk.len())
+            }
         );
         let untouched =
             std::fs::read_to_string(directory.path().join("lib.rs")).expect("fixture file reads");
         assert_eq!(
-            untouched, source,
+            untouched, shrunk,
             "a refused removal must leave the tree untouched"
         );
     }
@@ -1146,7 +1207,7 @@ mod tests {
         .expect_err("a range naming no syntax node must error");
         assert_eq!(error.descriptor().code(), "invalid_request");
         assert!(
-            error.to_string().contains("outside the addressed file"),
+            error.to_string().contains("names no syntax node"),
             "message must name the range, not a witness mismatch: {error}"
         );
         let untouched =
@@ -1326,6 +1387,36 @@ mod tests {
         (directory, reads, engines)
     }
 
+    /// A workspace served by a canned `sh` engine that announces work through `$/progress`
+    /// and never ends it, answering no references on both configured attempts: the engine
+    /// is still loading when the retry schedule is spent, the condition rust-analyzer shows
+    /// on a cold repository. The exchange ends in [`EngineFault::Analyzing`].
+    fn workspace_with_loading_references_engine(
+        files: &[(&str, &str)],
+    ) -> (tempfile::TempDir, ReadService, EnginePool) {
+        let (directory, reads, _unused_engines) = workspace(files);
+        let capabilities = framed(
+            r#"{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"referencesProvider":true}}}"#,
+        );
+        let progress_begin = framed(
+            r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"warm","value":{"kind":"begin","title":"loading"}}}"#,
+        );
+        let no_references =
+            |id: u64| framed(&format!(r#"{{"jsonrpc":"2.0","id":{id},"result":null}}"#));
+        let script = format!(
+            "printf '%s' '{capabilities}{progress_begin}{}{}'; sleep 0.2",
+            no_references(1),
+            no_references(2),
+        );
+        let retry = rift_protocol::retry::RetryPolicy {
+            attempts: 2,
+            delay: rift_protocol::configuration::Duration::from_millis(1),
+            delay_limit: rift_protocol::configuration::Duration::from_millis(1),
+        };
+        let engines = engine_pool(directory.path(), references_engine(script, retry));
+        (directory, reads, engines)
+    }
+
     /// The engine announces and ends unrelated work, then answers no references before its
     /// settled reference arrives. The transcript records whether retries kept one document
     /// exchange open.
@@ -1434,6 +1525,79 @@ mod tests {
         assert_eq!(diagnostic.code.as_deref(), Some("rift.remove.unchecked"));
         assert!(
             diagnostic.message.contains("fake"),
+            "{}",
+            diagnostic.message
+        );
+        engines.shutdown().await;
+    }
+
+    /// An engine that did not answer the check - still loading on every attempt - proves
+    /// nothing about the declaration's references, so the removal refuses
+    /// `temporarily_unavailable` naming the engine, the way an unconfirmed answer does,
+    /// and leaves the tree untouched.
+    #[tokio::test]
+    async fn plan_remove_symbol_against_an_engine_still_loading_refuses_temporarily_unavailable() {
+        let source = "pub fn beacon() {}\n";
+        let (directory, reads, engines) =
+            workspace_with_loading_references_engine(&[("lib.rs", source)]);
+        let error = plan_remove_symbol(
+            &reads,
+            &engines,
+            directory.path(),
+            &RemoveSymbolParams {
+                symbol: symbol("beacon"),
+                force: false,
+            },
+        )
+        .await
+        .expect_err("an engine that did not answer must refuse, not apply");
+        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("engine fake did not answer the reference check"),
+            "{rendered}"
+        );
+        let untouched =
+            std::fs::read_to_string(directory.path().join("lib.rs")).expect("fixture file reads");
+        assert_eq!(
+            untouched, source,
+            "a refusal over an unanswered check leaves the tree untouched"
+        );
+        engines.shutdown().await;
+    }
+
+    /// `force` overrides the unanswered-check refusal the same way it overrides the
+    /// unconfirmed one: the removal applies, and the warning names the engine that did
+    /// not answer.
+    #[tokio::test]
+    async fn plan_remove_symbol_against_an_engine_still_loading_with_force_applies_with_a_warning()
+    {
+        let source = "pub fn beacon() {}\n";
+        let (directory, reads, engines) =
+            workspace_with_loading_references_engine(&[("lib.rs", source)]);
+        let resolution = plan_remove_symbol(
+            &reads,
+            &engines,
+            directory.path(),
+            &RemoveSymbolParams {
+                symbol: symbol("beacon"),
+                force: true,
+            },
+        )
+        .await
+        .expect("force lets an unanswered check proceed");
+        let RemoveResolution::Planned(plan) = resolution else {
+            panic!("force must plan the removal: {resolution:?}");
+        };
+        let diagnostic = plan
+            .diagnostic
+            .expect("an applied removal over an unanswered check carries a warning");
+        assert_eq!(diagnostic.severity, Severity::Warning);
+        assert_eq!(diagnostic.code.as_deref(), Some("rift.remove.unchecked"));
+        assert!(
+            diagnostic
+                .message
+                .contains("engine fake did not answer the reference check"),
             "{}",
             diagnostic.message
         );
