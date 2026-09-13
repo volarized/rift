@@ -330,6 +330,18 @@ mod tests {
     }
 
     #[test]
+    fn test_package_index_keeps_an_exported_macro_and_drops_a_bare_one() {
+        let package = rust_package(
+            "macros",
+            "#[macro_export]\nmacro_rules! cfg_if { () => {}; }\nmacro_rules! helper { () => {}; }\n",
+        );
+
+        let matches = package.symbols("", 10);
+
+        assert_eq!(names(&matches), ["cfg_if"]);
+    }
+
+    #[test]
     fn test_package_index_keeps_items_of_a_pub_trait_and_drops_private_impl_methods() {
         let package = rust_package(
             "traits",
