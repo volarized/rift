@@ -222,12 +222,10 @@ impl WorkspaceIndexFault {
             .and_then(|source| source.downcast_ref::<rift_history::HistoryError>())
     }
 
-    /// The provider failure behind a `Syntax` violation, which owns this
-    /// fault's registry identity.
+    /// The provider failure behind this fault, which owns a `Syntax` violation's
+    /// registry identity. Only a `Syntax` violation carries a [`SyntaxError`] as
+    /// its source, so the downcast alone decides.
     fn syntax_source(&self) -> Option<&SyntaxError> {
-        if self.violation != WorkspaceIndexViolation::Syntax {
-            return None;
-        }
         self.source
             .as_deref()
             .and_then(|source| source.downcast_ref::<SyntaxError>())
@@ -5232,6 +5230,52 @@ mod tests {
                 violation: SyntaxViolation::SourceTooLarge,
             })
         );
+    }
+
+    /// A provider failing outside its bounds: the fault is not one that leaves the file
+    /// out, so the read keeps failing the build.
+    #[derive(Debug)]
+    struct RefusingProvider {
+        language: rift_protocol::read::Language,
+    }
+
+    impl SyntaxProvider for RefusingProvider {
+        fn language(&self) -> &rift_protocol::read::Language {
+            &self.language
+        }
+
+        fn source_bytes_max(&self) -> usize {
+            4_096
+        }
+
+        fn analyze(&self, _source: SyntaxSource<'_>) -> Result<SyntaxDocument, SyntaxError> {
+            Err(rift_core::Error::new(
+                rift_syntax::SyntaxFault::UnknownNodeKind {
+                    kind: "beacon".to_owned(),
+                },
+            ))
+        }
+
+        fn node_facets(&self, _kind: &str) -> Vec<rift_protocol::read::NodeFacet> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn test_syntax_read_keeps_failing_the_build_on_a_provider_fault_outside_its_bounds() {
+        let path = ProjectPath::new("lib.rs").expect("valid path");
+        let text = TextSourceFile::from_content(path.clone(), "pub fn beacon() {}\n".to_owned());
+        let provider = RefusingProvider {
+            language: rift_protocol::read::Language::from_identity_segment("rust")
+                .expect("rust is a language"),
+        };
+
+        let Err(error) = syntax_read(&text, Path::new("/workspace/lib.rs"), &provider) else {
+            panic!("a provider fault outside its bounds fails the build");
+        };
+
+        assert_eq!(error.fault().violation(), WorkspaceIndexViolation::Syntax);
+        assert_eq!(error.fault().left_out_file(path), None);
     }
 
     #[cfg(unix)]
