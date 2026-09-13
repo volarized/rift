@@ -111,6 +111,52 @@ or `.gitignore` entry can make the server serve them.
 reach one such file on demand, through the request-side `force_include` override on `search`'s
 `paths` selector.
 
+## Dependencies
+
+<VersionBadge version="v0.0.32" languages={["Rust", "Python", "TypeScript"]} />
+
+`dependencies` shapes the [dependency index](/docs/architecture#dependency-index): whether it
+runs, how the catalog is resolved, which cataloged packages it indexes, and the bounds it reads
+and holds under. The keys are shown at their defaults:
+
+```toml
+[dependencies]
+enabled = true
+resolution = "auto"
+include = []
+exclude = []
+package_size = "4mb"
+index_size = "256mb"
+package_files = 2000
+command_timeout = "120s"
+```
+
+- `enabled = false` turns the index off: [`get_symbol`](/docs/protocol/mcp#tool-get_symbol) and
+  [`search`](/docs/protocol/mcp#tool-search) refuse a `scope` beyond `project` with
+  `capability_unavailable`. The catalog still resolves, so `rift://map` still lists `packages`
+- `resolution` selects how the resolvers reach a package graph: `auto` runs each toolchain and
+  answers from the lockfile when the run fails; `static` never runs a toolchain, so every
+  resolver answers from its lockfile and the machine's package cache alone. The Rust standard
+  library is cataloged from `rustc`, so under `static` it has no entry and the answer reports
+  the degradation
+- `include` and `exclude` are globs over `<manager>/<name>` - `cargo/tokio`, `npm/@types/*`,
+  `stdlib/*` - matched the way `source` patterns are, each list at most 64 patterns of at most
+  256 bytes. Empty `include` selects every cataloged package; a match in `exclude` drops a
+  package even when `include` also matches it. A dropped package is never planned: it stays in
+  the catalog and on the map, and no answer reports it pending or skipped
+- `package_size` bounds the selected source one package may hold, 64kb to 1gb; a package past
+  it is skipped
+- `index_size` bounds what every indexed package holds together, 1mb to 16gb; a package that
+  would cross it is skipped
+- `package_files` bounds the files one package's selection may hold, 1 to 100000; a package
+  past it is skipped
+- `command_timeout` bounds one toolchain run - `cargo metadata`, `rustc --print sysroot` - 1s
+  to 1h; a run past it is killed and the resolver answers from its static inputs
+
+A change to `package_size`, `index_size`, `package_files`, `include`, or `exclude` re-indexes
+every package: each held build was read under the old bounds and selection, so the next
+publication plans the index again from the catalog.
+
 ## Languages and LSP
 
 <VersionBadge version="v0.0.25" />
