@@ -1336,6 +1336,52 @@ impl LexicalWrite {
             Self::Change(change) => change.is_empty(),
         }
     }
+
+    /// The write without every unit whose `content` exceeds `unit_bytes_max`, beside the
+    /// units left out.
+    ///
+    /// The store refuses a whole batch over one oversized unit, and a publication cannot
+    /// wait on an operator raising a bound the configuration does not expose. The unit is
+    /// left out of the lexical index instead: its file stays in the syntax index and keeps
+    /// answering `get_symbol` and symbol search, and only its text ranking is absent. A
+    /// change set keeps every replaced path, so the stored units of a file whose one unit
+    /// grew past the bound are still deleted.
+    fn within_unit_bound(self, unit_bytes_max: usize) -> (Self, Vec<LexicalUnit>) {
+        let mut left_out = Vec::new();
+        let mut within = |unit: LexicalUnit| {
+            if unit.content().len() > unit_bytes_max {
+                left_out.push(unit);
+                None
+            } else {
+                Some(unit)
+            }
+        };
+        let kept = match self {
+            Self::Whole(units) => Self::Whole(units.into_iter().filter_map(&mut within).collect()),
+            Self::Change(change) => {
+                let (replaced, inserted) = change.into_parts();
+                let inserted = inserted.into_iter().filter_map(&mut within).collect();
+                Self::Change(LexicalChange::new(replaced, inserted))
+            }
+        };
+        (kept, left_out)
+    }
+}
+
+/// Records each unit one commit left out of the lexical index, once per build, in the
+/// form `file left out of the index` takes.
+fn record_units_left_out(left_out: &[LexicalUnit], unit_bytes_max: usize) {
+    for unit in left_out {
+        tracing::warn!(
+            component = "index",
+            operation = "index.build",
+            path = unit.path().as_str(),
+            observed = unit.content().len(),
+            maximum = unit_bytes_max,
+            "lexical unit left out of the search index: its content exceeds the unit byte \
+             bound; the file still answers get_symbol and symbol search"
+        );
+    }
 }
 
 /// One commit request: what to write, the tree revision to stamp, and where the reply goes.
@@ -1360,6 +1406,8 @@ struct LexicalCommit {
 #[derive(Clone, Debug)]
 pub(crate) struct LexicalLane {
     commits: mpsc::Sender<LexicalCommit>,
+    /// The store's per-unit content bound, applied before a write reaches it.
+    unit_bytes_max: usize,
 }
 
 impl LexicalLane {
@@ -1369,6 +1417,8 @@ impl LexicalLane {
     /// supervisor runs under. A commit in flight when that happens is answered with the
     /// closed-queue failure, so no rebuild waits on an owner that has gone.
     pub(crate) fn spawn(index: Arc<SearchIndex>, cancellation: CancellationToken) -> Self {
+        let unit_bytes_max =
+            usize::try_from(index.lexical_limits().unit_bytes_max()).unwrap_or(usize::MAX);
         let (commits, mut requests) = mpsc::channel::<LexicalCommit>(LEXICAL_COMMITS_MAX);
         tokio::spawn(async move {
             loop {
@@ -1390,14 +1440,19 @@ impl LexicalLane {
                 let _ = commit.reply.send(written);
             }
         });
-        Self { commits }
+        Self {
+            commits,
+            unit_bytes_max,
+        }
     }
 
     /// Commits `write`, stamps `tree_revision`, and returns once that transaction has
     /// ended.
     ///
-    /// A write that changes nothing returns without a transaction: the stored stamp already
-    /// names the tree revision the candidate answers under.
+    /// A unit whose content exceeds the store's per-unit bound is left out of the write and
+    /// recorded, so one oversized declaration cannot refuse the whole publication. A write
+    /// that changes nothing returns without a transaction: the stored stamp already names
+    /// the tree revision the candidate answers under.
     ///
     /// # Errors
     ///
@@ -1415,6 +1470,8 @@ impl LexicalLane {
         write: LexicalWrite,
         tree_revision: &str,
     ) -> Result<(), ReadError> {
+        let (write, left_out) = write.within_unit_bound(self.unit_bytes_max);
+        record_units_left_out(&left_out, self.unit_bytes_max);
         if write.is_empty() {
             return Ok(());
         }
@@ -1919,12 +1976,15 @@ mod tests {
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
     use notify::{Event, EventKind};
     use rift_core::{SourceVisibility, TextFileInclusion};
-    use rift_index::{LexicalIndexLimits, WorkspaceIndexLimits, WorkspaceSourcePolicy};
+    use rift_index::{
+        LexicalChange, LexicalIndexLimits, WorkspaceIndexLimits, WorkspaceSourcePolicy,
+    };
     use rift_protocol::configuration::ServerConfiguration;
     use rift_search::{RevisionScoped, SearchIndex, SearchIndexLimits, SemanticReadiness};
     use rift_server::{LspProcessKey, ReadFault};
     use tokio::sync::{Barrier as AsyncBarrier, RwLock};
     use tokio_util::sync::CancellationToken;
+    use tracing_subscriber::layer::SubscriberExt as _;
 
     use super::{
         BlockingExecutor, ChangeSet, ConfigurationFingerprint, ConfigurationState, IndexState,
@@ -3282,6 +3342,154 @@ mod tests {
         );
         cancellation.cancel();
         Ok(())
+    }
+
+    /// A search index whose lexical tier accepts at most `unit_bytes_max` content bytes
+    /// per unit, for the left-out cases.
+    async fn search_index_bounded(
+        database: &std::path::Path,
+        unit_bytes_max: u32,
+    ) -> TestResult<SearchIndex> {
+        let defaults = LexicalIndexLimits::default();
+        let lexical = LexicalIndexLimits::new(
+            defaults.units_max(),
+            unit_bytes_max,
+            defaults.query_terms_max(),
+            defaults.matches_max(),
+            defaults.pool_slots(),
+            defaults.busy_timeout_ms(),
+        );
+        let limits = SearchIndexLimits::builder(lexical)
+            .disable_semantic()
+            .build();
+        Ok(SearchIndex::open(database, limits).await?)
+    }
+
+    /// One unit `bytes` long at `path`, for the bound cases.
+    fn unit_of(path: &str, identity: &str, bytes: usize) -> TestResult<rift_index::LexicalUnit> {
+        Ok(rift_index::LexicalUnit::new(
+            identity,
+            rift_core::ProjectPath::new(path)?,
+            rift_index::LexicalUnitKind::Symbol,
+            Some(identity.to_owned()),
+            "x".repeat(bytes),
+        )?)
+    }
+
+    #[test]
+    fn a_whole_write_leaves_out_every_unit_over_the_bound() -> TestResult {
+        let write = super::LexicalWrite::Whole(vec![
+            unit_of("a.rs", "small", 8)?,
+            unit_of("b.rs", "large", 9)?,
+            unit_of("c.rs", "exact", 8)?,
+        ]);
+
+        let (kept, left_out) = write.within_unit_bound(8);
+
+        let super::LexicalWrite::Whole(kept) = kept else {
+            return Err("a whole write stays whole".into());
+        };
+        assert_eq!(
+            kept.iter()
+                .map(rift_index::LexicalUnit::identity)
+                .collect::<Vec<_>>(),
+            ["small", "exact"]
+        );
+        assert_eq!(left_out.len(), 1);
+        assert_eq!(left_out[0].path().as_str(), "b.rs");
+        Ok(())
+    }
+
+    #[test]
+    fn a_change_write_keeps_its_replaced_paths_while_leaving_out_the_unit() -> TestResult {
+        let path = rift_core::ProjectPath::new("grown.rs")?;
+        let write = super::LexicalWrite::Change(LexicalChange::new(
+            vec![path.clone()],
+            vec![unit_of("grown.rs", "grown", 9)?],
+        ));
+
+        let (kept, left_out) = write.within_unit_bound(8);
+
+        let super::LexicalWrite::Change(change) = kept else {
+            return Err("a change write stays a change".into());
+        };
+        assert_eq!(change.replaced(), [path]);
+        assert!(
+            change.inserted().is_empty(),
+            "the grown unit is left out: {:?}",
+            change.inserted()
+        );
+        assert!(
+            !change.is_empty(),
+            "the stored units of the grown file are still deleted"
+        );
+        assert_eq!(left_out.len(), 1);
+        Ok(())
+    }
+
+    /// The lane commits the rest of the set when one declaration exceeds the store's
+    /// unit bound, stamps the revision, and records the unit it left out. The store's own
+    /// refusal is what this replaces: `lexical.rs` still refuses such a unit handed to it
+    /// directly.
+    #[tokio::test]
+    async fn a_commit_leaves_out_an_oversized_unit_records_it_and_publishes_the_rest() -> TestResult
+    {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            directory.path().join("blob.rs"),
+            format!("pub const BLOB: &str = \"{}\";\n", "b".repeat(96)),
+        )?;
+        let published = stable_candidate(directory.path(), 0)?;
+        let index = Arc::new(search_index_bounded(&directory.path().join("search.db"), 64).await?);
+        let cancellation = CancellationToken::new();
+        let lane = LexicalLane::spawn(Arc::clone(&index), cancellation.clone());
+        let (sink, mut drain) = crate::logs::log_capture();
+        let subscriber = tracing_subscriber::registry().with(sink);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        lane.commit(
+            super::lexical_write(&published, &ChangeSet::Full),
+            published.reads.tree_revision(),
+        )
+        .await?;
+
+        assert_eq!(
+            index.tree_revision().await?.as_deref(),
+            Some(published.reads.tree_revision()),
+            "the commit publishes the rest of the set under the tree revision"
+        );
+        let ranked = ranked_at(&index, published.reads.tree_revision(), "beacon", 8).await?;
+        assert!(
+            !ranked.is_empty(),
+            "the sibling declaration stays searchable"
+        );
+        let blob = ranked_at(&index, published.reads.tree_revision(), "BLOB", 8).await?;
+        assert!(blob.is_empty(), "the oversized unit is absent: {blob:?}");
+        let recorded = queued_records(&mut drain);
+        let left_out = recorded
+            .iter()
+            .find(|record| record.message().contains("lexical unit left out"))
+            .ok_or("the left-out unit is recorded")?;
+        assert_eq!(left_out.level(), "warn");
+        assert_eq!(left_out.component(), "index");
+        assert!(
+            left_out.fields().contains("blob.rs")
+                && left_out.fields().contains("\"maximum\":\"64\""),
+            "the record names the path and the bound: {}",
+            left_out.fields()
+        );
+        cancellation.cancel();
+        Ok(())
+    }
+
+    /// Drains what the queue currently holds, without a store.
+    fn queued_records(drain: &mut crate::logs::LogDrain) -> Vec<rift_index::LogRecord> {
+        let mut records = Vec::new();
+        while let Ok(record) = drain.try_recv_record() {
+            records.push(record);
+        }
+        records
     }
 
     #[tokio::test]

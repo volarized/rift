@@ -4255,6 +4255,57 @@ pub fn beacon() -> u64 {
         Ok(())
     }
 
+    /// One declaration's content past the lexical unit bound leaves the lexical index
+    /// alone: the publication lands, the sibling answers `search`, the declaration still
+    /// answers `get_symbol`, and the record names the file. The lexical commit runs on
+    /// the building task, so the thread-local subscriber sees it.
+    #[tokio::test]
+    async fn an_oversized_declaration_is_left_out_of_search_and_the_rest_serves() -> TestResult {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        let unit_bytes_max =
+            usize::try_from(rift_index::LexicalIndexLimits::default().unit_bytes_max())?;
+        fs::write(
+            directory.path().join("src/blob.rs"),
+            format!(
+                "pub const BLOB: &str = \"{}\";\n",
+                "b".repeat(unit_bytes_max)
+            ),
+        )?;
+        super::hermetic_workspace(directory.path(), "")?;
+        let (sink, mut drain) = crate::logs::log_capture();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
+
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+
+        let kept = serde_json::to_value(run_search(&server, "beacon").await?)?;
+        assert!(hit_paths(&kept).contains(&"src/lib.rs"), "{kept:#}");
+        let symbol = get_symbol(&server, "BLOB").await?;
+        assert_eq!(
+            symbol.hits.len(),
+            1,
+            "the declaration stays in the syntax index: {symbol:?}"
+        );
+        let recorded = loop {
+            match drain.try_recv_record() {
+                Ok(record) if record.message().contains("lexical unit left out") => break record,
+                Ok(_) => {}
+                Err(_) => return Err("the left-out unit must be recorded".into()),
+            }
+        };
+        assert_eq!(recorded.level(), "warn");
+        assert_eq!(recorded.component(), "index");
+        assert!(
+            recorded.fields().contains("src/blob.rs"),
+            "the record names the path: {}",
+            recorded.fields()
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_cancelled_supervisor_reports_that_it_stopped() -> TestResult {
         let (_directory, server) = fixture().await?;
