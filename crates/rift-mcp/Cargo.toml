@@ -76,6 +76,10 @@ name = "hook_pipeline"
 path = "tests/hook_pipeline.rs"
 
 [[test]]
+name = "index_bounds"
+path = "tests/index_bounds.rs"
+
+[[test]]
 name = "live_rust_analyzer"
 path = "tests/live_rust_analyzer.rs"
 
