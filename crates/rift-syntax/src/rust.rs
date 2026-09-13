@@ -447,7 +447,7 @@ impl GrammarRules for RustGrammarRules {
         let Some(name) = declaration_name(node, text) else {
             return Ok(None);
         };
-        let visibility = declaration_visibility(node, text);
+        let visibility = declared_visibility(node, kind, text);
         let mut facets = declaration_facets(kind, &visibility);
         if is_entrypoint(node, kind, &name) {
             facets.push(SymbolFacet::Entrypoint);
@@ -508,6 +508,22 @@ fn rust_parser() -> Result<Parser, SyntaxError> {
 fn declaration_name(node: Node<'_>, text: &str) -> Option<String> {
     let name = node.child_by_field_name(RustGrammarField::Name.as_str())?;
     text.get(name.byte_range()).map(Into::into)
+}
+
+/// The attribute that exports a `macro_rules!` macro from its crate.
+const MACRO_EXPORT_ATTRIBUTE: &str = "macro_export";
+
+/// A declaration's visibility: its `visibility_modifier`, or, for a `macro_rules!`
+/// macro that carries no modifier, `pub` when `#[macro_export]` is attached.
+fn declared_visibility(node: Node<'_>, kind: RustSymbolKind, text: &str) -> RustVisibility {
+    let authored = declaration_visibility(node, text);
+    if kind == RustSymbolKind::Macro
+        && authored == RustVisibility::Private
+        && attachment::has_attached_attribute(node, text, MACRO_EXPORT_ATTRIBUTE)
+    {
+        return RustVisibility::Public;
+    }
+    authored
 }
 
 fn declaration_visibility(node: Node<'_>, text: &str) -> RustVisibility {
@@ -740,6 +756,29 @@ mod tests {
             .map(|symbol| symbol.signatures[0].display.as_str())
             .collect();
         assert_eq!(signatures, ["pub fn one()", "pub fn two(x: u8) -> u8"]);
+    }
+
+    #[test]
+    fn test_document_exported_macro_is_public_and_a_bare_macro_is_private() {
+        let document = analyze(
+            "#[macro_export]\nmacro_rules! shown { () => {}; }\n\
+             #[macro_export(local_inner_macros)]\nmacro_rules! local { () => {}; }\n\
+             macro_rules! hidden { () => {}; }\n",
+        );
+        let visibilities = document
+            .symbols()
+            .iter()
+            .map(|symbol| (symbol.name.as_str(), symbol.visibility.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            visibilities,
+            [
+                ("shown", Some("pub")),
+                ("local", Some("private")),
+                ("hidden", Some("private")),
+            ]
+        );
+        assert!(document.symbols()[0].facets.contains(&SymbolFacet::Public));
     }
 
     #[test]
