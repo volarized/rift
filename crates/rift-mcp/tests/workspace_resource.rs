@@ -114,3 +114,40 @@ async fn a_workspace_page_past_the_end_answers_an_empty_catalog() -> TestResult 
     server_task.await?;
     Ok(())
 }
+
+/// One byte past the 4 MiB per-file bound every shipped provider declares, the bound the
+/// workspace scan applies to text files too.
+const OVERSIZED_FILE_BYTES: usize = 4 * 1024 * 1024 + 1;
+
+/// A file past the per-file byte bound is left out of the index, so the source listing
+/// omits it the way the index does instead of refusing the whole resource.
+#[tokio::test]
+async fn a_file_past_the_per_file_bound_is_absent_from_the_source_listing() -> TestResult {
+    let oversized = "x".repeat(OVERSIZED_FILE_BYTES);
+    let (_directory, client, server_task) = served_workspace(
+        &[
+            ("lib.rs", "pub fn beacon() {}\n"),
+            ("blob.txt", oversized.as_str()),
+        ],
+        None,
+    )
+    .await?;
+
+    let body = resource_body(&client, "rift://workspace").await?;
+
+    let paths: Vec<&str> = body["source"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|unit| unit["path"].as_str())
+        .collect();
+    assert!(paths.contains(&"lib.rs"), "{body:#}");
+    assert!(
+        !paths.contains(&"blob.txt"),
+        "a file the index leaves out is no source unit: {body:#}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}

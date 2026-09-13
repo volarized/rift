@@ -303,3 +303,44 @@ async fn missing_and_valid_files_serve_normally() -> TestResult {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn out_of_range_source_files_fails_reads_naming_the_field() -> TestResult {
+    for configuration in ["[source]\nfiles = 999\n", "[source]\nfiles = 5000001\n"] {
+        let directory = workspace_with(Some(configuration))?;
+        let client = client_for(directory.path()).await?;
+
+        let read = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
+        assert_eq!(read["code"], json!("configuration_invalid"));
+        let message = read["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("source.files") && message.contains("1000..=5000000"),
+            "the refusal must name the field and its range: {message}"
+        );
+
+        client.cancel().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn out_of_range_source_workspace_size_fails_reads_naming_the_field() -> TestResult {
+    for configuration in [
+        "[source]\nworkspace_size = \"15mb\"\n",
+        "[source]\nworkspace_size = \"65gb\"\n",
+    ] {
+        let directory = workspace_with(Some(configuration))?;
+        let client = client_for(directory.path()).await?;
+
+        let read = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
+        assert_eq!(read["code"], json!("configuration_invalid"));
+        let message = read["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("source.workspace_size") && message.contains("16777216..=68719476736"),
+            "the refusal must name the field and its range: {message}"
+        );
+
+        client.cancel().await?;
+    }
+    Ok(())
+}
