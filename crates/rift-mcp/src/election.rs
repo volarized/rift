@@ -1009,10 +1009,15 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt as _;
 
         let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        fs::write(directory.path().join("other.rs"), "pub fn other() {}\n")?;
-        crate::server::hermetic_workspace(directory.path(), "")?;
-        let limits = rift_index::WorkspaceIndexLimits::new(1, 4_096, 4_096, 8, 32)?;
+        // `[source] files` accepts at least 1,000; one file past it fails the build.
+        for index in 0..=1_000 {
+            fs::write(
+                directory.path().join(format!("unit_{index:04}.rs")),
+                "pub fn beacon() {}\n",
+            )?;
+        }
+        crate::server::hermetic_workspace(directory.path(), "[source]\nfiles = 1000\n")?;
+        let limits = rift_index::WorkspaceIndexLimits::default();
         let (sink, mut drain) = crate::logs::log_capture();
         let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
         let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
