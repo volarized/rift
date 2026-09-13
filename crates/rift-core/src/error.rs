@@ -525,18 +525,132 @@ impl Fault for ErrorName {
     }
 }
 
+/// Sources one walk of a failure's `source` chain visits, at most.
+///
+/// A chain deeper than this is cut, so a source that cycles back on itself
+/// cannot keep a render walking forever.
+pub const CAUSE_DEPTH_MAX: usize = 8;
+
+/// The causes below `error`, outermost first, each rendered once.
+///
+/// A carrier whose `source` renders the same text as itself - the CLI's
+/// error over the crate's [`Error`], a fault over the error it forwards -
+/// contributes no repeated line. The walk visits at most
+/// [`CAUSE_DEPTH_MAX`] sources.
+#[must_use]
+pub fn causes(error: &(dyn std::error::Error + 'static)) -> Vec<String> {
+    let mut rendered = Vec::new();
+    let mut previous = error.to_string();
+    let mut source = error.source();
+    for _ in 0..CAUSE_DEPTH_MAX {
+        let Some(cause) = source else {
+            break;
+        };
+        let text = cause.to_string();
+        if text != previous {
+            rendered.push(text.clone());
+            previous = text;
+        }
+        source = cause.source();
+    }
+    rendered
+}
+
 /// A failure with no domain kind beyond its registry identity.
 pub type RiftError = Error<ErrorName>;
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CliCode, Error, ErrorCode, ErrorContext, ErrorName, Fault, RiftError, fault_label,
-        render_failure,
+        CAUSE_DEPTH_MAX, CliCode, Error, ErrorCode, ErrorContext, ErrorName, Fault, RiftError,
+        causes, fault_label, render_failure,
     };
     use serde::Serialize;
     use std::collections::HashSet;
     use strum::VariantArray;
+
+    /// A fault forwarding one wrapped failure, for cause-chain cases.
+    #[derive(Debug)]
+    struct Forwarding(Box<dyn std::error::Error + Send + Sync + 'static>);
+
+    impl Fault for Forwarding {
+        fn name(&self) -> ErrorName {
+            ErrorName::Wire(ErrorCode::InternalError)
+        }
+
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self.0.as_ref())
+        }
+    }
+
+    /// A failure whose `source` is itself, for the depth bound.
+    #[derive(Debug)]
+    struct Cyclic;
+
+    impl std::fmt::Display for Cyclic {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("cyclic")
+        }
+    }
+
+    impl std::error::Error for Cyclic {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self)
+        }
+    }
+
+    #[test]
+    fn causes_walk_the_source_chain_outermost_first() {
+        let inner = std::io::Error::other("disk gone");
+        let middle = Error::new(Forwarding(Box::new(inner)))
+            .with_context(ErrorContext::new("operation", "publish"));
+        let outer = Error::new(Forwarding(Box::new(middle)));
+
+        let chain = causes(&outer);
+
+        assert_eq!(chain.len(), 2, "{chain:?}");
+        assert!(chain[0].contains("operation publish"), "{chain:?}");
+        assert_eq!(chain[1], "disk gone");
+    }
+
+    #[test]
+    fn causes_skip_a_source_that_renders_as_its_carrier() {
+        let inner = Error::new(Forwarding(Box::new(std::io::Error::other("root cause"))));
+        let outer = Error::new(Forwarding(Box::new(inner)));
+        assert_eq!(
+            outer.to_string(),
+            "the server failed in a way it did not classify; retry once, and report the full \
+             message if the failure repeats"
+        );
+
+        let chain = causes(&outer);
+
+        assert_eq!(chain, vec!["root cause".to_owned()]);
+    }
+
+    #[test]
+    fn causes_end_on_a_source_that_cycles_back_on_itself() {
+        let chain = causes(&Cyclic);
+
+        assert!(
+            chain.is_empty(),
+            "every visited source repeats the text: {chain:?}"
+        );
+    }
+
+    #[test]
+    fn causes_stop_at_the_depth_bound() {
+        let mut error = Error::new(Forwarding(Box::new(std::io::Error::other("bottom"))));
+        for depth in 0..(CAUSE_DEPTH_MAX + 4) {
+            error = Error::new(Forwarding(Box::new(error)))
+                .with_context(ErrorContext::new("depth", depth.to_string()));
+        }
+
+        let chain = causes(&error);
+
+        assert_eq!(chain.len(), CAUSE_DEPTH_MAX, "{chain:?}");
+        assert!(!chain.iter().any(|cause| cause == "bottom"), "{chain:?}");
+    }
 
     #[test]
     fn registry_codes_are_unique_snake_case_strings() {

@@ -1,10 +1,12 @@
-//! The two bounds a large workspace meets first, proven through the served surface:
-//! the lexical index's `[search.lexical] units_max` key, and one file a syntax provider
-//! refuses under its own bounds.
+//! The bounds a large workspace meets first, proven through the served surface: the
+//! lexical index's `[search.lexical] units_max` key, the `[source] workspace_size` key,
+//! and one file a syntax provider refuses under its own bounds.
 //!
-//! A workspace past `units_max` refuses to build naming the key and its maximum, and the
-//! same workspace under the default serves. A workspace holding one file past the syntax
-//! depth bound still answers `search` from its other file, with the deep file absent.
+//! A workspace past `units_max` or `workspace_size` refuses to build naming the key and
+//! its maximum, and the same workspace under the default serves; lowering
+//! `workspace_size` on a served workspace rebuilds the index and refuses the next
+//! request the same way. A workspace holding one file past the syntax depth bound still
+//! answers `search` from its other file, with the deep file absent.
 
 mod hermetic_search;
 #[allow(dead_code)]
@@ -128,6 +130,107 @@ async fn a_file_past_a_syntax_bound_is_left_out_and_the_rest_serves() -> TestRes
     assert!(
         !hit_paths(&absent).contains(&"src/deep.rs"),
         "the deep file answers no search: {absent:#}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// Text files whose bytes together pass the smallest `workspace_size` acceptance admits.
+const WORKSPACE_FILE_COUNT: usize = 17;
+
+/// Bytes each of those files holds: one MiB, under every language's per-file bound.
+const WORKSPACE_FILE_BYTES: usize = 1 << 20;
+
+/// The smallest `workspace_size` acceptance admits, on its own table.
+const WORKSPACE_SIZE_CONFIGURATION: &str = "[source]\nworkspace_size = \"16mb\"\n";
+
+/// One normal source file and `WORKSPACE_FILE_COUNT` text files of `WORKSPACE_FILE_BYTES`
+/// each.
+fn workspace_files() -> Vec<(String, String)> {
+    let mut files = vec![("lib.rs".to_owned(), "pub fn beacon() {}\n".to_owned())];
+    let line = "bulk text line\n";
+    let body = line.repeat(WORKSPACE_FILE_BYTES / line.len());
+    files.extend(
+        (0..WORKSPACE_FILE_COUNT).map(|index| (format!("bulk-{index:02}.txt"), body.clone())),
+    );
+    files
+}
+
+/// The message of one refused tool call.
+fn refusal_message(error: rmcp::ServiceError) -> String {
+    match error {
+        rmcp::ServiceError::McpError(data) => data.message.into_owned(),
+        other => panic!("expected a protocol-level McpError, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_workspace_past_workspace_size_refuses_to_build_naming_the_key() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    for (name, source) in workspace_files() {
+        fs::write(directory.path().join(name), source)?;
+    }
+    let mut configuration = hermetic_search::SEMANTIC_DISABLED.to_owned();
+    configuration.push_str(WORKSPACE_SIZE_CONFIGURATION);
+    fs::write(directory.path().join("rift.toml"), configuration)?;
+
+    let refusal = match RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await {
+        Ok(_server) => {
+            return Err("a workspace past workspace_size must refuse to build".into());
+        }
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        refusal.contains("source.workspace_size") && refusal.contains("maximum 16777216"),
+        "the refusal must name the key and its maximum: {refusal}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_same_workspace_serves_under_the_default_workspace_size_and_a_change_rebuilds()
+-> TestResult {
+    let files = workspace_files();
+    let (directory, client, server_task) = served_workspace(&borrowed(&files), None).await?;
+
+    let answer = search_page(&client, "beacon").await?;
+    assert!(hit_paths(&answer).contains(&"lib.rs"), "{answer:#}");
+
+    let mut lowered = hermetic_search::SEMANTIC_DISABLED.to_owned();
+    lowered.push_str(WORKSPACE_SIZE_CONFIGURATION);
+    fs::write(directory.path().join("rift.toml"), lowered)?;
+    let refused = client
+        .call_tool(tool_request("search", &json!({"query": "beacon"})))
+        .await
+        .expect_err("the rebuild under the lowered bound refuses the request");
+    let message = refusal_message(refused);
+    assert!(
+        message.contains("source.workspace_size"),
+        "the refusal must name the key: {message}"
+    );
+
+    // The restored file reaches the server through the filesystem watcher, so the
+    // recovery is polled under a bound rather than asserted on the next request.
+    fs::write(
+        directory.path().join("rift.toml"),
+        hermetic_search::SEMANTIC_DISABLED,
+    )?;
+    let mut recovered = false;
+    for _attempt in 0..100 {
+        if search_page(&client, "beacon")
+            .await
+            .is_ok_and(|answer| hit_paths(&answer).contains(&"lib.rs"))
+        {
+            recovered = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        recovered,
+        "the restored bound must serve the workspace again"
     );
 
     client.cancel().await?;

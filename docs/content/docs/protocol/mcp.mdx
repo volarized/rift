@@ -63,6 +63,12 @@ Three more warnings cover the search ranking tiers:
 A `symbol_disagreement` warning names a symbol whose selected presentation and at least one
 provider's own facts disagree.
 
+A `source_unavailable` warning names a file the index left out - bytes that are not valid UTF-8,
+a file past its per-file bound, or a syntax tree the provider refused - so it answers no search or
+lookup while every other file stays available. An answer carries at most eight of them, in
+project-path order; when more files were left out, one more `source_unavailable` carries no `unit`
+and counts the rest, and `rift://logs` names each.
+
 Three warnings ride a `get_symbol` or `search` answer whose `scope` reaches dependencies, and
 no other answer:
 
@@ -76,7 +82,8 @@ no other answer:
 
 An answer carries at most eight `dependency_package_skipped` and
 `dependency_resolver_degraded` warnings together: the skipped packages first, in package
-identity order, then the degraded resolvers in resolver order.
+identity order, then the degraded resolvers in resolver order. The `source_unavailable` bound
+above is separate, so an answer can carry eight of each.
 
 Every read carries an optional `rev`, and reads the workspace tree when it is absent.
 

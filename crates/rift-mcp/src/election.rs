@@ -10,11 +10,13 @@
 
 use std::fs::{OpenOptions, TryLockError};
 use std::io::{self, Write as _};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rift_core::constants::RIFT_STATE_DIRECTORY;
-use rift_core::{CliCode, Error, ErrorCode, ErrorContext, ErrorName, Fault};
+use rift_core::{CliCode, Error, ErrorCode, ErrorContext, ErrorName, Fault, causes};
+use rift_index::WorkspaceIndexLimits;
 use rift_protocol::lock::{SERVER_LOCK_FILE_NAME, ServerLock, ServerLockViolation};
 use tokio_util::sync::CancellationToken;
 
@@ -31,6 +33,12 @@ const SERVER_ELECTION_FILE_NAME: &str = "server.lock";
 
 /// Longest wait for a server that failed to publish to shut down again.
 const UNPUBLISHED_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Bound on one probe's connect to the recorded port.
+///
+/// The port is a loopback one, where a connect is accepted or refused at
+/// once; the bound only keeps a probe from hanging on a filtered socket.
+const PRESENCE_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Failure while claiming, publishing, or serving a workspace's election.
 pub type ElectionError = Error<ElectionFault>;
@@ -213,21 +221,33 @@ impl ElectionGuard {
         Ok(())
     }
 
-    /// Removes the published document, best effort.
+    /// Removes the published document, or empties it when it cannot be removed.
     ///
-    /// A document that cannot be removed is reported, not raised: once the
-    /// election lock releases with this guard, [`probe`] classifies the
-    /// leftover document as stale and the next starter replaces it.
+    /// A removal can fail where a truncation succeeds: unlinking needs the
+    /// state directory writable and, on a full volume, room for the
+    /// directory's own update. An emptied document is malformed, so no
+    /// [`probe`] pairs the previous holder's facts with this holder's lock.
+    /// A document that cannot be emptied either is reported, not raised:
+    /// once the election lock releases with this guard, [`probe`] classifies
+    /// the leftover as stale and the next starter replaces it.
     pub fn retire(&self) {
         match std::fs::remove_file(&self.document_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(()) => return,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
             Err(error) => tracing::warn!(
                 component = "mcp",
                 path = %self.document_path.display(),
                 %error,
-                "server lock document could not be removed"
+                "server lock document could not be removed; emptying it instead"
             ),
+        }
+        if let Err(error) = std::fs::File::create(&self.document_path) {
+            tracing::warn!(
+                component = "mcp",
+                path = %self.document_path.display(),
+                %error,
+                "server lock document could not be emptied"
+            );
         }
     }
 }
@@ -247,13 +267,31 @@ impl Drop for ElectionGuard {
 /// What one workspace's lock state says about a serving process.
 #[derive(Debug)]
 pub enum ServerPresence {
-    /// A live process holds the election and its published document
-    /// validates: the port and token reach a serving `rift server`.
+    /// A live process holds the election, its published document
+    /// validates, and the recorded port accepts a connect: the port and
+    /// token reach a serving `rift server`.
     Serving(ServerLock),
+    /// A live process holds the election but has published no document
+    /// yet: the elected server is still building its first index.
+    Starting,
     /// Lock state exists but names no live server.
     Stale(StaleReason),
     /// No lock document exists for this workspace.
     Absent,
+}
+
+impl ServerPresence {
+    /// Whether a live process holds the election, whatever it has published.
+    ///
+    /// A starter that spawns under a held election only loses it; a stop
+    /// is complete only once the election releases.
+    #[must_use]
+    pub fn election_held(&self) -> bool {
+        matches!(
+            self,
+            Self::Serving(_) | Self::Starting | Self::Stale(StaleReason::PortUnreachable { .. })
+        )
+    }
 }
 
 /// Why a workspace's lock state names no live server.
@@ -269,21 +307,56 @@ pub enum StaleReason {
     ElectionUnheld,
     /// The election file exists but its lock state could not be observed.
     ElectionUnobservable,
+    /// A live process holds the election and its document validates, but
+    /// the recorded port refuses a connect: the holder, whose pid the
+    /// document recorded, is shutting down.
+    PortUnreachable {
+        /// The pid the document recorded.
+        pid: u32,
+    },
+}
+
+/// What the election file says about a holder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ElectionState {
+    /// A live process holds the exclusive lock.
+    Held,
+    /// Nothing holds the lock, or no election file exists.
+    Unheld,
+    /// The election file exists but its lock state could not be observed.
+    Unobservable,
 }
 
 /// Observes the workspace's lock state without blocking.
 ///
-/// A [`ServerPresence::Serving`] answer requires both halves: the document
-/// reads and validates, and a non-blocking shared lock on the election file
-/// fails - proof a live process holds the exclusive lock. A shared lock
-/// that succeeds is released immediately. The probe itself never waits and
-/// never polls; callers that need to wait poll this function.
+/// A [`ServerPresence::Serving`] answer requires every half: a non-blocking
+/// shared lock on the election file fails - proof a live process holds the
+/// exclusive lock - the document reads and validates, and the recorded port
+/// accepts a connect within `PRESENCE_CONNECT_TIMEOUT`. A held election
+/// with no validating document is a server still starting; a held election
+/// whose recorded port refuses is a server shutting down. A shared lock that
+/// succeeds is released immediately. The probe itself never waits and never
+/// polls; callers that need to wait poll this function.
 #[must_use]
 pub fn probe(root: &Path) -> ServerPresence {
-    match published_document(root) {
-        Ok(lock) => classify_holder(root, lock),
-        Err(presence) => presence,
+    match (election_state(root), published_document(root)) {
+        (ElectionState::Held, Ok(lock)) if port_answers(lock.port) => ServerPresence::Serving(lock),
+        (ElectionState::Held, Ok(lock)) => {
+            ServerPresence::Stale(StaleReason::PortUnreachable { pid: lock.pid })
+        }
+        (ElectionState::Held, Err(_)) => ServerPresence::Starting,
+        (ElectionState::Unheld, Ok(_)) => ServerPresence::Stale(StaleReason::ElectionUnheld),
+        (ElectionState::Unobservable, Ok(_)) => {
+            ServerPresence::Stale(StaleReason::ElectionUnobservable)
+        }
+        (_, Err(presence)) => presence,
     }
+}
+
+/// Whether the recorded loopback port accepts a connect right now.
+fn port_answers(port: u16) -> bool {
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    TcpStream::connect_timeout(&address, PRESENCE_CONNECT_TIMEOUT).is_ok()
 }
 
 /// The workspace's lock document path, `.rift/server.json` below `root`.
@@ -329,24 +402,22 @@ fn restrict_to_owner(_file: &std::fs::File) -> io::Result<()> {
     Ok(())
 }
 
-/// Whether a live process stands behind a validated document.
-fn classify_holder(root: &Path, lock: ServerLock) -> ServerPresence {
+/// Whether a live process holds the election file's exclusive lock.
+fn election_state(root: &Path) -> ElectionState {
     let election_path = root
         .join(RIFT_STATE_DIRECTORY)
         .join(SERVER_ELECTION_FILE_NAME);
     let election_file = match OpenOptions::new().read(true).open(&election_path) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return ServerPresence::Stale(StaleReason::ElectionUnheld);
-        }
-        Err(_) => return ServerPresence::Stale(StaleReason::ElectionUnobservable),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return ElectionState::Unheld,
+        Err(_) => return ElectionState::Unobservable,
     };
     match election_file.try_lock_shared() {
         // Nothing holds the exclusive lock; the probe's shared lock
         // releases with the handle at the end of this scope.
-        Ok(()) => ServerPresence::Stale(StaleReason::ElectionUnheld),
-        Err(TryLockError::WouldBlock) => ServerPresence::Serving(lock),
-        Err(TryLockError::Error(_)) => ServerPresence::Stale(StaleReason::ElectionUnobservable),
+        Ok(()) => ElectionState::Unheld,
+        Err(TryLockError::WouldBlock) => ElectionState::Held,
+        Err(TryLockError::Error(_)) => ElectionState::Unobservable,
     }
 }
 
@@ -358,7 +429,7 @@ fn classify_holder(root: &Path, lock: ServerLock) -> ServerPresence {
 pub fn read_serving(root: &Path) -> Option<ServerLock> {
     match probe(root) {
         ServerPresence::Serving(lock) => Some(lock),
-        ServerPresence::Stale(_) | ServerPresence::Absent => None,
+        ServerPresence::Starting | ServerPresence::Stale(_) | ServerPresence::Absent => None,
     }
 }
 
@@ -417,9 +488,70 @@ pub async fn serve_elected_with_storage(
     shutdown: CancellationToken,
     storage: WorkspaceStorage,
 ) -> Result<ElectedServer, ElectionError> {
+    serve_elected_at(root, shutdown, storage, WorkspaceIndexLimits::default()).await
+}
+
+/// Serves the workspace under explicit index bounds, recording a start that
+/// fails before it returns.
+///
+/// This is the server's whole startup: the election claim, the index build,
+/// the transport, and the publication. A failure anywhere in it is what the
+/// process exits on, so it is recorded here as one `ERROR` event carrying
+/// the full cause chain, where `rift server logs --level error` reads it
+/// back after the process is gone. An election another server already holds
+/// is recorded at `INFO`: losing the start race is the expected outcome for
+/// every starter but one.
+///
+/// # Errors
+///
+/// Returns the same failures as [`serve_elected`].
+///
+/// # Cancel safety
+///
+/// Dropping this future follows [`serve_elected`]'s cancellation behavior.
+pub(crate) async fn serve_elected_at(
+    root: &Path,
+    shutdown: CancellationToken,
+    storage: WorkspaceStorage,
+    limits: WorkspaceIndexLimits,
+) -> Result<ElectedServer, ElectionError> {
+    let elected = elect_and_serve(root, shutdown, storage, limits).await;
+    if let Err(error) = &elected {
+        record_start_failure(error);
+    }
+    elected
+}
+
+/// Records why this process will not serve, before the caller exits on it.
+fn record_start_failure(error: &ElectionError) {
+    if matches!(error.fault(), ElectionFault::AlreadyServing) {
+        tracing::info!(
+            component = "mcp",
+            operation = "server.start",
+            "another rift server already serves this workspace; this process exits"
+        );
+        return;
+    }
+    let causes = causes(error).join(": ");
+    tracing::error!(
+        component = "mcp",
+        operation = "server.start",
+        error = %error,
+        causes,
+        "the server failed to start and exits"
+    );
+}
+
+/// Claims, builds, binds, and publishes, in that order.
+async fn elect_and_serve(
+    root: &Path,
+    shutdown: CancellationToken,
+    storage: WorkspaceStorage,
+    limits: WorkspaceIndexLimits,
+) -> Result<ElectedServer, ElectionError> {
     let guard = claim(root)?;
     let serving_stop = shutdown.child_token();
-    let server = serve_http_with_storage(root, serving_stop.clone(), storage)
+    let server = serve_http_with_storage(root, serving_stop.clone(), storage, limits)
         .await
         .map_err(ElectionFault::serve)?;
     let document = served_document(
@@ -510,10 +642,25 @@ mod tests {
 
     use super::{
         ElectionFault, SERVER_ELECTION_FILE_NAME, ServerPresence, StaleReason, claim, probe,
-        read_serving, serve_elected, serve_http, served_document, shut_down_unpublished,
+        read_serving, serve_elected, serve_elected_at, serve_http, served_document,
+        shut_down_unpublished,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    /// A loopback listener a probe's connect reaches, and the port it holds.
+    fn answering_port() -> TestResult<(std::net::TcpListener, u16)> {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let port = listener.local_addr()?.port();
+        Ok((listener, port))
+    }
+
+    /// A loopback port nothing listens on: bound to learn the number, then released.
+    fn dead_port() -> TestResult<u16> {
+        let (listener, port) = answering_port()?;
+        drop(listener);
+        Ok(port)
+    }
 
     /// Publishes per round in the atomicity test.
     const PUBLISH_ROUND_COUNT: usize = 200;
@@ -720,17 +867,105 @@ mod tests {
     }
 
     #[test]
-    fn probe_reports_a_held_election_with_a_valid_document_as_serving() -> TestResult {
+    fn probe_reports_a_held_election_with_an_answering_document_as_serving() -> TestResult {
         let directory = tempfile::tempdir()?;
         let guard = claim(directory.path())?;
-        let document = valid_document();
+        let (_listener, port) = answering_port()?;
+        let document = ServerLock {
+            port,
+            ..valid_document()
+        };
         guard.publish(&document)?;
         match probe(directory.path()) {
             ServerPresence::Serving(lock) => assert_eq!(lock, document),
-            other => panic!("held election with a valid document must serve: {other:?}"),
+            other => panic!("held election with an answering document must serve: {other:?}"),
         }
         let read = read_serving(directory.path()).ok_or("read_serving must see the server")?;
         assert_eq!(read, document);
+        assert!(probe(directory.path()).election_held());
+        Ok(())
+    }
+
+    /// The document alone is not an answer: a holder whose listener is gone is shutting
+    /// down, and the recorded port says so before the election releases.
+    #[test]
+    fn probe_reports_a_held_election_whose_port_refuses_as_stale() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let guard = claim(directory.path())?;
+        let document = ServerLock {
+            port: dead_port()?,
+            ..valid_document()
+        };
+        guard.publish(&document)?;
+        let presence = probe(directory.path());
+        assert!(
+            matches!(
+                presence,
+                ServerPresence::Stale(StaleReason::PortUnreachable { pid: 4_242 })
+            ),
+            "{presence:?}"
+        );
+        assert!(
+            presence.election_held(),
+            "the holder is still alive: {presence:?}"
+        );
+        assert!(read_serving(directory.path()).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn probe_reports_a_held_election_without_a_document_as_starting() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let _guard = claim(directory.path())?;
+        let presence = probe(directory.path());
+        assert!(matches!(presence, ServerPresence::Starting), "{presence:?}");
+        assert!(presence.election_held());
+        assert!(read_serving(directory.path()).is_none());
+        assert!(
+            !ServerPresence::Absent.election_held()
+                && !ServerPresence::Stale(StaleReason::ElectionUnheld).election_held()
+        );
+        Ok(())
+    }
+
+    /// A claim whose scrub cannot unlink the previous holder's document empties it
+    /// instead, so the probe reads a starting server, never the previous holder's port
+    /// under this holder's lock.
+    #[cfg(unix)]
+    #[test]
+    fn claim_empties_a_previous_document_it_cannot_remove() -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir()?;
+        let state_directory = directory.path().join(".rift");
+        fs::create_dir_all(&state_directory)?;
+        fs::write(state_directory.join(SERVER_ELECTION_FILE_NAME), b"")?;
+        let (_listener, port) = answering_port()?;
+        let previous = ServerLock {
+            port,
+            ..valid_document()
+        };
+        fs::write(
+            document_path(directory.path()),
+            serde_json::to_vec(&previous)?,
+        )?;
+        let saved = fs::metadata(&state_directory)?.permissions();
+        fs::set_permissions(&state_directory, fs::Permissions::from_mode(0o500))?;
+
+        let claimed = claim(directory.path());
+        let presence = probe(directory.path());
+        let leftover = fs::read(document_path(directory.path()));
+        fs::set_permissions(&state_directory, saved)?;
+
+        let _guard = claimed?;
+        assert!(
+            matches!(presence, ServerPresence::Starting),
+            "the previous holder's document must not pair with this lock: {presence:?}"
+        );
+        assert!(
+            leftover?.is_empty(),
+            "the document the scrub could not remove is emptied"
+        );
         Ok(())
     }
 
@@ -764,6 +999,83 @@ mod tests {
         let observed = reader.join().map_err(|_panic| "reader panicked")?;
         assert!(observed > 0, "the reader must have observed documents");
         Ok(())
+    }
+
+    /// The build runs under a bound one file cannot meet, so the start fails inside the
+    /// election; the event that records it carries the refusal and every cause below it.
+    #[tokio::test]
+    async fn a_failing_index_build_is_recorded_with_its_causes_before_the_start_fails() -> TestResult
+    {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let directory = tempfile::tempdir()?;
+        // `[source] files` accepts at least 1,000; one file past it fails the build.
+        for index in 0..=1_000 {
+            fs::write(
+                directory.path().join(format!("unit_{index:04}.rs")),
+                "pub fn beacon() {}\n",
+            )?;
+        }
+        crate::server::hermetic_workspace(directory.path(), "[source]\nfiles = 1000\n")?;
+        let limits = rift_index::WorkspaceIndexLimits::default();
+        let (sink, mut drain) = crate::logs::log_capture();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
+        let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
+
+        let error = serve_elected_at(directory.path(), CancellationToken::new(), storage, limits)
+            .await
+            .expect_err("a workspace over files_max must fail the start");
+
+        assert_eq!(error.descriptor().code(), "limit_exceeded", "{error}");
+        let recorded = loop {
+            match drain.try_recv_record() {
+                Ok(record) if record.message() == "the server failed to start and exits" => {
+                    break record;
+                }
+                Ok(_) => {}
+                Err(_) => return Err("the failed start must be recorded".into()),
+            }
+        };
+        assert_eq!(recorded.level(), "error");
+        assert_eq!(recorded.component(), "mcp");
+        assert_eq!(recorded.operation(), "server.start");
+        assert!(
+            recorded.fields().contains("too_many_files"),
+            "the event names the refusal: {}",
+            recorded.fields()
+        );
+        assert!(
+            recorded.fields().contains("\"causes\""),
+            "the event carries the cause chain: {}",
+            recorded.fields()
+        );
+        assert!(
+            !document_path(directory.path()).exists(),
+            "a failed start publishes nothing"
+        );
+        Ok(())
+    }
+
+    /// The expected outcome of a start race is recorded where an operator looks for a
+    /// refusal, at `INFO`, and the process still exits on it.
+    #[test]
+    fn a_lost_election_is_recorded_at_info() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let (sink, mut drain) = crate::logs::log_capture();
+        let subscriber = tracing_subscriber::registry().with(sink);
+        tracing::subscriber::with_default(subscriber, || {
+            super::record_start_failure(&Error::new(ElectionFault::AlreadyServing));
+        });
+        let recorded = drain
+            .try_recv_record()
+            .expect("the lost election is recorded");
+        assert_eq!(recorded.level(), "info");
+        assert_eq!(recorded.operation(), "server.start");
+        assert!(
+            drain.try_recv_record().is_err(),
+            "one record, no error event"
+        );
     }
 
     #[test]

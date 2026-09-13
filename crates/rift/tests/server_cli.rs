@@ -15,7 +15,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use rift_mcp::{START_POLL_ATTEMPT_COUNT, ServerPresence, probe};
+use rift_mcp::{START_POLL_ATTEMPT_COUNT, ServerPresence, probe, stderr_file_path};
 use rift_protocol::lock::{
     ProductIdentity, SERVER_LOCK_FILE_NAME, SERVER_TOKEN_LENGTH, ServerLock,
 };
@@ -161,7 +161,7 @@ fn wait_for<T>(
 fn serving_document(root: &Path) -> Option<ServerLock> {
     match probe(root) {
         ServerPresence::Serving(lock) => Some(lock),
-        ServerPresence::Stale(_) | ServerPresence::Absent => None,
+        ServerPresence::Starting | ServerPresence::Stale(_) | ServerPresence::Absent => None,
     }
 }
 
@@ -211,6 +211,14 @@ fn start_serves_stop_shuts_down_and_both_repeat_idempotently() -> TestResult {
         "{repeated_stdout:?}"
     );
     assert_eq!(listening_facts(&repeated_stdout)?, (port, pid));
+
+    // The detached server's stderr lands in the workspace file the start
+    // truncated for it, where its own startup lines are the first content.
+    let stderr = fs::read_to_string(stderr_file_path(root))?;
+    assert!(
+        stderr.contains("MCP server ready"),
+        "the detached server's stderr file carries its startup line: {stderr:?}"
+    );
 
     let stopped = rift(root, &["server", "stop"])?;
     require_success(&stopped, "stop")?;

@@ -839,7 +839,8 @@ impl RiftMcp {
         let startup_configuration = Self::startup_configuration(&root).await?;
         let blocking =
             BlockingExecutor::for_configuration(&startup_configuration.server_configuration());
-        let (validation, invalidations) = IndexValidation::new(limits.files_max());
+        let (validation, invalidations) =
+            IndexValidation::new(startup_configuration.index_limits(limits)?.files_max());
         let watcher = Self::start_watcher(&root, &validation, &blocking).await?;
         let dependencies = Arc::new(DependencyStore::new(DependencyIndex::planned(
             &DependencyCatalog::default(),
@@ -1424,7 +1425,10 @@ impl RiftMcp {
         let languages = rift_core::LanguageFileSelections::from(&configuration);
         let history = configuration.providers.history.clone();
         let root = self.root.clone();
-        let limits = self.limits;
+        let limits = published
+            .configuration
+            .index_limits(self.limits)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
         self.blocking
             .run("revision workspace read", move || {
                 let reads = ReadService::at_revision_with_languages(
@@ -1551,7 +1555,10 @@ impl RiftMcp {
         for _attempt in 0..INDEX_CAPTURE_ATTEMPTS_MAX {
             let current = self.await_current_workspace(phase).await?;
             let root = self.root.clone();
-            let limits = self.limits;
+            let limits = current
+                .configuration
+                .index_limits(self.limits)
+                .map_err(|error| error.tool_error(phase))?;
             let visibility = current.configuration.source_visibility();
             let text_inclusion = current.configuration.text_inclusion();
             let languages = current.configuration.language_file_selections();
@@ -2541,7 +2548,7 @@ mod tests {
         assert!(result.hits.is_empty());
         assert!(result.warnings.iter().any(|warning| matches!(
             warning,
-            ReadWarning::SourceUnavailable { unit, detail }
+            ReadWarning::SourceUnavailable { unit: Some(unit), detail }
                 if unit.0.ends_with("/wide.rs") && detail.contains("file byte limit")
         )));
         Ok(())
@@ -2561,7 +2568,7 @@ mod tests {
         assert!(
             result.warnings.iter().any(|warning| matches!(
                 warning,
-                ReadWarning::SourceUnavailable { unit, .. } if unit.0.contains("invalid.rs")
+                ReadWarning::SourceUnavailable { unit: Some(unit), .. } if unit.0.contains("invalid.rs")
             )),
             "the answer must name the file the index omitted: {:?}",
             result.warnings
@@ -2645,7 +2652,7 @@ mod tests {
         assert!(skipped.hits.is_empty());
         assert!(skipped.warnings.iter().any(|warning| matches!(
             warning,
-            ReadWarning::SourceUnavailable { unit, detail }
+            ReadWarning::SourceUnavailable { unit: Some(unit), detail }
                 if unit.0.ends_with("/lib.rs") && detail.contains("file byte limit")
         )));
 
@@ -3521,7 +3528,7 @@ pub fn beacon() -> u64 {
         assert!(skipped.hits.is_empty());
         assert!(skipped.warnings.iter().any(|warning| matches!(
             warning,
-            ReadWarning::SourceUnavailable { unit, detail }
+            ReadWarning::SourceUnavailable { unit: Some(unit), detail }
                 if unit.0.ends_with("/lib.rs") && detail.contains("file byte limit")
         )));
 
@@ -3755,6 +3762,10 @@ pub fn beacon() -> u64 {
         };
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[source]\nfiles = 1000\n",
+        )?;
         let candidate = stable_candidate(directory.path(), 0)?;
         let (validation, _receiver) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
@@ -3764,16 +3775,15 @@ pub fn beacon() -> u64 {
         });
         let changes = ChangeService::new(directory.path());
         let root = directory.path().to_path_buf();
-        // `files_max=1` accepts the workspace's single Rust source file: the source scan
-        // never counts `.gitignore` files. `ReadService::build` also compiles the `[source]`
-        // policy right after that scan, and its `GitignoreChain` walk counts each `.gitignore`
-        // file against that same bound, so two `.gitignore` files written by the change trip
-        // `TooManyFiles` there even though the source scan alone already succeeded.
-        let tight_limits = WorkspaceIndexLimits::new(1, 1_048_576, 10_485_760, 16, 5)
-            .expect("tight limits accept exactly one file");
+        // `[source] files = 1000` accepts the workspace's single Rust source file: the
+        // source scan never counts `.gitignore` files. `ReadService::build` also compiles
+        // the `[source]` policy right after that scan, and its `GitignoreChain` walk counts
+        // each `.gitignore` file against that same bound, so the 1001 `.gitignore` files
+        // written by the change trip `TooManyFiles` there even though the source scan alone
+        // already succeeded.
         let outcome = RiftMcp::change_serialized(
             directory.path(),
-            tight_limits,
+            WorkspaceIndexLimits::default(),
             &published,
             &validation,
             &changes,
@@ -3785,6 +3795,12 @@ pub fn beacon() -> u64 {
                 fs::create_dir_all(&nested).expect("nested directory scaffold must write");
                 fs::write(&root_gitignore, "").expect("root gitignore scaffold must write");
                 fs::write(&nested_gitignore, "").expect("nested gitignore scaffold must write");
+                for index in 1..1_000 {
+                    let directory = root.join(format!("nested-{index:04}"));
+                    fs::create_dir_all(&directory).expect("nested directory scaffold must write");
+                    fs::write(directory.join(".gitignore"), "")
+                        .expect("gitignore scaffold must write");
+                }
                 Ok(ChangeResult::Applied {
                     summary: ChangeSummary {
                         id: ChangeId("0123abcd".to_owned()),
@@ -4251,6 +4267,57 @@ pub fn beacon() -> u64 {
                 && text.contains("src/deep.rs")
                 && text.contains("too_deep"),
             "the logs must name the left-out file and its bound: {text}"
+        );
+        Ok(())
+    }
+
+    /// One declaration's content past the lexical unit bound leaves the lexical index
+    /// alone: the publication lands, the sibling answers `search`, the declaration still
+    /// answers `get_symbol`, and the record names the file. The lexical commit runs on
+    /// the building task, so the thread-local subscriber sees it.
+    #[tokio::test]
+    async fn an_oversized_declaration_is_left_out_of_search_and_the_rest_serves() -> TestResult {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        let unit_bytes_max =
+            usize::try_from(rift_index::LexicalIndexLimits::default().unit_bytes_max())?;
+        fs::write(
+            directory.path().join("src/blob.rs"),
+            format!(
+                "pub const BLOB: &str = \"{}\";\n",
+                "b".repeat(unit_bytes_max)
+            ),
+        )?;
+        super::hermetic_workspace(directory.path(), "")?;
+        let (sink, mut drain) = crate::logs::log_capture();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
+
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+
+        let kept = serde_json::to_value(run_search(&server, "beacon").await?)?;
+        assert!(hit_paths(&kept).contains(&"src/lib.rs"), "{kept:#}");
+        let symbol = get_symbol(&server, "BLOB").await?;
+        assert_eq!(
+            symbol.hits.len(),
+            1,
+            "the declaration stays in the syntax index: {symbol:?}"
+        );
+        let recorded = loop {
+            match drain.try_recv_record() {
+                Ok(record) if record.message().contains("lexical unit left out") => break record,
+                Ok(_) => {}
+                Err(_) => return Err("the left-out unit must be recorded".into()),
+            }
+        };
+        assert_eq!(recorded.level(), "warn");
+        assert_eq!(recorded.component(), "index");
+        assert!(
+            recorded.fields().contains("src/blob.rs"),
+            "the record names the path: {}",
+            recorded.fields()
         );
         Ok(())
     }

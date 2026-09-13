@@ -152,17 +152,19 @@ pub async fn serve_http(
     shutdown: CancellationToken,
 ) -> Result<HttpServer, HttpServeError> {
     let storage = WorkspaceStorage::open(root).await;
-    serve_http_with_storage(root, shutdown, storage).await
+    serve_http_with_storage(root, shutdown, storage, WorkspaceIndexLimits::default()).await
 }
 
-/// Serves HTTP through storage already opened by the serving process.
+/// Serves HTTP through storage already opened by the serving process, under
+/// explicit index bounds.
 pub(crate) async fn serve_http_with_storage(
     root: &Path,
     shutdown: CancellationToken,
     storage: WorkspaceStorage,
+    limits: WorkspaceIndexLimits,
 ) -> Result<HttpServer, HttpServeError> {
     tracing::info!(component = "mcp", transport = "http", "MCP server starting");
-    let server = RiftMcp::build_with_storage(root, WorkspaceIndexLimits::default(), storage)
+    let server = RiftMcp::build_with_storage(root, limits, storage)
         .await
         .map_err(HttpServeFault::workspace)?;
     let identity = server.product_identity().clone();

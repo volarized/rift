@@ -541,6 +541,12 @@ impl SearchIndex {
         }
     }
 
+    /// The bounds the lexical tier enforces on what it is handed.
+    #[must_use]
+    pub const fn lexical_limits(&self) -> LexicalIndexLimits {
+        self.limits.lexical()
+    }
+
     /// Replaces the lexical unit set and embeds every declaration handed over.
     ///
     /// This is the pass that establishes a set rather than following one: the

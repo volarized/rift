@@ -238,8 +238,10 @@ pub enum GetSymbolInclude {
 ]))]
 pub struct GetSymbolParams {
     /// The declaration name to look up - a name, not a full `SymbolId` or free-text
-    /// query; `search` takes free text. An exact symbol name ranks first, then prefix
-    /// matches, then qualified-name substrings.
+    /// query; `search` takes free text. Matching is case-insensitive. An exact symbol
+    /// name ranks first, then prefix matches, then qualified-name substrings; every tier
+    /// joins the result set, so a substring match still answers, after the exact and
+    /// prefix matches.
     #[schemars(length(min = 1, max = 4096))]
     pub name: String,
     /// Narrows the answer to one language. Omitted searches every served language.
@@ -870,6 +872,11 @@ pub struct ProjectPath(
 /// resolvers in resolver order, cut here.
 pub const DEPENDENCY_WARNINGS_MAX: usize = 8;
 
+/// Most `source_unavailable` warnings one answer carries for the files the index left out,
+/// in project-path order; when more files are left out, one more warning follows them and
+/// counts the rest.
+pub const SOURCE_WARNINGS_MAX: usize = 8;
+
 /// One warning attached to a read result. The answer stands; the warning carries evidence
 /// of a condition the caller weighs before relying on it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -921,10 +928,14 @@ pub enum ReadWarning {
     /// A claimed file is left out of the index - its bytes are not valid UTF-8, or it
     /// crosses a per-file bound - so it answers no search or lookup, and addressing it
     /// directly still refuses `content_unavailable`. Every other file in the workspace
-    /// stays available.
+    /// stays available. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in
+    /// project-path order; when more files are left out, one more carries no `unit` and
+    /// counts the rest, and `rift://logs` names each of them.
     SourceUnavailable {
-        /// The file whose bytes could not be read.
-        unit: FileId,
+        /// The file whose bytes could not be read. Absent on the one warning that counts
+        /// the files past `SOURCE_WARNINGS_MAX`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unit: Option<FileId>,
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
         detail: String,
@@ -2066,7 +2077,7 @@ mod tests {
             ),
             (
                 ReadWarning::SourceUnavailable {
-                    unit: FileId("rift://file/src%2Finvalid.rs".to_owned()),
+                    unit: Some(FileId("rift://file/src%2Finvalid.rs".to_owned())),
                     detail: "src/invalid.rs is not UTF-8 and is absent from the index".to_owned(),
                 },
                 json!({
