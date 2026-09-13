@@ -18,8 +18,8 @@ pub use configuration::{
     LanguageFileSelection, LanguageFileSelections, SourceVisibility, TextFileInclusion,
 };
 pub use error::{
-    CliCode, Error, ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, Fault, LimitEvidence,
-    RetryDirective, RiftError, fault_label, render_failure,
+    CAUSE_DEPTH_MAX, CliCode, Error, ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, Fault,
+    LimitEvidence, RetryDirective, RiftError, causes, fault_label, render_failure,
 };
 pub use identity::{
     CompositionId, CompositionRevision, IdError, IdFault, IndexRevision, ModelId, ModelRevision,
