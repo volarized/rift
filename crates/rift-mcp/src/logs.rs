@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use rift_core::causes;
 use rift_index::{LOG_BATCH_RECORDS_MAX, LogRecord, LogStore};
 use rift_protocol::configuration::LogsConfiguration;
 use tokio::sync::mpsc::{self, Receiver, Sender, error::TrySendError};
@@ -78,6 +79,12 @@ pub struct LogDrain {
 }
 
 impl LogDrain {
+    /// One queued record, without waiting; for a test that reads the queue without a store.
+    #[cfg(test)]
+    pub(crate) fn try_recv_record(&mut self) -> Result<LogRecord, mpsc::error::TryRecvError> {
+        self.receiver.try_recv()
+    }
+
     /// Writes records until the queue closes, draining buffered records after cancellation.
     ///
     /// Records are written in batches: the task takes what the queue holds,
@@ -407,17 +414,64 @@ fn quoted(value: &str) -> String {
 /// actually said.
 fn caused_by(error: &(dyn std::error::Error + 'static)) -> String {
     let mut rendered = String::new();
-    let mut previous = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        let text = cause.to_string();
-        if text != previous {
-            let _ = write!(rendered, ": {text}");
-            previous = text;
-        }
-        source = cause.source();
+    for cause in causes(error) {
+        let _ = write!(rendered, ": {cause}");
     }
     rendered
+}
+
+/// Bytes of a panic payload the recorded event keeps, at most.
+pub const PANIC_PAYLOAD_BYTES_MAX: usize = 4 << 10;
+
+/// Installs the panic hook that records a panic before the default hook prints it.
+///
+/// A detached server's panic reaches nobody otherwise: its standard error is a file at
+/// best, and the default hook writes there alone. The installed hook emits one `ERROR`
+/// event carrying the payload and the source location, through whatever subscriber the
+/// panicking thread runs under, then hands the panic to the hook that was installed
+/// before it. Installing twice chains the hooks, so a second call records each panic
+/// twice; the server installs it once, before it serves.
+pub fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = panic_payload(info.payload());
+        let location = info
+            .location()
+            .map(|location| {
+                format!(
+                    "{}:{}:{}",
+                    location.file(),
+                    location.line(),
+                    location.column()
+                )
+            })
+            .unwrap_or_default();
+        tracing::error!(
+            component = "mcp",
+            operation = "server.panic",
+            payload,
+            location,
+            "the server panicked"
+        );
+        previous(info);
+    }));
+}
+
+/// The panic payload as text, cut at [`PANIC_PAYLOAD_BYTES_MAX`] on a character boundary.
+///
+/// `panic!` with a literal carries a `&str`; a formatted message carries a `String`; any
+/// other payload is named by its absence.
+fn panic_payload(payload: &(dyn std::any::Any + Send)) -> String {
+    let text = payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "<payload is not text>".to_owned());
+    let mut cut = text.len().min(PANIC_PAYLOAD_BYTES_MAX);
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text[..cut].to_owned()
 }
 
 /// Milliseconds since the Unix epoch, or zero on a clock before it.
@@ -439,7 +493,10 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
 
-    use super::{LOG_QUEUE_RECORDS, RecordedFields, log_capture, quoted};
+    use super::{
+        LOG_QUEUE_RECORDS, PANIC_PAYLOAD_BYTES_MAX, RecordedFields, install_panic_hook,
+        log_capture, panic_payload, quoted,
+    };
     use tracing::field::Visit;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -636,6 +693,60 @@ mod tests {
         sink.send(record("after shutdown"));
 
         assert_eq!(sink.dropped(), 0);
+    }
+
+    /// The hook is process-global: the thread panics under its own subscriber, so the
+    /// event the hook emits lands in this case's queue and nowhere else.
+    #[test]
+    fn a_panic_under_the_hook_is_recorded_with_its_payload_and_location() {
+        install_panic_hook();
+        let (sink, mut drain) = log_capture();
+        let subscriber = tracing_subscriber::registry().with(sink);
+
+        let joined = std::thread::spawn(move || {
+            tracing::subscriber::with_default(subscriber, || {
+                panic!("injected panic for the hook");
+            });
+        })
+        .join();
+
+        assert!(joined.is_err(), "the thread must have panicked");
+        let records = events(queued(&mut drain));
+        let recorded = records
+            .iter()
+            .find(|record| record.message() == "the server panicked")
+            .expect("the hook records the panic");
+        assert_eq!(recorded.level(), "error");
+        assert_eq!(recorded.component(), "mcp");
+        assert_eq!(recorded.operation(), "server.panic");
+        assert!(
+            recorded.fields().contains("injected panic for the hook"),
+            "{}",
+            recorded.fields()
+        );
+        assert!(
+            recorded.fields().contains("logs.rs"),
+            "the location names this file: {}",
+            recorded.fields()
+        );
+    }
+
+    #[test]
+    fn a_panic_payload_is_text_cut_at_its_bound() {
+        let literal: Box<dyn std::any::Any + Send> = Box::new("literal");
+        assert_eq!(panic_payload(literal.as_ref()), "literal");
+
+        let formatted: Box<dyn std::any::Any + Send> = Box::new(String::from("formatted"));
+        assert_eq!(panic_payload(formatted.as_ref()), "formatted");
+
+        let opaque: Box<dyn std::any::Any + Send> = Box::new(7_u8);
+        assert_eq!(panic_payload(opaque.as_ref()), "<payload is not text>");
+
+        let oversized: Box<dyn std::any::Any + Send> =
+            Box::new("é".repeat(PANIC_PAYLOAD_BYTES_MAX));
+        let cut = panic_payload(oversized.as_ref());
+        assert!(cut.len() <= PANIC_PAYLOAD_BYTES_MAX);
+        assert!(cut.chars().all(|character| character == 'é'));
     }
 
     #[test]
