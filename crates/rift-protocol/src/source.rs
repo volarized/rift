@@ -1,18 +1,38 @@
 //! The `[source]` table of `rift.toml`: which files below the workspace root the index and
-//! reads consider visible.
+//! reads consider visible, and how many files and bytes the index holds together.
 
-use crate::configuration::{ConfigurationViolation, first_out_of_range};
+use crate::configuration::{ByteSize, ConfigurationViolation, first_out_of_range};
 use crate::read::PathPattern;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Entries `source.include` or `source.exclude` may hold, at most.
 pub const SOURCE_PATTERNS_MAX: usize = 512;
+/// Files the index may hold, by default.
+pub const SOURCE_FILES_DEFAULT: u64 = 100_000;
+/// Files the index may hold, at least.
+pub const SOURCE_FILES_MIN: u64 = 1_000;
+/// Files the index may hold, at most.
+pub const SOURCE_FILES_MAX: u64 = 5_000_000;
+/// Bytes every indexed file may hold together, by default: 512 MiB.
+pub const SOURCE_WORKSPACE_BYTES_DEFAULT: u64 = 512 << 20;
+/// Bytes every indexed file may hold together, at least: 16 MiB.
+pub const SOURCE_WORKSPACE_BYTES_MIN: u64 = 16 << 20;
+/// Bytes every indexed file may hold together, at most: 64 GiB.
+pub const SOURCE_WORKSPACE_BYTES_MAX: u64 = 64 << 30;
+/// The key path acceptance and the index build both name when the file count bound is
+/// crossed.
+pub const SOURCE_FILES_FIELD: &str = "source.files";
+/// The key path acceptance and the index build both name when the aggregate byte bound
+/// is crossed.
+pub const SOURCE_WORKSPACE_SIZE_FIELD: &str = "source.workspace_size";
 
 /// The `[source]` table: which files below the workspace root the index and reads consider
-/// visible. `.git`, `.rift`, and `target` stay invisible whatever this table says.
+/// visible, and how many files and bytes the index holds together. `.git`, `.rift`, and
+/// `target` stay invisible whatever this table says.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[schemars(transform = crate::schema::declare_source_ranges)]
 pub struct SourceConfiguration {
     /// Exact file paths or globs a file must match to stay visible, in [`PathPattern`] syntax.
     /// Empty includes every file `exclude` and `.gitignore` leave standing.
@@ -25,6 +45,15 @@ pub struct SourceConfiguration {
     /// Whether the workspace's own `.gitignore` files, root and nested, hide the paths they
     /// match. Global and parent-directory gitignore sources are never read.
     pub respect_gitignore: bool,
+    /// Most files the index holds, 1000 to 5000000. A workspace past it refuses its rebuild
+    /// naming this key.
+    #[schemars(range(min = 1_000, max = 5_000_000))]
+    #[serde(default = "default_source_files")]
+    pub files: u64,
+    /// Most source bytes the index holds together, 16mb to 64gb. A workspace past it
+    /// refuses its rebuild naming this key.
+    #[serde(default = "default_source_workspace_size")]
+    pub workspace_size: ByteSize,
 }
 
 impl Default for SourceConfiguration {
@@ -33,13 +62,15 @@ impl Default for SourceConfiguration {
             include: Vec::new(),
             exclude: Vec::new(),
             respect_gitignore: true,
+            files: default_source_files(),
+            workspace_size: default_source_workspace_size(),
         }
     }
 }
 
 impl SourceConfiguration {
-    /// The table's list-length bounds, then each pattern's forward-slash-only contract, in
-    /// key then list order.
+    /// The table's list-length and numeric bounds, then each pattern's forward-slash-only
+    /// contract, in key then list order.
     pub(crate) fn violation(&self) -> Option<ConfigurationViolation> {
         first_out_of_range([
             (
@@ -54,10 +85,30 @@ impl SourceConfiguration {
                 0,
                 SOURCE_PATTERNS_MAX as u64,
             ),
+            (
+                SOURCE_FILES_FIELD,
+                self.files,
+                SOURCE_FILES_MIN,
+                SOURCE_FILES_MAX,
+            ),
+            (
+                SOURCE_WORKSPACE_SIZE_FIELD,
+                self.workspace_size.bytes(),
+                SOURCE_WORKSPACE_BYTES_MIN,
+                SOURCE_WORKSPACE_BYTES_MAX,
+            ),
         ])
         .or_else(|| pattern_list_violation("source.include", &self.include))
         .or_else(|| pattern_list_violation("source.exclude", &self.exclude))
     }
+}
+
+fn default_source_files() -> u64 {
+    SOURCE_FILES_DEFAULT
+}
+
+fn default_source_workspace_size() -> ByteSize {
+    ByteSize::from_bytes(SOURCE_WORKSPACE_BYTES_DEFAULT)
 }
 
 /// The first pattern in `patterns` breaking [`PathPattern`]'s forward-slash-only contract,
@@ -174,5 +225,126 @@ mod tests {
         );
         assert!(!configuration.source.respect_gitignore);
         assert_eq!(configuration.validate(), Ok(()));
+    }
+
+    #[test]
+    fn test_source_defaults_are_the_named_constants() {
+        let table = SourceConfiguration::default();
+        assert!(table.include.is_empty());
+        assert!(table.exclude.is_empty());
+        assert!(table.respect_gitignore);
+        assert_eq!(table.files, SOURCE_FILES_DEFAULT);
+        assert_eq!(
+            table.workspace_size,
+            ByteSize::from_bytes(SOURCE_WORKSPACE_BYTES_DEFAULT)
+        );
+        let parsed: SourceConfiguration =
+            serde_json::from_value(json!({})).expect("an empty table deserializes");
+        assert_eq!(parsed, table);
+        assert_eq!(table.violation(), None);
+    }
+
+    /// Sets one numeric key of the table to a value in its base unit.
+    type Setter = fn(&mut SourceConfiguration, u64);
+
+    #[test]
+    fn test_source_numeric_bounds_are_enforced_naming_the_field() {
+        let cases: [(&str, Setter, [u64; 2]); 2] = [
+            (
+                SOURCE_FILES_FIELD,
+                |table, value| table.files = value,
+                [SOURCE_FILES_MIN - 1, SOURCE_FILES_MAX + 1],
+            ),
+            (
+                SOURCE_WORKSPACE_SIZE_FIELD,
+                |table, value| table.workspace_size = ByteSize::from_bytes(value),
+                [
+                    SOURCE_WORKSPACE_BYTES_MIN - 1,
+                    SOURCE_WORKSPACE_BYTES_MAX + 1,
+                ],
+            ),
+        ];
+        for (field, set, values) in cases {
+            for value in values {
+                let mut configuration = WorkspaceConfiguration::default();
+                set(&mut configuration.source, value);
+                let violation = configuration
+                    .validate()
+                    .expect_err("a value outside its range must be refused");
+                assert!(
+                    matches!(
+                        violation,
+                        ConfigurationViolation::LimitOutOfRange { field: found, .. } if found == field
+                    ),
+                    "{field} = {value}: {violation:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_source_bounds_accept_their_edges() {
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.source.files = SOURCE_FILES_MIN;
+        configuration.source.workspace_size = ByteSize::from_bytes(SOURCE_WORKSPACE_BYTES_MAX);
+        assert_eq!(configuration.validate(), Ok(()));
+        configuration.source.files = SOURCE_FILES_MAX;
+        configuration.source.workspace_size = ByteSize::from_bytes(SOURCE_WORKSPACE_BYTES_MIN);
+        assert_eq!(configuration.validate(), Ok(()));
+    }
+
+    #[test]
+    fn test_source_table_parses_every_key() {
+        let table: SourceConfiguration = serde_json::from_value(json!({
+            "include": ["src/**"],
+            "exclude": ["**/generated/**"],
+            "respect_gitignore": false,
+            "files": 2000,
+            "workspace_size": "1gb",
+        }))
+        .expect("every documented key parses");
+        assert_eq!(table.files, 2000);
+        assert_eq!(table.workspace_size, ByteSize::from_bytes(1 << 30));
+        assert_eq!(table.violation(), None);
+    }
+
+    #[test]
+    fn test_source_schema_defaults_and_ranges_equal_the_constants() {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let table = &schema["$defs"]["SourceConfiguration"]["properties"];
+        let cases = [
+            (
+                "files default",
+                &table["files"]["default"],
+                json!(SOURCE_FILES_DEFAULT),
+            ),
+            (
+                "files min",
+                &table["files"]["minimum"],
+                json!(SOURCE_FILES_MIN),
+            ),
+            (
+                "files max",
+                &table["files"]["maximum"],
+                json!(SOURCE_FILES_MAX),
+            ),
+            (
+                "workspace size default",
+                &table["workspace_size"]["default"],
+                json!(ByteSize::from_bytes(SOURCE_WORKSPACE_BYTES_DEFAULT)),
+            ),
+            (
+                "workspace size range",
+                &table["workspace_size"]["rift:range"],
+                json!({
+                    "min": ByteSize::from_bytes(SOURCE_WORKSPACE_BYTES_MIN),
+                    "max": ByteSize::from_bytes(SOURCE_WORKSPACE_BYTES_MAX),
+                }),
+            ),
+        ];
+        for (name, found, expected) in cases {
+            assert_eq!(*found, expected, "{name}");
+        }
     }
 }

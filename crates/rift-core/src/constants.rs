@@ -47,9 +47,11 @@ pub const WORKSPACE_DATABASE_FILE_NAME: &str = "db";
 pub const STAGE_NAME_BYTES_MAX: usize = 64;
 /// Punctuation accepted in provider-composition stage names.
 pub const STAGE_NAME_PUNCTUATION: &[u8] = b"-";
-/// Default maximum Rust files indexed from one workspace.
+/// Default maximum files indexed from one workspace, every language together. The served
+/// index reads its own bound from `[source] files`.
 pub const WORKSPACE_FILES_MAX_DEFAULT: usize = 20_000;
-/// Default maximum aggregate Rust source bytes indexed from one workspace.
+/// Default maximum aggregate source bytes indexed from one workspace, every language
+/// together. The served index reads its own bound from `[source] workspace_size`.
 pub const WORKSPACE_BYTES_MAX_DEFAULT: usize = 128 * 1_024 * 1_024;
 /// Default maximum directory depth scanned from one workspace.
 pub const WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT: usize = 64;
