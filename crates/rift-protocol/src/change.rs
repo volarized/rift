@@ -283,6 +283,7 @@ impl ChangeSummary {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "status", deny_unknown_fields)]
 #[schemars(transform = schema::declare_change_result_empty_defaults)]
+#[schemars(transform = schema::declare_object_type)]
 #[schemars(extend("examples" = [
     {
         "status": "applied",
