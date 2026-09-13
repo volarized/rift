@@ -716,6 +716,10 @@ refuses as `unsupported`, and an engine that declines the new name refuses as
 change applies, the server sweeps the tree for surviving occurrences of the old name and reports
 each one as a warning.
 
+An edit the engine proposes into a cataloged package refuses as `unsupported`, naming the
+package file's [`SourceUnitId`](/docs/protocol/reference#SourceUnitId): dependency source is
+read-only, and the unit tells the caller which package the rename would have reached.
+
 <McpTool name="move_file" />
 
 Any visible regular file moves, including one no syntax provider claims; a directory in its
@@ -736,6 +740,12 @@ refuses `unmet_precondition` naming `no_references`, unless `force` applies the 
 and carries the references as a warning. Without a configured engine, or one that does not
 advertise `textDocument/references`, the removal applies and carries a warning naming why it was
 not checked.
+
+A reference the engine finds in a cataloged package is named by that package file's
+[`SourceUnitId`](/docs/protocol/reference#SourceUnitId), the unit `get_symbol` serves the
+package under: the failed condition carries it in `units` beside the project `paths`, and the
+`force` warning names it with them. A location under no cataloged root counts toward the
+condition, and the warning names it by the engine's own URI.
 
 An engine that answers with no references before confirming its own readiness is a third case:
 that answer looks the same as one from an engine that checked and found nothing, so the removal
