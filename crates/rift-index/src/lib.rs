@@ -19,9 +19,8 @@ pub use change_set::{ChangeSet, FileDigest, PathChange, PathChanges, WorkspaceDi
 pub use database::{DatabasePool, WorkspaceDatabase};
 pub use dependency::{
     DIRECTORY_DEPTH_MAX_DEFAULT, DependencyIndex, DependencyIndexLimits, DependencySymbolMatch,
-    PACKAGE_BYTES_MAX_DEFAULT, PACKAGE_FILES_MAX_DEFAULT, PackageFiles, PackageIndex,
-    PackageIndexError, PackageIndexFault, PackageIndexViolation, SkippedPackage,
-    TOTAL_BYTES_MAX_DEFAULT, WALK_ENTRIES_MAX_DEFAULT, package_files,
+    PackageFiles, PackageIndex, PackageIndexError, PackageIndexFault, PackageIndexViolation,
+    PackageSelection, SkippedPackage, WALK_ENTRIES_MAX_DEFAULT, package_files,
 };
 pub use glob::PathMatcher;
 pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};

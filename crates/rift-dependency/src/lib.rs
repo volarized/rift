@@ -30,7 +30,7 @@ pub use npm::NpmResolver;
 pub use resolver::{
     CommandFailure, CommandOutput, DIRECTORY_ENTRIES_MAX, DependencyResolver, FileObservation,
     Inspector, LOCKFILE_BYTES_MAX, MANIFESTS_MAX, PACKAGES_MAX, ResolutionRequest, ResolverName,
-    TOOLCHAIN_COMMAND_TIMEOUT, TOOLCHAIN_OUTPUT_BYTES_MAX, ToolchainCommand,
+    TOOLCHAIN_OUTPUT_BYTES_MAX, ToolchainCommand,
 };
 pub use resolvers::{is_claimed_manifest, resolvers};
 pub use uv::UvResolver;

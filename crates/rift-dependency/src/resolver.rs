@@ -2,7 +2,6 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use rift_protocol::read::{Language, ProjectPath};
 use serde::Serialize;
@@ -21,8 +20,6 @@ const _: () = assert!(
     TOOLCHAIN_OUTPUT_BYTES_MAX < rift_core::STREAM_TOTAL_BYTES_MAX,
     "the toolchain capture must sit below the stream drain ceiling"
 );
-/// Wall clock one toolchain run may take before the inspector kills it.
-pub const TOOLCHAIN_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 /// Bytes one lockfile may hold before a resolver refuses to read it.
 pub const LOCKFILE_BYTES_MAX: u64 = 16 << 20;
 /// Manifests one resolver reads per workspace, at most. The rest are dropped and the
@@ -76,8 +73,9 @@ impl fmt::Display for ResolverName {
 /// One toolchain invocation a resolver asks the inspector to run.
 ///
 /// The program is a bare name the inspector resolves on its own `PATH`; a resolver
-/// never names an absolute executable. The run is bounded by
-/// [`TOOLCHAIN_COMMAND_TIMEOUT`] and [`TOOLCHAIN_OUTPUT_BYTES_MAX`].
+/// never names an absolute executable. The run is bounded by the inspector's own
+/// wall-clock timeout, which the `[dependencies]` table's `command_timeout` sets, and by
+/// [`TOOLCHAIN_OUTPUT_BYTES_MAX`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolchainCommand {
     /// The program to run, resolved on the inspector's `PATH`.
@@ -166,12 +164,13 @@ pub trait Inspector {
     /// Empty when no directory stands there.
     fn list_directory(&mut self, path: &Path, entries_max: usize) -> Vec<String>;
 
-    /// Runs one toolchain command to completion under the crate's bounds.
+    /// Runs one toolchain command to completion under the inspector's bounds.
     ///
     /// # Errors
     ///
-    /// Returns [`CommandFailure`] when the program cannot be started, overstays
-    /// [`TOOLCHAIN_COMMAND_TIMEOUT`], or cannot be observed to its end.
+    /// Returns [`CommandFailure`] when the inspector runs no toolchain, when the
+    /// program cannot be started, overstays the inspector's timeout, or cannot be
+    /// observed to its end.
     fn run(&mut self, command: &ToolchainCommand) -> Result<CommandOutput, CommandFailure>;
 
     /// The value of one environment variable, absent when unset.
