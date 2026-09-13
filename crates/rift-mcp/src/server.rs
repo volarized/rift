@@ -7,8 +7,8 @@ use std::time::Duration;
 use rift_core::{ProjectPath as CoreProjectPath, SourceVisibility};
 use rift_dependency::DependencyCatalog;
 use rift_index::{
-    DependencyIndex, DependencyIndexLimits, LexicalIndexLimits, LogStore, PathChanges,
-    WorkspaceIndexLimits, capture_digests_with_languages,
+    DependencyIndex, DependencyIndexLimits, LexicalIndexLimits, LogStore, PackageSelection,
+    PathChanges, WorkspaceIndexLimits, capture_digests_with_languages,
 };
 use rift_protocol::change::{
     ChangeResult, ChangeSummary, GuaranteeEvidence, InsertNodeParams, InsertSymbolParams,
@@ -51,7 +51,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
-use crate::dependency::DependencyLane;
+use crate::dependency::{DependencyLane, DependencyRequest};
 use crate::failure::{WireFailure, hook_failure_diagnostic, stale_snapshot_diagnostic};
 use crate::resource;
 use crate::storage::WorkspaceStorage;
@@ -843,6 +843,7 @@ impl RiftMcp {
         let dependencies = Arc::new(DependencyStore::new(DependencyIndex::planned(
             &DependencyCatalog::default(),
             DependencyIndexLimits::default(),
+            PackageSelection::default(),
         )));
         let (published, lexical_write) =
             initial_workspace(&root, limits, &validation, &blocking, &dependencies).await?;
@@ -950,8 +951,8 @@ impl RiftMcp {
             .await
     }
 
-    /// Plans the dependency store over the initial publication's catalog and spawns the
-    /// lane that fills it.
+    /// Plans the dependency store over the initial publication's catalog and plan, and
+    /// spawns the lane that fills it.
     ///
     /// The store is planned before anything is served, so a lookup answered ahead of the
     /// lane's first pass reports the packages still pending rather than an empty catalog.
@@ -961,16 +962,12 @@ impl RiftMcp {
         blocking: &BlockingExecutor,
         cancellation: CancellationToken,
     ) -> Result<DependencyLane, ReadError> {
-        dependencies
-            .write()?
-            .retain_catalog(published.reads.dependency_catalog());
-        let lane = DependencyLane::spawn(
-            Arc::clone(dependencies),
-            DependencyIndexLimits::default(),
-            blocking.clone(),
-            cancellation,
-        );
-        lane.request(Arc::clone(published.reads.dependency_catalog()));
+        let request = DependencyRequest::for_publication(published);
+        let mut index = dependencies.write()?;
+        request.follow(&mut index);
+        drop(index);
+        let lane = DependencyLane::spawn(Arc::clone(dependencies), blocking.clone(), cancellation);
+        lane.request(request);
         Ok(lane)
     }
 
@@ -1703,8 +1700,7 @@ impl RiftMcp {
             .filter(|publication| publication.published)
             .map(|publication| &publication.snapshot);
         if let Some(next) = published_next {
-            self.dependency_lane
-                .request(Arc::clone(next.reads.dependency_catalog()));
+            self.dependency_lane.request_for(next);
             if let Some(lane) = self.population.as_ref() {
                 lane.request(Arc::clone(next));
             }
@@ -2295,7 +2291,7 @@ mod tests {
     use serde_json::json;
     use sha2::{Digest as _, Sha256};
 
-    use crate::dependency::empty_dependency_store;
+    use crate::dependency::{DependencyPlan, empty_dependency_store};
     use crate::validation::RebuildRequest;
 
     use super::{BlockingExecutor, ChangeLane, Parameters, RiftMcp};
@@ -3003,6 +2999,7 @@ mod tests {
                 fingerprint: candidate.fingerprint.clone(),
                 source_policy: Arc::clone(&candidate.source_policy),
                 map: Arc::clone(&candidate.map),
+                dependency_plan: DependencyPlan::default(),
                 epoch: 0,
             }),
             failure: None,

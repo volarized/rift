@@ -6,14 +6,19 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use rift_dependency::{CatalogEntry, DependencyCatalog};
-use rift_index::{DependencyIndexLimits, PackageIndex, PackageIndexError, package_files};
+use rift_index::{
+    DependencyIndex, DependencyIndexLimits, PackageIndex, PackageIndexError, PackageSelection,
+    package_files,
+};
+use rift_protocol::dependencies::{DEPENDENCIES_ENABLED_DEFAULT, DependenciesConfiguration};
 use rift_protocol::read::PackageIdentity;
-use rift_server::{DependencyStore, ReadError};
+use rift_server::{DependencyStore, ReadError, ReadFault};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use crate::server::BlockingExecutor;
+use crate::validation::PublishedWorkspace;
 
 /// The revision every package index is built under. A package's declarations are built
 /// once and never revalidated, so no package sees a second revision.
@@ -22,14 +27,93 @@ const PACKAGE_INDEX_REVISION: u64 = 1;
 /// The operation name a package build queues on the worker pool under.
 const PACKAGE_INDEX_OPERATION: &str = "dependency package index";
 
+/// What the accepted `[dependencies]` table asks of the index: whether it runs, which
+/// cataloged packages it plans, and the bounds it reads and holds under.
+///
+/// A publication compiles one beside its read service, so every request the lane
+/// receives carries the plan the same acceptance produced.
+#[derive(Clone, Debug)]
+pub(crate) struct DependencyPlan {
+    /// The bounds every build runs under.
+    pub(crate) limits: DependencyIndexLimits,
+    /// The `include` and `exclude` globs, compiled.
+    pub(crate) selection: PackageSelection,
+    /// Whether the index runs at all. `false` empties the store and plans nothing.
+    pub(crate) enabled: bool,
+}
+
+impl DependencyPlan {
+    /// Compiles the accepted table's bounds and selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when an `include` or `exclude` pattern is not a valid glob,
+    /// the same refusal an invalid `[source]` glob draws.
+    pub(crate) fn compile(configuration: &DependenciesConfiguration) -> Result<Self, ReadError> {
+        let selection = PackageSelection::compile(configuration).map_err(ReadFault::index)?;
+        Ok(Self {
+            limits: DependencyIndexLimits::from(configuration),
+            selection,
+            enabled: configuration.enabled,
+        })
+    }
+}
+
+impl Default for DependencyPlan {
+    /// The default `[dependencies]` table's plan.
+    fn default() -> Self {
+        Self {
+            limits: DependencyIndexLimits::default(),
+            selection: PackageSelection::default(),
+            enabled: DEPENDENCIES_ENABLED_DEFAULT,
+        }
+    }
+}
+
+/// One request the lane indexes: a publication's catalog under its plan.
+///
+/// A disabled plan carries the empty catalog, so following the request drops every
+/// held package and plans nothing until a later publication enables the index again.
+#[derive(Clone, Debug)]
+pub(crate) struct DependencyRequest {
+    catalog: Arc<DependencyCatalog>,
+    plan: DependencyPlan,
+}
+
+impl DependencyRequest {
+    /// The request over `catalog` under `plan`.
+    pub(crate) fn new(catalog: Arc<DependencyCatalog>, plan: DependencyPlan) -> Self {
+        let catalog = if plan.enabled {
+            catalog
+        } else {
+            Arc::new(DependencyCatalog::default())
+        };
+        Self { catalog, plan }
+    }
+
+    /// The request one publication asks for: its resolved catalog under its plan.
+    pub(crate) fn for_publication(published: &PublishedWorkspace) -> Self {
+        Self::new(
+            Arc::clone(published.reads.dependency_catalog()),
+            published.dependency_plan.clone(),
+        )
+    }
+
+    /// Makes `index` follow this request: a fresh plan under changed bounds or
+    /// selection, the catalog alone otherwise.
+    pub(crate) fn follow(&self, index: &mut DependencyIndex) {
+        index.follow(&self.catalog, self.plan.limits, &self.plan.selection);
+    }
+}
+
 /// The dependency lane: one long-lived task owning every package build, and the handle a
 /// publication hands its catalog to.
 ///
 /// A publication resolves the catalog; the lane indexes what the catalog names, one
 /// package at a time on the worker pool, so no request and no publication awaits a
 /// package build. Requests coalesce the way the population lane's do: the channel holds
-/// one catalog, a request landing while an earlier one waits overwrites it, and a pass
-/// checks between packages whether a newer catalog arrived and restarts over that one.
+/// one request, a request landing while an earlier one waits overwrites it, and a pass
+/// checks between packages whether a newer request arrived and restarts over that one.
 /// The channel starts over an empty catalog, seen at creation, so the task waits for
 /// the first request.
 ///
@@ -37,7 +121,7 @@ const PACKAGE_INDEX_OPERATION: &str = "dependency package index";
 /// pending, and the answer carries them as `dependency_index_pending`.
 #[derive(Clone, Debug)]
 pub(crate) struct DependencyLane {
-    catalogs: Arc<watch::Sender<Arc<DependencyCatalog>>>,
+    requests: Arc<watch::Sender<DependencyRequest>>,
 }
 
 impl DependencyLane {
@@ -53,11 +137,14 @@ impl DependencyLane {
     /// the package stays pending and no lock is held across the cancellation.
     pub(crate) fn spawn(
         store: Arc<DependencyStore>,
-        limits: DependencyIndexLimits,
         blocking: BlockingExecutor,
         cancellation: CancellationToken,
     ) -> Self {
-        let (catalogs, mut requests) = watch::channel(Arc::new(DependencyCatalog::default()));
+        let idle = DependencyRequest::new(
+            Arc::new(DependencyCatalog::default()),
+            DependencyPlan::default(),
+        );
+        let (sender, mut requests) = watch::channel(idle);
         tokio::spawn(async move {
             loop {
                 let received = tokio::select! {
@@ -67,11 +154,10 @@ impl DependencyLane {
                 if received.is_err() {
                     return;
                 }
-                let catalog = requests.borrow_and_update().clone();
+                let request = requests.borrow_and_update().clone();
                 let pass = IndexPass {
                     store: &store,
-                    catalog: &catalog,
-                    limits,
+                    request: &request,
                     blocking: &blocking,
                     requests: &requests,
                 };
@@ -82,18 +168,18 @@ impl DependencyLane {
             }
         });
         Self {
-            catalogs: Arc::new(catalogs),
+            requests: Arc::new(sender),
         }
     }
 
-    /// Hands `catalog` to the lane and returns, never awaiting the pass it asks for.
+    /// Hands `request` to the lane and returns, never awaiting the pass it asks for.
     ///
     /// A closed channel is a server already shutting down: the lane's task ended with the
     /// cancellation token, and no later lookup will read the packages this pass would have
     /// built. That is a debug line rather than a caller's failure, because the publication
-    /// this catalog came from already landed.
-    pub(crate) fn request(&self, catalog: Arc<DependencyCatalog>) {
-        if self.catalogs.send(catalog).is_err() {
+    /// this request came from already landed.
+    pub(crate) fn request(&self, request: DependencyRequest) {
+        if self.requests.send(request).is_err() {
             tracing::debug!(
                 component = "dependency",
                 operation = "dependency.index",
@@ -102,13 +188,18 @@ impl DependencyLane {
         }
     }
 
+    /// Hands `published`'s catalog and plan to the lane.
+    pub(crate) fn request_for(&self, published: &PublishedWorkspace) {
+        self.request(DependencyRequest::for_publication(published));
+    }
+
     /// Whether the lane's task has ended, which a cancelled token causes.
     ///
     /// The task holds the channel's only receiver, so releasing it is the one observable
     /// end of the lane.
     #[cfg(test)]
     pub(crate) fn has_ended(&self) -> bool {
-        self.catalogs.receiver_count() == 0
+        self.requests.receiver_count() == 0
     }
 
     /// A lane over `store` on an isolated executor under a token nobody cancels: the
@@ -117,7 +208,6 @@ impl DependencyLane {
     pub(crate) fn spawn_isolated(store: &Arc<DependencyStore>) -> Self {
         Self::spawn(
             Arc::clone(store),
-            DependencyIndexLimits::default(),
             BlockingExecutor::isolated(1, 60_000),
             CancellationToken::new(),
         )
@@ -131,32 +221,32 @@ fn identity_key(identity: &PackageIdentity) -> IdentityKey<'_> {
     (&identity.manager, &identity.name, &identity.version)
 }
 
-/// One pass over one catalog: the store follows the catalog, then each pending package is
-/// built in pass order.
+/// One pass over one request: the store follows the request, then each pending package
+/// is built in pass order.
 struct IndexPass<'a> {
     store: &'a DependencyStore,
-    catalog: &'a DependencyCatalog,
-    limits: DependencyIndexLimits,
+    request: &'a DependencyRequest,
     blocking: &'a BlockingExecutor,
-    requests: &'a watch::Receiver<Arc<DependencyCatalog>>,
+    requests: &'a watch::Receiver<DependencyRequest>,
 }
 
 impl IndexPass<'_> {
-    /// Follows the catalog, then builds each pending package until none is left.
+    /// Follows the request, then builds each pending package until none is left.
     ///
     /// Every iteration takes the store's next pending package and removes it from the
     /// pending list through `insert` or `skip`, so the loop runs at most `pending_count()`
-    /// times. It ends early when a newer catalog arrived, when the worker pool refused a
+    /// times. It ends early when a newer request arrived, when the worker pool refused a
     /// build, or when the store cannot be reached; the packages still pending wait for the
     /// next request.
     async fn run(self) {
         let entries: BTreeMap<IdentityKey<'_>, &CatalogEntry> = self
+            .request
             .catalog
             .entries()
             .iter()
             .map(|entry| (identity_key(entry.identity()), entry))
             .collect();
-        if self.follow_catalog().is_break() {
+        if self.follow_request().is_break() {
             return;
         }
         loop {
@@ -169,9 +259,9 @@ impl IndexPass<'_> {
             }
             let step = match entries.get(&identity_key(&identity)) {
                 Some(entry) => self.index_package(entry).await,
-                // `retain_catalog` queues pending packages from this very catalog, so a
-                // pending identity it does not name cannot arise; the skip keeps the loop
-                // bounded all the same.
+                // The store queues pending packages from this very catalog, so a pending
+                // identity it does not name cannot arise; the skip keeps the loop bounded
+                // all the same.
                 None => self.skip(identity, "the catalog no longer names the package"),
             };
             if step.is_break() {
@@ -181,11 +271,13 @@ impl IndexPass<'_> {
         }
     }
 
-    /// Drops the packages the catalog no longer lists and queues the arrivals.
-    fn follow_catalog(&self) -> ControlFlow<()> {
+    /// Makes the store follow the request: a fresh plan under changed bounds or
+    /// selection, else the packages the catalog no longer lists dropped and the arrivals
+    /// queued.
+    fn follow_request(&self) -> ControlFlow<()> {
         match self.store.write() {
             Ok(mut index) => {
-                index.retain_catalog(self.catalog);
+                self.request.follow(&mut index);
                 ControlFlow::Continue(())
             }
             Err(error) => Self::store_unreachable(&error),
@@ -219,7 +311,7 @@ impl IndexPass<'_> {
         );
         let built = {
             let entry = entry.clone();
-            let limits = self.limits;
+            let limits = self.request.plan.limits;
             self.blocking
                 .run(PACKAGE_INDEX_OPERATION, move || {
                     Ok(build_package(&entry, &limits))
@@ -315,15 +407,14 @@ fn build_package(
     PackageIndex::build(entry, &files, PACKAGE_INDEX_REVISION)
 }
 
-/// A store planned over an empty catalog: what a test that exercises the wiring
-/// without packages attaches to its read services.
+/// A store planned over an empty catalog under the default plan: what a test that
+/// exercises the wiring without packages attaches to its read services.
 #[cfg(test)]
 pub(crate) fn empty_dependency_store() -> Arc<DependencyStore> {
-    use rift_index::DependencyIndex;
-
     Arc::new(DependencyStore::new(DependencyIndex::planned(
         &DependencyCatalog::default(),
         DependencyIndexLimits::default(),
+        PackageSelection::default(),
     )))
 }
 
@@ -336,13 +427,16 @@ mod tests {
     use std::time::Duration;
 
     use rift_dependency::{CatalogEntry, DependencyCatalog, Resolution, ResolverName};
-    use rift_index::{DependencyIndex, DependencyIndexLimits};
+    use rift_index::{DependencyIndex, DependencyIndexLimits, PackageSelection};
+    use rift_protocol::dependencies::{DependenciesConfiguration, PackageNamePattern};
     use rift_protocol::read::{Language, PackageIdentity};
     use rift_server::DependencyStore;
     use tokio::sync::watch;
     use tokio_util::sync::CancellationToken;
 
-    use super::{DependencyLane, IndexPass, empty_dependency_store};
+    use super::{
+        DependencyLane, DependencyPlan, DependencyRequest, IndexPass, empty_dependency_store,
+    };
     use crate::server::BlockingExecutor;
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -387,11 +481,23 @@ mod tests {
         )]))
     }
 
+    /// `catalog` under the default plan.
+    fn requested(catalog: Arc<DependencyCatalog>) -> DependencyRequest {
+        DependencyRequest::new(catalog, DependencyPlan::default())
+    }
+
+    /// The default plan under `limits`.
+    fn plan_under(limits: DependencyIndexLimits) -> DependencyPlan {
+        DependencyPlan {
+            limits,
+            ..DependencyPlan::default()
+        }
+    }
+
     fn spawned(store: &Arc<DependencyStore>) -> (DependencyLane, CancellationToken) {
         let cancellation = CancellationToken::new();
         let lane = DependencyLane::spawn(
             Arc::clone(store),
-            DependencyIndexLimits::default(),
             BlockingExecutor::isolated(1, 60_000),
             cancellation.clone(),
         );
@@ -405,17 +511,16 @@ mod tests {
         Ok(())
     }
 
-    /// One pass over `catalog`, driven directly: what the lane's task runs per request.
+    /// One pass over `request`, driven directly: what the lane's task runs per request.
     fn pass<'a>(
         store: &'a DependencyStore,
-        catalog: &'a DependencyCatalog,
+        request: &'a DependencyRequest,
         blocking: &'a BlockingExecutor,
-        requests: &'a watch::Receiver<Arc<DependencyCatalog>>,
+        requests: &'a watch::Receiver<DependencyRequest>,
     ) -> IndexPass<'a> {
         IndexPass {
             store,
-            catalog,
-            limits: DependencyIndexLimits::default(),
+            request,
             blocking,
             requests,
         }
@@ -442,6 +547,33 @@ mod tests {
         .into())
     }
 
+    #[test]
+    fn a_plan_compiles_the_table_and_an_invalid_glob_refuses() -> TestResult {
+        let table = DependenciesConfiguration {
+            enabled: false,
+            package_files: 7,
+            exclude: vec![PackageNamePattern("cargo/helper".to_owned())],
+            ..DependenciesConfiguration::default()
+        };
+        let plan = DependencyPlan::compile(&table)?;
+        assert!(!plan.enabled);
+        assert_eq!(plan.limits, DependencyIndexLimits::from(&table));
+        assert_eq!(plan.selection, PackageSelection::compile(&table)?);
+        assert!(!plan.selection.selects(&helper()));
+        let default = DependencyPlan::default();
+        assert!(default.enabled);
+        assert_eq!(default.limits, DependencyIndexLimits::default());
+        assert_eq!(default.selection, PackageSelection::default());
+
+        let broken = DependenciesConfiguration {
+            include: vec![PackageNamePattern("cargo/[".to_owned())],
+            ..DependenciesConfiguration::default()
+        };
+        let error = DependencyPlan::compile(&broken).expect_err("an unclosed class");
+        assert_eq!(error.descriptor().code(), "configuration_invalid");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn the_lane_indexes_a_rooted_package() -> TestResult {
         let root = tempfile::tempdir()?;
@@ -452,7 +584,7 @@ mod tests {
         let store = empty_dependency_store();
         let (lane, cancellation) = spawned(&store);
 
-        lane.request(rooted_helper(root.path()));
+        lane.request(requested(rooted_helper(root.path())));
         store_within_bound(&store, |index| index.indexed_count() == 1).await?;
 
         let index = store.read()?;
@@ -473,7 +605,7 @@ mod tests {
         let store = empty_dependency_store();
         let (lane, cancellation) = spawned(&store);
 
-        lane.request(rooted_helper(&root.path().join("absent")));
+        lane.request(requested(rooted_helper(&root.path().join("absent"))));
         store_within_bound(&store, |index| index.skipped().len() == 1).await?;
 
         let index = store.read()?;
@@ -497,13 +629,73 @@ mod tests {
         write_helper_crate(root.path(), "pub fn helper_beacon() {}\n")?;
         let store = empty_dependency_store();
         let (lane, cancellation) = spawned(&store);
-        lane.request(rooted_helper(root.path()));
+        lane.request(requested(rooted_helper(root.path())));
         store_within_bound(&store, |index| index.indexed_count() == 1).await?;
 
-        lane.request(catalog(Vec::new()));
+        lane.request(requested(catalog(Vec::new())));
         store_within_bound(&store, |index| index.indexed_count() == 0).await?;
 
         assert_eq!(store.read()?.pending_count(), 0);
+        cancellation.cancel();
+        Ok(())
+    }
+
+    /// A request whose plan turns the index off empties the store, whatever its catalog
+    /// names; a later enabled request over the same catalog indexes it again.
+    #[tokio::test]
+    async fn a_disabled_plan_empties_the_store_and_an_enabled_one_refills_it() -> TestResult {
+        let root = tempfile::tempdir()?;
+        write_helper_crate(root.path(), "pub fn helper_beacon() {}\n")?;
+        let store = empty_dependency_store();
+        let (lane, cancellation) = spawned(&store);
+        lane.request(requested(rooted_helper(root.path())));
+        store_within_bound(&store, |index| index.indexed_count() == 1).await?;
+
+        let disabled = DependencyPlan {
+            enabled: false,
+            ..DependencyPlan::default()
+        };
+        lane.request(DependencyRequest::new(rooted_helper(root.path()), disabled));
+        store_within_bound(&store, |index| index.indexed_count() == 0).await?;
+
+        assert_eq!(
+            store.read()?.pending_count(),
+            0,
+            "a disabled plan plans nothing"
+        );
+
+        lane.request(requested(rooted_helper(root.path())));
+        store_within_bound(&store, |index| index.indexed_count() == 1).await?;
+
+        cancellation.cancel();
+        Ok(())
+    }
+
+    /// A package the plan's selection drops is never planned: not pending, not skipped,
+    /// and not held.
+    #[tokio::test]
+    async fn a_dropped_package_is_never_planned() -> TestResult {
+        let root = tempfile::tempdir()?;
+        write_helper_crate(root.path(), "pub fn helper_beacon() {}\n")?;
+        let store = empty_dependency_store();
+        let (lane, cancellation) = spawned(&store);
+        let plan = DependencyPlan::compile(&DependenciesConfiguration {
+            exclude: vec![PackageNamePattern("cargo/helper".to_owned())],
+            ..DependenciesConfiguration::default()
+        })?;
+
+        lane.request(DependencyRequest::new(rooted_helper(root.path()), plan));
+        store_within_bound(&store, |index| {
+            index.selection().exclude() == ["cargo/helper"]
+        })
+        .await?;
+
+        let index = store.read()?;
+        assert_eq!(index.pending_count(), 0);
+        assert_eq!(index.indexed_count(), 0);
+        assert!(index.skipped().is_empty(), "{:?}", index.skipped());
+        drop(index);
+
         cancellation.cancel();
         Ok(())
     }
@@ -529,7 +721,7 @@ mod tests {
             "the lane's task must end with the cancellation it races"
         );
 
-        lane.request(rooted_helper(root.path()));
+        lane.request(requested(rooted_helper(root.path())));
         tokio::time::sleep(LANE_POLL).await;
         let index = store.read()?;
         assert_eq!(index.indexed_count(), 0);
@@ -547,14 +739,21 @@ mod tests {
             total_bytes_max: 0,
             ..DependencyIndexLimits::default()
         };
-        let planned = DependencyIndex::planned(&DependencyCatalog::default(), limits);
-        let store = Arc::new(DependencyStore::new(planned));
+        let store = empty_dependency_store();
         let (lane, cancellation) = spawned(&store);
 
-        lane.request(rooted_helper(root.path()));
+        lane.request(DependencyRequest::new(
+            rooted_helper(root.path()),
+            plan_under(limits),
+        ));
         store_within_bound(&store, |index| index.skipped().len() == 1).await?;
 
         let index = store.read()?;
+        assert_eq!(
+            index.limits(),
+            limits,
+            "the request's bounds replan the store"
+        );
         assert_eq!(index.indexed_count(), 0);
         assert_eq!(index.pending_count(), 0);
         let skipped = &index.skipped()[0];
@@ -570,7 +769,37 @@ mod tests {
         Ok(())
     }
 
-    /// A pass over a poisoned store ends before it follows the catalog, and leaves the
+    /// A request under wider bounds replans the store from nothing, so a package an
+    /// earlier bound refused is built again.
+    #[tokio::test]
+    async fn a_request_under_other_bounds_rebuilds_a_refused_package() -> TestResult {
+        let root = tempfile::tempdir()?;
+        write_helper_crate(root.path(), "pub fn helper_beacon() {}\n")?;
+        let store = empty_dependency_store();
+        let (lane, cancellation) = spawned(&store);
+        let narrow = DependencyIndexLimits {
+            total_bytes_max: 0,
+            ..DependencyIndexLimits::default()
+        };
+        lane.request(DependencyRequest::new(
+            rooted_helper(root.path()),
+            plan_under(narrow),
+        ));
+        store_within_bound(&store, |index| index.skipped().len() == 1).await?;
+
+        lane.request(requested(rooted_helper(root.path())));
+        store_within_bound(&store, |index| index.indexed_count() == 1).await?;
+
+        let index = store.read()?;
+        assert!(index.skipped().is_empty(), "{:?}", index.skipped());
+        assert_eq!(index.limits(), DependencyIndexLimits::default());
+        drop(index);
+
+        cancellation.cancel();
+        Ok(())
+    }
+
+    /// A pass over a poisoned store ends before it follows the request, and leaves the
     /// store as the panicking holder left it.
     #[tokio::test]
     async fn a_poisoned_store_ends_the_pass_before_the_catalog_is_followed() -> TestResult {
@@ -587,11 +816,11 @@ mod tests {
             panicked.is_err(),
             "the holder must panic with the lock held"
         );
-        let requested = rooted_helper(root.path());
-        let (_sender, requests) = watch::channel(Arc::new(DependencyCatalog::default()));
+        let request = requested(rooted_helper(root.path()));
+        let (_sender, requests) = watch::channel(requested(Arc::new(DependencyCatalog::default())));
         let blocking = BlockingExecutor::isolated(1, 60_000);
 
-        pass(&store, &requested, &blocking, &requests).run().await;
+        pass(&store, &request, &blocking, &requests).run().await;
 
         assert!(
             store.read().is_err(),
@@ -607,12 +836,12 @@ mod tests {
         let root = tempfile::tempdir()?;
         write_helper_crate(root.path(), "pub fn helper_beacon() {}\n")?;
         let store = empty_dependency_store();
-        let requested = rooted_helper(root.path());
-        let (_sender, requests) = watch::channel(Arc::new(DependencyCatalog::default()));
+        let request = requested(rooted_helper(root.path()));
+        let (_sender, requests) = watch::channel(requested(Arc::new(DependencyCatalog::default())));
         let blocking = BlockingExecutor::isolated(1, 60_000);
         blocking.operations.close();
 
-        pass(&store, &requested, &blocking, &requests).run().await;
+        pass(&store, &request, &blocking, &requests).run().await;
 
         let index = store.read()?;
         assert_eq!(index.pending_count(), 1);
@@ -621,19 +850,19 @@ mod tests {
         Ok(())
     }
 
-    /// A newer catalog on the channel ends the pass before its next build; the lane's
-    /// task restarts over that catalog with the package still pending.
+    /// A newer request on the channel ends the pass before its next build; the lane's
+    /// task restarts over that request with the package still pending.
     #[tokio::test]
-    async fn a_newer_catalog_ends_the_pass_before_the_next_build() -> TestResult {
+    async fn a_newer_request_ends_the_pass_before_the_next_build() -> TestResult {
         let root = tempfile::tempdir()?;
         write_helper_crate(root.path(), "pub fn helper_beacon() {}\n")?;
         let store = empty_dependency_store();
-        let requested = rooted_helper(root.path());
-        let (sender, requests) = watch::channel(Arc::clone(&requested));
-        sender.send(Arc::new(DependencyCatalog::default()))?;
+        let request = requested(rooted_helper(root.path()));
+        let (sender, requests) = watch::channel(request.clone());
+        sender.send(requested(Arc::new(DependencyCatalog::default())))?;
         let blocking = BlockingExecutor::isolated(1, 60_000);
 
-        pass(&store, &requested, &blocking, &requests).run().await;
+        pass(&store, &request, &blocking, &requests).run().await;
 
         let index = store.read()?;
         assert_eq!(index.pending_count(), 1);
