@@ -909,6 +909,16 @@ pub fn declare_change_result_empty_defaults(schema: &mut Schema) {
     }
 }
 
+/// MCP types a tool's `outputSchema` as `{ type: "object", ... }`. A tagged union such as
+/// [`ChangeResult`](crate::change::ChangeResult) derives as a bare `oneOf` of object arms, so
+/// the object type is declared beside the union; a client that validates the listing, such as
+/// the MCP Python SDK, refuses `tools/list` without it.
+pub fn declare_object_type(schema: &mut Schema) {
+    schema
+        .ensure_object()
+        .insert(keyword::TYPE.to_owned(), json!("object"));
+}
+
 /// A [`Diagnostic`](crate::diagnostic::Diagnostic) states `default: []` on `related` and
 /// `tags`, and `default: {}` on `extensions`.
 pub fn declare_diagnostic_empty_defaults(schema: &mut Schema) {

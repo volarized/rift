@@ -1693,3 +1693,28 @@ determinism = "deterministic"
     server_task.await?;
     Ok(())
 }
+
+/// MCP types a tool's `outputSchema` as an object schema, `type: "object"` at the top; a
+/// client that validates the listing, such as the MCP Python SDK, refuses `tools/list`
+/// without it, so a tagged-union result declares the type beside its `oneOf`.
+#[tokio::test]
+async fn every_advertised_output_schema_declares_the_object_type() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+    let tools = client.list_all_tools().await?;
+    let mut missing = Vec::new();
+    for tool in &tools {
+        let Some(schema) = tool.output_schema.as_deref() else {
+            continue;
+        };
+        if schema.get("type").and_then(Value::as_str) != Some("object") {
+            missing.push(tool.name.to_string());
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "tools/list advertises output schemas without `type: object`: {missing:?}"
+    );
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
