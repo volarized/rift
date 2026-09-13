@@ -224,6 +224,8 @@ impl PackageFiles {
 struct Candidate {
     absolute: PathBuf,
     relative: ProjectPath,
+    /// The file's size when the walk saw it, summed before any file is read.
+    bytes: u64,
 }
 
 impl Candidate {
@@ -287,9 +289,11 @@ fn candidates_below(
             .caused_by(error)
     })?;
     if metadata.is_file() {
-        return Ok(single_file_candidate(root, language, package)?
-            .into_iter()
-            .collect());
+        return Ok(
+            single_file_candidate(root, metadata.len(), language, package)?
+                .into_iter()
+                .collect(),
+        );
     }
     let mut candidates = Vec::new();
     let walked = bounded_for!(
@@ -321,6 +325,7 @@ fn candidates_below(
 /// A single-file source root as its own candidate, when its name is selected.
 fn single_file_candidate(
     root: &Path,
+    bytes: u64,
     language: PackageLanguage,
     package: &PackageIdentity,
 ) -> Result<Option<Candidate>, PackageIndexError> {
@@ -342,6 +347,7 @@ fn single_file_candidate(
     Ok(Some(Candidate {
         absolute: root.to_path_buf(),
         relative,
+        bytes,
     }))
 }
 
@@ -373,9 +379,18 @@ fn candidate_of(
         return Ok(None);
     }
     let relative = package_relative(root, entry.path(), package)?;
+    let bytes = entry
+        .metadata()
+        .map_err(|error| {
+            PackageIndexFault::new(PackageIndexViolation::Unreadable, package)
+                .at(entry.path())
+                .caused_by(error)
+        })?
+        .len();
     Ok(Some(Candidate {
         absolute: entry.path().to_path_buf(),
         relative,
+        bytes,
     }))
 }
 
@@ -421,12 +436,29 @@ fn package_relative(
 
 /// Reads every candidate under `package_bytes_max`, skipping binary content.
 ///
-/// The loop is bounded by the caller's `package_files_max` refusal.
+/// The bound is checked against the sizes the walk recorded before any file is read, so
+/// a refusal names the package's whole selected size. The check inside the loop stays for
+/// a file that grew between the walk and its read; that refusal names the file. The loop
+/// is bounded by the caller's `package_files_max` refusal.
 fn read_candidates(
     candidates: Vec<Candidate>,
     package: &PackageIdentity,
     limits: &DependencyIndexLimits,
 ) -> Result<PackageFiles, PackageIndexError> {
+    let selected_bytes = candidates.iter().fold(0_u64, |total, candidate| {
+        total.saturating_add(candidate.bytes)
+    });
+    if selected_bytes > limits.package_bytes_max {
+        return Err(
+            PackageIndexFault::new(PackageIndexViolation::PackageBytesExceeded, package)
+                .breached(
+                    PACKAGE_BYTES_MAX_FIELD,
+                    limits.package_bytes_max,
+                    selected_bytes,
+                )
+                .into(),
+        );
+    }
     let mut files = Vec::with_capacity(candidates.len());
     let mut skipped_binary = 0_usize;
     let mut byte_count = 0_u64;
@@ -515,14 +547,16 @@ fn is_skipped_directory_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use rift_core::{ErrorCode, ErrorName, Fault as _};
+    use rift_core::{ErrorCode, ErrorName, Fault as _, ProjectPath};
     use rift_dependency::{CatalogEntry, PackageLocation};
     use rift_syntax::ShippedLanguage;
 
     use super::super::fixture::{
         identity, language, rooted, sorted_paths, tokio, violation_of, write,
     };
-    use super::{DependencyIndexLimits, PackageIndexViolation, package_files};
+    use super::{
+        Candidate, DependencyIndexLimits, PackageIndexViolation, package_files, read_candidates,
+    };
 
     #[test]
     fn test_package_files_rust_selects_rs_files_and_skips_test_directories() {
@@ -634,9 +668,44 @@ mod tests {
         assert_eq!(evidence.field, "package_bytes_max");
         assert_eq!(evidence.limit, 15);
         assert_eq!(
-            evidence.required, 16,
-            "the second read stops one byte past the bound, so the requirement is \
-             counted up to the ceiling plus one, never the whole package"
+            evidence.required, 20,
+            "the requirement is the package's whole selected size, summed from the walk"
+        );
+        assert!(
+            error.fault().path().is_none(),
+            "a package-wide bound names no single file"
+        );
+    }
+
+    #[test]
+    fn test_read_candidates_refuses_a_file_that_grew_after_the_walk_naming_it() {
+        let root = tempfile::tempdir().expect("package root");
+        write(root.path(), "src/a.rs", b"0123456789");
+        let candidate = Candidate {
+            absolute: root.path().join("src/a.rs"),
+            relative: ProjectPath::new("src/a.rs").expect("valid path"),
+            bytes: 0,
+        };
+        let limits = DependencyIndexLimits {
+            package_bytes_max: 5,
+            ..DependencyIndexLimits::default()
+        };
+
+        let error = read_candidates(vec![candidate], &tokio(), &limits)
+            .expect_err("the grown file crosses the bound");
+
+        assert_eq!(
+            violation_of(&error),
+            PackageIndexViolation::PackageBytesExceeded
+        );
+        assert_eq!(
+            error.fault().path(),
+            Some(root.path().join("src/a.rs").as_path())
+        );
+        let evidence = error.fault().limit_evidence().expect("limit evidence");
+        assert_eq!(
+            evidence.required, 6,
+            "the read stops one byte past the bound, counted up to the ceiling plus one"
         );
     }
 
