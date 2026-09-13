@@ -88,6 +88,47 @@ fn attachment_kinds() -> &'static AttachmentKinds {
 /// A blank line between an attachable sibling and the declaration detaches
 /// it, matching rustdoc's own attachment rule.
 pub(super) fn declaration_start(node: Node<'_>, text: &str) -> usize {
+    attached_front(node, text).start_byte()
+}
+
+/// Whether one of the declaration's attached outer attributes is `#[<name>]`.
+///
+/// The attribute's own text between `#[` and `]` is compared whole, so
+/// `#[macro_export]` matches `macro_export` and `#[macro_export(local_inner_macros)]`
+/// does not; the walk is the one [`declaration_start`] uses.
+pub(super) fn has_attached_attribute(node: Node<'_>, text: &str, name: &str) -> bool {
+    let kinds = attachment_kinds();
+    let front = attached_front(node, text);
+    let mut cursor = Some(front);
+    while let Some(sibling) = cursor {
+        if sibling.start_byte() >= node.start_byte() {
+            break;
+        }
+        if sibling.kind_id() == kinds.attribute_item
+            && text
+                .get(sibling.byte_range())
+                .and_then(attribute_name)
+                .is_some_and(|attribute| attribute == name)
+        {
+            return true;
+        }
+        cursor = sibling.next_sibling();
+    }
+    false
+}
+
+/// The name inside `#[...]`, trimmed; `None` for text that is not an attribute item.
+fn attribute_name(attribute_text: &str) -> Option<&str> {
+    attribute_text
+        .trim()
+        .strip_prefix("#[")
+        .and_then(|inner| inner.strip_suffix(']'))
+        .map(str::trim)
+}
+
+/// The first sibling of the run of attached outer attributes and doc comments
+/// standing before `node`; `node` itself when nothing is attached.
+fn attached_front<'tree>(node: Node<'tree>, text: &str) -> Node<'tree> {
     let mut front = node;
     while let Some(previous) = front.prev_sibling() {
         if !is_attached(previous) {
@@ -109,7 +150,7 @@ pub(super) fn declaration_start(node: Node<'_>, text: &str) -> usize {
         }
         front = previous;
     }
-    front.start_byte()
+    front
 }
 
 /// Reports whether `node` is an attribute or an outer doc comment, either
