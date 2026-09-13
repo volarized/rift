@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::dependencies::DependenciesConfiguration;
 use crate::lock::{SERVER_PORT_FLOOR, SERVER_PORT_MAX, SERVER_PORT_MIN};
 use crate::read::{CoverageScope, Language, PathPattern, ProjectPath};
 use crate::retry::{
@@ -395,6 +396,9 @@ pub struct WorkspaceConfiguration {
     pub search: SearchConfiguration,
     /// Which files below the workspace root the index and reads consider visible.
     pub source: SourceConfiguration,
+    /// Whether the dependency index runs, how the catalog is resolved, which
+    /// cataloged packages it indexes, and the bounds it indexes under.
+    pub dependencies: DependenciesConfiguration,
     /// The server's own log records: how many the workspace database keeps,
     /// how many one read returns, and which targets are captured.
     pub logs: LogsConfiguration,
@@ -450,6 +454,7 @@ impl WorkspaceConfiguration {
             .or_else(|| self.providers.binding.violation())
             .or_else(|| self.search.violation())
             .or_else(|| self.source.violation())
+            .or_else(|| self.dependencies.violation())
             .or_else(|| self.logs.violation())
             .or_else(|| hooks_violation(&self.hooks))
             .or_else(|| languages_violation(&self.languages, &self.lsp))
@@ -2001,6 +2006,15 @@ pub enum ConfigurationViolation {
         /// The rejected pattern.
         pattern: String,
     },
+    /// A `dependencies.include` or `dependencies.exclude` entry breaks the package name
+    /// pattern contract: it is empty, longer than 256 bytes, absolute, or carries a
+    /// backslash, a control character, or a `.` or `..` segment.
+    PackagePatternInvalid {
+        /// The key's path in the file: `dependencies.include` or `dependencies.exclude`.
+        field: &'static str,
+        /// The rejected pattern.
+        pattern: String,
+    },
     /// A `logs.capture` value is not a tracing filter directive.
     LogCaptureInvalid {
         /// The rejected filter.
@@ -2117,7 +2131,8 @@ impl ConfigurationViolation {
             Self::LspEmbeddedExtras { lsp, field } => {
                 vec![("lsp", lsp.clone()), ("field", (*field).to_owned())]
             }
-            Self::PathPatternInvalid { field, pattern } => {
+            Self::PathPatternInvalid { field, pattern }
+            | Self::PackagePatternInvalid { field, pattern } => {
                 vec![("field", (*field).to_owned()), ("pattern", pattern.clone())]
             }
             Self::LogCaptureInvalid { capture, detail } => vec![
@@ -2823,6 +2838,8 @@ mod tests {
         assert!(configuration.source.include.is_empty());
         assert!(configuration.source.exclude.is_empty());
         assert!(configuration.source.respect_gitignore);
+        assert!(configuration.dependencies.enabled);
+        assert_eq!(configuration.dependencies.package_files, 2_000);
         assert!(configuration.hooks.is_empty());
         assert!(configuration.languages.is_empty());
         assert!(configuration.lsp.is_empty());
@@ -2844,6 +2861,7 @@ mod tests {
             json!({ "search": { "unknown": "x" } }),
             json!({ "search": { "text": { "unknown": "x" } } }),
             json!({ "source": { "unknown": "x" } }),
+            json!({ "dependencies": { "unknown": "x" } }),
             json!({ "lsp": { "ty": {
                 "command": "ty", "unknown": 1,
             } } }),
@@ -4542,6 +4560,10 @@ mod tests {
             },
             ConfigurationViolation::LspInitializationOptionsNotObject { lsp: text() },
             ConfigurationViolation::PathPatternInvalid {
+                field: "x",
+                pattern: text(),
+            },
+            ConfigurationViolation::PackagePatternInvalid {
                 field: "x",
                 pattern: text(),
             },
