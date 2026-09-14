@@ -756,13 +756,17 @@ and carries the references as a warning. Without a configured engine, or one tha
 advertise `textDocument/references`, the removal applies and carries a warning naming why it was
 not checked.
 
+The check asks the engine to include the declaration itself, so an engine that names nothing at
+all - that declaration included - has not resolved the file. That answer checks no reference, and
+the removal applies carrying the same warning, naming the engine that does not hold the file.
+
 A reference the engine finds in a cataloged package is named by that package file's
 [`SourceUnitId`](/docs/protocol/reference#SourceUnitId), the unit `get_symbol` serves the
 package under: the failed condition carries it in `units` beside the project `paths`, and the
 `force` warning names it with them. A location under no cataloged root counts toward the
 condition, and the warning names it by the engine's own URI.
 
-An engine that answers with no references before confirming its own readiness is a third case:
+An engine that answers with no references before confirming its own readiness reaches no verdict:
 that answer looks the same as one from an engine that checked and found nothing, so the removal
 refuses `temporarily_unavailable` instead of applying. An engine that could not answer the check
 at all - still loading on every attempt, or a failed request - refuses the same
