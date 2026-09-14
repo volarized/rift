@@ -1521,7 +1521,7 @@ impl LexicalLane {
             Ok(Ok(Ok(()))) => Ok(()),
             Ok(Ok(Err(error))) => Err(ReadFault::unavailable(
                 "lexical index commit",
-                error.to_string(),
+                error.detail(),
             )),
             Ok(Err(_)) => Err(lexical_unavailable("the lexical owner dropped this commit")),
             Err(_) => Err(lexical_unavailable(
@@ -3693,7 +3693,7 @@ mod tests {
         limit: u32,
     ) -> TestResult<Vec<rift_search::RankedUnit>> {
         match index.search(tree_revision, query, limit).await? {
-            RevisionScoped::Matched(ranked) => Ok(ranked),
+            RevisionScoped::Matched(ranked) => Ok(ranked.into_units()),
             other => Err(format!("the store must hold {tree_revision}: {other:?}").into()),
         }
     }

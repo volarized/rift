@@ -543,10 +543,7 @@ fn visible_source(
     path: &CoreProjectPath,
     absolute: &Path,
 ) -> Result<Result<String, ChangeResult>, ReadError> {
-    let visible = reads
-        .source_policy()
-        .is_some_and(|policy| policy.visible(absolute));
-    if !visible {
+    if !crate::publish::visible(reads, absolute) {
         return Ok(Err(crate::publish::not_visible_refusal(path)));
     }
     let metadata = match fs::metadata(absolute) {

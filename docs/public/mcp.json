@@ -106,7 +106,7 @@
           },
           "limit": {
             "default": 5,
-            "description": "Most hits to return in one page, capped by `max_page_items`.",
+            "description": "Most hits to return in one page, at most 10,000; the server refuses a larger\n`limit` naming the field. The server's result bound caps the set itself, and an\nanswer whose set reached it warns `results_truncated`.",
             "format": "uint64",
             "maximum": 10000,
             "minimum": 1,
@@ -582,6 +582,48 @@
                 "required": [
                   "code",
                   "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The lexical ranking stopped at `matches_max` units; hits past it never reached the\npage, whatever `paths` selects. Narrow `query`.",
+                "properties": {
+                  "code": {
+                    "const": "lexical_ranking_truncated",
+                    "type": "string"
+                  },
+                  "matches_max": {
+                    "description": "Units the ranking stopped at: the server's bound on one lexical ranking.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "matches_max"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The result set reached `results_max` hits, the server's result bound, before\nordering and paging: hits past it never reach any page, and `total_pages` counts\nonly what fit. The warning means the bound was reached; a set of exactly\n`results_max` hits carries it too. Narrow `query` or `paths`.",
+                "properties": {
+                  "code": {
+                    "const": "results_truncated",
+                    "type": "string"
+                  },
+                  "results_max": {
+                    "description": "Hits the result set stopped at: the server's bound on one read's result set.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "results_max"
                 ],
                 "type": "object"
               },
@@ -1182,8 +1224,12 @@
           },
           "SymbolHistory": {
             "additionalProperties": false,
-            "description": "One symbol's timeline across the workspace's version-control history, newest revision\nfirst. The walk follows first parents from the served revision along the declaration's\ncurrent path only, bounded by the configured history depth.",
+            "description": "One symbol's timeline across the workspace's version-control history, newest revision\nfirst. The walk follows first parents from the served revision along the declaration's\ncurrent path only, bounded by the configured history depth and by a shallow clone's\nboundary.",
             "properties": {
+              "complete": {
+                "description": "Whether the walk reached the repository's first commit. `false` when the\n`max_revisions` bound or a shallow clone's boundary ended the walk first, so\nrevisions older than the listed ones may have touched the symbol.",
+                "type": "boolean"
+              },
               "symbol": {
                 "$ref": "#/$defs/SymbolId",
                 "description": "The symbol the timeline is for."
@@ -1198,7 +1244,8 @@
             },
             "required": [
               "symbol",
-              "versions"
+              "versions",
+              "complete"
             ],
             "type": "object"
           },
@@ -1498,6 +1545,7 @@
             "hits": [
               {
                 "history": {
+                  "complete": true,
                   "symbol": "rift://symbol/rust/src/config.rs/load_config",
                   "versions": [
                     {
@@ -5131,6 +5179,48 @@
                 "required": [
                   "code",
                   "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The lexical ranking stopped at `matches_max` units; hits past it never reached the\npage, whatever `paths` selects. Narrow `query`.",
+                "properties": {
+                  "code": {
+                    "const": "lexical_ranking_truncated",
+                    "type": "string"
+                  },
+                  "matches_max": {
+                    "description": "Units the ranking stopped at: the server's bound on one lexical ranking.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "matches_max"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The result set reached `results_max` hits, the server's result bound, before\nordering and paging: hits past it never reach any page, and `total_pages` counts\nonly what fit. The warning means the bound was reached; a set of exactly\n`results_max` hits carries it too. Narrow `query` or `paths`.",
+                "properties": {
+                  "code": {
+                    "const": "results_truncated",
+                    "type": "string"
+                  },
+                  "results_max": {
+                    "description": "Hits the result set stopped at: the server's bound on one read's result set.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "results_max"
                 ],
                 "type": "object"
               },
@@ -11453,7 +11543,7 @@
               },
               "force_include": {
                 "default": [],
-                "description": "Globs reaching files the workspace's `[source]` policy or `.gitignore` excluded from\nthe index. Matches are bounded per request, and the server refuses the search when the\nbound is crossed rather than truncating it silently.",
+                "description": "Globs reaching files the workspace's `[source]` policy or `.gitignore` excluded from\nthe index. Matches are bounded per request - the bound counts the files the request\nreaches outside the index, so a glob whose matches the index already holds adds none -\nand the server refuses the search when the bound is crossed rather than truncating it\nsilently.",
                 "items": {
                   "$ref": "#/$defs/PathPattern"
                 },
@@ -11839,7 +11929,7 @@
             ]
           },
           "limit": {
-            "description": "Most hits to return in one page. `max_page_items` from the workspace resource caps\nit, and fewer may come back.",
+            "description": "Most hits to return in one page, at most 10,000; the server refuses a larger\n`limit` naming the field. The server's result bound caps the set itself, and an\nanswer whose set reached it warns `results_truncated`.",
             "format": "uint64",
             "maximum": 10000,
             "minimum": 1,
@@ -12329,6 +12419,48 @@
                 "required": [
                   "code",
                   "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The lexical ranking stopped at `matches_max` units; hits past it never reached the\npage, whatever `paths` selects. Narrow `query`.",
+                "properties": {
+                  "code": {
+                    "const": "lexical_ranking_truncated",
+                    "type": "string"
+                  },
+                  "matches_max": {
+                    "description": "Units the ranking stopped at: the server's bound on one lexical ranking.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "matches_max"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The result set reached `results_max` hits, the server's result bound, before\nordering and paging: hits past it never reach any page, and `total_pages` counts\nonly what fit. The warning means the bound was reached; a set of exactly\n`results_max` hits carries it too. Narrow `query` or `paths`.",
+                "properties": {
+                  "code": {
+                    "const": "results_truncated",
+                    "type": "string"
+                  },
+                  "results_max": {
+                    "description": "Hits the result set stopped at: the server's bound on one read's result set.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "results_max"
                 ],
                 "type": "object"
               },

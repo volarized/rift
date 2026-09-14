@@ -290,22 +290,28 @@ fn move_targets(params: &MoveFileParams) -> Result<(CoreProjectPath, CoreProject
 ///
 /// Any visible regular file is movable: absence of a language identity only means there
 /// is nothing to ask an engine with, which [`engine_proposal`] and the move's own
-/// warning path already cover. An indexed path already passed the workspace's
-/// `[source]` policy at index construction; a path the index does not hold is checked
-/// against that policy directly here, so an excluded path stays unreachable regardless of
-/// whether a provider would otherwise claim it. A missing path refuses `target_exists`; a
+/// warning path already cover. The path clears the write gate every write tool resolves
+/// its targets through, whether or not the syntax index holds it, so a path the
+/// `[source]` policy excludes stays unreachable and the move cannot disagree with the
+/// other write tools on what is visible. A missing path refuses `target_exists`; a
 /// directory refuses `target_is_file`.
 async fn resolved_source(
     reads: &ReadService,
     workspace_root: &Path,
     from: &CoreProjectPath,
 ) -> Result<MovedSource, PlanEnd> {
-    let absolute = workspace_root.join(from.as_str());
-    if reads.index().file(from).is_none() && !source_visible(reads, &absolute) {
-        return Err(PlanEnd::Refused(crate::publish::not_visible_refusal(from)));
-    }
+    let target = match crate::publish::resolve_write_target(
+        reads,
+        workspace_root,
+        from,
+        crate::publish::SymlinkResolution::Addressed,
+    )? {
+        Ok(target) => target,
+        Err(refusal) => return Err(PlanEnd::Refused(refusal)),
+    };
+    let absolute = target.absolute();
     let language_segment = reads.engine_language_segment(from)?;
-    let metadata = match tokio::fs::metadata(&absolute).await {
+    let metadata = match tokio::fs::metadata(absolute).await {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(PlanEnd::Refused(missing_source_refusal(from)));
@@ -321,22 +327,13 @@ async fn resolved_source(
     if !metadata.is_file() {
         return Err(PlanEnd::Refused(directory_source_refusal(from)));
     }
-    let text = tokio::fs::read_to_string(&absolute)
+    let text = tokio::fs::read_to_string(absolute)
         .await
         .map_err(|error| PlanEnd::from(ReadFault::storage(from.as_str(), "read", &error)))?;
     Ok(MovedSource {
         language_segment,
         text,
     })
-}
-
-/// Whether `absolute` is visible under the workspace's `[source]` policy, checked directly
-/// for a path the syntax index does not claim - the same policy an indexed path already
-/// passed at index construction.
-fn source_visible(reads: &ReadService, absolute: &Path) -> bool {
-    reads
-        .source_policy()
-        .is_some_and(|policy| policy.visible(absolute))
 }
 
 /// The moved file's source condition failed: it does not exist.
@@ -730,6 +727,13 @@ mod tests {
         }
     }
 
+    fn planned(resolution: MoveResolution) -> MovePlan {
+        match resolution {
+            MoveResolution::Planned(plan) => plan,
+            MoveResolution::Refused(result) => panic!("expected a plan, got refusal {result:?}"),
+        }
+    }
+
     /// A language segment no identity spells is a language no engine claims:
     /// the proposal answers the same warning an unserved language does.
     #[tokio::test]
@@ -1105,6 +1109,57 @@ mod tests {
             condition.expected,
             PreconditionValue::Boolean { value: false }
         );
+    }
+
+    /// An unclaimed file - one no syntax provider parses - clears the same write gate
+    /// every write tool resolves its targets through, so the move plans it.
+    #[tokio::test]
+    async fn unclaimed_file_under_a_plain_root_is_movable() {
+        let (directory, reads, engines) = workspace(&[
+            ("lib.rs", "pub fn beacon() {}\n"),
+            ("notes.txt", "moved note\n"),
+        ]);
+        let resolution = plan_move(
+            &reads,
+            &engines,
+            directory.path(),
+            &params("notes.txt", "moved.txt"),
+        )
+        .await
+        .expect("the plan is typed");
+        let plan = planned(resolution);
+        assert_eq!(plan.moved_source, "moved note\n");
+        assert_eq!(plan.to.as_str(), "moved.txt");
+    }
+
+    /// A root the caller spells through a symlink, as macOS spells `/tmp`: the
+    /// `[source]` policy normalizes that spelling, and the move sees the unclaimed
+    /// file under it the way the other write tools do.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unclaimed_file_under_a_symlinked_root_is_movable() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let real = directory.path().join("real");
+        fs::create_dir(&real).expect("fixture real root");
+        fs::write(real.join("lib.rs"), "pub fn beacon() {}\n").expect("fixture write");
+        fs::write(real.join("notes.txt"), "moved note\n").expect("fixture write");
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("fixture root link");
+        let reads = ReadService::build(
+            &link,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )
+        .expect("fixture workspace indexes");
+        let engines = EnginePool::new(&link, BTreeMap::new(), BTreeMap::new());
+        let resolution = plan_move(&reads, &engines, &link, &params("notes.txt", "moved.txt"))
+            .await
+            .expect("the plan is typed");
+        let plan = planned(resolution);
+        assert_eq!(plan.moved_source, "moved note\n");
+        assert_eq!(plan.to.as_str(), "moved.txt");
     }
 
     #[tokio::test]

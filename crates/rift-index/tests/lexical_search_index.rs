@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use rift_core::{ErrorCode, ErrorName, ProjectPath};
 use rift_index::{DatabasePool, WorkspaceDatabase};
 use rift_index::{
-    LexicalChange, LexicalIndexLimits, LexicalIndexViolation, LexicalMatch, LexicalSearchIndex,
-    LexicalUnit, LexicalUnitKind, RevisionScoped,
+    LexicalChange, LexicalIndexLimits, LexicalIndexViolation, LexicalMatch, LexicalRanking,
+    LexicalSearchIndex, LexicalUnit, LexicalUnitKind, RevisionScoped,
 };
 use tempfile::TempDir;
 use toasty::Db;
@@ -16,18 +16,30 @@ use toasty::stmt::Type;
 use toasty_core::driver::operation::TransactionMode;
 use toasty_driver_sqlite::Sqlite;
 
-/// The matches one revision-qualified search returned, refusing any answer the store could
+/// The ranking one revision-qualified search returned, refusing any answer the store could
 /// not place under `tree_revision`.
+async fn search_ranking(
+    index: &LexicalSearchIndex,
+    tree_revision: &str,
+    query: &str,
+    limit: u32,
+) -> Result<LexicalRanking, Box<dyn std::error::Error>> {
+    match index.search(tree_revision, query, limit).await? {
+        RevisionScoped::Matched(ranking) => Ok(ranking),
+        other => Err(format!("the store must hold {tree_revision}: {other:?}").into()),
+    }
+}
+
+/// The matches one revision-qualified search returned, best first.
 async fn search_matches(
     index: &LexicalSearchIndex,
     tree_revision: &str,
     query: &str,
     limit: u32,
 ) -> Result<Vec<LexicalMatch>, Box<dyn std::error::Error>> {
-    match index.search(tree_revision, query, limit).await? {
-        RevisionScoped::Matched(matches) => Ok(matches),
-        other => Err(format!("the store must hold {tree_revision}: {other:?}").into()),
-    }
+    Ok(search_ranking(index, tree_revision, query, limit)
+        .await?
+        .into_matches())
 }
 
 /// Builds one text-file unit; its identity is its own path, per convention.
@@ -153,6 +165,54 @@ async fn test_lexical_search_index_search_limit_and_matches_max_cap_results()
 
     let capped_by_limit = search_matches(&index, "revision-1", "shared", 1).await?;
     assert_eq!(capped_by_limit.len(), 1, "explicit limit must cap results");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_search_names_the_bound_a_match_lies_past()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let limits = LexicalIndexLimits::new(100, 1_048_576, 32, 2, 4, 1_000);
+    let path = database_path(&directory);
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        limits,
+    );
+
+    let at_the_bound = [
+        text_unit("docs/0.md", "shared token")?,
+        text_unit("docs/1.md", "shared token")?,
+    ];
+    index.replace_all(&at_the_bound, "revision-1").await?;
+    let whole = search_ranking(&index, "revision-1", "shared", 10).await?;
+    assert_eq!(whole.matches().len(), 2);
+    assert_eq!(
+        whole.truncated_at(),
+        None,
+        "exactly matches_max matches is not truncated"
+    );
+
+    let past_the_bound = [
+        text_unit("docs/0.md", "shared token")?,
+        text_unit("docs/1.md", "shared token")?,
+        text_unit("docs/2.md", "shared token")?,
+    ];
+    index.replace_all(&past_the_bound, "revision-2").await?;
+    let cut = search_ranking(&index, "revision-2", "shared", 10).await?;
+    assert_eq!(cut.matches().len(), 2, "the answer keeps matches_max rows");
+    assert_eq!(
+        cut.truncated_at(),
+        Some(2),
+        "one match past matches_max names the bound"
+    );
+
+    let cut_by_limit = search_ranking(&index, "revision-2", "shared", 1).await?;
+    assert_eq!(cut_by_limit.matches().len(), 1);
+    assert_eq!(
+        cut_by_limit.truncated_at(),
+        Some(1),
+        "a limit below matches_max is the bound that cut"
+    );
     Ok(())
 }
 
@@ -1044,10 +1104,11 @@ async fn test_lexical_search_index_search_qualifies_an_empty_query_by_revision_t
         RevisionScoped::NoRevision
     );
     index.replace_all(&[], "revision-one").await?;
-    assert_eq!(
-        index.search("revision-one", "   ", 8).await?,
-        RevisionScoped::Matched(Vec::new())
-    );
+    let RevisionScoped::Matched(ranking) = index.search("revision-one", "   ", 8).await? else {
+        return Err("the store holds the tree that was just stamped".into());
+    };
+    assert!(ranking.matches().is_empty());
+    assert_eq!(ranking.truncated_at(), None);
     Ok(())
 }
 

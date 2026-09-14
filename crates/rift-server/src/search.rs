@@ -15,16 +15,17 @@ use rift_index::{
     WorkspaceIndex,
 };
 use rift_protocol::read::{
-    MatchedField, PathPattern, PathSelector, ProjectPath as WireProjectPath, ResultOrder,
-    SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget, SearchResult,
-    SearchScope, SourceUnitId, Symbol, SymbolId,
+    MatchedField, PathPattern, PathSelector, ProjectPath as WireProjectPath, ReadWarning,
+    ResultOrder, SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget,
+    SearchResult, SearchScope, SourceUnitId, Symbol, SymbolId,
 };
 use rift_search::{Declaration, DescribedUnit, RankedUnit};
 use rift_syntax::{ByteRange, SyntaxSymbol};
 
 use crate::read::{
     ReadError, ReadFault, ReadService, accepted_limit, dependency_symbol, dependency_warnings,
-    excerpt, page, project_path, text_range, validate_common, wire_symbol,
+    excerpt, page, project_path, results_truncation_warning, text_range, validate_common,
+    wire_symbol,
 };
 use crate::traversal::{collect_traversal_hits, traversal_truncation_warning, validate_traversal};
 
@@ -52,17 +53,9 @@ impl ReadService {
         if self.revision().is_some() && force_include_requested(params) {
             return Err(ReadFault::unsupported("force_include at a revision"));
         }
-        let query = params.query.as_deref();
-        if query.is_none() && params.traversal.is_none() {
-            return Err(ReadFault::invalid("query", "missing"));
-        }
-        if query.is_some_and(str::is_empty) {
-            return Err(ReadFault::invalid("query", "empty"));
-        }
+        let query = accepted_query(params)?;
         let limit = accepted_limit(params.limit.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))?;
-        let root = self.index().root();
-        let selector = params.paths.as_ref();
-        let matcher = path_matcher(root, selector)?;
+        let selected = self.selected_paths(params.paths.as_ref())?;
         let payloads = HitPayloads::requested(params);
         // The whole candidate pool is collected up to the index's own `results_max` bound -
         // bounded work whatever the page size - then ordered and truncated to that same
@@ -78,31 +71,14 @@ impl ReadService {
                 target: params.target,
                 payloads,
             };
-            if params.scope != SearchScope::Dependencies {
-                collect_indexed_hits(
-                    self.index(),
-                    matcher.as_ref(),
-                    root,
-                    criteria,
-                    fetch_limit,
-                    &mut results,
-                )?;
-                if results.len() < fetch_limit
-                    && let Some(selector) = selector
-                {
-                    collect_force_include_hits(
-                        self.index(),
-                        selector,
-                        criteria,
-                        fetch_limit,
-                        &mut results,
-                    )?;
-                }
-                let index = self.index();
-                let matcher = matcher.as_ref();
-                collect_ranked_hits(index, matcher, root, criteria, ranked, &mut results)?;
-            }
-            collect_dependency_hits(dependencies.as_deref(), criteria, fetch_limit, &mut results)?;
+            self.collect_query_hits(
+                criteria,
+                params.scope,
+                &selected,
+                ranked,
+                dependencies.as_deref(),
+                &mut results,
+            )?;
         }
         let mut traversal_truncated = false;
         if let Some(traversal) = params.traversal.as_ref()
@@ -113,15 +89,14 @@ impl ReadService {
         {
             traversal_truncated = collect_traversal_hits(
                 self,
-                matcher.as_ref(),
-                root,
+                selected.matcher.as_ref(),
+                self.index().root(),
                 traversal,
                 payloads,
                 &mut results,
             )?;
         }
-        order_hits(&mut results, params.order);
-        results.truncate(fetch_limit);
+        let results_max_reached = order_and_bound_hits(&mut results, params.order, fetch_limit);
         let (mut results, pagination) = page(results, params.page_index, limit);
         if !payloads.score {
             for hit in &mut results {
@@ -131,20 +106,93 @@ impl ReadService {
         Ok(SearchResult {
             results,
             pagination,
-            warnings: {
-                let mut warnings = self.warnings();
-                if traversal_truncated {
-                    warnings.push(traversal_truncation_warning());
-                }
-                if params.scope != SearchScope::Project {
-                    warnings.extend(dependency_warnings(
-                        dependencies.as_deref(),
-                        self.dependency_catalog(),
-                    ));
-                }
-                warnings
-            },
+            warnings: self.search_warnings(
+                params.scope,
+                dependencies.as_deref(),
+                traversal_truncated,
+                results_max_reached,
+            ),
         })
+    }
+
+    /// The warnings one search answer carries: the snapshot's own, the traversal bound
+    /// when the walk hit it, the result bound when the pool reached it, and the
+    /// dependency warnings when `scope` reaches dependencies.
+    fn search_warnings(
+        &self,
+        scope: SearchScope,
+        dependencies: Option<&DependencyIndex>,
+        traversal_truncated: bool,
+        results_max_reached: Option<usize>,
+    ) -> Vec<ReadWarning> {
+        let mut warnings = self.warnings();
+        if traversal_truncated {
+            warnings.push(traversal_truncation_warning());
+        }
+        if let Some(results_max) = results_max_reached {
+            warnings.push(results_truncation_warning(results_max));
+        }
+        if scope != SearchScope::Project {
+            warnings.extend(dependency_warnings(dependencies, self.dependency_catalog()));
+        }
+        warnings
+    }
+
+    /// Compiles `selector` into the files the request reaches: no matcher when neither
+    /// `include` nor `exclude` is set, no force-include index when `force_include` is
+    /// empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] for an invalid glob, or a `force_include` matching more
+    /// files than `FORCE_INCLUDE_FILES_MAX`.
+    fn selected_paths(&self, selector: Option<&PathSelector>) -> Result<SelectedPaths, ReadError> {
+        let index = self.index();
+        let matcher = path_matcher(index.root(), selector)?;
+        let force_include = match selector {
+            Some(selector) if !selector.force_include.is_empty() => Some(
+                index
+                    .force_include_index(
+                        &pattern_strings(&selector.force_include),
+                        FORCE_INCLUDE_FILES_MAX,
+                    )
+                    .map_err(ReadFault::index)?,
+            ),
+            _ => None,
+        };
+        Ok(SelectedPaths {
+            matcher,
+            force_include,
+        })
+    }
+
+    /// The lexical passes one `query` runs, in merge order: the indexed declarations
+    /// and lines, the `force_include` files while the pool has room for them, the ranked
+    /// units, then the cataloged packages when `scope` reaches dependencies. Every pass
+    /// appends to `results` up to the index's `results_max` bound.
+    fn collect_query_hits(
+        &self,
+        criteria: SearchCriteria<'_>,
+        scope: SearchScope,
+        selected: &SelectedPaths,
+        ranked: &[RankedUnit],
+        dependencies: Option<&DependencyIndex>,
+        results: &mut Vec<SearchHit>,
+    ) -> Result<(), ReadError> {
+        let index = self.index();
+        let root = index.root();
+        let matcher = selected.matcher.as_ref();
+        let fetch_limit = index.results_max();
+        if scope != SearchScope::Dependencies {
+            collect_indexed_hits(index, matcher, root, criteria, fetch_limit, results)?;
+            if results.len() < fetch_limit
+                && let Some(extra) = selected.force_include.as_ref()
+            {
+                collect_force_include_hits(extra, criteria, fetch_limit, results)?;
+            }
+            collect_ranked_hits(index, matcher, root, criteria, ranked, results)?;
+        }
+        collect_dependency_hits(dependencies, criteria, fetch_limit, results)
     }
 
     /// Derives the lexical write one change set owes: the paths whose stored units go, and
@@ -242,6 +290,16 @@ struct SearchCriteria<'a> {
     payloads: HitPayloads,
 }
 
+/// The files one request's `paths` selector reaches, compiled before any hit is
+/// collected: the `include`/`exclude` matcher screening the indexed candidates, and the
+/// index over the `force_include` files the persistent index never held. Building that
+/// index enforces the `force_include` file bound on the request itself, whatever the
+/// query and however many hits the persistent index yields.
+struct SelectedPaths {
+    matcher: Option<PathMatcher>,
+    force_include: Option<WorkspaceIndex>,
+}
+
 pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
     validate_common(params.rev.is_some())?;
     if let Some(selector) = params.paths.as_ref() {
@@ -264,6 +322,19 @@ pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
     Ok(())
 }
 
+/// The lexical `query` the request carries, if any: refused when the request carries
+/// neither `query` nor `traversal`, and when the query is empty.
+fn accepted_query(params: &SearchParams) -> Result<Option<&str>, ReadError> {
+    let query = params.query.as_deref();
+    if query.is_none() && params.traversal.is_none() {
+        return Err(ReadFault::invalid("query", "missing"));
+    }
+    if query.is_some_and(str::is_empty) {
+        return Err(ReadFault::invalid("query", "empty"));
+    }
+    Ok(query)
+}
+
 /// Refuses `selector` when any `include`, `exclude`, or `force_include` pattern breaks
 /// [`PathPattern`]'s forward-slash-only contract, before it reaches a glob engine that would
 /// otherwise read a stray backslash as an escape.
@@ -282,8 +353,8 @@ fn validate_path_selector(selector: &PathSelector) -> Result<(), ReadError> {
 }
 
 /// Compiles `selector`'s `include`/`exclude` globs into one matcher, or none when neither list
-/// is set. `force_include` is handled separately by [`collect_force_include_hits`]: it reaches
-/// files the index never held, so it never narrows the indexed candidate set this matcher
+/// is set. `force_include` is compiled separately, into [`SelectedPaths`]: it reaches files
+/// the index never held, so it never narrows the indexed candidate set this matcher
 /// screens.
 fn path_matcher(
     root: &Path,
@@ -384,34 +455,27 @@ fn collect_indexed_content_hits(
     Ok(())
 }
 
-/// Reaches request-selected files outside persistent index.
+/// Hits from `extra` - the index [`SelectedPaths`] built over the request's
+/// `force_include` files - appended to `results` up to `fetch_limit`. The file bound was
+/// checked when that index was built, on the request rather than on the hits: this pass
+/// runs only while the pool has room, so a check here would depend on the query.
 fn collect_force_include_hits(
-    index: &WorkspaceIndex,
-    selector: &PathSelector,
+    extra: &WorkspaceIndex,
     criteria: SearchCriteria<'_>,
     fetch_limit: usize,
     results: &mut Vec<SearchHit>,
 ) -> Result<(), ReadError> {
-    if selector.force_include.is_empty() {
-        return Ok(());
-    }
     let SearchCriteria {
         query,
         target,
         payloads,
     } = criteria;
-    let extra = index
-        .force_include_index(
-            &pattern_strings(&selector.force_include),
-            FORCE_INCLUDE_FILES_MAX,
-        )
-        .map_err(ReadFault::index)?;
     if matches!(target, SearchParamsTarget::All | SearchParamsTarget::Symbol) {
         for matched in extra
             .symbols(query, fetch_limit - results.len())
             .map_err(ReadFault::index)?
         {
-            results.push(symbol_search_hit(&extra, matched, payloads)?);
+            results.push(symbol_search_hit(extra, matched, payloads)?);
         }
     }
     if results.len() < fetch_limit
@@ -852,6 +916,21 @@ fn ranked_file_hit(
     }
 }
 
+/// Orders the whole pool, then cuts it to `results_max`, answering that bound when the
+/// pool reached it. Every collector stops at `results_max`, so a pool of exactly that
+/// many hits counts as reached: the answer warns that the bound was met, whether or not
+/// a hit past it existed.
+fn order_and_bound_hits(
+    results: &mut Vec<SearchHit>,
+    order: ResultOrder,
+    results_max: usize,
+) -> Option<usize> {
+    order_hits(results, order);
+    let reached = results.len() >= results_max;
+    results.truncate(results_max);
+    reached.then_some(results_max)
+}
+
 /// Sorts merged hits by the request's `order`, every order ending in a hit's own stable wire
 /// identity so the result does not depend on the arrival order of lexical matches, which
 /// carries no guaranteed order of its own, and so two results that tie never swap places
@@ -901,8 +980,7 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
 
-    use rift_core::SourceVisibility;
-    use rift_core::constants::READ_RESULTS_MAX_DEFAULT;
+    use rift_core::{Fault as _, SourceVisibility};
     use rift_index::{LexicalIndexLimits, LexicalUnitKind, WorkspaceIndexLimits};
     use rift_protocol::configuration::HistoryConfiguration;
     use rift_protocol::read::{
@@ -1409,20 +1487,60 @@ pub fn compute() -> i32 {
     }
 
     /// Collection is bounded by `results_max` whatever the page size, so a `limit` above
-    /// that bound simply serves the whole bounded result set as one page.
+    /// that bound serves the whole bounded result set as one page, and the answer warns
+    /// `results_truncated` naming the bound.
     #[test]
     fn search_limit_above_the_result_bound_serves_the_whole_set_on_one_page() -> TestResult {
-        let (_directory, service) = fixture()?;
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("src"))?;
+        fs::write(
+            directory.path().join("src/lib.rs"),
+            "// Beacon marker\npub fn foo() {}\n",
+        )?;
+        fs::write(directory.path().join("README.txt"), "Beacon docs\n")?;
+        fs::write(directory.path().join("notes.txt"), "Beacon notes\n")?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::new(10, 4_096, 8_192, 8, 1)?,
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
         let params: SearchParams = serde_json::from_value(json!({
             "query": "Beacon",
             "target": "file",
-            "limit": READ_RESULTS_MAX_DEFAULT as u64 + 1
+            "limit": 2
         }))?;
         let value = serde_json::to_value(service.search(&params, &[])?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
-        assert!(!results.is_empty());
-        assert_eq!(value["pagination"]["page_index"], json!(0));
-        assert_eq!(value["pagination"]["total_pages"], json!(1));
+        assert_eq!(results.len(), 1, "{results:#?}");
+        assert_eq!(
+            value["pagination"],
+            json!({ "page_index": 0, "total_pages": 1 })
+        );
+        assert!(
+            value["warnings"].as_array().is_some_and(|warnings| {
+                warnings.contains(&json!({ "code": "results_truncated", "results_max": 1 }))
+            }),
+            "{value:#}"
+        );
+        Ok(())
+    }
+
+    /// A result set under `results_max` carries no `results_truncated` warning.
+    #[test]
+    fn search_under_the_result_bound_carries_no_results_truncated_warning() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({ "query": "Beacon" }))?;
+        let result = service.search(&params, &[])?;
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::ResultsTruncated { .. })),
+            "{:?}",
+            result.warnings
+        );
         Ok(())
     }
 
@@ -2043,6 +2161,8 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
+    /// A `force_include` past its file bound refuses through the index fault, whose
+    /// evidence names the field, the bound, and the match count.
     #[test]
     fn search_force_include_bound_breach_refuses() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -2065,13 +2185,58 @@ pub fn compute() -> i32 {
             "query": "extra",
             "paths": {"force_include": ["extra_*.rs"]}
         }))?;
-        assert!(matches!(
-            service
-                .search(&params, &[])
-                .expect_err("a force_include match count above the bound must refuse")
-                .fault(),
-            ReadFault::Index(_)
-        ));
+        let error = service
+            .search(&params, &[])
+            .expect_err("a force_include match count above the bound must refuse");
+        assert!(matches!(error.fault(), ReadFault::Index(_)));
+        assert_eq!(
+            error.fault().limit_evidence().map(|evidence| (
+                evidence.field,
+                evidence.limit,
+                evidence.required
+            )),
+            Some((
+                "paths.force_include".to_owned(),
+                super::FORCE_INCLUDE_FILES_MAX as u64,
+                super::FORCE_INCLUDE_FILES_MAX as u64 + 1
+            )),
+            "the refusal carries the bound and the match count"
+        );
+        Ok(())
+    }
+
+    /// A `force_include` within its bound is built even when the persistent index alone
+    /// fills `results_max`: the request still answers, and its warnings are the ones the
+    /// same query carries without the selector.
+    #[test]
+    fn search_force_include_within_bound_beside_a_full_index_still_answers() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join(".gitignore"), "gitignored.rs\n")?;
+        fs::write(
+            directory.path().join("visible.rs"),
+            "pub fn visible_symbol() {}\n",
+        )?;
+        fs::write(
+            directory.path().join("gitignored.rs"),
+            "pub fn phantom_gitignored() {}\n",
+        )?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::new(10, 4_096, 8_192, 8, 1)?,
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let plain: SearchParams = serde_json::from_value(json!({ "query": "visible" }))?;
+        let reaching: SearchParams = serde_json::from_value(json!({
+            "query": "visible",
+            "paths": {"force_include": ["gitignored.rs"]}
+        }))?;
+        let without = service.search(&plain, &[])?;
+        let with = service.search(&reaching, &[])?;
+        assert_eq!(with.results.len(), 1, "{:#?}", with.results);
+        assert_eq!(with.results[0].path, without.results[0].path);
+        assert_eq!(with.warnings, without.warnings);
         Ok(())
     }
 
@@ -2457,6 +2622,7 @@ pub fn compute() -> i32 {
         else {
             return Err("the store must hold the revision it was just stamped with".into());
         };
+        let ranked = ranked.into_units();
         assert!(!ranked.is_empty(), "the fixture query must rank something");
         Ok(ranked)
     }

@@ -37,17 +37,20 @@ Callers read code through these tools:
 | [`search`](#tool-search) | ranked files and symbols across the workspace tree |
 | [`nodes`](#tool-nodes) | the syntax nodes covering one position, with witnessed addresses |
 
+The index never follows or indexes a symlink, so no read returns one; the file a link points
+at answers under its own path.
+
 `get_symbol` and `search` page by `page_index`. The request names the zero-based page under its
-`limit`, and the result's `pagination` carries the served `page_index` and the true
-`total_pages`. The server retains no capture between pages: each page is computed from the
-request, and a `page_index` past the last page returns an empty page whose `pagination` still
-carries the true `total_pages`.
+`limit`, at most 10,000, and the result's `pagination` carries the served `page_index` and the
+true `total_pages`; a larger `limit` is refused as `invalid_request` naming the field. The server
+retains no capture between pages: each page is computed from the request, and a `page_index` past
+the last page returns an empty page whose `pagination` still carries the true `total_pages`.
 
 Every read result also carries `warnings`. A `stale_index` warning reports an answer computed
 from an index that lags the tree the read captured, and names the two tree revision digests that
 disagree.
 
-Three more warnings cover the search ranking tiers:
+The search ranking tiers carry their own warnings:
 
 - `semantic_index_preparing` - the semantic ranking is still being built. A query sharing no
   token with the code it describes reaches nothing until every declaration carries a vector;
@@ -59,6 +62,13 @@ Three more warnings cover the search ranking tiers:
   tier is read under the answer's own tree revision, so one holding another tree is recaptured
   rather than warned about, a case a caller cannot otherwise tell apart from a tier that
   searched and found nothing.
+- `lexical_ranking_truncated` - the lexical ranking stopped at `matches_max` units, and hits
+  past that bound never reach a page, whatever `paths` selects. `total_pages` counts the units
+  that did; a narrower `query` brings the rest inside the bound.
+- `results_truncated` - the result set reached `results_max` hits, the server's result bound,
+  before ordering and paging, so hits past it never reach a page and `total_pages` counts only
+  what fit. The warning means the bound was reached: a set of exactly `results_max` hits carries
+  it too. A narrower `query` or `paths` brings the set inside the bound.
 
 A `symbol_disagreement` warning names a symbol whose selected presentation and at least one
 provider's own facts disagree.
@@ -138,10 +148,12 @@ defaults to `["source"]`; an explicit empty list carries neither.
 `include: ["history"]` attaches the symbol's version-control timeline as a
 [`SymbolHistory`](/docs/protocol/reference#SymbolHistory). The server follows first parents
 from the served revision along the declaration's current path, bounded by the `max_revisions`
-key in [`[providers.history]`](/docs/configuration#providers), and classifies what each
-touching revision did: `introduced`, `body_changed`, `signature_changed`, `removed`, or
-`decorators_changed`. A revision whose source cannot be parsed, or where the symbol is absent,
-contributes no version.
+key in [`[providers.history]`](/docs/configuration#providers) and by a shallow clone's
+boundary, and classifies what each touching revision did: `introduced`, `body_changed`,
+`signature_changed`, `removed`, or `decorators_changed`. A revision whose source cannot be
+parsed, or where the symbol is absent, contributes no version. `complete` says whether the
+walk reached the repository's first commit; `false` means one of those bounds ended it first,
+so revisions older than the listed ones may have touched the symbol.
 
 ### Dependency scope [#get_symbol-scope]
 
@@ -211,8 +223,10 @@ scoring.
 
 `paths.force_include` reaches past both: a file `[source]` or `.gitignore` excluded from the
 index is parsed on demand and searched alongside the indexed hits, up to 256 matched files per
-request. A request whose `paths.force_include` matches more than that refuses with
-`limit_exceeded` rather than searching a silently truncated set.
+request - the bound counts the files the request reaches outside the index, so a glob whose
+matches the index already holds adds none. A request whose `paths.force_include` matches more
+than that refuses with `limit_exceeded` rather than searching a silently truncated set; the
+`limit` evidence names `paths.force_include`, the bound, and the match count.
 
 The top-level `include` field is a separate selector: it requests extra payload per hit instead
 of narrowing which files are searched. `source` attaches the excerpt around the hit; `score`
@@ -241,6 +255,14 @@ This request narrows the search to the tests tree, then reaches one file the wor
 `query` matches declaration names, file contents, and declaration sources through a full-text
 index. A multi-word query matches a unit that carries any one of its terms anywhere in its
 content, and a unit carrying more of the query's terms ranks above one carrying fewer.
+
+The index ranks at most 1,000 units for one request. When more units match, the answer
+carries a `lexical_ranking_truncated` warning naming that bound, and hits past it never reach
+a page: `paths` selects among the ranked units, so only a narrower `query` brings the rest
+inside the bound.
+
+The result set has its own bound of 1,000 hits, applied before ordering and paging: an answer
+whose set reached it warns `results_truncated`.
 
 A symbol whose only match sits in its declaration, not its name, still returns as a `symbol`
 hit. The ranked lane placed it, so the hit is tagged `matched_by: ["ranked"]`, not

@@ -115,6 +115,47 @@ impl RankedUnit {
     }
 }
 
+/// Both tiers' fused ranking, and the bound the lexical tier stopped at when its store
+/// held a match past it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FusedRanking {
+    units: Vec<RankedUnit>,
+    lexical_truncated_at: Option<u32>,
+}
+
+impl FusedRanking {
+    /// Constructs one fused ranking directly. Production code only ever builds these from
+    /// a live [`SearchIndex::search`]; this constructor exists for callers that consume a
+    /// ranking they already hold - most notably tests exercising that consumption without
+    /// a live database.
+    #[must_use]
+    pub const fn new(units: Vec<RankedUnit>, lexical_truncated_at: Option<u32>) -> Self {
+        Self {
+            units,
+            lexical_truncated_at,
+        }
+    }
+
+    /// The fused units, best first.
+    #[must_use]
+    pub fn units(&self) -> &[RankedUnit] {
+        &self.units
+    }
+
+    /// The fused units, best first, owned.
+    #[must_use]
+    pub fn into_units(self) -> Vec<RankedUnit> {
+        self.units
+    }
+
+    /// The bound the lexical tier stopped at while its store held a match past it, or
+    /// `None` when it ranked every match.
+    #[must_use]
+    pub const fn lexical_truncated_at(&self) -> Option<u32> {
+        self.lexical_truncated_at
+    }
+}
+
 /// What one [`SearchIndex`] may spend, and how it weighs its two tiers.
 ///
 /// This is the search tier's own type. The layer that reads the workspace
@@ -639,7 +680,8 @@ impl SearchIndex {
     /// says it answers and a pass has published a corpus to scan.
     /// Both rankings go to [`fuse`]: a tier that returned nothing contributes
     /// no ranking, and one ranking fused alone is still the fused score, so
-    /// two queries' scores mean the same thing.
+    /// two queries' scores mean the same thing. The fused ranking carries the
+    /// bound the lexical tier stopped at, when its store held a match past it.
     ///
     /// An empty query returns nothing. The lexical tier has no term to match,
     /// and the semantic tier would rank the retrieval prefix alone.
@@ -658,28 +700,31 @@ impl SearchIndex {
         tree_revision: &str,
         query: &str,
         limit: u32,
-    ) -> Result<RevisionScoped<Vec<RankedUnit>>, SearchError> {
+    ) -> Result<RevisionScoped<FusedRanking>, SearchError> {
         let lexical = match self
             .lexical
             .search(tree_revision, query, limit)
             .await
             .map_err(store_failed)?
         {
-            RevisionScoped::Matched(matches) => matches,
+            RevisionScoped::Matched(ranking) => ranking,
             RevisionScoped::OtherRevision(stored) => {
                 return Ok(RevisionScoped::OtherRevision(stored));
             }
             RevisionScoped::NoRevision => return Ok(RevisionScoped::NoRevision),
         };
         if query.trim().is_empty() {
-            return Ok(RevisionScoped::Matched(Vec::new()));
+            return Ok(RevisionScoped::Matched(FusedRanking {
+                units: Vec::new(),
+                lexical_truncated_at: None,
+            }));
         }
         let semantic = self.semantic(query, tree_revision).await?;
-        let fused = self.fused(&lexical, &semantic, limit)?;
-        Ok(RevisionScoped::Matched(ranked(
-            &fused,
-            &directory(&lexical, &semantic),
-        )))
+        let fused = self.fused(lexical.matches(), &semantic, limit)?;
+        Ok(RevisionScoped::Matched(FusedRanking {
+            units: ranked(&fused, &directory(lexical.matches(), &semantic)),
+            lexical_truncated_at: lexical.truncated_at(),
+        }))
     }
 
     /// What the semantic tier can answer right now.
