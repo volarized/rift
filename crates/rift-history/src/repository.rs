@@ -1182,6 +1182,96 @@ mod tests {
         );
     }
 
+    /// Three commits touching lib.rs, with `.git/shallow` naming the second
+    /// the way `git clone --depth` records the boundary; returns the first
+    /// commit's id, the one past that boundary.
+    fn shallow_fixture() -> (tempfile::TempDir, String) {
+        let directory = repository_fixture();
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn beacon() -> u8 { 7 }\n",
+        )
+        .expect("source");
+        commit_all(directory.path(), "widen beacon");
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn beacon() -> u8 { 9 }\n",
+        )
+        .expect("source");
+        commit_all(directory.path(), "raise beacon");
+        let repository = Repository::open(directory.path()).expect("repository");
+        let second = repository.resolve("HEAD~1").expect("second commit");
+        let first = repository.resolve("HEAD~2").expect("first commit");
+        fs::write(
+            directory.path().join(".git/shallow"),
+            format!("{}\n", second.commit_id()),
+        )
+        .expect("shallow file");
+        (directory, first.commit_id())
+    }
+
+    /// The loose object file holding `commit_id`.
+    fn loose_object(root: &Path, commit_id: &str) -> PathBuf {
+        root.join(".git/objects")
+            .join(&commit_id[..2])
+            .join(&commit_id[2..])
+    }
+
+    #[test]
+    fn test_path_revisions_ends_incomplete_at_the_shallow_boundary() {
+        let (directory, _first) = shallow_fixture();
+        let repository = Repository::open(directory.path()).expect("repository");
+        let head = repository.resolve("HEAD").expect("head resolves");
+        let history = repository
+            .path_revisions(&head, "lib.rs", 100)
+            .expect("walk");
+        let summaries: Vec<Option<&str>> = history
+            .revisions()
+            .iter()
+            .map(PathRevision::summary)
+            .collect();
+        assert_eq!(
+            summaries,
+            [Some("raise beacon"), Some("widen beacon")],
+            "the commit the shallow file names is the last one examined"
+        );
+        assert!(
+            !history.is_complete(),
+            "a shallow boundary is not the path's first commit"
+        );
+    }
+
+    #[test]
+    fn test_path_revisions_never_reads_past_the_shallow_boundary() {
+        let (directory, first) = shallow_fixture();
+        fs::remove_file(loose_object(directory.path(), &first))
+            .expect("the first commit's object is a loose file");
+        let repository = Repository::open(directory.path()).expect("repository");
+        let head = repository.resolve("HEAD").expect("head resolves");
+        let history = repository
+            .path_revisions(&head, "lib.rs", 100)
+            .expect("the walk never asks for the boundary's parent");
+        assert_eq!(history.revisions().len(), 2);
+        assert!(!history.is_complete());
+    }
+
+    #[test]
+    fn test_path_revisions_refuses_a_missing_parent_outside_the_shallow_set() {
+        let (directory, first) = shallow_fixture();
+        fs::remove_file(directory.path().join(".git/shallow")).expect("shallow file");
+        fs::remove_file(loose_object(directory.path(), &first))
+            .expect("the first commit's object is a loose file");
+        let repository = Repository::open(directory.path()).expect("repository");
+        let head = repository.resolve("HEAD").expect("head resolves");
+        let error = repository
+            .path_revisions(&head, "lib.rs", 100)
+            .expect_err("a parent absent without a shallow boundary is a storage failure");
+        let HistoryFault::Storage { operation, .. } = error.fault() else {
+            panic!("expected Storage, got {:?}", error.fault());
+        };
+        assert_eq!(*operation, "read commit");
+    }
+
     #[test]
     fn test_tree_files_refuses_a_non_utf8_committed_path() {
         let directory = repository_fixture();
