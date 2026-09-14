@@ -31,7 +31,7 @@ pub use diagnose::{
 pub use engine::{EnginePool, EngineSlot, LspProcessKey};
 pub use hook::{HookRun, HookStatus, hook_matches_paths, run_hook, selected_hooks};
 pub use move_file::{MovePlan, MoveResolution, plan_move};
-pub use read::{ReadError, ReadFault, ReadService};
+pub use read::{DependencyStore, ReadError, ReadFault, ReadService};
 pub use remove::{
     REMOVE_REFERENCES_MAX, RemovePlan, RemoveResolution, plan_remove_node, plan_remove_symbol,
 };

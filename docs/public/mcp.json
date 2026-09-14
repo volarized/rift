@@ -2,7 +2,7 @@
   "description": "Tools served by the Rift MCP server, with the JSON Schemas derived from the Rust wire models.",
   "tools": [
     {
-      "description": "Finds declarations and their source by exact symbol name. Each hit\ncarries the declaration and its source excerpt unless `include` omits\n`source`. `include: [\"history\"]` adds each hit's version-control timeline,\nwalked from the served revision. `rev` serves the lookup from a\nversion-control revision instead of the current tree. Use `search` when\nthe name is not exactly known.",
+      "description": "Finds declarations and their source by exact symbol name. Each hit\ncarries the declaration and its source excerpt unless `include` omits\n`source`. `include: [\"history\"]` adds each hit's version-control timeline,\nwalked from the served revision. `rev` serves the lookup from a\nversion-control revision instead of the current tree. `scope` reaches\npast the project tree: `dependencies` answers from the public\ndeclarations of the cataloged packages alone, `all` from both, project\nhits first. Use `search` when the name is not exactly known.",
       "input_schema": {
         "$defs": {
           "GetSymbolInclude": {
@@ -36,6 +36,26 @@
             ],
             "pattern": "^[A-Za-z0-9._/-]{1,128}$",
             "type": "string"
+          },
+          "SearchScope": {
+            "description": "Which declarations a `get_symbol` lookup searches.",
+            "oneOf": [
+              {
+                "const": "project",
+                "description": "The project tree the server serves.",
+                "type": "string"
+              },
+              {
+                "const": "dependencies",
+                "description": "The packages the dependency resolvers cataloged, answered from their public\ndeclarations alone.",
+                "type": "string"
+              },
+              {
+                "const": "all",
+                "description": "Both: hits merge by rank; at equal rank a project hit orders before a dependency\nhit.",
+                "type": "string"
+              }
+            ]
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -55,6 +75,11 @@
             "limit": 10,
             "name": "Deserialize",
             "page_index": 1
+          },
+          {
+            "limit": 5,
+            "name": "spawn",
+            "scope": "all"
           }
         ],
         "properties": {
@@ -110,6 +135,11 @@
               }
             ],
             "description": "The version-control revision to read - a branch, tag, or commit id as the\nworkspace's version control spells it. Omitted reads the current tree. The server\nrefuses a revision read when the workspace has no version-control repository."
+          },
+          "scope": {
+            "$ref": "#/$defs/SearchScope",
+            "default": "project",
+            "description": "Which declarations the lookup searches: the project tree, the cataloged\ndependency packages, or both. Omitted, `project`. The server refuses a scope\nbeyond `project` together with `rev`, since dependencies are served for the\ncurrent tree alone."
           }
         },
         "required": [
@@ -638,6 +668,78 @@
                   "code",
                   "visited",
                   "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "Cataloged packages with a source root are still being indexed, so a `dependencies`\nor `all` answer holds their declarations only once the index reaches them. The\nanswer is served from the packages indexed so far. Rides only an answer whose\n`scope` reaches dependencies.",
+                "properties": {
+                  "code": {
+                    "const": "dependency_index_pending",
+                    "type": "string"
+                  },
+                  "pending": {
+                    "description": "Packages cataloged with a source root and not yet indexed.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "pending"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The dependency index refused one cataloged package, so none of its declarations\nanswers. Rides only an answer whose `scope` reaches dependencies; at most\n`DEPENDENCY_WARNINGS_MAX` of this warning and `dependency_resolver_degraded`\ntogether ride one answer, this one first, in package identity order.",
+                "properties": {
+                  "code": {
+                    "const": "dependency_package_skipped",
+                    "type": "string"
+                  },
+                  "package": {
+                    "$ref": "#/$defs/PackageIdentity",
+                    "description": "The package the index refused."
+                  },
+                  "reason": {
+                    "description": "Why the index refused it - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "package",
+                  "reason"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "One dependency resolver answered less than its toolchain would have, so the\ncatalog may miss packages. Rides only an answer whose `scope` reaches\ndependencies; at most `DEPENDENCY_WARNINGS_MAX` of this warning and\n`dependency_package_skipped` together ride one answer, this one after every\nskipped package, in resolver order.",
+                "properties": {
+                  "code": {
+                    "const": "dependency_resolver_degraded",
+                    "type": "string"
+                  },
+                  "reason": {
+                    "description": "What the resolver could not do - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "resolver": {
+                    "description": "The resolver that degraded, by its manager name: `cargo`, `uv`, `npm`, or `bun`.",
+                    "maxLength": 128,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "resolver",
+                  "reason"
                 ],
                 "type": "object"
               }
@@ -4839,6 +4941,33 @@
             ],
             "type": "object"
           },
+          "PackageIdentity": {
+            "additionalProperties": false,
+            "description": "One package as its package manager identifies it.",
+            "properties": {
+              "manager": {
+                "description": "Package manager or ecosystem name.",
+                "maxLength": 128,
+                "type": "string"
+              },
+              "name": {
+                "description": "Package name in that ecosystem.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "version": {
+                "description": "Resolved package version.",
+                "maxLength": 4096,
+                "type": "string"
+              }
+            },
+            "required": [
+              "manager",
+              "name",
+              "version"
+            ],
+            "type": "object"
+          },
           "ReadWarning": {
             "description": "One warning attached to a read result. The answer stands; the warning carries evidence\nof a condition the caller weighs before relying on it.",
             "oneOf": [
@@ -5034,6 +5163,78 @@
                   "code",
                   "visited",
                   "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "Cataloged packages with a source root are still being indexed, so a `dependencies`\nor `all` answer holds their declarations only once the index reaches them. The\nanswer is served from the packages indexed so far. Rides only an answer whose\n`scope` reaches dependencies.",
+                "properties": {
+                  "code": {
+                    "const": "dependency_index_pending",
+                    "type": "string"
+                  },
+                  "pending": {
+                    "description": "Packages cataloged with a source root and not yet indexed.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "pending"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The dependency index refused one cataloged package, so none of its declarations\nanswers. Rides only an answer whose `scope` reaches dependencies; at most\n`DEPENDENCY_WARNINGS_MAX` of this warning and `dependency_resolver_degraded`\ntogether ride one answer, this one first, in package identity order.",
+                "properties": {
+                  "code": {
+                    "const": "dependency_package_skipped",
+                    "type": "string"
+                  },
+                  "package": {
+                    "$ref": "#/$defs/PackageIdentity",
+                    "description": "The package the index refused."
+                  },
+                  "reason": {
+                    "description": "Why the index refused it - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "package",
+                  "reason"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "One dependency resolver answered less than its toolchain would have, so the\ncatalog may miss packages. Rides only an answer whose `scope` reaches\ndependencies; at most `DEPENDENCY_WARNINGS_MAX` of this warning and\n`dependency_package_skipped` together ride one answer, this one after every\nskipped package, in resolver order.",
+                "properties": {
+                  "code": {
+                    "const": "dependency_resolver_degraded",
+                    "type": "string"
+                  },
+                  "reason": {
+                    "description": "What the resolver could not do - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "resolver": {
+                    "description": "The resolver that degraded, by its manager name: `cargo`, `uv`, `npm`, or `bun`.",
+                    "maxLength": 128,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "resolver",
+                  "reason"
                 ],
                 "type": "object"
               }
@@ -12027,6 +12228,78 @@
                   "code",
                   "visited",
                   "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "Cataloged packages with a source root are still being indexed, so a `dependencies`\nor `all` answer holds their declarations only once the index reaches them. The\nanswer is served from the packages indexed so far. Rides only an answer whose\n`scope` reaches dependencies.",
+                "properties": {
+                  "code": {
+                    "const": "dependency_index_pending",
+                    "type": "string"
+                  },
+                  "pending": {
+                    "description": "Packages cataloged with a source root and not yet indexed.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "pending"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The dependency index refused one cataloged package, so none of its declarations\nanswers. Rides only an answer whose `scope` reaches dependencies; at most\n`DEPENDENCY_WARNINGS_MAX` of this warning and `dependency_resolver_degraded`\ntogether ride one answer, this one first, in package identity order.",
+                "properties": {
+                  "code": {
+                    "const": "dependency_package_skipped",
+                    "type": "string"
+                  },
+                  "package": {
+                    "$ref": "#/$defs/PackageIdentity",
+                    "description": "The package the index refused."
+                  },
+                  "reason": {
+                    "description": "Why the index refused it - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "package",
+                  "reason"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "One dependency resolver answered less than its toolchain would have, so the\ncatalog may miss packages. Rides only an answer whose `scope` reaches\ndependencies; at most `DEPENDENCY_WARNINGS_MAX` of this warning and\n`dependency_package_skipped` together ride one answer, this one after every\nskipped package, in resolver order.",
+                "properties": {
+                  "code": {
+                    "const": "dependency_resolver_degraded",
+                    "type": "string"
+                  },
+                  "reason": {
+                    "description": "What the resolver could not do - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "resolver": {
+                    "description": "The resolver that degraded, by its manager name: `cargo`, `uv`, `npm`, or `bun`.",
+                    "maxLength": 128,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "resolver",
+                  "reason"
                 ],
                 "type": "object"
               }

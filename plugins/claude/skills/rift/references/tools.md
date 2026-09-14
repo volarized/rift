@@ -8,8 +8,10 @@ Finds declarations and their source by exact symbol name. Each hit
 carries the declaration and its source excerpt unless `include` omits
 `source`. `include: ["history"]` adds each hit's version-control timeline,
 walked from the served revision. `rev` serves the lookup from a
-version-control revision instead of the current tree. Use `search` when
-the name is not exactly known.
+version-control revision instead of the current tree. `scope` reaches
+past the project tree: `dependencies` answers from the public
+declarations of the cataloged packages alone, `all` from both, project
+hits first. Use `search` when the name is not exactly known.
 
 Parameters:
 
@@ -19,6 +21,7 @@ Parameters:
 - `name` (required) - The declaration name to look up - a name, not a full `SymbolId` or free-text query; `search` takes free text.
 - `page_index` - Zero-based page of the result set to serve, sized by `limit`.
 - `rev` - The version-control revision to read - a branch, tag, or commit id as the workspace's version control spells it.
+- `scope` - Which declarations the lookup searches: the project tree, the cataloged dependency packages, or both.
 
 ## insert_node
 

@@ -63,6 +63,21 @@ Three more warnings cover the search ranking tiers:
 A `symbol_disagreement` warning names a symbol whose selected presentation and at least one
 provider's own facts disagree.
 
+Three warnings ride a `get_symbol` answer whose `scope` reaches dependencies, and no other
+answer:
+
+- `dependency_index_pending` - `pending` cataloged packages with a source root are not yet
+  indexed. The answer is served from the packages indexed so far, and holds the rest's
+  declarations once the index reaches them.
+- `dependency_package_skipped` - the dependency index refused `package` for `reason`, so none
+  of its declarations answers.
+- `dependency_resolver_degraded` - `resolver` answered less than its toolchain would have, for
+  `reason`, so the catalog can miss packages.
+
+An answer carries at most eight `dependency_package_skipped` and
+`dependency_resolver_degraded` warnings together: the skipped packages first, in package
+identity order, then the degraded resolvers in resolver order.
+
 Every read carries an optional `rev`, and reads the workspace tree when it is absent.
 
 ### Revision-addressed reads [#revision-reads]
@@ -120,6 +135,63 @@ key in [`[providers.history]`](/docs/configuration#providers), and classifies wh
 touching revision did: `introduced`, `body_changed`, `signature_changed`, `removed`, or
 `decorators_changed`. A revision whose source cannot be parsed, or where the symbol is absent,
 contributes no version.
+
+### Dependency scope [#get_symbol-scope]
+
+<VersionBadge version="v0.0.32" languages={["Rust", "Python", "TypeScript"]} />
+
+`scope` selects which declarations the lookup searches. `project`, the default, searches the
+workspace tree. `dependencies` searches the public declarations of the packages the
+[dependency resolvers](/docs/architecture#source-discovery) cataloged with a source root, as
+the [dependency index](/docs/architecture#dependency-index) holds them. `all` searches both and
+lists a project hit before a dependency hit of equal rank.
+
+A dependency hit carries `unit` in place of `path`: the
+[`SourceUnitId`](/docs/protocol/reference#SourceUnitId) of the package file, spelled
+`rift://source/<manager>/<name>@<version>/<file>`. Its `symbol.origin` names the owning
+package. The hit carries no `node`, since a package is never an edit target, and no
+`history`.
+
+The server refuses `rev` together with a scope beyond `project` as `invalid_request`: the
+dependency index serves the current tree alone.
+
+This lookup reaches the `helper` crate a workspace's `Cargo.toml` names by path:
+
+**Request:**
+
+```json
+{ "name": "helper_beacon", "scope": "dependencies" }
+```
+
+**Response:**
+
+```json
+{
+  "hits": [
+    {
+      "symbol": {
+        "id": "rift://symbol/rust/cargo/helper@0.1.0/src/lib.rs/helper_beacon",
+        "language": "rust",
+        "name": "helper_beacon",
+        "kind": "function",
+        "facets": ["value", "callable", "public"],
+        "visibility": "pub",
+        "signatures": [{ "display": "pub fn helper_beacon()", "language": "rust" }],
+        "origin": {
+          "location": "dependency",
+          "package": { "manager": "cargo", "name": "helper", "version": "0.1.0" },
+          "source_kind": "authored"
+        }
+      },
+      "unit": "rift://source/cargo/helper@0.1.0/src/lib.rs",
+      "range": { "start": 0, "end": 25 },
+      "line": 1,
+      "source": "pub fn helper_beacon() {}"
+    }
+  ],
+  "pagination": { "page_index": 0, "total_pages": 1 }
+}
+```
 
 <McpTool name="search" />
 
