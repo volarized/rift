@@ -12,6 +12,7 @@ publish = false
 [workspace.dependencies]
 rift-binding = { path = "crates/rift-binding" }
 rift-core = { path = "crates/rift-core" }
+rift-dependency = { path = "crates/rift-dependency" }
 rift-history = { path = "crates/rift-history" }
 rift-index = { path = "crates/rift-index" }
 rift-lsp = { path = "crates/rift-lsp" }

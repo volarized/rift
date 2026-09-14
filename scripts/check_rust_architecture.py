@@ -30,6 +30,8 @@ EXPECTED_EDGES = {
     "rift-binding -> rift-core",
     "rift-binding -> rift-provider",
     "rift-core -> rift-protocol",
+    "rift-dependency -> rift-core",
+    "rift-dependency -> rift-protocol",
     "rift-history -> rift-core",
     "rift-index -> rift-binding",
     "rift-index -> rift-core",
