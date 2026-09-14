@@ -6,6 +6,9 @@
 //! parsing refuses any URI that is not a hostless `file:` URI naming a
 //! valid project path strictly under the root - escaped traversal decodes
 //! first and is then refused by the path rules.
+//! A URI under a cataloged package root addresses that package's file by
+//! dependency unit through [`EngineRoots`]; only a URI under no root
+//! refuses.
 
 use std::path::Path;
 use std::str::FromStr;
@@ -13,7 +16,8 @@ use std::str::FromStr;
 use lsp_types::Uri;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use rift_core::{
-    Error, ErrorCode, ErrorContext, ErrorName, Fault, PathError, ProjectPath, fault_label,
+    Error, ErrorCode, ErrorContext, ErrorName, Fault, PackageIdentity, PathError, ProjectPath,
+    SourceUnitId, SourceUnitIdError, fault_label,
 };
 use serde::Serialize;
 
@@ -73,6 +77,13 @@ pub enum UriFault {
         #[serde(skip)]
         source: PathError,
     },
+    /// The relative path under a package root mints no source unit. The refusal is
+    /// boxed so every other document fault stays small.
+    UnitRefused {
+        /// The unit identity's own refusal.
+        #[serde(skip)]
+        source: Box<SourceUnitIdError>,
+    },
 }
 
 impl Fault for UriFault {
@@ -96,6 +107,7 @@ impl Fault for UriFault {
             }
             Self::HostRefused { host } => context.push(ErrorContext::new("host", host.clone())),
             Self::PathRefused { source } => context.extend(source.context()),
+            Self::UnitRefused { source } => context.extend(source.context()),
             _ => {}
         }
         context
@@ -104,6 +116,7 @@ impl Fault for UriFault {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::PathRefused { source } => Some(source),
+            Self::UnitRefused { source } => Some(source.as_ref()),
             _ => None,
         }
     }
@@ -261,6 +274,131 @@ fn normalize_drive(decoded: &str) -> String {
     }
 }
 
+/// One cataloged package's source root; its files are addressed by dependency unit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackageRoot {
+    root: TreeRoot,
+    package: PackageIdentity,
+}
+
+impl PackageRoot {
+    /// Pairs a package's source root with the identity its units carry.
+    #[must_use]
+    pub const fn new(root: TreeRoot, package: PackageIdentity) -> Self {
+        Self { root, package }
+    }
+
+    /// The package's source root in forward-slash form.
+    #[must_use]
+    pub const fn root(&self) -> &TreeRoot {
+        &self.root
+    }
+
+    /// The package as its manager identifies it.
+    #[must_use]
+    pub const fn package(&self) -> &PackageIdentity {
+        &self.package
+    }
+}
+
+/// Every root an engine's URIs may fall under: the workspace tree, then cataloged package roots.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EngineRoots {
+    tree: TreeRoot,
+    packages: Vec<PackageRoot>,
+}
+
+impl EngineRoots {
+    /// Roots holding the workspace tree alone.
+    #[must_use]
+    pub const fn new(tree: TreeRoot) -> Self {
+        Self {
+            tree,
+            packages: Vec::new(),
+        }
+    }
+
+    /// Adds the cataloged package roots a URI may fall under.
+    #[must_use]
+    pub fn with_packages(mut self, packages: Vec<PackageRoot>) -> Self {
+        self.packages = packages;
+        self
+    }
+
+    /// The workspace tree root.
+    #[must_use]
+    pub const fn tree(&self) -> &TreeRoot {
+        &self.tree
+    }
+
+    /// How many package roots a URI may fall under.
+    #[must_use]
+    pub fn package_count(&self) -> usize {
+        self.packages.len()
+    }
+
+    /// Resolves one engine URI to the project path or package file it addresses.
+    ///
+    /// The tree is tried first, and a URI under it answers
+    /// [`EngineAddress::Project`]. Only [`UriFault::OutsideRoot`] moves on to
+    /// the package roots; every other fault - scheme, host, decoding, path
+    /// rules - is returned as is. Each package root is tried through its own
+    /// [`TreeRoot::project_path`], and the match with the longest root wins,
+    /// so a package root nested inside another's directory addresses its own
+    /// files. The matched relative path mints the unit through
+    /// [`SourceUnitId::for_package`]. The work is one pass over the package
+    /// roots, whose count is the catalog's own package bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UriError`] with [`UriFault::OutsideRoot`] for a URI under no
+    /// root, [`UriFault::UnitRefused`] when the matched path mints no unit,
+    /// and the tree's own fault for every other refusal.
+    pub fn address(&self, uri: &Uri) -> Result<EngineAddress, UriError> {
+        match self.tree.project_path(uri) {
+            Ok(path) => Ok(EngineAddress::Project(path)),
+            Err(error) if is_outside_root(&error) => self.package_address(uri),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The package file `uri` addresses; `OutsideRoot` when no package root holds it.
+    fn package_address(&self, uri: &Uri) -> Result<EngineAddress, UriError> {
+        let claimed = self
+            .packages
+            .iter()
+            .filter_map(|package| match package.root.project_path(uri) {
+                Err(error) if is_outside_root(&error) => None,
+                outcome => Some((package, outcome)),
+            })
+            .max_by_key(|(package, _)| package.root.slash_form.len());
+        let Some((package, relative)) = claimed else {
+            return Err(Error::new(UriFault::OutsideRoot));
+        };
+        SourceUnitId::for_package(&package.package, &relative?)
+            .map(EngineAddress::Package)
+            .map_err(|source| {
+                Error::new(UriFault::UnitRefused {
+                    source: Box::new(source),
+                })
+            })
+    }
+}
+
+/// One engine URI's target: a project path in the tree, or a cataloged package's file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EngineAddress {
+    /// A document below the workspace root.
+    Project(ProjectPath),
+    /// A file of a cataloged package, by its source unit.
+    Package(SourceUnitId),
+}
+
+/// Whether a refusal is the decoded path falling outside the tried root.
+fn is_outside_root(error: &UriError) -> bool {
+    matches!(error.fault(), UriFault::OutsideRoot)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,6 +409,25 @@ mod tests {
 
     fn path(value: &str) -> ProjectPath {
         ProjectPath::new(value).expect("fixture path is valid")
+    }
+
+    fn uri(text: &str) -> Uri {
+        parse_uri(text).expect("fixture uri parses")
+    }
+
+    fn package_root(slash_form: &str, name: &str, version: &str) -> PackageRoot {
+        PackageRoot::new(
+            root(slash_form),
+            PackageIdentity {
+                manager: "cargo".to_owned(),
+                name: name.to_owned(),
+                version: version.to_owned(),
+            },
+        )
+    }
+
+    fn unit(address: &str) -> SourceUnitId {
+        SourceUnitId::parse(address).expect("fixture unit is canonical")
     }
 
     #[test]
@@ -393,5 +550,141 @@ mod tests {
             .project_path(&parse_uri("file:///work/other/a.rs").expect("uri parses"))
             .expect_err("outside the root");
         assert!(std::error::Error::source(&outside).is_none());
+    }
+
+    #[test]
+    fn engine_roots_answer_the_tree_before_any_package_root() {
+        let roots = EngineRoots::new(root("/work/ws")).with_packages(vec![
+            package_root("/work/ws", "self", "0.0.0"),
+            package_root("/work/ws/vendor/helper", "helper", "0.1.0"),
+        ]);
+        assert_eq!(
+            roots.address(&uri("file:///work/ws/vendor/helper/src/lib.rs")),
+            Ok(EngineAddress::Project(path("vendor/helper/src/lib.rs")))
+        );
+        assert_eq!(
+            roots.address(&uri("file:///work/ws/src/lib.rs")),
+            Ok(EngineAddress::Project(path("src/lib.rs")))
+        );
+    }
+
+    #[test]
+    fn engine_roots_address_a_package_file_by_its_unit() {
+        let roots = EngineRoots::new(root("/work/ws")).with_packages(vec![package_root(
+            "/cache/helper-0.1.0",
+            "helper",
+            "0.1.0",
+        )]);
+        assert_eq!(
+            roots.address(&uri("file:///cache/helper-0.1.0/src/lib.rs")),
+            Ok(EngineAddress::Package(unit(
+                "rift://source/cargo/helper@0.1.0/src/lib.rs"
+            )))
+        );
+    }
+
+    #[test]
+    fn engine_roots_prefer_the_longest_package_root_whatever_the_catalog_order() {
+        let outer = package_root("/cache/outer", "outer", "1.0.0");
+        let inner = package_root("/cache/outer/vendor/inner", "inner", "2.0.0");
+        for packages in [
+            vec![outer.clone(), inner.clone()],
+            vec![inner.clone(), outer.clone()],
+        ] {
+            let roots = EngineRoots::new(root("/work/ws")).with_packages(packages);
+            assert_eq!(
+                roots.address(&uri("file:///cache/outer/vendor/inner/src/lib.rs")),
+                Ok(EngineAddress::Package(unit(
+                    "rift://source/cargo/inner@2.0.0/src/lib.rs"
+                )))
+            );
+            assert_eq!(
+                roots.address(&uri("file:///cache/outer/vendor/other.rs")),
+                Ok(EngineAddress::Package(unit(
+                    "rift://source/cargo/outer@1.0.0/vendor/other.rs"
+                )))
+            );
+        }
+    }
+
+    #[test]
+    fn engine_roots_refuse_a_uri_under_no_root_including_sibling_prefixes() {
+        let roots = EngineRoots::new(root("/work/ws")).with_packages(vec![package_root(
+            "/cache/helperx",
+            "helperx",
+            "0.1.0",
+        )]);
+        for outside in [
+            "file:///cache/helper/src/lib.rs",
+            "file:///work/other/src/lib.rs",
+            "file:///cache",
+        ] {
+            let error = roots.address(&uri(outside)).expect_err("under no root");
+            assert!(matches!(error.fault(), UriFault::OutsideRoot), "{outside}");
+            assert_eq!(error.name(), ErrorName::Wire(ErrorCode::PermissionDenied));
+        }
+    }
+
+    #[test]
+    fn engine_roots_pass_scheme_host_decoding_and_path_faults_through_unchanged() {
+        let roots = EngineRoots::new(root("/work/ws")).with_packages(vec![package_root(
+            "/cache/helper",
+            "helper",
+            "0.1.0",
+        )]);
+        let scheme = roots
+            .address(&uri("untitled:src/lib.rs"))
+            .expect_err("scheme refused");
+        assert!(matches!(
+            scheme.fault(),
+            UriFault::SchemeRefused { scheme } if scheme == "untitled"
+        ));
+        let host = roots
+            .address(&uri("file://build-host/cache/helper/src/lib.rs"))
+            .expect_err("host refused");
+        assert!(matches!(
+            host.fault(),
+            UriFault::HostRefused { host } if host == "build-host"
+        ));
+        let undecodable = roots
+            .address(&uri("file:///cache/helper/%FF.rs"))
+            .expect_err("not unicode");
+        assert!(matches!(undecodable.fault(), UriFault::PathNotDecodable));
+        let traversal = roots
+            .address(&uri("file:///cache/helper/%2E%2E/out.rs"))
+            .expect_err("traversal under a package root is refused by the path rules");
+        assert!(matches!(traversal.fault(), UriFault::PathRefused { .. }));
+    }
+
+    #[test]
+    fn engine_roots_count_their_package_roots() {
+        let tree = root("/work/ws");
+        let roots = EngineRoots::new(tree.clone());
+        assert_eq!(roots.package_count(), 0);
+        assert_eq!(roots.tree(), &tree);
+        let with_packages = roots.with_packages(vec![
+            package_root("/cache/a", "a", "1.0.0"),
+            package_root("/cache/b", "b", "1.0.0"),
+        ]);
+        assert_eq!(with_packages.package_count(), 2);
+        assert_eq!(with_packages.tree(), &tree);
+    }
+
+    #[test]
+    fn unit_refused_names_the_evidence_and_exposes_the_unit_source() {
+        let package = package_root("/cache/helper", "helper", "0.1.0\\beta");
+        assert_eq!(package.root(), &root("/cache/helper"));
+        assert_eq!(package.package().version, "0.1.0\\beta");
+        let roots = EngineRoots::new(root("/work/ws")).with_packages(vec![package]);
+        let error = roots
+            .address(&uri("file:///cache/helper/src/lib.rs"))
+            .expect_err("the version spells no source path");
+        assert!(matches!(error.fault(), UriFault::UnitRefused { .. }));
+        assert_eq!(error.name(), ErrorName::Wire(ErrorCode::UnsupportedPath));
+        let rendered = error.to_string();
+        assert!(rendered.contains("fault unit_refused"), "{rendered}");
+        assert!(rendered.contains("identity source_unit"), "{rendered}");
+        assert!(rendered.contains("violation backslash"), "{rendered}");
+        assert!(std::error::Error::source(&error).is_some());
     }
 }

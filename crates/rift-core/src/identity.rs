@@ -11,7 +11,10 @@ use crate::constants::{
     SOURCE_RESOLVER_PUNCTUATION, SOURCE_UNIT_ID_BYTES_MAX, SOURCE_UNIT_SAFE_PUNCTUATION,
     SOURCE_UNIT_SEPARATOR, SOURCE_UNIT_SEPARATOR_BYTES, SOURCE_UNIT_URI_PREFIX,
 };
-use crate::{Error, ErrorCode, ErrorContext, ErrorName, Fault, PathError, SourcePath};
+use crate::{
+    Error, ErrorCode, ErrorContext, ErrorName, Fault, PackageIdentity, PathError, ProjectPath,
+    SourcePath,
+};
 
 /// ASCII bytes percent-encoded inside one segment of a `rift://` identity.
 ///
@@ -294,6 +297,29 @@ impl SourceUnitId {
         Ok(identity)
     }
 
+    /// The unit of one file inside a cataloged package.
+    ///
+    /// The resolver is the package's manager and the key is `<name>@<version>/<path>`,
+    /// so the unit renders as `rift://source/cargo/helper@0.1.0/src/lib.rs`. The
+    /// dependency lane and the engine tier both mint a package file's unit here: one
+    /// file has one unit wherever it is addressed from.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SourceUnitIdError`] when the manager is no resolver identity, when
+    /// the key breaks the source path rules, or when the canonical URI exceeds the
+    /// protocol limit.
+    pub fn for_package(
+        package: &PackageIdentity,
+        path: &ProjectPath,
+    ) -> Result<Self, SourceUnitIdError> {
+        let resolver = SourceResolverId::new(package.manager.clone())
+            .map_err(|error| Error::new(SourceUnitIdFault::InvalidResolver(error)))?;
+        let key = SourcePath::new(format!("{}@{}/{path}", package.name, package.version))
+            .map_err(|error| Error::new(SourceUnitIdFault::InvalidKey(error)))?;
+        Self::new(resolver, key)
+    }
+
     /// Parses canonical `rift://source/` identity.
     ///
     /// # Errors
@@ -476,10 +502,10 @@ mod tests {
         SourceRevision, SourceUnitId, SourceUnitIdError, SourceUnitIdFault, SymbolId, TreeRevision,
         WorkspaceId, encode_path, symbol_identity,
     };
-    use crate::SourcePath;
     use crate::constants::{
         SOURCE_RESOLVER_ID_BYTES_MAX, SOURCE_UNIT_ID_BYTES_MAX, SOURCE_UNIT_URI_PREFIX,
     };
+    use crate::{PackageIdentity, PathViolation, ProjectPath, SourcePath};
 
     #[test]
     fn encode_path_keeps_the_rfc3986_path_set_literal_and_escapes_the_rest() {
@@ -870,5 +896,52 @@ mod tests {
         );
         assert_eq!(IndexRevision::new(4).map(IndexRevision::get), Ok(4));
         assert_eq!(ModelRevision::new(5).map(ModelRevision::get), Ok(5));
+    }
+
+    fn package(manager: &str, name: &str, version: &str) -> PackageIdentity {
+        PackageIdentity {
+            manager: manager.to_owned(),
+            name: name.to_owned(),
+            version: version.to_owned(),
+        }
+    }
+
+    #[test]
+    fn package_unit_spells_the_manager_resolver_and_the_name_at_version_key() {
+        let path = ProjectPath::new("src/lib.rs").expect("valid path");
+        let unit = SourceUnitId::for_package(&package("cargo", "helper", "0.1.0"), &path)
+            .expect("unit fits protocol bound");
+        assert_eq!(
+            unit.to_string(),
+            "rift://source/cargo/helper@0.1.0/src/lib.rs"
+        );
+        assert_eq!(unit.resolver().as_str(), "cargo");
+        assert_eq!(unit.key().as_str(), "helper@0.1.0/src/lib.rs");
+    }
+
+    #[test]
+    fn package_unit_refuses_a_manager_that_is_no_resolver_identity() {
+        let path = ProjectPath::new("src/lib.rs").expect("valid path");
+        let error = SourceUnitId::for_package(&package("Cargo", "helper", "0.1.0"), &path)
+            .expect_err("uppercase manager");
+        assert!(matches!(
+            error.fault(),
+            SourceUnitIdFault::InvalidResolver(inner)
+                if inner.fault().violation() == SourceResolverIdViolation::InvalidCharacter
+        ));
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn package_unit_refuses_a_version_that_breaks_the_source_path_rules() {
+        let path = ProjectPath::new("src/lib.rs").expect("valid path");
+        let error = SourceUnitId::for_package(&package("cargo", "helper", "0.1.0\\beta"), &path)
+            .expect_err("a backslash in the version");
+        assert!(matches!(
+            error.fault(),
+            SourceUnitIdFault::InvalidKey(inner)
+                if inner.fault().violation() == PathViolation::Backslash
+        ));
+        assert!(std::error::Error::source(&error).is_some());
     }
 }

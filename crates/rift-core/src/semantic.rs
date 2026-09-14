@@ -4,7 +4,8 @@ use std::collections::BTreeSet;
 
 pub use rift_protocol::read::{
     Documentation, DocumentationFormat, ExactKind, ExtensionKey, ExtensionValue, Extensions,
-    Language, NodeId, Signature, SourceKind, SourceLocation, SymbolFacet, TypeBinding,
+    Language, NodeId, PackageIdentity, Signature, SourceKind, SourceLocation, SymbolFacet,
+    TypeBinding,
 };
 use serde::Serialize;
 

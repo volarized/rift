@@ -784,6 +784,13 @@ The engine works against the workspace directory, because a language server take
 like `cargo test` and the linter before it. It reads the tree's bytes as the change tools write
 them, so its analysis tracks the rename as it lands.
 
+An engine resolves beyond the tree - rust-analyzer through the whole crate graph, tsserver
+through `node_modules` - so a proposal or a reference can land in a file the workspace does not
+own. The server maps such a location through the [source catalog](#source-discovery): a file
+under a cataloged package's source root is named by that package file's `SourceUnitId`, the unit
+the [dependency index](#dependency-index) serves it under. A reference there reaches the caller
+under that name, and an edit proposed there refuses, because dependency source is read-only.
+
 An engine can miss sites - a name built at runtime, an occurrence in a doc comment or a template
 no resolver parses. After the rewrites land, the server sweeps the changed tree for surviving
 word-boundary occurrences of the old name, and each finding rides the change summary as a warning

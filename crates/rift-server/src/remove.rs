@@ -10,18 +10,20 @@
 //! unless `force` overrides it too, because nothing tells that answer apart from the answer
 //! of an engine that has not read the file yet.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use lsp_types::Location;
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::line::{lines_inclusive, without_ending};
+use rift_dependency::DependencyCatalog;
 use rift_lsp::session::{EngineError, EngineFault, EngineReadiness, EngineSession};
-use rift_lsp::uri::TreeRoot;
+use rift_lsp::uri::{EngineAddress, EngineRoots};
 use rift_protocol::change::{
     ChangeResult, OperationPrecondition, OperationPreconditionKind, OperationPreconditionStatus,
     PreconditionAddress, PreconditionValue, RefusalReason, RemoveNodeParams, RemoveSymbolParams,
 };
-use rift_protocol::read::{Diagnostic, DiagnosticCode, Language, NodeId, Severity};
+use rift_protocol::read::{Diagnostic, DiagnosticCode, Language, NodeId, Severity, SourceUnitId};
 use rift_syntax::ByteRange;
 
 use crate::change::{
@@ -31,13 +33,14 @@ use crate::change::{
 use crate::engine::{EnginePool, EngineSlot};
 use crate::read::{ReadError, ReadFault, ReadService, digest_hex8, symbol_for_range};
 use crate::rename::{
-    NamePositions, PlanEnd, declaration_name_offset, failed_precondition, name_positions,
-    plan_diagnostic, workspace_tree_root,
+    NamePositions, PlanEnd, declaration_name_offset, engine_roots, failed_precondition,
+    name_positions, plan_diagnostic,
 };
 
-/// Most reference paths a removal's checked-reference finding names, deduplicated and
-/// sorted. A removal touching more references than this still refuses, or still applies
-/// under `force`; only the named path list stops at this bound.
+/// Most references a removal's checked-reference finding names across its project paths,
+/// its cataloged package units, and its URIs under no root, deduplicated and sorted. A
+/// removal touching more references than this still refuses, or still applies under
+/// `force`; only the named lists stop at this bound.
 pub const REMOVE_REFERENCES_MAX: usize = 64;
 
 /// One removal, checked against references and compiled into a single-file rewrite, not yet
@@ -146,7 +149,15 @@ async fn planned_remove_symbol(
         &addresses,
     )
     .await?;
-    concluded_plan(workspace_root, engines, target, addresses, params.force).await
+    concluded_plan(
+        workspace_root,
+        reads.dependency_catalog(),
+        engines,
+        target,
+        addresses,
+        params.force,
+    )
+    .await
 }
 
 async fn planned_remove_node(
@@ -166,7 +177,15 @@ async fn planned_remove_node(
         &addresses,
     )
     .await?;
-    concluded_plan(workspace_root, engines, target, addresses, params.force).await
+    concluded_plan(
+        workspace_root,
+        reads.dependency_catalog(),
+        engines,
+        target,
+        addresses,
+        params.force,
+    )
+    .await
 }
 
 /// Resolves the address to its declaration, keeping the shared refusal shapes for a missing
@@ -253,24 +272,27 @@ async fn verified_disk_source(
 /// Widens the removal span, checks references, and builds the plan the outcome carries.
 async fn concluded_plan(
     workspace_root: &Path,
+    catalog: &DependencyCatalog,
     engines: &EnginePool,
     target: RemovalTarget,
     addresses: Vec<PreconditionAddress>,
     force: bool,
 ) -> Result<RemovePlan, PlanEnd> {
     let widened = widened_removal_span(&target.indexed_source, target.remove_range);
-    let check = checked_references(workspace_root, engines, &target).await?;
+    let check = checked_references(workspace_root, catalog, engines, &target).await?;
     match check {
         ReferenceCheck::Clean => Ok(built_plan(target, widened, addresses, None)),
-        ReferenceCheck::Found { count, paths } if force => Ok(built_plan(
+        ReferenceCheck::Found { count, references } if force => Ok(built_plan(
             target,
             widened,
             addresses,
-            Some(forced_reference_diagnostic(count, &paths)),
+            Some(forced_reference_diagnostic(count, &references)),
         )),
-        ReferenceCheck::Found { count, paths } => {
-            Err(PlanEnd::Refused(reference_refusal(addresses, count, paths)))
-        }
+        ReferenceCheck::Found { count, references } => Err(PlanEnd::Refused(reference_refusal(
+            addresses,
+            count,
+            &references,
+        ))),
         ReferenceCheck::Unconfirmed { engine } if force => Ok(built_plan(
             target,
             widened,
@@ -333,8 +355,11 @@ enum ReferenceCheck {
     /// The engine answered and named nothing.
     Clean,
     /// The engine named at least one reference: `count` is the number the engine answered,
-    /// `paths` the deduplicated, bounded project paths it named.
-    Found { count: u64, paths: Vec<String> },
+    /// `references` the deduplicated, bounded names it gave them.
+    Found {
+        count: u64,
+        references: NamedReferences,
+    },
     /// The engine answered with no references while it had never confirmed its own
     /// readiness: nothing distinguishes that answer from the answer of an engine that has
     /// not read the file yet, so it is not proof the declaration is unreferenced.
@@ -389,6 +414,7 @@ impl NotChecked {
 /// not proven clean.
 async fn checked_references(
     workspace_root: &Path,
+    catalog: &DependencyCatalog,
     engines: &EnginePool,
     target: &RemovalTarget,
 ) -> Result<ReferenceCheck, PlanEnd> {
@@ -401,7 +427,7 @@ async fn checked_references(
         }));
     };
     let positions = name_positions(&target.indexed_source, name_offset)?;
-    let tree_root = workspace_tree_root(workspace_root)?;
+    let roots = engine_roots(workspace_root, catalog)?;
     let exchanged = engine_exchange(
         slot,
         &target.path,
@@ -412,7 +438,7 @@ async fn checked_references(
     .await;
     match exchanged {
         Ok((locations, readiness)) => Ok(reference_check_from_locations(
-            &tree_root,
+            &roots,
             &locations,
             readiness,
             slot.name(),
@@ -488,7 +514,7 @@ async fn references_on_session(
 /// or is still analyzing; an engine that has never announced any work at all gets
 /// [`ReferenceCheck::Unconfirmed`] instead.
 fn reference_check_from_locations(
-    tree_root: &TreeRoot,
+    roots: &EngineRoots,
     locations: &[Location],
     readiness: EngineReadiness,
     engine: &str,
@@ -502,37 +528,103 @@ fn reference_check_from_locations(
             ReferenceCheck::Clean
         };
     }
-    let mut paths = std::collections::BTreeSet::new();
-    for location in locations {
-        let spelling = tree_root.project_path(&location.uri).map_or_else(
-            |_| location.uri.as_str().to_owned(),
-            |path| path.as_str().to_owned(),
-        );
-        paths.insert(spelling);
-    }
     ReferenceCheck::Found {
         count: locations.len() as u64,
-        paths: paths.into_iter().take(REMOVE_REFERENCES_MAX).collect(),
+        references: NamedReferences::from_locations(roots, locations),
+    }
+}
+
+/// The references an engine named, spelled the way the result carries them: project paths
+/// under the tree, the `SourceUnitId` of each file in a cataloged package, and the raw URI
+/// of a location under no root. Each list is deduplicated and sorted, and the three are
+/// bounded together by [`REMOVE_REFERENCES_MAX`], paths first. The typed precondition
+/// carries the paths and the units; a URI under no root reaches the caller in the `force`
+/// warning alone, since the wire has no typed field for it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct NamedReferences {
+    paths: Vec<CoreProjectPath>,
+    units: Vec<rift_core::SourceUnitId>,
+    uris: Vec<String>,
+}
+
+impl NamedReferences {
+    /// Names every location through `roots`, then keeps the first
+    /// [`REMOVE_REFERENCES_MAX`] names across the three lists.
+    fn from_locations(roots: &EngineRoots, locations: &[Location]) -> Self {
+        let mut paths = BTreeSet::new();
+        let mut units = BTreeSet::new();
+        let mut uris = BTreeSet::new();
+        for location in locations {
+            match roots.address(&location.uri) {
+                Ok(EngineAddress::Project(path)) => {
+                    paths.insert(path);
+                }
+                Ok(EngineAddress::Package(unit)) => {
+                    units.insert(unit);
+                }
+                Err(_) => {
+                    uris.insert(location.uri.as_str().to_owned());
+                }
+            }
+        }
+        let paths: Vec<CoreProjectPath> = paths.into_iter().take(REMOVE_REFERENCES_MAX).collect();
+        let units: Vec<rift_core::SourceUnitId> = units
+            .into_iter()
+            .take(REMOVE_REFERENCES_MAX - paths.len())
+            .collect();
+        let uris = uris
+            .into_iter()
+            .take(REMOVE_REFERENCES_MAX - paths.len() - units.len())
+            .collect();
+        Self { paths, units, uris }
+    }
+
+    /// Every name on one list for the warning text: paths, then units, then URIs.
+    fn spellings(&self) -> Vec<String> {
+        self.wire_paths()
+            .into_iter()
+            .chain(self.units.iter().map(ToString::to_string))
+            .chain(self.uris.iter().cloned())
+            .collect()
+    }
+
+    /// The project paths as the wire precondition takes them.
+    fn wire_paths(&self) -> Vec<String> {
+        self.paths
+            .iter()
+            .map(|path| path.as_str().to_owned())
+            .collect()
+    }
+
+    /// The package units as the wire precondition carries them.
+    fn wire_units(&self) -> Vec<SourceUnitId> {
+        self.units
+            .iter()
+            .map(|unit| SourceUnitId(unit.to_string()))
+            .collect()
     }
 }
 
 /// The removal refuses: a standing reference is an unmet `no_references` condition, naming
-/// the engine's own count and the paths it named.
+/// the engine's own count, the project paths, and the cataloged package units it named.
 fn reference_refusal(
     addresses: Vec<PreconditionAddress>,
     count: u64,
-    paths: Vec<String>,
+    references: &NamedReferences,
 ) -> ChangeResult {
     ChangeResult::refused(
         RefusalReason::UnmetPrecondition,
-        vec![OperationPrecondition::new(
-            OperationPreconditionKind::NoReferences,
-            OperationPreconditionStatus::Failed,
-            addresses,
-            paths,
-            PreconditionValue::Count { value: 0 },
-            PreconditionValue::Count { value: count },
-        )],
+        vec![
+            OperationPrecondition::new(
+                OperationPreconditionKind::NoReferences,
+                OperationPreconditionStatus::Failed,
+                addresses,
+                references.wire_paths(),
+                PreconditionValue::Count { value: 0 },
+                PreconditionValue::Count { value: count },
+            )
+            .with_units(references.wire_units()),
+        ],
     )
 }
 
@@ -548,10 +640,10 @@ fn unchecked_diagnostic(reason: &NotChecked) -> Diagnostic {
 }
 
 /// The removal applies under `force` while references still stand: a warning naming them.
-fn forced_reference_diagnostic(count: u64, paths: &[String]) -> Diagnostic {
+fn forced_reference_diagnostic(count: u64, references: &NamedReferences) -> Diagnostic {
     let mut diagnostic = plan_diagnostic(format!(
         "the declaration was removed with {count} reference(s) still standing: {}",
-        paths.join(", ")
+        references.spellings().join(", ")
     ));
     diagnostic.severity = Severity::Warning;
     diagnostic.code = Some(DiagnosticCode::RemoveReference.code());
@@ -901,17 +993,30 @@ mod tests {
     }
 
     #[test]
-    fn forced_reference_diagnostic_carries_the_stable_code_and_paths() {
-        let diagnostic = forced_reference_diagnostic(2, &["caller.rs".to_owned()]);
+    fn forced_reference_diagnostic_carries_the_stable_code_and_every_name() {
+        let references = NamedReferences {
+            paths: vec![core_path("caller.rs")],
+            units: vec![core_unit(HELPER_UNIT)],
+            uris: vec!["file:///outside/other.rs".to_owned()],
+        };
+        let diagnostic = forced_reference_diagnostic(3, &references);
         assert_eq!(diagnostic.severity, Severity::Warning);
         assert_eq!(diagnostic.code.as_deref(), Some("rift.remove.reference"));
-        assert!(diagnostic.message.contains("caller.rs"));
-        assert!(diagnostic.message.contains('2'));
+        assert_eq!(
+            diagnostic.message,
+            "the declaration was removed with 3 reference(s) still standing: caller.rs, \
+             rift://source/cargo/helper@0.1.0/src/lib.rs, file:///outside/other.rs"
+        );
     }
 
     #[test]
-    fn reference_refusal_names_no_references_with_expected_and_observed_counts() {
-        let result = reference_refusal(Vec::new(), 3, vec!["caller.rs".to_owned()]);
+    fn reference_refusal_names_paths_units_and_counts_but_no_raw_uri() {
+        let references = NamedReferences {
+            paths: vec![core_path("caller.rs")],
+            units: vec![core_unit(HELPER_UNIT)],
+            uris: vec!["file:///outside/other.rs".to_owned()],
+        };
+        let result = reference_refusal(Vec::new(), 3, &references);
         let ChangeResult::Refused {
             reason,
             preconditions,
@@ -932,6 +1037,14 @@ mod tests {
         assert_eq!(
             preconditions[0].observed,
             PreconditionValue::Count { value: 3 }
+        );
+        assert_eq!(
+            preconditions[0].paths,
+            vec![rift_protocol::read::ProjectPath("caller.rs".to_owned())]
+        );
+        assert_eq!(
+            preconditions[0].units,
+            vec![SourceUnitId(HELPER_UNIT.to_owned())]
         );
     }
 
@@ -1363,31 +1476,81 @@ mod tests {
 
     #[test]
     fn reference_check_from_locations_falls_back_to_the_raw_uri_outside_the_tree_root() {
-        let tree_root = TreeRoot::new(Path::new("/workspace")).expect("root parses");
-        let outside = rift_lsp::uri::parse_uri("file:///outside/other.rs").expect("uri parses");
-        let expected = outside.as_str().to_owned();
-        let location = Location {
-            uri: outside,
-            range: lsp_types::Range::default(),
-        };
+        let outside = location("file:///outside/other.rs");
+        let expected = outside.uri.as_str().to_owned();
         let check = reference_check_from_locations(
-            &tree_root,
-            std::slice::from_ref(&location),
+            &roots(),
+            std::slice::from_ref(&outside),
             EngineReadiness::Ready,
             "fake",
         );
-        let ReferenceCheck::Found { count, paths } = check else {
+        let ReferenceCheck::Found { count, references } = check else {
             panic!("a located reference must be found");
         };
         assert_eq!(count, 1);
-        assert_eq!(paths, vec![expected]);
+        assert_eq!(
+            references,
+            NamedReferences {
+                paths: Vec::new(),
+                units: Vec::new(),
+                uris: vec![expected],
+            }
+        );
+    }
+
+    #[test]
+    fn reference_check_from_locations_spells_a_cataloged_package_reference_as_its_unit() {
+        let locations = [
+            location("file:///workspace/caller.rs"),
+            location("file:///cache/helper-0.1.0/src/lib.rs"),
+        ];
+        let check = reference_check_from_locations(
+            &roots_with_helper(),
+            &locations,
+            EngineReadiness::Ready,
+            "fake",
+        );
+        let ReferenceCheck::Found { count, references } = check else {
+            panic!("located references must be found");
+        };
+        assert_eq!(count, 2);
+        assert_eq!(
+            references,
+            NamedReferences {
+                paths: vec![core_path("caller.rs")],
+                units: vec![core_unit(HELPER_UNIT)],
+                uris: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn named_references_stop_at_the_bound_across_paths_then_units_then_uris() {
+        let mut locations: Vec<Location> = (0..REMOVE_REFERENCES_MAX)
+            .map(|index| location(&format!("file:///workspace/caller_{index:03}.rs")))
+            .collect();
+        locations.push(location("file:///cache/helper-0.1.0/src/lib.rs"));
+        locations.push(location("file:///outside/other.rs"));
+        let full = NamedReferences::from_locations(&roots_with_helper(), &locations);
+        assert_eq!(full.paths.len(), REMOVE_REFERENCES_MAX);
+        assert!(
+            full.units.is_empty() && full.uris.is_empty(),
+            "the bound is shared across the three lists, paths first: {full:?}"
+        );
+        let fewer = NamedReferences::from_locations(
+            &roots_with_helper(),
+            &locations[REMOVE_REFERENCES_MAX - 1..],
+        );
+        assert_eq!(
+            (fewer.paths.len(), fewer.units.len(), fewer.uris.len()),
+            (1, 1, 1)
+        );
     }
 
     #[test]
     fn an_empty_answer_from_an_unconfirmed_engine_is_not_read_as_clean() {
-        let tree_root = TreeRoot::new(Path::new("/workspace")).expect("root parses");
         let check =
-            reference_check_from_locations(&tree_root, &[], EngineReadiness::Unconfirmed, "fake");
+            reference_check_from_locations(&roots(), &[], EngineReadiness::Unconfirmed, "fake");
         assert!(
             matches!(check, ReferenceCheck::Unconfirmed { ref engine } if engine == "fake"),
             "an unconfirmed engine's empty answer must not read as clean"
@@ -1396,13 +1559,49 @@ mod tests {
 
     #[test]
     fn an_empty_answer_from_a_settled_engine_still_reads_as_clean() {
-        let tree_root = TreeRoot::new(Path::new("/workspace")).expect("root parses");
         for readiness in [EngineReadiness::Ready, EngineReadiness::Analyzing] {
-            let check = reference_check_from_locations(&tree_root, &[], readiness, "fake");
+            let check = reference_check_from_locations(&roots(), &[], readiness, "fake");
             assert!(
                 matches!(check, ReferenceCheck::Clean),
                 "readiness {readiness:?} must still read an empty answer as clean"
             );
+        }
+    }
+
+    /// The unit the helper's crate root is served under.
+    const HELPER_UNIT: &str = "rift://source/cargo/helper@0.1.0/src/lib.rs";
+
+    fn core_path(value: &str) -> CoreProjectPath {
+        CoreProjectPath::new(value).expect("fixture path is valid")
+    }
+
+    fn core_unit(value: &str) -> rift_core::SourceUnitId {
+        rift_core::SourceUnitId::parse(value).expect("fixture unit is canonical")
+    }
+
+    fn roots() -> EngineRoots {
+        EngineRoots::new(
+            rift_lsp::uri::TreeRoot::new(Path::new("/workspace")).expect("root parses"),
+        )
+    }
+
+    /// The tree root beside one cataloged package root at `/cache/helper-0.1.0`.
+    fn roots_with_helper() -> EngineRoots {
+        let helper = rift_lsp::uri::PackageRoot::new(
+            rift_lsp::uri::TreeRoot::new(Path::new("/cache/helper-0.1.0")).expect("root parses"),
+            rift_core::PackageIdentity {
+                manager: "cargo".to_owned(),
+                name: "helper".to_owned(),
+                version: "0.1.0".to_owned(),
+            },
+        );
+        roots().with_packages(vec![helper])
+    }
+
+    fn location(uri: &str) -> Location {
+        Location {
+            uri: rift_lsp::uri::parse_uri(uri).expect("uri parses"),
+            range: lsp_types::Range::default(),
         }
     }
 

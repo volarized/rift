@@ -17,6 +17,7 @@ use std::path::Path;
 
 use lsp_types::{TextEdit, WorkspaceEdit};
 use rift_core::ProjectPath as CoreProjectPath;
+use rift_dependency::DependencyCatalog;
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::session::{
     EngineError, EngineFault, EngineReadiness, EngineSession, proposes_no_edit,
@@ -29,8 +30,8 @@ use rift_protocol::read::{Diagnostic, DiagnosticCode, Language, Severity};
 use crate::engine::{EnginePool, EngineSlot};
 use crate::read::{ReadError, ReadFault, ReadService};
 use crate::rename::{
-    PlanEnd, PlannedRewrite, ProposalContext, compiled_rewrites, failed_precondition,
-    plan_diagnostic, proposal_documents, refused_oversized, workspace_tree_root,
+    PlanEnd, PlannedRewrite, ProposalContext, compiled_rewrites, engine_roots, failed_precondition,
+    plan_diagnostic, proposal_documents, refused_oversized,
 };
 
 /// The operation prose opening every move refusal detail.
@@ -204,7 +205,16 @@ async fn planned_move(
     match proposal {
         EngineProposal::Nothing(reason) => Ok(unedited_plan(from, to, source.text, Some(reason))),
         EngineProposal::Answered { edit, encoding } => {
-            compiled_move(workspace_root, &edit, encoding, from, to, source.text).await
+            compiled_move(
+                workspace_root,
+                reads.dependency_catalog(),
+                &edit,
+                encoding,
+                from,
+                to,
+                source.text,
+            )
+            .await
         }
     }
 }
@@ -530,20 +540,21 @@ async fn will_rename_on_session(
 /// destination.
 async fn compiled_move(
     workspace_root: &Path,
+    catalog: &DependencyCatalog,
     edit: &WorkspaceEdit,
     encoding: PositionEncoding,
     from: CoreProjectPath,
     to: CoreProjectPath,
     moved_source: String,
 ) -> Result<MovePlan, PlanEnd> {
-    let tree_root = workspace_tree_root(workspace_root)?;
+    let roots = engine_roots(workspace_root, catalog)?;
     let context = ProposalContext {
         operation: MOVE_OPERATION,
         addresses: Vec::new(),
         opened: None,
         bases: BTreeMap::from([(&from, moved_source.as_str()), (&to, moved_source.as_str())]),
     };
-    let documents = proposal_documents(edit, &tree_root, &context)?;
+    let documents = proposal_documents(edit, &roots, &context)?;
     let documents = merged_moved_documents(documents, &from, &to);
     let compiled = compiled_rewrites(workspace_root, documents, encoding, &context).await?;
     let mut moved_next = moved_source.clone();

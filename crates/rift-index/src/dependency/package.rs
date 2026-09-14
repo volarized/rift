@@ -5,8 +5,8 @@ use std::ffi::OsStr;
 use std::path::Path;
 
 use rift_core::{
-    ContributionOrigin, ErrorContext, ProjectPath, SourceKind, SourceLocation, SourcePath,
-    SourceResolverId, SourceUnitId, symbol_identity,
+    ContributionOrigin, ErrorContext, ProjectPath, SourceKind, SourceLocation, SourceUnitId,
+    symbol_identity,
 };
 use rift_dependency::{CatalogEntry, PackageLocation};
 use rift_protocol::read::PackageIdentity;
@@ -63,15 +63,12 @@ impl PackageIndex {
         revision: u64,
     ) -> Result<Self, PackageIndexError> {
         let package = entry.identity();
-        let resolver = SourceResolverId::new(package.manager.clone()).map_err(|error| {
-            PackageIndexFault::new(PackageIndexViolation::Identity, package).caused_by(error)
-        })?;
         let byte_count = files.byte_count();
         let skipped_binary = files.skipped_binary();
         let mut indexed = Vec::with_capacity(files.file_count());
         for file in files.files() {
             let parsed = parsed_file(file, package)?;
-            let placement = placement_of(&resolver, entry, file.path())?;
+            let placement = placement_of(entry, file.path())?;
             let public = public_qualified_names(entry.language(), parsed.syntax());
             indexed.push(PackageFile {
                 file: parsed,
@@ -230,7 +227,6 @@ fn parsed_file(
 
 /// The placement of one package file: its unit, identity path, and origin.
 fn placement_of(
-    resolver: &SourceResolverId,
     entry: &CatalogEntry,
     path: &ProjectPath,
 ) -> Result<DocumentPlacement, PackageIndexError> {
@@ -238,14 +234,7 @@ fn placement_of(
     let identity_fault = || PackageIndexFault::new(PackageIndexViolation::Identity, package);
     let origin = ContributionOrigin::new(Some(source_location(entry)), SourceKind::Authored)
         .map_err(|error| identity_fault().caused_by(error))?;
-    let key = SourcePath::new(format!("{}@{}/{path}", package.name, package.version)).map_err(
-        |error| {
-            identity_fault()
-                .at(Path::new(path.as_str()))
-                .caused_by(error)
-        },
-    )?;
-    let unit = SourceUnitId::new(resolver.clone(), key).map_err(|error| {
+    let unit = SourceUnitId::for_package(package, path).map_err(|error| {
         identity_fault()
             .at(Path::new(path.as_str()))
             .caused_by(error)
@@ -569,7 +558,8 @@ mod tests {
         assert_eq!(error.fault().path(), Some(Path::new("src/lib.rs")));
         assert!(
             std::error::Error::source(&error)
-                .is_some_and(|source| source.downcast_ref::<PathError>().is_some()),
+                .and_then(std::error::Error::source)
+                .is_some_and(|cause| cause.downcast_ref::<PathError>().is_some()),
             "the source path refusal is the cause"
         );
     }

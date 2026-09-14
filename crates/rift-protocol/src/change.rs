@@ -5,7 +5,9 @@
 //! request and response schemas from these definitions.
 
 use crate::configuration::GuaranteeKind;
-use crate::read::{CoverageScope, Diagnostic, NodeId, ProjectPath, RegionRole, SymbolId};
+use crate::read::{
+    CoverageScope, Diagnostic, NodeId, ProjectPath, RegionRole, SourceUnitId, SymbolId,
+};
 use crate::schema;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -183,6 +185,12 @@ pub struct OperationPrecondition {
     /// exist.
     #[schemars(length(max = 64))]
     pub paths: Vec<ProjectPath>,
+    /// Files of cataloged packages involved in the condition, by source unit: the
+    /// references a language engine found in dependency source. Absent when every subject
+    /// is a project path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 64))]
+    pub units: Vec<SourceUnitId>,
     /// Required value for this check.
     pub expected: PreconditionValue,
     /// Value found while checking the condition.
@@ -206,9 +214,17 @@ impl OperationPrecondition {
             status,
             addresses,
             paths: paths.into_iter().map(ProjectPath).collect(),
+            units: Vec::new(),
             expected,
             observed,
         }
+    }
+
+    /// Attaches the cataloged package files the condition names.
+    #[must_use]
+    pub fn with_units(mut self, units: Vec<SourceUnitId>) -> Self {
+        self.units = units;
+        self
     }
 }
 
@@ -763,6 +779,7 @@ mod tests {
                     symbol: SymbolId("rift://symbol/rust/foo".to_owned()),
                 }],
                 paths: vec![ProjectPath("src/lib.rs".to_owned())],
+                units: Vec::new(),
                 expected: PreconditionValue::Boolean { value: true },
                 observed: PreconditionValue::Boolean { value: false },
             }],

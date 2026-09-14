@@ -20,10 +20,11 @@ use lsp_types::{
     TextEdit, Uri, WorkspaceEdit,
 };
 use rift_core::ProjectPath as CoreProjectPath;
+use rift_dependency::{CatalogEntry, DependencyCatalog};
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::position::LineIndex;
 use rift_lsp::session::{EngineError, EngineFault, EngineSession};
-use rift_lsp::uri::TreeRoot;
+use rift_lsp::uri::{EngineAddress, EngineRoots, PackageRoot, TreeRoot, UriError};
 use rift_protocol::change::{
     ChangeResult, OperationPrecondition, OperationPreconditionKind, OperationPreconditionStatus,
     PreconditionAddress, PreconditionValue, RefusalReason, RenameSymbolParams,
@@ -174,7 +175,16 @@ async fn planned_rename(
     let positions = name_positions(&target.indexed_source, target.name_offset)?;
     let answer = engine_exchange(slot, &target, &positions, &params.new_name).await?;
     let (edit, encoding, version) = proposed_edit(answer, &address)?;
-    compiled_plan(workspace_root, &edit, encoding, version, &address, &target).await
+    compiled_plan(
+        workspace_root,
+        reads.dependency_catalog(),
+        &edit,
+        encoding,
+        version,
+        &address,
+        &target,
+    )
+    .await
 }
 
 /// The resolved declaration a rename targets.
@@ -459,13 +469,14 @@ fn proposed_edit(
 /// that moves between compile and apply refuses instead of drifting.
 async fn compiled_plan(
     workspace_root: &Path,
+    catalog: &DependencyCatalog,
     edit: &WorkspaceEdit,
     encoding: PositionEncoding,
     version: i32,
     address: &SymbolAddress,
     target: &RenameTarget,
 ) -> Result<RenamePlan, PlanEnd> {
-    let tree_root = workspace_tree_root(workspace_root)?;
+    let roots = engine_roots(workspace_root, catalog)?;
     let context = ProposalContext {
         operation: RENAME_OPERATION,
         addresses: vec![PreconditionAddress::Symbol {
@@ -474,7 +485,7 @@ async fn compiled_plan(
         opened: Some((&target.path, version)),
         bases: BTreeMap::from([(&target.path, target.indexed_source.as_str())]),
     };
-    let documents = proposal_documents(edit, &tree_root, &context)?;
+    let documents = proposal_documents(edit, &roots, &context)?;
     let rewrites = compiled_rewrites(workspace_root, documents, encoding, &context).await?;
     if rewrites.is_empty() {
         return Err(PlanEnd::Refused(declined_refusal(
@@ -489,14 +500,40 @@ async fn compiled_plan(
     })
 }
 
-/// The workspace root as a tree root for proposal URI conversion.
-pub(crate) fn workspace_tree_root(workspace_root: &Path) -> Result<TreeRoot, PlanEnd> {
-    TreeRoot::new(workspace_root).map_err(|error| {
-        PlanEnd::Failed(ReadFault::task(
-            "proposal root conversion",
-            error.to_string(),
-        ))
-    })
+/// Every root an engine's URIs may fall under, for proposal URI conversion:
+/// the workspace tree, then one package root per catalog entry holding a
+/// source root. The work is one pass over the catalog's entries, whose
+/// count is the resolvers' own package bound.
+///
+/// A package source root the tree root conversion refuses fails the plan
+/// rather than skipping the entry: a package the engine can reach but the
+/// server cannot name would let raw cache paths into results.
+pub(crate) fn engine_roots(
+    workspace_root: &Path,
+    catalog: &DependencyCatalog,
+) -> Result<EngineRoots, PlanEnd> {
+    let tree = TreeRoot::new(workspace_root)
+        .map_err(|error| root_conversion_failed("proposal root conversion", &error))?;
+    let packages = catalog
+        .entries()
+        .iter()
+        .filter_map(|entry| entry.source_root().map(|root| (entry, root)))
+        .map(|(entry, root)| package_root(entry, root))
+        .collect::<Result<Vec<PackageRoot>, PlanEnd>>()?;
+    Ok(EngineRoots::new(tree).with_packages(packages))
+}
+
+/// One cataloged package's root, or the failure for a source root the tree
+/// root conversion refuses.
+fn package_root(entry: &CatalogEntry, source_root: &Path) -> Result<PackageRoot, PlanEnd> {
+    TreeRoot::new(source_root)
+        .map(|root| PackageRoot::new(root, entry.identity().clone()))
+        .map_err(|error| root_conversion_failed("package root conversion", &error))
+}
+
+/// The plan failure for a root the URI conversion refuses.
+fn root_conversion_failed(operation: &'static str, error: &UriError) -> PlanEnd {
+    PlanEnd::Failed(ReadFault::task(operation, error.to_string()))
 }
 
 /// Compiles per-file text edits into whole-file rewrites, dropping a file
@@ -530,22 +567,22 @@ pub(crate) async fn compiled_rewrites(
 ///
 /// `documentChanges` is preferred over `changes` when both are present, as
 /// the protocol specifies. A resource operation, an edit outside the tree
-/// root, a version other than the opened document's, or a proposal past
-/// the file and edit bounds refuses.
+/// root or into a cataloged package, a version other than the opened
+/// document's, or a proposal past the file and edit bounds refuses.
 pub(crate) fn proposal_documents(
     edit: &WorkspaceEdit,
-    tree_root: &TreeRoot,
+    roots: &EngineRoots,
     context: &ProposalContext<'_>,
 ) -> Result<Vec<(CoreProjectPath, Vec<TextEdit>)>, PlanEnd> {
     let mut documents: BTreeMap<CoreProjectPath, Vec<TextEdit>> = BTreeMap::new();
     match (&edit.document_changes, &edit.changes) {
         (Some(DocumentChanges::Edits(edits)), _) => {
-            collect_document_edits(&mut documents, tree_root, context, edits)?;
+            collect_document_edits(&mut documents, roots, context, edits)?;
         }
         (Some(DocumentChanges::Operations(operations)), _) => {
-            collect_operations(&mut documents, tree_root, context, operations)?;
+            collect_operations(&mut documents, roots, context, operations)?;
         }
-        (None, Some(changes)) => collect_changes(&mut documents, tree_root, context, changes)?,
+        (None, Some(changes)) => collect_changes(&mut documents, roots, context, changes)?,
         (None, None) => {}
     }
     refused_past_bounds(&documents, context.operation)?;
@@ -555,12 +592,12 @@ pub(crate) fn proposal_documents(
 /// Collects every `TextDocumentEdit` into the per-file map.
 fn collect_document_edits(
     documents: &mut BTreeMap<CoreProjectPath, Vec<TextEdit>>,
-    tree_root: &TreeRoot,
+    roots: &EngineRoots,
     context: &ProposalContext<'_>,
     edits: &[TextDocumentEdit],
 ) -> Result<(), PlanEnd> {
     for document in edits {
-        collect_document_edit(documents, tree_root, context, document)?;
+        collect_document_edit(documents, roots, context, document)?;
     }
     Ok(())
 }
@@ -569,7 +606,7 @@ fn collect_document_edits(
 /// proposal that creates, moves, or deletes files is not applied.
 fn collect_operations(
     documents: &mut BTreeMap<CoreProjectPath, Vec<TextEdit>>,
-    tree_root: &TreeRoot,
+    roots: &EngineRoots,
     context: &ProposalContext<'_>,
     operations: &[DocumentChangeOperation],
 ) -> Result<(), PlanEnd> {
@@ -583,7 +620,7 @@ fn collect_operations(
                 ))));
             }
             DocumentChangeOperation::Edit(document) => {
-                collect_document_edit(documents, tree_root, context, document)?;
+                collect_document_edit(documents, roots, context, document)?;
             }
         }
     }
@@ -597,12 +634,12 @@ fn collect_operations(
 )]
 fn collect_changes(
     documents: &mut BTreeMap<CoreProjectPath, Vec<TextEdit>>,
-    tree_root: &TreeRoot,
+    roots: &EngineRoots,
     context: &ProposalContext<'_>,
     changes: &std::collections::HashMap<Uri, Vec<TextEdit>>,
 ) -> Result<(), PlanEnd> {
     for (uri, edits) in changes {
-        let path = tree_path(tree_root, uri, context.operation)?;
+        let path = proposal_path(roots, uri, context.operation)?;
         documents
             .entry(path)
             .or_default()
@@ -614,11 +651,11 @@ fn collect_changes(
 /// Collects one document's edits after its address and version pass.
 fn collect_document_edit(
     documents: &mut BTreeMap<CoreProjectPath, Vec<TextEdit>>,
-    tree_root: &TreeRoot,
+    roots: &EngineRoots,
     context: &ProposalContext<'_>,
     document: &TextDocumentEdit,
 ) -> Result<(), PlanEnd> {
-    let path = tree_path(tree_root, &document.text_document.uri, context.operation)?;
+    let path = proposal_path(roots, &document.text_document.uri, context.operation)?;
     verified_document_version(&path, document.text_document.version, context)?;
     let edits = documents.entry(path).or_default();
     for edit in &document.edits {
@@ -661,19 +698,25 @@ fn verified_document_version(
 }
 
 /// The project path one proposal URI addresses, or the refusal for a URI
-/// the workspace tree cannot address.
-fn tree_path(
-    tree_root: &TreeRoot,
+/// no edit may land at: a cataloged package's file, which is read-only, or
+/// a URI under no root.
+fn proposal_path(
+    roots: &EngineRoots,
     uri: &Uri,
     operation: &'static str,
 ) -> Result<CoreProjectPath, PlanEnd> {
-    tree_root.project_path(uri).map_err(|error| {
-        PlanEnd::Refused(unsupported_refusal(format!(
+    match roots.address(uri) {
+        Ok(EngineAddress::Project(path)) => Ok(path),
+        Ok(EngineAddress::Package(unit)) => Err(PlanEnd::Refused(unsupported_refusal(format!(
+            "{operation} (the engine proposed an edit into dependency source, which is \
+             read-only: {unit})"
+        )))),
+        Err(error) => Err(PlanEnd::Refused(unsupported_refusal(format!(
             "{operation} (the engine proposed an edit outside the workspace tree: \
              {}: {error})",
             uri.as_str()
-        )))
-    })
+        )))),
+    }
 }
 
 /// Refuses a proposal past the file or per-file edit bounds.
@@ -1033,12 +1076,30 @@ mod tests {
         }
     }
 
-    fn tree() -> TreeRoot {
-        TreeRoot::from_slash_form("/rift-ws").expect("fixture root is absolute")
+    fn roots() -> EngineRoots {
+        EngineRoots::new(TreeRoot::from_slash_form("/rift-ws").expect("fixture root is absolute"))
+    }
+
+    fn helper_identity() -> rift_core::PackageIdentity {
+        rift_core::PackageIdentity {
+            manager: "cargo".to_owned(),
+            name: "helper".to_owned(),
+            version: "0.1.0".to_owned(),
+        }
+    }
+
+    /// The tree root beside one cataloged package root at `/cache/helper-0.1.0`.
+    fn roots_with_helper() -> EngineRoots {
+        let helper = PackageRoot::new(
+            TreeRoot::from_slash_form("/cache/helper-0.1.0").expect("fixture root is absolute"),
+            helper_identity(),
+        );
+        roots().with_packages(vec![helper])
     }
 
     fn uri(path: &str) -> Uri {
-        tree()
+        roots()
+            .tree()
             .document_uri(&project_path(path))
             .expect("fixture uri composes")
     }
@@ -1120,7 +1181,7 @@ mod tests {
             opened: Some((&opened, 1)),
             ..plain_context()
         };
-        proposal_documents(edit, &tree(), &context)
+        proposal_documents(edit, &roots(), &context)
     }
 
     /// Builds a `changes`-form proposal; the key type is lsp-types' own.
@@ -1208,6 +1269,25 @@ mod tests {
     }
 
     #[test]
+    fn package_uri_refuses_as_read_only_dependency_source() {
+        let inside: Uri = "file:///cache/helper-0.1.0/src/lib.rs"
+            .parse()
+            .expect("uri parses");
+        let proposal = changes_proposal(vec![(inside, vec![edit((0, 0), (0, 1), "x")])]);
+        let result = refusal(
+            proposal_documents(&proposal, &roots_with_helper(), &plain_context())
+                .expect_err("a package URI refuses"),
+        );
+        assert_eq!(refusal_reason(&result), RefusalReason::Unsupported);
+        let detail = refusal_detail(&result);
+        assert!(detail.contains("dependency source"), "{detail}");
+        assert!(
+            detail.contains("rift://source/cargo/helper@0.1.0/src/lib.rs"),
+            "{detail}"
+        );
+    }
+
+    #[test]
     fn document_versions_accept_none_and_the_opened_version_only() {
         let versioned = |uri_path: &str, version: Option<i32>| WorkspaceEdit {
             document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
@@ -1234,9 +1314,9 @@ mod tests {
         // An operation that opened nothing - a file move - accepts only
         // version-free documents.
         let nothing_opened = plain_context();
-        assert!(proposal_documents(&versioned("lib.rs", None), &tree(), &nothing_opened).is_ok());
+        assert!(proposal_documents(&versioned("lib.rs", None), &roots(), &nothing_opened).is_ok());
         let refused = refusal(
-            proposal_documents(&versioned("lib.rs", Some(1)), &tree(), &nothing_opened)
+            proposal_documents(&versioned("lib.rs", Some(1)), &roots(), &nothing_opened)
                 .expect_err("every versioned document refuses when nothing was opened"),
         );
         assert_eq!(refusal_reason(&refused), RefusalReason::Unsupported);
@@ -1589,6 +1669,7 @@ mod tests {
     async fn compiled_plan_fails_when_the_workspace_root_is_relative() {
         let outcome = compiled_plan(
             Path::new("relative-root"),
+            &DependencyCatalog::default(),
             &WorkspaceEdit::default(),
             PositionEncoding::Utf8,
             0,
@@ -1600,6 +1681,48 @@ mod tests {
             panic!("a relative workspace root must fail");
         };
         assert!(error.to_string().contains("proposal root conversion"));
+    }
+
+    /// A catalog holding `helper` rooted at `source_root` beside one entry with no source
+    /// root.
+    fn catalog_with(source_root: &str) -> DependencyCatalog {
+        let rust = Language::from_identity_segment("rust").expect("fixture language");
+        let rootless = rift_core::PackageIdentity {
+            manager: "cargo".to_owned(),
+            name: "rootless".to_owned(),
+            version: "2.0.0".to_owned(),
+        };
+        let resolution = rift_dependency::Resolution {
+            entries: vec![
+                CatalogEntry::dependency(
+                    helper_identity(),
+                    rust.clone(),
+                    Some(std::path::PathBuf::from(source_root)),
+                    true,
+                ),
+                CatalogEntry::dependency(rootless, rust, None, false),
+            ],
+            inputs: Vec::new(),
+            degradations: Vec::new(),
+        };
+        DependencyCatalog::assemble(vec![(rift_dependency::ResolverName::Cargo, resolution)])
+    }
+
+    #[test]
+    fn engine_roots_hold_one_package_root_per_cataloged_source_root() {
+        let converted = engine_roots(Path::new("/rift-ws"), &catalog_with("/cache/helper-0.1.0"))
+            .expect("absolute roots convert");
+        assert_eq!(converted.package_count(), 1);
+        assert_eq!(converted.tree(), roots().tree());
+    }
+
+    #[test]
+    fn engine_roots_fail_when_a_package_source_root_is_relative() {
+        let outcome = engine_roots(Path::new("/rift-ws"), &catalog_with("relative-cache"));
+        let Err(PlanEnd::Failed(error)) = outcome else {
+            panic!("a relative package source root must fail");
+        };
+        assert!(error.to_string().contains("package root conversion"));
     }
 
     fn target_over(source: &str) -> RenameTarget {
