@@ -39,6 +39,11 @@ const LARGE_FIXTURE_DECLARATIONS: usize = 12;
 /// How long after rewriting the large fixture the stop is issued: long enough for the
 /// capture to be running and the previous rebuild's lexical transaction to hold the write turn.
 const STOP_DELAY_AFTER_REWRITE: Duration = Duration::from_millis(200);
+/// How long the server serves before the stop that tests the stop's own budget.
+///
+/// It outlasts `SERVER_STOP_DEADLINE`, the server-side stop's span, so a deadline
+/// derived where the server began listening would already be spent when the stop lands.
+const IDLE_SPAN_PAST_STOP_DEADLINE: Duration = Duration::from_secs(9);
 
 /// Serializes the tests: the served port range is machine-global.
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -187,6 +192,19 @@ fn wait_for<T>(
     Err(format!("timed out waiting for {what}").into())
 }
 
+/// The fields the server's own stop line carries, as its stderr rendered them.
+///
+/// The recorded stream is styled, so a field name and its `=` are separated by
+/// escape codes; the values themselves stay plain, and the line is read for
+/// those.
+fn stop_line_of(stderr: &str) -> TestResult<&str> {
+    let after_message = stderr
+        .split_once("MCP server stopped")
+        .ok_or_else(|| format!("serving must end before the process leaves: {stderr:?}"))?
+        .1;
+    Ok(after_message.lines().next().unwrap_or_default())
+}
+
 fn serving_document(root: &Path) -> Option<ServerLock> {
     match probe(root) {
         ServerPresence::Serving(lock) => Some(lock),
@@ -313,6 +331,55 @@ fn foreground_start_serves_until_stopped_and_exits_cleanly() -> TestResult {
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("rift server listening on 127.0.0.1:"),
         "the foreground server prints its listening line"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_stop_after_a_long_serving_span_still_runs_every_stage_inside_its_budget() -> TestResult {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rift"))
+        .args(["server", "start", "--foreground"])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let serving = wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
+        serving_document(root)
+    })?;
+    assert_eq!(serving.pid, child.id(), "the child itself must serve");
+
+    // The server serves past its own stop span before anyone asks it to stop, so a
+    // deadline derived at startup would leave every later stage nothing to spend.
+    std::thread::sleep(IDLE_SPAN_PAST_STOP_DEADLINE);
+    let stopped = rift(root, &["server", "stop"])?;
+    require_success(&stopped, "stop of a long-serving foreground server")?;
+
+    wait_for(
+        GONE_POLL_ATTEMPT_COUNT,
+        "the foreground child to exit",
+        || child.try_wait().ok().flatten(),
+    )?;
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "a stopped foreground server exits cleanly: {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stop_line = stop_line_of(&stderr)?;
+    assert!(
+        stop_line.contains("\"ok\""),
+        "the engines and the index supervisor must join inside the budget: {stop_line}"
+    );
+    assert!(
+        !stderr.contains("outlasted the stop deadline"),
+        "the log drain's final flush must get its share of the budget: {stderr}"
     );
     Ok(())
 }

@@ -234,26 +234,32 @@ impl HttpServer {
     }
 
     /// Waits until the server stopped and its index supervisor shut down,
-    /// bounded by `deadline`.
+    /// bounded by `budget` from the moment serving ended.
     ///
     /// Resolves after the serve loop ended - through the external shutdown
-    /// token, an authorized `POST /api/stop`, or the idle timeout. The engines
-    /// then shut down in parallel and the index supervisor joins, both under
-    /// `deadline`: it is the whole stop's shared deadline, so each stage takes
-    /// only what the one before it left, and work that outlasts it is killed
-    /// rather than waited on.
+    /// token, an authorized `POST /api/stop`, or the idle timeout. The stop's
+    /// deadline is derived there, `budget` after the serving task joined, so
+    /// the span the server spent listening never spends it. The engines then
+    /// shut down in parallel and the index supervisor joins, both under that
+    /// deadline: each stage takes only what the one before it left, and work
+    /// that outlasts it is killed rather than waited on. The returned deadline
+    /// is that same instant, so the caller's later stop stages share it.
     ///
     /// # Errors
     ///
-    /// Returns [`HttpServeError`] when the supervisor outlasted `deadline` or a
-    /// serving task failed.
+    /// The second tuple element carries [`HttpServeError`] when the supervisor
+    /// outlasted the deadline or a serving task failed.
     ///
     /// # Cancel safety
     ///
     /// Dropping this future detaches the serving tasks; a shutdown already
     /// triggered still completes in the background.
-    pub async fn stopped(self, deadline: Instant) -> Result<(), HttpServeError> {
+    pub async fn stopped(self, budget: Duration) -> (Instant, Result<(), HttpServeError>) {
         let serve_result = classify_serve_outcome(self.serving.await);
+        // The serving task runs for the server's whole life, so the stop's
+        // deadline starts where that task ended: a deadline taken before it
+        // joined is already spent when the stop arrives.
+        let deadline = Instant::now() + budget;
         // The serve loop can end on its own I/O error, where nothing has
         // cancelled the token yet; cancelling here unblocks the idle watch
         // on every path.
@@ -276,9 +282,10 @@ impl HttpServer {
             outcome,
             "MCP server stopped"
         );
-        supervisor_outcome?;
-        serve_result?;
-        idle_outcome.map_err(|error| HttpServeFault::serve("idle watch task", error))
+        let stopped = supervisor_outcome.and(serve_result).and_then(|()| {
+            idle_outcome.map_err(|error| HttpServeFault::serve("idle watch task", error))
+        });
+        (deadline, stopped)
     }
 }
 
@@ -633,19 +640,24 @@ async fn watch_idle(idle: Arc<IdleTracker>, idle_timeout: Duration, stop: Cancel
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
 
     use axum::http::{StatusCode, header};
+    use rift_index::WorkspaceIndexLimits;
     use rift_protocol::lock::{ProductIdentity, SERVER_PORT_MIN, SERVER_TOKEN_LENGTH, ServerLock};
     use rift_server::ReadFault;
     use tokio_util::sync::CancellationToken;
 
     use tokio::time::Instant;
 
+    use crate::server::EngineHold;
+    use crate::validation::{IndexSupervisor, IndexValidation};
+
     use super::{
-        HttpServeFault, IdleTracker, bearer_authorized, bind_first_free, classify_serve_outcome,
-        mint_token, stop_outcome_label, unauthorized, watch_idle,
+        HttpServeFault, HttpServer, IdleTracker, bearer_authorized, bind_first_free,
+        classify_serve_outcome, mint_token, stop_outcome_label, unauthorized, watch_idle,
     };
 
     #[test]
@@ -796,6 +808,58 @@ mod tests {
     fn stop_outcome_label_names_both_outcomes() {
         assert_eq!(stop_outcome_label(true), "ok");
         assert_eq!(stop_outcome_label(false), "error");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_stop_budget_starts_where_serving_ended() {
+        /// How long the server serves before its loop ends. It outlasts the
+        /// budget, so a deadline taken where serving began is already spent.
+        const SERVE_SPAN: Duration = Duration::from_secs(30);
+        /// The budget every stage of the stop shares.
+        const STOP_BUDGET: Duration = Duration::from_secs(8);
+
+        let directory = tempfile::tempdir().expect("the fixture root must be created");
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        *validation.task.lock().await = Some(tokio::spawn(std::future::pending::<()>()));
+        let server = HttpServer {
+            port: SERVER_PORT_MIN,
+            token: mint_token().expect("token must mint"),
+            identity: ProductIdentity {
+                version: "0.0.9".to_owned(),
+                executable_digest: "a".repeat(64),
+                schema_digest: "b".repeat(64),
+            },
+            stop: CancellationToken::new(),
+            serving: tokio::spawn(async {
+                tokio::time::sleep(SERVE_SPAN).await;
+                Ok::<(), std::io::Error>(())
+            }),
+            idle_watch: tokio::spawn(std::future::ready(())),
+            supervisor: IndexSupervisor { validation },
+            engines: Arc::new(EngineHold::new(
+                directory.path().to_path_buf(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )),
+        };
+
+        let started = Instant::now();
+        let (deadline, stopped) = server.stopped(STOP_BUDGET).await;
+        let served_until = started + SERVE_SPAN;
+        assert_eq!(
+            deadline,
+            served_until + STOP_BUDGET,
+            "the stop's deadline starts where serving ended: served_until={served_until:?}, \
+             budget={STOP_BUDGET:?}, deadline={deadline:?}"
+        );
+        assert_eq!(
+            Instant::now(),
+            deadline,
+            "the later stages must be given the whole budget"
+        );
+        let error = stopped.expect_err("a supervisor that never joins must miss the deadline");
+        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
     }
 
     #[test]
