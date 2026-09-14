@@ -1,12 +1,14 @@
 //! The bounds a large workspace meets first, proven through the served surface: the
 //! lexical index's `[search.lexical] units_max` key, the `[source] workspace_size` key,
-//! and one file a syntax provider refuses under its own bounds.
+//! one file a syntax provider refuses under its own bounds, and one file the Contribution
+//! contract refuses.
 //!
 //! A workspace past `units_max` or `workspace_size` refuses to build naming the key and
 //! its maximum, and the same workspace under the default serves; lowering
 //! `workspace_size` on a served workspace rebuilds the index and refuses the next
 //! request the same way. A workspace holding one file past the syntax depth bound still
-//! answers `search` from its other file, with the deep file absent.
+//! answers `search` from its other file, with the deep file absent; a force-included file
+//! the Contribution contract refuses is left out the same way, and the answer names it.
 
 mod hermetic_search;
 #[allow(dead_code)]
@@ -130,6 +132,71 @@ async fn a_file_past_a_syntax_bound_is_left_out_and_the_rest_serves() -> TestRes
     assert!(
         !hit_paths(&absent).contains(&"src/deep.rs"),
         "the deep file answers no search: {absent:#}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A declaration named exactly `PROVIDER_SYMBOL_ID_BYTES_MAX` bytes: the document keeps
+/// it, and the identity minted from it passes the bound, so the Contribution contract
+/// refuses it when the file is published.
+fn wide_source() -> String {
+    format!(
+        "pub struct {};\n",
+        "S".repeat(rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX)
+    )
+}
+
+/// Whether one search answer names `path` in a `source_unavailable` warning.
+fn names_unavailable(answer: &Value, path: &str) -> bool {
+    let unit = format!("rift://file/{path}");
+    answer["warnings"].as_array().is_some_and(|warnings| {
+        warnings
+            .iter()
+            .any(|warning| warning["code"] == "source_unavailable" && warning["unit"] == unit)
+    })
+}
+
+/// `search` with `paths.force_include` naming a file the walk skipped and the Contribution
+/// contract refuses answers from the other file, with the refused file named in a
+/// `source_unavailable` warning, instead of failing the request. A plain search carries
+/// no such warning: the file is left out by the on-demand index alone.
+#[tokio::test]
+async fn a_force_included_file_the_contract_refuses_is_left_out_and_the_answer_warns() -> TestResult
+{
+    let wide = wide_source();
+    let (_directory, client, server_task) = served_workspace(
+        &[
+            (".gitignore", "src/wide.rs\n"),
+            ("src/lib.rs", "pub fn beacon() {}\n"),
+            ("src/wide.rs", wide.as_str()),
+        ],
+        None,
+    )
+    .await?;
+
+    let plain = search_page(&client, "beacon").await?;
+    assert!(hit_paths(&plain).contains(&"src/lib.rs"), "{plain:#}");
+    assert!(
+        !names_unavailable(&plain, "src/wide.rs"),
+        "the walk never reaches the ignored file: {plain:#}"
+    );
+
+    let forced = client
+        .call_tool(tool_request(
+            "search",
+            &json!({"query": "beacon", "paths": {"force_include": ["src/wide.rs"]}}),
+        ))
+        .await?;
+    let forced = forced
+        .structured_content
+        .ok_or("search answers with structured content")?;
+    assert!(hit_paths(&forced).contains(&"src/lib.rs"), "{forced:#}");
+    assert!(
+        names_unavailable(&forced, "src/wide.rs"),
+        "the answer names the refused file: {forced:#}"
     );
 
     client.cancel().await?;
