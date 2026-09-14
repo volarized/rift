@@ -3762,10 +3762,8 @@ pub fn beacon() -> u64 {
         };
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        fs::write(
-            directory.path().join("rift.toml"),
-            "[source]\nfiles = 1000\n",
-        )?;
+        let configuration = directory.path().join("rift.toml");
+        fs::write(configuration, "[source]\nfiles = 1000\n")?;
         let candidate = stable_candidate(directory.path(), 0)?;
         let (validation, _receiver) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
