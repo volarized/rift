@@ -811,9 +811,12 @@ impl ChangeService {
         Ok(result)
     }
 
-    /// The first rewrite precondition that fails: a planned file gone from
-    /// the index, or one whose disk bytes drifted from the bytes the plan
-    /// was compiled against. Nothing when every file still matches.
+    /// The first rewrite precondition that fails: a planned file the write
+    /// gate refuses or the filesystem no longer holds, or one whose disk
+    /// bytes drifted from the bytes the plan was compiled against. Nothing
+    /// when every file still matches. Index membership proves nothing here:
+    /// a visible file no syntax provider parses is a legal move source the
+    /// index never holds.
     fn rewrite_precondition_failure<'plan>(
         &self,
         reads: &ReadService,
@@ -821,21 +824,10 @@ impl ChangeService {
         checks: impl Iterator<Item = (&'plan CoreProjectPath, &'plan str)>,
     ) -> Result<Option<ChangeResult>, ReadError> {
         for (path, base_source) in checks {
-            if reads.index().file(path).is_none() {
-                return Ok(Some(ChangeResult::refused(
-                    RefusalReason::UnmetPrecondition,
-                    vec![OperationPrecondition::new(
-                        OperationPreconditionKind::TargetExists,
-                        OperationPreconditionStatus::Failed,
-                        addresses.to_vec(),
-                        vec![path.as_str().to_owned()],
-                        PreconditionValue::Boolean { value: true },
-                        PreconditionValue::Boolean { value: false },
-                    )],
-                )));
-            }
-            let disk = fs::read_to_string(self.root.join(path.as_str()))
-                .map_err(|error| ReadFault::storage(path.as_str(), "read", &error))?;
+            let disk = match self.base_on_disk(reads, addresses, path)? {
+                Ok(disk) => disk,
+                Err(refusal) => return Ok(Some(refusal)),
+            };
             if disk != base_source {
                 return Ok(Some(ChangeResult::refused(
                     RefusalReason::UnmetPrecondition,
@@ -855,6 +847,45 @@ impl ChangeService {
             }
         }
         Ok(None)
+    }
+
+    /// The bytes `path` holds on disk, for a planned rewrite to prove its base
+    /// against. The path is resolved through the write gate every write tool
+    /// resolves its targets through, so one the `[source]` policy no longer
+    /// makes visible refuses there; one the filesystem no longer holds refuses
+    /// `target_exists`.
+    fn base_on_disk(
+        &self,
+        reads: &ReadService,
+        addresses: &[PreconditionAddress],
+        path: &CoreProjectPath,
+    ) -> Result<Result<String, ChangeResult>, ReadError> {
+        let target = match crate::publish::resolve_write_target(
+            reads,
+            &self.root,
+            path,
+            crate::publish::SymlinkResolution::Addressed,
+        )? {
+            Ok(target) => target,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        match fs::read_to_string(target.absolute()) {
+            Ok(disk) => Ok(Ok(disk)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Err(ChangeResult::refused(
+                    RefusalReason::UnmetPrecondition,
+                    vec![OperationPrecondition::new(
+                        OperationPreconditionKind::TargetExists,
+                        OperationPreconditionStatus::Failed,
+                        addresses.to_vec(),
+                        vec![path.as_str().to_owned()],
+                        PreconditionValue::Boolean { value: true },
+                        PreconditionValue::Boolean { value: false },
+                    )],
+                )))
+            }
+            Err(error) => Err(ReadFault::storage(path.as_str(), "read", &error)),
+        }
     }
 
     /// Applies unified-diff hunks to workspace files atomically.
@@ -4915,6 +4946,33 @@ mod tests {
             hub,
             "the source never left"
         );
+        Ok(())
+    }
+
+    /// A visible file no syntax provider parses is a legal move source the
+    /// index never holds: the apply proves its base against the disk, the way
+    /// the plan did, and lands the move.
+    #[test]
+    fn apply_move_lands_an_unclaimed_file() -> TestResult {
+        let note = "moved note\n";
+        let (directory, reads, changes) =
+            multi_file_fixture(&[("lib.rs", "pub fn beacon() {}\n"), ("notes.txt", note)])?;
+        let plan = move_plan(
+            "notes.txt",
+            "moved/notes.txt",
+            (note, note),
+            Vec::new(),
+            None,
+        );
+
+        let summary = applied_summary(changes.apply_move(&reads, &plan)?);
+
+        assert!(!directory.path().join("notes.txt").exists());
+        assert_eq!(
+            fs::read_to_string(directory.path().join("moved/notes.txt"))?,
+            note
+        );
+        assert!(!summary.files.is_empty(), "{summary:#?}");
         Ok(())
     }
 
