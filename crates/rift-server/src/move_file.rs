@@ -610,8 +610,13 @@ fn merged_moved_documents(
 mod tests {
     use std::fs;
 
+    use lsp_types::{
+        DocumentChanges, OneOf, OptionalVersionedTextDocumentIdentifier, Position, Range,
+        TextDocumentEdit,
+    };
     use rift_core::{SourceVisibility, TextFileInclusion};
     use rift_index::WorkspaceIndexLimits;
+    use rift_lsp::uri::EngineRoots;
     use rift_protocol::configuration::HistoryConfiguration;
     use rift_protocol::read::ProjectPath;
 
@@ -1260,6 +1265,166 @@ mod tests {
             .find(|(path, _)| path == &from)
             .expect("the moved file's edits merge");
         assert_eq!(moved.1.len(), 2, "both URIs' edits file under the source");
+    }
+
+    /// The version the move's `didOpen` carried for `lib.rs` in the compile
+    /// fixtures below.
+    const OPENED_VERSION: i32 = 3;
+
+    /// A workspace holding the moved file and one file referencing it, with
+    /// the engine roots the proposal's URIs resolve against.
+    fn compile_workspace() -> (tempfile::TempDir, ReadService, EngineRoots) {
+        let (directory, reads, _engines) = workspace(&[
+            ("lib.rs", "pub fn beacon() {}\n"),
+            ("main.rs", "mod lib;\n"),
+        ]);
+        let roots =
+            engine_roots(directory.path(), reads.dependency_catalog()).expect("fixture roots");
+        (directory, reads, roots)
+    }
+
+    fn edit_at(start: (u32, u32), end: (u32, u32), text: &str) -> TextEdit {
+        TextEdit {
+            range: Range {
+                start: Position {
+                    line: start.0,
+                    character: start.1,
+                },
+                end: Position {
+                    line: end.0,
+                    character: end.1,
+                },
+            },
+            new_text: text.to_owned(),
+        }
+    }
+
+    /// One document's edit in the engine's reply, versioned as the engine
+    /// chose.
+    fn document_edit(
+        roots: &EngineRoots,
+        path: &str,
+        version: Option<i32>,
+        edit: TextEdit,
+    ) -> TextDocumentEdit {
+        let path = CoreProjectPath::new(path).expect("fixture path");
+        TextDocumentEdit {
+            text_document: OptionalVersionedTextDocumentIdentifier {
+                uri: roots
+                    .tree()
+                    .document_uri(&path)
+                    .expect("fixture uri composes"),
+                version,
+            },
+            edits: vec![OneOf::Left(edit)],
+        }
+    }
+
+    /// The engine's reply to the move of `lib.rs`: its edit on the moved
+    /// file at `moved_version`, beside a version-free reference rewrite in
+    /// `main.rs`.
+    fn will_rename_reply(roots: &EngineRoots, moved_version: Option<i32>) -> WorkspaceEdit {
+        WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Edits(vec![
+                document_edit(
+                    roots,
+                    "lib.rs",
+                    moved_version,
+                    edit_at((0, 0), (0, 0), "//! moved\n"),
+                ),
+                document_edit(roots, "main.rs", None, edit_at((0, 4), (0, 7), "moved")),
+            ])),
+            ..WorkspaceEdit::default()
+        }
+    }
+
+    /// Compiles one engine reply for the move of `lib.rs` to `moved.rs`,
+    /// opened at [`OPENED_VERSION`].
+    async fn compiled_reply(
+        directory: &Path,
+        reads: &ReadService,
+        reply: WorkspaceEdit,
+    ) -> Result<MovePlan, PlanEnd> {
+        let proposal = AnsweredProposal {
+            edit: reply,
+            encoding: PositionEncoding::Utf8,
+            version: OPENED_VERSION,
+        };
+        let from = CoreProjectPath::new("lib.rs").expect("fixture path");
+        let to = CoreProjectPath::new("moved.rs").expect("fixture path");
+        let moved_source = "pub fn beacon() {}\n".to_owned();
+        compiled_move(
+            directory,
+            reads.dependency_catalog(),
+            &proposal,
+            from,
+            to,
+            moved_source,
+        )
+        .await
+    }
+
+    /// The first finding of an `unsupported` refusal the compile ended with.
+    fn unsupported_detail(end: PlanEnd) -> String {
+        let PlanEnd::Refused(ChangeResult::Refused {
+            reason,
+            diagnostics,
+            ..
+        }) = end
+        else {
+            panic!("expected a refusal, got {end:?}");
+        };
+        assert_eq!(reason, RefusalReason::Unsupported);
+        diagnostics[0].message.clone()
+    }
+
+    #[tokio::test]
+    async fn an_edit_on_the_opened_file_at_its_opened_version_compiles() {
+        let (directory, reads, roots) = compile_workspace();
+        let reply = will_rename_reply(&roots, Some(OPENED_VERSION));
+        let plan = compiled_reply(directory.path(), &reads, reply)
+            .await
+            .expect("the opened version compiles");
+        assert_eq!(plan.moved_next, "//! moved\npub fn beacon() {}\n");
+        assert_eq!(plan.rewrites.len(), 1);
+        assert_eq!(plan.rewrites[0].path.as_str(), "main.rs");
+        assert_eq!(plan.rewrites[0].next_source, "mod moved;\n");
+    }
+
+    #[tokio::test]
+    async fn an_edit_on_the_opened_file_at_another_version_refuses_unsupported() {
+        let (directory, reads, roots) = compile_workspace();
+        let reply = will_rename_reply(&roots, Some(OPENED_VERSION + 1));
+        let refused = compiled_reply(directory.path(), &reads, reply)
+            .await
+            .expect_err("a version the server does not hold refuses");
+        assert_eq!(
+            unsupported_detail(refused),
+            "file move (the engine edited lib.rs at document version 4, which the server does \
+             not hold)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_versioned_edit_on_a_file_the_move_did_not_open_refuses() {
+        let (directory, reads, roots) = compile_workspace();
+        let reply = WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Edits(vec![document_edit(
+                &roots,
+                "main.rs",
+                Some(OPENED_VERSION),
+                edit_at((0, 4), (0, 7), "moved"),
+            )])),
+            ..WorkspaceEdit::default()
+        };
+        let refused = compiled_reply(directory.path(), &reads, reply)
+            .await
+            .expect_err("a version on a document the move did not open refuses");
+        assert_eq!(
+            unsupported_detail(refused),
+            "file move (the engine edited main.rs at document version 3, which the server does \
+             not hold)"
+        );
     }
 
     #[test]
