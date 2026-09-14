@@ -230,9 +230,10 @@ scoring.
 
 `paths.force_include` reaches past both: a file `[source]` or `.gitignore` excluded from the
 index is parsed on demand and searched alongside the indexed hits, up to 256 matched files per
-request. A request whose `paths.force_include` matches more than that refuses with
-`limit_exceeded` rather than searching a silently truncated set; the `limit` evidence names
-`paths.force_include`, the bound, and the match count.
+request - the bound counts the files the request reaches outside the index, so a glob whose
+matches the index already holds adds none. A request whose `paths.force_include` matches more
+than that refuses with `limit_exceeded` rather than searching a silently truncated set; the
+`limit` evidence names `paths.force_include`, the bound, and the match count.
 
 The top-level `include` field is a separate selector: it requests extra payload per hit instead
 of narrowing which files are searched. `source` attaches the excerpt around the hit; `score`
@@ -751,6 +752,11 @@ refuses as `unsupported`, and an engine that declines the new name refuses as
 change applies, the server sweeps the tree for surviving occurrences of the old name and reports
 each one as a warning.
 
+A rewrite whose result reports a syntax finding the file's pre-edit source did not report
+refuses the same `unmet_precondition` naming `engine_proposed_edits`, and nothing is written.
+The refusal names the file and carries the parser's own message. A finding the pre-edit source
+already reported rides the applied summary as before.
+
 An edit the engine proposes into a cataloged package refuses as `unsupported`, naming the
 package file's [`SourceUnitId`](/docs/protocol/reference#SourceUnitId): dependency source is
 read-only, and the unit tells the caller which package the rename would have reached.
@@ -761,7 +767,10 @@ Any visible regular file moves, including one no syntax provider claims; a direc
 place refuses `unmet_precondition` naming `target_is_file`. An engine advertising
 `workspace/willRenameFiles` proposes the reference updates, and they land with the move as one
 change. Without such an engine, or without a provider that claims the file's language, the move
-still applies and the result carries a `rift.move.references_not_updated` warning.
+still applies and the result carries a `rift.move.references_not_updated` warning. A proposed
+rewrite whose result no longer parses refuses the way `rename_symbol` refuses one. After the
+move applies, the server sweeps the tree for surviving occurrences of the moved file's old path
+and reports each one as a warning.
 
 <McpTool name="remove_symbol" />
 

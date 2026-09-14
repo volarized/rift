@@ -147,8 +147,10 @@ pub struct PathSelector {
     #[serde(default)]
     pub exclude: Vec<PathPattern>,
     /// Globs reaching files the workspace's `[source]` policy or `.gitignore` excluded from
-    /// the index. Matches are bounded per request, and the server refuses the search when the
-    /// bound is crossed rather than truncating it silently.
+    /// the index. Matches are bounded per request - the bound counts the files the request
+    /// reaches outside the index, so a glob whose matches the index already holds adds none -
+    /// and the server refuses the search when the bound is crossed rather than truncating it
+    /// silently.
     #[serde(default)]
     pub force_include: Vec<PathPattern>,
 }
