@@ -102,6 +102,11 @@ pub(crate) struct WriteTarget {
 }
 
 impl WriteTarget {
+    /// The absolute location this write's bytes land at.
+    pub(crate) fn absolute(&self) -> &Path {
+        &self.absolute
+    }
+
     /// A warning naming both the requested link and the target its
     /// publish landed on, carried on a change result that wrote through a
     /// symlink. `None` when this target is not a symlink.
@@ -170,7 +175,7 @@ fn symlink_unresolved_refusal(requested: &CoreProjectPath, detail: &str) -> Chan
 /// Whether `absolute` is visible under the workspace's `[source]` policy.
 /// A snapshot with no policy - a revision snapshot, which has no
 /// filesystem tree to be visible in - makes everything invisible.
-fn visible(reads: &ReadService, absolute: &Path) -> bool {
+pub(crate) fn visible(reads: &ReadService, absolute: &Path) -> bool {
     reads
         .source_policy()
         .is_some_and(|policy| policy.visible(absolute))

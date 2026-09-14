@@ -91,7 +91,7 @@ fn javascript_kinds() -> &'static EcmaScriptKinds {
 
 #[cfg(test)]
 mod tests {
-    use rift_core::ProjectPath;
+    use rift_core::{PROVIDER_SYMBOL_ID_BYTES_MAX, ProjectPath};
     use rift_protocol::read::SymbolFacet;
 
     use super::*;
@@ -366,5 +366,44 @@ mod tests {
         let document = analyze("");
         assert!(document.symbols().is_empty());
         assert!(!document.has_errors());
+    }
+
+    /// Bytes past `PROVIDER_SYMBOL_ID_BYTES_MAX`, the name bound the
+    /// Contribution contract enforces.
+    const OVERSIZED_NAME_BYTES: usize = 9_000;
+    const _: () = assert!(OVERSIZED_NAME_BYTES > PROVIDER_SYMBOL_ID_BYTES_MAX);
+
+    /// A computed member key spells an expression of any length - the one
+    /// name derivation a minified bundle pushes past the name bound. The
+    /// method under it declares nothing; its class and the sibling method
+    /// stay, and the document counts the one it left out.
+    #[test]
+    fn test_a_computed_key_past_the_name_bound_emits_no_symbol() {
+        let key = "k".repeat(OVERSIZED_NAME_BYTES);
+        let text = format!("class Bundle {{\n  [{key}]() {{}}\n  kept() {{}}\n}}\n");
+        let document = analyze(&text);
+        let names = document
+            .symbols()
+            .iter()
+            .map(|symbol| (symbol.qualified_name.as_str(), symbol.container.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(names, [("Bundle", None), ("Bundle.kept", Some("Bundle"))]);
+        assert_eq!(document.left_out_declaration_count(), 1);
+    }
+
+    /// A class named past the bound declares nothing, and neither does the
+    /// method nested under it, whose qualified name carries the class name.
+    #[test]
+    fn test_a_class_past_the_name_bound_takes_its_methods_with_it() {
+        let name = "c".repeat(OVERSIZED_NAME_BYTES);
+        let text = format!("class {name} {{\n  run() {{}}\n}}\nfunction kept() {{}}\n");
+        let document = analyze(&text);
+        let names = document
+            .symbols()
+            .iter()
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["kept"]);
+        assert_eq!(document.left_out_declaration_count(), 2);
     }
 }

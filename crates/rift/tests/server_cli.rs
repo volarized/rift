@@ -31,6 +31,11 @@ const GONE_POLL_ATTEMPT_COUNT: u32 = 100;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// Concurrent `rift server start` invocations in the election race.
 const CONCURRENT_START_COUNT: usize = 4;
+/// Source files in the workspace whose lexical commit a stop lands inside.
+const LARGE_FIXTURE_FILES: usize = 3_000;
+/// Declarations per file in that fixture: one lexical unit each, so the whole commit
+/// that runs behind the publication takes seconds on a development machine.
+const LARGE_FIXTURE_DECLARATIONS: usize = 12;
 
 /// Serializes the tests: the served port range is machine-global.
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -64,6 +69,27 @@ fn workspace() -> TestResult<tempfile::TempDir> {
         format!("{SEMANTIC_DISABLED}[server]\nidle_timeout = \"60s\"\n"),
     )?;
     Ok(directory)
+}
+
+/// Fills the fixture with [`LARGE_FIXTURE_FILES`] Rust files under `src`, each declaring
+/// [`LARGE_FIXTURE_DECLARATIONS`] documented functions.
+fn write_large_fixture(root: &Path) -> TestResult {
+    use std::fmt::Write as _;
+
+    let source = root.join("src");
+    fs::create_dir_all(&source)?;
+    for file in 0..LARGE_FIXTURE_FILES {
+        let mut contents = String::new();
+        for declaration in 0..LARGE_FIXTURE_DECLARATIONS {
+            writeln!(
+                contents,
+                "/// Beacon {declaration} in file {file}.\npub fn beacon_{file}_{declaration}(value: \
+                 u64) -> u64 {{\n    value + {declaration}\n}}\n"
+            )?;
+        }
+        fs::write(source.join(format!("file_{file}.rs")), contents)?;
+    }
+    Ok(())
 }
 
 /// Stops the fixture's server when a test unwinds, best effort.
@@ -289,6 +315,56 @@ fn foreground_start_serves_until_stopped_and_exits_cleanly() -> TestResult {
 }
 
 #[test]
+fn stop_during_the_lexical_commit_behind_the_publication_ends_the_process() -> TestResult {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let directory = workspace()?;
+    let root = directory.path();
+    write_large_fixture(root)?;
+    let _cleanup = StopOnDrop::new(root);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rift"))
+        .args(["server", "start", "--foreground"])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let serving = wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
+        serving_document(root)
+    })?;
+    assert_eq!(serving.pid, child.id(), "the child itself must serve");
+
+    // The document appears once the index publishes; the lexical commit of every unit
+    // runs behind that publication, so the stop lands while it runs.
+    let stopped = rift(root, &["server", "stop"])?;
+    require_success(&stopped, "stop during the lexical commit")?;
+
+    // `GONE_POLL_ATTEMPT_COUNT` probes at `POLL_INTERVAL` is the server's own stop bound.
+    // The process leaves once the log drain has stopped; that drain's last batch waits
+    // for the database write turn the transaction holds, under the drain's own deadline.
+    let status = wait_for(
+        GONE_POLL_ATTEMPT_COUNT,
+        "the stopped server's process to exit while its lexical commit runs",
+        || child.try_wait().ok().flatten(),
+    )?;
+    assert!(
+        status.success(),
+        "a stopped foreground server exits cleanly: {status:?}"
+    );
+    let output = child.wait_with_output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("MCP server stopped"),
+        "serving ended before the process left: {stderr}"
+    );
+    assert!(
+        !document_path(root).exists(),
+        "a graceful stop retires server.json"
+    );
+    Ok(())
+}
+
+#[test]
 fn concurrent_starts_agree_on_one_elected_server() -> TestResult {
     let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let directory = workspace()?;
@@ -424,6 +500,44 @@ fn stop_without_a_server_reports_and_discards_stale_state() -> TestResult {
     assert!(
         !document_path(root).exists(),
         "a stale document is discarded best effort"
+    );
+    Ok(())
+}
+
+/// A server that fails at startup exits before publishing: the start reports the
+/// exited child's pid and points at the stderr file that holds the refusal.
+#[test]
+fn start_reports_a_server_that_exits_before_publishing() -> TestResult {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+    // `[source] files` accepts at least 1,000; one file past it fails the build.
+    for index in 0..=1_000 {
+        let unit = root.join(format!("unit_{index:04}.rs"));
+        fs::write(unit, "pub fn beacon() {}\n")?;
+    }
+    let configuration =
+        format!("{SEMANTIC_DISABLED}[server]\nidle_timeout = \"60s\"\n[source]\nfiles = 1000\n");
+    fs::write(root.join("rift.toml"), configuration)?;
+
+    let started = rift(root, &["server", "start"])?;
+    let stderr = String::from_utf8_lossy(&started.stderr);
+    assert!(
+        !started.status.success(),
+        "a server that exits before publishing fails the start: {:?}",
+        stdout_of(&started)
+    );
+    assert!(stderr.contains("server_start_failed"), "{stderr:?}");
+    assert!(stderr.contains("exited before publishing"), "{stderr:?}");
+    assert!(
+        !document_path(root).exists(),
+        "the failed server published nothing"
+    );
+    let recorded = fs::read_to_string(stderr_file_path(root))?;
+    assert!(
+        recorded.contains("failed to start"),
+        "the stderr file carries the server's refusal: {recorded:?}"
     );
     Ok(())
 }

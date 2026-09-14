@@ -494,7 +494,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        LOG_QUEUE_RECORDS, PANIC_PAYLOAD_BYTES_MAX, RecordedFields, install_panic_hook,
+        LOG_QUEUE_RECORDS, PANIC_PAYLOAD_BYTES_MAX, RecordedFields, caused_by, install_panic_hook,
         log_capture, panic_payload, quoted,
     };
     use tracing::field::Visit;
@@ -747,6 +747,29 @@ mod tests {
         let cut = panic_payload(oversized.as_ref());
         assert!(cut.len() <= PANIC_PAYLOAD_BYTES_MAX);
         assert!(cut.chars().all(|character| character == 'é'));
+    }
+
+    #[test]
+    fn a_panic_payload_cut_moves_back_to_a_character_boundary() {
+        let three_byte_characters: Box<dyn std::any::Any + Send> =
+            Box::new("€".repeat(PANIC_PAYLOAD_BYTES_MAX));
+        let cut = panic_payload(three_byte_characters.as_ref());
+        assert_eq!(
+            cut.len(),
+            PANIC_PAYLOAD_BYTES_MAX - PANIC_PAYLOAD_BYTES_MAX % 3
+        );
+        assert!(cut.chars().all(|character| character == '€'));
+    }
+
+    #[test]
+    fn a_failure_renders_its_causes_after_its_own_text() {
+        let refused = rift_core::Error::new(crate::election::ElectionFault::Storage {
+            operation: "publish",
+            path: std::path::PathBuf::from(".rift/server.json"),
+            source: std::io::Error::other("disk full"),
+        });
+        assert_eq!(caused_by(&refused), ": disk full");
+        assert_eq!(caused_by(&std::io::Error::other("disk full")), "");
     }
 
     #[test]

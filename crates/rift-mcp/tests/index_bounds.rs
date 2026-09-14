@@ -1,12 +1,18 @@
 //! The bounds a large workspace meets first, proven through the served surface: the
 //! lexical index's `[search.lexical] units_max` key, the `[source] workspace_size` key,
-//! and one file a syntax provider refuses under its own bounds.
+//! one file a syntax provider refuses under its own bounds, one file the Contribution
+//! contract refuses, and the file bound on `search`'s `paths.force_include`.
 //!
-//! A workspace past `units_max` or `workspace_size` refuses to build naming the key and
-//! its maximum, and the same workspace under the default serves; lowering
-//! `workspace_size` on a served workspace rebuilds the index and refuses the next
-//! request the same way. A workspace holding one file past the syntax depth bound still
-//! answers `search` from its other file, with the deep file absent.
+//! A workspace past `workspace_size` refuses to build naming the key and its maximum, and
+//! the same workspace under the default serves; lowering `workspace_size` on a served
+//! workspace fails the rebuild, and the next request answers from the last snapshot with
+//! `stale_index` naming the key. A workspace past `units_max` serves, and `search` answers
+//! from identifier matching with `lexical_ranking_unavailable` naming the key and its
+//! maximum. A workspace holding one file past the syntax depth bound still answers
+//! `search` from its other file, with the deep file absent; a force-included file the
+//! Contribution contract refuses is left out the same way, and the answer names it. A
+//! `force_include` matching more files than its bound refuses naming the field, the bound,
+//! and the count.
 
 mod hermetic_search;
 #[allow(dead_code)]
@@ -14,10 +20,17 @@ mod workspace_client;
 
 use std::fs;
 
+use rift_core::constants::FORCE_INCLUDE_FILES_MAX;
 use rift_index::WorkspaceIndexLimits;
 use rift_mcp::RiftMcp;
 use serde_json::{Value, json};
-use workspace_client::{TestResult, served_workspace, tool_request};
+use workspace_client::{TestResult, served_root, served_workspace, tool_request};
+
+/// Polls of one served answer a test waits on before it gives up: two seconds, at
+/// [`ANSWER_POLL`] each.
+const ANSWER_ATTEMPTS_MAX: usize = 100;
+/// Wait between two polls of a served answer.
+const ANSWER_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Text files past `units_max = 1000`, one lexical unit each.
 const UNIT_FILE_COUNT: usize = 1_100;
@@ -78,8 +91,36 @@ async fn search_page(
         .ok_or_else(|| "search answers with structured content".into())
 }
 
+/// The `detail` of the first warning on `answer` whose code is `code`, when one is.
+fn warning_detail<'a>(answer: &'a Value, code: &str) -> Option<&'a str> {
+    answer["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|warning| warning["code"] == code)
+        .and_then(|warning| warning["detail"].as_str())
+}
+
+/// Polls `search` for `query` under a bound until `accept` takes the answer.
+async fn search_until(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    query: &str,
+    what: &str,
+    accept: impl Fn(&Value) -> bool,
+) -> TestResult<Value> {
+    let mut answer = search_page(client, query).await?;
+    for _attempt in 0..ANSWER_ATTEMPTS_MAX {
+        if accept(&answer) {
+            return Ok(answer);
+        }
+        tokio::time::sleep(ANSWER_POLL).await;
+        answer = search_page(client, query).await?;
+    }
+    Err(format!("{what}; the last answer was {answer:#}").into())
+}
+
 #[tokio::test]
-async fn a_workspace_past_units_max_refuses_to_build_naming_the_key() -> TestResult {
+async fn a_workspace_past_units_max_serves_and_search_names_the_key() -> TestResult {
     let directory = tempfile::tempdir()?;
     for (name, source) in unit_files() {
         fs::write(directory.path().join(name), source)?;
@@ -87,15 +128,28 @@ async fn a_workspace_past_units_max_refuses_to_build_naming_the_key() -> TestRes
     let mut configuration = hermetic_search::SEMANTIC_DISABLED.to_owned();
     configuration.push_str(UNITS_MAX_CONFIGURATION);
     fs::write(directory.path().join("rift.toml"), configuration)?;
+    let (client, server_task) = served_root(directory.path()).await?;
 
-    let refusal = match RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await {
-        Ok(_server) => return Err("a workspace past units_max must refuse to build".into()),
-        Err(error) => error.to_string(),
-    };
+    // The lexical commit runs behind the publication, so the store's refusal reaches the
+    // answer once the lane has run it; until then the answer names the commit it waits on.
+    let answer = search_until(
+        &client,
+        "beacon",
+        "the refused commit never reached search",
+        |answer| {
+            warning_detail(answer, "lexical_ranking_unavailable").is_some_and(|detail| {
+                detail.contains("units_max") && detail.contains("maximum 1000")
+            })
+        },
+    )
+    .await?;
     assert!(
-        refusal.contains("units_max") && refusal.contains("maximum 1000"),
-        "the refusal must name the key and its maximum: {refusal}"
+        hit_paths(&answer).contains(&"lib.rs"),
+        "identifier matching still answers: {answer:#}"
     );
+
+    client.cancel().await?;
+    server_task.await?;
     Ok(())
 }
 
@@ -137,6 +191,71 @@ async fn a_file_past_a_syntax_bound_is_left_out_and_the_rest_serves() -> TestRes
     Ok(())
 }
 
+/// A declaration named exactly `PROVIDER_SYMBOL_ID_BYTES_MAX` bytes: the document keeps
+/// it, and the identity minted from it passes the bound, so the Contribution contract
+/// refuses it when the file is published.
+fn wide_source() -> String {
+    format!(
+        "pub struct {};\n",
+        "S".repeat(rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX)
+    )
+}
+
+/// Whether one search answer names `path` in a `source_unavailable` warning.
+fn names_unavailable(answer: &Value, path: &str) -> bool {
+    let unit = format!("rift://file/{path}");
+    answer["warnings"].as_array().is_some_and(|warnings| {
+        warnings
+            .iter()
+            .any(|warning| warning["code"] == "source_unavailable" && warning["unit"] == unit)
+    })
+}
+
+/// `search` with `paths.force_include` naming a file the walk skipped and the Contribution
+/// contract refuses answers from the other file, with the refused file named in a
+/// `source_unavailable` warning, instead of failing the request. A plain search carries
+/// no such warning: the file is left out by the on-demand index alone.
+#[tokio::test]
+async fn a_force_included_file_the_contract_refuses_is_left_out_and_the_answer_warns() -> TestResult
+{
+    let wide = wide_source();
+    let (_directory, client, server_task) = served_workspace(
+        &[
+            (".gitignore", "src/wide.rs\n"),
+            ("src/lib.rs", "pub fn beacon() {}\n"),
+            ("src/wide.rs", wide.as_str()),
+        ],
+        None,
+    )
+    .await?;
+
+    let plain = search_page(&client, "beacon").await?;
+    assert!(hit_paths(&plain).contains(&"src/lib.rs"), "{plain:#}");
+    assert!(
+        !names_unavailable(&plain, "src/wide.rs"),
+        "the walk never reaches the ignored file: {plain:#}"
+    );
+
+    let forced = client
+        .call_tool(tool_request(
+            "search",
+            &json!({"query": "beacon", "paths": {"force_include": ["src/wide.rs"]}}),
+        ))
+        .await?;
+    let forced = forced
+        .structured_content
+        .ok_or("search answers with structured content")?;
+    assert!(hit_paths(&forced).contains(&"src/lib.rs"), "{forced:#}");
+    assert!(
+        names_unavailable(&forced, "src/wide.rs"),
+        "the answer names the refused file: {forced:#}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
 /// Text files whose bytes together pass the smallest `workspace_size` acceptance admits.
 const WORKSPACE_FILE_COUNT: usize = 17;
 
@@ -156,14 +275,6 @@ fn workspace_files() -> Vec<(String, String)> {
         (0..WORKSPACE_FILE_COUNT).map(|index| (format!("bulk-{index:02}.txt"), body.clone())),
     );
     files
-}
-
-/// The message of one refused tool call.
-fn refusal_message(error: rmcp::ServiceError) -> String {
-    match error {
-        rmcp::ServiceError::McpError(data) => data.message.into_owned(),
-        other => panic!("expected a protocol-level McpError, got {other:?}"),
-    }
 }
 
 #[tokio::test]
@@ -201,14 +312,15 @@ async fn the_same_workspace_serves_under_the_default_workspace_size_and_a_change
     let mut lowered = hermetic_search::SEMANTIC_DISABLED.to_owned();
     lowered.push_str(WORKSPACE_SIZE_CONFIGURATION);
     fs::write(directory.path().join("rift.toml"), lowered)?;
-    let refused = client
-        .call_tool(tool_request("search", &json!({"query": "beacon"})))
-        .await
-        .expect_err("the rebuild under the lowered bound refuses the request");
-    let message = refusal_message(refused);
+    // The rebuild under the lowered bound fails, and the read answers from the last
+    // snapshot with the failure rather than waiting for a rebuild that cannot land.
+    let stale = search_page(&client, "beacon").await?;
+    assert!(hit_paths(&stale).contains(&"lib.rs"), "{stale:#}");
+    let detail = warning_detail(&stale, "stale_index")
+        .ok_or_else(|| format!("the answer carries stale_index: {stale:#}"))?;
     assert!(
-        message.contains("source.workspace_size"),
-        "the refusal must name the key: {message}"
+        detail.contains("source.workspace_size") && detail.contains("maximum 16777216"),
+        "the warning must name the key and its maximum: {detail}"
     );
 
     // The restored file reaches the server through the filesystem watcher, so the
@@ -217,20 +329,71 @@ async fn the_same_workspace_serves_under_the_default_workspace_size_and_a_change
         directory.path().join("rift.toml"),
         hermetic_search::SEMANTIC_DISABLED,
     )?;
-    let mut recovered = false;
-    for _attempt in 0..100 {
-        if search_page(&client, "beacon")
-            .await
-            .is_ok_and(|answer| hit_paths(&answer).contains(&"lib.rs"))
-        {
-            recovered = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    search_until(
+        &client,
+        "beacon",
+        "the restored bound must serve the workspace again without a warning",
+        |answer| {
+            hit_paths(answer).contains(&"lib.rs") && warning_detail(answer, "stale_index").is_none()
+        },
+    )
+    .await?;
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// Text files below `extra/`, two past the file bound one `paths.force_include` may reach.
+const FORCE_INCLUDE_FILE_COUNT: usize = FORCE_INCLUDE_FILES_MAX + 2;
+
+/// One normal source file, a `.gitignore` leaving `extra/` out of the index, and
+/// `FORCE_INCLUDE_FILE_COUNT` one-line text files below it.
+fn force_include_files() -> Vec<(String, String)> {
+    let mut files = vec![
+        ("lib.rs".to_owned(), "pub fn beacon() {}\n".to_owned()),
+        (".gitignore".to_owned(), "extra/\n".to_owned()),
+    ];
+    files.extend((0..FORCE_INCLUDE_FILE_COUNT).map(|index| {
+        (
+            format!("extra/note-{index:04}.txt"),
+            format!("note {index}\n"),
+        )
+    }));
+    files
+}
+
+/// The wire `data` of one refused tool call.
+fn refusal_data(error: rmcp::ServiceError) -> Value {
+    match error {
+        rmcp::ServiceError::McpError(data) => data.data.expect("wire error data must be present"),
+        other => panic!("expected a protocol-level McpError, got {other:?}"),
     }
-    assert!(
-        recovered,
-        "the restored bound must serve the workspace again"
+}
+
+#[tokio::test]
+async fn a_force_include_past_its_file_bound_refuses_with_the_match_count_as_evidence() -> TestResult
+{
+    let files = force_include_files();
+    let (_directory, client, server_task) = served_workspace(&borrowed(&files), None).await?;
+
+    let refused = client
+        .call_tool(tool_request(
+            "search",
+            &json!({ "query": "note", "paths": { "force_include": ["extra/**"] } }),
+        ))
+        .await
+        .expect_err("a force_include past its file bound refuses the request");
+    let wire = refusal_data(refused);
+    assert_eq!(wire["code"], json!("limit_exceeded"), "{wire:#}");
+    assert_eq!(
+        wire["limit"],
+        json!({
+            "field": "paths.force_include",
+            "limit": FORCE_INCLUDE_FILES_MAX,
+            "required": FORCE_INCLUDE_FILE_COUNT
+        }),
+        "the refusal must carry typed wire evidence: {wire:#}"
     );
 
     client.cancel().await?;

@@ -17,7 +17,7 @@ Parameters:
 
 - `include` - Optional hit fields to attach: `source`, `history`.
 - `language` - Narrows the answer to one language.
-- `limit` - Most hits to return in one page, capped by `max_page_items`.
+- `limit` - Most hits to return in one page, at most 10,000; the server refuses a larger `limit` naming the field.
 - `name` (required) - The declaration name to look up - a name, not a full `SymbolId` or free-text query; `search` takes free text.
 - `page_index` - Zero-based page of the result set to serve, sized by `limit`.
 - `rev` - The version-control revision to read - a branch, tag, or commit id as the workspace's version control spells it.
@@ -196,7 +196,7 @@ results computed from another.
 Parameters:
 
 - `include` - Extra payload to attach to every hit.
-- `limit` - Most hits to return in one page.
+- `limit` - Most hits to return in one page, at most 10,000; the server refuses a larger `limit` naming the field.
 - `order` - Which total order the page comes back in.
 - `page_index` - Zero-based page of the result set to serve, sized by `limit`.
 - `paths` - Files eligible for the search, selected by project-relative globs.

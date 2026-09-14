@@ -80,25 +80,46 @@ fn cli_command() -> Command {
     Cli::command()
 }
 
+/// The process status a foreground server leaves with when its serving ended cleanly.
+const SERVED_EXIT_STATUS: i32 = 0;
+/// The process status a foreground server leaves with when its serving failed.
+const FAILED_EXIT_STATUS: i32 = 1;
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    let logs = cli
-        .records_logs()
-        .then(|| rift_mcp::logs_configuration(Path::new(".")));
-    let stderr = stderr_policy(cli.records_logs(), std::io::stderr().is_terminal());
+    let serves = cli.records_logs();
+    let logs = serves.then(|| rift_mcp::logs_configuration(Path::new(".")));
+    let stderr = stderr_policy(serves, std::io::stderr().is_terminal());
     let drain = initialize_tracing(logs.as_ref().map(|logs| logs.capture.as_str()), stderr);
     let retention_records = logs.map_or(0, |logs| logs.retention_records);
-    match run(cli, drain, retention_records).await {
+    let succeeded = match run(cli, drain, retention_records).await {
         Ok(Some(outcome)) => {
             println!("{outcome}");
-            ExitCode::SUCCESS
+            true
         }
-        Ok(None) => ExitCode::SUCCESS,
+        Ok(None) => true,
         Err(error) => {
             eprint!("{}", error.rendered());
-            ExitCode::FAILURE
+            false
         }
+    };
+    if serves {
+        // A foreground server's index build, a lane's pass, or a lexical transaction can
+        // still be running when serving ends. Returning would drop the runtime, and that
+        // drop waits for every `spawn_blocking` task to return and for every running task
+        // to yield, which nothing can cancel; the server's outcome is already printed, its
+        // log drain stopped, and its lock document retired, so the process leaves here.
+        std::process::exit(if succeeded {
+            SERVED_EXIT_STATUS
+        } else {
+            FAILED_EXIT_STATUS
+        });
+    }
+    if succeeded {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 

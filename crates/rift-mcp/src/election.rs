@@ -945,10 +945,8 @@ mod tests {
             port,
             ..valid_document()
         };
-        fs::write(
-            document_path(directory.path()),
-            serde_json::to_vec(&previous)?,
-        )?;
+        let previous_bytes = serde_json::to_vec(&previous)?;
+        fs::write(document_path(directory.path()), previous_bytes)?;
         let saved = fs::metadata(&state_directory)?.permissions();
         fs::set_permissions(&state_directory, fs::Permissions::from_mode(0o500))?;
 
@@ -1011,10 +1009,8 @@ mod tests {
         let directory = tempfile::tempdir()?;
         // `[source] files` accepts at least 1,000; one file past it fails the build.
         for index in 0..=1_000 {
-            fs::write(
-                directory.path().join(format!("unit_{index:04}.rs")),
-                "pub fn beacon() {}\n",
-            )?;
+            let unit = directory.path().join(format!("unit_{index:04}.rs"));
+            fs::write(unit, "pub fn beacon() {}\n")?;
         }
         crate::server::hermetic_workspace(directory.path(), "[source]\nfiles = 1000\n")?;
         let limits = rift_index::WorkspaceIndexLimits::default();

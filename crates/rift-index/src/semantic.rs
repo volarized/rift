@@ -7,8 +7,8 @@ use rift_binding::{
     UnitBindingFacts, assemble, resolve_all,
 };
 use rift_core::{
-    ContributionError, ContributionOrigin, ContributionReference, IndexRevision, ProviderId,
-    ProviderRevision, ProviderSymbolId, RevisionError, SourceRevision, SourceUnitId,
+    ContributionError, ContributionOrigin, ContributionReference, IndexRevision, ProjectPath,
+    ProviderId, ProviderRevision, ProviderSymbolId, RevisionError, SourceRevision, SourceUnitId,
     SourceUnitIdError, TreeRevision,
 };
 use rift_protocol::configuration::BindingConfiguration;
@@ -159,6 +159,9 @@ impl WorkspaceSemantics {
     /// an exhausted limit, a refused publication, a refused refinement - never fails
     /// the build: the revision publishes with the syntax publication alone and the
     /// failure lands in the server log.
+    ///
+    /// A document whose declarations the syntax publication refuses names itself in
+    /// the error, so the index can leave that one file out instead of failing the build.
     pub(crate) fn build_placed(
         documents: &[PlacedDocument<'_>],
         project_paths: &[&str],
@@ -178,7 +181,12 @@ impl WorkspaceSemantics {
             limits,
         )?;
         for placed in documents {
-            builder.add_document_placed(placed.document, &placed.placement)?;
+            builder
+                .add_document_placed(placed.document, &placed.placement)
+                .map_err(|error| WorkspaceSemanticError::Document {
+                    path: placed.document.path().clone(),
+                    error,
+                })?;
         }
         let publication = builder.build()?;
         let publications = PublicationSet::empty(limits).replaced(publication)?;
@@ -401,9 +409,37 @@ fn binding_units(
 pub(crate) enum WorkspaceSemanticError {
     Revision(RevisionError),
     Syntax(SyntaxPublicationError),
+    /// One document's declarations refused publication; `path` names the document,
+    /// so the index can leave that one file out instead of failing the build.
+    Document {
+        path: ProjectPath,
+        error: SyntaxPublicationError,
+    },
     Publication(PublicationError),
     Normalization(ContributionError),
     Binding(BindingError),
+}
+
+impl WorkspaceSemanticError {
+    /// The document whose declarations were refused, when the failure names one.
+    pub(crate) const fn document_path(&self) -> Option<&ProjectPath> {
+        match self {
+            Self::Document { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    /// The Contribution the syntax publication refused for one document, when that
+    /// is the failure.
+    pub(crate) const fn refused_contribution(&self) -> Option<&ContributionError> {
+        match self {
+            Self::Document {
+                error: SyntaxPublicationError::Contribution(error),
+                ..
+            } => Some(error),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for WorkspaceSemanticError {
@@ -411,6 +447,7 @@ impl fmt::Display for WorkspaceSemanticError {
         match self {
             Self::Revision(error) => error.fmt(formatter),
             Self::Syntax(error) => error.fmt(formatter),
+            Self::Document { path, error } => write!(formatter, "{}: {error}", path.as_str()),
             Self::Publication(error) => error.fmt(formatter),
             Self::Normalization(error) => error.fmt(formatter),
             Self::Binding(error) => error.fmt(formatter),
@@ -422,7 +459,7 @@ impl StdError for WorkspaceSemanticError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Revision(error) => Some(error),
-            Self::Syntax(error) => Some(error),
+            Self::Syntax(error) | Self::Document { error, .. } => Some(error),
             Self::Publication(error) => Some(error),
             Self::Normalization(error) => Some(error),
             Self::Binding(error) => Some(error),

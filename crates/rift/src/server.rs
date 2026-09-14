@@ -1098,7 +1098,8 @@ mod tests {
         StaleReason, StartMode, TailCount, await_election_released, await_serving, await_stopped,
         discard_stale_document, foreground_refused, holder_evidence, label, level_glyph, logs_mode,
         logs_query, logs_unavailable, now_ms, print_logs, rendered_fields, rendered_line,
-        rendered_timestamp, stale_reason_phrase, start_mode, status, stop, stop_log_drain,
+        rendered_timestamp, stale_reason_phrase, start_detached, start_mode, status, stop,
+        stop_log_drain,
     };
     use jiff::tz::{Offset, TimeZone};
     use rift_core::Error;
@@ -1683,6 +1684,37 @@ mod tests {
         );
         drop(guard);
         await_election_released(directory.path(), 4_242, 1).await?;
+        Ok(())
+    }
+
+    /// A holder that stopped answering its port is on its way out: the start waits for
+    /// it to release the election and refuses with its pid when it keeps the election.
+    #[tokio::test(start_paused = true)]
+    async fn start_waits_for_a_holder_whose_port_refuses_and_names_it_when_it_stays() -> TestResult
+    {
+        let directory = tempfile::tempdir()?;
+        let guard = rift_mcp::claim(directory.path())?;
+        guard.publish(&holder_on(dead_port()?))?;
+        let error = start_detached(directory.path())
+            .await
+            .expect_err("a holder that keeps the election past the stop window refuses the start");
+        let fault = error.fault();
+        let unreleased = matches!(fault, ServerCommandFault::ElectionUnreleased { pid: 4_242 });
+        assert!(unreleased, "{error:?}");
+        drop(guard);
+        Ok(())
+    }
+
+    /// A holder that has not published yet is a server still building: the start
+    /// answers that it is starting and spawns nothing.
+    #[tokio::test]
+    async fn start_reports_a_building_holder_as_starting() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let _guard = rift_mcp::claim(directory.path())?;
+        assert_eq!(
+            start_detached(directory.path()).await?,
+            ServerOutcome::Starting { pid: None }
+        );
         Ok(())
     }
 

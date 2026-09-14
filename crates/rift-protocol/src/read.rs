@@ -257,9 +257,11 @@ pub struct GetSymbolParams {
     /// `["source"]`; an explicit empty list carries neither.
     #[serde(default = "default_get_symbol_params_include")]
     pub include: Vec<GetSymbolInclude>,
-    /// Most hits to return in one page, capped by `max_page_items`.
+    /// Most hits to return in one page, at most 10,000; the server refuses a larger
+    /// `limit` naming the field. The server's result bound caps the set itself, and an
+    /// answer whose set reached it warns `results_truncated`.
     #[serde(default = "default_get_symbol_params_limit")]
-    #[schemars(range(min = 1_u64, max = 10_000_u64))]
+    #[schemars(range(min = 1_u64, max = PAGE_LIMIT_MAX))]
     pub limit: u64,
     /// Zero-based page of the result set to serve, sized by `limit`. A `page_index` past
     /// the last page returns an empty page whose `pagination` carries the requested
@@ -803,6 +805,9 @@ pub struct PackageIdentity {
 /// Default `page_index` for a paginated request: the first page.
 pub const PAGE_INDEX_DEFAULT: u64 = 0;
 
+/// Largest `limit` a paginated request may name; the server refuses a larger one.
+pub const PAGE_LIMIT_MAX: u64 = 10_000;
+
 /// Where one page sits in the full result set the request's `limit` divides.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -924,6 +929,20 @@ pub enum ReadWarning {
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
         detail: String,
+    },
+    /// The lexical ranking stopped at `matches_max` units; hits past it never reached the
+    /// page, whatever `paths` selects. Narrow `query`.
+    LexicalRankingTruncated {
+        /// Units the ranking stopped at: the server's bound on one lexical ranking.
+        matches_max: u64,
+    },
+    /// The result set reached `results_max` hits, the server's result bound, before
+    /// ordering and paging: hits past it never reach any page, and `total_pages` counts
+    /// only what fit. The warning means the bound was reached; a set of exactly
+    /// `results_max` hits carries it too. Narrow `query` or `paths`.
+    ResultsTruncated {
+        /// Hits the result set stopped at: the server's bound on one read's result set.
+        results_max: u64,
     },
     /// A claimed file is left out of the index - its bytes are not valid UTF-8, or it
     /// crosses a per-file bound - so it answers no search or lookup, and addressing it
@@ -1752,8 +1771,8 @@ pub struct TypeExpression {
 mod tests {
     use super::{
         Digest, Duration, FileId, GetSymbolParams, LANGUAGE_IDENTITY_PATTERN, Language,
-        PAGE_INDEX_DEFAULT, PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning, RevisionId,
-        RevisionIdViolation, SearchScope, SourceUnitId, Symbol, SymbolId,
+        PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX, PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning,
+        RevisionId, RevisionIdViolation, SearchScope, SourceUnitId, Symbol, SymbolId,
     };
     use schemars::schema_for;
     use serde_json::json;
@@ -1783,6 +1802,17 @@ mod tests {
         assert_eq!(
             schema["properties"]["page_index"]["default"],
             json!(PAGE_INDEX_DEFAULT)
+        );
+    }
+
+    /// The schema's `maximum` on `limit` and `accepted_limit`'s refusal both read
+    /// `PAGE_LIMIT_MAX`; this pins the advertised maximum to that one constant.
+    #[test]
+    fn get_symbol_params_schema_limit_maximum_equals_the_enforced_constant() {
+        let schema = serde_json::to_value(schema_for!(GetSymbolParams)).expect("schema");
+        assert_eq!(
+            schema["properties"]["limit"]["maximum"],
+            json!(PAGE_LIMIT_MAX)
         );
     }
 
@@ -2144,6 +2174,24 @@ mod tests {
     }
 
     #[test]
+    fn the_lexical_truncation_warning_round_trips_under_its_code_tag() {
+        let warning = ReadWarning::LexicalRankingTruncated { matches_max: 1_000 };
+        let wire = json!({ "code": "lexical_ranking_truncated", "matches_max": 1_000 });
+        assert_eq!(serde_json::to_value(&warning).expect("serialize"), wire);
+        let parsed: ReadWarning = serde_json::from_value(wire).expect("deserialize");
+        assert_eq!(parsed, warning);
+    }
+
+    #[test]
+    fn the_results_truncation_warning_round_trips_under_its_code_tag() {
+        let warning = ReadWarning::ResultsTruncated { results_max: 1_000 };
+        let wire = json!({ "code": "results_truncated", "results_max": 1_000 });
+        assert_eq!(serde_json::to_value(&warning).expect("serialize"), wire);
+        let parsed: ReadWarning = serde_json::from_value(wire).expect("deserialize");
+        assert_eq!(parsed, warning);
+    }
+
+    #[test]
     fn the_read_warning_schema_advertises_every_tier_warning() {
         let schema = serde_json::to_value(schema_for!(ReadWarning)).expect("warning schema");
         let arms = schema["oneOf"].as_array().cloned().unwrap_or_default();
@@ -2156,6 +2204,8 @@ mod tests {
             "semantic_index_preparing",
             "semantic_ranking_unavailable",
             "lexical_ranking_unavailable",
+            "lexical_ranking_truncated",
+            "results_truncated",
             "source_unavailable",
             "symbol_disagreement",
             "dependency_index_pending",
