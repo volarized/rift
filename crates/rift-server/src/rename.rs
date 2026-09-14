@@ -38,7 +38,7 @@ use rift_syntax::SyntaxSymbol;
 use crate::change::{SymbolAddress, SymbolResolution, parse_symbol_address, resolve_symbol};
 use crate::engine::{EnginePool, EngineSlot};
 use crate::read::{ReadError, ReadFault, ReadService, digest_hex8, file_id};
-use crate::rewrite::REWRITE_FILE_BYTES_MAX;
+use crate::rewrite::{EngineRewrite, REWRITE_FILE_BYTES_MAX};
 
 /// Most files one engine rename proposal may rewrite.
 pub const RENAME_FILES_MAX: usize = 64;
@@ -72,6 +72,12 @@ impl RenamePlan {
             symbol: self.symbol.clone(),
         }]
     }
+
+    /// Every rewrite this plan lands. The engine wrote all of it, so the
+    /// change lane judges each one against both images before it writes.
+    pub(crate) fn engine_rewrites(&self) -> Vec<EngineRewrite<'_>> {
+        self.rewrites.iter().map(EngineRewrite::from).collect()
+    }
 }
 
 /// One file's rewrite: the bytes the plan was compiled against, and the
@@ -81,6 +87,16 @@ pub(crate) struct PlannedRewrite {
     pub(crate) path: CoreProjectPath,
     pub(crate) base_source: String,
     pub(crate) next_source: String,
+}
+
+impl<'plan> From<&'plan PlannedRewrite> for EngineRewrite<'plan> {
+    fn from(rewrite: &'plan PlannedRewrite) -> Self {
+        Self {
+            path: &rewrite.path,
+            base_source: &rewrite.base_source,
+            next_source: &rewrite.next_source,
+        }
+    }
 }
 
 /// What planning decided: a plan ready for the change lane, or the refusal
@@ -537,9 +553,14 @@ fn root_conversion_failed(operation: &'static str, error: &UriError) -> PlanEnd 
 }
 
 /// Compiles per-file text edits into whole-file rewrites, dropping a file
-/// whose edits change nothing. Each rewrite writes its file whole and
-/// carries the regions the engine's own edits named, which is what the
-/// result reports.
+/// whose edits change nothing.
+///
+/// A compiled rewrite whose next source equals its base is no rewrite at
+/// all: the file is not written, not proven against the disk, and not
+/// reparsed, so an edit that lands a file's own bytes back never reports
+/// the findings that file already carried. Each surviving rewrite writes
+/// its file whole and carries the regions the engine's own edits named,
+/// which is what the result reports.
 pub(crate) async fn compiled_rewrites(
     workspace_root: &Path,
     documents: Vec<(CoreProjectPath, Vec<TextEdit>)>,
@@ -862,22 +883,41 @@ fn converted_offset(
 }
 
 /// Findings for word-boundary occurrences of the old name that survive in
-/// the changed tree, bounded by files, bytes, and finding count.
+/// the changed tree.
 ///
-/// The changed tree is the served snapshot's visible file set with each
-/// rewritten file's new bytes substituted: a rename rewrites existing
-/// files and never creates one, so the set is exact and no fresh scan
-/// races the publish.
+/// A rename rewrites existing files and never creates one, so the swept set
+/// is exact.
 pub(crate) fn survivor_findings(reads: &ReadService, plan: &RenamePlan) -> Vec<Diagnostic> {
     let rewritten: BTreeMap<&CoreProjectPath, &str> = plan
         .rewrites
         .iter()
         .map(|rewrite| (&rewrite.path, rewrite.next_source.as_str()))
         .collect();
-    let mut findings = Vec::new();
+    surviving_occurrences(reads, &rewritten, &plan.old_name)
+        .iter()
+        .map(|(path, offset)| survivor_diagnostic(&plan.old_name, path, *offset))
+        .collect()
+}
+
+/// Word-boundary occurrences of `name` that survive one applied change, as
+/// the file holding each one and its byte offset.
+///
+/// The changed tree is the served snapshot's visible file set with each
+/// rewritten file's new bytes substituted, so no fresh scan races the
+/// publication; a file the change left nothing at substitutes empty bytes.
+/// `rename_symbol` sweeps for the declaration's old name and `move_file`
+/// for the moved file's old path, under the same three bounds:
+/// [`RENAME_SWEEP_FILES_MAX`], [`RENAME_SWEEP_BYTES_MAX`], and
+/// [`RENAME_SWEEP_FINDINGS_MAX`].
+pub(crate) fn surviving_occurrences(
+    reads: &ReadService,
+    rewritten: &BTreeMap<&CoreProjectPath, &str>,
+    name: &str,
+) -> Vec<(CoreProjectPath, usize)> {
+    let mut found: Vec<(CoreProjectPath, usize)> = Vec::new();
     let mut scanned_bytes: usize = 0;
     for file in reads.index().files().take(RENAME_SWEEP_FILES_MAX) {
-        if findings.len() >= RENAME_SWEEP_FINDINGS_MAX || scanned_bytes >= RENAME_SWEEP_BYTES_MAX {
+        if found.len() >= RENAME_SWEEP_FINDINGS_MAX || scanned_bytes >= RENAME_SWEEP_BYTES_MAX {
             break;
         }
         let text = rewritten
@@ -885,12 +925,12 @@ pub(crate) fn survivor_findings(reads: &ReadService, plan: &RenamePlan) -> Vec<D
             .copied()
             .unwrap_or_else(|| file.source());
         scanned_bytes = scanned_bytes.saturating_add(text.len());
-        let remaining = RENAME_SWEEP_FINDINGS_MAX - findings.len();
-        for offset in word_boundary_occurrences(text, &plan.old_name, remaining) {
-            findings.push(survivor_diagnostic(&plan.old_name, file.path(), offset));
+        let remaining = RENAME_SWEEP_FINDINGS_MAX - found.len();
+        for offset in word_boundary_occurrences(text, name, remaining) {
+            found.push((file.path().clone(), offset));
         }
     }
-    findings
+    found
 }
 
 /// Byte offsets where `name` occurs in `text` between word boundaries, at
@@ -1616,6 +1656,74 @@ mod tests {
             RENAME_SWEEP_FINDINGS_MAX,
             "findings stop at the bound before the sweep reaches zed.rs"
         );
+    }
+
+    #[tokio::test]
+    async fn a_no_op_edit_beside_a_real_one_compiles_the_real_file_alone() {
+        let (directory, _reads) = workspace(&[
+            ("lib.rs", "pub fn beacon() {}\n"),
+            ("main.rs", "fn main() { beacon(); }\n"),
+        ]);
+        let documents = vec![
+            (project_path("lib.rs"), vec![edit((0, 7), (0, 13), "flare")]),
+            (
+                project_path("main.rs"),
+                vec![edit((0, 12), (0, 18), "beacon")],
+            ),
+        ];
+        let rewrites = compiled_rewrites(
+            directory.path(),
+            documents,
+            PositionEncoding::Utf8,
+            &plain_context(),
+        )
+        .await
+        .expect("the proposal compiles");
+        assert_eq!(
+            rewrites.len(),
+            1,
+            "only the file whose bytes changed is written, witnessed, and reparsed"
+        );
+        assert_eq!(rewrites[0].path.as_str(), "lib.rs");
+        assert_eq!(rewrites[0].next_source, "pub fn flare() {}\n");
+    }
+
+    #[tokio::test]
+    async fn a_proposal_of_only_no_op_edits_refuses_as_one_proposing_none() {
+        let (directory, reads) = workspace(&[("lib.rs", "pub fn beacon() {}\n")]);
+        let roots =
+            engine_roots(directory.path(), reads.dependency_catalog()).expect("fixture roots");
+        let document = roots
+            .tree()
+            .document_uri(&project_path("lib.rs"))
+            .expect("fixture uri composes");
+        let proposal = changes_proposal(vec![(document, vec![edit((0, 7), (0, 13), "beacon")])]);
+        let target = RenameTarget {
+            path: project_path("lib.rs"),
+            language: Language::from_identity_segment("rust").expect("rust is a served language"),
+            old_name: "beacon".to_owned(),
+            name_offset: 7,
+            indexed_source: "pub fn beacon() {}\n".to_owned(),
+        };
+        let refused = refusal(
+            compiled_plan(
+                directory.path(),
+                reads.dependency_catalog(),
+                &proposal,
+                PositionEncoding::Utf8,
+                1,
+                &address(),
+                &target,
+            )
+            .await
+            .expect_err("a proposal that changes no bytes refuses"),
+        );
+        assert_eq!(refusal_reason(&refused), RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            first_precondition_kind(&refused),
+            OperationPreconditionKind::EngineProposedEdits
+        );
+        assert_eq!(refusal_detail(&refused), "the engine proposed no edits");
     }
 
     #[test]
