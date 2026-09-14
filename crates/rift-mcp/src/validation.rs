@@ -274,7 +274,10 @@ pub(crate) struct IndexValidation {
     /// workspace. The workspace's own file bound: retaining more paths than the workspace
     /// may hold files is a whole rebuild by another name.
     paths_max: usize,
-    pub(crate) source_policy: SyncRwLock<Option<Arc<WorkspaceSourcePolicy>>>,
+    /// The current publication as event classification sees it: the inclusion policy
+    /// the index was built under, and the index itself for what it holds. Absent before
+    /// the first publication, when every event asks for the whole workspace anyway.
+    pub(crate) published: SyncRwLock<Option<Arc<PublishedWorkspace>>>,
     pub(crate) cancellation: CancellationToken,
     pub(crate) task: AsyncMutex<Option<JoinHandle<()>>>,
     /// Whether the index supervisor is still running.
@@ -595,7 +598,7 @@ impl IndexValidation {
                 changed: Arc::new(Notify::new()),
                 publication_lane: SyncMutex::new(PendingWork::default()),
                 paths_max,
-                source_policy: SyncRwLock::new(None),
+                published: SyncRwLock::new(None),
                 cancellation: CancellationToken::new(),
                 task: AsyncMutex::new(None),
             }),
@@ -696,21 +699,22 @@ impl IndexValidation {
         self.observed_epoch.load(Ordering::SeqCst)
     }
 
-    /// Installs event inclusion policy under publication linearization.
+    /// Installs one publication under publication linearization.
     #[cfg(test)]
-    fn install_source_policy(&self, policy: Arc<WorkspaceSourcePolicy>) {
+    fn install_publication(&self, published: &Arc<PublishedWorkspace>) {
         let publication = self.locked_pending();
-        self.replace_source_policy_locked(policy);
+        self.replace_publication_locked(published);
         drop(publication);
     }
 
-    /// Replaces event inclusion policy while caller owns publication lane.
-    fn replace_source_policy_locked(&self, policy: Arc<WorkspaceSourcePolicy>) {
+    /// Replaces the publication event classification answers from, while the caller
+    /// owns the publication lane.
+    fn replace_publication_locked(&self, published: &Arc<PublishedWorkspace>) {
         let mut current = self
-            .source_policy
+            .published
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *current = Some(policy);
+        *current = Some(Arc::clone(published));
     }
 
     /// Classifies and observes one event within the publication critical section, so the
@@ -733,33 +737,62 @@ impl IndexValidation {
         result
     }
 
+    /// The publication event classification answers from, absent before the first one.
+    fn current_publication(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, Option<Arc<PublishedWorkspace>>> {
+        self.published
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// The project path one event path names, under the current inclusion policy.
     fn source_project_path(&self, path: &Path) -> Option<ProjectPath> {
-        let current = self
+        self.current_publication()
+            .as_ref()?
             .source_policy
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        current.as_ref()?.project_path(path)
+            .project_path(path)
     }
 
     /// Returns whether current policy includes one source event path.
     fn source_path_is_relevant(&self, path: &Path) -> bool {
-        let current = self
-            .source_policy
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        current.as_ref().is_none_or(|policy| policy.visible(path))
+        self.current_publication()
+            .as_ref()
+            .is_none_or(|published| published.source_policy.visible(path))
     }
 
     /// Returns whether current policy can include source below one directory.
     fn source_directory_is_relevant(&self, path: &Path) -> bool {
-        let current = self
-            .source_policy
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        current
+        self.current_publication()
             .as_ref()
-            .is_none_or(|policy| policy.may_include_descendant(path))
+            .is_none_or(|published| published.source_policy.may_include_descendant(path))
+    }
+
+    /// Whether the current publication holds at least one file below one event path.
+    ///
+    /// A path outside the policy's root, or one observed before the first publication,
+    /// holds nothing the index knows about.
+    fn published_holds_files_below(&self, path: &Path) -> bool {
+        let current = self.current_publication();
+        let Some(published) = current.as_ref() else {
+            return false;
+        };
+        published
+            .source_policy
+            .project_path(path)
+            .is_some_and(|directory| published.reads.holds_files_below(&directory))
+    }
+
+    /// Whether one watched path is the workspace's own configuration file.
+    ///
+    /// Before the first publication there is no policy to normalize through, so the
+    /// raw spelling decides; afterwards the policy answers, which is what makes the
+    /// comparison hold on a platform whose temporary root is a symlink.
+    fn is_workspace_configuration(&self, root: &Path, path: &Path) -> bool {
+        self.current_publication().as_ref().map_or_else(
+            || path == root.join(WORKSPACE_CONFIGURATION_FILE),
+            |published| published.source_policy.is_workspace_configuration(path),
+        )
     }
 
     /// Whether writing this path changes what the workspace includes.
@@ -767,33 +800,13 @@ impl IndexValidation {
     /// Before the first publication installs a policy there is nothing to ask, so only the
     /// root `rift.toml` and a `.gitignore` are taken as inclusion deciders; a published
     /// policy answers for its own root spellings and excluded directories.
-    /// Whether one watched path is the workspace's own configuration file.
-    ///
-    /// Before the first publication there is no policy to normalize through, so the
-    /// raw spelling decides; afterwards the policy answers, which is what makes the
-    /// comparison hold on a platform whose temporary root is a symlink.
-    fn is_workspace_configuration(&self, root: &Path, path: &Path) -> bool {
-        let current = self
-            .source_policy
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        current.as_ref().map_or_else(
-            || path == root.join(WORKSPACE_CONFIGURATION_FILE),
-            |policy| policy.is_workspace_configuration(path),
-        )
-    }
-
     pub(crate) fn decides_inclusion(&self, root: &Path, path: &Path) -> bool {
-        let current = self
-            .source_policy
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        current.as_ref().map_or_else(
+        self.current_publication().as_ref().map_or_else(
             || {
                 path == root.join(WORKSPACE_CONFIGURATION_FILE)
                     || path.file_name() == Some(std::ffi::OsStr::new(VCS_IGNORE_FILE))
             },
-            |policy| policy.decides_inclusion(path),
+            |published| published.source_policy.decides_inclusion(path),
         )
     }
 }
@@ -971,6 +984,13 @@ pub(crate) fn hard_floor_includes_watch_path(root: &Path, path: &Path) -> bool {
 /// A policy file rewrites what the workspace includes and a directory event can add or
 /// drop many files at once, so both ask for the whole workspace. Only a path that is
 /// itself a visible file narrows the next rebuild to that file.
+///
+/// A name event on an extensionless path asks for the whole workspace only when the
+/// path names a directory the index can hold files under: one on disk right now, or one
+/// the publication holds files below, as a directory renamed away is. The server's own
+/// writes stage each file as an extensionless temporary file beside its target and
+/// rename it over the target; the publication holds nothing under that staging name, so
+/// its name event takes the per-path route a file event takes.
 pub(crate) fn watch_path_impact(
     root: &Path,
     validation: &IndexValidation,
@@ -1001,11 +1021,9 @@ pub(crate) fn watch_path_impact(
             WatchImpact::None
         };
     }
-    let possible_directory =
-        path.extension().is_none() && validation.source_directory_is_relevant(path);
     let reshapes_tree = match kind {
         EventKind::Modify(ModifyKind::Name(_)) | EventKind::Any | EventKind::Other => {
-            possible_directory
+            names_a_directory(validation, path)
         }
         EventKind::Create(_)
         | EventKind::Remove(_)
@@ -1023,6 +1041,21 @@ pub(crate) fn watch_path_impact(
         .map_or(WatchImpact::WholeWorkspace, |path| {
             WatchImpact::Paths(vec![path])
         })
+}
+
+/// Whether one event path names a directory the index can hold files under: an
+/// extensionless path the policy may include descendants of, that is a directory on
+/// disk right now or that the current publication holds files below.
+///
+/// The disk probe is the one filesystem read event classification makes: a renamed
+/// directory's new spelling is known to the disk alone, and its old spelling to the
+/// publication alone.
+fn names_a_directory(validation: &IndexValidation, path: &Path) -> bool {
+    let extensionless = path.extension().is_none();
+    if !extensionless || !validation.source_directory_is_relevant(path) {
+        return false;
+    }
+    path.is_dir() || validation.published_holds_files_below(path)
 }
 
 /// Builds the first snapshot while rejecting concurrent filesystem movement, and returns
@@ -1115,7 +1148,7 @@ pub(crate) async fn initial_workspace_with(
                 drop(publication);
                 continue;
             }
-            validation.replace_source_policy_locked(Arc::clone(&built.source_policy));
+            validation.replace_publication_locked(&built);
             drop(publication);
             tracing::info!(
                 component = "index",
@@ -2390,13 +2423,12 @@ pub(crate) fn publish_rebuild_after(
         return RebuildOutcome::Cancelled;
     }
     let observed_epoch = validation.observed_epoch();
-    let source_policy = Arc::clone(&candidate.source_policy);
     let publishing = Arc::clone(&candidate);
     // IndexState::publish owns the still-current check, so a superseded
     // candidate is rejected in exactly one place.
     let published = state.publish(candidate, observed_epoch);
     if published {
-        validation.replace_source_policy_locked(source_policy);
+        validation.replace_publication_locked(&publishing);
         if let Some(handoff) = lexical {
             handoff.hand_over(publishing);
         }
@@ -2630,13 +2662,12 @@ mod tests {
 
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
     use notify::{Event, EventKind};
-    use rift_core::{SourceVisibility, TextFileInclusion};
-    use rift_index::{
-        LexicalChange, LexicalIndexLimits, WorkspaceIndexLimits, WorkspaceSourcePolicy,
-    };
+    use rift_core::SourceVisibility;
+    use rift_index::{LexicalChange, LexicalIndexLimits, WorkspaceIndexLimits};
+    use rift_protocol::change::{ChangeResult, PatchParams};
     use rift_protocol::configuration::ServerConfiguration;
     use rift_search::{RevisionScoped, SearchIndex, SearchIndexLimits, SemanticReadiness};
-    use rift_server::{LspProcessKey, ReadFault};
+    use rift_server::{ChangeService, LspProcessKey, ReadFault};
     use tokio::sync::{Barrier as AsyncBarrier, RwLock};
     use tokio_util::sync::CancellationToken;
     use tracing_subscriber::layer::SubscriberExt as _;
@@ -2792,20 +2823,17 @@ mod tests {
         fs::create_dir_all(directory.path().join("examples"))?;
         fs::create_dir_all(directory.path().join("target"))?;
         fs::write(directory.path().join(".gitignore"), "src/ignored.rs\n")?;
-        let visibility = SourceVisibility::new(
-            vec!["src/**".to_owned()],
-            vec!["src/generated/**".to_owned()],
-            true,
-        );
-        let policy = WorkspaceSourcePolicy::build(
-            &watched_root,
-            WorkspaceIndexLimits::default(),
-            &visibility,
-            &TextFileInclusion::default(),
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[source]\n\
+             include = [\"src/**\"]\n\
+             exclude = [\"src/generated/**\"]\n\
+             respect_gitignore = true\n",
         )?;
+        let current = stable_candidate(&watched_root, 0)?;
         let (validation, _invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        validation.install_source_policy(Arc::new(policy));
+        validation.install_publication(&current);
         let event = |kind, path: &str| Event::new(kind).add_path(event_root.join(path));
 
         let source_path = |path: &str| -> TestResult<super::WatchImpact> {
@@ -2950,7 +2978,7 @@ mod tests {
         }));
         let (validation, invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        validation.install_source_policy(Arc::clone(&before.source_policy));
+        validation.install_publication(&before);
         fs::write(directory.path().join("lib.rs"), "pub fn after() {}\n")?;
         fs::write(
             directory.path().join("rift.toml"),
@@ -3018,14 +3046,16 @@ mod tests {
         let state = fixture.state.blocking_read();
         assert_workspace_identity(&state.current, &fixture.after);
         drop(state);
-        let policy = fixture
+        let published = fixture
             .validation
-            .source_policy
+            .published
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(Arc::ptr_eq(
-            policy.as_ref().expect("policy must be published"),
-            &fixture.after.source_policy
+            published
+                .as_ref()
+                .expect("the publication must be installed"),
+            &fixture.after
         ));
     }
 
@@ -3110,7 +3140,7 @@ mod tests {
         });
         let (validation, _invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        validation.install_source_policy(Arc::clone(&before.source_policy));
+        validation.install_publication(&before);
         assert_eq!(validation.observe_whole_workspace()?, 1);
         assert_eq!(validation.observe_whole_workspace()?, 2);
         assert_eq!(
@@ -3120,17 +3150,17 @@ mod tests {
         let state_snapshot = state.blocking_read();
         assert_workspace_identity(&state_snapshot.current, &before);
         drop(state_snapshot);
-        let source_policy = validation
-            .source_policy
+        let published = validation
+            .published
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(Arc::ptr_eq(
-            source_policy
+            published
                 .as_ref()
-                .expect("policy must remain installed"),
-            &before.source_policy
+                .expect("the publication must remain installed"),
+            &before
         ));
-        drop(source_policy);
+        drop(published);
         assert!(!record_rebuild_failure(
             &state,
             &validation,
@@ -3171,15 +3201,10 @@ mod tests {
         let watched_root = directory.path().join(".");
         let event_root = directory.path().canonicalize()?;
         fs::create_dir_all(directory.path().join("src"))?;
-        let policy = WorkspaceSourcePolicy::build(
-            &watched_root,
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &TextFileInclusion::default(),
-        )?;
+        let current = stable_candidate(&watched_root, 0)?;
         let (validation, _invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        validation.install_source_policy(Arc::new(policy));
+        validation.install_publication(&current);
         let event = |kind, path: &str| Event::new(kind).add_path(event_root.join(path));
 
         assert_eq!(
@@ -3230,15 +3255,10 @@ mod tests {
         let watched_root = directory.path().join(".");
         let event_root = directory.path().canonicalize()?;
         fs::create_dir_all(directory.path().join("src"))?;
-        let policy = WorkspaceSourcePolicy::build(
-            &watched_root,
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &TextFileInclusion::default(),
-        )?;
+        let current = stable_candidate(&watched_root, 0)?;
         let (validation, _invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        validation.install_source_policy(Arc::new(policy));
+        validation.install_publication(&current);
         let renamed = Event::new(EventKind::Modify(ModifyKind::Name(
             notify::event::RenameMode::Both,
         )))
@@ -3252,6 +3272,159 @@ mod tests {
                 rift_core::ProjectPath::new("src/after.rs")?,
             ]),
             "a rename reports both spellings, and both are read again"
+        );
+        Ok(())
+    }
+
+    /// One publication over `root`, installed as what event classification answers from.
+    fn installed_publication(
+        root: &std::path::Path,
+    ) -> TestResult<(Arc<IndexValidation>, Arc<PublishedWorkspace>)> {
+        let current = stable_candidate(root, 0)?;
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        validation.install_publication(&current);
+        Ok((validation, current))
+    }
+
+    /// One name event on `path` below `root`, as a rename reaches the watcher.
+    fn name_event(root: &std::path::Path, path: &str) -> Event {
+        Event::new(EventKind::Modify(ModifyKind::Name(
+            notify::event::RenameMode::Any,
+        )))
+        .add_path(root.join(path))
+    }
+
+    #[test]
+    fn a_name_event_on_an_absent_extensionless_path_names_that_path() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        let event_root = directory.path().canonicalize()?;
+        let (validation, _current) = installed_publication(directory.path())?;
+        let staged = name_event(&event_root, ".tmpk3v9q2");
+
+        assert_eq!(
+            super::watch_event_impact(&event_root, &validation, &staged),
+            super::WatchImpact::Paths(vec![rift_core::ProjectPath::new(".tmpk3v9q2")?]),
+            "the publisher renames an extensionless staged file over its target; the \
+             publication holds nothing under that name, so the event names the path alone"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_name_event_on_a_directory_the_publication_holds_files_below_asks_for_the_workspace()
+    -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        let event_root = directory.path().canonicalize()?;
+        let (validation, _current) = installed_publication(directory.path())?;
+        fs::rename(directory.path().join("src"), directory.path().join("attic"))?;
+        let renamed_away = name_event(&event_root, "src");
+
+        assert_eq!(
+            super::watch_event_impact(&event_root, &validation, &renamed_away),
+            super::WatchImpact::WholeWorkspace,
+            "a directory renamed away is gone from the disk, and the publication still \
+             holds src/lib.rs below its old spelling"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_name_event_on_a_directory_on_disk_asks_for_the_workspace() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let event_root = directory.path().canonicalize()?;
+        let (validation, _current) = installed_publication(directory.path())?;
+        fs::create_dir_all(directory.path().join("examples"))?;
+        let moved_in = name_event(&event_root, "examples");
+
+        assert_eq!(
+            super::watch_event_impact(&event_root, &validation, &moved_in),
+            super::WatchImpact::WholeWorkspace,
+            "a directory the publication holds nothing under is still one on disk, and \
+             what moved in with it is unknown"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_name_event_on_an_extensionless_file_the_publication_holds_names_that_path() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("LICENSE"), "beacon\n")?;
+        let event_root = directory.path().canonicalize()?;
+        let (validation, _current) = installed_publication(directory.path())?;
+        let renamed = name_event(&event_root, "LICENSE");
+
+        assert_eq!(
+            super::watch_event_impact(&event_root, &validation, &renamed),
+            super::WatchImpact::Paths(vec![rift_core::ProjectPath::new("LICENSE")?]),
+            "a file the publication holds is read again by itself, whatever its name"
+        );
+        Ok(())
+    }
+
+    /// Waits under a bound until the pending work names `path`, or escalated to the
+    /// whole workspace, whichever the watcher's events produce first.
+    async fn path_pending_within_bound(
+        validation: &IndexValidation,
+        path: &rift_core::ProjectPath,
+    ) -> bool {
+        for _attempt in 0..LANE_ATTEMPTS_MAX {
+            let observed = {
+                let pending = validation.locked_pending();
+                pending.covers_whole_workspace() || pending.paths().any(|held| held == path)
+            };
+            if observed {
+                return true;
+            }
+            tokio::time::sleep(LANE_POLL).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_change_the_publisher_lands_keeps_the_next_batch_incremental() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let current = stable_candidate(directory.path(), 0)?;
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        validation.install_publication(&current);
+        let _watcher = super::workspace_watcher(directory.path(), &validation)
+            .map_err(|error| format!("watcher must start: {error:?}"))?;
+        let patch = "--- /dev/null\n+++ b/notes.md\n@@ -0,0 +1 @@\n+staged through the publisher\n";
+        let params = PatchParams {
+            patch: patch.into(),
+        };
+        let landed = ChangeService::new(directory.path()).patch(&current.reads, &params)?;
+        assert!(
+            matches!(landed, ChangeResult::Applied { .. }),
+            "the patch must land: {landed:?}"
+        );
+        let notes = rift_core::ProjectPath::new("notes.md")?;
+        assert!(
+            path_pending_within_bound(&validation, &notes).await,
+            "the watcher must report the landed write"
+        );
+
+        let mut request = validation.take_pending();
+        assert!(
+            !request.work.covers_whole_workspace(),
+            "a landed write names its own paths, the staged file's included: {:?}",
+            request.work
+        );
+        request.previous = Some(Arc::clone(&current));
+        let change_set = request.change_set(directory.path(), &current.configuration);
+        let ChangeSet::Incremental(changes) = change_set else {
+            return Err("a landed write resolves to an incremental change set".into());
+        };
+        assert!(
+            changes.paths().any(|path| path == &notes),
+            "the change set names the written file"
         );
         Ok(())
     }

@@ -582,6 +582,16 @@ impl ReadService {
         self.index.digest(path)
     }
 
+    /// Whether this snapshot holds at least one file below `directory`, the files it
+    /// left out included.
+    ///
+    /// A filesystem event names a path, and whether that path is a directory the index
+    /// holds files under decides whether one file or the whole workspace is read again.
+    #[must_use]
+    pub fn holds_files_below(&self, directory: &CoreProjectPath) -> bool {
+        self.index.holds_files_below(directory)
+    }
+
     /// Builds the next snapshot by reading only the paths `changes` names, sharing every
     /// other file with this one.
     ///
