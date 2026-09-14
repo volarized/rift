@@ -68,26 +68,30 @@ export for example.
 
 Startup runs one cycle:
 
-1. Parse `rift.toml` and accept the workspace; an invalid file keeps the server running but
+1. Take the exclusive file lock on `.rift/server.lock`, which picks one starter among racing
+   `rift mcp` processes, and hold it until the process exits.
+2. Parse `rift.toml` and accept the workspace; an invalid file keeps the server running but
    refuses every request until fixed.
-2. Take the exclusive file lock on `.rift/server.lock`, which picks one starter among racing
-   `rift mcp` processes.
-3. Bind the first free loopback port of the accepted
+3. Start the native filesystem watcher.
+4. Run the initial scan and parse on a Tokio-managed blocking task, so traversal and parsing
+   never occupy an async MCP worker.
+5. Bind the first free loopback port of the accepted
    [`[server]` selection](/docs/configuration#server) - the pinned `port` or the configured
    `port_range` - mint the bearer token, and write both into `.rift/server.json`.
-4. Start the native filesystem watcher.
-5. Schedule the initial scan and parse on a Tokio-managed blocking task, so traversal and
-   parsing never occupy an async MCP worker.
 6. Serve until no request remains active and the [`idle_timeout`](/docs/configuration#server)
    span passes after the last response completes, then stop.
 
-`rift server start` runs that cycle detached and waits for `.rift/server.json` to appear;
-detached startup and `rift mcp` each allow 30 seconds for publication.
-`rift server stop` sends the authorized stop request and waits for the election to release;
-`rift server restart` chains the two. `rift server status` reports the workspace's current
-state - a serving server with its port, pid, and version, a stale `.rift/server.json` with the
-reason it went stale, or no server - and changes nothing. `--foreground` keeps the cycle in the
-calling process, where Ctrl-C stops it.
+`rift server start` runs that cycle detached, with the child's standard error on
+`.rift/server.stderr`, and waits for `.rift/server.json` to appear; detached startup and
+`rift mcp` each allow 30 seconds for publication. A start whose child is still indexing when
+that window closes reports the server as starting rather than failing, and a start that finds
+the election already held reports the same without spawning. `rift server stop` sends the
+authorized stop request and waits for the election to release; `rift server restart` chains
+the two. `rift server status` reports the workspace's current state - a serving server with
+its port, pid, and version, a server still indexing, a stale `.rift/server.json` with the
+reason it went stale, or no server - and changes nothing. A probe counts a server as serving
+only when its election is held and its recorded port accepts a connect. `--foreground` keeps
+the cycle in the calling process, where Ctrl-C stops it.
 
 Blocking tasks run on a Tokio-controlled worker pool. A request for blocking work lands in a
 queue, and a worker picks it up when one is free. This behavior is configurable via the

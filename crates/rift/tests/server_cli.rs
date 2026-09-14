@@ -15,7 +15,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use rift_mcp::{START_POLL_ATTEMPT_COUNT, ServerPresence, probe};
+use rift_mcp::{START_POLL_ATTEMPT_COUNT, ServerPresence, probe, stderr_file_path};
 use rift_protocol::lock::{
     ProductIdentity, SERVER_LOCK_FILE_NAME, SERVER_TOKEN_LENGTH, ServerLock,
 };
@@ -161,7 +161,7 @@ fn wait_for<T>(
 fn serving_document(root: &Path) -> Option<ServerLock> {
     match probe(root) {
         ServerPresence::Serving(lock) => Some(lock),
-        ServerPresence::Stale(_) | ServerPresence::Absent => None,
+        ServerPresence::Starting | ServerPresence::Stale(_) | ServerPresence::Absent => None,
     }
 }
 
@@ -211,6 +211,14 @@ fn start_serves_stop_shuts_down_and_both_repeat_idempotently() -> TestResult {
         "{repeated_stdout:?}"
     );
     assert_eq!(listening_facts(&repeated_stdout)?, (port, pid));
+
+    // The detached server's stderr lands in the workspace file the start
+    // truncated for it, where its own startup lines are the first content.
+    let stderr = fs::read_to_string(stderr_file_path(root))?;
+    assert!(
+        stderr.contains("MCP server ready"),
+        "the detached server's stderr file carries its startup line: {stderr:?}"
+    );
 
     let stopped = rift(root, &["server", "stop"])?;
     require_success(&stopped, "stop")?;
@@ -416,6 +424,44 @@ fn stop_without_a_server_reports_and_discards_stale_state() -> TestResult {
     assert!(
         !document_path(root).exists(),
         "a stale document is discarded best effort"
+    );
+    Ok(())
+}
+
+/// A server that fails at startup exits before publishing: the start reports the
+/// exited child's pid and points at the stderr file that holds the refusal.
+#[test]
+fn start_reports_a_server_that_exits_before_publishing() -> TestResult {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+    // `[source] files` accepts at least 1,000; one file past it fails the build.
+    for index in 0..=1_000 {
+        let unit = root.join(format!("unit_{index:04}.rs"));
+        fs::write(unit, "pub fn beacon() {}\n")?;
+    }
+    let configuration =
+        format!("{SEMANTIC_DISABLED}[server]\nidle_timeout = \"60s\"\n[source]\nfiles = 1000\n");
+    fs::write(root.join("rift.toml"), configuration)?;
+
+    let started = rift(root, &["server", "start"])?;
+    let stderr = String::from_utf8_lossy(&started.stderr);
+    assert!(
+        !started.status.success(),
+        "a server that exits before publishing fails the start: {:?}",
+        stdout_of(&started)
+    );
+    assert!(stderr.contains("server_start_failed"), "{stderr:?}");
+    assert!(stderr.contains("exited before publishing"), "{stderr:?}");
+    assert!(
+        !document_path(root).exists(),
+        "the failed server published nothing"
+    );
+    let recorded = fs::read_to_string(stderr_file_path(root))?;
+    assert!(
+        recorded.contains("failed to start"),
+        "the stderr file carries the server's refusal: {recorded:?}"
     );
     Ok(())
 }

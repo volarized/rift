@@ -1025,6 +1025,13 @@ impl LexicalChange {
     pub fn is_empty(&self) -> bool {
         self.replaced.is_empty() && self.inserted.is_empty()
     }
+
+    /// The change as its two halves, for a caller that rebuilds it over a narrowed
+    /// unit list.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<ProjectPath>, Vec<LexicalUnit>) {
+        (self.replaced, self.inserted)
+    }
 }
 
 /// `SQLite` FTS5-backed lexical search index.

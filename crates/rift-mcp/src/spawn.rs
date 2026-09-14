@@ -7,17 +7,36 @@
 //! lock document live beside the spawn, so every caller shares one meaning
 //! of "the server came up in time".
 
-use std::io::{self, Read};
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use rift_core::constants::RIFT_STATE_DIRECTORY;
 use rift_core::{CapturedStream, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX};
+use tracing_subscriber::fmt::MakeWriter;
 
 /// Bytes of a detached server's startup stderr kept verbatim; the rest is
 /// only counted, the same split [`CapturedStream`] reports for a hook's
 /// captured streams.
 const STARTUP_STDERR_CAPTURE_BYTES: usize = 8 << 10;
+
+/// The file under `.rift`, beside `server.json`, that holds the standard
+/// error of the server `rift server start` spawns. Each start truncates it.
+pub const SERVER_STDERR_FILE_NAME: &str = "server.stderr";
+/// Bytes of traced diagnostics a server writes to its standard error before
+/// it stops writing there, when that stream is not a terminal.
+///
+/// The file is what a crashed server leaves behind: it holds the start, and
+/// a panic's own report reaches it through the default panic hook past this
+/// bound. The diagnostics of a long life go to `rift server logs`.
+pub const SERVER_STDERR_BYTES_MAX: u64 = 1 << 20;
+/// The line the writer prints once, as the last thing, when the bound is reached.
+const SERVER_STDERR_BOUND_NOTICE: &str =
+    "rift: standard error reached its byte bound; later diagnostics are under `rift server logs`\n";
 
 /// Pause between presence probes while waiting on a workspace's server.
 pub const PRESENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -63,45 +82,175 @@ fn detach(command: &mut Command) {
 /// read.
 fn detached_command(root: &Path) -> Result<Command, io::Error> {
     let program = std::env::current_exe()?;
+    Ok(detached_command_for(
+        program,
+        ["server", "start", "--foreground"],
+        root,
+    ))
+}
+
+/// The detached shape over any program: run inside `root`, off this
+/// process's terminal and process group, stdin and stdout null.
+fn detached_command_for(
+    program: impl AsRef<OsStr>,
+    arguments: impl IntoIterator<Item = impl AsRef<OsStr>>,
+    root: &Path,
+) -> Command {
     let mut command = Command::new(program);
     command
-        .args(["server", "start", "--foreground"])
+        .args(arguments)
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::null());
     detach(&mut command);
-    Ok(command)
+    command
 }
 
 /// Spawns `rift server start --foreground` for `root`, fully detached,
-/// discarding its stderr entirely.
+/// with its stderr routed to the workspace's [`SERVER_STDERR_FILE_NAME`].
 ///
 /// The child runs this same binary with `root` as its working directory and
 /// inherits this process's environment - it serves the workspace the caller
-/// addressed - with stdin, stdout, and stderr all null and its own process
-/// group, so it survives the caller's exit and its terminal. The child
-/// handle is dropped unawaited: callers poll the published lock document
-/// instead, and an exited child is reaped by the init process.
+/// addressed - with stdin and stdout null, stderr on the file this start
+/// truncates, and its own process group, so it survives the caller's exit
+/// and its terminal. The returned handle is this process's view of its own
+/// child: the caller polls the published lock document for the server, and
+/// asks the handle whether the child is still running when that document
+/// does not appear. An exited child is reaped by that ask, or by the init
+/// process once the handle is gone.
 ///
 /// Losing the election race is not a spawn failure: a child that finds the
 /// workspace already served exits on its own, and the caller's poll adopts
 /// whoever won.
 ///
-/// Used by `rift server start`: the operator already sees the elected
-/// server's own diagnostics through `--foreground`'s direct process, so
-/// this detached spawn only needs to start the workspace's background
-/// server. `rift mcp` has no such channel and uses
-/// `spawn_detached_server_with_captured_stderr` instead.
+/// Used by `rift server start`. `rift mcp` has no file to point an agent
+/// at and uses `spawn_detached_server_with_captured_stderr` instead.
 ///
 /// # Errors
 ///
 /// Returns the underlying failure when this binary's path cannot be read
 /// or the process cannot be spawned; callers classify it for their own
-/// surface.
-pub fn spawn_detached_server(root: &Path) -> Result<(), io::Error> {
+/// surface. A stderr file that cannot be created is reported and the
+/// child's stderr is discarded, so a full or read-only `.rift` never stops
+/// a start.
+pub fn spawn_detached_server(root: &Path) -> Result<SpawnedServer, io::Error> {
     let mut command = detached_command(root)?;
-    command.stderr(Stdio::null());
-    command.spawn().map(drop)
+    command.stderr(stderr_destination(root));
+    let child = command.spawn()?;
+    Ok(SpawnedServer { child })
+}
+
+/// The path of the detached server's standard error file below `root`.
+#[must_use]
+pub fn stderr_file_path(root: &Path) -> PathBuf {
+    root.join(RIFT_STATE_DIRECTORY)
+        .join(SERVER_STDERR_FILE_NAME)
+}
+
+/// Where a detached server's standard error goes: the workspace's stderr
+/// file, truncated for this start, or nowhere when it cannot be created.
+fn stderr_destination(root: &Path) -> Stdio {
+    match stderr_file(root) {
+        Ok(file) => Stdio::from(file),
+        Err(error) => {
+            tracing::warn!(
+                component = "mcp",
+                path = %stderr_file_path(root).display(),
+                %error,
+                "the server stderr file could not be created; the detached server's stderr is \
+                 discarded"
+            );
+            Stdio::null()
+        }
+    }
+}
+
+/// Creates or truncates the stderr file, creating `.rift` when absent.
+fn stderr_file(root: &Path) -> io::Result<File> {
+    std::fs::create_dir_all(root.join(RIFT_STATE_DIRECTORY))?;
+    File::create(stderr_file_path(root))
+}
+
+/// One detached server this process spawned.
+#[derive(Debug)]
+#[must_use = "a spawned server is watched through `is_running`"]
+pub struct SpawnedServer {
+    child: Child,
+}
+
+impl SpawnedServer {
+    /// The child's process id, as the operator sees it in `ps`.
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Whether the child has not exited yet.
+    ///
+    /// Never blocks: an exited child is reaped and answers `false`. A child
+    /// whose state cannot be observed answers `false` too, so a caller
+    /// never reports a server it cannot see as still starting; a running
+    /// child it missed is found by the next probe through the election it
+    /// holds.
+    pub fn is_running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
+/// Standard error of a server whose stream is a file, cut at
+/// [`SERVER_STDERR_BYTES_MAX`].
+///
+/// The file `rift server start` hands its server would otherwise grow for
+/// the server's whole life. Past the bound the writer prints one notice and
+/// drops what it is handed afterwards; the diagnostics recorded under
+/// `rift server logs` are unaffected.
+#[derive(Debug, Default)]
+pub struct BoundedStderr {
+    written: AtomicU64,
+}
+
+impl<'a> MakeWriter<'a> for BoundedStderr {
+    type Writer = BoundedWriter<'a, io::Stderr>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        BoundedWriter::new(&self.written, io::stderr())
+    }
+}
+
+/// One writer over a shared byte count: writes pass through until the count
+/// reaches [`SERVER_STDERR_BYTES_MAX`], the crossing write is followed by
+/// the notice, and later writes are counted and dropped.
+#[derive(Debug)]
+pub struct BoundedWriter<'a, Sink: Write> {
+    written: &'a AtomicU64,
+    sink: Sink,
+}
+
+impl<'a, Sink: Write> BoundedWriter<'a, Sink> {
+    /// A writer over `sink` sharing `written` with every sibling writer.
+    pub fn new(written: &'a AtomicU64, sink: Sink) -> Self {
+        Self { written, sink }
+    }
+}
+
+impl<Sink: Write> Write for BoundedWriter<'_, Sink> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let before = self
+            .written
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        if before >= SERVER_STDERR_BYTES_MAX {
+            return Ok(bytes.len());
+        }
+        self.sink.write_all(bytes)?;
+        if before + bytes.len() as u64 >= SERVER_STDERR_BYTES_MAX {
+            self.sink.write_all(SERVER_STDERR_BOUND_NOTICE.as_bytes())?;
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.sink.flush()
+    }
 }
 
 /// Spawns `rift server start --foreground` for `root`, fully detached,
@@ -214,13 +363,102 @@ fn drain_until_closed(mut stream: impl Read, capture_bytes: usize) -> CapturedSt
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+    use std::sync::atomic::AtomicU64;
     use std::sync::mpsc;
     use std::time::Duration;
 
     use super::{
-        CapturedStream, PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX,
-        STARTUP_STDERR_CAPTURE_BYTES, StartupCapture,
+        BoundedWriter, CapturedStream, PRESENCE_POLL_INTERVAL, SERVER_STDERR_BOUND_NOTICE,
+        SERVER_STDERR_BYTES_MAX, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX,
+        STARTUP_STDERR_CAPTURE_BYTES, StartupCapture, stderr_file_path,
     };
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    /// Poll attempts while waiting on a spawned child to exit: 10 seconds.
+    const EXIT_POLL_ATTEMPT_COUNT: u32 = 100;
+
+    /// Spawns `sh -c script` in the detached shape with its stderr on the
+    /// workspace's stderr file, and waits for it to exit.
+    #[cfg(unix)]
+    fn run_detached_script(root: &std::path::Path, script: &str) -> TestResult {
+        let mut command = super::detached_command_for("sh", ["-c", script], root);
+        command.stderr(super::stderr_destination(root));
+        let mut spawned = super::SpawnedServer {
+            child: command.spawn()?,
+        };
+        assert!(spawned.pid() > 0);
+        for _ in 0..EXIT_POLL_ATTEMPT_COUNT {
+            if !spawned.is_running() {
+                return Ok(());
+            }
+            std::thread::sleep(PRESENCE_POLL_INTERVAL);
+        }
+        Err("the detached script must exit".into())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_detached_child_writes_its_stderr_to_the_workspace_file() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        run_detached_script(directory.path(), "echo first start >&2")?;
+        assert_eq!(
+            std::fs::read_to_string(stderr_file_path(directory.path()))?,
+            "first start\n"
+        );
+
+        run_detached_script(directory.path(), "echo second start >&2")?;
+        assert_eq!(
+            std::fs::read_to_string(stderr_file_path(directory.path()))?,
+            "second start\n",
+            "each start truncates the file"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_state_directory_discards_the_child_stderr_and_still_spawns() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join(".rift"), b"a file in the way")?;
+        run_detached_script(directory.path(), "echo lost >&2")?;
+        assert!(!stderr_file_path(directory.path()).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn a_bounded_writer_passes_the_crossing_write_then_drops() -> TestResult {
+        let written = AtomicU64::new(0);
+        let mut sink = Vec::new();
+        let head = vec![b'a'; usize::try_from(SERVER_STDERR_BYTES_MAX)? - 4];
+        {
+            let mut writer = BoundedWriter::new(&written, &mut sink);
+            writer.write_all(&head)?;
+            writer.write_all(b"crossing")?;
+            writer.write_all(b"dropped")?;
+            writer.flush()?;
+        }
+        let expected_length = head.len() + "crossing".len() + SERVER_STDERR_BOUND_NOTICE.len();
+        assert_eq!(sink.len(), expected_length);
+        assert!(sink.ends_with(SERVER_STDERR_BOUND_NOTICE.as_bytes()));
+        assert!(!sink.windows(7).any(|window| window == b"dropped"));
+        assert_eq!(
+            written.load(std::sync::atomic::Ordering::Relaxed),
+            (head.len() + "crossing".len() + "dropped".len()) as u64,
+            "dropped bytes are still counted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_bounded_writer_shares_its_count_between_writers() -> TestResult {
+        let written = AtomicU64::new(SERVER_STDERR_BYTES_MAX);
+        let mut sink = Vec::new();
+        BoundedWriter::new(&written, &mut sink).write_all(b"late")?;
+        assert!(sink.is_empty(), "a writer past the bound writes nothing");
+        Ok(())
+    }
 
     #[test]
     fn start_poll_attempt_count_derives_from_its_window() {

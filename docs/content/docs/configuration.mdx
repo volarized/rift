@@ -612,6 +612,12 @@ A workspace past it refuses its rebuild: a read then answers `temporarily_unavai
 `units_max`, the observed count, and the maximum. Raise the key, or narrow
 [`[source]`](/docs/configuration#source) so fewer files reach the index.
 
+One unit holds at most 1mb of content. A declaration past that - a bundled source file whose
+whole body is one declaration, for example - is left out of the lexical index rather than
+refusing the publication: its file stays in the syntax index and answers `get_symbol` and
+symbol search, only its text ranking is absent. The server records each such unit under
+`rift server logs --component index`, with the path and the observed size.
+
 ## Hooks
 
 <VersionBadge version="v0.0.5" />

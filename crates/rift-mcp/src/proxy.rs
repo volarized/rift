@@ -27,7 +27,7 @@ use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{ErrorData, ServerHandler, ServiceError, ServiceExt as _};
 
-use crate::election::{ServerPresence, probe};
+use crate::election::{ServerPresence, StaleReason, probe};
 use crate::failure::WireFailure as _;
 use crate::http::MCP_PATH;
 use crate::spawn::{
@@ -445,16 +445,22 @@ async fn connect_upstream(
     if let Some(running) = adopt_serving(root, identity).await? {
         return Ok(running);
     }
-    // A lost spawn race is fine - this process's own spawned server finds
-    // the workspace already served, exits on its own, and the poll below
-    // adopts the winner once it finishes binding. A spawn that cannot
-    // launch at all is reported, and the poll still gives a concurrently
-    // started server its chance.
-    let mut startup = match spawn_detached_server_with_captured_stderr(root) {
-        Ok(startup) => Some(startup),
-        Err(error) => {
-            tracing::warn!(component = "mcp", %error, "detached server spawn failed");
-            None
+    // A server another starter elected is still building: a spawn now would
+    // only lose the election, so the poll below waits for that server's
+    // document instead. Otherwise a lost spawn race is fine - this
+    // process's own spawned server finds the workspace already served, exits
+    // on its own, and the poll adopts the winner once it finishes binding. A
+    // spawn that cannot launch at all is reported, and the poll still gives
+    // a concurrently started server its chance.
+    let mut startup = if matches!(probe(root), ServerPresence::Starting) {
+        None
+    } else {
+        match spawn_detached_server_with_captured_stderr(root) {
+            Ok(startup) => Some(startup),
+            Err(error) => {
+                tracing::warn!(component = "mcp", %error, "detached server spawn failed");
+                None
+            }
         }
     };
     let deadline = tokio::time::Instant::now() + START_WAIT_MAX;
@@ -595,8 +601,19 @@ async fn adopt_serving(
     root: &Path,
     identity: &ProductIdentity,
 ) -> Result<Option<RunningService<RoleClient, ()>>, ErrorData> {
-    let ServerPresence::Serving(lock) = probe(root) else {
-        return Ok(None);
+    let lock = match probe(root) {
+        ServerPresence::Serving(lock) => lock,
+        ServerPresence::Stale(StaleReason::PortUnreachable { pid }) => {
+            tracing::info!(
+                component = "mcp",
+                pid,
+                "recorded server did not answer; treating the lock as stale"
+            );
+            return Ok(None);
+        }
+        ServerPresence::Starting | ServerPresence::Stale(_) | ServerPresence::Absent => {
+            return Ok(None);
+        }
     };
     require_identity_match(identity, &lock)?;
     match connect_recorded(&lock, UPSTREAM_CONNECT_TIMEOUT).await {
@@ -839,10 +856,10 @@ mod tests {
 
     use super::{
         ConnectAttemptFailure, ProxyFault, RiftProxy, SpawnPollOutcome, StartupCapture, Upstream,
-        UpstreamSlot, adopt_serving, connect_recorded, fallback_info, forwarded_error,
-        lost_start_election, mirrored_info, quit_reason_result, require_identity_match,
-        reuse_current, serve_connection, server_start_failed, spawn_poll_outcome, transport_failed,
-        upstream_unavailable,
+        UpstreamSlot, adopt_serving, connect_recorded, connect_upstream, fallback_info,
+        forwarded_error, lost_start_election, mirrored_info, quit_reason_result,
+        require_identity_match, reuse_current, serve_connection, server_start_failed,
+        spawn_poll_outcome, transport_failed, upstream_unavailable,
     };
     use crate::election::claim;
     use rift_core::{CapturedStream, Error};
@@ -1399,6 +1416,32 @@ mod tests {
                 .is_none(),
             "a recorded server that answers nothing must be treated as stale"
         );
+        Ok(())
+    }
+
+    /// A server another starter elected is still building: the connect spawns nothing
+    /// and waits for that holder's document, refusing once the start window closes.
+    #[tokio::test(start_paused = true)]
+    async fn connect_spawns_nothing_while_another_starter_holds_the_election() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let _guard = claim(directory.path())?;
+        let refusal = connect_upstream(directory.path(), &test_identity())
+            .await
+            .expect_err("a holder that never publishes must exhaust the start window");
+        assert_eq!(refusal.message, upstream_unavailable().message);
+        Ok(())
+    }
+
+    /// A spawn that cannot launch is reported, and the poll still gives a concurrently
+    /// started server its window before refusing.
+    #[tokio::test(start_paused = true)]
+    async fn connect_reports_a_spawn_that_cannot_launch_and_still_polls() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let missing = directory.path().join("missing");
+        let refusal = connect_upstream(&missing, &test_identity())
+            .await
+            .expect_err("a workspace nobody serves must exhaust the start window");
+        assert_eq!(refusal.message, upstream_unavailable().message);
         Ok(())
     }
 

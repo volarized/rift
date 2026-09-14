@@ -79,8 +79,10 @@ process the port and token it needs to reach that server. For example:
 ```
 
 When no live server stands behind the file, `rift mcp` starts one. An exclusive file lock
-elects one starter if several processes race; the winner binds a port and publishes the file,
-and the rest connect to it.
+elects one starter if several processes race; the winner builds its index, binds a port, and
+publishes the file, and the rest connect to it. The winner holds the lock from its election
+onward, so a `rift mcp` or `rift server start` that arrives while it is still indexing waits
+for its file instead of starting another server.
 
 The proxy adopts that server only when package version, executable SHA-256, and served MCP schema
 SHA-256 match its own identity. A mismatch is stale state, even when the recorded process and port
@@ -88,7 +90,8 @@ are live, so requests never cross between binaries or tool schemas that interpre
 
 A reader that cannot reach the recorded port treats the file as stale. The election lock
 releases with its holder, so a stale file never has a live server behind it, and the next
-starter replaces the file.
+starter replaces the file. A server on its way out closes its port before it releases the
+lock, and the next starter waits for the release before electing a fresh one.
 
 To enforce a cross-process boundary between OS users, the server persists a token in
 `.rift/server.json`, which only the file's owner can read. Every request carries this token,
@@ -132,7 +135,10 @@ The server stops itself once no request remains active and the
 changesets, and execution copies live under `.rift` and survive the exit.
 
 `rift server status` reports which of these states the workspace is in - a serving server with
-its port, pid, and version, a stale `.rift/server.json`, or no server - and changes nothing.
+its port, pid, and version, a server still indexing, a stale `.rift/server.json`, or no server
+- and changes nothing. A server that fails to start, or panics, records why under
+`rift server logs --level error` before it exits, and a server `rift server start` spawned
+writes its standard error to `.rift/server.stderr`, truncated at each start.
 
 ## Source discovery
 

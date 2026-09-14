@@ -6,12 +6,14 @@ mod server;
 mod steer;
 mod update;
 use std::fmt;
+use std::io::IsTerminal as _;
 use std::path::Path;
 use std::process::ExitCode;
 
 #[cfg(test)]
 use clap::{Command, CommandFactory};
 use clap::{Parser, Subcommand};
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::{EnvFilter, Layer as _};
@@ -84,7 +86,8 @@ async fn main() -> ExitCode {
     let logs = cli
         .records_logs()
         .then(|| rift_mcp::logs_configuration(Path::new(".")));
-    let drain = initialize_tracing(logs.as_ref().map(|logs| logs.capture.as_str()));
+    let stderr = stderr_policy(cli.records_logs(), std::io::stderr().is_terminal());
+    let drain = initialize_tracing(logs.as_ref().map(|logs| logs.capture.as_str()), stderr);
     let retention_records = logs.map_or(0, |logs| logs.retention_records);
     match run(cli, drain, retention_records).await {
         Ok(Some(outcome)) => {
@@ -93,12 +96,31 @@ async fn main() -> ExitCode {
         }
         Ok(None) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!(
-                "rift: error[{code}]: {error}",
-                code = error.descriptor().code()
-            );
+            eprint!("{}", error.rendered());
             ExitCode::FAILURE
         }
+    }
+}
+
+/// How much the process may write to its standard error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StderrPolicy {
+    /// Everything the filter admits: the stream belongs to whoever reads it.
+    Unbounded,
+    /// At most [`rift_mcp::SERVER_STDERR_BYTES_MAX`] bytes: the stream is
+    /// the file `rift server start` handed its detached server.
+    Bounded,
+}
+
+/// The policy for this invocation: a server whose stderr is not a terminal
+/// is writing into a file or a pipe that outlives every reader, so it is
+/// bounded; every other command, and a server an operator watches in a
+/// terminal, writes freely.
+fn stderr_policy(serves: bool, terminal: bool) -> StderrPolicy {
+    if serves && !terminal {
+        StderrPolicy::Bounded
+    } else {
+        StderrPolicy::Unbounded
     }
 }
 
@@ -112,7 +134,7 @@ async fn main() -> ExitCode {
 ///
 /// The returned drain exists only for a foreground server. Other commands install no
 /// recording layer and allocate no log queue.
-fn initialize_tracing(capture: Option<&str>) -> Option<rift_mcp::LogDrain> {
+fn initialize_tracing(capture: Option<&str>, stderr: StderrPolicy) -> Option<rift_mcp::LogDrain> {
     let (sink, drain) = match capture {
         Some(capture) => {
             let (sink, drain) = rift_mcp::log_capture();
@@ -122,11 +144,15 @@ fn initialize_tracing(capture: Option<&str>) -> Option<rift_mcp::LogDrain> {
         }
         None => (None, None),
     };
+    let writer = match stderr {
+        StderrPolicy::Unbounded => BoxMakeWriter::new(std::io::stderr),
+        StderrPolicy::Bounded => BoxMakeWriter::new(rift_mcp::BoundedStderr::default()),
+    };
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
                 .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-                .with_writer(std::io::stderr)
+                .with_writer(writer)
                 .with_filter(
                     EnvFilter::try_from_default_env()
                         .unwrap_or_else(|_| EnvFilter::new(DEFAULT_TRACING_FILTER)),
@@ -154,6 +180,25 @@ impl CliError {
             Self::Update(error) => error.descriptor(),
             Self::Install(error) => error.descriptor(),
         }
+    }
+
+    /// The failure as the operator reads it: the registry line, then each
+    /// cause below it on its own line.
+    ///
+    /// The outer line names what was refused; the causes name why, down to
+    /// the store's or the provider's own words. The walk is bounded by
+    /// [`rift_core::CAUSE_DEPTH_MAX`].
+    fn rendered(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut rendered = format!(
+            "rift: error[{code}]: {self}\n",
+            code = self.descriptor().code()
+        );
+        for cause in rift_core::causes(self) {
+            let _ = writeln!(rendered, "  caused by: {cause}");
+        }
+        rendered
     }
 }
 
@@ -512,6 +557,58 @@ mod tests {
         assert_eq!(error.descriptor().code(), "server_start_timed_out");
         assert!(error.to_string().contains("--foreground"));
         assert!(error.source().is_some());
+    }
+
+    /// The wrapped server error renders the same text as the CLI error over it, so
+    /// the chain below the registry line starts at the first cause that says more.
+    #[test]
+    fn a_rendered_error_prints_each_cause_on_its_own_line() {
+        let inner = std::io::Error::other("the disk is full");
+        let election = rift_core::Error::new(rift_mcp::ElectionFault::Storage {
+            operation: "publish lock document",
+            path: std::path::PathBuf::from("/workspace/.rift/server.json"),
+            source: inner,
+        });
+        let error = CliError::Server(super::server::election_error_for_test(election));
+
+        let rendered = error.rendered();
+
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 2, "{rendered}");
+        assert!(
+            lines[0].starts_with("rift: error[storage_failure]: "),
+            "{rendered}"
+        );
+        assert!(lines[0].contains("publish lock document"), "{rendered}");
+        assert_eq!(lines[1], "  caused by: the disk is full");
+    }
+
+    #[test]
+    fn a_rendered_error_without_causes_is_one_line() {
+        let error = CliError::Server(super::server::error_for_test());
+        let rendered = error.rendered();
+        assert_eq!(rendered.lines().count(), 1, "{rendered}");
+        assert!(rendered.ends_with('\n'));
+    }
+
+    #[test]
+    fn only_a_server_off_a_terminal_bounds_its_stderr() {
+        assert_eq!(
+            super::stderr_policy(true, false),
+            super::StderrPolicy::Bounded
+        );
+        assert_eq!(
+            super::stderr_policy(true, true),
+            super::StderrPolicy::Unbounded
+        );
+        assert_eq!(
+            super::stderr_policy(false, false),
+            super::StderrPolicy::Unbounded
+        );
+        assert_eq!(
+            super::stderr_policy(false, true),
+            super::StderrPolicy::Unbounded
+        );
     }
 
     #[test]
