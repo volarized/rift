@@ -18,6 +18,7 @@ use rift_core::constants::RIFT_STATE_DIRECTORY;
 use rift_core::{CliCode, Error, ErrorCode, ErrorContext, ErrorName, Fault, causes};
 use rift_index::WorkspaceIndexLimits;
 use rift_protocol::lock::{SERVER_LOCK_FILE_NAME, ServerLock, ServerLockViolation};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
@@ -576,18 +577,13 @@ async fn shut_down_unpublished(
     publish_failure: ElectionError,
 ) -> ElectionError {
     serving_stop.cancel();
-    match tokio::time::timeout(UNPUBLISHED_SHUTDOWN_DEADLINE, server.stopped()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!(
+    let deadline = Instant::now() + UNPUBLISHED_SHUTDOWN_DEADLINE;
+    if let Err(error) = server.stopped(deadline).await {
+        tracing::warn!(
             component = "mcp",
             %error,
             "unpublished server reported a shutdown failure"
-        ),
-        Err(_elapsed) => tracing::warn!(
-            component = "mcp",
-            deadline = ?UNPUBLISHED_SHUTDOWN_DEADLINE,
-            "unpublished server missed its shutdown deadline"
-        ),
+        );
     }
     publish_failure
 }
@@ -607,22 +603,30 @@ impl ElectedServer {
         self.server.port()
     }
 
-    /// Waits until the server stopped, then retires the lock document.
+    /// Waits until the server stopped, bounded by `deadline`, and hands the
+    /// election guard back so the caller releases it last.
+    ///
+    /// The document is not retired here: the caller drops the returned guard
+    /// after every later stop stage, the log drain's final flush included, so
+    /// the election releases immediately before the process leaves. The
+    /// transport shutdown takes only what remains of `deadline`.
     ///
     /// # Errors
     ///
-    /// Returns the transport's shutdown failure; the document is retired
-    /// and the election released on every path.
+    /// The second tuple element carries the transport's shutdown failure.
     ///
     /// # Cancel safety
     ///
     /// Dropping this future retires the document and releases the election
     /// through the guard's drop; the serving tasks detach and complete a
     /// shutdown already triggered in the background.
-    pub async fn stopped(self) -> Result<(), ElectionError> {
-        let outcome = self.server.stopped().await.map_err(ElectionFault::serve);
-        self.guard.retire();
-        outcome
+    pub async fn stopped(self, deadline: Instant) -> (ElectionGuard, Result<(), ElectionError>) {
+        let outcome = self
+            .server
+            .stopped(deadline)
+            .await
+            .map_err(ElectionFault::serve);
+        (self.guard, outcome)
     }
 }
 
@@ -1308,6 +1312,35 @@ mod tests {
                 }
             ),
             "the publish failure must surface: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_document_outlives_the_transport_stop_and_the_caller_retires_it() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(directory.path(), "")?;
+        let shutdown = CancellationToken::new();
+        let elected = serve_elected(directory.path(), shutdown.clone()).await?;
+        let document = document_path(directory.path());
+        assert!(
+            document.is_file(),
+            "a served election publishes its document"
+        );
+
+        shutdown.cancel();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        let (guard, outcome) = elected.stopped(deadline).await;
+        outcome.map_err(|error| format!("the transport must stop cleanly: {error:?}"))?;
+        assert!(
+            document.is_file(),
+            "the document outlives the transport stop; only the caller retires it"
+        );
+
+        guard.retire();
+        assert!(
+            !document.exists(),
+            "the caller's retire removes the document"
         );
         Ok(())
     }

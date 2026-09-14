@@ -814,6 +814,38 @@ fn ranking_of(
     }
 }
 
+/// Where `tree_revision` stands with `lane` once the commit for it has landed, or once
+/// `budget` ran out with the lane still holding it: `Committing` in the second case
+/// alone.
+///
+/// The wake-up is subscribed before each state read, so a landing between the read and
+/// the await is never missed: tokio's `Notified` "is guaranteed to receive wakeups from
+/// `notify_waiters()` as soon as it has been created, even if it has not yet been
+/// polled". A landing for another revision - the one running ahead of a held write -
+/// wakes the wait, which reads the state again under the same deadline; the loop runs
+/// once per landing inside the budget.
+///
+/// # Cancel safety
+///
+/// Dropping the future drops its subscription; the lane is never written.
+async fn commit_landed(
+    lane: &LexicalLane,
+    tree_revision: &str,
+    budget: Duration,
+) -> LexicalCommitState {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let landed = lane.landed();
+        let commit_state = lane.commit_state(tree_revision);
+        if commit_state != LexicalCommitState::Committing {
+            return commit_state;
+        }
+        if tokio::time::timeout_at(deadline, landed).await.is_err() {
+            return commit_state;
+        }
+    }
+}
+
 /// The warning a lexical ranking cut at `matches_max` carries: hits past that bound never
 /// reach a page, so the caller narrows `query` rather than paging on.
 fn lexical_truncated(matches_max: u32) -> ReadWarning {
@@ -974,19 +1006,19 @@ pub struct RiftMcp {
 }
 
 /// One already-serialized change's outcome, threaded out of the blocking executor so the
-/// async `change` method commits and publishes exactly the candidate this change built,
-/// without a second, possibly-superseded read of shared state.
+/// async `change` method hands on exactly the publication this change landed, without a
+/// second, possibly-superseded read of shared state.
 struct SerializedChange {
     result: Result<Json<ChangeResult>, ErrorData>,
-    candidate: Option<AppliedCandidate>,
+    publication: Option<AppliedPublication>,
 }
 
 impl SerializedChange {
-    /// A refusal or a diagnostic-only outcome: no candidate to commit or publish.
+    /// A refusal or a diagnostic-only outcome: nothing published.
     const fn wire(result: Result<Json<ChangeResult>, ErrorData>) -> Self {
         Self {
             result,
-            candidate: None,
+            publication: None,
         }
     }
 }
@@ -1402,14 +1434,18 @@ impl RiftMcp {
     /// past the captured publication ends this attempt rather than ranking rows the answer
     /// cannot place. The next attempt captures the publication the store already holds, and
     /// the bound is the same one `reconcile_workspace` applies to a tree that keeps moving.
+    /// Each attempt's wait for a lexical commit in flight gets the full
+    /// `[server] readiness_timeout`: the workspace wait's own deadline stays inside
+    /// `published_workspace`, so what remains of it is not at hand here.
     async fn current_tree_search(
         &self,
         params: SearchParams,
     ) -> Result<Json<SearchResult>, ErrorData> {
+        let budget = self.readiness_timeout().await;
         for _attempt in 0..INDEX_CAPTURE_ATTEMPTS_MAX {
             let resolved = self.published_workspace(wire::ErrorPhase::Read).await?;
             let Some(SearchRanking { units, warnings }) =
-                self.ranking(&params, &resolved.published).await?
+                self.ranking(&params, &resolved.published, budget).await?
             else {
                 continue;
             };
@@ -1433,15 +1469,17 @@ impl RiftMcp {
     /// Returns nothing when the store has moved past `published`'s tree to a newer
     /// publication, which asks the caller to capture the publication the store already
     /// answers for. Every other outcome ranks: an index that could not be opened, one the
-    /// lexical lane is still committing this tree into, and one that missed a commit warn
-    /// `lexical_ranking_unavailable` and leave identifier search to answer alone. A
-    /// query-term limit the index refuses surfaces as this request's own `limit_exceeded`
-    /// error, never a silent degrade. A `dependencies` scope never consults the index: the
-    /// ranked lane serves the project alone, so nothing about it rides that answer.
+    /// lexical lane is still committing this tree into once `budget` ran out, and one
+    /// that missed a commit warn `lexical_ranking_unavailable` and leave identifier
+    /// search to answer alone. A query-term limit the index refuses surfaces as this
+    /// request's own `limit_exceeded` error, never a silent degrade. A `dependencies`
+    /// scope never consults the index: the ranked lane serves the project alone, so
+    /// nothing about it rides that answer.
     async fn ranking(
         &self,
         params: &SearchParams,
         published: &PublishedWorkspace,
+        budget: Duration,
     ) -> Result<Option<SearchRanking>, ErrorData> {
         if params.scope == SearchScope::Dependencies {
             return Ok(Some(SearchRanking::default()));
@@ -1459,16 +1497,9 @@ impl RiftMcp {
             return Ok(Some(SearchRanking::default()));
         };
         let tree_revision = published.reads.tree_revision();
-        let searched = index
-            .search(tree_revision, query, self.fetch_limit())
-            .await
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
-        let commit_state = self
-            .lexical
-            .as_ref()
-            .map_or(LexicalCommitState::Settled, |lane| {
-                lane.commit_state(tree_revision)
-            });
+        let (searched, commit_state) = self
+            .store_answer(index, tree_revision, query, budget)
+            .await?;
         Ok(ranking_of(
             searched,
             index.readiness(),
@@ -1476,6 +1507,53 @@ impl RiftMcp {
             tree_revision,
             commit_state,
         ))
+    }
+
+    /// The store's answer for `tree_revision`, read as deep as [`Self::fetch_limit`].
+    async fn read_store(
+        &self,
+        index: &SearchIndex,
+        tree_revision: &str,
+        query: &str,
+    ) -> Result<RevisionScoped<FusedRanking>, ErrorData> {
+        index
+            .search(tree_revision, query, self.fetch_limit())
+            .await
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+    }
+
+    /// The store's answer for `tree_revision` and where that revision stands with the
+    /// lexical lane, after waiting out a commit in flight.
+    ///
+    /// A store that does not hold the captured tree while the lane is still committing
+    /// it is a transient condition: the read waits for that commit to land under
+    /// `budget`, then reads the store and the state again once. `Owed` and `Settled`
+    /// never wait, since no held transaction can change either. A wait that runs out
+    /// leaves `Committing` standing, which is what [`ranking_of`] warns about. Without a
+    /// lane the revision counts as settled: nothing could commit it.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future drops the wait and the store read; nothing is written.
+    async fn store_answer(
+        &self,
+        index: &SearchIndex,
+        tree_revision: &str,
+        query: &str,
+        budget: Duration,
+    ) -> Result<(RevisionScoped<FusedRanking>, LexicalCommitState), ErrorData> {
+        let searched = self.read_store(index, tree_revision, query).await?;
+        let Some(lane) = self.lexical.as_ref() else {
+            return Ok((searched, LexicalCommitState::Settled));
+        };
+        let commit_state = lane.commit_state(tree_revision);
+        let matched = matches!(searched, RevisionScoped::Matched(_));
+        if matched || commit_state != LexicalCommitState::Committing {
+            return Ok((searched, commit_state));
+        }
+        let commit_state = commit_landed(lane, tree_revision, budget).await;
+        let searched = self.read_store(index, tree_revision, query).await?;
+        Ok((searched, commit_state))
     }
 
     /// How deep the search index is read for one request: the same `results_max` bound
@@ -2008,7 +2086,8 @@ impl RiftMcp {
         }
     }
 
-    /// Runs one change, publishes its snapshot, then pulls engine diagnostics.
+    /// Runs one change under the change lane, then hands its publication to the
+    /// dependency and population lanes and pulls engine diagnostics.
     async fn change(
         &self,
         operation: impl FnOnce(&ReadService, &ChangeService) -> Result<ChangeResult, ReadError>
@@ -2023,6 +2102,7 @@ impl RiftMcp {
         let changes = Arc::clone(&self.changes);
         let change_lane = Arc::clone(&self.change_lane);
         let dependencies = Arc::clone(&self.dependencies);
+        let lexical = self.lexical.clone();
         let outcome = self
             .blocking
             .run("workspace change", move || {
@@ -2034,6 +2114,7 @@ impl RiftMcp {
                         &validation,
                         &changes,
                         &dependencies,
+                        lexical.as_ref(),
                         operation,
                     )
                 })
@@ -2041,12 +2122,7 @@ impl RiftMcp {
             .await
             .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
         let mut result = outcome.result?;
-        let publication = match (&mut result, outcome.candidate) {
-            (Json(ChangeResult::Applied { summary }), Some(candidate)) => {
-                self.publish_applied_change(candidate, summary).await
-            }
-            _ => None,
-        };
+        let publication = outcome.publication;
         let published_next = publication
             .as_ref()
             .filter(|publication| publication.published)
@@ -2077,79 +2153,62 @@ impl RiftMcp {
         Ok(result)
     }
 
-    /// Publishes one landed change, handing the lexical lane its write, and returns what
-    /// it published.
+    /// Publishes one landed change under the lane the caller holds, handing the lexical
+    /// lane its write, and returns what it published.
     ///
-    /// A change whose publication failed returns nothing: its summary already carries the
-    /// stale-snapshot warning, and current-tree reads answer from the previous snapshot
-    /// until a fresh one publishes.
-    async fn publish_applied_change(
-        &self,
+    /// The publication takes the same linearization point filesystem observation takes,
+    /// so a candidate superseded while it was built cannot become current. A publication
+    /// the supervisor's cancellation refused answers like a superseded one: the snapshot
+    /// did not become current, and the process is leaving.
+    fn publish_applied_change(
+        published: &RwLock<IndexState>,
+        validation: &IndexValidation,
+        lexical: Option<&LexicalLane>,
         candidate: AppliedCandidate,
-        summary: &mut ChangeSummary,
-    ) -> Option<AppliedPublication> {
+    ) -> AppliedPublication {
         let AppliedCandidate {
             previous,
-            published,
+            published: snapshot,
             change_set,
             write,
             work,
             epoch,
         } = candidate;
-        let lexical = self
-            .lexical
-            .clone()
+        let handoff = lexical
+            .cloned()
             .map(|lane| LexicalHandoff::new(lane, write));
-        let state = Arc::clone(&self.published);
-        let validation = Arc::clone(&self.validation);
-        let publishing = Arc::clone(&published);
-        let outcome = self
-            .blocking
-            .run("workspace change publication", move || {
-                Ok(finish_rebuild(
-                    &state,
-                    &validation,
-                    publishing,
-                    work,
-                    epoch,
-                    lexical,
-                ))
-            })
-            .await;
-        match outcome {
-            Ok(RebuildOutcome::Published) => {
-                tracing::info!(
-                    component = "index",
-                    operation = "index.publish",
-                    trigger = "rift_change",
-                    epoch,
-                    "index snapshot published"
-                );
-                Some(AppliedPublication {
-                    previous,
-                    snapshot: published,
-                    published: true,
-                    change_set,
-                })
-            }
-            // A publication the supervisor's cancellation refused answers like a superseded
-            // one: the snapshot did not become current, and the process is leaving.
-            Ok(RebuildOutcome::Superseded | RebuildOutcome::Cancelled) => {
-                Some(AppliedPublication {
-                    previous,
-                    snapshot: published,
-                    published: false,
-                    change_set,
-                })
-            }
-            Err(error) => {
-                summary.diagnostics.push(stale_snapshot_diagnostic(&error));
-                None
-            }
+        let outcome = finish_rebuild(published, validation, Arc::clone(&snapshot), work, handoff);
+        let became_current = outcome == RebuildOutcome::Published;
+        if became_current {
+            tracing::info!(
+                component = "index",
+                operation = "index.publish",
+                trigger = "rift_change",
+                epoch,
+                "index snapshot published"
+            );
+        }
+        AppliedPublication {
+            previous,
+            snapshot,
+            published: became_current,
+            change_set,
         }
     }
 
-    /// One serialized change result and its new workspace snapshot.
+    /// One serialized change result and the publication it landed.
+    ///
+    /// Everything here runs under the change lane the caller holds: the write, the
+    /// hooks, the rebuild, and the publication with its lexical hand-off. A watcher
+    /// batch raised by the write's own filesystem events enters the lane after this
+    /// returns, so it resolves its observations against the published edit, finds every
+    /// digest equal, and builds nothing. The hand-offs to the dependency and population
+    /// lanes and the engine diagnostics run after the lane, in [`Self::change`]: none of
+    /// them changes the tree or the publication a later batch resolves against.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per piece of server state the change lane reads and publishes through"
+    )]
     fn change_serialized(
         root: &Path,
         limits: WorkspaceIndexLimits,
@@ -2157,6 +2216,7 @@ impl RiftMcp {
         validation: &IndexValidation,
         changes: &ChangeService,
         dependencies: &Arc<DependencyStore>,
+        lexical: Option<&LexicalLane>,
         operation: impl FnOnce(&ReadService, &ChangeService) -> Result<ChangeResult, ReadError>,
     ) -> Result<SerializedChange, ReadError> {
         let state = published.blocking_read();
@@ -2192,7 +2252,7 @@ impl RiftMcp {
             )?,
             None => result,
         };
-        let candidate = if let ChangeResult::Applied { summary } = &mut result {
+        let publication = if let ChangeResult::Applied { summary } = &mut result {
             Self::rebuild_after_applied_change(
                 root,
                 limits,
@@ -2202,12 +2262,15 @@ impl RiftMcp {
                 summary,
                 dependencies,
             )
+            .map(|candidate| {
+                Self::publish_applied_change(published, validation, lexical, candidate)
+            })
         } else {
             None
         };
         Ok(SerializedChange {
             result: Ok(Json(result)),
-            candidate,
+            publication,
         })
     }
 
@@ -2632,7 +2695,7 @@ mod tests {
     use std::error::Error;
     use std::fs;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use rift_index::WorkspaceIndexLimits;
@@ -3065,8 +3128,11 @@ mod tests {
         let supervisor = server.index_supervisor();
         drop(server);
         assert!(supervisor.validation.cancellation.is_cancelled());
-        supervisor.shutdown().await?;
-        supervisor.shutdown().await?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        supervisor.shutdown(deadline).await?;
+        supervisor
+            .shutdown(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
+            .await?;
         assert!(supervisor.validation.task.lock().await.is_none());
         Ok(())
     }
@@ -3380,12 +3446,13 @@ mod tests {
             &validation,
             &changes,
             &empty_dependency_store(),
+            None,
             |_, _| {
                 operation_called.store(true, Ordering::SeqCst);
                 panic!("invalid configuration must stop before operation")
             },
         )?;
-        assert!(outcome.candidate.is_none());
+        assert!(outcome.publication.is_none());
         let Err(error) = outcome.result else {
             panic!("invalid configuration must refuse change");
         };
@@ -4021,9 +4088,10 @@ pub fn beacon() -> u64 {
             &validation,
             &changes,
             &empty_dependency_store(),
+            None,
             |_, _| panic!("a moved index must refuse before the operation runs"),
         )?;
-        assert!(outcome.candidate.is_none());
+        assert!(outcome.publication.is_none());
         let Err(error) = outcome.result else {
             panic!("a moved index must refuse the change");
         };
@@ -4057,6 +4125,7 @@ pub fn beacon() -> u64 {
             &validation,
             &changes,
             &empty_dependency_store(),
+            None,
             |_, _| {
                 Ok(ChangeResult::Applied {
                     summary: ChangeSummary {
@@ -4068,7 +4137,7 @@ pub fn beacon() -> u64 {
                 })
             },
         )?;
-        assert!(outcome.candidate.is_none());
+        assert!(outcome.publication.is_none());
         let Ok(rmcp::Json(ChangeResult::Applied { summary })) = outcome.result else {
             panic!("the applied change must survive a lost observation");
         };
@@ -4102,6 +4171,7 @@ pub fn beacon() -> u64 {
             &validation,
             &changes,
             &empty_dependency_store(),
+            None,
             move |_, _| {
                 let moved = "[providers.history]\nenabled = false\n";
                 fs::write(root.join("rift.toml"), moved).map_err(|error| {
@@ -4117,7 +4187,7 @@ pub fn beacon() -> u64 {
                 })
             },
         )?;
-        assert!(outcome.candidate.is_none());
+        assert!(outcome.publication.is_none());
         let Ok(rmcp::Json(ChangeResult::Applied { summary })) = outcome.result else {
             panic!("the applied change must survive a moved configuration");
         };
@@ -4163,6 +4233,7 @@ pub fn beacon() -> u64 {
             &validation,
             &changes,
             &empty_dependency_store(),
+            None,
             move |_, _| {
                 let nested = root.join("nested");
                 let root_gitignore = root.join(".gitignore");
@@ -4564,6 +4635,129 @@ pub fn beacon() -> u64 {
         Ok(())
     }
 
+    /// The production capture, counting every build it runs: a stable candidate whose
+    /// change set replaces at least one path. A candidate that shares the previous read
+    /// service built nothing and is not counted.
+    fn counting_capture(
+        dependencies: &Arc<rift_server::DependencyStore>,
+        builds: &Arc<AtomicUsize>,
+    ) -> impl crate::validation::CaptureWorkspace + Clone + Send + 'static {
+        let scan = workspace_capture(dependencies);
+        let builds = Arc::clone(builds);
+        move |root: &std::path::Path, limits: WorkspaceIndexLimits, request: &RebuildRequest| {
+            let candidate = scan(root, limits, request)?;
+            if let WorkspaceCandidate::Stable { change_set, .. } = &candidate
+                && !change_set.is_empty()
+            {
+                builds.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(candidate)
+        }
+    }
+
+    /// One landed change beside the watcher batch its own write raises: the batch is
+    /// coalesced while the change holds the lane, and enters the lane after it. The
+    /// change is the one capture and the one publication; a batch whose paths all match
+    /// the publication builds nothing and stamps that publication with its epoch.
+    #[tokio::test]
+    async fn a_landed_change_beside_a_pending_watcher_batch_is_captured_once() -> TestResult {
+        use rift_protocol::change::{ChangeResult, PatchParams};
+
+        let (directory, assembled) = unsupervised_fixture().await?;
+        let server = &assembled.server;
+        let batch = Arc::new(std::sync::Mutex::new(None));
+        let coalesced = Arc::clone(&batch);
+        let observing = Arc::clone(&server.validation);
+        let path = CoreProjectPath::new("lib.rs")?;
+        let params: PatchParams = serde_json::from_value(json!({
+            "patch": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1,2 @@\n pub fn beacon() {}\n+pub fn lantern() {}\n"
+        }))?;
+        let lane = Arc::clone(&server.change_lane);
+        let root = directory.path().to_path_buf();
+        let published = Arc::clone(&server.published);
+        let validation = Arc::clone(&server.validation);
+        let changes = Arc::clone(&server.changes);
+        let dependencies = Arc::clone(&server.dependencies);
+        let lexical = server.lexical.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            lane.run(|| {
+                RiftMcp::change_serialized(
+                    &root,
+                    WorkspaceIndexLimits::default(),
+                    &published,
+                    &validation,
+                    &changes,
+                    &dependencies,
+                    lexical.as_ref(),
+                    move |reads, changes: &ChangeService| {
+                        let result = changes.patch(reads, &params)?;
+                        // The watcher observes the write while the change still holds
+                        // the lane, and the supervisor coalesces that batch before the
+                        // change observes its own paths.
+                        observing.observe_paths([path])?;
+                        *coalesced
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(observing.take_pending());
+                        Ok(result)
+                    },
+                )
+            })
+        })
+        .await??;
+        let publication = outcome
+            .publication
+            .ok_or("the landed change must publish its snapshot")?;
+        assert!(
+            publication.published,
+            "the change's snapshot becomes current before the lane releases"
+        );
+        assert!(
+            !publication.change_set.is_empty(),
+            "the landed change is the one capture"
+        );
+        let Ok(rmcp::Json(ChangeResult::Applied { .. })) = outcome.result else {
+            return Err("the change must land".into());
+        };
+
+        let builds = Arc::new(AtomicUsize::new(0));
+        let capture = counting_capture(&assembled.context.dependencies, &builds);
+        let pending = batch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or("the watcher batch must be pending")?;
+        let first = rebuild_workspace(&assembled.context, pending, capture.clone()).await?;
+        assert_eq!(
+            first,
+            RebuildOutcome::Superseded,
+            "the batch coalesced before the change observed its paths is superseded"
+        );
+        let second = server.validation.take_pending();
+        let second = rebuild_workspace(&assembled.context, second, capture).await?;
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            0,
+            "a watcher batch whose paths the landed change already published builds nothing"
+        );
+        assert_eq!(
+            second,
+            RebuildOutcome::Unchanged,
+            "the batch stamps the published edit with its epoch and publishes nothing new"
+        );
+        let current = current_publication(server).await;
+        assert_eq!(
+            current.epoch,
+            server.validation.observed_epoch(),
+            "the current publication answers the batch's epoch"
+        );
+        assert!(
+            Arc::ptr_eq(&current.reads, &publication.snapshot.reads),
+            "the current publication shares the change's own read service"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_change_under_a_rebuild_failure_at_the_observed_epoch_refuses() -> TestResult {
         let (directory, assembled) = unsupervised_fixture().await?;
@@ -4621,20 +4815,23 @@ pub fn beacon() -> u64 {
         assert_eq!(super::bounded_detail(multibyte, 3), "\u{e9}");
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_search_before_the_first_lexical_commit_lands_names_the_revision() -> TestResult {
-        use tracing_subscriber::layer::SubscriberExt as _;
+    /// How long after a search starts waiting the gated commit is released.
+    const COMMIT_LANDING_DELAY: Duration = Duration::from_millis(50);
+    /// A commit wait budget a held commit never lands inside.
+    const COMMIT_WAIT_BUDGET: Duration = Duration::from_millis(100);
 
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        super::hermetic_workspace(directory.path(), "")?;
-        let (sink, mut drain) = crate::logs::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let _guard = tracing::subscriber::set_default(subscriber);
+    /// A server over a one-declaration workspace whose lexical lane runs over a
+    /// [`StoreDouble`] holding every write at its gate, with the double the test releases
+    /// them through. Returns once the first write is held.
+    async fn server_over_gated_store(
+        root: &std::path::Path,
+    ) -> TestResult<(RiftMcp, Arc<StoreDouble>)> {
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(root, "")?;
         let double = StoreDouble::new();
         let gate = Arc::clone(&double);
         let assembled = RiftMcp::assemble(
-            super::absolute_root(directory.path())?,
+            super::absolute_root(root)?,
             WorkspaceIndexLimits::default(),
             None,
             move |index, blocking, cancellation| {
@@ -4645,11 +4842,25 @@ pub fn beacon() -> u64 {
         .await?;
         let server = assembled.supervised().await;
         double.calls_within_bound(1).await?;
-        let revision = server
-            .published
-            .read()
+        Ok((server, double))
+    }
+
+    /// The publication `server` currently answers from.
+    async fn current_publication(server: &RiftMcp) -> Arc<PublishedWorkspace> {
+        Arc::clone(&server.published.read().await.current)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_search_before_the_first_lexical_commit_lands_names_the_revision() -> TestResult {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let directory = tempfile::tempdir()?;
+        let (sink, mut drain) = crate::logs::log_capture();
+        let subscriber = tracing_subscriber::registry().with(sink);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let (server, double) = server_over_gated_store(directory.path()).await?;
+        let revision = current_publication(&server)
             .await
-            .current
             .reads
             .tree_revision()
             .to_owned();
@@ -4666,7 +4877,7 @@ pub fn beacon() -> u64 {
                 ReadWarning::LexicalRankingUnavailable { detail } => Some(detail.clone()),
                 _ => None,
             })
-            .ok_or("the search warns while the lane still holds the transaction")?;
+            .ok_or("the search warns once its budget ran out with the transaction still held")?;
         assert!(
             detail.contains(&format!("still committing tree revision {revision}")),
             "{detail}"
@@ -4695,6 +4906,93 @@ pub fn beacon() -> u64 {
             ranked.warnings.is_empty(),
             "a landed commit clears the warning: {:?}",
             ranked.warnings
+        );
+        Ok(())
+    }
+
+    /// A commit that lands inside the budget is waited out: the answer is store-ranked,
+    /// and the operator-action warning is never spent.
+    #[tokio::test(start_paused = true)]
+    async fn a_search_waits_out_a_commit_that_lands_inside_its_budget() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (server, double) = server_over_gated_store(directory.path()).await?;
+        let release = tokio::spawn({
+            let double = Arc::clone(&double);
+            async move {
+                tokio::time::sleep(COMMIT_LANDING_DELAY).await;
+                double.release_one();
+            }
+        });
+        let started = tokio::time::Instant::now();
+        let answer = run_search(&server, "beacon").await?;
+        let waited = started.elapsed();
+        release.await?;
+        assert!(
+            store_ranked(&answer) && !answer.results.is_empty(),
+            "the landed commit ranks the answer: {:?}",
+            answer.warnings
+        );
+        assert!(
+            waited >= COMMIT_LANDING_DELAY && waited < Duration::from_secs(1),
+            "the search waited for the landing and no longer: {waited:?}"
+        );
+        Ok(())
+    }
+
+    /// A commit that never lands inside the budget leaves the answer ranked by identifier
+    /// matching, warning that the tree is still committing, once the budget ran out.
+    #[tokio::test(start_paused = true)]
+    async fn a_search_whose_commit_never_lands_inside_its_budget_warns() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (server, _double) = server_over_gated_store(directory.path()).await?;
+        let published = current_publication(&server).await;
+        let params: SearchParams = serde_json::from_value(json!({"query": "beacon"}))?;
+        let started = tokio::time::Instant::now();
+        let ranking = server
+            .ranking(&params, &published, COMMIT_WAIT_BUDGET)
+            .await?
+            .ok_or("a tree still committing ranks by identifier matching alone")?;
+        let waited = started.elapsed();
+        let detail =
+            unavailable_detail(&ranking).ok_or("the tier warns once the budget ran out")?;
+        assert!(
+            detail.contains(&format!(
+                "still committing tree revision {}",
+                published.reads.tree_revision()
+            )),
+            "{detail}"
+        );
+        assert!(
+            waited >= COMMIT_WAIT_BUDGET && waited < COMMIT_WAIT_BUDGET * 2,
+            "the wait spent its budget and no more: {waited:?}"
+        );
+        Ok(())
+    }
+
+    /// A settled store never waits: the answer comes back at once, far under the budget.
+    #[tokio::test(start_paused = true)]
+    async fn a_search_over_a_settled_store_never_waits() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (server, double) = server_over_gated_store(directory.path()).await?;
+        double.release_one();
+        search_after_population(&server, "beacon").await?;
+        let published = current_publication(&server).await;
+        let params: SearchParams = serde_json::from_value(json!({"query": "beacon"}))?;
+        let budget = server.readiness_timeout().await;
+        let started = tokio::time::Instant::now();
+        let ranking = server
+            .ranking(&params, &published, budget)
+            .await?
+            .ok_or("a settled store ranks")?;
+        let waited = started.elapsed();
+        assert!(
+            ranking.warnings.is_empty(),
+            "a settled store warns nothing: {:?}",
+            ranking.warnings
+        );
+        assert!(
+            waited < budget / 100,
+            "a settled store answers without waiting: {waited:?} under {budget:?}"
         );
         Ok(())
     }
@@ -5565,8 +5863,9 @@ pub fn beacon() -> u64 {
         fs::write(other.path().join("lib.rs"), "pub fn lantern() {}\n")?;
         let moved = stable_candidate(other.path(), 0)?;
         let params: SearchParams = serde_json::from_value(json!({"query": "lantern"}))?;
+        let budget = server.readiness_timeout().await;
         assert!(
-            server.ranking(&params, &moved).await?.is_none(),
+            server.ranking(&params, &moved, budget).await?.is_none(),
             "a store that never held this tree ends the attempt rather than ranking"
         );
         Ok(())

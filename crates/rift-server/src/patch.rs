@@ -66,17 +66,47 @@ const HUNK_HEADER_PREFIX: &str = "@@";
 /// instead of editing an existing one.
 const NULL_TARGET: &str = "/dev/null";
 
+/// Opens git's header line naming the path a rename reads from, such as
+/// `rename from src/old.rs`.
+const RENAME_FROM_HEADER_PREFIX: &str = "rename from ";
+
+/// Opens git's header line naming the path a rename writes to, such as
+/// `rename to src/new.rs`.
+const RENAME_TO_HEADER_PREFIX: &str = "rename to ";
+
+/// Opens git's header line naming the path a copy reads from, such as
+/// `copy from src/old.rs`.
+const COPY_FROM_HEADER_PREFIX: &str = "copy from ";
+
+/// Opens git's header line naming the path a copy writes to, such as
+/// `copy to src/new.rs`.
+const COPY_TO_HEADER_PREFIX: &str = "copy to ";
+
+/// The header lines that make a diff a rename or copy, which `patch` does
+/// not serve, whether or not file headers and hunks follow them.
+const RENAME_OR_COPY_HEADER_PREFIXES: &[&str] = &[
+    RENAME_FROM_HEADER_PREFIX,
+    RENAME_TO_HEADER_PREFIX,
+    COPY_FROM_HEADER_PREFIX,
+    COPY_TO_HEADER_PREFIX,
+];
+
 /// Opens the `apply_patch` envelope some agents emit; not a unified diff.
 const APPLY_PATCH_ENVELOPE_OPENING: &str = "*** Begin Patch";
 
 /// The unified-diff form every shape refusal names.
 const UNIFIED_DIFF_EXPECTED_FORM: &str = "send a unified diff that opens each file with `--- a/src/lib.rs` and `+++ b/src/lib.rs` headers followed by `@@ -1,3 +1,4 @@` hunks, where context lines start with a space, removed lines with `-`, and added lines with `+`";
 
-/// Why a patch body is not a unified diff `patch` reads.
+/// Why a patch body refuses before any segment parses. Either it is not a
+/// unified diff `patch` reads, or it is a rename or copy `patch` does not
+/// serve.
 #[derive(Debug, PartialEq, Eq)]
 enum PatchShapeViolation {
     /// The body opens with the `apply_patch` envelope instead of a file header.
     ApplyPatchEnvelope,
+    /// The body carries a `rename from`, `rename to`, `copy from`, or `copy to`
+    /// header: a rename or copy, which `patch` does not serve.
+    RenameOrCopy,
     /// The body carries no file header at all.
     NoFileHeaders,
     /// The body carries a file header no hunk follows, and no `NULL_TARGET`
@@ -92,6 +122,9 @@ impl std::fmt::Display for PatchShapeViolation {
             Self::ApplyPatchEnvelope => write!(
                 formatter,
                 "is an `{APPLY_PATCH_ENVELOPE_OPENING}` envelope, which `patch` does not read: {UNIFIED_DIFF_EXPECTED_FORM}"
+            ),
+            Self::RenameOrCopy => formatter.write_str(
+                "renames or copies a file, and `patch` carries no rename or copy support: `move_file` moves a file, and a `/dev/null` header creates or deletes one",
             ),
             Self::NoFileHeaders => {
                 write!(
@@ -118,17 +151,26 @@ fn names_null_target(text: &str) -> bool {
         == Some(NULL_TARGET)
 }
 
-/// Classifies why `patch` is not a unified diff `patch` reads, in precedence
-/// order: an `apply_patch` envelope, then a body carrying no file header, then
-/// more files than the bound, then a file header no hunk follows. A creation or
-/// deletion carries no hunk of its own, so a [`NULL_TARGET`] header excuses the
-/// last arm.
+/// Whether `text` is one of the [`RENAME_OR_COPY_HEADER_PREFIXES`] header lines.
+fn names_rename_or_copy(text: &str) -> bool {
+    RENAME_OR_COPY_HEADER_PREFIXES
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+}
+
+/// Classifies why `patch` refuses before any segment parses, in precedence
+/// order: an `apply_patch` envelope, then a rename or copy, then a body
+/// carrying no file header, then more files than the bound, then a file header
+/// no hunk follows. A rename or copy outranks the missing file headers because
+/// git's rename-only diff carries none. A creation or deletion carries no hunk
+/// of its own, so a [`NULL_TARGET`] header excuses the last arm.
 fn patch_shape_violation(patch: &str) -> Option<PatchShapeViolation> {
     let opening = line::lines_inclusive(patch)
         .map(line::without_ending)
         .find(|text| !text.trim().is_empty())
         .unwrap_or_default();
     let (_, segments) = split_at_marker(patch, |text| text.starts_with(ORIGINAL_HEADER_PREFIX));
+    let carries_rename_or_copy = line::lines_inclusive(patch).any(names_rename_or_copy);
     let carries_hunk =
         line::lines_inclusive(patch).any(|text| text.starts_with(HUNK_HEADER_PREFIX));
     let carries_null_target = line::lines_inclusive(patch)
@@ -138,6 +180,7 @@ fn patch_shape_violation(patch: &str) -> Option<PatchShapeViolation> {
         _ if opening.starts_with(APPLY_PATCH_ENVELOPE_OPENING) => {
             Some(PatchShapeViolation::ApplyPatchEnvelope)
         }
+        _ if carries_rename_or_copy => Some(PatchShapeViolation::RenameOrCopy),
         0 => Some(PatchShapeViolation::NoFileHeaders),
         file_count if file_count > PATCH_FILES_MAX => {
             Some(PatchShapeViolation::TooManyFiles { file_count })
@@ -161,16 +204,21 @@ fn patch_shape_violation(patch: &str) -> Option<PatchShapeViolation> {
 /// # Errors
 ///
 /// Returns [`ReadError`] naming the [`PatchShapeViolation`] when `patch` is
-/// not a unified diff this function can split.
-pub(crate) fn split_file_segments(patch: &str) -> Result<Vec<String>, ReadError> {
-    if let Some(violation) = patch_shape_violation(patch) {
-        return Err(ReadFault::invalid("patch", violation.to_string()));
+/// not a unified diff this function can split. A rename or copy, which
+/// `patch` does not serve, comes back as the inner refusal instead.
+pub(crate) fn split_file_segments(
+    patch: &str,
+) -> Result<Result<Vec<String>, ChangeResult>, ReadError> {
+    match patch_shape_violation(patch) {
+        Some(PatchShapeViolation::RenameOrCopy) => return Ok(Err(rename_or_copy_refusal())),
+        Some(violation) => return Err(ReadFault::invalid("patch", violation.to_string())),
+        None => {}
     }
     let (_, raw_segments) = split_at_marker(patch, |text| text.starts_with(ORIGINAL_HEADER_PREFIX));
-    Ok(raw_segments
+    Ok(Ok(raw_segments
         .iter()
         .map(|raw| recounted_headers(&normalize_segment(raw)))
-        .collect())
+        .collect()))
 }
 
 /// Rewrites every hunk header's line counts to the counts the hunk's own
@@ -411,15 +459,19 @@ fn resolve_patch_target(
             let original = strip_prefix(original, "a/");
             let modified = strip_prefix(modified, "b/");
             if original != modified {
-                return Ok(Err(ChangeResult::refused(
-                    RefusalReason::Unsupported,
-                    Vec::new(),
-                )));
+                return Ok(Err(rename_or_copy_refusal()));
             }
             PatchTarget::Modify(project_path(original)?)
         }
     };
     Ok(Ok(target))
+}
+
+/// Refuses a rename or copy, which `patch` does not serve, in the words of
+/// [`PatchShapeViolation::RenameOrCopy`], so the shape check and the target
+/// resolution name the same recovery: `move_file`, or a `/dev/null` header.
+fn rename_or_copy_refusal() -> ChangeResult {
+    crate::rename::unsupported_refusal(format!("the diff {}", PatchShapeViolation::RenameOrCopy))
 }
 
 fn strip_prefix<'a>(value: &'a str, prefix: &str) -> &'a str {
@@ -990,7 +1042,32 @@ mod tests {
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
     fn hunks(diff: &str) -> TestResult<Vec<String>> {
-        Ok(super::split_file_segments(diff)?)
+        Ok(super::split_file_segments(diff)?.map_err(|_| "the diff must split into segments")?)
+    }
+
+    /// Sends `patch` over a fresh fixture and returns the refusal it draws, with
+    /// the fixture directory so a test can prove the tree untouched.
+    fn refusal_for(patch: &str) -> TestResult<(tempfile::TempDir, RefusalReason, Vec<String>)> {
+        let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
+        let result = changes.patch(
+            &reads,
+            &PatchParams {
+                patch: patch.into(),
+            },
+        )?;
+        let ChangeResult::Refused {
+            reason,
+            diagnostics,
+            ..
+        } = result
+        else {
+            return Err("the patch must refuse".into());
+        };
+        let messages = diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+        Ok((directory, reason, messages))
     }
 
     /// Builds a workspace with one `lib.rs`, and services over it.
@@ -1954,6 +2031,24 @@ mod tests {
     }
 
     #[test]
+    fn patch_shape_violation_names_a_rename_before_missing_file_headers() {
+        assert_eq!(
+            super::patch_shape_violation(
+                "diff --git a/lib.rs b/other.rs\nsimilarity index 100%\nrename from lib.rs\nrename to other.rs\n"
+            ),
+            Some(super::PatchShapeViolation::RenameOrCopy),
+            "a rename-only diff carries no file header, and the rename must outrank that"
+        );
+        assert_eq!(
+            super::patch_shape_violation(
+                "diff --git a/lib.rs b/twin.rs\nsimilarity index 100%\ncopy from lib.rs\ncopy to twin.rs\n"
+            ),
+            Some(super::PatchShapeViolation::RenameOrCopy),
+            "a copy-only diff classifies the same way"
+        );
+    }
+
+    #[test]
     fn patch_shape_violation_accepts_a_unified_diff() {
         assert_eq!(
             super::patch_shape_violation("--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-x\n+y\n"),
@@ -1991,6 +2086,61 @@ mod tests {
         assert_eq!(reason, RefusalReason::Unsupported);
         let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
         assert_eq!(untouched, "pub fn beacon() {}\n");
+        Ok(())
+    }
+
+    #[test]
+    fn patch_refuses_a_rename_only_diff_as_unsupported() -> TestResult {
+        let diff = "diff --git a/lib.rs b/other.rs\nsimilarity index 100%\nrename from lib.rs\nrename to other.rs\n";
+        let (directory, reason, messages) = refusal_for(diff)?;
+        assert_eq!(reason, RefusalReason::Unsupported);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("no rename or copy support")),
+            "{messages:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("lib.rs"))?,
+            "pub fn beacon() {}\n"
+        );
+        assert!(!directory.path().join("other.rs").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn patch_refuses_a_copy_only_diff_as_unsupported() -> TestResult {
+        let diff = "diff --git a/lib.rs b/twin.rs\nsimilarity index 100%\ncopy from lib.rs\ncopy to twin.rs\n";
+        let (directory, reason, messages) = refusal_for(diff)?;
+        assert_eq!(reason, RefusalReason::Unsupported);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("no rename or copy support")),
+            "{messages:?}"
+        );
+        assert!(!directory.path().join("twin.rs").exists());
+        Ok(())
+    }
+
+    /// A rename git emits with a hunk carries `---`/`+++` headers after its
+    /// `rename from`/`rename to` lines; the rename still refuses `unsupported`
+    /// rather than reaching the hunk.
+    #[test]
+    fn patch_refuses_a_rename_with_a_hunk_as_unsupported() -> TestResult {
+        let diff = "diff --git a/lib.rs b/other.rs\nsimilarity index 96%\nrename from lib.rs\nrename to other.rs\n--- a/lib.rs\n+++ b/other.rs\n@@ -1 +1 @@\n-pub fn beacon() {}\n+pub fn beacon() -> u8 { 7 }\n";
+        let (directory, reason, messages) = refusal_for(diff)?;
+        assert_eq!(reason, RefusalReason::Unsupported);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("no rename or copy support")),
+            "{messages:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("lib.rs"))?,
+            "pub fn beacon() {}\n"
+        );
         Ok(())
     }
 
