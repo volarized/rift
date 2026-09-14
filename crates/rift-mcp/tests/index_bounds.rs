@@ -16,7 +16,7 @@ mod workspace_client;
 
 use std::fs;
 
-use rift_core::constants::FORCE_INCLUDE_FILES_MAX;
+use rift_core::constants::{FORCE_INCLUDE_FILES_MAX, READ_RESULTS_MAX_DEFAULT};
 use rift_index::WorkspaceIndexLimits;
 use rift_mcp::RiftMcp;
 use serde_json::{Value, json};
@@ -281,6 +281,42 @@ async fn a_force_include_past_its_file_bound_refuses_with_the_match_count_as_evi
         ))
         .await
         .expect_err("a force_include past its file bound refuses the request");
+    let wire = refusal_data(refused);
+    assert_eq!(wire["code"], json!("limit_exceeded"), "{wire:#}");
+    assert_eq!(
+        wire["limit"],
+        json!({
+            "field": "paths.force_include",
+            "limit": FORCE_INCLUDE_FILES_MAX,
+            "required": FORCE_INCLUDE_FILE_COUNT
+        }),
+        "the refusal must carry typed wire evidence: {wire:#}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// The same past-bound `force_include` beside indexed files enough to fill the index's
+/// own result bound on their own: the bound is checked on the request, so the refusal
+/// does not depend on the room the indexed hits leave.
+#[tokio::test]
+async fn a_force_include_past_its_file_bound_refuses_when_the_index_fills_the_pool() -> TestResult {
+    let mut files = force_include_files();
+    files.extend(
+        (0..READ_RESULTS_MAX_DEFAULT)
+            .map(|index| (format!("note-{index:04}.txt"), format!("note {index}\n"))),
+    );
+    let (_directory, client, server_task) = served_workspace(&borrowed(&files), None).await?;
+
+    let refused = client
+        .call_tool(tool_request(
+            "search",
+            &json!({ "query": "note", "paths": { "force_include": ["extra/**"] } }),
+        ))
+        .await
+        .expect_err("a force_include past its file bound refuses whatever the index yields");
     let wire = refusal_data(refused);
     assert_eq!(wire["code"], json!("limit_exceeded"), "{wire:#}");
     assert_eq!(

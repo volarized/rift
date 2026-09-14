@@ -2205,6 +2205,41 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
+    /// A `force_include` within its bound is built even when the persistent index alone
+    /// fills `results_max`: the request still answers, and its warnings are the ones the
+    /// same query carries without the selector.
+    #[test]
+    fn search_force_include_within_bound_beside_a_full_index_still_answers() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join(".gitignore"), "gitignored.rs\n")?;
+        fs::write(
+            directory.path().join("visible.rs"),
+            "pub fn visible_symbol() {}\n",
+        )?;
+        fs::write(
+            directory.path().join("gitignored.rs"),
+            "pub fn phantom_gitignored() {}\n",
+        )?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::new(10, 4_096, 8_192, 8, 1)?,
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let plain: SearchParams = serde_json::from_value(json!({ "query": "visible" }))?;
+        let reaching: SearchParams = serde_json::from_value(json!({
+            "query": "visible",
+            "paths": {"force_include": ["gitignored.rs"]}
+        }))?;
+        let without = service.search(&plain, &[])?;
+        let with = service.search(&reaching, &[])?;
+        assert_eq!(with.results.len(), 1, "{:#?}", with.results);
+        assert_eq!(with.results[0].path, without.results[0].path);
+        assert_eq!(with.warnings, without.warnings);
+        Ok(())
+    }
+
     #[test]
     fn search_force_include_invalid_glob_refuses() -> TestResult {
         let (_directory, service) = fixture()?;
