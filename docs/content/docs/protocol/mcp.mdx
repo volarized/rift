@@ -64,7 +64,8 @@ The search ranking tiers carry their own warnings:
   tree revision. Ranking falls back to identifier matching, so a query phrased as prose finds
   nothing; the tier is read under the answer's own tree revision, so one that has moved past it
   is recaptured rather than warned about, a case a caller cannot otherwise tell apart from a
-  tier that searched and found nothing.
+  tier that searched and found nothing. A read waits for a commit in flight up to
+  `[server] readiness_timeout` and warns only when that budget runs out.
 - `lexical_ranking_truncated` - the lexical ranking stopped at `matches_max` units, and hits
   past that bound never reach a page, whatever `paths` selects. `total_pages` counts the units
   that did; a narrower `query` brings the rest inside the bound.
