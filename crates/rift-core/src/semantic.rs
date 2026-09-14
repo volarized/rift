@@ -899,7 +899,7 @@ fn validate_provider_symbol(contribution: &Contribution) -> Result<(), Contribut
 }
 
 fn validate_portable_facts(facts: &PortableSymbolFacts) -> Result<(), ContributionError> {
-    if invalid_text(&facts.name) || invalid_text(&facts.qualified_name) {
+    if !is_portable_name(&facts.name) || !is_portable_name(&facts.qualified_name) {
         return Err(contribution_error(
             ContributionViolation::InvalidName,
             "facts.name",
@@ -1011,10 +1011,18 @@ fn validate_namespace(key: &ExtensionKey) -> Result<(), ContributionError> {
     ))
 }
 
-fn invalid_text(value: &str) -> bool {
-    value.is_empty()
-        || value.len() > PROVIDER_SYMBOL_ID_BYTES_MAX
-        || value.chars().any(char::is_control)
+/// Whether the Contribution contract accepts `value` as a portable name: nonempty, at
+/// most [`PROVIDER_SYMBOL_ID_BYTES_MAX`] bytes, and free of control characters.
+///
+/// A syntax provider runs every declaration's `name` and `qualified_name` through this
+/// one predicate before its document is built, so a name the contract refuses never
+/// reaches a Contribution.
+#[must_use]
+pub fn is_portable_name(value: &str) -> bool {
+    let nonempty = !value.is_empty();
+    let within_bound = value.len() <= PROVIDER_SYMBOL_ID_BYTES_MAX;
+    let control_free = !value.chars().any(char::is_control);
+    nonempty && within_bound && control_free
 }
 
 fn valid_language(language: &Language) -> bool {

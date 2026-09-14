@@ -124,7 +124,7 @@ impl SyntaxProvider for TypeScriptSyntaxProvider {
 
 #[cfg(test)]
 mod tests {
-    use rift_core::ProjectPath;
+    use rift_core::{PROVIDER_SYMBOL_ID_BYTES_MAX, ProjectPath};
     use rift_protocol::read::SymbolFacet;
 
     use super::*;
@@ -412,5 +412,22 @@ mod tests {
         let document = analyze("");
         assert!(document.symbols().is_empty());
         assert!(!document.has_errors());
+    }
+
+    /// An interface named past `PROVIDER_SYMBOL_ID_BYTES_MAX` bytes declares
+    /// nothing; the type alias beside it stays, and the document counts the
+    /// one it left out.
+    #[test]
+    fn test_a_declaration_past_the_name_bound_emits_no_symbol() {
+        let name = "i".repeat(PROVIDER_SYMBOL_ID_BYTES_MAX + 1);
+        let text = format!("interface {name} {{}}\ntype Kept = string;\n");
+        let document = analyze(&text);
+        let names = document
+            .symbols()
+            .iter()
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["Kept"]);
+        assert_eq!(document.left_out_declaration_count(), 1);
     }
 }

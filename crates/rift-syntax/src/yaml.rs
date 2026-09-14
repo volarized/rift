@@ -11,6 +11,11 @@
 //!   quotes with escapes kept. A key that is not a scalar - a flow
 //!   collection - names by its own source bytes. A key spelling no
 //!   characters (`''`) names nothing and emits no symbol.
+//! - A key whose bytes hold a control character - a block scalar under `?`,
+//!   literal or folded - or pass `PROVIDER_SYMBOL_ID_BYTES_MAX` bytes names
+//!   nothing either: the document leaves the entry out with every entry
+//!   nested in its value, whose qualified name would carry the same bytes,
+//!   and counts them.
 //! - Qualified names join nested entry keys with ` > ` (`server > port`),
 //!   the markdown spelling and for the markdown reason: a key is an
 //!   arbitrary string, so the language reserves no separator - `.` and `/`
@@ -438,7 +443,7 @@ fn yaml_kinds() -> &'static YamlKinds {
 
 #[cfg(test)]
 mod tests {
-    use rift_core::ProjectPath;
+    use rift_core::{PROVIDER_SYMBOL_ID_BYTES_MAX, ProjectPath};
 
     use super::*;
     use crate::failure::SyntaxViolation;
@@ -852,5 +857,31 @@ mod tests {
                 "structural kind {kind} carries no portable facet"
             );
         }
+    }
+
+    /// A complex key (`? |`) spells a block scalar whose bytes hold newlines,
+    /// so the entry declares nothing, and neither does the entry nested in
+    /// its value, whose qualified name would carry the same bytes. The plain
+    /// key beside it is the document's one symbol, and the document counts
+    /// the two it left out.
+    #[test]
+    fn test_a_complex_key_holding_control_characters_emits_no_symbol() {
+        let text = "? |\n  first line\n  second line\n: {nested: 1}\nplain: 1\n";
+        let document = analyze(text);
+        assert_eq!(qualified_names(&document), [("plain", None)]);
+        assert_eq!(document.left_out_declaration_count(), 2);
+    }
+
+    /// A key past `PROVIDER_SYMBOL_ID_BYTES_MAX` bytes declares nothing, and
+    /// the plain key beside it stays.
+    #[test]
+    fn test_a_key_past_the_name_bound_emits_no_symbol() {
+        let text = format!(
+            "{}: 1\nplain: 2\n",
+            "k".repeat(PROVIDER_SYMBOL_ID_BYTES_MAX + 1)
+        );
+        let document = analyze(&text);
+        assert_eq!(qualified_names(&document), [("plain", None)]);
+        assert_eq!(document.left_out_declaration_count(), 1);
     }
 }
