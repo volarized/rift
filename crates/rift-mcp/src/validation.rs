@@ -217,6 +217,25 @@ pub(crate) struct PublishedWorkspace {
     pub(crate) epoch: u64,
 }
 
+impl PublishedWorkspace {
+    /// This publication's twin under `configuration` and `epoch`.
+    ///
+    /// Every part is shared, so the twin costs the clones of its handles and reads no
+    /// file again. It is what a capture that read nothing new publishes: the same tree,
+    /// answering a later observation.
+    fn under(&self, configuration: ConfigurationState, epoch: u64) -> Self {
+        Self {
+            reads: Arc::clone(&self.reads),
+            configuration,
+            fingerprint: self.fingerprint.clone(),
+            source_policy: Arc::clone(&self.source_policy),
+            map: Arc::clone(&self.map),
+            dependency_plan: self.dependency_plan.clone(),
+            epoch,
+        }
+    }
+}
+
 /// Published workspace plus failure for latest observed epoch.
 #[derive(Debug)]
 pub(crate) struct IndexState {
@@ -1295,15 +1314,7 @@ fn shared_workspace_candidate(
     epoch: u64,
 ) -> Result<PublishedWorkspace, ReadError> {
     if changes.is_empty() {
-        return Ok(PublishedWorkspace {
-            reads: Arc::clone(&previous.reads),
-            configuration,
-            fingerprint: previous.fingerprint.clone(),
-            source_policy: Arc::clone(&previous.source_policy),
-            map: Arc::clone(&previous.map),
-            dependency_plan: previous.dependency_plan.clone(),
-            epoch,
-        });
+        return Ok(previous.under(configuration, epoch));
     }
     let reads = previous.reads.rebuilt(changes)?;
     let map = Arc::new(reads.workspace_map());
@@ -2316,15 +2327,17 @@ async fn publish_captured(
     work: PendingWork,
     lexical: Option<LexicalHandoff>,
 ) -> Result<RebuildOutcome, ReadError> {
+    let root = context.root.clone();
     let published = Arc::clone(&context.published);
     let validation = Arc::clone(&context.validation);
     let publication = context
         .blocking
         .run("filesystem index publication", move || {
             Ok(finish_rebuild(
+                &root,
                 &published,
                 &validation,
-                candidate,
+                &candidate,
                 work,
                 lexical,
             ))
@@ -2454,13 +2467,14 @@ pub(crate) fn capture_rebuild_with(
 /// Publishes one candidate and hands the lane its lexical write, or returns its
 /// observation's work when the tree moved underneath it or the supervisor was cancelled.
 pub(crate) fn finish_rebuild(
+    root: &Path,
     published: &RwLock<IndexState>,
     validation: &IndexValidation,
-    candidate: Arc<PublishedWorkspace>,
+    candidate: &Arc<PublishedWorkspace>,
     work: PendingWork,
     lexical: Option<LexicalHandoff>,
 ) -> RebuildOutcome {
-    let outcome = publish_rebuild_after(published, validation, candidate, lexical, || {});
+    let outcome = publish_rebuild_after(root, published, validation, candidate, lexical, || {});
     if outcome == RebuildOutcome::Published {
         validation.changed.notify_waiters();
     } else {
@@ -2484,11 +2498,12 @@ pub(crate) fn accept_rebuild(validation: &IndexValidation, epoch: u64) -> Result
 /// hand over.
 #[cfg(test)]
 pub(crate) fn publish_rebuild(
+    root: &Path,
     published: &RwLock<IndexState>,
     validation: &IndexValidation,
-    candidate: Arc<PublishedWorkspace>,
+    candidate: &Arc<PublishedWorkspace>,
 ) -> RebuildOutcome {
-    publish_rebuild_after(published, validation, candidate, None, || {})
+    publish_rebuild_after(root, published, validation, candidate, None, || {})
 }
 
 /// Publishes under observation lane; hook enables deterministic overlap tests.
@@ -2497,14 +2512,20 @@ pub(crate) fn publish_rebuild(
 /// releases, so two publications hand their writes over in the order they published.
 /// A candidate that meets a cancelled token under those locks is refused unpublished:
 /// the token is cancelled only at shutdown, and the lane it would be handed to has ended.
+///
+/// A candidate whose epoch the observation already passed still publishes when it holds
+/// what every path observed since its capture now holds; see [`answered_candidate`].
 pub(crate) fn publish_rebuild_after(
+    root: &Path,
     published: &RwLock<IndexState>,
     validation: &IndexValidation,
-    candidate: Arc<PublishedWorkspace>,
+    candidate: &Arc<PublishedWorkspace>,
     lexical: Option<LexicalHandoff>,
     after_state_lock: impl FnOnce(),
 ) -> RebuildOutcome {
     let publication = validation.locked_pending();
+    let observed_epoch = validation.observed_epoch();
+    let candidate = answered_candidate(root, candidate, &publication, observed_epoch);
     let mut state = published.blocking_write();
     after_state_lock();
     if validation.cancellation.is_cancelled() {
@@ -2512,7 +2533,11 @@ pub(crate) fn publish_rebuild_after(
         drop(publication);
         return RebuildOutcome::Cancelled;
     }
-    let observed_epoch = validation.observed_epoch();
+    let Some(candidate) = candidate else {
+        drop(state);
+        drop(publication);
+        return RebuildOutcome::Superseded;
+    };
     let publishing = Arc::clone(&candidate);
     // IndexState::publish owns the still-current check, so a superseded
     // candidate is rejected in exactly one place.
@@ -2530,6 +2555,44 @@ pub(crate) fn publish_rebuild_after(
     } else {
         RebuildOutcome::Superseded
     }
+}
+
+/// The candidate to publish under `observed_epoch`, or nothing when the observation
+/// genuinely moved past it.
+///
+/// A candidate answers the epoch its capture took. When the observation moved while the
+/// capture ran, the paths that moved are still the lane's pending work, so the same
+/// comparison a rebuild makes - [`PathChanges::resolve`] against the candidate's own
+/// digests - says whether the candidate already holds what they name. A candidate that
+/// holds all of them answers the later observation too and publishes as its twin under
+/// that epoch: a change's own write reaches the watcher after the change captured it,
+/// and reading the same bytes a second time is the work this drops. An observation that
+/// names a path the candidate does not hold, one that asks for the whole workspace, or
+/// one made while `rift.toml` moved, supersedes the candidate.
+///
+/// Work is one digest per observed path, bounded by how many paths one observation
+/// retains, and it runs under the publication lane alone.
+fn answered_candidate(
+    root: &Path,
+    candidate: &Arc<PublishedWorkspace>,
+    pending: &PendingWork,
+    observed_epoch: u64,
+) -> Option<Arc<PublishedWorkspace>> {
+    if candidate.epoch == observed_epoch {
+        return Some(Arc::clone(candidate));
+    }
+    if pending.covers_whole_workspace()
+        || candidate.configuration.fingerprint != configuration_fingerprint(root)
+    {
+        return None;
+    }
+    let observed = observed_digests(root, &pending.paths, &candidate.source_policy)?;
+    let changes = PathChanges::resolve(observed, |path| candidate.reads.file_digest(path));
+    if !changes.is_empty() {
+        return None;
+    }
+    let twin = candidate.under(candidate.configuration.clone(), observed_epoch);
+    Some(Arc::new(twin))
 }
 
 /// Records failure under same observation linearization as publication.
@@ -3046,12 +3109,19 @@ mod tests {
     }
 
     struct PublicationFixture {
-        _directory: tempfile::TempDir,
+        directory: tempfile::TempDir,
         before: Arc<super::PublishedWorkspace>,
         after: Arc<super::PublishedWorkspace>,
         state: Arc<RwLock<IndexState>>,
         validation: Arc<IndexValidation>,
         _invalidations: tokio::sync::mpsc::Receiver<()>,
+    }
+
+    impl PublicationFixture {
+        /// The workspace root every candidate in this fixture was captured over.
+        fn root(&self) -> &std::path::Path {
+            self.directory.path()
+        }
     }
 
     fn publication_fixture() -> TestResult<PublicationFixture> {
@@ -3077,7 +3147,7 @@ mod tests {
         let epoch = validation.observe_whole_workspace()?;
         let after = stable_candidate(directory.path(), epoch)?;
         Ok(PublicationFixture {
-            _directory: directory,
+            directory,
             before,
             after,
             state,
@@ -3158,6 +3228,7 @@ mod tests {
         prepublication_captures.wait();
         let publication_locked = Arc::new(ThreadBarrier::new(2));
         let publication_released = Arc::new(ThreadBarrier::new(2));
+        let publisher_root = fixture.root().to_path_buf();
         let publisher_state = Arc::clone(&fixture.state);
         let publisher_validation = Arc::clone(&fixture.validation);
         let published_candidate = Arc::clone(&fixture.after);
@@ -3165,9 +3236,10 @@ mod tests {
         let released = Arc::clone(&publication_released);
         let publisher = std::thread::spawn(move || {
             publish_rebuild_after(
+                &publisher_root,
                 &publisher_state,
                 &publisher_validation,
-                published_candidate,
+                &published_candidate,
                 None,
                 || {
                     locked.wait();
@@ -3234,7 +3306,7 @@ mod tests {
         assert_eq!(validation.observe_whole_workspace()?, 1);
         assert_eq!(validation.observe_whole_workspace()?, 2);
         assert_eq!(
-            publish_rebuild(&state, &validation, Arc::clone(&after)),
+            publish_rebuild(directory.path(), &state, &validation, &after),
             RebuildOutcome::Superseded
         );
         let state_snapshot = state.blocking_read();
@@ -5678,9 +5750,10 @@ mod tests {
         fixture.validation.cancellation.cancel();
         assert_eq!(
             publish_rebuild(
+                fixture.root(),
                 &fixture.state,
                 &fixture.validation,
-                Arc::clone(&fixture.after)
+                &fixture.after
             ),
             RebuildOutcome::Cancelled
         );

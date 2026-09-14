@@ -2157,10 +2157,13 @@ impl RiftMcp {
     /// lane its write, and returns what it published.
     ///
     /// The publication takes the same linearization point filesystem observation takes,
-    /// so a candidate superseded while it was built cannot become current. A publication
-    /// the supervisor's cancellation refused answers like a superseded one: the snapshot
-    /// did not become current, and the process is leaving.
+    /// so a candidate superseded while it was built cannot become current. The events
+    /// the change's own write raised are not such a supersession: they name paths the
+    /// snapshot already holds, and the publication answers their epoch instead. A
+    /// publication the supervisor's cancellation refused answers like a superseded one:
+    /// the snapshot did not become current, and the process is leaving.
     fn publish_applied_change(
+        root: &Path,
         published: &RwLock<IndexState>,
         validation: &IndexValidation,
         lexical: Option<&LexicalLane>,
@@ -2177,7 +2180,7 @@ impl RiftMcp {
         let handoff = lexical
             .cloned()
             .map(|lane| LexicalHandoff::new(lane, write));
-        let outcome = finish_rebuild(published, validation, Arc::clone(&snapshot), work, handoff);
+        let outcome = finish_rebuild(root, published, validation, &snapshot, work, handoff);
         let became_current = outcome == RebuildOutcome::Published;
         if became_current {
             tracing::info!(
@@ -2263,7 +2266,7 @@ impl RiftMcp {
                 dependencies,
             )
             .map(|candidate| {
-                Self::publish_applied_change(published, validation, lexical, candidate)
+                Self::publish_applied_change(root, published, validation, lexical, candidate)
             })
         } else {
             None
@@ -4754,6 +4757,180 @@ pub fn beacon() -> u64 {
         assert!(
             Arc::ptr_eq(&current.reads, &publication.snapshot.reads),
             "the current publication shares the change's own read service"
+        );
+        Ok(())
+    }
+
+    /// The pieces of one server a change publishes through, owned so the change lane
+    /// can run them on a blocking thread.
+    struct ChangeLaneParts {
+        root: std::path::PathBuf,
+        published: Arc<tokio::sync::RwLock<IndexState>>,
+        validation: Arc<IndexValidation>,
+        changes: Arc<ChangeService>,
+        dependencies: Arc<rift_server::DependencyStore>,
+        lexical: Option<LexicalLane>,
+    }
+
+    impl ChangeLaneParts {
+        fn of(server: &RiftMcp, root: &std::path::Path) -> Self {
+            Self {
+                root: root.to_path_buf(),
+                published: Arc::clone(&server.published),
+                validation: Arc::clone(&server.validation),
+                changes: Arc::clone(&server.changes),
+                dependencies: Arc::clone(&server.dependencies),
+                lexical: server.lexical.clone(),
+            }
+        }
+    }
+
+    /// Observes `path` the way the watcher does once the filesystem delivers a write.
+    fn observe_written_path(validation: &IndexValidation, path: &str) -> Result<(), String> {
+        let path =
+            CoreProjectPath::new(path).map_err(|error| format!("path must parse: {error:?}"))?;
+        validation
+            .observe_paths([path])
+            .map_err(|error| format!("the write's events must be observed: {error:?}"))?;
+        Ok(())
+    }
+
+    /// Lands one patch and publishes its snapshot, running `between` in the window the
+    /// capture and the publication leave open.
+    ///
+    /// That window is where the watcher delivers what the write raised: the change has
+    /// already taken the pending work its capture answers, so an observation made there
+    /// arrives against a candidate one epoch behind.
+    fn landed_change_publication(
+        parts: &ChangeLaneParts,
+        params: &rift_protocol::change::PatchParams,
+        between: impl FnOnce() -> Result<(), String>,
+    ) -> Result<super::AppliedPublication, String> {
+        use rift_protocol::change::ChangeResult;
+
+        let current = parts.published.blocking_read().snapshot().0;
+        let configuration = current
+            .configuration
+            .accepted(super::wire::ErrorPhase::Change)
+            .map_err(|error| format!("the fixture's configuration must accept: {error:?}"))?;
+        let applied = parts
+            .changes
+            .patch(&current.reads, params)
+            .map_err(|error| format!("the patch must apply: {error:?}"))?;
+        let ChangeResult::Applied { mut summary } = applied else {
+            return Err("the patch must land".to_owned());
+        };
+        let candidate = RiftMcp::rebuild_after_applied_change(
+            &parts.root,
+            WorkspaceIndexLimits::default(),
+            &parts.validation,
+            &configuration,
+            &current,
+            &mut summary,
+            &parts.dependencies,
+        )
+        .ok_or_else(|| "the landed change must build a candidate".to_owned())?;
+        between()?;
+        Ok(RiftMcp::publish_applied_change(
+            &parts.root,
+            &parts.published,
+            &parts.validation,
+            parts.lexical.as_ref(),
+            candidate,
+        ))
+    }
+
+    /// The patch both window tests land on the fixture's `lib.rs`.
+    fn lantern_patch() -> TestResult<rift_protocol::change::PatchParams> {
+        Ok(serde_json::from_value(json!({
+            "patch": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1,2 @@\n pub fn beacon() {}\n+pub fn lantern() {}\n"
+        }))?)
+    }
+
+    /// One landed change whose own write reaches the watcher after the capture: the
+    /// events name exactly the paths the change captured, so the candidate still
+    /// answers them and publishes once.
+    #[tokio::test]
+    async fn a_landed_change_publishes_past_the_events_its_own_write_raised() -> TestResult {
+        let (directory, assembled) = unsupervised_fixture().await?;
+        let server = &assembled.server;
+        let params = lantern_patch()?;
+        let parts = ChangeLaneParts::of(server, directory.path());
+        let lane = Arc::clone(&server.change_lane);
+        let publication = tokio::task::spawn_blocking(move || {
+            lane.run(|| {
+                landed_change_publication(&parts, &params, || {
+                    observe_written_path(&parts.validation, "lib.rs")
+                })
+            })
+        })
+        .await??;
+        assert!(
+            publication.published,
+            "a change's own filesystem events must not supersede the snapshot they describe"
+        );
+
+        let builds = Arc::new(AtomicUsize::new(0));
+        let capture = counting_capture(&assembled.context.dependencies, &builds);
+        let pending = server.validation.take_pending();
+        let outcome = rebuild_workspace(&assembled.context, pending, capture).await?;
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            0,
+            "the landed change is the one capture; the events it raised build nothing"
+        );
+        assert_eq!(
+            outcome,
+            RebuildOutcome::Unchanged,
+            "the batch stamps the published edit with its epoch and publishes nothing new"
+        );
+        let current = current_publication(server).await;
+        assert!(
+            Arc::ptr_eq(&current.reads, &publication.snapshot.reads),
+            "the current publication shares the change's own read service"
+        );
+        Ok(())
+    }
+
+    /// The same window, entered by a write the change did not make: the observed path
+    /// no longer holds what the candidate captured, so the candidate is superseded and
+    /// the next batch reads the tree again.
+    #[tokio::test]
+    async fn a_write_the_change_did_not_make_supersedes_its_candidate() -> TestResult {
+        let (directory, assembled) = unsupervised_fixture().await?;
+        let server = &assembled.server;
+        let params = lantern_patch()?;
+        let parts = ChangeLaneParts::of(server, directory.path());
+        let lane = Arc::clone(&server.change_lane);
+        let intruded = directory.path().join("lib.rs");
+        let publication = tokio::task::spawn_blocking(move || {
+            lane.run(|| {
+                landed_change_publication(&parts, &params, || {
+                    fs::write(&intruded, "pub fn intruder() {}\n")
+                        .map_err(|error| format!("the second write must land: {error:?}"))?;
+                    observe_written_path(&parts.validation, "lib.rs")
+                })
+            })
+        })
+        .await??;
+        assert!(
+            !publication.published,
+            "bytes the candidate never read must supersede it"
+        );
+
+        let builds = Arc::new(AtomicUsize::new(0));
+        let capture = counting_capture(&assembled.context.dependencies, &builds);
+        let pending = server.validation.take_pending();
+        let outcome = rebuild_workspace(&assembled.context, pending, capture).await?;
+        assert_eq!(
+            outcome,
+            RebuildOutcome::Published,
+            "the batch publishes the bytes the superseding write left"
+        );
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "the superseding write is read by the batch that answers it"
         );
         Ok(())
     }
