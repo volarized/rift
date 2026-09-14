@@ -38,7 +38,7 @@ use rift_syntax::SyntaxSymbol;
 use crate::change::{SymbolAddress, SymbolResolution, parse_symbol_address, resolve_symbol};
 use crate::engine::{EnginePool, EngineSlot};
 use crate::read::{ReadError, ReadFault, ReadService, digest_hex8, file_id};
-use crate::rewrite::REWRITE_FILE_BYTES_MAX;
+use crate::rewrite::{EngineRewrite, REWRITE_FILE_BYTES_MAX};
 
 /// Most files one engine rename proposal may rewrite.
 pub const RENAME_FILES_MAX: usize = 64;
@@ -72,6 +72,12 @@ impl RenamePlan {
             symbol: self.symbol.clone(),
         }]
     }
+
+    /// Every rewrite this plan lands. The engine wrote all of it, so the
+    /// change lane judges each one against both images before it writes.
+    pub(crate) fn engine_rewrites(&self) -> Vec<EngineRewrite<'_>> {
+        self.rewrites.iter().map(EngineRewrite::from).collect()
+    }
 }
 
 /// One file's rewrite: the bytes the plan was compiled against, and the
@@ -81,6 +87,16 @@ pub(crate) struct PlannedRewrite {
     pub(crate) path: CoreProjectPath,
     pub(crate) base_source: String,
     pub(crate) next_source: String,
+}
+
+impl<'plan> From<&'plan PlannedRewrite> for EngineRewrite<'plan> {
+    fn from(rewrite: &'plan PlannedRewrite) -> Self {
+        Self {
+            path: &rewrite.path,
+            base_source: &rewrite.base_source,
+            next_source: &rewrite.next_source,
+        }
+    }
 }
 
 /// What planning decided: a plan ready for the change lane, or the refusal

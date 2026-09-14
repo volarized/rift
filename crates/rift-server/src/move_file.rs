@@ -33,6 +33,7 @@ use crate::rename::{
     PlanEnd, PlannedRewrite, ProposalContext, compiled_rewrites, engine_roots, failed_precondition,
     plan_diagnostic, proposal_documents, refused_oversized,
 };
+use crate::rewrite::EngineRewrite;
 
 /// The operation prose opening every move refusal detail.
 const MOVE_OPERATION: &str = "file move";
@@ -54,6 +55,25 @@ pub struct MovePlan {
     /// Why the references were not updated, when they were not; the apply
     /// attaches it to the summary as its warning.
     pub(crate) references_not_updated: Option<ReferencesNotUpdated>,
+}
+
+impl MovePlan {
+    /// Every rewrite this plan lands whose text the engine wrote: the
+    /// reference rewrites, and the moved file under its destination path
+    /// when the engine edited the moved bytes. Bytes that move unchanged
+    /// carry no engine text and are not judged against a grammar.
+    pub(crate) fn engine_rewrites(&self) -> Vec<EngineRewrite<'_>> {
+        let mut rewrites: Vec<EngineRewrite<'_>> =
+            self.rewrites.iter().map(EngineRewrite::from).collect();
+        if self.moved_next != self.moved_source {
+            rewrites.push(EngineRewrite {
+                path: &self.to,
+                base_source: &self.moved_source,
+                next_source: &self.moved_next,
+            });
+        }
+        rewrites
+    }
 }
 
 /// What planning decided: a plan ready for the change lane, or the refusal
