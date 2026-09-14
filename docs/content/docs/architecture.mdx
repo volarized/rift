@@ -128,6 +128,11 @@ configuration allows you to describe:
 An edit to the file takes effect for later requests once the server accepts it again. An
 invalid file keeps the workspace unusable until you fix it.
 
+A rebuild that fails - the tree crossed a configured bound, a file could not be read - leaves the
+last published snapshot served. A read answers from that snapshot and carries a `stale_index`
+warning naming the failure, and a change refuses until a rebuild publishes. The next filesystem
+event retries the rebuild, and a rebuild that publishes clears the warning.
+
 The server stops itself once no request remains active and the
 [`idle_timeout`](/docs/configuration#server) span passes after the last response completes.
 `rift server stop` ends it sooner. The server removes its lock file on the way out, and the next
@@ -450,10 +455,16 @@ a NUL byte whose effective language entry or
 their effective language entry selects. The units persist in the workspace database at
 `.rift/db`, stamped with the tree revision that published them.
 
-Those units are written before the rebuilt index becomes current, in one transaction with the
-stamp. A read that captures a tree therefore finds the database already holding it, and a rebuild
-whose transaction refuses publishes nothing: the previous index stays current, and the read meets
-the recorded failure rather than an index the database does not hold.
+The rebuilt index becomes current as soon as its syntax index is built, and the units are written
+behind that publication, in one transaction with the stamp. A whole replace on a large workspace
+runs for longer than a read is willing to wait, so the publication never waits for it.
+
+A search that captures the publication before its transaction lands is ranked by identifier
+matching alone and carries a `lexical_ranking_unavailable` warning naming the tree revision the
+store is still committing; the store's ranking joins the answer once the transaction ends. A
+transaction that refuses leaves the previous rows and stamp intact and is recorded in
+[`rift://logs`](/docs/protocol/mcp#resource-logs), and the next publication replaces the whole
+unit set rather than applying its change on top of rows the store missed.
 
 The semantic tier's vectors are not part of that transaction. Embedding one declaration can cost
 more than a read is willing to wait, so vectors are refreshed after the index publishes, and a
@@ -463,9 +474,9 @@ search whose vectors are still being written ranks lexically and reports the tie
 Both tiers answer under one tree revision: the full-text store reads its stamp and its rows in
 one transaction, and the vectors a pass published carry the tree they were described for. A store
 that has moved past the tree a request captured returns nothing, and the request captures the
-publication the store already answers for. What a caller is told about is a tier that will not
-answer at all - one that refused to load, or holds no indexed tree - which raises
-`lexical_ranking_unavailable`.
+publication the store already answers for. What `lexical_ranking_unavailable` tells a caller
+about is a store that has not yet committed the captured tree, one that missed a commit, or one
+that will not answer at all because it refused to load or holds no indexed tree.
 
 <VersionBadge version="v0.0.32" />
 

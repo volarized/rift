@@ -98,6 +98,11 @@ queue, and a worker picks it up when one is free. This behavior is configurable 
 `num_workers` and `worker_queue_timeout` keys in the
 [`[server]` section](/docs/configuration#server).
 
+A stopped server leaves its process as soon as serving has ended and the log drain has stopped,
+through the process exit rather than by returning from `main`. Dropping the runtime would wait
+for every blocking task still running, and a lexical transaction or a dependency pass that
+started behind a publication can run for minutes with nothing able to cancel it.
+
 The project resolver skips symlinks and the `.git`, `.rift`, and `target` directories.
 
 The symbol index stays in memory as one immutable value: a rebuild constructs the next index and
@@ -119,6 +124,11 @@ Before each current-tree read, the server captures an exact digest of every incl
 file, then waits until the published index counter matches its observation. That capture already
 read the tree, so a read that finds the index behind names the files that moved rather than
 asking for a whole rebuild.
+
+A read that meets a recorded rebuild failure at or past the published counter waits for nothing:
+it answers from the published index and carries `stale_index`, whose `detail` names the counter
+the failed rebuild answered for, the counter the tree is at, and the failure's causes. A change
+meeting the same failure refuses, and the next observation retries the rebuild.
 
 ## Rift FS
 
@@ -156,14 +166,18 @@ two trees. A rebuild that read the whole workspace replaces the whole unit set; 
 named the files it read deletes those paths' rows and inserts their new ones, which costs one
 delete and one insert batch per changed path instead of a rewrite of every row.
 
-The transaction commits before the rebuilt index becomes current. One process-wide write turn
+The transaction runs behind the publication: the rebuilt index becomes current first, and the
+lexical lane runs the writes it was handed in publication order, one transaction at a time. The
+lane holds a bounded number of writes behind the running one; a write handed to a full lane
+supersedes the held ones, and the store is then owed a whole replace. One process-wide write turn
 serializes index commits, vector batches, and log batches, and each transaction starts with
 `BEGIN IMMEDIATE`.
 
 The database uses WAL with `synchronous=NORMAL`. Read-only connections use committed WAL
 snapshots. `search.busy_timeout` bounds a lock wait caused by another process.
 
-A commit that refuses publishes nothing and leaves the previous rows and stamp intact.
+A commit that refuses leaves the previous rows and stamp intact and records its cause in the
+server log; the next publication's transaction replaces the whole unit set.
 
 The database tables:
 
@@ -172,8 +186,9 @@ The database tables:
 - `lexical_index_state` - stamps the set with the tree revision that published it. One read
   transaction reads that stamp and runs the query, so a commit landing between the two cannot
   slip another tree's rows into an answer. A store holding another tree returns no rows at all:
-  the request captured a publication that has since been superseded, and it recaptures rather
-  than ranking rows it cannot place.
+  either the lane has not committed the captured publication yet, and `search` warns naming that
+  revision, or the publication has since been superseded, and the request recaptures rather than
+  ranking rows it cannot place.
 - `lexical_units_fts` - the [FTS5](https://www.sqlite.org/fts5.html) virtual table over `name`
   and `content`, with `identity` riding unindexed as the join key; ranking is FTS5's `bm25`
   with per-column weights, comparable only within one search.

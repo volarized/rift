@@ -608,8 +608,9 @@ file, text chunk, and declaration, 1000 to 50000000:
 units_max = 1000000
 ```
 
-A workspace past it refuses its rebuild: a read then answers `temporarily_unavailable` naming
-`units_max`, the observed count, and the maximum. Raise the key, or narrow
+A workspace past it publishes its index without the lexical ranking: the store refuses the
+commit, and `search` answers from identifier matching with a `lexical_ranking_unavailable`
+warning naming `units_max`, the observed count, and the maximum. Raise the key, or narrow
 [`[source]`](/docs/configuration#source) so fewer files reach the index.
 
 One unit holds at most 1mb of content. A declaration past that - a bundled source file whose
