@@ -411,12 +411,12 @@ carrying the `entrypoint` [`SymbolFacet`](/docs/protocol/reference#SymbolFacet) 
 `fn main`, not one nested in a module, an `impl` block, or another function. Both stay empty for
 a workspace with no such facts.
 
-<VersionBadge version="v0.0.32" languages={["Rust", "Python"]} />
+<VersionBadge version="v0.0.32" languages={["Rust", "Python", "TypeScript"]} />
 
 `packages` lists what the [dependency resolvers](/docs/architecture#source-discovery) cataloged:
 the Cargo resolver reads the resolved graph from `cargo metadata` and falls back to
-`Cargo.lock` when `cargo` is not on the server's `PATH`; the uv resolver reads `uv.lock`.
-Each entry is a
+`Cargo.lock` when `cargo` is not on the server's `PATH`; the uv, npm, and Bun resolvers read
+`uv.lock`, `package-lock.json`, and `bun.lock`. Each entry is a
 [`PackageIdentity`](/docs/protocol/reference#PackageIdentity). The list follows the lockfile:
 a lockfile rewritten while the server runs is re-cataloged on the next publication.
 

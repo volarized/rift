@@ -150,10 +150,15 @@ claims one manifest file name, and every visible manifest with that name reaches
   distribution's installed source through the project environment: the `.venv` beside the
   manifest, or the directory `UV_PROJECT_ENVIRONMENT` names; it catalogs the interpreter's
   standard library from the environment's `pyvenv.cfg`
+- the npm resolver claims `package.json`, reads the `package-lock.json` beside it, and finds
+  each package under `node_modules`; when the lockfile pins `typescript`, it catalogs that
+  compiler's `lib.*.d.ts` set as the TypeScript standard library
+- the Bun resolver claims `package.json` too and reads `bun.lock` the same way, so a manifest
+  reaches whichever of the two has a lockfile beside it
 
-A resolver never downloads a package and never writes to the tree. The uv resolver reads
-the lockfile and probes directories, and runs nothing. The Cargo resolver is the one that
-runs a toolchain, under `--locked`, which refuses to rewrite the lockfile, and `--offline`,
+A resolver never downloads a package and never writes to the tree. The uv, npm, and Bun
+resolvers read lockfiles and probe directories, and run nothing. The Cargo resolver is the one
+that runs a toolchain, under `--locked`, which refuses to rewrite the lockfile, and `--offline`,
 which refuses the network. When `cargo` is not on the server's `PATH`, or exits with an error
 because `Cargo.lock` no longer matches `Cargo.toml`, it answers from the lockfile alone and
 probes the machine's package cache for each package's source. That answer lists what the
