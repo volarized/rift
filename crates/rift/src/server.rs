@@ -40,12 +40,14 @@ const STOP_WAIT_MAX: Duration = Duration::from_secs(10);
 const STOP_POLL_ATTEMPT_COUNT: u32 = 100;
 /// Bound on the whole stop request: connect, send, and read the answer.
 const STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-/// One deadline for the whole server-side stop, shared by every stage under it.
+/// How long the whole server-side stop has, shared by every stage under it.
 ///
-/// It sits under [`STOP_WAIT_MAX`], so the process leaves before the CLI stop
-/// that asked for it gives up waiting. Serving ends, the engines shut down in
-/// parallel, the index supervisor joins, and the log drain's final flush runs,
-/// each taking only what the stage before it left of this deadline.
+/// The stop derives its deadline from this span where serving ends, never
+/// where the server started listening. The span sits under [`STOP_WAIT_MAX`],
+/// so the process leaves before the CLI stop that asked for it gives up
+/// waiting. Serving ends, the engines shut down in parallel, the index
+/// supervisor joins, and the log drain's final flush runs, each taking only
+/// what the stage before it left of that deadline.
 const SERVER_STOP_DEADLINE: Duration = Duration::from_secs(8);
 /// Wall-clock span between two polls of the store while following.
 const LOG_FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -640,8 +642,8 @@ async fn await_election_released(
 /// the engines and index supervisor shut down, the log drain's final flush
 /// runs, and only then is the election released, by dropping the guard right
 /// before the process exits - so a stop the CLI reports as success means the
-/// process is leaving. Each stage takes only what the one before it left of
-/// the deadline.
+/// process is leaving. The deadline starts where serving ends, and each stage
+/// takes only what the one before it left of it.
 async fn serve_foreground(
     root: &Path,
     drain: Option<LogDrain>,
@@ -683,8 +685,7 @@ async fn serve_foreground(
         }
     );
     let interrupt = tokio::spawn(cancel_on_interrupt(shutdown.clone()));
-    let deadline = tokio::time::Instant::now() + SERVER_STOP_DEADLINE;
-    let (guard, stopped) = server.stopped(deadline).await;
+    let (guard, deadline, stopped) = server.stopped(SERVER_STOP_DEADLINE).await;
     let stopped =
         stopped.map_err(|error| Error::new(ServerCommandFault::Election(Box::new(error))));
     shutdown.cancel();
