@@ -170,7 +170,12 @@ async fn happy_engine_script(mut engine: ScriptedEngine<DuplexStream>) {
         .expect("uri")
         .to_owned();
     engine.respond(&id, json!({"changes": {new_uri: []}})).await;
-    let (id, _params) = engine.expect_request("textDocument/references").await;
+    let (id, params) = engine.expect_request("textDocument/references").await;
+    assert_eq!(
+        params["context"]["includeDeclaration"],
+        json!(true),
+        "the reference request asks the engine to name the declaration itself"
+    );
     engine.respond(&id, json!([])).await;
     let (id, _params) = engine.expect_request("textDocument/diagnostic").await;
     engine
@@ -265,7 +270,7 @@ async fn happy_engine_negotiates_renames_and_serves_diagnostics() {
         .expect("references answers");
     assert!(
         references.is_empty(),
-        "the declaration's own occurrence is excluded by include_declaration: false"
+        "the scripted engine names no location, the declaration's own included"
     );
 
     let pulled = session
