@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Read as _;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -1584,6 +1585,19 @@ impl WorkspaceIndex {
             .or_else(|| self.left_out.get(path).map(|state| state.content))
     }
 
+    /// Whether this index holds at least one file below `directory`, the files it left
+    /// out included.
+    ///
+    /// A filesystem event on a directory the index holds files under can move every one
+    /// of them at once, and this is what tells such a directory apart from an
+    /// extensionless file. Every held file sits in `text_files` and every other tree
+    /// entry in `left_out`, so two ordered-map probes answer in logarithmic time.
+    #[must_use]
+    pub fn holds_files_below(&self, directory: &ProjectPath) -> bool {
+        let prefix = format!("{}/", directory.as_str());
+        holds_path_below(&self.text_files, &prefix) || holds_path_below(&self.left_out, &prefix)
+    }
+
     /// Derives lexical search units from this index: one unit per indexed symbol, carrying
     /// its declaration source, and one or more units per baseline text file - one whole unit
     /// when the file is within `[search.text].max_chunk`, one unit per chunk otherwise. A
@@ -2508,6 +2522,16 @@ fn keyed_digests(
                     .map(|(path, state)| (path.clone(), state.state)),
             ),
     )
+}
+
+/// Whether a map keyed by project path holds a key below `prefix`, one directory's
+/// spelling with its trailing separator: the first key at or after the prefix in path
+/// order lies below that directory exactly when it starts with the prefix.
+fn holds_path_below<Value>(keyed: &BTreeMap<ProjectPath, Value>, prefix: &str) -> bool {
+    keyed
+        .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
+        .next()
+        .is_some_and(|(path, _)| path.as_str().starts_with(prefix))
 }
 
 /// Keys an accepted file list by project path, sharing each file behind one `Arc`.

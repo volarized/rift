@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::fmt;
 
 use unicode_normalization::UnicodeNormalization;
@@ -120,6 +121,15 @@ impl ProjectPath {
 impl fmt::Display for ProjectPath {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+/// Lets an ordered map keyed by project path be probed by its text: the files below one
+/// directory are the keys at or after its spelling with a trailing separator. Ordering,
+/// equality, and hashing all derive from that same text, as the borrow requires.
+impl Borrow<str> for ProjectPath {
+    fn borrow(&self) -> &str {
+        self.as_str()
     }
 }
 

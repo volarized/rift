@@ -274,7 +274,10 @@ pub(crate) struct IndexValidation {
     /// workspace. The workspace's own file bound: retaining more paths than the workspace
     /// may hold files is a whole rebuild by another name.
     paths_max: usize,
-    pub(crate) source_policy: SyncRwLock<Option<Arc<WorkspaceSourcePolicy>>>,
+    /// The current publication as event classification sees it: the inclusion policy
+    /// the index was built under, and the index itself for what it holds. Absent before
+    /// the first publication, when every event asks for the whole workspace anyway.
+    pub(crate) published: SyncRwLock<Option<Arc<PublishedWorkspace>>>,
     pub(crate) cancellation: CancellationToken,
     pub(crate) task: AsyncMutex<Option<JoinHandle<()>>>,
     /// Whether the index supervisor is still running.
@@ -595,7 +598,7 @@ impl IndexValidation {
                 changed: Arc::new(Notify::new()),
                 publication_lane: SyncMutex::new(PendingWork::default()),
                 paths_max,
-                source_policy: SyncRwLock::new(None),
+                published: SyncRwLock::new(None),
                 cancellation: CancellationToken::new(),
                 task: AsyncMutex::new(None),
             }),
@@ -696,21 +699,22 @@ impl IndexValidation {
         self.observed_epoch.load(Ordering::SeqCst)
     }
 
-    /// Installs event inclusion policy under publication linearization.
+    /// Installs one publication under publication linearization.
     #[cfg(test)]
-    fn install_source_policy(&self, policy: Arc<WorkspaceSourcePolicy>) {
+    fn install_publication(&self, published: &Arc<PublishedWorkspace>) {
         let publication = self.locked_pending();
-        self.replace_source_policy_locked(policy);
+        self.replace_publication_locked(published);
         drop(publication);
     }
 
-    /// Replaces event inclusion policy while caller owns publication lane.
-    fn replace_source_policy_locked(&self, policy: Arc<WorkspaceSourcePolicy>) {
+    /// Replaces the publication event classification answers from, while the caller
+    /// owns the publication lane.
+    fn replace_publication_locked(&self, published: &Arc<PublishedWorkspace>) {
         let mut current = self
-            .source_policy
+            .published
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *current = Some(policy);
+        *current = Some(Arc::clone(published));
     }
 
     /// Classifies and observes one event within the publication critical section, so the
@@ -733,33 +737,62 @@ impl IndexValidation {
         result
     }
 
+    /// The publication event classification answers from, absent before the first one.
+    fn current_publication(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, Option<Arc<PublishedWorkspace>>> {
+        self.published
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// The project path one event path names, under the current inclusion policy.
     fn source_project_path(&self, path: &Path) -> Option<ProjectPath> {
-        let current = self
+        self.current_publication()
+            .as_ref()?
             .source_policy
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        current.as_ref()?.project_path(path)
+            .project_path(path)
     }
 
     /// Returns whether current policy includes one source event path.
     fn source_path_is_relevant(&self, path: &Path) -> bool {
-        let current = self
-            .source_policy
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        current.as_ref().is_none_or(|policy| policy.visible(path))
+        self.current_publication()
+            .as_ref()
+            .is_none_or(|published| published.source_policy.visible(path))
     }
 
     /// Returns whether current policy can include source below one directory.
     fn source_directory_is_relevant(&self, path: &Path) -> bool {
-        let current = self
-            .source_policy
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        current
+        self.current_publication()
             .as_ref()
-            .is_none_or(|policy| policy.may_include_descendant(path))
+            .is_none_or(|published| published.source_policy.may_include_descendant(path))
+    }
+
+    /// Whether the current publication holds at least one file below one event path.
+    ///
+    /// A path outside the policy's root, or one observed before the first publication,
+    /// holds nothing the index knows about.
+    fn published_holds_files_below(&self, path: &Path) -> bool {
+        let current = self.current_publication();
+        let Some(published) = current.as_ref() else {
+            return false;
+        };
+        published
+            .source_policy
+            .project_path(path)
+            .is_some_and(|directory| published.reads.holds_files_below(&directory))
+    }
+
+    /// Whether one watched path is the workspace's own configuration file.
+    ///
+    /// Before the first publication there is no policy to normalize through, so the
+    /// raw spelling decides; afterwards the policy answers, which is what makes the
+    /// comparison hold on a platform whose temporary root is a symlink.
+    fn is_workspace_configuration(&self, root: &Path, path: &Path) -> bool {
+        self.current_publication().as_ref().map_or_else(
+            || path == root.join(WORKSPACE_CONFIGURATION_FILE),
+            |published| published.source_policy.is_workspace_configuration(path),
+        )
     }
 
     /// Whether writing this path changes what the workspace includes.
@@ -767,33 +800,13 @@ impl IndexValidation {
     /// Before the first publication installs a policy there is nothing to ask, so only the
     /// root `rift.toml` and a `.gitignore` are taken as inclusion deciders; a published
     /// policy answers for its own root spellings and excluded directories.
-    /// Whether one watched path is the workspace's own configuration file.
-    ///
-    /// Before the first publication there is no policy to normalize through, so the
-    /// raw spelling decides; afterwards the policy answers, which is what makes the
-    /// comparison hold on a platform whose temporary root is a symlink.
-    fn is_workspace_configuration(&self, root: &Path, path: &Path) -> bool {
-        let current = self
-            .source_policy
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        current.as_ref().map_or_else(
-            || path == root.join(WORKSPACE_CONFIGURATION_FILE),
-            |policy| policy.is_workspace_configuration(path),
-        )
-    }
-
     pub(crate) fn decides_inclusion(&self, root: &Path, path: &Path) -> bool {
-        let current = self
-            .source_policy
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        current.as_ref().map_or_else(
+        self.current_publication().as_ref().map_or_else(
             || {
                 path == root.join(WORKSPACE_CONFIGURATION_FILE)
                     || path.file_name() == Some(std::ffi::OsStr::new(VCS_IGNORE_FILE))
             },
-            |policy| policy.decides_inclusion(path),
+            |published| published.source_policy.decides_inclusion(path),
         )
     }
 }
@@ -971,6 +984,13 @@ pub(crate) fn hard_floor_includes_watch_path(root: &Path, path: &Path) -> bool {
 /// A policy file rewrites what the workspace includes and a directory event can add or
 /// drop many files at once, so both ask for the whole workspace. Only a path that is
 /// itself a visible file narrows the next rebuild to that file.
+///
+/// A name event on an extensionless path asks for the whole workspace only when the
+/// path names a directory the index can hold files under: one on disk right now, or one
+/// the publication holds files below, as a directory renamed away is. The server's own
+/// writes stage each file as an extensionless temporary file beside its target and
+/// rename it over the target; the publication holds nothing under that staging name, so
+/// its name event takes the per-path route a file event takes.
 pub(crate) fn watch_path_impact(
     root: &Path,
     validation: &IndexValidation,
@@ -1001,11 +1021,9 @@ pub(crate) fn watch_path_impact(
             WatchImpact::None
         };
     }
-    let possible_directory =
-        path.extension().is_none() && validation.source_directory_is_relevant(path);
     let reshapes_tree = match kind {
         EventKind::Modify(ModifyKind::Name(_)) | EventKind::Any | EventKind::Other => {
-            possible_directory
+            names_a_directory(validation, path)
         }
         EventKind::Create(_)
         | EventKind::Remove(_)
@@ -1025,6 +1043,21 @@ pub(crate) fn watch_path_impact(
         })
 }
 
+/// Whether one event path names a directory the index can hold files under: an
+/// extensionless path the policy may include descendants of, that is a directory on
+/// disk right now or that the current publication holds files below.
+///
+/// The disk probe is the one filesystem read event classification makes: a renamed
+/// directory's new spelling is known to the disk alone, and its old spelling to the
+/// publication alone.
+fn names_a_directory(validation: &IndexValidation, path: &Path) -> bool {
+    let extensionless = path.extension().is_none();
+    if !extensionless || !validation.source_directory_is_relevant(path) {
+        return false;
+    }
+    path.is_dir() || validation.published_holds_files_below(path)
+}
+
 /// Builds the first snapshot while rejecting concurrent filesystem movement, and returns
 /// what the lexical index owes for it.
 ///
@@ -1038,17 +1071,8 @@ pub(crate) async fn initial_workspace(
     blocking: &BlockingExecutor,
     dependencies: &Arc<DependencyStore>,
 ) -> Result<(Arc<PublishedWorkspace>, LexicalWrite), ReadError> {
-    let dependencies = Arc::clone(dependencies);
-    initial_workspace_with(
-        root,
-        limits,
-        validation,
-        blocking,
-        move |root, limits, request| {
-            build_workspace_candidate(root, limits, request, &dependencies)
-        },
-    )
-    .await
+    let capture = workspace_capture(dependencies);
+    initial_workspace_with(root, limits, validation, blocking, capture).await
 }
 
 /// One candidate capture: the whole-workspace scan, or a test's stand-in for it.
@@ -1061,6 +1085,16 @@ impl<Capture> CaptureWorkspace for Capture where
     Capture:
         Fn(&Path, WorkspaceIndexLimits, &RebuildRequest) -> Result<WorkspaceCandidate, ReadError>
 {
+}
+
+/// The capture production runs: the whole-workspace scan over the dependency index.
+pub(crate) fn workspace_capture(
+    dependencies: &Arc<DependencyStore>,
+) -> impl CaptureWorkspace + Clone + Send + 'static {
+    let dependencies = Arc::clone(dependencies);
+    move |root: &Path, limits: WorkspaceIndexLimits, request: &RebuildRequest| {
+        build_workspace_candidate(root, limits, request, &dependencies)
+    }
 }
 
 /// Runs the bounded capture loop over an injectable capture, so tests can
@@ -1114,7 +1148,7 @@ pub(crate) async fn initial_workspace_with(
                 drop(publication);
                 continue;
             }
-            validation.replace_source_policy_locked(Arc::clone(&built.source_policy));
+            validation.replace_publication_locked(&built);
             drop(publication);
             tracing::info!(
                 component = "index",
@@ -2024,6 +2058,9 @@ pub(crate) enum RebuildOutcome {
     Published,
     /// New observation invalidated candidate before publication.
     Superseded,
+    /// The supervisor was cancelled while the capture or the publication ran; nothing
+    /// publishes and the blocking thread ends on its own.
+    Cancelled,
 }
 
 /// Owns native watcher and reconciles coalesced invalidations until shutdown.
@@ -2033,13 +2070,27 @@ pub(crate) enum RebuildOutcome {
 /// would hold the whole reconciliation loop for as long as that pass ran, and the filesystem
 /// does not stop moving meanwhile.
 pub(crate) async fn run_index_supervisor(
+    watcher: notify::RecommendedWatcher,
+    invalidations: mpsc::Receiver<()>,
+    context: IndexSupervisorContext,
+) {
+    let capture = workspace_capture(&context.dependencies);
+    run_index_supervisor_with(watcher, invalidations, context, capture).await;
+}
+
+/// Runs the supervisor loop over an injectable capture, so a test can hold one capture
+/// open at the moment a cancellation lands.
+///
+/// A cancelled rebuild ends the loop: the token is cancelled only at shutdown, and the
+/// capture it interrupted finishes on its own thread with nothing left to publish.
+pub(crate) async fn run_index_supervisor_with(
     _watcher: notify::RecommendedWatcher,
     mut invalidations: mpsc::Receiver<()>,
     context: IndexSupervisorContext,
+    capture: impl CaptureWorkspace + Clone + Send + 'static,
 ) {
     let validation = Arc::clone(&context.validation);
     let published = Arc::clone(&context.published);
-    let blocking = context.blocking.clone();
     let population = context.population.clone();
     // The guard reports the supervisor's end however it comes: a return, a cancellation, or
     // a panic unwinding this task. A reader that meets the readiness deadline needs to know
@@ -2069,7 +2120,7 @@ pub(crate) async fn run_index_supervisor(
             whole_workspace = request.work.covers_whole_workspace(),
             "filesystem invalidations coalesced"
         );
-        let result = rebuild_workspace(&context, request)
+        let result = rebuild_workspace(&context, request, capture.clone())
             .instrument(tracing::info_span!(
                 "index.build",
                 component = "index",
@@ -2086,33 +2137,39 @@ pub(crate) async fn run_index_supervisor(
                 }
             }
             Ok(RebuildOutcome::Superseded) => {}
-            Err(error) => {
-                tracing::warn!(
-                    component = "index",
-                    operation = "index.build",
-                    epoch,
-                    error_code = error.descriptor().code(),
-                    "index rebuild failed"
-                );
-                let failed_state = Arc::clone(&published);
-                let failed_validation = Arc::clone(&validation);
-                let recorded = blocking
-                    .run("index failure publication", move || {
-                        Ok(record_rebuild_failure(
-                            &failed_state,
-                            &failed_validation,
-                            epoch,
-                            error,
-                        ))
-                    })
-                    .await;
-                if recorded.is_err() {
-                    let _ = validation.observe_watch_failure();
-                }
-                validation.changed.notify_waiters();
-            }
+            Ok(RebuildOutcome::Cancelled) => return,
+            Err(error) => publish_rebuild_failure(&context, epoch, error).await,
         }
     }
+}
+
+/// Records one failed rebuild under the publication lane and wakes the requests waiting
+/// on it; a failure the pool can no longer record marks the watch unhealthy instead.
+async fn publish_rebuild_failure(context: &IndexSupervisorContext, epoch: u64, error: ReadError) {
+    tracing::warn!(
+        component = "index",
+        operation = "index.build",
+        epoch,
+        error_code = error.descriptor().code(),
+        "index rebuild failed"
+    );
+    let failed_state = Arc::clone(&context.published);
+    let failed_validation = Arc::clone(&context.validation);
+    let recorded = context
+        .blocking
+        .run("index failure publication", move || {
+            Ok(record_rebuild_failure(
+                &failed_state,
+                &failed_validation,
+                epoch,
+                error,
+            ))
+        })
+        .await;
+    if recorded.is_err() {
+        let _ = context.validation.observe_watch_failure();
+    }
+    context.validation.changed.notify_waiters();
 }
 
 /// Rebuilds and atomically publishes only a still-current candidate, handing the lexical
@@ -2130,6 +2187,10 @@ pub(crate) async fn run_index_supervisor(
 /// pending requests keep waiting because the observed epoch still differs from the
 /// published one.
 ///
+/// Each blocking operation races the supervisor's cancellation token. A stop that lands
+/// while the capture scans a large tree answers [`RebuildOutcome::Cancelled`] at once
+/// instead of after the scan, and the supervisor ends on that answer.
+///
 /// # Errors
 ///
 /// Returns [`ReadError`] when the capture fails. Nothing publishes then, so a current-tree
@@ -2137,11 +2198,21 @@ pub(crate) async fn run_index_supervisor(
 ///
 /// # Cancel safety
 ///
-/// Dropping this future after the capture starts does not cancel it: the serialized
-/// operation finishes before releasing its lane.
+/// Dropping this future, or losing the race to the token, stops neither the capture nor
+/// the publication once its closure runs. [`BlockingExecutor::run`] moves its permit into
+/// the `spawn_blocking` closure and drops it only when that closure returns, and tokio
+/// documents the closure's thread as beyond reach: "tasks spawned using `spawn_blocking`
+/// cannot be aborted because they are not async", and "If a `JoinHandle` is dropped, then
+/// the task continues running in the background and its return value is lost". The
+/// running closure therefore holds the change lane and its permit until it ends on its
+/// own, and its result is dropped. A future dropped while it still queues for the permit
+/// spawns nothing. The capture meets the token at its next phase boundary and returns
+/// its work to the observation; a publication that took its locks before the token was
+/// cancelled still lands, and nobody hands it to the lanes.
 pub(crate) async fn rebuild_workspace(
     context: &IndexSupervisorContext,
     request: RebuildRequest,
+    capture: impl CaptureWorkspace + Send + 'static,
 ) -> Result<RebuildOutcome, ReadError> {
     let epoch = request.epoch;
     let root = context.root.clone();
@@ -2152,9 +2223,9 @@ pub(crate) async fn rebuild_workspace(
     let captured_state = Arc::clone(&published);
     let captured_validation = Arc::clone(&validation);
     let change_lane = Arc::clone(&context.change_lane);
-    let dependencies = Arc::clone(&context.dependencies);
-    let captured = blocking
-        .run("filesystem index rebuild", move || {
+    let captured = tokio::select! {
+        () = validation.cancellation.cancelled() => return Ok(RebuildOutcome::Cancelled),
+        captured = blocking.run("filesystem index rebuild", move || {
             capture_rebuild(
                 &root,
                 limits,
@@ -2162,34 +2233,37 @@ pub(crate) async fn rebuild_workspace(
                 &change_lane,
                 &captured_validation,
                 request,
-                &dependencies,
+                capture,
             )
-        })
-        .await?;
-    let CapturedRebuild::Candidate {
-        published: candidate,
-        write,
-        work,
-    } = captured
-    else {
-        return Ok(RebuildOutcome::Superseded);
+        }) => captured?,
+    };
+    let (candidate, write, work) = match captured {
+        CapturedRebuild::Candidate {
+            published,
+            write,
+            work,
+        } => (published, write, work),
+        CapturedRebuild::Superseded => return Ok(RebuildOutcome::Superseded),
+        CapturedRebuild::Cancelled => return Ok(RebuildOutcome::Cancelled),
     };
     let lexical = context
         .lexical
         .clone()
         .map(|lane| LexicalHandoff::new(lane, write));
-    blocking
-        .run("filesystem index publication", move || {
-            Ok(finish_rebuild(
-                &published,
-                &validation,
-                candidate,
-                work,
-                epoch,
-                lexical,
-            ))
-        })
-        .await
+    let publication = blocking.run("filesystem index publication", move || {
+        Ok(finish_rebuild(
+            &published,
+            &validation,
+            candidate,
+            work,
+            epoch,
+            lexical,
+        ))
+    });
+    tokio::select! {
+        () = context.validation.cancellation.cancelled() => Ok(RebuildOutcome::Cancelled),
+        outcome = publication => outcome,
+    }
 }
 
 /// What one capture leaves for the commit and the publication that follow it.
@@ -2205,6 +2279,9 @@ pub(crate) enum CapturedRebuild {
     },
     /// The observation was already superseded, or configuration moved during the capture.
     Superseded,
+    /// The supervisor was cancelled before the capture ran, or before its candidate was
+    /// handed on; the observation's work is returned and nothing publishes.
+    Cancelled,
 }
 
 /// Captures one candidate while the mutation lane is held.
@@ -2215,30 +2292,9 @@ pub(crate) fn capture_rebuild(
     change_lane: &ChangeLane,
     validation: &IndexValidation,
     request: RebuildRequest,
-    dependencies: &Arc<DependencyStore>,
+    capture: impl CaptureWorkspace,
 ) -> Result<CapturedRebuild, ReadError> {
-    change_lane.run(|| {
-        capture_rebuild_serialized(root, limits, published, validation, request, dependencies)
-    })
-}
-
-/// Captures one candidate with the mutation lane already held.
-pub(crate) fn capture_rebuild_serialized(
-    root: &Path,
-    limits: WorkspaceIndexLimits,
-    published: &RwLock<IndexState>,
-    validation: &IndexValidation,
-    request: RebuildRequest,
-    dependencies: &Arc<DependencyStore>,
-) -> Result<CapturedRebuild, ReadError> {
-    capture_rebuild_with(
-        root,
-        limits,
-        published,
-        validation,
-        request,
-        |root, limits, request| build_workspace_candidate(root, limits, request, dependencies),
-    )
+    change_lane.run(|| capture_rebuild_with(root, limits, published, validation, request, capture))
 }
 
 /// Runs one serialized capture over an injectable candidate builder, so tests can force
@@ -2248,6 +2304,10 @@ pub(crate) fn capture_rebuild_serialized(
 /// publication is the acknowledgement that lets those paths be dropped, so a superseded
 /// candidate leaves the next rebuild owing exactly what this one owed plus whatever landed
 /// while it ran.
+///
+/// The supervisor's cancellation is checked at the phase boundaries: before the capture
+/// runs, and before the candidate's lexical write is derived. A stop that lands during a
+/// long scan therefore ends the attempt at the next boundary, with its work returned.
 pub(crate) fn capture_rebuild_with(
     root: &Path,
     limits: WorkspaceIndexLimits,
@@ -2263,6 +2323,10 @@ pub(crate) fn capture_rebuild_with(
     if !accept_rebuild(validation, request.epoch)? {
         validation.restore_pending(request.work);
         return Ok(CapturedRebuild::Superseded);
+    }
+    if validation.cancellation.is_cancelled() {
+        validation.restore_pending(request.work);
+        return Ok(CapturedRebuild::Cancelled);
     }
     request.previous = Some(published.blocking_read().snapshot().0);
     let candidate = match capture(root, limits, &request) {
@@ -2280,6 +2344,10 @@ pub(crate) fn capture_rebuild_with(
         let _ = validation.observe_whole_workspace();
         return Ok(CapturedRebuild::Superseded);
     };
+    if validation.cancellation.is_cancelled() {
+        validation.restore_pending(request.work);
+        return Ok(CapturedRebuild::Cancelled);
+    }
     let write = lexical_write(&candidate, &change_set);
     Ok(CapturedRebuild::Candidate {
         published: candidate,
@@ -2289,7 +2357,7 @@ pub(crate) fn capture_rebuild_with(
 }
 
 /// Publishes one candidate and hands the lane its lexical write, or returns its
-/// observation's work when the tree moved underneath it.
+/// observation's work when the tree moved underneath it or the supervisor was cancelled.
 pub(crate) fn finish_rebuild(
     published: &RwLock<IndexState>,
     validation: &IndexValidation,
@@ -2304,7 +2372,9 @@ pub(crate) fn finish_rebuild(
             trace_publication(epoch);
             validation.changed.notify_waiters();
         }
-        RebuildOutcome::Superseded => validation.restore_pending(work),
+        RebuildOutcome::Superseded | RebuildOutcome::Cancelled => {
+            validation.restore_pending(work);
+        }
     }
     outcome
 }
@@ -2335,6 +2405,8 @@ pub(crate) fn publish_rebuild(
 ///
 /// A published candidate's lexical write is handed to the lane before the lane's lock
 /// releases, so two publications hand their writes over in the order they published.
+/// A candidate that meets a cancelled token under those locks is refused unpublished:
+/// the token is cancelled only at shutdown, and the lane it would be handed to has ended.
 pub(crate) fn publish_rebuild_after(
     published: &RwLock<IndexState>,
     validation: &IndexValidation,
@@ -2345,14 +2417,18 @@ pub(crate) fn publish_rebuild_after(
     let publication = validation.locked_pending();
     let mut state = published.blocking_write();
     after_state_lock();
+    if validation.cancellation.is_cancelled() {
+        drop(state);
+        drop(publication);
+        return RebuildOutcome::Cancelled;
+    }
     let observed_epoch = validation.observed_epoch();
-    let source_policy = Arc::clone(&candidate.source_policy);
     let publishing = Arc::clone(&candidate);
     // IndexState::publish owns the still-current check, so a superseded
     // candidate is rejected in exactly one place.
     let published = state.publish(candidate, observed_epoch);
     if published {
-        validation.replace_source_policy_locked(source_policy);
+        validation.replace_publication_locked(&publishing);
         if let Some(handoff) = lexical {
             handoff.hand_over(publishing);
         }
@@ -2586,13 +2662,12 @@ mod tests {
 
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
     use notify::{Event, EventKind};
-    use rift_core::{SourceVisibility, TextFileInclusion};
-    use rift_index::{
-        LexicalChange, LexicalIndexLimits, WorkspaceIndexLimits, WorkspaceSourcePolicy,
-    };
+    use rift_core::SourceVisibility;
+    use rift_index::{LexicalChange, LexicalIndexLimits, WorkspaceIndexLimits};
+    use rift_protocol::change::{ChangeResult, PatchParams};
     use rift_protocol::configuration::ServerConfiguration;
     use rift_search::{RevisionScoped, SearchIndex, SearchIndexLimits, SemanticReadiness};
-    use rift_server::{LspProcessKey, ReadFault};
+    use rift_server::{ChangeService, LspProcessKey, ReadFault};
     use tokio::sync::{Barrier as AsyncBarrier, RwLock};
     use tokio_util::sync::CancellationToken;
     use tracing_subscriber::layer::SubscriberExt as _;
@@ -2748,20 +2823,17 @@ mod tests {
         fs::create_dir_all(directory.path().join("examples"))?;
         fs::create_dir_all(directory.path().join("target"))?;
         fs::write(directory.path().join(".gitignore"), "src/ignored.rs\n")?;
-        let visibility = SourceVisibility::new(
-            vec!["src/**".to_owned()],
-            vec!["src/generated/**".to_owned()],
-            true,
-        );
-        let policy = WorkspaceSourcePolicy::build(
-            &watched_root,
-            WorkspaceIndexLimits::default(),
-            &visibility,
-            &TextFileInclusion::default(),
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[source]\n\
+             include = [\"src/**\"]\n\
+             exclude = [\"src/generated/**\"]\n\
+             respect_gitignore = true\n",
         )?;
+        let current = stable_candidate(&watched_root, 0)?;
         let (validation, _invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        validation.install_source_policy(Arc::new(policy));
+        validation.install_publication(&current);
         let event = |kind, path: &str| Event::new(kind).add_path(event_root.join(path));
 
         let source_path = |path: &str| -> TestResult<super::WatchImpact> {
@@ -2906,7 +2978,7 @@ mod tests {
         }));
         let (validation, invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        validation.install_source_policy(Arc::clone(&before.source_policy));
+        validation.install_publication(&before);
         fs::write(directory.path().join("lib.rs"), "pub fn after() {}\n")?;
         fs::write(
             directory.path().join("rift.toml"),
@@ -2974,14 +3046,16 @@ mod tests {
         let state = fixture.state.blocking_read();
         assert_workspace_identity(&state.current, &fixture.after);
         drop(state);
-        let policy = fixture
+        let published = fixture
             .validation
-            .source_policy
+            .published
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(Arc::ptr_eq(
-            policy.as_ref().expect("policy must be published"),
-            &fixture.after.source_policy
+            published
+                .as_ref()
+                .expect("the publication must be installed"),
+            &fixture.after
         ));
     }
 
@@ -3066,7 +3140,7 @@ mod tests {
         });
         let (validation, _invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        validation.install_source_policy(Arc::clone(&before.source_policy));
+        validation.install_publication(&before);
         assert_eq!(validation.observe_whole_workspace()?, 1);
         assert_eq!(validation.observe_whole_workspace()?, 2);
         assert_eq!(
@@ -3076,17 +3150,17 @@ mod tests {
         let state_snapshot = state.blocking_read();
         assert_workspace_identity(&state_snapshot.current, &before);
         drop(state_snapshot);
-        let source_policy = validation
-            .source_policy
+        let published = validation
+            .published
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(Arc::ptr_eq(
-            source_policy
+            published
                 .as_ref()
-                .expect("policy must remain installed"),
-            &before.source_policy
+                .expect("the publication must remain installed"),
+            &before
         ));
-        drop(source_policy);
+        drop(published);
         assert!(!record_rebuild_failure(
             &state,
             &validation,
@@ -3127,15 +3201,10 @@ mod tests {
         let watched_root = directory.path().join(".");
         let event_root = directory.path().canonicalize()?;
         fs::create_dir_all(directory.path().join("src"))?;
-        let policy = WorkspaceSourcePolicy::build(
-            &watched_root,
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &TextFileInclusion::default(),
-        )?;
+        let current = stable_candidate(&watched_root, 0)?;
         let (validation, _invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        validation.install_source_policy(Arc::new(policy));
+        validation.install_publication(&current);
         let event = |kind, path: &str| Event::new(kind).add_path(event_root.join(path));
 
         assert_eq!(
@@ -3186,15 +3255,10 @@ mod tests {
         let watched_root = directory.path().join(".");
         let event_root = directory.path().canonicalize()?;
         fs::create_dir_all(directory.path().join("src"))?;
-        let policy = WorkspaceSourcePolicy::build(
-            &watched_root,
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &TextFileInclusion::default(),
-        )?;
+        let current = stable_candidate(&watched_root, 0)?;
         let (validation, _invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        validation.install_source_policy(Arc::new(policy));
+        validation.install_publication(&current);
         let renamed = Event::new(EventKind::Modify(ModifyKind::Name(
             notify::event::RenameMode::Both,
         )))
@@ -3208,6 +3272,159 @@ mod tests {
                 rift_core::ProjectPath::new("src/after.rs")?,
             ]),
             "a rename reports both spellings, and both are read again"
+        );
+        Ok(())
+    }
+
+    /// One publication over `root`, installed as what event classification answers from.
+    fn installed_publication(
+        root: &std::path::Path,
+    ) -> TestResult<(Arc<IndexValidation>, Arc<PublishedWorkspace>)> {
+        let current = stable_candidate(root, 0)?;
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        validation.install_publication(&current);
+        Ok((validation, current))
+    }
+
+    /// One name event on `path` below `root`, as a rename reaches the watcher.
+    fn name_event(root: &std::path::Path, path: &str) -> Event {
+        Event::new(EventKind::Modify(ModifyKind::Name(
+            notify::event::RenameMode::Any,
+        )))
+        .add_path(root.join(path))
+    }
+
+    #[test]
+    fn a_name_event_on_an_absent_extensionless_path_names_that_path() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        let event_root = directory.path().canonicalize()?;
+        let (validation, _current) = installed_publication(directory.path())?;
+        let staged = name_event(&event_root, ".tmpk3v9q2");
+
+        assert_eq!(
+            super::watch_event_impact(&event_root, &validation, &staged),
+            super::WatchImpact::Paths(vec![rift_core::ProjectPath::new(".tmpk3v9q2")?]),
+            "the publisher renames an extensionless staged file over its target; the \
+             publication holds nothing under that name, so the event names the path alone"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_name_event_on_a_directory_the_publication_holds_files_below_asks_for_the_workspace()
+    -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        let event_root = directory.path().canonicalize()?;
+        let (validation, _current) = installed_publication(directory.path())?;
+        fs::rename(directory.path().join("src"), directory.path().join("attic"))?;
+        let renamed_away = name_event(&event_root, "src");
+
+        assert_eq!(
+            super::watch_event_impact(&event_root, &validation, &renamed_away),
+            super::WatchImpact::WholeWorkspace,
+            "a directory renamed away is gone from the disk, and the publication still \
+             holds src/lib.rs below its old spelling"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_name_event_on_a_directory_on_disk_asks_for_the_workspace() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let event_root = directory.path().canonicalize()?;
+        let (validation, _current) = installed_publication(directory.path())?;
+        fs::create_dir_all(directory.path().join("examples"))?;
+        let moved_in = name_event(&event_root, "examples");
+
+        assert_eq!(
+            super::watch_event_impact(&event_root, &validation, &moved_in),
+            super::WatchImpact::WholeWorkspace,
+            "a directory the publication holds nothing under is still one on disk, and \
+             what moved in with it is unknown"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_name_event_on_an_extensionless_file_the_publication_holds_names_that_path() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("LICENSE"), "beacon\n")?;
+        let event_root = directory.path().canonicalize()?;
+        let (validation, _current) = installed_publication(directory.path())?;
+        let renamed = name_event(&event_root, "LICENSE");
+
+        assert_eq!(
+            super::watch_event_impact(&event_root, &validation, &renamed),
+            super::WatchImpact::Paths(vec![rift_core::ProjectPath::new("LICENSE")?]),
+            "a file the publication holds is read again by itself, whatever its name"
+        );
+        Ok(())
+    }
+
+    /// Waits under a bound until the pending work names `path`, or escalated to the
+    /// whole workspace, whichever the watcher's events produce first.
+    async fn path_pending_within_bound(
+        validation: &IndexValidation,
+        path: &rift_core::ProjectPath,
+    ) -> bool {
+        for _attempt in 0..LANE_ATTEMPTS_MAX {
+            let observed = {
+                let pending = validation.locked_pending();
+                pending.covers_whole_workspace() || pending.paths().any(|held| held == path)
+            };
+            if observed {
+                return true;
+            }
+            tokio::time::sleep(LANE_POLL).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_change_the_publisher_lands_keeps_the_next_batch_incremental() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let current = stable_candidate(directory.path(), 0)?;
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        validation.install_publication(&current);
+        let _watcher = super::workspace_watcher(directory.path(), &validation)
+            .map_err(|error| format!("watcher must start: {error:?}"))?;
+        let patch = "--- /dev/null\n+++ b/notes.md\n@@ -0,0 +1 @@\n+staged through the publisher\n";
+        let params = PatchParams {
+            patch: patch.into(),
+        };
+        let landed = ChangeService::new(directory.path()).patch(&current.reads, &params)?;
+        assert!(
+            matches!(landed, ChangeResult::Applied { .. }),
+            "the patch must land: {landed:?}"
+        );
+        let notes = rift_core::ProjectPath::new("notes.md")?;
+        assert!(
+            path_pending_within_bound(&validation, &notes).await,
+            "the watcher must report the landed write"
+        );
+
+        let mut request = validation.take_pending();
+        assert!(
+            !request.work.covers_whole_workspace(),
+            "a landed write names its own paths, the staged file's included: {:?}",
+            request.work
+        );
+        request.previous = Some(Arc::clone(&current));
+        let change_set = request.change_set(directory.path(), &current.configuration);
+        let ChangeSet::Incremental(changes) = change_set else {
+            return Err("a landed write resolves to an incremental change set".into());
+        };
+        assert!(
+            changes.paths().any(|path| path == &notes),
+            "the change set names the written file"
         );
         Ok(())
     }
@@ -3254,13 +3471,13 @@ mod tests {
         // The observation this attempt answers for is already superseded, so it publishes
         // nothing and owes its paths back.
         validation.observe_paths([rift_core::ProjectPath::new("other.rs")?])?;
-        let outcome = super::capture_rebuild_serialized(
+        let outcome = super::capture_rebuild_with(
             directory.path(),
             WorkspaceIndexLimits::default(),
             &state,
             &validation,
             request,
-            &empty_dependency_store(),
+            super::workspace_capture(&empty_dependency_store()),
         )?;
         assert!(matches!(outcome, super::CapturedRebuild::Superseded));
 
@@ -3543,13 +3760,13 @@ mod tests {
             current: candidate,
             failure: None,
         });
-        let outcome = super::capture_rebuild_serialized(
+        let outcome = super::capture_rebuild_with(
             directory.path(),
             WorkspaceIndexLimits::default(),
             &state,
             &validation,
             RebuildRequest::initial(7),
-            &empty_dependency_store(),
+            super::workspace_capture(&empty_dependency_store()),
         )?;
         assert!(matches!(outcome, super::CapturedRebuild::Superseded));
         Ok(())
@@ -3835,7 +4052,8 @@ mod tests {
             dependencies: Arc::clone(&dependencies),
             dependency_lane: DependencyLane::spawn_isolated(&dependencies),
         };
-        super::rebuild_workspace(&context, request).await
+        let capture = super::workspace_capture(&dependencies);
+        super::rebuild_workspace(&context, request, capture).await
     }
 
     #[tokio::test]
@@ -5041,6 +5259,249 @@ mod tests {
 
         validation.cancellation.cancel();
         supervisor.await?;
+        Ok(())
+    }
+
+    /// The supervisor context the cancellation tests drive, over `blocking` sized to one
+    /// slot so a sentinel run through it proves the held capture's thread has ended.
+    fn cancellation_context(
+        root: &std::path::Path,
+        validation: &Arc<IndexValidation>,
+        published: &Arc<RwLock<IndexState>>,
+        blocking: &BlockingExecutor,
+        dependencies: &Arc<super::DependencyStore>,
+    ) -> super::IndexSupervisorContext {
+        super::IndexSupervisorContext {
+            root: root.to_path_buf(),
+            limits: WorkspaceIndexLimits::default(),
+            published: Arc::clone(published),
+            change_lane: Arc::new(crate::server::ChangeLane::default()),
+            validation: Arc::clone(validation),
+            blocking: blocking.clone(),
+            population: None,
+            lexical: None,
+            dependencies: Arc::clone(dependencies),
+            dependency_lane: DependencyLane::spawn_isolated(dependencies),
+        }
+    }
+
+    /// A capture that reports it started, blocks until the test releases it, and then
+    /// scans the workspace as production would.
+    ///
+    /// The release is a rendezvous: it succeeds only while the capture still waits in
+    /// it, so a successful release proves the capture was blocking at that moment.
+    fn held_capture(
+        dependencies: &Arc<super::DependencyStore>,
+    ) -> (
+        impl super::CaptureWorkspace + Clone + Send + 'static,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (started, started_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (release, release_receiver) = std::sync::mpsc::sync_channel::<()>(0);
+        let release_receiver = Arc::new(std::sync::Mutex::new(release_receiver));
+        let scan = super::workspace_capture(dependencies);
+        let capture = move |root: &std::path::Path,
+                            limits: WorkspaceIndexLimits,
+                            request: &RebuildRequest| {
+            let _ = started.send(());
+            release_receiver
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv()
+                .expect("the test releases the held capture");
+            scan(root, limits, request)
+        };
+        (capture, started_receiver, release)
+    }
+
+    #[tokio::test]
+    async fn rebuild_answers_cancelled_while_its_capture_still_blocks() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let published = Arc::new(RwLock::new(IndexState {
+            current: stable_candidate(directory.path(), 0)?,
+            failure: None,
+        }));
+        let blocking = BlockingExecutor::isolated(1, 60_000);
+        let dependencies = empty_dependency_store();
+        let context = cancellation_context(
+            directory.path(),
+            &validation,
+            &published,
+            &blocking,
+            &dependencies,
+        );
+        let (capture, mut started, release) = held_capture(&dependencies);
+        validation.observe_whole_workspace()?;
+        let request = validation.take_pending();
+
+        let cancel_once_started = async {
+            started.recv().await;
+            validation.cancellation.cancel();
+        };
+        let rebuild = tokio::time::timeout(
+            Duration::from_secs(1),
+            super::rebuild_workspace(&context, request, capture),
+        );
+        let (outcome, ()) = tokio::join!(rebuild, cancel_once_started);
+        let outcome = outcome.map_err(
+            |_| "a cancelled rebuild must answer within a second while its capture blocks",
+        )??;
+        assert_eq!(outcome, RebuildOutcome::Cancelled);
+        release
+            .send(())
+            .map_err(|_| "the capture must still block when the rebuild answers")?;
+
+        // The one slot is free again only once the detached capture thread has ended.
+        blocking
+            .run("sentinel", || Ok::<(), rift_server::ReadError>(()))
+            .await?;
+        let state = published.read().await;
+        let (snapshot, failure) = state.snapshot();
+        assert_eq!(snapshot.epoch, 0, "a cancelled rebuild publishes nothing");
+        assert!(failure.is_none(), "a cancelled rebuild records no failure");
+        drop(state);
+        assert!(
+            validation.locked_pending().covers_whole_workspace(),
+            "the cancelled capture returns its work"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn supervisor_ends_when_cancelled_while_its_capture_still_blocks() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let (validation, invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let published = Arc::new(RwLock::new(IndexState {
+            current: stable_candidate(directory.path(), 0)?,
+            failure: None,
+        }));
+        let watcher = super::workspace_watcher(directory.path(), &validation)
+            .map_err(|error| format!("watcher must start: {error:?}"))?;
+        let blocking = BlockingExecutor::isolated(1, 60_000);
+        let dependencies = empty_dependency_store();
+        let context = cancellation_context(
+            directory.path(),
+            &validation,
+            &published,
+            &blocking,
+            &dependencies,
+        );
+        let (capture, mut started, release) = held_capture(&dependencies);
+        let supervisor = tokio::spawn(super::run_index_supervisor_with(
+            watcher,
+            invalidations,
+            context,
+            capture,
+        ));
+        validation.observe_whole_workspace()?;
+        started
+            .recv()
+            .await
+            .ok_or("the supervisor must start the capture")?;
+        validation.cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(1), supervisor)
+            .await
+            .map_err(|_| "the supervisor must end within a second while its capture blocks")??;
+        release
+            .send(())
+            .map_err(|_| "the capture must still block when the supervisor ends")?;
+
+        blocking
+            .run("sentinel", || Ok::<(), rift_server::ReadError>(()))
+            .await?;
+        let state = published.read().await;
+        let (snapshot, failure) = state.snapshot();
+        assert_eq!(snapshot.epoch, 0, "a cancelled rebuild publishes nothing");
+        assert!(failure.is_none(), "a cancelled rebuild records no failure");
+        Ok(())
+    }
+
+    #[test]
+    fn capture_is_cancelled_before_it_runs_once_the_token_is_cancelled() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let (validation, _receiver) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let state = RwLock::new(IndexState {
+            current: stable_candidate(directory.path(), 0)?,
+            failure: None,
+        });
+        validation.observe_whole_workspace()?;
+        let request = validation.take_pending();
+        validation.cancellation.cancel();
+        let mut ran = false;
+        let outcome = super::capture_rebuild_with(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &state,
+            &validation,
+            request,
+            |_, _, _| {
+                ran = true;
+                Ok(WorkspaceCandidate::ConfigurationChanged)
+            },
+        )?;
+        assert!(matches!(outcome, super::CapturedRebuild::Cancelled));
+        assert!(!ran, "a cancelled attempt never runs its capture");
+        assert!(
+            validation.locked_pending().covers_whole_workspace(),
+            "the cancelled attempt returns its work"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn capture_is_cancelled_before_its_candidate_is_handed_on() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let (validation, _receiver) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let state = RwLock::new(IndexState {
+            current: stable_candidate(directory.path(), 0)?,
+            failure: None,
+        });
+        validation.observe_whole_workspace()?;
+        let request = validation.take_pending();
+        let cancelling = Arc::clone(&validation);
+        let outcome = super::capture_rebuild_with(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &state,
+            &validation,
+            request,
+            move |root, limits, request| {
+                cancelling.cancellation.cancel();
+                build_workspace_candidate(root, limits, request, &empty_dependency_store())
+            },
+        )?;
+        assert!(matches!(outcome, super::CapturedRebuild::Cancelled));
+        assert!(
+            validation.locked_pending().covers_whole_workspace(),
+            "a candidate captured under cancellation returns its work"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn publication_is_refused_once_the_token_is_cancelled() -> TestResult {
+        let fixture = publication_fixture()?;
+        fixture.validation.cancellation.cancel();
+        assert_eq!(
+            publish_rebuild(
+                &fixture.state,
+                &fixture.validation,
+                Arc::clone(&fixture.after)
+            ),
+            RebuildOutcome::Cancelled
+        );
+        let state = fixture.state.blocking_read();
+        assert_workspace_identity(&state.current, &fixture.before);
         Ok(())
     }
 }
