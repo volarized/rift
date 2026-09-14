@@ -9,6 +9,7 @@
 
 use std::error::Error;
 use std::fs;
+use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -210,6 +211,39 @@ fn serving_document(root: &Path) -> Option<ServerLock> {
         ServerPresence::Serving(lock) => Some(lock),
         ServerPresence::Starting | ServerPresence::Stale(_) | ServerPresence::Absent => None,
     }
+}
+
+/// Calls the `search` tool over the served MCP path and reads the whole answer.
+///
+/// The server serves MCP statelessly with JSON responses, so one authorized
+/// `POST` carries the whole call and the reply arrives on the same connection,
+/// which `Connection: close` ends. A query matching every unit of the large
+/// fixture keeps the request in flight while the stop lands.
+fn search_request(port: u16, token: &str) -> TestResult<String> {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "search", "arguments": {"query": "beacon"}},
+    }))?;
+    let head = format!(
+        "POST /api/mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\n\
+         Content-Length: {length}\r\nConnection: close\r\n\r\n",
+        length = body.len()
+    );
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let mut stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)?;
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(&body)?;
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer)?;
+    Ok(answer)
+}
+
+/// Whether one `rift server stop` printed the line that reports success.
+fn reports_stopped(output: &Output) -> bool {
+    stdout_of(output).contains("rift server stopped")
 }
 
 /// Waits until a fresh connect to `port` is refused again.
@@ -549,6 +583,90 @@ fn stop_issued_during_a_rebuild_ends_the_process_before_the_document_goes() -> T
         !document_path(root).exists(),
         "a graceful stop retires server.json"
     );
+    Ok(())
+}
+
+#[test]
+fn a_stop_reports_success_only_once_the_election_it_waited_on_released() -> TestResult {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let directory = workspace()?;
+    let root = directory.path();
+    write_large_fixture(root)?;
+    let _cleanup = StopOnDrop::new(root);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rift"))
+        .args(["server", "start", "--foreground"])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let serving = wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
+        serving_document(root)
+    })?;
+    assert_eq!(serving.pid, child.id(), "the child itself must serve");
+
+    // The search reads the large fixture's units, so serving still has a request to
+    // drain when the stop issued behind it cancels the serve loop. Its answer is not
+    // asserted: a drain the stop's budget cuts short leaves the caller without one,
+    // and that is a valid stop.
+    let searching = std::thread::spawn(move || {
+        let _answer = search_request(serving.port, &serving.token);
+    });
+    let stopping = std::thread::spawn({
+        let root = root.to_owned();
+        move || rift(&root, &["server", "stop"]).map_err(|error| error.to_string())
+    });
+
+    // Every stop asked while the first one waits meets the workspace mid-shutdown.
+    // Each answer is read with the election state it was printed under. Only the
+    // stop the server answers is required to report success: a sibling's request can
+    // be cut by the cancellation the answered one triggered, and that stop refuses
+    // with `server_stop_failed` rather than claiming a stop it never delivered.
+    let mut observations = Vec::new();
+    while !stopping.is_finished() {
+        let again = rift(root, &["server", "stop"])?;
+        observations.push((reports_stopped(&again), probe(root).election_held()));
+    }
+    let stopped = stopping
+        .join()
+        .map_err(|_| "the stop thread must not panic")??;
+    observations.push((reports_stopped(&stopped), probe(root).election_held()));
+    assert!(
+        observations
+            .iter()
+            .any(|&(reported_stopped, _)| reported_stopped),
+        "the stop the server answered must report success; observed (reported \
+         stopped, election held) per stop: {observations:?}"
+    );
+    assert!(
+        observations
+            .iter()
+            .all(|&(reported_stopped, election_held)| !reported_stopped || !election_held),
+        "a stop reports success only once the election released; observed (reported \
+         stopped, election held) per stop: {observations:?}"
+    );
+
+    // The election releases immediately before the process leaves, so a reported stop
+    // is followed by the exit itself. The exit status is left unasserted: it carries
+    // whether the drain finished inside the stop's budget, which this fixture's search
+    // does not pin.
+    wait_for(
+        GONE_POLL_ATTEMPT_COUNT,
+        "the stopped server's process to exit after its stop reported success",
+        || child.try_wait().ok().flatten(),
+    )?;
+    let output = child.wait_with_output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("MCP server stopped"),
+        "serving ended before the process left: {stderr}"
+    );
+    assert!(
+        !document_path(root).exists(),
+        "a graceful stop retires server.json"
+    );
+    let _ = searching.join();
     Ok(())
 }
 
