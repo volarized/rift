@@ -587,6 +587,27 @@
               },
               {
                 "additionalProperties": false,
+                "description": "The lexical ranking stopped at `matches_max` units; hits past it never reached the\npage, whatever `paths` selects. Narrow `query`.",
+                "properties": {
+                  "code": {
+                    "const": "lexical_ranking_truncated",
+                    "type": "string"
+                  },
+                  "matches_max": {
+                    "description": "Units the ranking stopped at: the server's bound on one lexical ranking.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "matches_max"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "A claimed file is left out of the index - its bytes are not valid UTF-8, or it\ncrosses a per-file bound - so it answers no search or lookup, and addressing it\ndirectly still refuses `content_unavailable`. Every other file in the workspace\nstays available. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in\nproject-path order; when more files are left out, one more carries no `unit` and\ncounts the rest, and `rift://logs` names each of them.",
                 "properties": {
                   "code": {
@@ -5131,6 +5152,27 @@
                 "required": [
                   "code",
                   "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The lexical ranking stopped at `matches_max` units; hits past it never reached the\npage, whatever `paths` selects. Narrow `query`.",
+                "properties": {
+                  "code": {
+                    "const": "lexical_ranking_truncated",
+                    "type": "string"
+                  },
+                  "matches_max": {
+                    "description": "Units the ranking stopped at: the server's bound on one lexical ranking.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "matches_max"
                 ],
                 "type": "object"
               },
@@ -12329,6 +12371,27 @@
                 "required": [
                   "code",
                   "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The lexical ranking stopped at `matches_max` units; hits past it never reached the\npage, whatever `paths` selects. Narrow `query`.",
+                "properties": {
+                  "code": {
+                    "const": "lexical_ranking_truncated",
+                    "type": "string"
+                  },
+                  "matches_max": {
+                    "description": "Units the ranking stopped at: the server's bound on one lexical ranking.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "matches_max"
                 ],
                 "type": "object"
               },

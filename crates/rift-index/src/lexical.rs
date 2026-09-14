@@ -235,6 +235,51 @@ pub enum RevisionScoped<T> {
     NoRevision,
 }
 
+/// What one lexical search ranked, and whether the store held a match past its bound.
+///
+/// A ranking stops at `limit` capped by `matches_max`. The query reads one row past that
+/// bound, so a store holding more than the bound reports it here and a caller never has
+/// to compare the answer's length with a bound it may not know: a query with exactly as
+/// many matches as the bound is not truncated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LexicalRanking {
+    matches: Vec<LexicalMatch>,
+    truncated_at: Option<u32>,
+}
+
+impl LexicalRanking {
+    /// Keeps `bound` rows of a probe that read one row past it: a row past the bound
+    /// proves the store held a match the bound cut.
+    fn from_probe(mut matches: Vec<LexicalMatch>, bound: u32) -> Self {
+        let kept = bound_as_usize(bound);
+        let truncated_at = (matches.len() > kept).then_some(bound);
+        matches.truncate(kept);
+        Self {
+            matches,
+            truncated_at,
+        }
+    }
+
+    /// The ranked matches, best first.
+    #[must_use]
+    pub fn matches(&self) -> &[LexicalMatch] {
+        &self.matches
+    }
+
+    /// The ranked matches, best first, owned.
+    #[must_use]
+    pub fn into_matches(self) -> Vec<LexicalMatch> {
+        self.matches
+    }
+
+    /// The bound the ranking stopped at while the store held a match past it, or `None`
+    /// when every match was ranked.
+    #[must_use]
+    pub const fn truncated_at(&self) -> Option<u32> {
+        self.truncated_at
+    }
+}
+
 /// One lexical search hit.
 ///
 /// `bm25` is negative; lower is better. `rank` is only comparable within the
@@ -1167,7 +1212,8 @@ impl LexicalSearchIndex {
     /// [`RevisionScoped::NoRevision`].
     ///
     /// An empty or all-punctuation `query` matches nothing. The effective result count is
-    /// `limit` capped by `matches_max`.
+    /// `limit` capped by `matches_max`; the ranking says when the store held a match past
+    /// that count, so a caller can tell a full answer from a cut one.
     ///
     /// # Errors
     ///
@@ -1184,10 +1230,12 @@ impl LexicalSearchIndex {
         tree_revision: &str,
         query: &str,
         limit: u32,
-    ) -> Result<RevisionScoped<Vec<LexicalMatch>>, LexicalIndexError> {
+    ) -> Result<RevisionScoped<LexicalRanking>, LexicalIndexError> {
         let terms_max = bound_as_usize(self.limits.query_terms_max());
         let expression = match_expression(query, terms_max)?;
-        let effective_limit = i64::from(limit.min(self.limits.matches_max()));
+        let bound = limit.min(self.limits.matches_max());
+        // One row past the bound tells whether the store holds a match the bound cuts.
+        let probe_limit = i64::from(bound) + 1;
 
         let mut connection = self.database.connection().await?;
         let mut transaction = connection.transaction().await.map_err(storage_error)?;
@@ -1200,11 +1248,14 @@ impl LexicalSearchIndex {
             Some(_) => {}
         }
         let Some(expression) = expression else {
-            return Ok(RevisionScoped::Matched(Vec::new()));
+            return Ok(RevisionScoped::Matched(LexicalRanking::from_probe(
+                Vec::new(),
+                bound,
+            )));
         };
         let rows = toasty::sql::query(lexical_search_sql())
             .bind(expression)
-            .bind(effective_limit)
+            .bind(probe_limit)
             .column_types([
                 Type::String,
                 Type::String,
@@ -1216,10 +1267,13 @@ impl LexicalSearchIndex {
             .await
             .map_err(storage_error)?;
 
-        rows.iter()
+        let matches = rows
+            .iter()
             .map(decode_lexical_match)
-            .collect::<Result<Vec<_>, _>>()
-            .map(RevisionScoped::Matched)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(RevisionScoped::Matched(LexicalRanking::from_probe(
+            matches, bound,
+        )))
     }
 
     /// Returns one unit's indexed content by its identity, or `None` when no
@@ -1262,12 +1316,47 @@ impl LexicalSearchIndex {
 mod tests {
     use super::{
         LexicalIndexFault, LexicalIndexLimits, LexicalIndexStateRecord, LexicalIndexViolation,
-        LexicalSearchIndex, LexicalUnit, LexicalUnitKind, LexicalUnitRecord, UNIT_NAME_BYTES_MAX,
-        checked_byte_length, decode_lexical_match, identifier_expansion, lexical_error,
-        lexical_error_caused_by, match_expression, require_pragma_row, validate_lexical_batch,
+        LexicalMatch, LexicalRanking, LexicalSearchIndex, LexicalUnit, LexicalUnitKind,
+        LexicalUnitRecord, UNIT_NAME_BYTES_MAX, checked_byte_length, decode_lexical_match,
+        identifier_expansion, lexical_error, lexical_error_caused_by, match_expression,
+        require_pragma_row, validate_lexical_batch,
     };
     use rift_core::{ErrorCode, ErrorName, Fault, ProjectPath};
     use toasty::stmt::Value;
+
+    fn ranked(identity: &str) -> LexicalMatch {
+        let path = ProjectPath::new("docs/a.md").expect("fixture path must be valid");
+        LexicalMatch::new(identity, path, LexicalUnitKind::TextFile, None, -1.0)
+    }
+
+    #[test]
+    fn test_lexical_ranking_below_the_bound_is_not_truncated() {
+        let ranking = LexicalRanking::from_probe(vec![ranked("a")], 2);
+        assert_eq!(ranking.matches().len(), 1);
+        assert_eq!(ranking.truncated_at(), None);
+    }
+
+    #[test]
+    fn test_lexical_ranking_at_exactly_the_bound_is_not_truncated() {
+        let ranking = LexicalRanking::from_probe(vec![ranked("a"), ranked("b")], 2);
+        assert_eq!(ranking.matches().len(), 2);
+        assert_eq!(ranking.truncated_at(), None);
+    }
+
+    #[test]
+    fn test_lexical_ranking_one_past_the_bound_keeps_the_bound_and_names_it() {
+        let probe = vec![ranked("a"), ranked("b"), ranked("c")];
+        let ranking = LexicalRanking::from_probe(probe, 2);
+        assert_eq!(
+            ranking
+                .matches()
+                .iter()
+                .map(LexicalMatch::identity)
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert_eq!(ranking.truncated_at(), Some(2));
+    }
 
     #[test]
     fn test_lexical_unit_new_refuses_empty_identity() {

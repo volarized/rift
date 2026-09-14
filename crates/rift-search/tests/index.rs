@@ -326,10 +326,11 @@ async fn lexical_order(root: &Path, query: &str, limit: u32) -> Fallible<Vec<Str
         WorkspaceDatabase::open(&database(root), database_pool()).await?,
         LexicalIndexLimits::default(),
     );
-    let RevisionScoped::Matched(matches) = index.search(REVISION, query, limit).await? else {
+    let RevisionScoped::Matched(ranking) = index.search(REVISION, query, limit).await? else {
         return Err("the lexical store must hold the fixture revision".into());
     };
-    Ok(matches
+    Ok(ranking
+        .matches()
         .iter()
         .map(|matched| matched.identity().to_owned())
         .collect())
@@ -339,7 +340,7 @@ async fn lexical_order(root: &Path, query: &str, limit: u32) -> Fallible<Vec<Str
 /// `REVISION`.
 async fn ranked_units(index: &SearchIndex, query: &str, limit: u32) -> Fallible<Vec<RankedUnit>> {
     match index.search(REVISION, query, limit).await? {
-        RevisionScoped::Matched(ranked) => Ok(ranked),
+        RevisionScoped::Matched(ranked) => Ok(ranked.into_units()),
         other => Err(format!("the store must hold {REVISION}: {other:?}").into()),
     }
 }
@@ -1190,7 +1191,7 @@ async fn a_corpus_described_for_the_previous_tree_ranks_nothing() -> TestResult 
         return Err("the store holds the tree that was just stamped".into());
     };
     assert!(
-        ranked.is_empty(),
+        ranked.units().is_empty(),
         "the previous tree's vectors must not rank a tree they were not described for"
     );
 
@@ -1201,7 +1202,7 @@ async fn a_corpus_described_for_the_previous_tree_ranks_nothing() -> TestResult 
         return Err("the store still holds the tree that was stamped".into());
     };
     assert_eq!(
-        ranked.len(),
+        ranked.units().len(),
         2,
         "the pass for this tree publishes a corpus that ranks it"
     );

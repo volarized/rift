@@ -925,6 +925,12 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
+    /// The lexical ranking stopped at `matches_max` units; hits past it never reached the
+    /// page, whatever `paths` selects. Narrow `query`.
+    LexicalRankingTruncated {
+        /// Units the ranking stopped at: the server's bound on one lexical ranking.
+        matches_max: u64,
+    },
     /// A claimed file is left out of the index - its bytes are not valid UTF-8, or it
     /// crosses a per-file bound - so it answers no search or lookup, and addressing it
     /// directly still refuses `content_unavailable`. Every other file in the workspace
@@ -2144,6 +2150,15 @@ mod tests {
     }
 
     #[test]
+    fn the_lexical_truncation_warning_round_trips_under_its_code_tag() {
+        let warning = ReadWarning::LexicalRankingTruncated { matches_max: 1_000 };
+        let wire = json!({ "code": "lexical_ranking_truncated", "matches_max": 1_000 });
+        assert_eq!(serde_json::to_value(&warning).expect("serialize"), wire);
+        let parsed: ReadWarning = serde_json::from_value(wire).expect("deserialize");
+        assert_eq!(parsed, warning);
+    }
+
+    #[test]
     fn the_read_warning_schema_advertises_every_tier_warning() {
         let schema = serde_json::to_value(schema_for!(ReadWarning)).expect("warning schema");
         let arms = schema["oneOf"].as_array().cloned().unwrap_or_default();
@@ -2156,6 +2171,7 @@ mod tests {
             "semantic_index_preparing",
             "semantic_ranking_unavailable",
             "lexical_ranking_unavailable",
+            "lexical_ranking_truncated",
             "source_unavailable",
             "symbol_disagreement",
             "dependency_index_pending",

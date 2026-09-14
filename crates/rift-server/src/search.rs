@@ -2460,6 +2460,7 @@ pub fn compute() -> i32 {
         else {
             return Err("the store must hold the revision it was just stamped with".into());
         };
+        let ranked = ranked.into_units();
         assert!(!ranked.is_empty(), "the fixture query must rank something");
         Ok(ranked)
     }
