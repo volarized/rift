@@ -365,6 +365,58 @@ fn stop_during_the_lexical_commit_behind_the_publication_ends_the_process() -> T
 }
 
 #[test]
+fn stop_during_a_running_capture_ends_the_process() -> TestResult {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let directory = workspace()?;
+    let root = directory.path();
+    write_large_fixture(root)?;
+    let _cleanup = StopOnDrop::new(root);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rift"))
+        .args(["server", "start", "--foreground"])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let serving = wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
+        serving_document(root)
+    })?;
+    assert_eq!(serving.pid, child.id(), "the child itself must serve");
+
+    // The document appears once the initial index publishes. Rewriting every fixture
+    // file then streams invalidations for longer than the supervisor's debounce, so
+    // rebuilds run back to back on the blocking pool while the stop lands.
+    write_large_fixture(root)?;
+    let stopped = rift(root, &["server", "stop"])?;
+    require_success(&stopped, "stop during the rebuild")?;
+
+    // `GONE_POLL_ATTEMPT_COUNT` probes at `POLL_INTERVAL` is the server's own stop bound.
+    // A capture the stop interrupts ends on its own thread; the supervisor does not
+    // wait for it before the process leaves.
+    let status = wait_for(
+        GONE_POLL_ATTEMPT_COUNT,
+        "the stopped server's process to exit while its capture runs",
+        || child.try_wait().ok().flatten(),
+    )?;
+    assert!(
+        status.success(),
+        "a stopped foreground server exits cleanly: {status:?}"
+    );
+    let output = child.wait_with_output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("MCP server stopped"),
+        "serving ended before the process left: {stderr}"
+    );
+    assert!(
+        !document_path(root).exists(),
+        "a graceful stop retires server.json"
+    );
+    Ok(())
+}
+
+#[test]
 fn concurrent_starts_agree_on_one_elected_server() -> TestResult {
     let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let directory = workspace()?;
