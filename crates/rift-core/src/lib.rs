@@ -43,6 +43,7 @@ pub use semantic::{
     Language, NodeId, PROVIDER_SYMBOL_ID_BYTES_MAX, PackageIdentity, PortableSymbolFacts,
     ReferenceRole, RelationshipKind, SemanticReference, Signature, SourceApplicability, SourceKind,
     SourceLocation, SourceRange, SymbolFacet, SymbolRecord, SymbolResolution, TypeBinding,
+    is_portable_name,
 };
 
 /// Iterates while charging one unit to a loop budget before each body execution.

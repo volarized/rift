@@ -18,6 +18,10 @@
 //!   assigned to one is that variable, named by the declarator. A
 //!   destructuring declarator declares its names through a pattern, not a
 //!   single name, and emits no symbol.
+//! - A computed member key names its method by the key expression's own
+//!   bytes, so a name can run to any length. A declaration whose name or
+//!   qualified name passes `PROVIDER_SYMBOL_ID_BYTES_MAX` bytes is left out
+//!   of the document with every declaration nested under it, and counted.
 //! - A declaration's complete span includes directly attached `JSDoc` comments.
 //!   Decorators remain children of the declared node.
 //! - `documentation` remains empty. A `Signature` renders for a callable

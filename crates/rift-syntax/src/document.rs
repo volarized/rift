@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use rift_binding::UnitBindingFacts;
-use rift_core::ProjectPath;
+use rift_core::{ProjectPath, is_portable_name};
 use rift_protocol::read::{Documentation, Language, Signature, SymbolFacet};
 
 /// The character a qualified name carries its disambiguating number after,
@@ -91,6 +91,7 @@ pub struct SyntaxDocument {
     nodes: Vec<SyntaxNode>,
     symbols: Vec<SyntaxSymbol>,
     has_errors: bool,
+    left_out_declarations: usize,
     binding: Option<UnitBindingFacts>,
 }
 
@@ -163,10 +164,33 @@ fn unused_suffixed_name(name: &str, count: &mut u32, taken: &HashSet<String>) ->
     }
 }
 
+/// Leaves out every declaration whose `name` or `qualified_name` the
+/// Contribution contract refuses - empty, past `PROVIDER_SYMBOL_ID_BYTES_MAX`
+/// bytes, or holding a control character - and returns how many left.
+///
+/// The rule is `rift_core::is_portable_name`, the predicate the contract
+/// itself checks a Contribution's name with, so a declaration this pass
+/// keeps is one the contract accepts. A declaration nested under a refused
+/// one carries the refused bytes in its own qualified name, so the same rule
+/// leaves it out. The pass runs after the suffix pass, so the bound holds
+/// for the qualified name the Contribution carries.
+///
+/// Every provider funnels through [`SyntaxDocument::new`], so no provider
+/// can emit a name the contract refuses. Work is one predicate per
+/// declaration, already bounded by the provider's node bound.
+fn leave_out_refused_names(symbols: &mut Vec<SyntaxSymbol>) -> usize {
+    let extracted = symbols.len();
+    symbols.retain(|symbol| {
+        is_portable_name(&symbol.name) && is_portable_name(&symbol.qualified_name)
+    });
+    extracted - symbols.len()
+}
+
 impl SyntaxDocument {
     /// Assembles one document from a provider's extracted facts, suffixing
-    /// every repeated qualified name apart so each declaration addresses one
-    /// identity.
+    /// every repeated qualified name apart so each declaration addresses
+    /// one identity, then leaving out every declaration whose name the
+    /// Contribution contract refuses.
     pub(crate) fn new(
         language: Language,
         path: ProjectPath,
@@ -175,12 +199,14 @@ impl SyntaxDocument {
         has_errors: bool,
     ) -> Self {
         suffix_duplicate_qualified_names(&mut symbols);
+        let left_out_declarations = leave_out_refused_names(&mut symbols);
         Self {
             language,
             path,
             nodes,
             symbols,
             has_errors,
+            left_out_declarations,
             binding: None,
         }
     }
@@ -222,6 +248,15 @@ impl SyntaxDocument {
         &self.symbols
     }
 
+    /// How many extracted declarations this document leaves out: each with
+    /// a `name` or `qualified_name` the Contribution contract refuses -
+    /// empty, past `PROVIDER_SYMBOL_ID_BYTES_MAX` bytes, or holding a
+    /// control character.
+    #[must_use]
+    pub const fn left_out_declaration_count(&self) -> usize {
+        self.left_out_declarations
+    }
+
     /// Reports whether parser observed malformed syntax.
     #[must_use]
     pub const fn has_errors(&self) -> bool {
@@ -240,7 +275,7 @@ impl SyntaxDocument {
 
 #[cfg(test)]
 mod tests {
-    use rift_core::{encode_path, symbol_identity};
+    use rift_core::{PROVIDER_SYMBOL_ID_BYTES_MAX, encode_path, symbol_identity};
 
     use super::*;
 
@@ -433,5 +468,49 @@ mod tests {
                     || SYMBOL_ID_TAIL_CHARACTERS.contains(character)),
             "every character must be one SymbolId's pattern accepts: identity={identity}"
         );
+    }
+
+    /// A declaration whose name is empty, holds a control character, or
+    /// passes `PROVIDER_SYMBOL_ID_BYTES_MAX` bytes is left out; a name at
+    /// the bound stays. The count names how many left.
+    #[test]
+    fn test_names_the_contract_refuses_are_left_out_and_counted() {
+        let at_bound = "n".repeat(PROVIDER_SYMBOL_ID_BYTES_MAX);
+        let past_bound = "n".repeat(PROVIDER_SYMBOL_ID_BYTES_MAX + 1);
+        let document = document(&[
+            "",
+            "first\nline",
+            at_bound.as_str(),
+            past_bound.as_str(),
+            "kept",
+        ]);
+        assert_eq!(qualified_names(&document), [at_bound.as_str(), "kept"]);
+        assert_eq!(document.left_out_declaration_count(), 2 + 1);
+    }
+
+    #[test]
+    fn test_a_document_whose_names_the_contract_accepts_leaves_none_out() {
+        let document = document(&["version", "updates"]);
+        assert_eq!(document.left_out_declaration_count(), 0);
+    }
+
+    /// A declaration nested under a refused one carries the refused bytes in
+    /// its own qualified name, so the same rule leaves it out.
+    #[test]
+    fn test_a_declaration_nested_under_a_refused_name_is_left_out_with_it() {
+        let document = document(&["first\nline", "first\nline > child", "kept"]);
+        assert_eq!(qualified_names(&document), ["kept"]);
+        assert_eq!(document.left_out_declaration_count(), 2);
+    }
+
+    /// The suffix pass runs first, so the bound holds for the qualified name
+    /// the Contribution carries: two declarations spelling one name at the
+    /// bound each take a suffix that passes it, and both are left out.
+    #[test]
+    fn test_the_bound_holds_for_the_suffixed_qualified_name() {
+        let at_bound = "n".repeat(PROVIDER_SYMBOL_ID_BYTES_MAX);
+        let document = document(&[at_bound.as_str(), at_bound.as_str(), "kept"]);
+        assert_eq!(qualified_names(&document), ["kept"]);
+        assert_eq!(document.left_out_declaration_count(), 2);
     }
 }
