@@ -2,28 +2,24 @@
 //!
 //! Each hook is an executable started directly - no shell - inside the
 //! changed tree, its streams captured up to the configured prefix, its
-//! wall-clock bounded by `timeout`. A command starts from the environment
-//! the server inherited, with the hook's `environment` entries laid on top.
+//! wall-clock bounded by `timeout`; `crate::process::run_bounded` is the
+//! runner. A command starts from the environment the server inherited, with
+//! the hook's `environment` entries laid on top.
 //! [`selected_hooks`] picks the commands one change runs from its initially
 //! changed project paths.
 //! Hooks observe an already-applied change: a failing hook rides the result
 //! as evidence and never rolls the change back.
 
-use std::io::Read;
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Command, ExitStatus};
+use std::time::Duration;
 
-use rift_core::{
-    CapturedStream, ProjectPath as CoreProjectPath, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX,
-};
+use rift_core::{CapturedStream, ProjectPath as CoreProjectPath};
 use rift_index::{PathMatcher, WorkspaceIndexError};
 use rift_protocol::configuration::{ChangedPaths, CommandHook};
 use rift_protocol::read::ProjectPath;
 
-/// How long the runner sleeps between checks on a running hook. The wait
-/// loop wakes at most `timeout / HOOK_POLL_INTERVAL + 1` times.
-const HOOK_POLL_INTERVAL: Duration = Duration::from_millis(25);
+use crate::process::run_bounded;
 
 /// What one configured hook's run produced.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -156,38 +152,25 @@ fn run_one(hook: &CommandHook, tree_root: &Path, ordered_paths: &[&str]) -> Hook
     }
     command
         .current_dir(working_directory)
-        .envs(&hook.environment)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(io) => return error_run(hook, format!("failed to launch: {io}")),
-    };
+        .envs(&hook.environment);
     #[expect(
         clippy::cast_possible_truncation,
         reason = "output_limit is validated to at most 4096 bytes, which fits usize on every \
                   served target"
     )]
     let capture_bytes = hook.output_limit.bytes() as usize;
-    let stdout_drain = drain_thread(child.stdout.take(), capture_bytes);
-    let stderr_drain = drain_thread(child.stderr.take(), capture_bytes);
-
-    let (exit, timed_out) = wait_bounded(
-        &mut child,
-        Duration::from_millis(hook.timeout.milliseconds()),
-    );
-    let stdout = join_drain(stdout_drain);
-    let stderr = join_drain(stderr_drain);
-
-    let (status, exit_code) = conclude(exit, timed_out);
+    let timeout = Duration::from_millis(hook.timeout.milliseconds());
+    let run = match run_bounded(&mut command, timeout, capture_bytes) {
+        Ok(run) => run,
+        Err(io) => return error_run(hook, format!("failed to launch: {io}")),
+    };
+    let (status, exit_code) = conclude(run.exit, run.timed_out);
     HookRun {
         id: hook.id.clone(),
         status,
         exit_code,
-        stdout,
-        stderr,
+        stdout: run.stdout,
+        stderr: run.stderr,
     }
 }
 
@@ -222,81 +205,6 @@ fn conclude(exit: std::io::Result<ExitStatus>, timed_out: bool) -> (HookStatus, 
     }
 }
 
-/// Waits for the child within `timeout`, then kills it. The poll loop wakes
-/// at most `timeout / HOOK_POLL_INTERVAL + 1` times before the deadline
-/// forces the kill.
-fn wait_bounded(child: &mut Child, timeout: Duration) -> (std::io::Result<ExitStatus>, bool) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(exit)) => return (Ok(exit), false),
-            Ok(None) => {}
-            Err(io) => {
-                // The child's state is unknown, and an unobservable child must
-                // not outlive its bound: kill it before reporting the failure.
-                let _ = child.kill();
-                let _ = child.wait();
-                return (Err(io), false);
-            }
-        }
-        let Some(remaining) = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|left| !left.is_zero())
-        else {
-            let _ = child.kill();
-            return (child.wait(), true);
-        };
-        std::thread::sleep(remaining.min(HOOK_POLL_INTERVAL));
-    }
-}
-
-/// Starts one reader thread over a hook stream. Null where the pipe was
-/// not handed over, which try-spawned children never do.
-fn drain_thread(
-    stream: Option<impl Read + Send + 'static>,
-    capture_bytes: usize,
-) -> Option<std::thread::JoinHandle<CapturedStream>> {
-    let stream = stream?;
-    Some(std::thread::spawn(move || drain(stream, capture_bytes)))
-}
-
-/// The thread's captured stream; a reader that panicked reports an empty
-/// capture rather than tearing down the change result.
-fn join_drain(handle: Option<std::thread::JoinHandle<CapturedStream>>) -> CapturedStream {
-    handle
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default()
-}
-
-/// Reads one stream until end-of-file or the drain ceiling, keeping the
-/// first `capture_bytes` and counting the rest. The loop is bounded by
-/// [`STREAM_TOTAL_BYTES_MAX`]: each read returns at least one byte, so it
-/// iterates at most that many times before end-of-file, an error, or the
-/// ceiling stops it.
-fn drain(mut stream: impl Read, capture_bytes: usize) -> CapturedStream {
-    let mut kept: Vec<u8> = Vec::with_capacity(capture_bytes.min(STREAM_READ_BYTES));
-    let mut total_bytes: u64 = 0;
-    let mut buffer = [0_u8; STREAM_READ_BYTES];
-    while total_bytes < STREAM_TOTAL_BYTES_MAX {
-        match stream.read(&mut buffer) {
-            Ok(0) | Err(_) => break,
-            Ok(read_bytes) => {
-                total_bytes = STREAM_TOTAL_BYTES_MAX.min(total_bytes + read_bytes as u64);
-                if kept.len() < capture_bytes {
-                    let taken = read_bytes.min(capture_bytes - kept.len());
-                    kept.extend_from_slice(&buffer[..taken]);
-                }
-            }
-        }
-    }
-    CapturedStream {
-        text: String::from_utf8_lossy(&kept).into_owned(),
-        captured_bytes: kept.len() as u64,
-        total_bytes,
-        truncated: total_bytes > kept.len() as u64,
-    }
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -304,6 +212,7 @@ mod tests {
     use rift_protocol::configuration::{CommandInput, Determinism, HookKind};
     use rift_protocol::read::PathPattern;
     use std::collections::BTreeMap;
+    use std::time::Instant;
 
     fn hook(program: &str, arguments: &[&str]) -> CommandHook {
         let command = std::iter::once(program)
@@ -640,54 +549,6 @@ mod tests {
             .insert("HOME".to_owned(), "/rift/overlay".to_owned());
         let run = run_hook(&overlaid, directory.path(), &[]);
         assert_eq!(run.stdout.text, "/rift/overlay\n");
-    }
-
-    /// A stream that never ends, for proving the drain ceiling.
-    struct EndlessStream;
-
-    impl Read for EndlessStream {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            buffer.fill(b'x');
-            Ok(buffer.len())
-        }
-    }
-
-    #[test]
-    fn test_drain_stops_counting_at_the_stream_ceiling() {
-        let captured = drain(EndlessStream, 16);
-        assert_eq!(captured.total_bytes, STREAM_TOTAL_BYTES_MAX);
-        assert_eq!(captured.captured_bytes, 16);
-        assert!(captured.truncated);
-    }
-
-    /// A stream that fails on its first read.
-    struct FailingStream;
-
-    impl Read for FailingStream {
-        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::other("stream torn down"))
-        }
-    }
-
-    #[test]
-    fn test_drain_reports_an_erroring_stream_as_empty() {
-        let captured = drain(FailingStream, 16);
-        assert_eq!(captured, CapturedStream::default());
-    }
-
-    /// A stream whose reader thread panics, for proving the join fallback.
-    struct PanickingStream;
-
-    impl Read for PanickingStream {
-        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-            panic!("reader died mid-stream");
-        }
-    }
-
-    #[test]
-    fn test_panicked_reader_reports_an_empty_capture() {
-        let captured = join_drain(drain_thread(Some(PanickingStream), 16));
-        assert_eq!(captured, CapturedStream::default());
     }
 
     #[test]

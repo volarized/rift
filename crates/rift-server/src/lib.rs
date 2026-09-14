@@ -2,6 +2,7 @@
 
 mod change;
 mod configuration;
+mod dependency;
 mod diagnose;
 mod embedded;
 mod engine;
@@ -10,6 +11,7 @@ mod hook;
 mod map;
 mod move_file;
 mod patch;
+mod process;
 mod publish;
 mod read;
 mod remove;

@@ -4,7 +4,9 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::read::{Digest, ExactKind, Language, Pagination, ProjectPath, SymbolId};
+use crate::read::{
+    Digest, ExactKind, Language, PackageIdentity, Pagination, ProjectPath, SymbolId,
+};
 use crate::schema;
 
 /// Directory depth a [`MapModule`] tree carries, at most. A directory deeper than this folds
@@ -16,10 +18,13 @@ pub const MAP_HUBS_MAX: usize = 20;
 pub const MAP_ENTRY_POINTS_MAX: usize = 50;
 /// [`WorkspaceMap::docs`] entries one map carries, at most.
 pub const MAP_DOCS_MAX: usize = 100;
+/// [`WorkspaceMap::packages`] entries one map carries, at most.
+pub const MAP_PACKAGES_MAX: usize = 1_000;
 
 /// Workspace orientation snapshot served by `rift://map`. Carries per-language totals, the
-/// directory tree indexed files sit under, the most-referenced symbols, entry points, and
-/// documentation paths. Computed once when the index publishes and served from cache until
+/// directory tree indexed files sit under, the most-referenced symbols, entry points,
+/// documentation paths, and the packages the workspace's manifests declare directly.
+/// Computed once when the index publishes and served from cache until
 /// the next publication.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -50,6 +55,13 @@ pub struct WorkspaceMap {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 100))]
     pub docs: Vec<ProjectPath>,
+    /// Packages the workspace's manifests declare directly, as their package managers
+    /// resolved them, in `manager`, `name`, `version` order. A transitive dependency is
+    /// cataloged but not listed here. At most [`MAP_PACKAGES_MAX`] entries; a workspace
+    /// declaring more lists the first in that order. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 1_000))]
+    pub packages: Vec<PackageIdentity>,
     /// Always the whole map on one page.
     pub pagination: Pagination,
 }
@@ -143,6 +155,11 @@ mod tests {
                 "rift://symbol/rust/crates/rift/src/main.rs/main".to_owned(),
             )],
             docs: vec![ProjectPath("README.md".to_owned())],
+            packages: vec![PackageIdentity {
+                manager: "cargo".to_owned(),
+                name: "tokio".to_owned(),
+                version: "1.53.1".to_owned(),
+            }],
             pagination: Pagination {
                 page_index: 0,
                 total_pages: 1,
@@ -227,6 +244,7 @@ mod tests {
             json!(MAP_ENTRY_POINTS_MAX)
         );
         assert_eq!(properties["docs"]["maxItems"], json!(MAP_DOCS_MAX));
+        assert_eq!(properties["packages"]["maxItems"], json!(MAP_PACKAGES_MAX));
 
         let module = &schema["$defs"]["MapModule"]["properties"];
         assert_eq!(
@@ -239,7 +257,14 @@ mod tests {
     fn schema_declares_empty_array_defaults() {
         let schema = serde_json::to_value(schema_for!(WorkspaceMap)).expect("map schema");
         let properties = &schema["properties"];
-        for name in ["languages", "modules", "hubs", "entry_points", "docs"] {
+        for name in [
+            "languages",
+            "modules",
+            "hubs",
+            "entry_points",
+            "docs",
+            "packages",
+        ] {
             assert_eq!(properties[name]["default"], json!([]), "field={name}");
         }
         let module = &schema["$defs"]["MapModule"]["properties"];

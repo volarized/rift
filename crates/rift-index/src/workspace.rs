@@ -669,7 +669,7 @@ impl WorkspaceSourcePolicy {
     /// # Errors
     ///
     /// Returns [`WorkspaceIndexError`] for discovery or configured-bound failures.
-    fn visible_paths(&self) -> Result<Vec<ProjectPath>, WorkspaceIndexError> {
+    pub fn visible_paths(&self) -> Result<Vec<ProjectPath>, WorkspaceIndexError> {
         let mut paths = Vec::new();
         for entry in source_walk(
             &self.root,
