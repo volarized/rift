@@ -919,11 +919,14 @@ impl EngineSession {
         Ok(edit)
     }
 
-    /// The locations referencing the declaration at one position.
+    /// The locations the engine names for the declaration at one position, its own
+    /// occurrence included.
     ///
-    /// `context.include_declaration` is `false`: the declaration itself is what a caller is
-    /// about to remove, so counting it would refuse every removal. An engine answering
-    /// `null` reports no references.
+    /// `context.include_declaration` is `true`, so an engine that resolved the declaration
+    /// names at least that declaration's own occurrence. The caller separates it from the
+    /// references, and reads an answer naming nothing at all as the answer of an engine
+    /// that does not hold the file, never as proof the declaration is unreferenced. An
+    /// engine answering `null` names nothing.
     ///
     /// # Errors
     ///
@@ -944,7 +947,7 @@ impl EngineSession {
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
             context: ReferenceContext {
-                include_declaration: false,
+                include_declaration: true,
             },
         };
         let locations = self.request::<References>(params).await?;
