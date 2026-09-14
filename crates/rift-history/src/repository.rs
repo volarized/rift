@@ -210,8 +210,9 @@ impl PathHistory {
     }
 
     /// Whether the walk examined the path's whole first-parent history.
-    /// `false` when the examination bound stopped the walk first, so
-    /// touching commits older than the listed ones may exist.
+    /// `false` when the examination bound or a shallow clone's boundary
+    /// stopped the walk first, so touching commits older than the listed
+    /// ones may exist.
     #[must_use]
     pub const fn is_complete(&self) -> bool {
         self.complete
@@ -388,9 +389,17 @@ impl Repository {
     /// commit reports itself incomplete and lists the newest touching
     /// commits only.
     ///
+    /// A shallow clone holds no commit past the boundary its `shallow`
+    /// file records, so a commit listed there is walked as having no
+    /// parent and the walk reports itself incomplete at it. The set is read
+    /// once per walk: gix reads the whole file, one commit id per line, so
+    /// its size bounds the set, and each examined commit costs one scan of
+    /// it. A parent absent for any other reason fails the read.
+    ///
     /// # Errors
     ///
-    /// Returns [`HistoryError`] when the object store cannot be read.
+    /// Returns [`HistoryError`] when the object store or the `shallow`
+    /// file cannot be read.
     pub fn path_revisions(
         &self,
         revision: &ResolvedRevision,
@@ -398,6 +407,10 @@ impl Repository {
         revisions_max: usize,
     ) -> Result<PathHistory, HistoryError> {
         let repository_path = self.repository_path(path);
+        let shallow = self
+            .inner
+            .shallow_commits()
+            .map_err(|error| storage("read shallow file", &error))?;
         let mut commit = self
             .inner
             .find_commit(revision.commit)
@@ -406,7 +419,12 @@ impl Repository {
         let mut revisions = Vec::new();
         let mut complete = false;
         for _ in 0..revisions_max {
-            let parent_id = commit.parent_ids().next().map(gix::Id::detach);
+            let at_boundary = at_shallow_boundary(shallow.as_ref(), &commit);
+            let parent_id = if at_boundary {
+                None
+            } else {
+                commit.parent_ids().next().map(gix::Id::detach)
+            };
             let (parent, parent_entry) = match parent_id {
                 Some(id) => {
                     let parent = self
@@ -422,7 +440,7 @@ impl Repository {
                 revisions.push(path_revision(&commit, path, entry)?);
             }
             let Some(parent) = parent else {
-                complete = true;
+                complete = !at_boundary;
                 break;
             };
             commit = parent;
@@ -479,6 +497,13 @@ fn blob_entry(
     Ok(entry
         .filter(|entry| entry.mode().is_blob())
         .map(|entry| entry.object_id()))
+}
+
+/// Whether `commit` sits on the clone's shallow boundary: listed in the
+/// `shallow` set, so the repository holds none of its parents. No set - the
+/// clone is not shallow - puts no commit on a boundary.
+fn at_shallow_boundary(shallow: Option<&gix::shallow::Commits>, commit: &gix::Commit<'_>) -> bool {
+    shallow.is_some_and(|set| set.contains(&commit.id))
 }
 
 /// One touching commit's recorded facts, with the blob its tree holds at
