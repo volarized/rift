@@ -40,6 +40,12 @@ const LARGE_FIXTURE_DECLARATIONS: usize = 12;
 /// How long after rewriting the large fixture the stop is issued: long enough for the
 /// capture to be running and the previous rebuild's lexical transaction to hold the write turn.
 const STOP_DELAY_AFTER_REWRITE: Duration = Duration::from_millis(200);
+/// How long the process may still run after `server.json` goes.
+///
+/// The serving process retires its own document, by dropping the election guard
+/// immediately before it leaves, so a poll can land between the two. The stop bounds
+/// that window; it does not remove it.
+const DOCUMENT_GONE_GRACE: Duration = Duration::from_secs(2);
 /// How long the server serves before the stop that tests the stop's own budget.
 ///
 /// It outlasts `SERVER_STOP_DEADLINE`, the server-side stop's span, so a deadline
@@ -521,7 +527,7 @@ fn stop_during_a_running_capture_ends_the_process() -> TestResult {
 }
 
 #[test]
-fn stop_issued_during_a_rebuild_ends_the_process_before_the_document_goes() -> TestResult {
+fn stop_issued_during_a_rebuild_ends_the_process_as_the_document_goes() -> TestResult {
     let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let directory = workspace()?;
     let root = directory.path();
@@ -548,9 +554,8 @@ fn stop_issued_during_a_rebuild_ends_the_process_before_the_document_goes() -> T
     let stopped = rift(root, &["server", "stop"])?;
     require_success(&stopped, "stop during the rebuild")?;
 
-    // Each poll reads the document before the process, so the one order the stop forbids
-    // - the document gone while the process still runs - can only be observed, never
-    // produced by the poll's own ordering.
+    // Each poll reads the document before the process, so a poll never manufactures the
+    // order it measures.
     let mut observations = Vec::with_capacity(GONE_POLL_ATTEMPT_COUNT as usize);
     let status = wait_for(
         GONE_POLL_ATTEMPT_COUNT,
@@ -566,12 +571,15 @@ fn stop_issued_during_a_rebuild_ends_the_process_before_the_document_goes() -> T
         status.success(),
         "a stopped foreground server exits cleanly: {status:?}"
     );
+    let lingering_polls = observations
+        .iter()
+        .filter(|&&(document_present, exited)| !document_present && !exited)
+        .count();
+    let lingering = POLL_INTERVAL * u32::try_from(lingering_polls).unwrap_or(u32::MAX);
     assert!(
-        observations
-            .iter()
-            .all(|&(document_present, exited)| document_present || exited),
-        "server.json goes only once the process is gone; observed (document present, \
-         process exited) per poll: {observations:?}"
+        lingering <= DOCUMENT_GONE_GRACE,
+        "the process leaves within {DOCUMENT_GONE_GRACE:?} of server.json going, observed \
+         {lingering:?}; (document present, process exited) per poll: {observations:?}"
     );
     let output = child.wait_with_output()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
