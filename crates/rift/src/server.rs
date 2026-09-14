@@ -40,8 +40,13 @@ const STOP_WAIT_MAX: Duration = Duration::from_secs(10);
 const STOP_POLL_ATTEMPT_COUNT: u32 = 100;
 /// Bound on the whole stop request: connect, send, and read the answer.
 const STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-/// Longest wait for queued diagnostics to reach the workspace database.
-const LOG_DRAIN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+/// One deadline for the whole server-side stop, shared by every stage under it.
+///
+/// It sits under [`STOP_WAIT_MAX`], so the process leaves before the CLI stop
+/// that asked for it gives up waiting. Serving ends, the engines shut down in
+/// parallel, the index supervisor joins, and the log drain's final flush runs,
+/// each taking only what the stage before it left of this deadline.
+const SERVER_STOP_DEADLINE: Duration = Duration::from_secs(8);
 /// Wall-clock span between two polls of the store while following.
 const LOG_FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// The form `--tail` accepts, named in every refusal.
@@ -630,6 +635,10 @@ async fn await_election_released(
 /// same way. This is the process that records: the drain writes what the
 /// tracing layer queued into the workspace database until the same token
 /// stops it.
+///
+/// The whole stop is bounded by [`SERVER_STOP_DEADLINE`]: the transport
+/// shutdown and the log drain's final flush each take only what the stage
+/// before it left of it.
 async fn serve_foreground(
     root: &Path,
     drain: Option<LogDrain>,
@@ -655,7 +664,11 @@ async fn serve_foreground(
         Ok(server) => server,
         Err(error) => {
             shutdown.cancel();
-            stop_log_drain(log_drain).await;
+            stop_log_drain(
+                log_drain,
+                tokio::time::Instant::now() + SERVER_STOP_DEADLINE,
+            )
+            .await;
             return Err(foreground_refused(root, error));
         }
     };
@@ -667,33 +680,38 @@ async fn serve_foreground(
         }
     );
     let interrupt = tokio::spawn(cancel_on_interrupt(shutdown.clone()));
+    let deadline = tokio::time::Instant::now() + SERVER_STOP_DEADLINE;
     let stopped = server
-        .stopped()
+        .stopped(deadline)
         .await
         .map_err(|error| Error::new(ServerCommandFault::Election(Box::new(error))));
     shutdown.cancel();
     interrupt.abort();
     let _ = interrupt.await;
-    stop_log_drain(log_drain).await;
+    stop_log_drain(log_drain, deadline).await;
     stopped
 }
 
-/// Joins the diagnostics drain within the foreground server's shutdown deadline.
-async fn stop_log_drain(drain: Option<tokio::task::JoinHandle<()>>) {
+/// Joins the diagnostics drain by `deadline`, the stop's shared deadline.
+///
+/// The drain runs last, so its final flush takes only what the engines and the
+/// index supervisor left of `deadline`. When the write turn a rebuild holds
+/// does not free in time, the drain drops its last batch with its own
+/// "refused a batch" stderr line, and this abort stops it waiting further.
+async fn stop_log_drain(
+    drain: Option<tokio::task::JoinHandle<()>>,
+    deadline: tokio::time::Instant,
+) {
     let Some(mut drain) = drain else {
         return;
     };
-    match tokio::time::timeout(LOG_DRAIN_SHUTDOWN_TIMEOUT, &mut drain).await {
+    match tokio::time::timeout_at(deadline, &mut drain).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => tracing::warn!(component = "logs", %error, "log drain task failed"),
         Err(_) => {
             drain.abort();
             let _ = drain.await;
-            tracing::warn!(
-                component = "logs",
-                timeout = ?LOG_DRAIN_SHUTDOWN_TIMEOUT,
-                "log drain missed its shutdown deadline"
-            );
+            tracing::warn!(component = "logs", "log drain outlasted the stop deadline");
         }
     }
 }
@@ -1093,13 +1111,13 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{
-        ChildWatch, LogLevel, LogsMode, PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT,
-        START_WAIT_MAX, STOP_POLL_ATTEMPT_COUNT, STOP_WAIT_MAX, ServerCommandFault, ServerOutcome,
-        StaleReason, StartMode, TailCount, await_election_released, await_serving, await_stopped,
-        discard_stale_document, foreground_refused, holder_evidence, label, level_glyph, logs_mode,
-        logs_query, logs_unavailable, now_ms, print_logs, rendered_fields, rendered_line,
-        rendered_timestamp, stale_reason_phrase, start_detached, start_mode, status, stop,
-        stop_log_drain,
+        ChildWatch, LogLevel, LogsMode, PRESENCE_POLL_INTERVAL, SERVER_STOP_DEADLINE,
+        START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, STOP_POLL_ATTEMPT_COUNT, STOP_WAIT_MAX,
+        ServerCommandFault, ServerOutcome, StaleReason, StartMode, TailCount,
+        await_election_released, await_serving, await_stopped, discard_stale_document,
+        foreground_refused, holder_evidence, label, level_glyph, logs_mode, logs_query,
+        logs_unavailable, now_ms, print_logs, rendered_fields, rendered_line, rendered_timestamp,
+        stale_reason_phrase, start_detached, start_mode, status, stop, stop_log_drain,
     };
     use jiff::tz::{Offset, TimeZone};
     use rift_core::Error;
@@ -1183,6 +1201,15 @@ mod tests {
     }
 
     #[test]
+    fn the_server_stop_deadline_leaves_before_the_cli_gives_up() {
+        assert!(
+            SERVER_STOP_DEADLINE < STOP_WAIT_MAX,
+            "the server-side stop must finish before the CLI's wait: \
+             SERVER_STOP_DEADLINE={SERVER_STOP_DEADLINE:?}, STOP_WAIT_MAX={STOP_WAIT_MAX:?}"
+        );
+    }
+
+    #[test]
     fn foreground_flag_selects_the_mode() {
         assert!(matches!(start_mode(true), StartMode::Foreground));
         assert!(matches!(start_mode(false), StartMode::Detached));
@@ -1192,7 +1219,11 @@ mod tests {
     async fn a_failed_log_drain_is_joined() {
         let drain = tokio::spawn(async { panic!("injected log drain failure") });
 
-        stop_log_drain(Some(drain)).await;
+        stop_log_drain(
+            Some(drain),
+            tokio::time::Instant::now() + SERVER_STOP_DEADLINE,
+        )
+        .await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -1212,7 +1243,11 @@ mod tests {
         });
         tokio::task::yield_now().await;
 
-        stop_log_drain(Some(drain)).await;
+        stop_log_drain(
+            Some(drain),
+            tokio::time::Instant::now() + SERVER_STOP_DEADLINE,
+        )
+        .await;
 
         assert!(stopped.load(Ordering::Acquire));
     }

@@ -38,6 +38,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::futures::Notified;
 use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
@@ -49,8 +50,6 @@ use crate::server::{BlockingExecutor, ChangeLane};
 pub(crate) const INDEX_INVALIDATIONS_MAX: usize = 1;
 /// Delay collecting one bounded filesystem-event batch.
 pub(crate) const INDEX_DEBOUNCE: Duration = Duration::from_millis(50);
-/// Deadline for joining the index supervisor during shutdown.
-pub(crate) const INDEX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Complete capture retries while the tree keeps moving.
 pub(crate) const INDEX_CAPTURE_ATTEMPTS_MAX: usize = 3;
 
@@ -819,22 +818,26 @@ impl Drop for IndexValidation {
 }
 
 impl IndexSupervisor {
-    /// Cancels and joins the workspace index supervisor.
+    /// Cancels the supervisor and joins it, bounded by `deadline`.
+    ///
+    /// `deadline` is the whole stop's shared deadline, so the join takes only
+    /// what earlier stages left of it; a supervisor still running when it
+    /// passes is aborted rather than waited on.
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when the task panics or misses its shutdown deadline.
+    /// Returns [`ReadError`] when the task panics or outlasts `deadline`.
     ///
     /// # Cancel safety
     ///
     /// Cancellation is requested before the join begins. Dropping this future
     /// after it takes task ownership detaches that terminating task.
-    pub(crate) async fn shutdown(&self) -> Result<(), ReadError> {
+    pub(crate) async fn shutdown(&self, deadline: Instant) -> Result<(), ReadError> {
         self.validation.cancellation.cancel();
         let Some(mut task) = self.validation.task.lock().await.take() else {
             return Ok(());
         };
-        if let Ok(result) = tokio::time::timeout(INDEX_SHUTDOWN_TIMEOUT, &mut task).await {
+        if let Ok(result) = tokio::time::timeout_at(deadline, &mut task).await {
             result.map_err(|error| ReadFault::task("index supervisor shutdown", error.to_string()))
         } else {
             task.abort();
@@ -3824,13 +3827,14 @@ mod tests {
         let supervisor = super::IndexSupervisor {
             validation: Arc::clone(&validation),
         };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let error = supervisor
-            .shutdown()
+            .shutdown(deadline)
             .await
             .expect_err("a stuck supervisor must miss the shutdown deadline");
         assert_eq!(error.descriptor().code(), "temporarily_unavailable");
         supervisor
-            .shutdown()
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(30))
             .await
             .map_err(|error| format!("second shutdown must be idempotent: {error:?}"))?;
         Ok(())

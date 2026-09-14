@@ -18,6 +18,7 @@ use rift_core::constants::RIFT_STATE_DIRECTORY;
 use rift_core::{CliCode, Error, ErrorCode, ErrorContext, ErrorName, Fault, causes};
 use rift_index::WorkspaceIndexLimits;
 use rift_protocol::lock::{SERVER_LOCK_FILE_NAME, ServerLock, ServerLockViolation};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
@@ -576,18 +577,13 @@ async fn shut_down_unpublished(
     publish_failure: ElectionError,
 ) -> ElectionError {
     serving_stop.cancel();
-    match tokio::time::timeout(UNPUBLISHED_SHUTDOWN_DEADLINE, server.stopped()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!(
+    let deadline = Instant::now() + UNPUBLISHED_SHUTDOWN_DEADLINE;
+    if let Err(error) = server.stopped(deadline).await {
+        tracing::warn!(
             component = "mcp",
             %error,
             "unpublished server reported a shutdown failure"
-        ),
-        Err(_elapsed) => tracing::warn!(
-            component = "mcp",
-            deadline = ?UNPUBLISHED_SHUTDOWN_DEADLINE,
-            "unpublished server missed its shutdown deadline"
-        ),
+        );
     }
     publish_failure
 }
@@ -607,7 +603,10 @@ impl ElectedServer {
         self.server.port()
     }
 
-    /// Waits until the server stopped, then retires the lock document.
+    /// Waits until the server stopped, bounded by `deadline`, then retires the
+    /// lock document.
+    ///
+    /// The transport shutdown takes only what remains of `deadline`.
     ///
     /// # Errors
     ///
@@ -619,8 +618,12 @@ impl ElectedServer {
     /// Dropping this future retires the document and releases the election
     /// through the guard's drop; the serving tasks detach and complete a
     /// shutdown already triggered in the background.
-    pub async fn stopped(self) -> Result<(), ElectionError> {
-        let outcome = self.server.stopped().await.map_err(ElectionFault::serve);
+    pub async fn stopped(self, deadline: Instant) -> Result<(), ElectionError> {
+        let outcome = self
+            .server
+            .stopped(deadline)
+            .await
+            .map_err(ElectionFault::serve);
         self.guard.retire();
         outcome
     }

@@ -3128,8 +3128,11 @@ mod tests {
         let supervisor = server.index_supervisor();
         drop(server);
         assert!(supervisor.validation.cancellation.is_cancelled());
-        supervisor.shutdown().await?;
-        supervisor.shutdown().await?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        supervisor.shutdown(deadline).await?;
+        supervisor
+            .shutdown(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
+            .await?;
         assert!(supervisor.validation.task.lock().await.is_none());
         Ok(())
     }
