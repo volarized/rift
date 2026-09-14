@@ -127,7 +127,8 @@ impl SymbolTimelines {
         // The state past the oldest walked commit: provably absent when the
         // walk covered the path's whole history, unknown - contributing no
         // version - when the examination bound cut the walk short.
-        let boundary = if history.is_complete() {
+        let complete = history.is_complete();
+        let boundary = if complete {
             SymbolState::Absent
         } else {
             SymbolState::Unknown
@@ -149,6 +150,7 @@ impl SymbolTimelines {
         Ok(SymbolHistory {
             symbol: symbol_id(matched.file, matched.symbol),
             versions,
+            complete,
         })
     }
 }
@@ -623,5 +625,75 @@ mod tests {
         let error = SymbolTimelines::open(directory.path(), None, &HistoryConfiguration::default())
             .expect_err("a repository without commits resolves no HEAD");
         assert!(matches!(error.fault(), ReadFault::History(_)));
+    }
+
+    /// One `beacon_one` timeline over the shared-path fixture, composed
+    /// under `history`.
+    fn beacon_timeline(
+        root: &Path,
+        service: &ReadService,
+        history: &HistoryConfiguration,
+    ) -> TestResult<SymbolHistory> {
+        let mut timelines =
+            SymbolTimelines::open(root, None, history).map_err(|error| error.to_string())?;
+        let matches = service
+            .index()
+            .symbols("beacon_one", 5)
+            .map_err(|error| error.to_string())?;
+        let timeline = timelines
+            .timeline(&RustSyntaxProvider::default(), matches[0])
+            .map_err(|error| error.to_string())?;
+        Ok(timeline)
+    }
+
+    #[test]
+    fn timeline_over_a_whole_history_is_complete() -> TestResult {
+        let (directory, service) = shared_path_fixture()?;
+        let timeline =
+            beacon_timeline(directory.path(), &service, &HistoryConfiguration::default())?;
+        assert!(
+            timeline.complete,
+            "a walk that reached the path's first commit covered its whole history"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn timeline_cut_by_the_revision_bound_is_incomplete() -> TestResult {
+        let (directory, service) = shared_path_fixture()?;
+        let bounded = HistoryConfiguration {
+            enabled: true,
+            max_revisions: 1,
+        };
+        let timeline = beacon_timeline(directory.path(), &service, &bounded)?;
+        assert!(
+            !timeline.complete,
+            "a walk the max_revisions bound stopped never reached the first commit"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn timeline_at_a_shallow_boundary_is_incomplete() -> TestResult {
+        let (directory, service) = shared_path_fixture()?;
+        let head = Repository::open(directory.path())
+            .map_err(|error| error.to_string())?
+            .resolve("HEAD")
+            .map_err(|error| error.to_string())?;
+        fs::write(
+            directory.path().join(".git/shallow"),
+            format!("{}\n", head.commit_id()),
+        )?;
+        let timeline =
+            beacon_timeline(directory.path(), &service, &HistoryConfiguration::default())?;
+        assert!(
+            !timeline.complete,
+            "a clone whose shallow file names the served commit holds none of its parents"
+        );
+        assert!(
+            timeline.versions.is_empty(),
+            "nothing older than the boundary is provable, so no version is classified"
+        );
+        Ok(())
     }
 }

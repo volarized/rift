@@ -1226,6 +1226,10 @@
             "additionalProperties": false,
             "description": "One symbol's timeline across the workspace's version-control history, newest revision\nfirst. The walk follows first parents from the served revision along the declaration's\ncurrent path only, bounded by the configured history depth and by a shallow clone's\nboundary.",
             "properties": {
+              "complete": {
+                "description": "Whether the walk reached the repository's first commit. `false` when the\n`max_revisions` bound or a shallow clone's boundary ended the walk first, so\nrevisions older than the listed ones may have touched the symbol.",
+                "type": "boolean"
+              },
               "symbol": {
                 "$ref": "#/$defs/SymbolId",
                 "description": "The symbol the timeline is for."
@@ -1240,7 +1244,8 @@
             },
             "required": [
               "symbol",
-              "versions"
+              "versions",
+              "complete"
             ],
             "type": "object"
           },
@@ -1540,6 +1545,7 @@
             "hits": [
               {
                 "history": {
+                  "complete": true,
                   "symbol": "rift://symbol/rust/src/config.rs/load_config",
                   "versions": [
                     {

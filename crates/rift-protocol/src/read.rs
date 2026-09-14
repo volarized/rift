@@ -390,7 +390,8 @@ fn default_get_symbol_params_page_index() -> u64 {
                             "timestamp": "2026-08-17T09:41:05+00:00",
                             "summary": "Add workspace configuration loading"
                         }
-                    ]
+                    ],
+                    "complete": true
                 }
             }
         ],
@@ -1576,6 +1577,10 @@ pub struct SymbolHistory {
     pub symbol: SymbolId,
     /// Revisions that touched the symbol, newest first.
     pub versions: Vec<SymbolVersion>,
+    /// Whether the walk reached the repository's first commit. `false` when the
+    /// `max_revisions` bound or a shallow clone's boundary ended the walk first, so
+    /// revisions older than the listed ones may have touched the symbol.
+    pub complete: bool,
 }
 
 /// Identity of one symbol. The name after the language is the provider's stable qualified
