@@ -146,13 +146,19 @@ claims one manifest file name, and every visible manifest with that name reaches
   top-level manifest, and catalogs every package outside the workspace members with the
   directory its source was unpacked to; it also asks `rustc` for its sysroot and catalogs the
   standard library source there
+- the uv resolver claims `pyproject.toml`, reads the `uv.lock` beside it, and finds each
+  distribution's installed source through the project environment: the `.venv` beside the
+  manifest, or the directory `UV_PROJECT_ENVIRONMENT` names; it catalogs the interpreter's
+  standard library from the environment's `pyvenv.cfg`
 
-A resolver never downloads a package and never writes to the tree: `--locked` refuses to
-rewrite the lockfile, and `--offline` refuses the network. When `cargo` is not on the server's
-`PATH`, or exits with an error because `Cargo.lock` no longer matches `Cargo.toml`, the resolver
-answers from the lockfile alone and probes the machine's package cache for each package's
-source. That answer lists what the lockfile pins, so it can over-approximate what the active feature
-set compiles; a package the cache does not hold is cataloged without a source root.
+A resolver never downloads a package and never writes to the tree. The uv resolver reads
+the lockfile and probes directories, and runs nothing. The Cargo resolver is the one that
+runs a toolchain, under `--locked`, which refuses to rewrite the lockfile, and `--offline`,
+which refuses the network. When `cargo` is not on the server's `PATH`, or exits with an error
+because `Cargo.lock` no longer matches `Cargo.toml`, it answers from the lockfile alone and
+probes the machine's package cache for each package's source. That answer lists what the
+lockfile pins, so it can over-approximate what the active feature set compiles; a package the
+cache does not hold is cataloged without a source root, whichever resolver cataloged it.
 
 The catalog keys each package by its
 [`PackageIdentity`](/docs/protocol/reference#PackageIdentity): the package manager, the name,

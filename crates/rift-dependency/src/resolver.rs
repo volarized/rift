@@ -31,33 +31,39 @@ pub const MANIFESTS_MAX: usize = 256;
 /// Packages one resolver catalogs per workspace, at most. The rest are dropped and the
 /// drop reported as a degradation.
 pub const PACKAGES_MAX: usize = 20_000;
-/// Directory entries one listing returns, at most.
-pub const DIRECTORY_ENTRIES_MAX: usize = 4_096;
+/// Directory entries one listing returns, at most. A flat `node_modules` or a
+/// `site-packages` directory is listed whole, so the bound sits above what an installed
+/// application holds.
+pub const DIRECTORY_ENTRIES_MAX: usize = 16_384;
 
 /// Identity of one shipped resolver.
 ///
-/// The lowercase spelling is the resolver segment of every source unit the resolver
-/// mints, `rift://source/cargo/...` for [`ResolverName::Cargo`].
+/// The lowercase spelling names the resolver in degradation text. The resolver segment
+/// of a source unit is the package namespace instead, [`DependencyResolver::manager`],
+/// so two resolvers over one namespace mint one spelling.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, VariantArray)]
 #[serde(rename_all = "snake_case")]
 pub enum ResolverName {
     /// Rust packages, as `cargo metadata` resolved them.
     Cargo,
+    /// Python distributions, as `uv.lock` pins them and the workspace environment holds them.
+    Uv,
 }
 
 impl ResolverName {
-    /// The resolver segment this name spells in a source unit identity.
+    /// The lowercase spelling, as the wire serializes it.
     #[must_use]
-    pub const fn segment(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Cargo => "cargo",
+            Self::Uv => "uv",
         }
     }
 }
 
 impl fmt::Display for ResolverName {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.segment())
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -181,10 +187,11 @@ pub struct ResolutionRequest<'a> {
 
 /// One shipped resolver: the ecosystem it serves and how it catalogs that ecosystem's packages.
 pub trait DependencyResolver: fmt::Debug + Send + Sync {
-    /// The resolver's identity, and the resolver segment of the units it mints.
+    /// The resolver's identity.
     fn name(&self) -> ResolverName;
 
-    /// The package namespace its entries belong to, as `PackageIdentity.manager` spells it.
+    /// The package namespace its entries belong to, as `PackageIdentity.manager` spells it
+    /// and as the resolver segment of every source unit those entries mint.
     fn manager(&self) -> &'static str;
 
     /// The language whose syntax provider parses the cataloged packages' source.
@@ -206,11 +213,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_resolver_name_segment_matches_its_wire_spelling() {
+    fn test_resolver_name_spelling_matches_its_wire_form() {
         for name in ResolverName::VARIANTS {
             let wire = serde_json::to_value(name).expect("a resolver name serializes");
-            assert_eq!(wire, serde_json::Value::String(name.segment().to_owned()));
-            assert_eq!(name.to_string(), name.segment());
+            assert_eq!(wire, serde_json::Value::String(name.as_str().to_owned()));
+            assert_eq!(name.to_string(), name.as_str());
         }
     }
 

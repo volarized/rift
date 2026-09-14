@@ -10,8 +10,10 @@
 
 mod cargo;
 mod catalog;
+mod manifest;
 mod resolver;
 mod resolvers;
+mod uv;
 
 #[cfg(test)]
 mod fixture;
@@ -26,3 +28,4 @@ pub use resolver::{
     TOOLCHAIN_COMMAND_TIMEOUT, TOOLCHAIN_OUTPUT_BYTES_MAX, ToolchainCommand,
 };
 pub use resolvers::{is_claimed_manifest, resolvers};
+pub use uv::UvResolver;
