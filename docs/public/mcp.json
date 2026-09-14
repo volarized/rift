@@ -478,7 +478,7 @@
             "oneOf": [
               {
                 "additionalProperties": false,
-                "description": "The answer was computed from an index that lags the tree the read captured. Facts\nderived from the index may miss the newest writes; the digests state which two\ntrees disagree.",
+                "description": "The answer was computed from an index that lags the tree the read captured. Facts\nderived from the index may miss the newest writes; the digests state which two\ntrees disagree. When the two digests are equal, the tree moved in recorded files\noutside the syntax-indexed ones or in the configuration file, and `detail` says\nwhich.",
                 "properties": {
                   "captured_tree_revision": {
                     "$ref": "#/$defs/Digest",
@@ -5075,7 +5075,7 @@
             "oneOf": [
               {
                 "additionalProperties": false,
-                "description": "The answer was computed from an index that lags the tree the read captured. Facts\nderived from the index may miss the newest writes; the digests state which two\ntrees disagree.",
+                "description": "The answer was computed from an index that lags the tree the read captured. Facts\nderived from the index may miss the newest writes; the digests state which two\ntrees disagree. When the two digests are equal, the tree moved in recorded files\noutside the syntax-indexed ones or in the configuration file, and `detail` says\nwhich.",
                 "properties": {
                   "captured_tree_revision": {
                     "$ref": "#/$defs/Digest",
@@ -12315,7 +12315,7 @@
             "oneOf": [
               {
                 "additionalProperties": false,
-                "description": "The answer was computed from an index that lags the tree the read captured. Facts\nderived from the index may miss the newest writes; the digests state which two\ntrees disagree.",
+                "description": "The answer was computed from an index that lags the tree the read captured. Facts\nderived from the index may miss the newest writes; the digests state which two\ntrees disagree. When the two digests are equal, the tree moved in recorded files\noutside the syntax-indexed ones or in the configuration file, and `detail` says\nwhich.",
                 "properties": {
                   "captured_tree_revision": {
                     "$ref": "#/$defs/Digest",

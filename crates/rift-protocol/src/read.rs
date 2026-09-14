@@ -890,7 +890,9 @@ pub const SOURCE_WARNINGS_MAX: usize = 8;
 pub enum ReadWarning {
     /// The answer was computed from an index that lags the tree the read captured. Facts
     /// derived from the index may miss the newest writes; the digests state which two
-    /// trees disagree.
+    /// trees disagree. When the two digests are equal, the tree moved in recorded files
+    /// outside the syntax-indexed ones or in the configuration file, and `detail` says
+    /// which.
     StaleIndex {
         /// Tree revision the published index covers.
         index_tree_revision: Digest,

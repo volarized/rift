@@ -124,9 +124,10 @@ fn advertised_identity(client: &RunningService<RoleClient, ()>) -> TestResult<Pr
 }
 
 async fn stopped_within_deadline(server: HttpServer) -> TestResult {
-    tokio::time::timeout(STOP_DEADLINE, server.stopped())
+    let (_deadline, stopped) = tokio::time::timeout(STOP_DEADLINE, server.stopped(STOP_DEADLINE))
         .await
-        .map_err(|_elapsed| format!("server must stop within {STOP_DEADLINE:?}"))??;
+        .map_err(|_elapsed| format!("server must stop within {STOP_DEADLINE:?}"))?;
+    stopped?;
     Ok(())
 }
 

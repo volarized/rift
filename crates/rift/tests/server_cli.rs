@@ -9,6 +9,7 @@
 
 use std::error::Error;
 use std::fs;
+use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -31,6 +32,25 @@ const GONE_POLL_ATTEMPT_COUNT: u32 = 100;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// Concurrent `rift server start` invocations in the election race.
 const CONCURRENT_START_COUNT: usize = 4;
+/// Source files in the workspace whose lexical commit a stop lands inside.
+const LARGE_FIXTURE_FILES: usize = 3_000;
+/// Declarations per file in that fixture: one lexical unit each, so the whole commit
+/// that runs behind the publication takes seconds on a development machine.
+const LARGE_FIXTURE_DECLARATIONS: usize = 12;
+/// How long after rewriting the large fixture the stop is issued: long enough for the
+/// capture to be running and the previous rebuild's lexical transaction to hold the write turn.
+const STOP_DELAY_AFTER_REWRITE: Duration = Duration::from_millis(200);
+/// How long the process may still run after `server.json` goes.
+///
+/// The serving process retires its own document, by dropping the election guard
+/// immediately before it leaves, so a poll can land between the two. The stop bounds
+/// that window; it does not remove it.
+const DOCUMENT_GONE_GRACE: Duration = Duration::from_secs(2);
+/// How long the server serves before the stop that tests the stop's own budget.
+///
+/// It outlasts `SERVER_STOP_DEADLINE`, the server-side stop's span, so a deadline
+/// derived where the server began listening would already be spent when the stop lands.
+const IDLE_SPAN_PAST_STOP_DEADLINE: Duration = Duration::from_secs(9);
 
 /// Serializes the tests: the served port range is machine-global.
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -64,6 +84,27 @@ fn workspace() -> TestResult<tempfile::TempDir> {
         format!("{SEMANTIC_DISABLED}[server]\nidle_timeout = \"60s\"\n"),
     )?;
     Ok(directory)
+}
+
+/// Fills the fixture with [`LARGE_FIXTURE_FILES`] Rust files under `src`, each declaring
+/// [`LARGE_FIXTURE_DECLARATIONS`] documented functions.
+fn write_large_fixture(root: &Path) -> TestResult {
+    use std::fmt::Write as _;
+
+    let source = root.join("src");
+    fs::create_dir_all(&source)?;
+    for file in 0..LARGE_FIXTURE_FILES {
+        let mut contents = String::new();
+        for declaration in 0..LARGE_FIXTURE_DECLARATIONS {
+            writeln!(
+                contents,
+                "/// Beacon {declaration} in file {file}.\npub fn beacon_{file}_{declaration}(value: \
+                 u64) -> u64 {{\n    value + {declaration}\n}}\n"
+            )?;
+        }
+        fs::write(source.join(format!("file_{file}.rs")), contents)?;
+    }
+    Ok(())
 }
 
 /// Stops the fixture's server when a test unwinds, best effort.
@@ -158,11 +199,57 @@ fn wait_for<T>(
     Err(format!("timed out waiting for {what}").into())
 }
 
+/// The fields the server's own stop line carries, as its stderr rendered them.
+///
+/// The recorded stream is styled, so a field name and its `=` are separated by
+/// escape codes; the values themselves stay plain, and the line is read for
+/// those.
+fn stop_line_of(stderr: &str) -> TestResult<&str> {
+    let after_message = stderr
+        .split_once("MCP server stopped")
+        .ok_or_else(|| format!("serving must end before the process leaves: {stderr:?}"))?
+        .1;
+    Ok(after_message.lines().next().unwrap_or_default())
+}
+
 fn serving_document(root: &Path) -> Option<ServerLock> {
     match probe(root) {
         ServerPresence::Serving(lock) => Some(lock),
         ServerPresence::Starting | ServerPresence::Stale(_) | ServerPresence::Absent => None,
     }
+}
+
+/// Calls the `search` tool over the served MCP path and reads the whole answer.
+///
+/// The server serves MCP statelessly with JSON responses, so one authorized
+/// `POST` carries the whole call and the reply arrives on the same connection,
+/// which `Connection: close` ends. A query matching every unit of the large
+/// fixture keeps the request in flight while the stop lands.
+fn search_request(port: u16, token: &str) -> TestResult<String> {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "search", "arguments": {"query": "beacon"}},
+    }))?;
+    let head = format!(
+        "POST /api/mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\n\
+         Content-Length: {length}\r\nConnection: close\r\n\r\n",
+        length = body.len()
+    );
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let mut stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)?;
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(&body)?;
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer)?;
+    Ok(answer)
+}
+
+/// Whether one `rift server stop` printed the line that reports success.
+fn reports_stopped(output: &Output) -> bool {
+    stdout_of(output).contains("rift server stopped")
 }
 
 /// Waits until a fresh connect to `port` is refused again.
@@ -285,6 +372,309 @@ fn foreground_start_serves_until_stopped_and_exits_cleanly() -> TestResult {
         String::from_utf8_lossy(&output.stdout).contains("rift server listening on 127.0.0.1:"),
         "the foreground server prints its listening line"
     );
+    Ok(())
+}
+
+#[test]
+fn a_stop_after_a_long_serving_span_still_runs_every_stage_inside_its_budget() -> TestResult {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rift"))
+        .args(["server", "start", "--foreground"])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let serving = wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
+        serving_document(root)
+    })?;
+    assert_eq!(serving.pid, child.id(), "the child itself must serve");
+
+    // The server serves past its own stop span before anyone asks it to stop, so a
+    // deadline derived at startup would leave every later stage nothing to spend.
+    std::thread::sleep(IDLE_SPAN_PAST_STOP_DEADLINE);
+    let stopped = rift(root, &["server", "stop"])?;
+    require_success(&stopped, "stop of a long-serving foreground server")?;
+
+    wait_for(
+        GONE_POLL_ATTEMPT_COUNT,
+        "the foreground child to exit",
+        || child.try_wait().ok().flatten(),
+    )?;
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "a stopped foreground server exits cleanly: {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stop_line = stop_line_of(&stderr)?;
+    assert!(
+        stop_line.contains("\"ok\""),
+        "the engines and the index supervisor must join inside the budget: {stop_line}"
+    );
+    assert!(
+        !stderr.contains("outlasted the stop deadline"),
+        "the log drain's final flush must get its share of the budget: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn stop_during_the_lexical_commit_behind_the_publication_ends_the_process() -> TestResult {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let directory = workspace()?;
+    let root = directory.path();
+    write_large_fixture(root)?;
+    let _cleanup = StopOnDrop::new(root);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rift"))
+        .args(["server", "start", "--foreground"])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let serving = wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
+        serving_document(root)
+    })?;
+    assert_eq!(serving.pid, child.id(), "the child itself must serve");
+
+    // The document appears once the index publishes; the lexical commit of every unit
+    // runs behind that publication, so the stop lands while it runs.
+    let stopped = rift(root, &["server", "stop"])?;
+    require_success(&stopped, "stop during the lexical commit")?;
+
+    // `GONE_POLL_ATTEMPT_COUNT` probes at `POLL_INTERVAL` is the server's own stop bound.
+    // The process leaves once the log drain has stopped; that drain's last batch waits
+    // for the database write turn the transaction holds, under the drain's own deadline.
+    let status = wait_for(
+        GONE_POLL_ATTEMPT_COUNT,
+        "the stopped server's process to exit while its lexical commit runs",
+        || child.try_wait().ok().flatten(),
+    )?;
+    assert!(
+        status.success(),
+        "a stopped foreground server exits cleanly: {status:?}"
+    );
+    let output = child.wait_with_output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("MCP server stopped"),
+        "serving ended before the process left: {stderr}"
+    );
+    assert!(
+        !document_path(root).exists(),
+        "a graceful stop retires server.json"
+    );
+    Ok(())
+}
+
+#[test]
+fn stop_during_a_running_capture_ends_the_process() -> TestResult {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let directory = workspace()?;
+    let root = directory.path();
+    write_large_fixture(root)?;
+    let _cleanup = StopOnDrop::new(root);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rift"))
+        .args(["server", "start", "--foreground"])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let serving = wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
+        serving_document(root)
+    })?;
+    assert_eq!(serving.pid, child.id(), "the child itself must serve");
+
+    // The document appears once the initial index publishes. Rewriting every fixture
+    // file then streams invalidations for longer than the supervisor's debounce, so
+    // rebuilds run back to back on the blocking pool while the stop lands.
+    write_large_fixture(root)?;
+    let stopped = rift(root, &["server", "stop"])?;
+    require_success(&stopped, "stop during the rebuild")?;
+
+    // `GONE_POLL_ATTEMPT_COUNT` probes at `POLL_INTERVAL` is the server's own stop bound.
+    // A capture the stop interrupts ends on its own thread; the supervisor does not
+    // wait for it before the process leaves.
+    let status = wait_for(
+        GONE_POLL_ATTEMPT_COUNT,
+        "the stopped server's process to exit while its capture runs",
+        || child.try_wait().ok().flatten(),
+    )?;
+    assert!(
+        status.success(),
+        "a stopped foreground server exits cleanly: {status:?}"
+    );
+    let output = child.wait_with_output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("MCP server stopped"),
+        "serving ended before the process left: {stderr}"
+    );
+    assert!(
+        !document_path(root).exists(),
+        "a graceful stop retires server.json"
+    );
+    Ok(())
+}
+
+#[test]
+fn stop_issued_during_a_rebuild_ends_the_process_as_the_document_goes() -> TestResult {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let directory = workspace()?;
+    let root = directory.path();
+    write_large_fixture(root)?;
+    let _cleanup = StopOnDrop::new(root);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rift"))
+        .args(["server", "start", "--foreground"])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let serving = wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
+        serving_document(root)
+    })?;
+    assert_eq!(serving.pid, child.id(), "the child itself must serve");
+
+    // Rewriting every file streams invalidations into a capture while the rebuild behind
+    // the publication is still replacing every lexical unit in one transaction that holds
+    // the database's write turn. The stop lands with both in flight.
+    write_large_fixture(root)?;
+    std::thread::sleep(STOP_DELAY_AFTER_REWRITE);
+    let stopped = rift(root, &["server", "stop"])?;
+    require_success(&stopped, "stop during the rebuild")?;
+
+    // Each poll reads the document before the process, so a poll never manufactures the
+    // order it measures.
+    let mut observations = Vec::with_capacity(GONE_POLL_ATTEMPT_COUNT as usize);
+    let status = wait_for(
+        GONE_POLL_ATTEMPT_COUNT,
+        "the stopped server's process to exit while its rebuild runs",
+        || {
+            let document_present = document_path(root).exists();
+            let exited = child.try_wait().ok().flatten();
+            observations.push((document_present, exited.is_some()));
+            exited
+        },
+    )?;
+    assert!(
+        status.success(),
+        "a stopped foreground server exits cleanly: {status:?}"
+    );
+    let lingering_polls = observations
+        .iter()
+        .filter(|&&(document_present, exited)| !document_present && !exited)
+        .count();
+    let lingering = POLL_INTERVAL * u32::try_from(lingering_polls).unwrap_or(u32::MAX);
+    assert!(
+        lingering <= DOCUMENT_GONE_GRACE,
+        "the process leaves within {DOCUMENT_GONE_GRACE:?} of server.json going, observed \
+         {lingering:?}; (document present, process exited) per poll: {observations:?}"
+    );
+    let output = child.wait_with_output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("MCP server stopped"),
+        "serving ended before the process left: {stderr}"
+    );
+    assert!(
+        !document_path(root).exists(),
+        "a graceful stop retires server.json"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_stop_reports_success_only_once_the_election_it_waited_on_released() -> TestResult {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let directory = workspace()?;
+    let root = directory.path();
+    write_large_fixture(root)?;
+    let _cleanup = StopOnDrop::new(root);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rift"))
+        .args(["server", "start", "--foreground"])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let serving = wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
+        serving_document(root)
+    })?;
+    assert_eq!(serving.pid, child.id(), "the child itself must serve");
+
+    // The search reads the large fixture's units, so serving still has a request to
+    // drain when the stop issued behind it cancels the serve loop. Its answer is not
+    // asserted: a drain the stop's budget cuts short leaves the caller without one,
+    // and that is a valid stop.
+    let searching = std::thread::spawn(move || {
+        let _answer = search_request(serving.port, &serving.token);
+    });
+    let stopping = std::thread::spawn({
+        let root = root.to_owned();
+        move || rift(&root, &["server", "stop"]).map_err(|error| error.to_string())
+    });
+
+    // Every stop asked while the first one waits meets the workspace mid-shutdown.
+    // Each answer is read with the election state it was printed under. Only the
+    // stop the server answers is required to report success: a sibling's request can
+    // be cut by the cancellation the answered one triggered, and that stop refuses
+    // with `server_stop_failed` rather than claiming a stop it never delivered.
+    let mut observations = Vec::new();
+    while !stopping.is_finished() {
+        let again = rift(root, &["server", "stop"])?;
+        observations.push((reports_stopped(&again), probe(root).election_held()));
+    }
+    let stopped = stopping
+        .join()
+        .map_err(|_| "the stop thread must not panic")??;
+    observations.push((reports_stopped(&stopped), probe(root).election_held()));
+    assert!(
+        observations
+            .iter()
+            .any(|&(reported_stopped, _)| reported_stopped),
+        "the stop the server answered must report success; observed (reported \
+         stopped, election held) per stop: {observations:?}"
+    );
+    assert!(
+        observations
+            .iter()
+            .all(|&(reported_stopped, election_held)| !reported_stopped || !election_held),
+        "a stop reports success only once the election released; observed (reported \
+         stopped, election held) per stop: {observations:?}"
+    );
+
+    // The election releases immediately before the process leaves, so a reported stop
+    // is followed by the exit itself. The exit status is left unasserted: it carries
+    // whether the drain finished inside the stop's budget, which this fixture's search
+    // does not pin.
+    wait_for(
+        GONE_POLL_ATTEMPT_COUNT,
+        "the stopped server's process to exit after its stop reported success",
+        || child.try_wait().ok().flatten(),
+    )?;
+    let output = child.wait_with_output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("MCP server stopped"),
+        "serving ended before the process left: {stderr}"
+    );
+    assert!(
+        !document_path(root).exists(),
+        "a graceful stop retires server.json"
+    );
+    let _ = searching.join();
     Ok(())
 }
 

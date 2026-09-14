@@ -582,6 +582,16 @@ impl ReadService {
         self.index.digest(path)
     }
 
+    /// Whether this snapshot holds at least one file below `directory`, the files it
+    /// left out included.
+    ///
+    /// A filesystem event names a path, and whether that path is a directory the index
+    /// holds files under decides whether one file or the whole workspace is read again.
+    #[must_use]
+    pub fn holds_files_below(&self, directory: &CoreProjectPath) -> bool {
+        self.index.holds_files_below(directory)
+    }
+
     /// Builds the next snapshot by reading only the paths `changes` names, sharing every
     /// other file with this one.
     ///
@@ -1691,11 +1701,6 @@ impl CapturedRevisions {
     }
 }
 
-/// Separates one path from its content digest in tree-revision material.
-const TREE_REVISION_PATH_SEPARATOR: u8 = 0;
-/// Separates adjacent files in tree-revision material.
-const TREE_REVISION_FILE_SEPARATOR: u8 = 0xff;
-
 /// Resolves the dependency catalog over every path `source_policy` makes visible,
 /// running toolchains under `policy`.
 ///
@@ -1723,26 +1728,11 @@ fn resolved_catalog(
 /// guards the comparison all the same, so an index resolved apart from its
 /// capture cannot lag silently.
 fn captured_revisions(index: &WorkspaceIndex) -> CapturedRevisions {
-    let digest = workspace_digest(index);
+    let digest = index.tree_revision();
     CapturedRevisions {
         tree_revision: digest.clone(),
         index_tree_revision: digest,
     }
-}
-
-/// Folds the index's own files, in project-path order, absorbing each file's content
-/// digest rather than its bytes. The index already carries that digest from the bytes it
-/// read, so a rebuild that replaced one file pays one hash update per file instead of
-/// rehashing every source it shared with the previous publication.
-fn workspace_digest(index: &WorkspaceIndex) -> String {
-    let mut hasher = Sha256::new();
-    for file in index.files() {
-        hasher.update(file.path().as_str().as_bytes());
-        hasher.update([TREE_REVISION_PATH_SEPARATOR]);
-        hasher.update(file.digest().as_bytes());
-        hasher.update([TREE_REVISION_FILE_SEPARATOR]);
-    }
-    format!("{:x}", hasher.finalize())
 }
 
 /// The witness a node address carries: the first eight lowercase hex characters of the
@@ -1842,7 +1832,13 @@ pub(crate) fn digest_hex8(source: &str) -> String {
 /// Truncates an already-hashed full-length hex digest to its wire form. `full` keeps
 /// collision resistance for internal identity computation; only the truncated form crosses
 /// the wire boundary.
-fn wire_digest(full: &str) -> Digest {
+///
+/// # Panics
+///
+/// Panics when `full` is shorter than the wire form: every caller hands it a full SHA-256
+/// hex rendering.
+#[must_use]
+pub fn wire_digest(full: &str) -> Digest {
     Digest(full[..DIGEST_WIRE_CHARS].to_owned())
 }
 
@@ -2493,7 +2489,7 @@ pub fn compute() -> i32 {
     #[test]
     fn workspace_digest_keeps_its_full_hash_before_wire_truncation() -> TestResult {
         let (_directory, service) = fixture()?;
-        let full = super::workspace_digest(service.index());
+        let full = service.index().tree_revision();
         assert_eq!(full.len(), 64);
         let wire = service.tree_revision();
         assert_eq!(wire.len(), 8);
