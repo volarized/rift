@@ -148,7 +148,9 @@ from the served revision along the declaration's current path, bounded by the `m
 key in [`[providers.history]`](/docs/configuration#providers) and by a shallow clone's
 boundary, and classifies what each touching revision did: `introduced`, `body_changed`,
 `signature_changed`, `removed`, or `decorators_changed`. A revision whose source cannot be
-parsed, or where the symbol is absent, contributes no version.
+parsed, or where the symbol is absent, contributes no version. `complete` says whether the
+walk reached the repository's first commit; `false` means one of those bounds ended it first,
+so revisions older than the listed ones may have touched the symbol.
 
 ### Dependency scope [#get_symbol-scope]
 
