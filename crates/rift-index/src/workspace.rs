@@ -29,7 +29,7 @@ use rift_syntax::{
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
-use crate::change_set::{FileDigest, PathChanges, WorkspaceDigests};
+use crate::change_set::{FileDigest, PathChanges, WorkspaceDigests, tree_revision_of};
 use crate::chunk::text_chunks;
 use crate::glob::PathMatcher;
 use crate::language::{ClassifiedPath, LanguagePolicyError, WorkspaceLanguagePolicy};
@@ -1515,6 +1515,14 @@ impl WorkspaceIndex {
         keyed_digests(&self.files, &self.text_files, &self.left_out)
     }
 
+    /// The tree revision this build's syntax-indexed files fold to, at full SHA-256
+    /// length: each file's path and content digest in project-path order. A request-time
+    /// capture of the same tree folds to the same value.
+    #[must_use]
+    pub fn tree_revision(&self) -> String {
+        tree_revision_of(self.files.iter().map(|(path, file)| (path, file.digest())))
+    }
+
     /// Returns the digest of the bytes read at `path`, whichever class holds it, the
     /// files left out included.
     ///
@@ -2218,18 +2226,14 @@ fn capture_paths(
     paths: &DiscoveredPaths,
     limits: WorkspaceIndexLimits,
 ) -> Result<WorkspaceDigests, WorkspaceIndexError> {
-    let mut digests = BTreeMap::new();
     let mut workspace_bytes = 0_usize;
     let source: Vec<PathBuf> = paths.source.iter().map(|(path, _)| path.clone()).collect();
-    capture_path_class(&mut digests, &mut workspace_bytes, root, &source, limits)?;
-    capture_path_class(
-        &mut digests,
-        &mut workspace_bytes,
-        root,
-        &paths.text,
-        limits,
-    )?;
-    Ok(WorkspaceDigests::new(digests))
+    let source = capture_path_class(&mut workspace_bytes, root, &source, limits)?;
+    let text = capture_path_class(&mut workspace_bytes, root, &paths.text, limits)?;
+    Ok(WorkspaceDigests::classified(
+        source,
+        text.into_iter().map(|(path, state, _)| (path, state)),
+    ))
 }
 
 /// Reads every visible file's digest below `root`, without parsing syntax.
@@ -2275,14 +2279,15 @@ pub fn capture_digests_with_languages(
     capture_paths(&root, &classified, limits)
 }
 
-/// Reads one path class into captured file states.
+/// Reads one path class into captured file states: each kept file's project path, its
+/// file-state digest, and its content digest, in walk order.
 fn capture_path_class(
-    digests: &mut BTreeMap<ProjectPath, FileDigest>,
     workspace_bytes: &mut usize,
     root: &Path,
     paths: &[PathBuf],
     limits: WorkspaceIndexLimits,
-) -> Result<(), WorkspaceIndexError> {
+) -> Result<Vec<(ProjectPath, FileDigest, FileDigest)>, WorkspaceIndexError> {
+    let mut captured = Vec::with_capacity(paths.len());
     for path in paths {
         let mut handle = fs::File::open(path).map_err(|error| {
             index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
@@ -2313,12 +2318,11 @@ fn capture_path_class(
             ));
         }
         let project_path = project_path_below(root, path)?;
-        digests.insert(
-            project_path,
-            FileDigest::of_file_state(&bytes, metadata_is_executable(&metadata)),
-        );
+        let (content, state) =
+            FileDigest::of_content_and_file_state(&bytes, metadata_is_executable(&metadata));
+        captured.push((project_path, state, content));
     }
-    Ok(())
+    Ok(captured)
 }
 
 impl WorkspaceDigests {
@@ -2335,21 +2339,22 @@ fn keyed_digests(
     text_files: &BTreeMap<ProjectPath, Arc<TextSourceFile>>,
     left_out: &BTreeMap<ProjectPath, LeftOutFileState>,
 ) -> WorkspaceDigests {
-    WorkspaceDigests::new(
-        files
+    WorkspaceDigests::classified(
+        files.iter().map(|(path, file)| {
+            (
+                path.clone(),
+                FileDigest::of_file_state(file.source().as_bytes(), file.executable()),
+                file.digest(),
+            )
+        }),
+        text_files
             .iter()
             .map(|(path, file)| {
                 (
                     path.clone(),
-                    FileDigest::of_file_state(file.source().as_bytes(), file.executable()),
-                )
-            })
-            .chain(text_files.iter().map(|(path, file)| {
-                (
-                    path.clone(),
                     FileDigest::of_file_state(file.content().as_bytes(), file.executable()),
                 )
-            }))
+            })
             .chain(
                 left_out
                     .iter()
@@ -5980,5 +5985,59 @@ mod tests {
             "the revision must serve the syntax publication alone"
         );
         assert_eq!(index.file_count(), 1, "syntax facts stay served");
+    }
+
+    #[test]
+    fn test_a_capture_folds_the_tree_revision_the_build_stamps() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let root = directory.path();
+        fs::create_dir_all(root.join("src")).expect("fixture directory");
+        fs::write(root.join("src/lib.rs"), "pub fn beacon() {}\n").expect("source");
+        fs::write(root.join("src/main.rs"), "pub fn lantern() {}\n").expect("source");
+        fs::write(root.join("NOTES.txt"), "notes\n").expect("text");
+        let inclusion = TextFileInclusion::default();
+        let index = indexed(root, &inclusion);
+        let capture = |root: &Path| {
+            capture_digests_with_languages(
+                root,
+                WorkspaceIndexLimits::default(),
+                &SourceVisibility::default(),
+                &inclusion,
+                &LanguageFileSelections::default(),
+            )
+            .expect("the capture must read the tree")
+        };
+        let captured = capture(root);
+        assert_eq!(
+            captured.tree_revision(),
+            Some(index.tree_revision().as_str())
+        );
+        assert_eq!(
+            index.tree_revision().len(),
+            64,
+            "the build keeps the full hash"
+        );
+        assert_eq!(captured.fingerprint(), *index.fingerprint());
+
+        fs::write(root.join("NOTES.txt"), "edited notes\n").expect("text");
+        let text_moved = capture(root);
+        assert_eq!(
+            text_moved.tree_revision(),
+            Some(index.tree_revision().as_str()),
+            "a text file's bytes never enter the tree revision"
+        );
+        assert_ne!(text_moved.fingerprint(), *index.fingerprint());
+
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn beacon() {}\npub fn torch() {}\n",
+        )
+        .expect("source");
+        let source_moved = capture(root);
+        assert_ne!(
+            source_moved.tree_revision(),
+            Some(index.tree_revision().as_str()),
+            "a syntax-indexed file's bytes move the tree revision"
+        );
     }
 }
