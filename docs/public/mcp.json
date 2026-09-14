@@ -1224,7 +1224,7 @@
           },
           "SymbolHistory": {
             "additionalProperties": false,
-            "description": "One symbol's timeline across the workspace's version-control history, newest revision\nfirst. The walk follows first parents from the served revision along the declaration's\ncurrent path only, bounded by the configured history depth.",
+            "description": "One symbol's timeline across the workspace's version-control history, newest revision\nfirst. The walk follows first parents from the served revision along the declaration's\ncurrent path only, bounded by the configured history depth and by a shallow clone's\nboundary.",
             "properties": {
               "symbol": {
                 "$ref": "#/$defs/SymbolId",

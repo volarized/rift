@@ -145,10 +145,10 @@ defaults to `["source"]`; an explicit empty list carries neither.
 `include: ["history"]` attaches the symbol's version-control timeline as a
 [`SymbolHistory`](/docs/protocol/reference#SymbolHistory). The server follows first parents
 from the served revision along the declaration's current path, bounded by the `max_revisions`
-key in [`[providers.history]`](/docs/configuration#providers), and classifies what each
-touching revision did: `introduced`, `body_changed`, `signature_changed`, `removed`, or
-`decorators_changed`. A revision whose source cannot be parsed, or where the symbol is absent,
-contributes no version.
+key in [`[providers.history]`](/docs/configuration#providers) and by a shallow clone's
+boundary, and classifies what each touching revision did: `introduced`, `body_changed`,
+`signature_changed`, `removed`, or `decorators_changed`. A revision whose source cannot be
+parsed, or where the symbol is absent, contributes no version.
 
 ### Dependency scope [#get_symbol-scope]
 
