@@ -11,6 +11,10 @@
 //! said before that answer: the contract already permits a move that needs
 //! no reference rewritten, and the warning tells the caller which case
 //! this was rather than staying silent about it.
+//!
+//! After the move lands, the changed tree is swept for surviving
+//! occurrences of the moved file's old path, and each survivor rides the
+//! summary as a warning finding.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -25,14 +29,15 @@ use rift_lsp::session::{
 use rift_protocol::change::{
     ChangeResult, MoveFileParams, OperationPreconditionKind, PreconditionValue, RefusalReason,
 };
-use rift_protocol::read::{Diagnostic, DiagnosticCode, Language, Severity};
+use rift_protocol::read::{Diagnostic, DiagnosticCode, Language, Severity, SourceSpan, TextRange};
 
 use crate::engine::{EnginePool, EngineSlot};
-use crate::read::{ReadError, ReadFault, ReadService};
+use crate::read::{ReadError, ReadFault, ReadService, file_id};
 use crate::rename::{
     PlanEnd, PlannedRewrite, ProposalContext, compiled_rewrites, engine_roots, failed_precondition,
-    plan_diagnostic, proposal_documents, refused_oversized,
+    plan_diagnostic, proposal_documents, refused_oversized, surviving_occurrences,
 };
+use crate::rewrite::EngineRewrite;
 
 /// The operation prose opening every move refusal detail.
 const MOVE_OPERATION: &str = "file move";
@@ -54,6 +59,25 @@ pub struct MovePlan {
     /// Why the references were not updated, when they were not; the apply
     /// attaches it to the summary as its warning.
     pub(crate) references_not_updated: Option<ReferencesNotUpdated>,
+}
+
+impl MovePlan {
+    /// Every rewrite this plan lands whose text the engine wrote: the
+    /// reference rewrites, and the moved file under its destination path
+    /// when the engine edited the moved bytes. Bytes that move unchanged
+    /// carry no engine text and are not judged against a grammar.
+    pub(crate) fn engine_rewrites(&self) -> Vec<EngineRewrite<'_>> {
+        let mut rewrites: Vec<EngineRewrite<'_>> =
+            self.rewrites.iter().map(EngineRewrite::from).collect();
+        if self.moved_next != self.moved_source {
+            rewrites.push(EngineRewrite {
+                path: &self.to,
+                base_source: &self.moved_source,
+                next_source: &self.moved_next,
+            });
+        }
+        rewrites
+    }
 }
 
 /// What planning decided: a plan ready for the change lane, or the refusal
@@ -606,6 +630,46 @@ fn merged_moved_documents(
     merged.into_iter().collect()
 }
 
+/// Findings for occurrences of the moved file's old project path that
+/// survive in the changed tree, under the same bounds and the same
+/// substitution of rewritten bytes the rename sweep runs.
+///
+/// The moved file substitutes empty bytes: nothing stands at the old path
+/// once the move lands, and the destination has no index entry until the
+/// next snapshot, so the sweep reads the files that may still point at the
+/// moved file rather than the moved file itself.
+pub(crate) fn moved_path_findings(reads: &ReadService, plan: &MovePlan) -> Vec<Diagnostic> {
+    let mut rewritten: BTreeMap<&CoreProjectPath, &str> = plan
+        .rewrites
+        .iter()
+        .map(|rewrite| (&rewrite.path, rewrite.next_source.as_str()))
+        .collect();
+    rewritten.insert(&plan.from, "");
+    surviving_occurrences(reads, &rewritten, plan.from.as_str())
+        .iter()
+        .map(|(path, offset)| moved_path_diagnostic(plan.from.as_str(), path, *offset))
+        .collect()
+}
+
+/// One surviving occurrence of the moved file's old path, as a warning
+/// finding naming the old path and the file that still holds it.
+fn moved_path_diagnostic(old_path: &str, path: &CoreProjectPath, offset: usize) -> Diagnostic {
+    let start = offset as u64;
+    let mut diagnostic = plan_diagnostic(format!(
+        "an occurrence of the moved file's old path {old_path} survives the move in {}",
+        path.as_str()
+    ));
+    diagnostic.code = Some(DiagnosticCode::MoveSurvivor.code());
+    diagnostic.span = Some(SourceSpan {
+        unit: file_id(path),
+        range: TextRange {
+            start,
+            end: start + old_path.len() as u64,
+        },
+    });
+    diagnostic
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -621,6 +685,7 @@ mod tests {
     use rift_protocol::read::ProjectPath;
 
     use super::*;
+    use crate::rename::RENAME_SWEEP_FINDINGS_MAX;
 
     fn engine_pool(
         root: &Path,
@@ -1392,6 +1457,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reference_edit_landing_the_same_bytes_compiles_no_rewrite() {
+        let (directory, reads, roots) = compile_workspace();
+        let reply = WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Edits(vec![
+                document_edit(
+                    &roots,
+                    "lib.rs",
+                    Some(OPENED_VERSION),
+                    edit_at((0, 0), (0, 0), "//! moved\n"),
+                ),
+                document_edit(&roots, "main.rs", None, edit_at((0, 4), (0, 7), "lib")),
+            ])),
+            ..WorkspaceEdit::default()
+        };
+        let plan = compiled_reply(directory.path(), &reads, reply)
+            .await
+            .expect("the proposal compiles");
+        assert_eq!(plan.moved_next, "//! moved\npub fn beacon() {}\n");
+        assert!(
+            plan.rewrites.is_empty(),
+            "a reference edit that lands the file's own bytes is no rewrite"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_proposal_of_only_no_op_edits_moves_the_bytes_unchanged() {
+        let (directory, reads, roots) = compile_workspace();
+        let reply = WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Edits(vec![
+                document_edit(
+                    &roots,
+                    "lib.rs",
+                    Some(OPENED_VERSION),
+                    edit_at((0, 7), (0, 13), "beacon"),
+                ),
+                document_edit(&roots, "main.rs", None, edit_at((0, 4), (0, 7), "lib")),
+            ])),
+            ..WorkspaceEdit::default()
+        };
+        let plan = compiled_reply(directory.path(), &reads, reply)
+            .await
+            .expect("the proposal compiles");
+        assert_eq!(plan.moved_next, "pub fn beacon() {}\n");
+        assert_eq!(plan.moved_next, plan.moved_source);
+        assert!(plan.rewrites.is_empty());
+    }
+
+    #[tokio::test]
     async fn an_edit_on_the_opened_file_at_another_version_refuses_unsupported() {
         let (directory, reads, roots) = compile_workspace();
         let reply = will_rename_reply(&roots, Some(OPENED_VERSION + 1));
@@ -1478,5 +1591,73 @@ mod tests {
                 diagnostic.message
             );
         }
+    }
+
+    /// A move plan for `hub.rs` to `spoke.rs` whose bytes land unchanged,
+    /// carrying the given reference rewrites.
+    fn sweep_plan(rewrites: Vec<(&str, &str)>) -> MovePlan {
+        let moved = "pub fn hub() {}\n".to_owned();
+        MovePlan {
+            from: CoreProjectPath::new("hub.rs").expect("fixture path"),
+            to: CoreProjectPath::new("spoke.rs").expect("fixture path"),
+            moved_next: moved.clone(),
+            moved_source: moved,
+            rewrites: rewrites
+                .into_iter()
+                .map(|(path, next_source)| PlannedRewrite {
+                    path: CoreProjectPath::new(path).expect("fixture path"),
+                    base_source: "include!(\"hub.rs\");\n".to_owned(),
+                    next_source: next_source.to_owned(),
+                })
+                .collect(),
+            references_not_updated: None,
+        }
+    }
+
+    #[test]
+    fn the_sweep_names_the_reference_the_engine_missed_and_not_the_one_it_updated() {
+        let (_directory, reads, _engines) = workspace(&[
+            ("hub.rs", "pub fn hub() {}\n"),
+            ("updated.rs", "include!(\"hub.rs\");\n"),
+            ("missed.rs", "include!(\"hub.rs\");\n"),
+        ]);
+        let plan = sweep_plan(vec![("updated.rs", "include!(\"spoke.rs\");\n")]);
+        let findings = moved_path_findings(&reads, &plan);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert_eq!(findings[0].code.as_deref(), Some("rift.move.survivor"));
+        let message = findings[0].message.clone();
+        assert!(message.contains("hub.rs"), "{message}");
+        assert!(message.contains("missed.rs"), "{message}");
+        let span = findings[0]
+            .span
+            .as_ref()
+            .expect("a survivor names its place");
+        assert_eq!(span.unit.0, "rift://file/missed.rs");
+    }
+
+    #[test]
+    fn a_move_every_reference_followed_sweeps_clean() {
+        let (_directory, reads, _engines) = workspace(&[
+            ("hub.rs", "pub fn hub() {}\n"),
+            ("updated.rs", "include!(\"hub.rs\");\n"),
+        ]);
+        let plan = sweep_plan(vec![("updated.rs", "include!(\"spoke.rs\");\n")]);
+        assert!(moved_path_findings(&reads, &plan).is_empty());
+    }
+
+    #[test]
+    fn the_sweep_stops_at_the_finding_bound() {
+        let occurrences = "include!(\"hub.rs\");\n".repeat(RENAME_SWEEP_FINDINGS_MAX + 8);
+        let (_directory, reads, _engines) = workspace(&[
+            ("hub.rs", "pub fn hub() {}\n"),
+            ("missed.rs", occurrences.as_str()),
+        ]);
+        let findings = moved_path_findings(&reads, &sweep_plan(Vec::new()));
+        assert_eq!(
+            findings.len(),
+            RENAME_SWEEP_FINDINGS_MAX,
+            "findings stop at the bound the rename sweep already enforces"
+        );
     }
 }

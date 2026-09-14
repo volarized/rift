@@ -64,6 +64,23 @@ pub(crate) struct FileRewrite {
     pub(crate) permissions: RewritePermissions,
 }
 
+/// One rewrite whose text a language engine proposed, borrowed from the
+/// plan that compiled it: where the bytes land, and the file's images
+/// before and after the edit.
+///
+/// `rename_symbol` and `move_file` are the two tools that write text the
+/// caller never wrote, so the change lane judges their rewrites against
+/// both images before it writes any of them.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EngineRewrite<'plan> {
+    /// The file the next image lands in.
+    pub(crate) path: &'plan ProjectPath,
+    /// The file's whole content the edit compiled against.
+    pub(crate) base_source: &'plan str,
+    /// The file's whole content after the edit.
+    pub(crate) next_source: &'plan str,
+}
+
 /// One raw-byte whole-file rewrite used only to restore a rejected hook write.
 #[derive(Clone, Debug)]
 pub(crate) struct ByteFileRewrite {
