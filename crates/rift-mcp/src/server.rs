@@ -2132,12 +2132,16 @@ impl RiftMcp {
                     change_set,
                 })
             }
-            Ok(RebuildOutcome::Superseded) => Some(AppliedPublication {
-                previous,
-                snapshot: published,
-                published: false,
-                change_set,
-            }),
+            // A publication the supervisor's cancellation refused answers like a superseded
+            // one: the snapshot did not become current, and the process is leaving.
+            Ok(RebuildOutcome::Superseded | RebuildOutcome::Cancelled) => {
+                Some(AppliedPublication {
+                    previous,
+                    snapshot: published,
+                    published: false,
+                    change_set,
+                })
+            }
             Err(error) => {
                 summary.diagnostics.push(stale_snapshot_diagnostic(&error));
                 None
@@ -2657,7 +2661,7 @@ mod tests {
         ConfigurationState, IndexState, IndexValidation, LEXICAL_COMMIT_TIMEOUT,
         LexicalCommitState, LexicalLane, PublishedWorkspace, RebuildOutcome, WorkspaceCandidate,
         build_workspace_candidate, configuration_fingerprint, rebuild_workspace,
-        record_rebuild_failure,
+        record_rebuild_failure, workspace_capture,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -4540,7 +4544,8 @@ pub fn beacon() -> u64 {
         stale_index_of(&run_search(server, "beacon").await?.warnings)?;
 
         let request = server.validation.take_pending();
-        let outcome = rebuild_workspace(&assembled.context, request).await?;
+        let capture = workspace_capture(&assembled.context.dependencies);
+        let outcome = rebuild_workspace(&assembled.context, request, capture).await?;
         assert_eq!(outcome, RebuildOutcome::Published);
 
         let answer = run_search(server, "lantern").await?;
@@ -5731,6 +5736,42 @@ pub fn beacon() -> u64 {
         })
     }
 
+    /// The units the store ranks for whatever tree it is stamped with right now.
+    ///
+    /// A store is read under one revision, so a poll that watches for a pass to land reads
+    /// the stamp first and asks that same tree for its rows. A pass that lands between the
+    /// two reads answers `OtherRevision`, so the read is made again, at most
+    /// [`SEARCH_TIER_ATTEMPTS_MAX`] times.
+    ///
+    /// # Errors
+    ///
+    /// Returns the last revision the store moved to once the bound runs out, and any other
+    /// unmatched answer at once.
+    async fn ranked_now(
+        index: &rift_search::SearchIndex,
+        query: &str,
+    ) -> TestResult<Vec<rift_search::RankedUnit>> {
+        let mut moved = None;
+        for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
+            let Some(stamped) = index.tree_revision().await? else {
+                return Ok(Vec::new());
+            };
+            match index.search(&stamped, query, 8).await? {
+                RevisionScoped::Matched(ranked) => return Ok(ranked.into_units()),
+                RevisionScoped::OtherRevision(revision) => moved = Some(revision),
+                other @ RevisionScoped::NoRevision => {
+                    return Err(
+                        format!("the store moved while it was being read: {other:?}").into(),
+                    );
+                }
+            }
+        }
+        Err(format!(
+            "the store kept moving across {SEARCH_TIER_ATTEMPTS_MAX} reads, last to {moved:?}"
+        )
+        .into())
+    }
+
     /// Polls one in-process search until the population lane's pass has landed, and answers
     /// with the first answer the store itself ranked.
     ///
@@ -5742,23 +5783,6 @@ pub fn beacon() -> u64 {
     /// # Errors
     ///
     /// Returns the warnings the last answer still carried once the bound runs out.
-    /// The units the store ranks for whatever tree it is stamped with right now.
-    ///
-    /// A store is read under one revision, so a poll that watches for a pass to land reads
-    /// the stamp first and asks that same tree for its rows.
-    async fn ranked_now(
-        index: &rift_search::SearchIndex,
-        query: &str,
-    ) -> TestResult<Vec<rift_search::RankedUnit>> {
-        let Some(stamped) = index.tree_revision().await? else {
-            return Ok(Vec::new());
-        };
-        match index.search(&stamped, query, 8).await? {
-            RevisionScoped::Matched(ranked) => Ok(ranked.into_units()),
-            other => Err(format!("the store moved while it was being read: {other:?}").into()),
-        }
-    }
-
     async fn search_after_population(server: &RiftMcp, query: &str) -> TestResult<SearchResult> {
         let mut answer = run_search(server, query).await?;
         for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {

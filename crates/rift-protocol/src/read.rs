@@ -1567,7 +1567,8 @@ pub enum SymbolFacet {
 
 /// One symbol's timeline across the workspace's version-control history, newest revision
 /// first. The walk follows first parents from the served revision along the declaration's
-/// current path only, bounded by the configured history depth.
+/// current path only, bounded by the configured history depth and by a shallow clone's
+/// boundary.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SymbolHistory {

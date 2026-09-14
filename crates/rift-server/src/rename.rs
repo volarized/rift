@@ -1311,8 +1311,8 @@ mod tests {
                 .expect_err("a version on an unopened document refuses"),
         );
         assert_eq!(refusal_reason(&unopened), RefusalReason::Unsupported);
-        // An operation that opened nothing - a file move - accepts only
-        // version-free documents.
+        // An operation that opened nothing accepts only version-free
+        // documents.
         let nothing_opened = plain_context();
         assert!(proposal_documents(&versioned("lib.rs", None), &roots(), &nothing_opened).is_ok());
         let refused = refusal(
