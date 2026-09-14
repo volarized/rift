@@ -35,6 +35,7 @@ use rift_server::{
 };
 use rmcp::ErrorData;
 use sha2::{Digest as _, Sha256};
+use tokio::sync::futures::Notified;
 use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -1646,12 +1647,16 @@ impl LexicalBacklog {
     }
 }
 
-/// The backlog and the wake-up the lane's handles and its task share.
+/// The backlog and the wake-ups the lane's handles and its task share.
 #[derive(Debug, Default)]
 struct LexicalQueue {
     backlog: SyncMutex<LexicalBacklog>,
     /// Wakes the task when a write lands.
     handed: Notify,
+    /// Wakes every waiter when a commit lands: a transaction ended, success or failure,
+    /// or a write handed to a full lane superseded the held ones. Each moves some tree
+    /// revision out of `Committing`, which is what a waiter reads again.
+    landed: Notify,
 }
 
 impl LexicalQueue {
@@ -1668,8 +1673,9 @@ impl LexicalQueue {
 /// A publication hands its write over and returns. The lane runs the writes in the order
 /// they were handed, which is publication order, one transaction at a time: `SQLite`
 /// would otherwise meet two rebuilds' writes as contention rather than as an order. A
-/// request that captures a publication before its transaction lands is told so by
-/// `search`, and answers from identifier matching meanwhile.
+/// request that captures a publication before its transaction lands waits for the
+/// landing under `[server] readiness_timeout`, and answers from identifier matching,
+/// saying so, only once that budget runs out.
 ///
 /// The lane is bounded by [`LEXICAL_COMMITS_MAX`] held writes. A write handed to a full
 /// lane supersedes every held one, and a transaction that fails or is superseded leaves
@@ -1727,7 +1733,9 @@ impl LexicalLane {
     ///
     /// A write that changes nothing is dropped unless the store is owed a whole replace:
     /// the stored stamp already names the tree revision `published` answers under. A
-    /// write handed to a full lane supersedes every held one, and the record says so.
+    /// write handed to a full lane supersedes every held one, and the record says so;
+    /// the superseded revisions are owed from then on, so the waiters on
+    /// [`Self::landed`] are woken to read that.
     pub(crate) fn request(&self, write: LexicalWrite, published: Arc<PublishedWorkspace>) {
         let tree_revision = published.reads.tree_revision().to_owned();
         let mut backlog = self.queue.locked();
@@ -1755,6 +1763,7 @@ impl LexicalLane {
                 "the lexical lane was handed a write it had no room for, so the held writes \
                  are superseded and the next transaction replaces the whole unit set"
             );
+            self.queue.landed.notify_waiters();
         }
         self.queue.handed.notify_one();
     }
@@ -1763,6 +1772,17 @@ impl LexicalLane {
     /// holding another tree.
     pub(crate) fn commit_state(&self, tree_revision: &str) -> LexicalCommitState {
         self.queue.locked().state_of(tree_revision)
+    }
+
+    /// A wake-up for the lane's next landing: a transaction's end, success or failure, or
+    /// a write superseding the held ones.
+    ///
+    /// Created before [`Self::commit_state`] is read, it cannot miss a landing between
+    /// that read and its await: tokio's `Notified` "is guaranteed to receive wakeups
+    /// from `notify_waiters()` as soon as it has been created, even if it has not yet
+    /// been polled".
+    pub(crate) fn landed(&self) -> Notified<'_> {
+        self.queue.landed.notified()
     }
 
     /// Whether the lane's task has ended, which a cancelled token causes.
@@ -1808,7 +1828,9 @@ struct LexicalTask<Store> {
 }
 
 impl<Store: LexicalStore> LexicalTask<Store> {
-    /// Runs held writes until the token is cancelled, then marks the lane ended.
+    /// Runs held writes until the token is cancelled, then marks the lane ended. Every
+    /// transaction's end, success or failure, wakes the waiters on
+    /// [`LexicalLane::landed`] once the backlog records it.
     async fn run(self) {
         while let Some((commit, whole_owed)) = self.next_commit().await {
             let outcome = self.transaction(commit, whole_owed).await;
@@ -1818,6 +1840,7 @@ impl<Store: LexicalStore> LexicalTask<Store> {
                 backlog.owe_whole(error.to_string());
             }
             drop(backlog);
+            self.queue.landed.notify_waiters();
         }
         self.queue.locked().ended = true;
     }
@@ -4827,6 +4850,99 @@ mod tests {
             LexicalCommitState::Settled,
         )
         .await?;
+        cancellation.cancel();
+        Ok(())
+    }
+
+    /// A waiter subscribed before a transaction fails is woken by its end, and reads the
+    /// revision as owed.
+    #[tokio::test]
+    async fn a_failed_transaction_wakes_the_waiters_on_the_landing() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let published = candidate_declaring(directory.path(), 0, "beacon")?;
+        let double = StoreDouble::new();
+        double.refuse_changes();
+        let cancellation = CancellationToken::new();
+        let lane = LexicalLane::spawn_over(
+            Arc::clone(&double),
+            usize::MAX,
+            BlockingExecutor::isolated(2, 60_000),
+            cancellation.clone(),
+        );
+        lane.request(change_naming_lib()?, Arc::clone(&published));
+        double.calls_within_bound(1).await?;
+        let landed = lane.landed();
+        assert_eq!(
+            lane.commit_state(published.reads.tree_revision()),
+            LexicalCommitState::Committing,
+            "the transaction is held at the store's gate"
+        );
+
+        double.release_one();
+        tokio::time::timeout(LEXICAL_COMMIT_TIMEOUT / 10, landed)
+            .await
+            .map_err(|_| "a failed transaction's end wakes the waiters")?;
+        assert!(
+            matches!(
+                lane.commit_state(published.reads.tree_revision()),
+                LexicalCommitState::Owed { .. }
+            ),
+            "the woken waiter reads the refused transaction as owed"
+        );
+        cancellation.cancel();
+        Ok(())
+    }
+
+    /// A write handed to a full lane wakes the waiters: the superseded revisions are owed
+    /// from then on, and a waiter reads that instead of waiting on a commit that never
+    /// runs.
+    #[tokio::test]
+    async fn a_superseding_write_wakes_the_waiters_on_the_landing() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let mut publications = Vec::new();
+        for epoch in 0..=LEXICAL_COMMITS_MAX as u64 + 1 {
+            publications.push(candidate_declaring(
+                directory.path(),
+                epoch,
+                &format!("declared{epoch}"),
+            )?);
+        }
+        let double = StoreDouble::new();
+        let cancellation = CancellationToken::new();
+        let lane = LexicalLane::spawn_over(
+            Arc::clone(&double),
+            usize::MAX,
+            BlockingExecutor::isolated(2, 60_000),
+            cancellation.clone(),
+        );
+        lane.request(
+            super::lexical_write(&publications[0], &ChangeSet::Full),
+            Arc::clone(&publications[0]),
+        );
+        double.calls_within_bound(1).await?;
+        for publication in &publications[1..=LEXICAL_COMMITS_MAX] {
+            lane.request(change_naming_lib()?, Arc::clone(publication));
+        }
+        let held = publications[LEXICAL_COMMITS_MAX].reads.tree_revision();
+        let landed = lane.landed();
+        assert_eq!(
+            lane.commit_state(held),
+            LexicalCommitState::Committing,
+            "the last held write is still committing"
+        );
+
+        let newest = &publications[LEXICAL_COMMITS_MAX + 1];
+        lane.request(change_naming_lib()?, Arc::clone(newest));
+        tokio::time::timeout(LEXICAL_COMMIT_TIMEOUT / 10, landed)
+            .await
+            .map_err(|_| "a superseding hand-off wakes the waiters")?;
+        assert_eq!(
+            lane.commit_state(held),
+            LexicalCommitState::Owed {
+                cause: super::SUPERSEDED_CAUSE.to_owned()
+            },
+            "the woken waiter reads the superseded revision as owed"
+        );
         cancellation.cancel();
         Ok(())
     }
