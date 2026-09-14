@@ -2132,12 +2132,16 @@ impl RiftMcp {
                     change_set,
                 })
             }
-            Ok(RebuildOutcome::Superseded) => Some(AppliedPublication {
-                previous,
-                snapshot: published,
-                published: false,
-                change_set,
-            }),
+            // A publication the supervisor's cancellation refused answers like a superseded
+            // one: the snapshot did not become current, and the process is leaving.
+            Ok(RebuildOutcome::Superseded | RebuildOutcome::Cancelled) => {
+                Some(AppliedPublication {
+                    previous,
+                    snapshot: published,
+                    published: false,
+                    change_set,
+                })
+            }
             Err(error) => {
                 summary.diagnostics.push(stale_snapshot_diagnostic(&error));
                 None
@@ -2657,7 +2661,7 @@ mod tests {
         ConfigurationState, IndexState, IndexValidation, LEXICAL_COMMIT_TIMEOUT,
         LexicalCommitState, LexicalLane, PublishedWorkspace, RebuildOutcome, WorkspaceCandidate,
         build_workspace_candidate, configuration_fingerprint, rebuild_workspace,
-        record_rebuild_failure,
+        record_rebuild_failure, workspace_capture,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -4540,7 +4544,8 @@ pub fn beacon() -> u64 {
         stale_index_of(&run_search(server, "beacon").await?.warnings)?;
 
         let request = server.validation.take_pending();
-        let outcome = rebuild_workspace(&assembled.context, request).await?;
+        let capture = workspace_capture(&assembled.context.dependencies);
+        let outcome = rebuild_workspace(&assembled.context, request, capture).await?;
         assert_eq!(outcome, RebuildOutcome::Published);
 
         let answer = run_search(server, "lantern").await?;
