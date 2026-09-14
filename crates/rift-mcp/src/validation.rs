@@ -1817,6 +1817,21 @@ impl<Store: LexicalStore> LexicalTask<Store> {
     /// Returns [`ReadError`] when the whole set could not be derived, when the transaction
     /// failed in the store, when its task ended without an answer, or when the lane was
     /// cancelled while it ran. Every one leaves the store owing a whole replace.
+    ///
+    /// # Cancel safety
+    ///
+    /// The lane's token cancels the transaction, never the other way round: the lane
+    /// aborts the transaction's task and waits for the abort to land before it answers.
+    /// The abort drops the store's future, and with it the write turn it holds and the
+    /// driver's `Transaction`, whose drop sends `ROLLBACK` to its connection's task
+    /// without waiting for it (`toasty::db::Transaction`: "If dropped without calling
+    /// commit or rollback, the transaction is automatically rolled back"). The connection
+    /// runs the rollback after the statement it is executing, so the write turn frees
+    /// within one statement's time. A rolled-back whole replace leaves the store stamped
+    /// with the previous tree revision; the next start's rebuild carries no previous
+    /// publication (`RebuildRequest::initial`), so `RebuildRequest::change_set` answers
+    /// `ChangeSet::Full` and `lexical_write` derives a whole replace from it: the first
+    /// commit after a restart replaces the whole unit set.
     async fn transaction(&self, commit: LexicalCommit, whole_owed: bool) -> Result<(), ReadError> {
         let LexicalCommit { write, published } = commit;
         let write = if whole_owed {
@@ -1838,6 +1853,7 @@ impl<Store: LexicalStore> LexicalTask<Store> {
         let ended = tokio::select! {
             ended = &mut running => ended,
             () = self.cancellation.cancelled() => {
+                abort_transaction(running).await;
                 return Err(lexical_unavailable("the lexical lane ended while the transaction ran"));
             }
             () = tokio::time::sleep(deadline) => {
@@ -1868,6 +1884,17 @@ impl<Store: LexicalStore> LexicalTask<Store> {
             .await
             .inspect_err(|error| record_commit_failure(tree_revision, "whole", error))
     }
+}
+
+/// Aborts a running transaction's task and waits for the abort to land, so the future
+/// holding the store's transaction and the write turn is dropped before the lane goes on.
+///
+/// The join answers with the abort, or with the outcome of a transaction that ended
+/// before the abort reached it. The lane is ending either way and the next start replaces
+/// the whole unit set, so neither answer changes what it does.
+async fn abort_transaction(running: JoinHandle<Result<(), SearchError>>) {
+    running.abort();
+    let _ = running.await;
 }
 
 /// Records one transaction that ran past its deadline, once.
@@ -2371,7 +2398,7 @@ pub(crate) mod lexical_double {
     //! A lexical store a test steers, for the lane and for a server built over it.
 
     use std::future::Future;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -2391,12 +2418,36 @@ pub(crate) mod lexical_double {
 
     /// A lexical store a test steers: every write records what it was asked and waits for
     /// one permit before it answers, refusing changes when told to, and writing through to
-    /// the attached index when one is held.
+    /// the attached index when one is held. A write whose future is dropped while the
+    /// store still holds it is counted, so a test can prove an abort reached it.
     pub(crate) struct StoreDouble {
         permits: Semaphore,
         calls: Mutex<Vec<(&'static str, String)>>,
         refuse_changes: AtomicBool,
         inner: Mutex<Option<Arc<SearchIndex>>>,
+        dropped_while_held: AtomicUsize,
+    }
+
+    /// One write the store holds at its gate: its drop is counted unless the write was
+    /// released first.
+    struct HeldWrite<'store> {
+        dropped_while_held: &'store AtomicUsize,
+        released: bool,
+    }
+
+    impl HeldWrite<'_> {
+        /// The write got its permit, so its later drop is a write that ran.
+        fn release(mut self) {
+            self.released = true;
+        }
+    }
+
+    impl Drop for HeldWrite<'_> {
+        fn drop(&mut self) {
+            if !self.released {
+                self.dropped_while_held.fetch_add(1, Ordering::SeqCst);
+            }
+        }
     }
 
     impl StoreDouble {
@@ -2406,7 +2457,13 @@ pub(crate) mod lexical_double {
                 calls: Mutex::new(Vec::new()),
                 refuse_changes: AtomicBool::new(false),
                 inner: Mutex::new(None),
+                dropped_while_held: AtomicUsize::new(0),
             })
+        }
+
+        /// How many writes had their future dropped while the store still held them.
+        pub(crate) fn dropped_while_held(&self) -> usize {
+            self.dropped_while_held.load(Ordering::SeqCst)
         }
 
         /// Writes every released write through to `index` from now on.
@@ -2467,10 +2524,15 @@ pub(crate) mod lexical_double {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push((form, tree_revision.to_owned()));
+            let held = HeldWrite {
+                dropped_while_held: &self.dropped_while_held,
+                released: false,
+            };
             let permit =
                 self.permits.acquire().await.map_err(|_| {
                     SearchError::new(SearchFault::new(SearchViolation::StoreFailed))
                 })?;
+            held.release();
             permit.forget();
             through.await
         }
@@ -4421,6 +4483,52 @@ mod tests {
             "a transaction that ended well after its deadline owes nothing"
         );
         cancellation.cancel();
+        Ok(())
+    }
+
+    /// A lane cancelled while its transaction waits at the store's gate aborts that
+    /// transaction: the store sees the write's future dropped, and the lane ends within a
+    /// bound far under `LEXICAL_COMMIT_TIMEOUT` instead of after the transaction.
+    #[tokio::test]
+    async fn a_cancelled_lane_aborts_the_transaction_it_was_running() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let published = candidate_declaring(directory.path(), 0, "beacon")?;
+        let double = StoreDouble::new();
+        let cancellation = CancellationToken::new();
+        let lane = LexicalLane::spawn_over(
+            Arc::clone(&double),
+            usize::MAX,
+            BlockingExecutor::isolated(2, 60_000),
+            cancellation.clone(),
+        );
+        lane.request(
+            super::lexical_write(&published, &ChangeSet::Full),
+            Arc::clone(&published),
+        );
+        double.calls_within_bound(1).await?;
+        assert_eq!(
+            double.dropped_while_held(),
+            0,
+            "the held write's future lives while the lane runs"
+        );
+
+        cancellation.cancel();
+        tokio::time::timeout(LEXICAL_COMMIT_TIMEOUT / 10, ended_within_bound(&lane))
+            .await
+            .map_err(|_| "the lane must end far under the commit timeout")??;
+        assert_eq!(
+            double.dropped_while_held(),
+            1,
+            "the abort dropped the transaction the store still held"
+        );
+        let LexicalCommitState::Owed { cause } = lane.commit_state(published.reads.tree_revision())
+        else {
+            return Err("an aborted transaction leaves a whole replace owed".into());
+        };
+        assert!(
+            cause.contains("the lexical lane ended while the transaction ran"),
+            "the owed cause names the cancellation: {cause}"
+        );
         Ok(())
     }
 
