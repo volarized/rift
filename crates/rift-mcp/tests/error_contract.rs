@@ -61,24 +61,17 @@ async fn served_wire_errors_validate_against_the_error_data_schema() -> TestResu
             json!({ "anchor": "not-an-address", "position": "after", "body": "x" }),
         ),
         // Both node writers resolve their address through `resolve_node_range`, so a range
-        // that names no indexed node refuses identically on each: in bounds but landing on
-        // no node, and past the end of the file. The witness is well formed in every one,
-        // so only the range can explain the refusal.
+        // in bounds but landing on no indexed node refuses identically on each. The witness
+        // is the digest of the bytes the range holds, `pub f`, so only the range can explain
+        // the refusal; a range the file no longer holds is a typed `source_unchanged`
+        // refusal the validation corpus covers.
         (
             "replace_node",
-            json!({ "node": "rift://node/rust/lib.rs@0-5#00000000", "body": "x" }),
+            json!({ "node": "rift://node/rust/lib.rs@0-5#8cd07f40", "body": "x" }),
         ),
         (
             "remove_node",
-            json!({ "node": "rift://node/rust/lib.rs@0-5#00000000", "force": false }),
-        ),
-        (
-            "replace_node",
-            json!({ "node": "rift://node/rust/lib.rs@0-999#00000000", "body": "x" }),
-        ),
-        (
-            "remove_node",
-            json!({ "node": "rift://node/rust/lib.rs@0-999#00000000", "force": false }),
+            json!({ "node": "rift://node/rust/lib.rs@0-5#8cd07f40", "force": false }),
         ),
         (
             "get_symbol",

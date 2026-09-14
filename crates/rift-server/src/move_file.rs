@@ -11,6 +11,10 @@
 //! said before that answer: the contract already permits a move that needs
 //! no reference rewritten, and the warning tells the caller which case
 //! this was rather than staying silent about it.
+//!
+//! After the move lands, the changed tree is swept for surviving
+//! occurrences of the moved file's old path, and each survivor rides the
+//! summary as a warning finding.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -25,14 +29,15 @@ use rift_lsp::session::{
 use rift_protocol::change::{
     ChangeResult, MoveFileParams, OperationPreconditionKind, PreconditionValue, RefusalReason,
 };
-use rift_protocol::read::{Diagnostic, DiagnosticCode, Language, Severity};
+use rift_protocol::read::{Diagnostic, DiagnosticCode, Language, Severity, SourceSpan, TextRange};
 
 use crate::engine::{EnginePool, EngineSlot};
-use crate::read::{ReadError, ReadFault, ReadService};
+use crate::read::{ReadError, ReadFault, ReadService, file_id};
 use crate::rename::{
     PlanEnd, PlannedRewrite, ProposalContext, compiled_rewrites, engine_roots, failed_precondition,
-    plan_diagnostic, proposal_documents, refused_oversized,
+    plan_diagnostic, proposal_documents, refused_oversized, surviving_occurrences,
 };
+use crate::rewrite::EngineRewrite;
 
 /// The operation prose opening every move refusal detail.
 const MOVE_OPERATION: &str = "file move";
@@ -54,6 +59,25 @@ pub struct MovePlan {
     /// Why the references were not updated, when they were not; the apply
     /// attaches it to the summary as its warning.
     pub(crate) references_not_updated: Option<ReferencesNotUpdated>,
+}
+
+impl MovePlan {
+    /// Every rewrite this plan lands whose text the engine wrote: the
+    /// reference rewrites, and the moved file under its destination path
+    /// when the engine edited the moved bytes. Bytes that move unchanged
+    /// carry no engine text and are not judged against a grammar.
+    pub(crate) fn engine_rewrites(&self) -> Vec<EngineRewrite<'_>> {
+        let mut rewrites: Vec<EngineRewrite<'_>> =
+            self.rewrites.iter().map(EngineRewrite::from).collect();
+        if self.moved_next != self.moved_source {
+            rewrites.push(EngineRewrite {
+                path: &self.to,
+                base_source: &self.moved_source,
+                next_source: &self.moved_next,
+            });
+        }
+        rewrites
+    }
 }
 
 /// What planning decided: a plan ready for the change lane, or the refusal
@@ -204,12 +228,11 @@ async fn planned_move(
     .await?;
     match proposal {
         EngineProposal::Nothing(reason) => Ok(unedited_plan(from, to, source.text, Some(reason))),
-        EngineProposal::Answered { edit, encoding } => {
+        EngineProposal::Answered(proposal) => {
             compiled_move(
                 workspace_root,
                 reads.dependency_catalog(),
-                &edit,
-                encoding,
+                &proposal,
                 from,
                 to,
                 source.text,
@@ -395,10 +418,16 @@ enum EngineProposal {
     /// applied move as its warning.
     Nothing(ReferencesNotUpdated),
     /// The engine proposed at least one reference edit.
-    Answered {
-        edit: WorkspaceEdit,
-        encoding: PositionEncoding,
-    },
+    Answered(AnsweredProposal),
+}
+
+/// The engine's proposal to compile, with the negotiated encoding and the
+/// version the moved file's `didOpen` carried.
+#[derive(Debug)]
+struct AnsweredProposal {
+    edit: WorkspaceEdit,
+    encoding: PositionEncoding,
+    version: i32,
 }
 
 /// One will-rename exchange's outcome on a running session.
@@ -409,6 +438,9 @@ enum MoveExchange {
     Answered {
         edit: Option<WorkspaceEdit>,
         encoding: PositionEncoding,
+        /// The version the moved file's `didOpen` carried; an edit the
+        /// engine versions on that file compiles at this version alone.
+        version: i32,
         /// The engine's own readiness as of this answer, read right after
         /// it: whatever the answer says, this is what the engine had
         /// proven about itself when it said it.
@@ -450,6 +482,7 @@ async fn engine_proposal(
         Ok(MoveExchange::Answered {
             edit,
             encoding,
+            version,
             readiness,
         }) => {
             if proposes_no_edit(edit.as_ref()) {
@@ -458,10 +491,11 @@ async fn engine_proposal(
                     readiness,
                 )))
             } else {
-                Ok(EngineProposal::Answered {
+                Ok(EngineProposal::Answered(AnsweredProposal {
                     edit: edit.unwrap_or_default(),
                     encoding,
-                })
+                    version,
+                }))
             }
         }
         Err(error) => {
@@ -523,11 +557,13 @@ async fn will_rename_on_session(
     if capabilities.will_rename_files() && !capabilities.will_rename_matches(from.as_str()) {
         return Ok(MoveExchange::FilterMismatch);
     }
+    let version = session.document_version();
     let edit = session.will_rename_files(from, to).await?;
     let readiness = session.readiness();
     Ok(MoveExchange::Answered {
         edit,
         encoding,
+        version,
         readiness,
     })
 }
@@ -537,12 +573,13 @@ async fn will_rename_on_session(
 ///
 /// An edit addressed to either the source or the destination path applies
 /// to the moved file's bytes, and the edited bytes land at the
-/// destination.
+/// destination. The source is the document the exchange opened, so an
+/// edit the engine versions on it compiles at the version its `didOpen`
+/// carried and refuses at any other.
 async fn compiled_move(
     workspace_root: &Path,
     catalog: &DependencyCatalog,
-    edit: &WorkspaceEdit,
-    encoding: PositionEncoding,
+    proposal: &AnsweredProposal,
     from: CoreProjectPath,
     to: CoreProjectPath,
     moved_source: String,
@@ -551,12 +588,13 @@ async fn compiled_move(
     let context = ProposalContext {
         operation: MOVE_OPERATION,
         addresses: Vec::new(),
-        opened: None,
+        opened: Some((&from, proposal.version)),
         bases: BTreeMap::from([(&from, moved_source.as_str()), (&to, moved_source.as_str())]),
     };
-    let documents = proposal_documents(edit, &roots, &context)?;
+    let documents = proposal_documents(&proposal.edit, &roots, &context)?;
     let documents = merged_moved_documents(documents, &from, &to);
-    let compiled = compiled_rewrites(workspace_root, documents, encoding, &context).await?;
+    let compiled =
+        compiled_rewrites(workspace_root, documents, proposal.encoding, &context).await?;
     let mut moved_next = moved_source.clone();
     let mut rewrites = Vec::with_capacity(compiled.len());
     for rewrite in compiled {
@@ -592,16 +630,62 @@ fn merged_moved_documents(
     merged.into_iter().collect()
 }
 
+/// Findings for occurrences of the moved file's old project path that
+/// survive in the changed tree, under the same bounds and the same
+/// substitution of rewritten bytes the rename sweep runs.
+///
+/// The moved file substitutes empty bytes: nothing stands at the old path
+/// once the move lands, and the destination has no index entry until the
+/// next snapshot, so the sweep reads the files that may still point at the
+/// moved file rather than the moved file itself.
+pub(crate) fn moved_path_findings(reads: &ReadService, plan: &MovePlan) -> Vec<Diagnostic> {
+    let mut rewritten: BTreeMap<&CoreProjectPath, &str> = plan
+        .rewrites
+        .iter()
+        .map(|rewrite| (&rewrite.path, rewrite.next_source.as_str()))
+        .collect();
+    rewritten.insert(&plan.from, "");
+    surviving_occurrences(reads, &rewritten, plan.from.as_str())
+        .iter()
+        .map(|(path, offset)| moved_path_diagnostic(plan.from.as_str(), path, *offset))
+        .collect()
+}
+
+/// One surviving occurrence of the moved file's old path, as a warning
+/// finding naming the old path and the file that still holds it.
+fn moved_path_diagnostic(old_path: &str, path: &CoreProjectPath, offset: usize) -> Diagnostic {
+    let start = offset as u64;
+    let mut diagnostic = plan_diagnostic(format!(
+        "an occurrence of the moved file's old path {old_path} survives the move in {}",
+        path.as_str()
+    ));
+    diagnostic.code = Some(DiagnosticCode::MoveSurvivor.code());
+    diagnostic.span = Some(SourceSpan {
+        unit: file_id(path),
+        range: TextRange {
+            start,
+            end: start + old_path.len() as u64,
+        },
+    });
+    diagnostic
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
 
+    use lsp_types::{
+        DocumentChanges, OneOf, OptionalVersionedTextDocumentIdentifier, Position, Range,
+        TextDocumentEdit,
+    };
     use rift_core::{SourceVisibility, TextFileInclusion};
     use rift_index::WorkspaceIndexLimits;
+    use rift_lsp::uri::EngineRoots;
     use rift_protocol::configuration::HistoryConfiguration;
     use rift_protocol::read::ProjectPath;
 
     use super::*;
+    use crate::rename::RENAME_SWEEP_FINDINGS_MAX;
 
     fn engine_pool(
         root: &Path,
@@ -1248,6 +1332,214 @@ mod tests {
         assert_eq!(moved.1.len(), 2, "both URIs' edits file under the source");
     }
 
+    /// The version the move's `didOpen` carried for `lib.rs` in the compile
+    /// fixtures below.
+    const OPENED_VERSION: i32 = 3;
+
+    /// A workspace holding the moved file and one file referencing it, with
+    /// the engine roots the proposal's URIs resolve against.
+    fn compile_workspace() -> (tempfile::TempDir, ReadService, EngineRoots) {
+        let (directory, reads, _engines) = workspace(&[
+            ("lib.rs", "pub fn beacon() {}\n"),
+            ("main.rs", "mod lib;\n"),
+        ]);
+        let roots =
+            engine_roots(directory.path(), reads.dependency_catalog()).expect("fixture roots");
+        (directory, reads, roots)
+    }
+
+    fn edit_at(start: (u32, u32), end: (u32, u32), text: &str) -> TextEdit {
+        TextEdit {
+            range: Range {
+                start: Position {
+                    line: start.0,
+                    character: start.1,
+                },
+                end: Position {
+                    line: end.0,
+                    character: end.1,
+                },
+            },
+            new_text: text.to_owned(),
+        }
+    }
+
+    /// One document's edit in the engine's reply, versioned as the engine
+    /// chose.
+    fn document_edit(
+        roots: &EngineRoots,
+        path: &str,
+        version: Option<i32>,
+        edit: TextEdit,
+    ) -> TextDocumentEdit {
+        let path = CoreProjectPath::new(path).expect("fixture path");
+        TextDocumentEdit {
+            text_document: OptionalVersionedTextDocumentIdentifier {
+                uri: roots
+                    .tree()
+                    .document_uri(&path)
+                    .expect("fixture uri composes"),
+                version,
+            },
+            edits: vec![OneOf::Left(edit)],
+        }
+    }
+
+    /// The engine's reply to the move of `lib.rs`: its edit on the moved
+    /// file at `moved_version`, beside a version-free reference rewrite in
+    /// `main.rs`.
+    fn will_rename_reply(roots: &EngineRoots, moved_version: Option<i32>) -> WorkspaceEdit {
+        WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Edits(vec![
+                document_edit(
+                    roots,
+                    "lib.rs",
+                    moved_version,
+                    edit_at((0, 0), (0, 0), "//! moved\n"),
+                ),
+                document_edit(roots, "main.rs", None, edit_at((0, 4), (0, 7), "moved")),
+            ])),
+            ..WorkspaceEdit::default()
+        }
+    }
+
+    /// Compiles one engine reply for the move of `lib.rs` to `moved.rs`,
+    /// opened at [`OPENED_VERSION`].
+    async fn compiled_reply(
+        directory: &Path,
+        reads: &ReadService,
+        reply: WorkspaceEdit,
+    ) -> Result<MovePlan, PlanEnd> {
+        let proposal = AnsweredProposal {
+            edit: reply,
+            encoding: PositionEncoding::Utf8,
+            version: OPENED_VERSION,
+        };
+        let from = CoreProjectPath::new("lib.rs").expect("fixture path");
+        let to = CoreProjectPath::new("moved.rs").expect("fixture path");
+        let moved_source = "pub fn beacon() {}\n".to_owned();
+        compiled_move(
+            directory,
+            reads.dependency_catalog(),
+            &proposal,
+            from,
+            to,
+            moved_source,
+        )
+        .await
+    }
+
+    /// The first finding of an `unsupported` refusal the compile ended with.
+    fn unsupported_detail(end: PlanEnd) -> String {
+        let PlanEnd::Refused(ChangeResult::Refused {
+            reason,
+            diagnostics,
+            ..
+        }) = end
+        else {
+            panic!("expected a refusal, got {end:?}");
+        };
+        assert_eq!(reason, RefusalReason::Unsupported);
+        diagnostics[0].message.clone()
+    }
+
+    #[tokio::test]
+    async fn an_edit_on_the_opened_file_at_its_opened_version_compiles() {
+        let (directory, reads, roots) = compile_workspace();
+        let reply = will_rename_reply(&roots, Some(OPENED_VERSION));
+        let plan = compiled_reply(directory.path(), &reads, reply)
+            .await
+            .expect("the opened version compiles");
+        assert_eq!(plan.moved_next, "//! moved\npub fn beacon() {}\n");
+        assert_eq!(plan.rewrites.len(), 1);
+        assert_eq!(plan.rewrites[0].path.as_str(), "main.rs");
+        assert_eq!(plan.rewrites[0].next_source, "mod moved;\n");
+    }
+
+    #[tokio::test]
+    async fn a_reference_edit_landing_the_same_bytes_compiles_no_rewrite() {
+        let (directory, reads, roots) = compile_workspace();
+        let reply = WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Edits(vec![
+                document_edit(
+                    &roots,
+                    "lib.rs",
+                    Some(OPENED_VERSION),
+                    edit_at((0, 0), (0, 0), "//! moved\n"),
+                ),
+                document_edit(&roots, "main.rs", None, edit_at((0, 4), (0, 7), "lib")),
+            ])),
+            ..WorkspaceEdit::default()
+        };
+        let plan = compiled_reply(directory.path(), &reads, reply)
+            .await
+            .expect("the proposal compiles");
+        assert_eq!(plan.moved_next, "//! moved\npub fn beacon() {}\n");
+        assert!(
+            plan.rewrites.is_empty(),
+            "a reference edit that lands the file's own bytes is no rewrite"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_proposal_of_only_no_op_edits_moves_the_bytes_unchanged() {
+        let (directory, reads, roots) = compile_workspace();
+        let reply = WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Edits(vec![
+                document_edit(
+                    &roots,
+                    "lib.rs",
+                    Some(OPENED_VERSION),
+                    edit_at((0, 7), (0, 13), "beacon"),
+                ),
+                document_edit(&roots, "main.rs", None, edit_at((0, 4), (0, 7), "lib")),
+            ])),
+            ..WorkspaceEdit::default()
+        };
+        let plan = compiled_reply(directory.path(), &reads, reply)
+            .await
+            .expect("the proposal compiles");
+        assert_eq!(plan.moved_next, "pub fn beacon() {}\n");
+        assert_eq!(plan.moved_next, plan.moved_source);
+        assert!(plan.rewrites.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_edit_on_the_opened_file_at_another_version_refuses_unsupported() {
+        let (directory, reads, roots) = compile_workspace();
+        let reply = will_rename_reply(&roots, Some(OPENED_VERSION + 1));
+        let refused = compiled_reply(directory.path(), &reads, reply)
+            .await
+            .expect_err("a version the server does not hold refuses");
+        assert_eq!(
+            unsupported_detail(refused),
+            "file move (the engine edited lib.rs at document version 4, which the server does \
+             not hold)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_versioned_edit_on_a_file_the_move_did_not_open_refuses() {
+        let (directory, reads, roots) = compile_workspace();
+        let reply = WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Edits(vec![document_edit(
+                &roots,
+                "main.rs",
+                Some(OPENED_VERSION),
+                edit_at((0, 4), (0, 7), "moved"),
+            )])),
+            ..WorkspaceEdit::default()
+        };
+        let refused = compiled_reply(directory.path(), &reads, reply)
+            .await
+            .expect_err("a version on a document the move did not open refuses");
+        assert_eq!(
+            unsupported_detail(refused),
+            "file move (the engine edited main.rs at document version 3, which the server does \
+             not hold)"
+        );
+    }
+
     #[test]
     fn every_reason_names_itself_and_carries_the_move_code() {
         let reasons = [
@@ -1299,5 +1591,73 @@ mod tests {
                 diagnostic.message
             );
         }
+    }
+
+    /// A move plan for `hub.rs` to `spoke.rs` whose bytes land unchanged,
+    /// carrying the given reference rewrites.
+    fn sweep_plan(rewrites: Vec<(&str, &str)>) -> MovePlan {
+        let moved = "pub fn hub() {}\n".to_owned();
+        MovePlan {
+            from: CoreProjectPath::new("hub.rs").expect("fixture path"),
+            to: CoreProjectPath::new("spoke.rs").expect("fixture path"),
+            moved_next: moved.clone(),
+            moved_source: moved,
+            rewrites: rewrites
+                .into_iter()
+                .map(|(path, next_source)| PlannedRewrite {
+                    path: CoreProjectPath::new(path).expect("fixture path"),
+                    base_source: "include!(\"hub.rs\");\n".to_owned(),
+                    next_source: next_source.to_owned(),
+                })
+                .collect(),
+            references_not_updated: None,
+        }
+    }
+
+    #[test]
+    fn the_sweep_names_the_reference_the_engine_missed_and_not_the_one_it_updated() {
+        let (_directory, reads, _engines) = workspace(&[
+            ("hub.rs", "pub fn hub() {}\n"),
+            ("updated.rs", "include!(\"hub.rs\");\n"),
+            ("missed.rs", "include!(\"hub.rs\");\n"),
+        ]);
+        let plan = sweep_plan(vec![("updated.rs", "include!(\"spoke.rs\");\n")]);
+        let findings = moved_path_findings(&reads, &plan);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert_eq!(findings[0].code.as_deref(), Some("rift.move.survivor"));
+        let message = findings[0].message.clone();
+        assert!(message.contains("hub.rs"), "{message}");
+        assert!(message.contains("missed.rs"), "{message}");
+        let span = findings[0]
+            .span
+            .as_ref()
+            .expect("a survivor names its place");
+        assert_eq!(span.unit.0, "rift://file/missed.rs");
+    }
+
+    #[test]
+    fn a_move_every_reference_followed_sweeps_clean() {
+        let (_directory, reads, _engines) = workspace(&[
+            ("hub.rs", "pub fn hub() {}\n"),
+            ("updated.rs", "include!(\"hub.rs\");\n"),
+        ]);
+        let plan = sweep_plan(vec![("updated.rs", "include!(\"spoke.rs\");\n")]);
+        assert!(moved_path_findings(&reads, &plan).is_empty());
+    }
+
+    #[test]
+    fn the_sweep_stops_at_the_finding_bound() {
+        let occurrences = "include!(\"hub.rs\");\n".repeat(RENAME_SWEEP_FINDINGS_MAX + 8);
+        let (_directory, reads, _engines) = workspace(&[
+            ("hub.rs", "pub fn hub() {}\n"),
+            ("missed.rs", occurrences.as_str()),
+        ]);
+        let findings = moved_path_findings(&reads, &sweep_plan(Vec::new()));
+        assert_eq!(
+            findings.len(),
+            RENAME_SWEEP_FINDINGS_MAX,
+            "findings stop at the bound the rename sweep already enforces"
+        );
     }
 }

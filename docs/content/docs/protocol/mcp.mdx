@@ -716,6 +716,11 @@ refuses as `unsupported`, and an engine that declines the new name refuses as
 change applies, the server sweeps the tree for surviving occurrences of the old name and reports
 each one as a warning.
 
+A rewrite whose result reports a syntax finding the file's pre-edit source did not report
+refuses the same `unmet_precondition` naming `engine_proposed_edits`, and nothing is written.
+The refusal names the file and carries the parser's own message. A finding the pre-edit source
+already reported rides the applied summary as before.
+
 An edit the engine proposes into a cataloged package refuses as `unsupported`, naming the
 package file's [`SourceUnitId`](/docs/protocol/reference#SourceUnitId): dependency source is
 read-only, and the unit tells the caller which package the rename would have reached.
@@ -726,7 +731,10 @@ Any visible regular file moves, including one no syntax provider claims; a direc
 place refuses `unmet_precondition` naming `target_is_file`. An engine advertising
 `workspace/willRenameFiles` proposes the reference updates, and they land with the move as one
 change. Without such an engine, or without a provider that claims the file's language, the move
-still applies and the result carries a `rift.move.references_not_updated` warning.
+still applies and the result carries a `rift.move.references_not_updated` warning. A proposed
+rewrite whose result no longer parses refuses the way `rename_symbol` refuses one. After the
+move applies, the server sweeps the tree for surviving occurrences of the moved file's old path
+and reports each one as a warning.
 
 <McpTool name="remove_symbol" />
 
@@ -741,16 +749,22 @@ and carries the references as a warning. Without a configured engine, or one tha
 advertise `textDocument/references`, the removal applies and carries a warning naming why it was
 not checked.
 
+The check asks the engine to include the declaration itself, so an engine that names nothing at
+all - that declaration included - has not resolved the file. That answer checks no reference, and
+the removal applies carrying the same warning, naming the engine that does not hold the file.
+
 A reference the engine finds in a cataloged package is named by that package file's
 [`SourceUnitId`](/docs/protocol/reference#SourceUnitId), the unit `get_symbol` serves the
 package under: the failed condition carries it in `units` beside the project `paths`, and the
 `force` warning names it with them. A location under no cataloged root counts toward the
 condition, and the warning names it by the engine's own URI.
 
-An engine that answers with no references before confirming its own readiness is a third case:
+An engine that answers with no references before confirming its own readiness reaches no verdict:
 that answer looks the same as one from an engine that checked and found nothing, so the removal
-refuses `temporarily_unavailable` instead of applying. `force` overrides this refusal too,
-carrying a warning that the engine's readiness was unconfirmed.
+refuses `temporarily_unavailable` instead of applying. An engine that could not answer the check
+at all - still loading on every attempt, or a failed request - refuses the same
+`temporarily_unavailable`, so the removal never applies on an unproven check. `force` overrides
+both refusals, carrying a warning that names the engine and why the check did not run to a verdict.
 
 <McpTool name="remove_node" />
 
@@ -802,6 +816,10 @@ still standing. A `replace_node` whose listing went stale shows the shape:
   ]
 }
 ```
+
+A node address whose range the file no longer holds - the file shrank below it since the
+listing - refuses the same way, with `observed` naming the file's current length in place of a
+digest: `outside the file's 120 bytes`.
 
 **Applied**, when final bytes differ from original bytes after transform hooks. At least one path
 changed. The result's `summary` carries change `id`, the `files` the change wrote, diagnostics, and

@@ -1326,9 +1326,10 @@ impl RiftMcp {
     /// stands where it stood. When the configured language engine
     /// advertises `textDocument/references`, a standing reference refuses
     /// `unmet_precondition` naming `no_references`, unless `force` applies
-    /// the removal anyway and carries the references as a warning. Without
-    /// such an engine, the removal applies and carries a warning naming why
-    /// it was not checked.
+    /// the removal anyway and carries the references as a warning. When the
+    /// check does not run - no such engine, an engine that has not confirmed
+    /// its readiness, or an engine that does not hold the file - the removal
+    /// applies and carries a warning naming why it was not checked.
     #[tool]
     async fn remove_symbol(
         &self,

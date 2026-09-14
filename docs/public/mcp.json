@@ -7415,7 +7415,7 @@
       }
     },
     {
-      "description": "Removes one declaration addressed by symbol. The whole declaration,\nits attached outer attributes and doc comments included, is removed\ntogether with the separator that followed it, so no blank-line run\nstands where it stood. When the configured language engine\nadvertises `textDocument/references`, a standing reference refuses\n`unmet_precondition` naming `no_references`, unless `force` applies\nthe removal anyway and carries the references as a warning. Without\nsuch an engine, the removal applies and carries a warning naming why\nit was not checked.",
+      "description": "Removes one declaration addressed by symbol. The whole declaration,\nits attached outer attributes and doc comments included, is removed\ntogether with the separator that followed it, so no blank-line run\nstands where it stood. When the configured language engine\nadvertises `textDocument/references`, a standing reference refuses\n`unmet_precondition` naming `no_references`, unless `force` applies\nthe removal anyway and carries the references as a warning. When the\ncheck does not run - no such engine, an engine that has not confirmed\nits readiness, or an engine that does not hold the file - the removal\napplies and carries a warning naming why it was not checked.",
       "input_schema": {
         "$defs": {
           "SymbolId": {

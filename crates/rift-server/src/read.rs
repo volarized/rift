@@ -1694,9 +1694,11 @@ pub(crate) fn node_witness(source: &str, range: ByteRange) -> String {
 pub(crate) enum NodeRangeResolution {
     /// The range lands on an indexed node and its bytes still hash to the given witness.
     Verified,
-    /// The range lands on an indexed node, but its bytes hash to a different witness.
+    /// The file's bytes no longer match the address: the range's bytes hash to a different
+    /// witness, or the file no longer holds the range at all.
     WitnessChanged {
-        /// The witness recomputed from the file's current bytes.
+        /// The witness recomputed from the file's current bytes, or, for a range the file
+        /// no longer holds, the file's current byte length: `outside the file's 120 bytes`.
         observed: String,
     },
 }
@@ -1704,48 +1706,52 @@ pub(crate) enum NodeRangeResolution {
 /// Resolves one witnessed node range against `file`: every witnessed node read and write
 /// proves its range through this call, and nothing else compares or clamps a node witness.
 ///
-/// The range must land on an indexed node's exact bytes - in bounds, on a UTF-8 character
-/// boundary at both ends, and equal to one of `file.syntax().nodes()`'s own ranges - before
-/// its witness is even computed. A range that does not land refuses here, naming the range
-/// rather than silently clamping it to whatever the file can still offer. A range that lands
-/// but hashes to a different witness is reported as [`NodeRangeResolution::WitnessChanged`]
-/// instead, so the caller can build its own `source_unchanged` precondition.
+/// A range is malformed on its own terms only when its start is beyond its end; that
+/// refuses. Every other mismatch between the address and the file is drift, because the
+/// address was minted from a file that held those bytes as a node: a range the file no
+/// longer holds - past its end, or off a UTF-8 character boundary - reports the file's
+/// current length as the observed value, and a range whose bytes hash to a different
+/// witness reports that witness, so the caller can build its own `source_unchanged`
+/// precondition either way. Nothing is clamped to whatever the file can still offer. A
+/// range whose bytes still hash to the witness must equal one of `file.syntax().nodes()`'s
+/// own ranges: no listing minted an address for any other range.
 ///
 /// # Errors
 ///
-/// Returns [`ReadError`] naming `range outside the addressed file` when the range does not
-/// land on an indexed node.
+/// Returns [`ReadError`] naming `start beyond end` for a malformed range, and `range names
+/// no syntax node` for an in-bounds range whose bytes match the witness while no indexed
+/// node has that range.
 pub(crate) fn resolve_node_range(
     file: &IndexedFile,
     range: ByteRange,
     witness: &str,
 ) -> Result<NodeRangeResolution, ReadError> {
-    if !range_names_an_indexed_node(file, range) {
-        return Err(ReadFault::invalid(
-            "span",
-            "range outside the addressed file",
-        ));
+    if range.start > range.end {
+        return Err(ReadFault::invalid("span", "start beyond end"));
     }
-    let observed = node_witness(file.source(), range);
-    Ok(if observed == witness {
-        NodeRangeResolution::Verified
-    } else {
-        NodeRangeResolution::WitnessChanged { observed }
-    })
+    let source = file.source();
+    if !range_lands_in_source(source, range) {
+        return Ok(NodeRangeResolution::WitnessChanged {
+            observed: format!("outside the file's {} bytes", source.len()),
+        });
+    }
+    let observed = node_witness(source, range);
+    if observed != witness {
+        return Ok(NodeRangeResolution::WitnessChanged { observed });
+    }
+    if !file.syntax().nodes().iter().any(|node| node.range == range) {
+        return Err(ReadFault::invalid("span", "range names no syntax node"));
+    }
+    Ok(NodeRangeResolution::Verified)
 }
 
-/// Whether `range` lands exactly on one of `file`'s indexed syntax nodes: in bounds, on a
-/// UTF-8 character boundary at both ends, and equal to a real node's own range.
-fn range_names_an_indexed_node(file: &IndexedFile, range: ByteRange) -> bool {
-    let source = file.source();
+/// Whether `source` holds `range`: both ends within its length and on a UTF-8 character
+/// boundary, so the range's bytes can be hashed.
+fn range_lands_in_source(source: &str, range: ByteRange) -> bool {
     let (Ok(start), Ok(end)) = (usize::try_from(range.start), usize::try_from(range.end)) else {
         return false;
     };
-    start <= end
-        && end <= source.len()
-        && source.is_char_boundary(start)
-        && source.is_char_boundary(end)
-        && file.syntax().nodes().iter().any(|node| node.range == range)
+    end <= source.len() && source.is_char_boundary(start) && source.is_char_boundary(end)
 }
 
 /// First `DIGEST_WIRE_CHARS` lowercase hex characters of the SHA-256 of `source` - the sole
@@ -2271,23 +2277,77 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
+    /// A range past the file's end is what an address minted before the file shrank looks
+    /// like: drift, reported as a changed witness naming the file's current length rather
+    /// than a malformed request.
     #[test]
-    fn resolve_node_range_refuses_a_range_past_the_source_length() -> TestResult {
+    fn resolve_node_range_reports_a_range_past_the_source_length_as_a_changed_witness() -> TestResult
+    {
         let (_directory, service) = fixture()?;
         let path = rift_core::ProjectPath::new("src/lib.rs")?;
         let file = service.index().file(&path).ok_or("fixture file indexed")?;
-        let source_len = file.source().len() as u64;
+        let source_len = file.source().len();
         let range = ByteRange {
             start: 0,
-            end: source_len + 10,
+            end: source_len as u64 + 10,
         };
+        let resolution = super::resolve_node_range(file, range, "00000000")?;
+        let super::NodeRangeResolution::WitnessChanged { observed } = resolution else {
+            panic!("a range past the source length must report drift, got {resolution:?}");
+        };
+        assert_eq!(observed, format!("outside the file's {source_len} bytes"));
+        Ok(())
+    }
+
+    /// A range that splits a multi-byte character cannot be hashed and names bytes the
+    /// file never held as a unit: it reports the same drift as a range past the end.
+    #[test]
+    fn resolve_node_range_reports_a_range_off_a_character_boundary_as_a_changed_witness()
+    -> TestResult {
+        let directory = TempDir::new()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn beacon() { \"é\" }\n",
+        )?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )?;
+        let path = rift_core::ProjectPath::new("lib.rs")?;
+        let file = service.index().file(&path).ok_or("fixture file indexed")?;
+        let source = file.source();
+        let inside_character = source.find('é').ok_or("fixture holds é")? as u64 + 1;
+        let range = ByteRange {
+            start: 0,
+            end: inside_character,
+        };
+        let resolution = super::resolve_node_range(file, range, "00000000")?;
+        let super::NodeRangeResolution::WitnessChanged { observed } = resolution else {
+            panic!("a range off a character boundary must report drift, got {resolution:?}");
+        };
+        assert_eq!(
+            observed,
+            format!("outside the file's {} bytes", source.len())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_node_range_refuses_a_range_whose_start_is_beyond_its_end() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let path = rift_core::ProjectPath::new("src/lib.rs")?;
+        let file = service.index().file(&path).ok_or("fixture file indexed")?;
+        let range = ByteRange { start: 5, end: 2 };
         let error = super::resolve_node_range(file, range, "00000000")
-            .expect_err("a range past the source length must refuse");
+            .expect_err("a range whose start is beyond its end must refuse");
         let ReadFault::Invalid { field, violation } = error.fault() else {
             panic!("expected Invalid, got {:?}", error.fault());
         };
         assert_eq!(*field, "span");
-        assert!(violation.contains("outside the addressed file"));
+        assert!(violation.contains("start beyond end"), "{violation}");
         Ok(())
     }
 
@@ -2307,7 +2367,7 @@ pub fn compute() -> i32 {
         };
         assert_eq!(*field, "span");
         assert!(
-            violation.contains("outside the addressed file"),
+            violation.contains("names no syntax node"),
             "the refusal must name the range, not a witness mismatch: {violation}"
         );
         Ok(())

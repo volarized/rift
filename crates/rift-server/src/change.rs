@@ -36,7 +36,7 @@ use crate::read::{
 };
 use crate::remove::{RemovePlan, is_blank_content};
 use crate::rename::{PlannedRewrite, RenamePlan, survivor_findings};
-use crate::rewrite::{ByteFileRewrite, FileRewrite};
+use crate::rewrite::{ByteFileRewrite, EngineRewrite, FileRewrite};
 
 /// Most findings one applied change reports: reparse findings and, for a
 /// rewrite that published through a symlink, the warning naming it.
@@ -686,7 +686,8 @@ impl ChangeService {
     /// Every rewritten file must still hold the exact bytes the plan was
     /// compiled against: the last precondition before an engine proposal
     /// may write, the same proof `verified_against_disk` runs for the
-    /// parser-derived plans.
+    /// parser-derived plans. A rewrite whose result no longer parses
+    /// refuses before any of them is written.
     ///
     /// # Errors
     ///
@@ -711,6 +712,11 @@ impl ChangeService {
         {
             return Ok(refusal);
         }
+        if let Some(refusal) =
+            engine_rewrite_syntax_failure(reads, &plan.symbol_addresses(), &plan.engine_rewrites())
+        {
+            return Ok(refusal);
+        }
         let rewrites: Vec<FileRewrite> = plan.rewrites.iter().map(modify_rewrite).collect();
         let mut result = self.apply_rewrites(reads, &rewrites)?;
         if let ChangeResult::Applied { summary } = &mut result {
@@ -720,6 +726,14 @@ impl ChangeService {
     }
 
     /// Verifies and writes one move plan atomically.
+    ///
+    /// A rewrite whose text the engine wrote and whose result no longer
+    /// parses refuses before anything is written, the same check
+    /// `apply_rename` runs.
+    ///
+    /// After the move lands, the changed tree is swept for surviving
+    /// occurrences of the old path, the same sweep `apply_rename` runs for
+    /// the old name.
     ///
     /// # Errors
     ///
@@ -740,6 +754,9 @@ impl ChangeService {
                 .map(|rewrite| (&rewrite.path, rewrite.base_source.as_str())),
         );
         if let Some(refusal) = self.rewrite_precondition_failure(reads, &[], checks)? {
+            return Ok(refusal);
+        }
+        if let Some(refusal) = engine_rewrite_syntax_failure(reads, &[], &plan.engine_rewrites()) {
             return Ok(refusal);
         }
         if self.root.join(plan.to.as_str()).symlink_metadata().is_ok() {
@@ -764,10 +781,13 @@ impl ChangeService {
         rewrites.push(FileRewrite::delete(plan.from.clone(), &plan.moved_source));
         rewrites.sort_by(|first, second| first.path.as_str().cmp(second.path.as_str()));
         let mut result = self.apply_rewrites(reads, &rewrites)?;
-        if let ChangeResult::Applied { summary } = &mut result
-            && let Some(reason) = &plan.references_not_updated
-        {
-            summary.diagnostics.push(reason.diagnostic());
+        if let ChangeResult::Applied { summary } = &mut result {
+            if let Some(reason) = &plan.references_not_updated {
+                summary.diagnostics.push(reason.diagnostic());
+            }
+            summary
+                .diagnostics
+                .extend(crate::move_file::moved_path_findings(reads, plan));
         }
         Ok(result)
     }
@@ -881,7 +901,10 @@ impl ChangeService {
             Ok(patch) => patch,
             Err(refusal) => return Ok(refusal),
         };
-        let segments = patch::split_file_segments(&patch)?;
+        let segments = match patch::split_file_segments(&patch)? {
+            Ok(segments) => segments,
+            Err(refusal) => return Ok(refusal),
+        };
         let mut rewrites: Vec<FileRewrite> = Vec::with_capacity(segments.len());
         for (index, segment) in segments.iter().enumerate() {
             match patch::resolve_segment(&self.root, reads, segment, index + 1)? {
@@ -944,13 +967,7 @@ impl ChangeService {
             identity.update([0]);
             identity.update(rewrite.next_source.as_bytes());
             files.push(rewrite.change());
-            let unit = match reads.index().file(&rewrite.path) {
-                Some(file) => file_id(file.path()),
-                None => FileId(format!(
-                    "rift://file/{}",
-                    rift_core::encode_path(rewrite.path.as_str())
-                )),
-            };
+            let unit = rewrite_unit(reads, &rewrite.path);
             fold_and_bound_diagnostics(reads, &mut diagnostics, rewrite, unit);
         }
         let digest = identity.finalize();
@@ -1402,8 +1419,14 @@ fn decoded(encoded: &str) -> Option<String> {
 
 /// Re-parses the changed file and reports parser findings, bounded.
 ///
-/// A change that breaks the syntax still lands - the tree is the caller's -
-/// but the result says so instead of leaving the discovery to the next read.
+/// A change whose text the caller supplied - `patch`, `replace_symbol`,
+/// `insert_symbol`, `replace_node`, `insert_node`, and the removals - still
+/// lands when it breaks the syntax, because the tree is the caller's, and
+/// the result says so instead of leaving the discovery to the next read.
+/// `rename_symbol` and `move_file` write text the engine proposed and the
+/// caller never saw, so a rewrite of theirs that breaks the syntax refuses
+/// at `engine_rewrite_syntax_failure` and never reaches this function.
+///
 /// `unit` names the changed file even when it has no prior index entry, as
 /// for a file a patch just created. The registry selects the parsing
 /// provider by the path's extension; a path no provider claims has no
@@ -1446,6 +1469,75 @@ fn reparse_diagnostics(
             })
             .collect(),
     }
+}
+
+/// The refusal for an engine-proposed rewrite whose result no longer
+/// parses: a syntax finding the file's pre-edit source did not report.
+/// Nothing when every rewrite parses as well as the bytes it replaces.
+///
+/// Each rewrite is judged on its own two images alone, so no tree scan
+/// runs, and the base is reparsed only where the next source has a finding
+/// of its own. A finding the pre-edit source already carried is the file's
+/// own, not the engine's, and rides the summary as it always has.
+fn engine_rewrite_syntax_failure(
+    reads: &ReadService,
+    addresses: &[PreconditionAddress],
+    rewrites: &[EngineRewrite<'_>],
+) -> Option<ChangeResult> {
+    for rewrite in rewrites {
+        let unit = rewrite_unit(reads, rewrite.path);
+        let broken = reparse_diagnostics(reads, unit.clone(), rewrite.path, rewrite.next_source);
+        let Some(finding) = broken.first() else {
+            continue;
+        };
+        if reparse_diagnostics(reads, unit, rewrite.path, rewrite.base_source).is_empty() {
+            return Some(broken_syntax_refusal(
+                addresses,
+                rewrite.path,
+                &finding.message,
+            ));
+        }
+    }
+    None
+}
+
+/// An engine proposal whose rewrite breaks the syntax: an unmet
+/// `engine_proposed_edits` condition naming the file, with the parser's own
+/// words as the finding. The targeted tree is untouched.
+fn broken_syntax_refusal(
+    addresses: &[PreconditionAddress],
+    path: &CoreProjectPath,
+    message: &str,
+) -> ChangeResult {
+    ChangeResult::Refused {
+        reason: RefusalReason::UnmetPrecondition,
+        preconditions: vec![crate::rename::failed_precondition(
+            OperationPreconditionKind::EngineProposedEdits,
+            addresses,
+            path,
+            PreconditionValue::Boolean { value: true },
+            PreconditionValue::Boolean { value: false },
+        )],
+        diagnostics: vec![crate::rename::plan_diagnostic(format!(
+            "the engine proposed an edit that breaks the syntax of {}: {message}",
+            path.as_str()
+        ))],
+    }
+}
+
+/// The unit one path's findings are filed under: the indexed file's
+/// identity, or the path's own address for a file no index entry names yet,
+/// as for a file this change creates.
+fn rewrite_unit(reads: &ReadService, path: &CoreProjectPath) -> FileId {
+    reads.index().file(path).map_or_else(
+        || {
+            FileId(format!(
+                "rift://file/{}",
+                rift_core::encode_path(path.as_str())
+            ))
+        },
+        |file| file_id(file.path()),
+    )
 }
 
 /// Folds `rewrite`'s reparse diagnostics into the batch's running list,
@@ -3732,7 +3824,7 @@ mod tests {
             .expect_err("a range naming no syntax node must error");
         assert_eq!(error.descriptor().code(), "invalid_request");
         assert!(
-            error.to_string().contains("outside the addressed file"),
+            error.to_string().contains("names no syntax node"),
             "message must name the range, not a witness mismatch: {error}"
         );
         let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
@@ -4171,29 +4263,151 @@ mod tests {
         Ok(())
     }
 
+    /// The source `lib.rs` shrinks to once the address below was minted from a longer file.
+    const SHRUNK_SOURCE: &str = "pub fn beacon() {}\n";
+
+    /// A workspace whose `lib.rs` held two declarations when the returned address was
+    /// minted for the second, then shrank to [`SHRUNK_SOURCE`] and was reindexed: the
+    /// address's range now reaches past the file's end, exactly what a listing kept across
+    /// another agent's edit looks like.
+    fn shrunk_fixture() -> TestResult<(tempfile::TempDir, ReadService, ChangeService, NodeId)> {
+        let (directory, reads, _changes) = fixture("pub fn beacon() {}\npub fn late() {}\n")?;
+        let listing = reads.nodes(NodesParams {
+            path: ProjectPath("lib.rs".to_owned()),
+            position: SHRUNK_SOURCE.len() as u64 + 3,
+            rev: None,
+        })?;
+        let index = listing
+            .source
+            .iter()
+            .position(|excerpt| excerpt == "pub fn late() {}")
+            .ok_or("no listed node's excerpt matches the second declaration")?;
+        let address = listing.nodes[index].id.clone();
+        fs::write(directory.path().join("lib.rs"), SHRUNK_SOURCE)?;
+        let reads = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let changes = ChangeService::new(directory.path());
+        Ok((directory, reads, changes, address))
+    }
+
+    /// The refusal a shrunk file answers: `source_unchanged` failed, `expected` the
+    /// address's own witness, `observed` the file's current byte length.
+    fn assert_shrunk_refusal(result: ChangeResult, address: &NodeId) -> TestResult {
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("a range past the shrunk file must refuse: {result:?}");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        let precondition = &preconditions[0];
+        assert_eq!(
+            precondition.kind,
+            OperationPreconditionKind::SourceUnchanged
+        );
+        let (_, witness) = address
+            .0
+            .rsplit_once('#')
+            .ok_or("a listed node id must carry a witness")?;
+        assert_eq!(
+            precondition.expected,
+            PreconditionValue::Text {
+                value: witness.to_owned()
+            }
+        );
+        assert_eq!(
+            precondition.observed,
+            PreconditionValue::Text {
+                value: format!("outside the file's {} bytes", SHRUNK_SOURCE.len())
+            }
+        );
+        Ok(())
+    }
+
+    /// An address minted before the file shrank below its range is drift, the same as a
+    /// stale witness: `replace_node` refuses `source_unchanged` naming the file's current
+    /// length, never `invalid_request`.
     #[test]
-    fn replace_node_span_beyond_the_file_fails_as_invalid() -> TestResult {
+    fn replace_node_against_a_file_that_shrank_below_the_address_refuses_source_unchanged()
+    -> TestResult {
+        let (directory, reads, changes, address) = shrunk_fixture()?;
+        let result = changes.replace_node(
+            &reads,
+            &ReplaceNodeParams {
+                node: address.clone(),
+                region: None,
+                body: "pub fn late() -> u8 { 7 }".to_owned().into(),
+            },
+        )?;
+        assert_shrunk_refusal(result, &address)?;
+        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(untouched, SHRUNK_SOURCE);
+        Ok(())
+    }
+
+    /// `insert_node` resolves its anchor through the same proof, so a shrunk file refuses
+    /// it the same way.
+    #[test]
+    fn insert_node_against_a_file_that_shrank_below_the_anchor_refuses_source_unchanged()
+    -> TestResult {
+        let (directory, reads, changes, address) = shrunk_fixture()?;
+        let result = changes.insert_node(
+            &reads,
+            &rift_protocol::change::InsertNodeParams {
+                anchor: address.clone(),
+                position: InsertPosition::After,
+                body: "pub fn later() {}".to_owned().into(),
+            },
+        )?;
+        assert_shrunk_refusal(result, &address)?;
+        let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert_eq!(untouched, SHRUNK_SOURCE);
+        Ok(())
+    }
+
+    /// A range inside the file whose bytes no longer hash to the witness is drift even
+    /// when no node has that exact range any more: the digest form answers, as it does
+    /// for a range that still names a node.
+    #[test]
+    fn replace_node_with_a_stale_witness_on_a_range_naming_no_node_refuses_source_unchanged()
+    -> TestResult {
         let source = "pub fn beacon() {}\n";
         let (directory, reads, changes) = fixture(source)?;
-        let end = source.len() as u64 + 10;
-        // A forged witness for a range wholly past the file: no legitimate listing could
-        // ever carry this address, so resolution must refuse before the witness even
-        // matters.
-        let witness = digest_hex8("");
-        let error = changes
-            .replace_node(
-                &reads,
-                &ReplaceNodeParams {
-                    node: NodeId(format!("rift://node/rust/lib.rs@0-{end}#{witness}")),
-                    region: None,
-                    body: "pub fn beacon() -> u8 { 7 }".to_owned().into(),
-                },
-            )
-            .expect_err("a span past the file end must error");
-        assert_eq!(error.descriptor().code(), "invalid_request");
-        assert!(
-            error.to_string().contains("outside the addressed file"),
-            "message must name the span fault: {error}"
+        let start = source.find("beacon").expect("fixture names beacon");
+        let end = start + "bea".len();
+        let result = changes.replace_node(
+            &reads,
+            &ReplaceNodeParams {
+                node: NodeId(format!("rift://node/rust/lib.rs@{start}-{end}#00000000")),
+                region: None,
+                body: "x".to_owned().into(),
+            },
+        )?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("a stale witness must refuse: {result:?}");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::SourceUnchanged
+        );
+        assert_eq!(
+            preconditions[0].observed,
+            PreconditionValue::Text {
+                value: digest_hex8(&source[start..end])
+            }
         );
         let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
         assert_eq!(untouched, source);
@@ -4223,7 +4437,7 @@ mod tests {
             .expect_err("a range naming no syntax node must error");
         assert_eq!(error.descriptor().code(), "invalid_request");
         assert!(
-            error.to_string().contains("outside the addressed file"),
+            error.to_string().contains("names no syntax node"),
             "message must name the range, not a witness mismatch: {error}"
         );
         let untouched = fs::read_to_string(directory.path().join("lib.rs"))?;
@@ -4318,6 +4532,63 @@ mod tests {
             .find(|finding| finding.code.as_deref() == Some("rift.rename.survivor"))
             .expect("the unrewritten caller must surface as a survivor");
         assert!(survivor.message.contains("beacon"));
+        Ok(())
+    }
+
+    #[test]
+    fn apply_rename_refuses_a_rewrite_whose_result_does_not_parse() -> TestResult {
+        let library = "pub fn beacon() { let mark = 1; }\n";
+        let (directory, reads, changes) = multi_file_fixture(&[("lib.rs", library)])?;
+        let plan = rename_plan(vec![("lib.rs", library, "pub fn beacon() { let = 1; }\n")]);
+        let result = changes.apply_rename(&reads, &plan)?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            diagnostics,
+        } = result
+        else {
+            panic!("an engine proposal that breaks the syntax must refuse");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::EngineProposedEdits
+        );
+        let detail = diagnostics[0].message.clone();
+        assert!(
+            detail.contains("lib.rs"),
+            "the refusal names the file: {detail}"
+        );
+        assert!(
+            detail.contains("the parser marked this region erroneous after the change"),
+            "the refusal carries the parser's own words: {detail}"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("lib.rs"))?,
+            library,
+            "a refused proposal leaves the file's bytes alone"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn apply_rename_carries_a_finding_the_pre_edit_source_already_had() -> TestResult {
+        let library = "pub fn beacon() { let = 1; }\n";
+        let renamed = "pub fn flare() { let = 1; }\n";
+        let (directory, reads, changes) = multi_file_fixture(&[("lib.rs", library)])?;
+        let plan = rename_plan(vec![("lib.rs", library, renamed)]);
+        let summary = applied_summary(changes.apply_rename(&reads, &plan)?);
+        assert!(
+            summary
+                .diagnostics
+                .iter()
+                .any(|finding| finding.code.as_deref() == Some("rift.syntax.error")),
+            "a finding the pre-edit source already reported rides the summary"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("lib.rs"))?,
+            renamed
+        );
         Ok(())
     }
 
@@ -4455,6 +4726,37 @@ mod tests {
             fs::read_to_string(directory.path().join("main.rs"))?,
             "mod spoke;\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn apply_move_refuses_a_moved_file_whose_result_does_not_parse() -> TestResult {
+        let hub = "pub fn hub() { let mark = 1; }\n";
+        let (directory, reads, changes) = multi_file_fixture(&[("hub.rs", hub)])?;
+        let plan = move_plan(
+            "hub.rs",
+            "spoke.rs",
+            (hub, "pub fn hub() { let = 1; }\n"),
+            Vec::new(),
+            None,
+        );
+        let result = changes.apply_move(&reads, &plan)?;
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("an engine proposal that breaks the syntax must refuse");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::EngineProposedEdits
+        );
+        assert_eq!(preconditions[0].paths[0].0, "spoke.rs");
+        assert!(!directory.path().join("spoke.rs").exists());
+        assert_eq!(fs::read_to_string(directory.path().join("hub.rs"))?, hub);
         Ok(())
     }
 

@@ -236,11 +236,22 @@ fn remove_corpus() -> Vec<(&'static str, Value)> {
                 "force": false
             }),
         ),
+        // A range past the end of `remove_caller.rs`: the address of a node the file no
+        // longer holds refuses `source_unchanged` with the file's length as the observed
+        // value, the same typed refusal a stale witness gets.
+        (
+            "remove_node",
+            json!({
+                "node": "rift://node/rust/remove_caller.rs@0-999#00000000",
+                "force": false
+            }),
+        ),
     ]
 }
 
 /// The node writers, each addressing a witnessed range: `replace_node` over a stale
-/// witness, `insert_node` over a fresh one and over a stale one.
+/// witness and over a range past the file's end, `insert_node` over a fresh witness, a
+/// stale one, and a range past the file's end.
 ///
 /// The applied insertion addresses `remove_watched.rs`, whose declaration only
 /// `remove_symbol` reaches later and only by symbol name, so the insertion cannot move a
@@ -253,6 +264,21 @@ fn node_write_corpus() -> Vec<(&'static str, Value)> {
             json!({
                 "node": "rift://node/rust/lib.rs@0-22#00000000",
                 "body": "pub fn beacon_one() {}"
+            }),
+        ),
+        (
+            "replace_node",
+            json!({
+                "node": "rift://node/rust/lib.rs@0-999#00000000",
+                "body": "pub fn never_lands() {}"
+            }),
+        ),
+        (
+            "insert_node",
+            json!({
+                "anchor": "rift://node/rust/lib.rs@0-999#00000000",
+                "position": "after",
+                "body": "pub fn never_lands() {}"
             }),
         ),
         (
@@ -898,11 +924,13 @@ impl CorpusArms {
                 self.refusal_reasons
             );
         }
-        assert!(
-            self.precondition_kinds.contains("target_exists"),
-            "the corpus must prove the target_exists precondition; proven: {:?}",
-            self.precondition_kinds
-        );
+        for kind in ["target_exists", "source_unchanged"] {
+            assert!(
+                self.precondition_kinds.contains(kind),
+                "the corpus must prove the {kind} precondition; proven: {:?}",
+                self.precondition_kinds
+            );
+        }
         assert!(
             self.dependency_units > 0,
             "the corpus must prove a get_symbol hit answered from the dependency index, \

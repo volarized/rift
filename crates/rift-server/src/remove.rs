@@ -3,17 +3,20 @@
 //! Each removal resolves the span its `replace_` neighbour resolves, widens it over the
 //! separator that followed, and rewrites the file without those bytes. Before it
 //! writes, the server asks the language engine configured for the declaration what still
-//! references it: a standing reference refuses unless `force` overrides the refusal, and an
-//! engine that cannot answer the question at all is not the same as one that answered it
-//! clean, so the two stay distinguishable on the result. An empty answer from an engine that
-//! has never confirmed its own readiness is a third case, distinct from both: it refuses
-//! unless `force` overrides it too, because nothing tells that answer apart from the answer
-//! of an engine that has not read the file yet.
+//! references it: a standing reference refuses unless `force` overrides the refusal. An
+//! empty answer from an engine that has never confirmed its own readiness refuses unless
+//! `force` overrides it too, because nothing tells that answer apart from the answer of an
+//! engine that has not read the file yet; so does an engine that did not answer at all -
+//! still loading on every attempt, or a failed request - because nothing was checked. Only
+//! a declaration no engine can check - none configured for its language, one that does not
+//! advertise references, or one whose answer does not name the declaration it was asked to
+//! include, which is the answer of an engine that does not hold the file - applies
+//! unchecked, and the result carries a warning saying why.
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use lsp_types::Location;
+use lsp_types::{Location, Position};
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::line::{lines_inclusive, without_ending};
 use rift_dependency::DependencyCatalog;
@@ -303,6 +306,21 @@ async fn concluded_plan(
             "remove reference check",
             "the engine has not confirmed it is ready",
         ))),
+        ReferenceCheck::Unanswered { engine, detail } if force => Ok(built_plan(
+            target,
+            widened,
+            addresses,
+            Some(unchecked_diagnostic(&NotChecked::Unanswered {
+                engine,
+                detail,
+            })),
+        )),
+        ReferenceCheck::Unanswered { engine, detail } => {
+            Err(PlanEnd::Failed(ReadFault::unavailable(
+                "remove reference check",
+                NotChecked::Unanswered { engine, detail }.detail(),
+            )))
+        }
         ReferenceCheck::NotChecked(reason) => Ok(built_plan(
             target,
             widened,
@@ -352,7 +370,8 @@ fn built_plan(
 
 /// What the reference check found for one removal target.
 enum ReferenceCheck {
-    /// The engine answered and named nothing.
+    /// The engine named the declaration's own occurrence and nothing beside it, so it
+    /// read the file and found no reference to what the removal takes out.
     Clean,
     /// The engine named at least one reference: `count` is the number the engine answered,
     /// `references` the deduplicated, bounded names it gave them.
@@ -364,11 +383,15 @@ enum ReferenceCheck {
     /// readiness: nothing distinguishes that answer from the answer of an engine that has
     /// not read the file yet, so it is not proof the declaration is unreferenced.
     Unconfirmed { engine: String },
-    /// No check ran, or the one that did could not be read as an answer.
+    /// The engine did not answer the request - it was still loading when the retry
+    /// schedule was spent, or the request itself failed - so nothing was checked. `detail`
+    /// is the engine failure's own rendering.
+    Unanswered { engine: String, detail: String },
+    /// No check could run: the removal applies, and the result says why.
     NotChecked(NotChecked),
 }
 
-/// Why a removal's reference check did not run to a verdict.
+/// Why a removal applied without its reference check running to a verdict.
 enum NotChecked {
     /// The address names no declaration - `remove_node` targeting a node no symbol covers.
     NodeNamesNoSymbol,
@@ -376,8 +399,11 @@ enum NotChecked {
     NoEngine { language_segment: String },
     /// The engine does not advertise `textDocument/references`.
     CapabilityAbsent { engine: String },
-    /// The engine failed to answer the request.
-    RequestFailed { engine: String },
+    /// The engine named no location at all, so it did not resolve the declaration it was
+    /// asked to include: it does not hold the file, and its answer checked no reference.
+    FileNotHeld { engine: String },
+    /// The engine did not answer the request; `force` let the removal proceed anyway.
+    Unanswered { engine: String, detail: String },
     /// The engine answered with no references while it had never confirmed its own
     /// readiness; `force` let the removal proceed anyway.
     Unconfirmed { engine: String },
@@ -396,8 +422,14 @@ impl NotChecked {
             Self::CapabilityAbsent { engine } => {
                 format!("engine {engine} does not advertise textDocument/references")
             }
-            Self::RequestFailed { engine } => {
-                format!("engine {engine} did not answer the reference check")
+            Self::FileNotHeld { engine } => {
+                format!(
+                    "engine {engine} did not name the declaration it was asked to include, \
+                     so it does not hold this file"
+                )
+            }
+            Self::Unanswered { engine, detail } => {
+                format!("engine {engine} did not answer the reference check: {detail}")
             }
             Self::Unconfirmed { engine } => format!(
                 "engine {engine} answered with no references and has announced no work of \
@@ -407,11 +439,13 @@ impl NotChecked {
     }
 }
 
-/// Runs the reference check for one removal target, downgrading every engine failure - a
-/// spawn, a timeout, a protocol fault, the capability itself being absent - to the
-/// not-checked case rather than failing the request: a removal the engine cannot check is
-/// still a removal the caller asked for, and the not-checked warning says why the tree was
-/// not proven clean.
+/// Runs the reference check for one removal target. A declaration no engine can check - no
+/// engine for its language, one without the references capability, or one whose answer
+/// does not name the declaration it was asked to include - is the not-checked case, and
+/// the removal applies with a warning saying why the tree was not proven clean. Every
+/// other engine failure - a spawn, a timeout, a protocol fault, a retry schedule spent
+/// while the engine was still loading - is [`ReferenceCheck::Unanswered`]: the check ran
+/// and reached no verdict, so the removal refuses unless `force` overrides it.
 async fn checked_references(
     workspace_root: &Path,
     catalog: &DependencyCatalog,
@@ -428,50 +462,44 @@ async fn checked_references(
     };
     let positions = name_positions(&target.indexed_source, name_offset)?;
     let roots = engine_roots(workspace_root, catalog)?;
-    let exchanged = engine_exchange(
-        slot,
-        &target.path,
-        &target.language,
-        &target.indexed_source,
-        &positions,
-    )
-    .await;
-    match exchanged {
-        Ok((locations, readiness)) => Ok(reference_check_from_locations(
+    match engine_exchange(slot, &roots, target, &positions).await {
+        Ok((answer, readiness)) => Ok(reference_check_from_answer(
             &roots,
-            &locations,
+            &answer,
             readiness,
             slot.name(),
         )),
-        Err(error) => {
-            let engine = slot.name().to_owned();
-            if matches!(error.fault(), EngineFault::CapabilityAbsent { .. }) {
-                Ok(ReferenceCheck::NotChecked(NotChecked::CapabilityAbsent {
-                    engine,
-                }))
-            } else {
-                Ok(ReferenceCheck::NotChecked(NotChecked::RequestFailed {
-                    engine,
-                }))
-            }
-        }
+        Err(error) => Ok(refused_exchange(&error, slot.name())),
+    }
+}
+
+/// The verdict one failed exchange leaves: an absent capability is a declaration no engine
+/// can check, and every other failure reached no verdict at all.
+fn refused_exchange(error: &EngineError, engine: &str) -> ReferenceCheck {
+    let engine = engine.to_owned();
+    if matches!(error.fault(), EngineFault::CapabilityAbsent { .. }) {
+        return ReferenceCheck::NotChecked(NotChecked::CapabilityAbsent { engine });
+    }
+    ReferenceCheck::Unanswered {
+        engine,
+        detail: error.to_string(),
     }
 }
 
 /// Runs the references conversation on the claimed engine's session.
 async fn engine_exchange(
     slot: &EngineSlot,
-    path: &CoreProjectPath,
-    language: &Language,
-    indexed_source: &str,
+    roots: &EngineRoots,
+    target: &RemovalTarget,
     positions: &NamePositions,
-) -> Result<(Vec<Location>, EngineReadiness), EngineError> {
-    let open_path = path.clone();
-    let open_language = language.name.clone();
-    let open_source = indexed_source.to_owned();
-    let request_path = path.clone();
+) -> Result<(ReferenceAnswer, EngineReadiness), EngineError> {
+    let open_path = target.path.clone();
+    let open_language = target.language.name.clone();
+    let open_source = target.indexed_source.clone();
+    let request_roots = roots.clone();
+    let request_path = target.path.clone();
     let request_positions = *positions;
-    let close_path = path.clone();
+    let close_path = target.path.clone();
     slot.request_exchange(
         move |session: &mut EngineSession| {
             let path = open_path.clone();
@@ -480,8 +508,11 @@ async fn engine_exchange(
             Box::pin(async move { session.open(&path, &language, source).await })
         },
         move |session: &mut EngineSession| {
+            let roots = request_roots.clone();
             let path = request_path.clone();
-            Box::pin(async move { references_on_session(session, &path, &request_positions).await })
+            Box::pin(async move {
+                references_on_session(session, &roots, &path, &request_positions).await
+            })
         },
         move |session: &mut EngineSession| {
             let path = close_path.clone();
@@ -493,45 +524,100 @@ async fn engine_exchange(
     .await
 }
 
-/// One references request on an open document.
+/// One references request on an open document, split at the declaration's own occurrence.
 ///
 /// The engine's readiness is read right after `references` answers: whatever the answer
 /// says, this is what the engine had proven about itself when it said it.
 async fn references_on_session(
     session: &mut EngineSession,
+    roots: &EngineRoots,
     path: &CoreProjectPath,
     positions: &NamePositions,
-) -> Result<(Vec<Location>, EngineReadiness), EngineError> {
+) -> Result<(ReferenceAnswer, EngineReadiness), EngineError> {
     let position = positions.negotiated(session.capabilities().position_encoding);
     let locations = session.references(path, position).await?;
     let readiness = session.readiness();
-    Ok((locations, readiness))
+    Ok((
+        ReferenceAnswer::from_locations(roots, path, position, locations),
+        readiness,
+    ))
 }
 
-/// The engine's answered locations, resolved to a checked-clean, checked-found, or
-/// unconfirmed verdict. The slot first spends its bounded retry schedule. Its final empty
-/// answer reads as clean only when `readiness` proves the engine has confirmed it is ready
-/// or is still analyzing; an engine that has never announced any work at all gets
-/// [`ReferenceCheck::Unconfirmed`] instead.
-fn reference_check_from_locations(
+/// What one engine answered about a declaration's references.
+///
+/// The request asks the engine to include the declaration, so an engine that resolved it
+/// names that declaration's own occurrence among the locations. `names_declaration`
+/// records whether it did, and `references` holds the occurrences beside it.
+#[derive(Debug, Default)]
+struct ReferenceAnswer {
+    names_declaration: bool,
+    references: Vec<Location>,
+}
+
+impl ReferenceAnswer {
+    /// Separates the declaration's own occurrence from the references answered with it.
+    fn from_locations(
+        roots: &EngineRoots,
+        path: &CoreProjectPath,
+        position: Position,
+        locations: Vec<Location>,
+    ) -> Self {
+        let mut answer = Self::default();
+        for location in locations {
+            if is_declaration_occurrence(roots, path, position, &location) {
+                answer.names_declaration = true;
+            } else {
+                answer.references.push(location);
+            }
+        }
+        answer
+    }
+}
+
+/// Whether one answered location is the declaration's own occurrence: the file the request
+/// named, over a range covering the position it named.
+fn is_declaration_occurrence(
     roots: &EngineRoots,
-    locations: &[Location],
+    path: &CoreProjectPath,
+    position: Position,
+    location: &Location,
+) -> bool {
+    let Ok(EngineAddress::Project(located)) = roots.address(&location.uri) else {
+        return false;
+    };
+    located == *path && location.range.start <= position && position <= location.range.end
+}
+
+/// The engine's answer, resolved to a checked-clean, checked-found, unconfirmed, or
+/// file-not-held verdict. The slot first spends its bounded retry schedule. An answer
+/// naming no reference reads as clean only when the engine named the declaration it was
+/// asked to include and `readiness` proves it has confirmed it is ready or is still
+/// analyzing: an engine that has never announced any work at all gets
+/// [`ReferenceCheck::Unconfirmed`], and one that named nothing at all did not hold the
+/// file and checked nothing.
+fn reference_check_from_answer(
+    roots: &EngineRoots,
+    answer: &ReferenceAnswer,
     readiness: EngineReadiness,
     engine: &str,
 ) -> ReferenceCheck {
-    if locations.is_empty() {
-        return if readiness == EngineReadiness::Unconfirmed {
-            ReferenceCheck::Unconfirmed {
-                engine: engine.to_owned(),
-            }
-        } else {
-            ReferenceCheck::Clean
+    if !answer.references.is_empty() {
+        return ReferenceCheck::Found {
+            count: answer.references.len() as u64,
+            references: NamedReferences::from_locations(roots, &answer.references),
         };
     }
-    ReferenceCheck::Found {
-        count: locations.len() as u64,
-        references: NamedReferences::from_locations(roots, locations),
+    if readiness == EngineReadiness::Unconfirmed {
+        return ReferenceCheck::Unconfirmed {
+            engine: engine.to_owned(),
+        };
     }
+    if answer.names_declaration {
+        return ReferenceCheck::Clean;
+    }
+    ReferenceCheck::NotChecked(NotChecked::FileNotHeld {
+        engine: engine.to_owned(),
+    })
 }
 
 /// The references an engine named, spelled the way the result carries them: project paths
@@ -966,10 +1052,17 @@ mod tests {
                 "does not advertise textDocument/references",
             ),
             (
-                NotChecked::RequestFailed {
+                NotChecked::FileNotHeld {
                     engine: "fake".to_owned(),
                 },
-                "did not answer the reference check",
+                "did not name the declaration it was asked to include",
+            ),
+            (
+                NotChecked::Unanswered {
+                    engine: "fake".to_owned(),
+                    detail: "attempts 8".to_owned(),
+                },
+                "did not answer the reference check: attempts 8",
             ),
             (
                 NotChecked::Unconfirmed {
@@ -1094,34 +1187,71 @@ mod tests {
         listing.nodes[0].id.0.clone()
     }
 
+    /// An address minted before `lib.rs` shrank below its range refuses the way
+    /// `replace_node` refuses the identical address: `source_unchanged` failed, with the
+    /// file's current length as the observed value. The two tools must agree.
     #[tokio::test]
-    async fn plan_remove_node_with_a_forged_out_of_bounds_range_fails_untouched() {
-        let source = "pub fn beacon() {}\n";
-        let (directory, reads, engines) = workspace(&[("lib.rs", source)]);
-        let end = source.len() as u64 + 10;
-        // A forged witness for a range wholly past the file, exactly what `replace_node`
-        // refuses for the identical address: the two tools must agree.
-        let witness = crate::read::digest_hex8("");
-        let error = plan_remove_node(
+    async fn plan_remove_node_against_a_file_that_shrank_below_the_address_refuses_source_unchanged()
+     {
+        let shrunk = "pub fn beacon() {}\n";
+        let (directory, reads, engines) =
+            workspace(&[("lib.rs", "pub fn beacon() {}\npub fn late() {}\n")]);
+        let address = listed_node_id(&reads, "lib.rs", shrunk.len() as u64 + 3);
+        std::fs::write(directory.path().join("lib.rs"), shrunk).expect("fixture file shrinks");
+        let reads = ReadService::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )
+        .expect("shrunk workspace indexes");
+        let resolution = plan_remove_node(
             &reads,
             &engines,
             directory.path(),
             &RemoveNodeParams {
-                node: NodeId(format!("rift://node/rust/lib.rs@0-{end}#{witness}")),
+                node: NodeId(address.clone()),
                 force: false,
             },
         )
         .await
-        .expect_err("a range past the file end must error");
-        assert_eq!(error.descriptor().code(), "invalid_request");
-        assert!(
-            error.to_string().contains("outside the addressed file"),
-            "message must name the span fault: {error}"
+        .expect("a shrunk file is a typed refusal, not an error");
+        let RemoveResolution::Refused(result) = resolution else {
+            panic!("a shrunk file must refuse: {resolution:?}");
+        };
+        let ChangeResult::Refused {
+            reason,
+            preconditions,
+            ..
+        } = result
+        else {
+            panic!("a shrunk file must refuse with preconditions");
+        };
+        assert_eq!(reason, RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            preconditions[0].kind,
+            OperationPreconditionKind::SourceUnchanged
+        );
+        let (_, witness) = address
+            .rsplit_once('#')
+            .expect("a listed node id carries a witness");
+        assert_eq!(
+            preconditions[0].expected,
+            PreconditionValue::Text {
+                value: witness.to_owned()
+            }
+        );
+        assert_eq!(
+            preconditions[0].observed,
+            PreconditionValue::Text {
+                value: format!("outside the file's {} bytes", shrunk.len())
+            }
         );
         let untouched =
             std::fs::read_to_string(directory.path().join("lib.rs")).expect("fixture file reads");
         assert_eq!(
-            untouched, source,
+            untouched, shrunk,
             "a refused removal must leave the tree untouched"
         );
     }
@@ -1146,7 +1276,7 @@ mod tests {
         .expect_err("a range naming no syntax node must error");
         assert_eq!(error.descriptor().code(), "invalid_request");
         assert!(
-            error.to_string().contains("outside the addressed file"),
+            error.to_string().contains("names no syntax node"),
             "message must name the range, not a witness mismatch: {error}"
         );
         let untouched =
@@ -1271,6 +1401,46 @@ mod tests {
         format!("Content-Length: {}\r\n\r\n{body}", body.len())
     }
 
+    /// The initialize answer a canned engine gives: `textDocument/references` advertised,
+    /// and no other operation.
+    fn references_capabilities() -> String {
+        framed(r#"{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"referencesProvider":true}}}"#)
+    }
+
+    /// The engine announcing one work-done token over `$/progress`.
+    fn progress_begin() -> String {
+        framed(
+            r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"warm","value":{"kind":"begin","title":"loading"}}}"#,
+        )
+    }
+
+    /// The engine ending the token [`progress_begin`] announced, which settles readiness.
+    fn progress_end() -> String {
+        framed(
+            r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"warm","value":{"kind":"end"}}}"#,
+        )
+    }
+
+    /// One references answer naming no location at all.
+    fn no_references(id: u64) -> String {
+        framed(&format!(r#"{{"jsonrpc":"2.0","id":{id},"result":null}}"#))
+    }
+
+    /// One references answer naming exactly `locations`.
+    fn answered_locations(id: u64, locations: &[Location]) -> String {
+        framed(&serde_json::json!({"jsonrpc": "2.0", "id": id, "result": locations}).to_string())
+    }
+
+    /// Two attempts one millisecond apart, so the second request lands inside the script's
+    /// own `sleep` window.
+    fn two_attempts() -> rift_protocol::retry::RetryPolicy {
+        rift_protocol::retry::RetryPolicy {
+            attempts: 2,
+            delay: rift_protocol::configuration::Duration::from_millis(1),
+            delay_limit: rift_protocol::configuration::Duration::from_millis(1),
+        }
+    }
+
     /// A canned `sh` engine configuration claiming `rust`, answering exactly the bytes
     /// `script` writes and nothing else. The script never reads its stdin.
     fn references_engine(
@@ -1299,30 +1469,84 @@ mod tests {
     /// A workspace served by a canned `sh` engine that advertises
     /// `textDocument/references` and never announces work through `$/progress`: its
     /// readiness stays [`rift_lsp::session::EngineReadiness::Unconfirmed`] throughout. Two
-    /// references answers ride the script, both empty. Configured retry attempts bound
-    /// resends before outer exchange settles on final answer. Retry wait is 1ms so second
-    /// request lands inside script's own `sleep` window. Script never reads stdin; it writes
-    /// both answers regardless of what session sends.
+    /// references answers ride the script, both naming nothing. Configured retry attempts
+    /// bound resends before the outer exchange settles on the final answer. The script
+    /// never reads stdin; it writes both answers regardless of what the session sends.
     fn workspace_with_unconfirmed_references_engine(
         files: &[(&str, &str)],
     ) -> (tempfile::TempDir, ReadService, EnginePool) {
         let (directory, reads, _unused_engines) = workspace(files);
-        let capabilities = framed(
-            r#"{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"referencesProvider":true}}}"#,
-        );
-        let no_references =
-            |id: u64| framed(&format!(r#"{{"jsonrpc":"2.0","id":{id},"result":null}}"#));
         let script = format!(
-            "printf '%s' '{capabilities}{}{}'; sleep 0.2",
+            "printf '%s' '{}{}{}'; sleep 0.2",
+            references_capabilities(),
             no_references(1),
             no_references(2),
         );
-        let retry = rift_protocol::retry::RetryPolicy {
-            attempts: 2,
-            delay: rift_protocol::configuration::Duration::from_millis(1),
-            delay_limit: rift_protocol::configuration::Duration::from_millis(1),
+        let engines = engine_pool(directory.path(), references_engine(script, two_attempts()));
+        (directory, reads, engines)
+    }
+
+    /// A workspace served by a canned `sh` engine that announces work and ends it, so its
+    /// readiness settles, and then names no location at all on both configured attempts -
+    /// not even the declaration it was asked to include. That is the answer of an engine
+    /// that does not hold the file, the condition rust-analyzer shows on a loose file no
+    /// crate owns.
+    fn workspace_with_engine_holding_nothing(
+        files: &[(&str, &str)],
+    ) -> (tempfile::TempDir, ReadService, EnginePool) {
+        let (directory, reads, _unused_engines) = workspace(files);
+        let script = format!(
+            "printf '%s' '{}{}{}{}{}'; sleep 0.2",
+            references_capabilities(),
+            progress_begin(),
+            progress_end(),
+            no_references(1),
+            no_references(2),
+        );
+        let engines = engine_pool(directory.path(), references_engine(script, two_attempts()));
+        (directory, reads, engines)
+    }
+
+    /// A workspace served by a canned `sh` engine that settles its readiness and then names
+    /// one location: the declaration's own occurrence in `lib.rs`, over `name`. The engine
+    /// holds the file and names no reference beside the declaration.
+    fn workspace_with_engine_holding_the_declaration(
+        files: &[(&str, &str)],
+        name: lsp_types::Range,
+    ) -> (tempfile::TempDir, ReadService, EnginePool) {
+        let (directory, reads, _unused_engines) = workspace(files);
+        let uri = format!("file://{}/lib.rs", directory.path().display());
+        let declaration = Location {
+            uri: rift_lsp::uri::parse_uri(&uri).expect("the fixture uri parses"),
+            range: name,
         };
-        let engines = engine_pool(directory.path(), references_engine(script, retry));
+        let script = format!(
+            "printf '%s' '{}{}{}{}'; sleep 0.2",
+            references_capabilities(),
+            progress_begin(),
+            progress_end(),
+            answered_locations(1, std::slice::from_ref(&declaration)),
+        );
+        let engines = engine_pool(directory.path(), references_engine(script, two_attempts()));
+        (directory, reads, engines)
+    }
+
+    /// A workspace served by a canned `sh` engine that announces work through `$/progress`
+    /// and never ends it, answering no references on both configured attempts: the engine
+    /// is still loading when the retry schedule is spent, the condition rust-analyzer shows
+    /// on a cold repository. The exchange ends in [`EngineFault::Analyzing`].
+    fn workspace_with_loading_references_engine(
+        files: &[(&str, &str)],
+    ) -> (tempfile::TempDir, ReadService, EnginePool) {
+        let (directory, reads, _unused_engines) = workspace(files);
+        let script = format!(
+            "printf '%s' '{}{}{}{}'; sleep 0.2",
+            references_capabilities(),
+            progress_begin(),
+            no_references(1),
+            no_references(2),
+        );
+        let engines = engine_pool(directory.path(), references_engine(script, two_attempts()));
         (directory, reads, engines)
     }
 
@@ -1339,32 +1563,19 @@ mod tests {
     ) {
         let (directory, reads, _unused_engines) = workspace(files);
         let transcript = directory.path().join("engine-transcript");
-        let capabilities = framed(
-            r#"{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"referencesProvider":true}}}"#,
-        );
-        let progress_begin = framed(
-            r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"warm","value":{"kind":"begin","title":"loading"}}}"#,
-        );
-        let progress_end = framed(
-            r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"warm","value":{"kind":"end"}}}"#,
-        );
-        let no_references = framed(r#"{"jsonrpc":"2.0","id":1,"result":null}"#);
         let caller_uri = format!("file://{}/caller.rs", directory.path().display());
         let reference = framed(&format!(
             r#"{{"jsonrpc":"2.0","id":2,"result":[{{"uri":"{caller_uri}","range":{{"start":{{"line":0,"character":0}},"end":{{"line":0,"character":1}}}}}}]}}"#
         ));
         let shutdown = framed(r#"{"jsonrpc":"2.0","id":3,"result":null}"#);
         let script = format!(
-            "printf '%s' '{capabilities}{progress_begin}{progress_end}{no_references}{reference}{shutdown}' & exec cat > \"$1\""
+            "printf '%s' '{}{}{}{}{reference}{shutdown}' & exec cat > \"$1\"",
+            references_capabilities(),
+            progress_begin(),
+            progress_end(),
+            no_references(1),
         );
-        let mut engine = references_engine(
-            script,
-            rift_protocol::retry::RetryPolicy {
-                attempts: 2,
-                delay: rift_protocol::configuration::Duration::from_millis(1),
-                delay_limit: rift_protocol::configuration::Duration::from_millis(1),
-            },
-        );
+        let mut engine = references_engine(script, two_attempts());
         let Some(rift_protocol::configuration::CommandInput::ProgramAndArguments(command)) =
             engine.command.as_mut()
         else {
@@ -1440,6 +1651,79 @@ mod tests {
         engines.shutdown().await;
     }
 
+    /// An engine that did not answer the check - still loading on every attempt - proves
+    /// nothing about the declaration's references, so the removal refuses
+    /// `temporarily_unavailable` naming the engine, the way an unconfirmed answer does,
+    /// and leaves the tree untouched.
+    #[tokio::test]
+    async fn plan_remove_symbol_against_an_engine_still_loading_refuses_temporarily_unavailable() {
+        let source = "pub fn beacon() {}\n";
+        let (directory, reads, engines) =
+            workspace_with_loading_references_engine(&[("lib.rs", source)]);
+        let error = plan_remove_symbol(
+            &reads,
+            &engines,
+            directory.path(),
+            &RemoveSymbolParams {
+                symbol: symbol("beacon"),
+                force: false,
+            },
+        )
+        .await
+        .expect_err("an engine that did not answer must refuse, not apply");
+        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("engine fake did not answer the reference check"),
+            "{rendered}"
+        );
+        let untouched =
+            std::fs::read_to_string(directory.path().join("lib.rs")).expect("fixture file reads");
+        assert_eq!(
+            untouched, source,
+            "a refusal over an unanswered check leaves the tree untouched"
+        );
+        engines.shutdown().await;
+    }
+
+    /// `force` overrides the unanswered-check refusal the same way it overrides the
+    /// unconfirmed one: the removal applies, and the warning names the engine that did
+    /// not answer.
+    #[tokio::test]
+    async fn plan_remove_symbol_against_an_engine_still_loading_with_force_applies_with_a_warning()
+    {
+        let source = "pub fn beacon() {}\n";
+        let (directory, reads, engines) =
+            workspace_with_loading_references_engine(&[("lib.rs", source)]);
+        let resolution = plan_remove_symbol(
+            &reads,
+            &engines,
+            directory.path(),
+            &RemoveSymbolParams {
+                symbol: symbol("beacon"),
+                force: true,
+            },
+        )
+        .await
+        .expect("force lets an unanswered check proceed");
+        let RemoveResolution::Planned(plan) = resolution else {
+            panic!("force must plan the removal: {resolution:?}");
+        };
+        let diagnostic = plan
+            .diagnostic
+            .expect("an applied removal over an unanswered check carries a warning");
+        assert_eq!(diagnostic.severity, Severity::Warning);
+        assert_eq!(diagnostic.code.as_deref(), Some("rift.remove.unchecked"));
+        assert!(
+            diagnostic
+                .message
+                .contains("engine fake did not answer the reference check"),
+            "{}",
+            diagnostic.message
+        );
+        engines.shutdown().await;
+    }
+
     /// Progress from unrelated work cannot make an empty semantic answer final. Retry keeps
     /// one open document until the engine returns its standing reference.
     #[tokio::test]
@@ -1474,13 +1758,100 @@ mod tests {
         assert_eq!(transcript.matches("textDocument/didClose").count(), 1);
     }
 
+    /// A settled engine that names nothing at all - not the declaration it was asked to
+    /// include, and not the call standing in the same file - does not hold the file, so
+    /// its answer checked nothing. The removal applies, and the warning says why, the way
+    /// a removal no engine can check does.
+    #[tokio::test]
+    async fn plan_remove_symbol_against_an_engine_holding_nothing_applies_with_a_warning() {
+        let source = "pub fn beacon() {}\n\npub fn caller() {\n    beacon();\n}\n";
+        let (directory, reads, engines) =
+            workspace_with_engine_holding_nothing(&[("lib.rs", source)]);
+        let resolution = plan_remove_symbol(
+            &reads,
+            &engines,
+            directory.path(),
+            &RemoveSymbolParams {
+                symbol: symbol("beacon"),
+                force: false,
+            },
+        )
+        .await
+        .expect("an engine that holds nothing leaves the removal unchecked, not refused");
+        let RemoveResolution::Planned(plan) = resolution else {
+            panic!("the removal must apply unchecked: {resolution:?}");
+        };
+        let diagnostic = plan
+            .diagnostic
+            .expect("a removal over a file no engine holds carries a warning");
+        assert_eq!(diagnostic.severity, Severity::Warning);
+        assert_eq!(diagnostic.code.as_deref(), Some("rift.remove.unchecked"));
+        assert_eq!(
+            diagnostic.message,
+            "the declaration was removed without a reference check: engine fake did not name \
+             the declaration it was asked to include, so it does not hold this file"
+        );
+        engines.shutdown().await;
+    }
+
+    /// A settled engine that names the declaration it was asked to include holds the file,
+    /// so an answer with nothing beside that declaration is a checked verdict: the removal
+    /// applies with no warning at all.
+    #[tokio::test]
+    async fn plan_remove_symbol_against_an_engine_holding_the_file_applies_with_no_warning() {
+        let source = "pub fn beacon() {}\n";
+        let start = u32::try_from(source.find("beacon").expect("the fixture names beacon"))
+            .expect("the fixture offset fits in u32");
+        let name = lsp_types::Range {
+            start: Position {
+                line: 0,
+                character: start,
+            },
+            end: Position {
+                line: 0,
+                character: start + 6,
+            },
+        };
+        let (directory, reads, engines) =
+            workspace_with_engine_holding_the_declaration(&[("lib.rs", source)], name);
+        let resolution = plan_remove_symbol(
+            &reads,
+            &engines,
+            directory.path(),
+            &RemoveSymbolParams {
+                symbol: symbol("beacon"),
+                force: false,
+            },
+        )
+        .await
+        .expect("an engine that holds the file answers the check");
+        let RemoveResolution::Planned(plan) = resolution else {
+            panic!("a checked-clean removal must apply: {resolution:?}");
+        };
+        assert!(
+            plan.diagnostic.is_none(),
+            "a checked verdict carries no warning: {:?}",
+            plan.diagnostic
+        );
+        engines.shutdown().await;
+    }
+
+    /// One engine answer naming the declaration it was asked to include, so the verdict
+    /// turns on the references beside it alone.
+    fn answer(references: Vec<Location>) -> ReferenceAnswer {
+        ReferenceAnswer {
+            names_declaration: true,
+            references,
+        }
+    }
+
     #[test]
-    fn reference_check_from_locations_falls_back_to_the_raw_uri_outside_the_tree_root() {
+    fn reference_check_from_answer_falls_back_to_the_raw_uri_outside_the_tree_root() {
         let outside = location("file:///outside/other.rs");
         let expected = outside.uri.as_str().to_owned();
-        let check = reference_check_from_locations(
+        let check = reference_check_from_answer(
             &roots(),
-            std::slice::from_ref(&outside),
+            &answer(vec![outside]),
             EngineReadiness::Ready,
             "fake",
         );
@@ -1499,14 +1870,14 @@ mod tests {
     }
 
     #[test]
-    fn reference_check_from_locations_spells_a_cataloged_package_reference_as_its_unit() {
-        let locations = [
+    fn reference_check_from_answer_spells_a_cataloged_package_reference_as_its_unit() {
+        let locations = vec![
             location("file:///workspace/caller.rs"),
             location("file:///cache/helper-0.1.0/src/lib.rs"),
         ];
-        let check = reference_check_from_locations(
+        let check = reference_check_from_answer(
             &roots_with_helper(),
-            &locations,
+            &answer(locations),
             EngineReadiness::Ready,
             "fake",
         );
@@ -1549,8 +1920,12 @@ mod tests {
 
     #[test]
     fn an_empty_answer_from_an_unconfirmed_engine_is_not_read_as_clean() {
-        let check =
-            reference_check_from_locations(&roots(), &[], EngineReadiness::Unconfirmed, "fake");
+        let check = reference_check_from_answer(
+            &roots(),
+            &ReferenceAnswer::default(),
+            EngineReadiness::Unconfirmed,
+            "fake",
+        );
         assert!(
             matches!(check, ReferenceCheck::Unconfirmed { ref engine } if engine == "fake"),
             "an unconfirmed engine's empty answer must not read as clean"
@@ -1558,14 +1933,67 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_answer_from_a_settled_engine_still_reads_as_clean() {
+    fn an_answer_naming_only_the_declaration_still_reads_as_clean() {
         for readiness in [EngineReadiness::Ready, EngineReadiness::Analyzing] {
-            let check = reference_check_from_locations(&roots(), &[], readiness, "fake");
+            let check =
+                reference_check_from_answer(&roots(), &answer(Vec::new()), readiness, "fake");
             assert!(
                 matches!(check, ReferenceCheck::Clean),
-                "readiness {readiness:?} must still read an empty answer as clean"
+                "readiness {readiness:?} must read an answer naming only the declaration as clean"
             );
         }
+    }
+
+    /// A settled engine that names no location at all did not resolve the declaration it
+    /// was asked to include, so it does not hold the file: the answer checked no
+    /// reference, and the removal applies with a warning rather than reading it as clean.
+    #[test]
+    fn an_answer_naming_nothing_at_all_is_not_read_as_clean() {
+        for readiness in [EngineReadiness::Ready, EngineReadiness::Analyzing] {
+            let check = reference_check_from_answer(
+                &roots(),
+                &ReferenceAnswer::default(),
+                readiness,
+                "fake",
+            );
+            let ReferenceCheck::NotChecked(reason) = check else {
+                panic!("readiness {readiness:?} must not read an empty answer as a verdict");
+            };
+            assert_eq!(
+                reason.detail(),
+                "engine fake did not name the declaration it was asked to include, so it does \
+                 not hold this file"
+            );
+        }
+    }
+
+    /// The declaration's own occurrence is the location under the file the request named,
+    /// over a range covering the position it named; every other location is a reference.
+    #[test]
+    fn from_locations_separates_the_declarations_own_occurrence_from_the_references() {
+        let position = Position {
+            line: 3,
+            character: 7,
+        };
+        let declaration = located(
+            "file:///workspace/lib.rs",
+            lsp_types::Range {
+                start: position,
+                end: Position {
+                    line: 3,
+                    character: 13,
+                },
+            },
+        );
+        let caller = located("file:///workspace/caller.rs", lsp_types::Range::default());
+        let split = ReferenceAnswer::from_locations(
+            &roots(),
+            &core_path("lib.rs"),
+            position,
+            vec![declaration, caller.clone()],
+        );
+        assert!(split.names_declaration, "{split:?}");
+        assert_eq!(split.references, vec![caller]);
     }
 
     /// The unit the helper's crate root is served under.
@@ -1599,9 +2027,13 @@ mod tests {
     }
 
     fn location(uri: &str) -> Location {
+        located(uri, lsp_types::Range::default())
+    }
+
+    fn located(uri: &str, range: lsp_types::Range) -> Location {
         Location {
             uri: rift_lsp::uri::parse_uri(uri).expect("uri parses"),
-            range: lsp_types::Range::default(),
+            range,
         }
     }
 
