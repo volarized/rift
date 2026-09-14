@@ -469,11 +469,13 @@ answer at all - one that refused to load, or holds no indexed tree - which raise
 
 <VersionBadge version="v0.0.32" />
 
-A file past the per-file byte bound, or one its syntax provider refuses under a node or depth
-bound, is left out of the index: it answers no search or lookup, counts nowhere in
+A file past the per-file byte bound, one its syntax provider refuses under a node or depth
+bound, or one holding a declaration the Contribution contract refuses, is left out of the
+index: it answers no search or lookup, counts nowhere in
 [`rift://map`](/docs/protocol/mcp#resource-map), and is named in
-[`rift://logs`](/docs/protocol/mcp#resource-logs) with the bound it crossed. One minified
-bundle therefore never blocks the workspace. The [`[source]`](/docs/configuration#source)
+[`rift://logs`](/docs/protocol/mcp#resource-logs) with the bound it crossed or the field the
+contract refused. One minified bundle therefore never blocks the workspace. The
+[`[source]`](/docs/configuration#source)
 exclusion remains the way to keep such files out of the walk altogether.
 
 ### Search
