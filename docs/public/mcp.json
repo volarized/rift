@@ -11272,7 +11272,7 @@
       }
     },
     {
-      "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies, and by a\nbounded relationship `traversal` from one seed symbol. `rev` searches a\nversion-control revision instead of the current tree, and never combines with\n`traversal`. Use `get_symbol` when the declaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the search index's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate ranked units against one snapshot and merge them into\nresults computed from another.",
+      "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies, and by a\nbounded relationship `traversal` from one seed symbol. `rev` searches a\nversion-control revision instead of the current tree, and never combines with\n`traversal`. `scope` reaches past the project tree: `dependencies` answers `query`\nfrom the public declarations of the cataloged packages alone, `all` from both,\nordered together. Use `get_symbol` when the declaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the search index's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate ranked units against one snapshot and merge them into\nresults computed from another.",
       "input_schema": {
         "$defs": {
           "PathPattern": {
@@ -11527,6 +11527,26 @@
               }
             ]
           },
+          "SearchScope": {
+            "description": "Which declarations a `get_symbol` lookup searches.",
+            "oneOf": [
+              {
+                "const": "project",
+                "description": "The project tree the server serves.",
+                "type": "string"
+              },
+              {
+                "const": "dependencies",
+                "description": "The packages the dependency resolvers cataloged, answered from their public\ndeclarations alone.",
+                "type": "string"
+              },
+              {
+                "const": "all",
+                "description": "Both: hits merge by rank; at equal rank a project hit orders before a dependency\nhit.",
+                "type": "string"
+              }
+            ]
+          },
           "SearchTraversal": {
             "additionalProperties": false,
             "description": "A bounded relationship walk starting at one symbol. From `seed`, the server visits its\nneighbors, then their neighbors, up to `depth` hops, following `direction` and narrowed to\n`facets`; each reached symbol keeps the shortest path the walk found to it.",
@@ -11643,6 +11663,12 @@
               ],
               "seed": "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
             }
+          },
+          {
+            "limit": 10,
+            "query": "spawn_blocking",
+            "scope": "dependencies",
+            "target": "symbol"
           }
         ],
         "properties": {
@@ -11706,6 +11732,11 @@
               }
             ],
             "description": "The version-control revision to search - a branch, tag, or commit id as the\nworkspace's version control spells it. Omitted searches the current tree. The server\nrefuses a revision search when the workspace has no version-control repository."
+          },
+          "scope": {
+            "$ref": "#/$defs/SearchScope",
+            "default": "project",
+            "description": "Which declarations `query` searches: the project tree, the public declarations of\nthe cataloged dependency packages, or both. Omitted, `project`. A package\ncontributes symbol hits alone. The server refuses a scope beyond `project`\ntogether with `rev`, since dependencies are served for the current tree alone,\nand `dependencies` together with `traversal`, since the relationship graph serves\nthe project alone."
           },
           "target": {
             "$ref": "#/$defs/SearchParamsTarget",
@@ -12630,7 +12661,7 @@
                     "type": "null"
                   }
                 ],
-                "description": "Project-relative path of the hit, where the location is a project path. Absent for\na hit whose only location is a dependency or standard-library source unit."
+                "description": "Project-relative path of the hit, present for a file hit and for a symbol hit whose\ndeclaration belongs to the project. A dependency or standard-library declaration\ncarries `unit` in its place."
               },
               "range": {
                 "anyOf": [
@@ -12641,7 +12672,7 @@
                     "type": "null"
                   }
                 ],
-                "description": "Byte range of the hit within `path`. Absent for a symbol whose source is\nunavailable or synthetic."
+                "description": "Byte range of the hit within `path` or `unit`. Absent for a symbol whose source is\nunavailable or synthetic."
               },
               "score": {
                 "description": "How well this hit matched, used to order the page and merge duplicate hits.\nPresent on the wire when `include` names `score`; comparable within one answer\nand nowhere else.",
@@ -12669,6 +12700,17 @@
                   "array",
                   "null"
                 ]
+              },
+              "unit": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/SourceUnitId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Source-catalog unit of a dependency or standard-library declaration. A symbol hit\ncarries exactly one of `path` and `unit`; a file hit carries `path`."
               }
             },
             "required": [
@@ -12895,6 +12937,13 @@
                 "type": "string"
               }
             ]
+          },
+          "SourceUnitId": {
+            "description": "Stable identity of one source unit in the source catalog: a resolver identity, then that\nresolver's canonical unit key in canonical percent-encoding - for the project resolver, the\nproject-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its\nresolver's canonical human-readable key; digests appear on the wire only as short witnesses\nwhere byte-identity is required.",
+            "maxLength": 8192,
+            "minLength": 17,
+            "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,8192}$",
+            "type": "string"
           },
           "Symbol": {
             "additionalProperties": false,

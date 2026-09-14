@@ -184,7 +184,9 @@ Searches indexed declarations and source lines by lexical `query`, merged with
 full-text matches from included `[search.text]` files and declaration bodies, and by a
 bounded relationship `traversal` from one seed symbol. `rev` searches a
 version-control revision instead of the current tree, and never combines with
-`traversal`. Use `get_symbol` when the declaration name is known.
+`traversal`. `scope` reaches past the project tree: `dependencies` answers `query`
+from the public declarations of the cataloged packages alone, `all` from both,
+ordered together. Use `get_symbol` when the declaration name is known.
 For a current-tree search, the published workspace is resolved exactly once and
 threaded through both the search index's revision check and the executed
 `ReadService::search` call: a concurrent rebuild between two separate resolutions
@@ -200,6 +202,7 @@ Parameters:
 - `paths` - Files eligible for the search, selected by project-relative globs.
 - `query` - Text to match against file contents, symbol names, and rendered signatures.
 - `rev` - The version-control revision to search - a branch, tag, or commit id as the workspace's version control spells it.
+- `scope` - Which declarations `query` searches: the project tree, the public declarations of the cataloged dependency packages, or both.
 - `target` - Which entity kinds may be returned - a kind selector, never the text to search for; that is `query`.
 - `traversal` - A bounded relationship walk, standing alone or beside `query`.
 
