@@ -38,6 +38,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::futures::Notified;
 use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
@@ -49,8 +50,6 @@ use crate::server::{BlockingExecutor, ChangeLane};
 pub(crate) const INDEX_INVALIDATIONS_MAX: usize = 1;
 /// Delay collecting one bounded filesystem-event batch.
 pub(crate) const INDEX_DEBOUNCE: Duration = Duration::from_millis(50);
-/// Deadline for joining the index supervisor during shutdown.
-pub(crate) const INDEX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Complete capture retries while the tree keeps moving.
 pub(crate) const INDEX_CAPTURE_ATTEMPTS_MAX: usize = 3;
 
@@ -819,22 +818,26 @@ impl Drop for IndexValidation {
 }
 
 impl IndexSupervisor {
-    /// Cancels and joins the workspace index supervisor.
+    /// Cancels the supervisor and joins it, bounded by `deadline`.
+    ///
+    /// `deadline` is the whole stop's shared deadline, so the join takes only
+    /// what earlier stages left of it; a supervisor still running when it
+    /// passes is aborted rather than waited on.
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when the task panics or misses its shutdown deadline.
+    /// Returns [`ReadError`] when the task panics or outlasts `deadline`.
     ///
     /// # Cancel safety
     ///
     /// Cancellation is requested before the join begins. Dropping this future
     /// after it takes task ownership detaches that terminating task.
-    pub(crate) async fn shutdown(&self) -> Result<(), ReadError> {
+    pub(crate) async fn shutdown(&self, deadline: Instant) -> Result<(), ReadError> {
         self.validation.cancellation.cancel();
         let Some(mut task) = self.validation.task.lock().await.take() else {
             return Ok(());
         };
-        if let Ok(result) = tokio::time::timeout(INDEX_SHUTDOWN_TIMEOUT, &mut task).await {
+        if let Ok(result) = tokio::time::timeout_at(deadline, &mut task).await {
             result.map_err(|error| ReadFault::task("index supervisor shutdown", error.to_string()))
         } else {
             task.abort();
@@ -2079,6 +2082,10 @@ impl PopulationLane {
 pub(crate) enum RebuildOutcome {
     /// Candidate became current and was published.
     Published,
+    /// Every path the observation named already held the bytes the publication holds,
+    /// under the same configuration: nothing was built, the publication now carries the
+    /// observation's epoch, and nothing is handed to the lanes.
+    Unchanged,
     /// New observation invalidated candidate before publication.
     Superseded,
     /// The supervisor was cancelled while the capture or the publication ran; nothing
@@ -2159,7 +2166,7 @@ pub(crate) async fn run_index_supervisor_with(
                     lane.request(current);
                 }
             }
-            Ok(RebuildOutcome::Superseded) => {}
+            Ok(RebuildOutcome::Unchanged | RebuildOutcome::Superseded) => {}
             Ok(RebuildOutcome::Cancelled) => return,
             Err(error) => publish_rebuild_failure(&context, epoch, error).await,
         }
@@ -2206,6 +2213,14 @@ async fn publish_rebuild_failure(context: &IndexSupervisorContext, epoch: u64, e
 /// The rebuild never waits for the transaction: a request that captures the publication
 /// before the transaction lands is told so by `search`.
 ///
+/// An observation whose every named path already holds the bytes the publication holds,
+/// under the same configuration, is answered by that publication: the capture builds
+/// nothing and answers [`CapturedRebuild::Unchanged`], the candidate sharing the
+/// publication's read service is stamped with the observation's epoch under the same
+/// linearization, so requests waiting on that epoch proceed, and the outcome is
+/// [`RebuildOutcome::Unchanged`]: nothing is recorded as a publication, and the supervisor
+/// hands nothing to the lanes.
+///
 /// A superseded candidate hands nothing to the lane. Its workspace never publishes, and
 /// pending requests keep waiting because the observed epoch still differs from the
 /// published one.
@@ -2240,15 +2255,12 @@ pub(crate) async fn rebuild_workspace(
     let epoch = request.epoch;
     let root = context.root.clone();
     let limits = context.limits;
-    let published = Arc::clone(&context.published);
-    let validation = Arc::clone(&context.validation);
-    let blocking = context.blocking.clone();
-    let captured_state = Arc::clone(&published);
-    let captured_validation = Arc::clone(&validation);
+    let captured_state = Arc::clone(&context.published);
+    let captured_validation = Arc::clone(&context.validation);
     let change_lane = Arc::clone(&context.change_lane);
     let captured = tokio::select! {
-        () = validation.cancellation.cancelled() => return Ok(RebuildOutcome::Cancelled),
-        captured = blocking.run("filesystem index rebuild", move || {
+        () = context.validation.cancellation.cancelled() => return Ok(RebuildOutcome::Cancelled),
+        captured = context.blocking.run("filesystem index rebuild", move || {
             capture_rebuild(
                 &root,
                 limits,
@@ -2260,29 +2272,63 @@ pub(crate) async fn rebuild_workspace(
             )
         }) => captured?,
     };
-    let (candidate, write, work) = match captured {
+    match captured {
         CapturedRebuild::Candidate {
             published,
             write,
             work,
-        } => (published, write, work),
-        CapturedRebuild::Superseded => return Ok(RebuildOutcome::Superseded),
-        CapturedRebuild::Cancelled => return Ok(RebuildOutcome::Cancelled),
-    };
-    let lexical = context
-        .lexical
-        .clone()
-        .map(|lane| LexicalHandoff::new(lane, write));
-    let publication = blocking.run("filesystem index publication", move || {
-        Ok(finish_rebuild(
-            &published,
-            &validation,
-            candidate,
-            work,
-            epoch,
-            lexical,
-        ))
-    });
+        } => {
+            let lexical = context
+                .lexical
+                .clone()
+                .map(|lane| LexicalHandoff::new(lane, write));
+            let outcome = publish_captured(context, published, work, lexical).await?;
+            if outcome == RebuildOutcome::Published {
+                trace_publication(epoch);
+            }
+            Ok(outcome)
+        }
+        CapturedRebuild::Unchanged { published, work } => {
+            let outcome = publish_captured(context, published, work, None).await?;
+            Ok(match outcome {
+                RebuildOutcome::Published => RebuildOutcome::Unchanged,
+                other => other,
+            })
+        }
+        CapturedRebuild::Superseded => Ok(RebuildOutcome::Superseded),
+        CapturedRebuild::Cancelled => Ok(RebuildOutcome::Cancelled),
+    }
+}
+
+/// Publishes one captured candidate on the pool, racing the supervisor's cancellation.
+///
+/// # Errors
+///
+/// Returns [`ReadError`] when the pool refuses the publication.
+///
+/// # Cancel safety
+///
+/// As for [`rebuild_workspace`]: a publication whose closure already runs still lands,
+/// and this future answers [`RebuildOutcome::Cancelled`] without waiting for it.
+async fn publish_captured(
+    context: &IndexSupervisorContext,
+    candidate: Arc<PublishedWorkspace>,
+    work: PendingWork,
+    lexical: Option<LexicalHandoff>,
+) -> Result<RebuildOutcome, ReadError> {
+    let published = Arc::clone(&context.published);
+    let validation = Arc::clone(&context.validation);
+    let publication = context
+        .blocking
+        .run("filesystem index publication", move || {
+            Ok(finish_rebuild(
+                &published,
+                &validation,
+                candidate,
+                work,
+                lexical,
+            ))
+        });
     tokio::select! {
         () = context.validation.cancellation.cancelled() => Ok(RebuildOutcome::Cancelled),
         outcome = publication => outcome,
@@ -2297,6 +2343,16 @@ pub(crate) enum CapturedRebuild {
         published: Arc<PublishedWorkspace>,
         /// What the lexical index applies before that candidate publishes.
         write: LexicalWrite,
+        /// The observation's work, returned to the supervisor when nothing publishes.
+        work: PendingWork,
+    },
+    /// Every path the observation named already holds the bytes the publication holds,
+    /// under the same configuration. The candidate shares the publication's read service
+    /// and carries the observation's epoch; publishing it answers the requests waiting on
+    /// that epoch with nothing built and no lexical write owed.
+    Unchanged {
+        /// The publication's twin under the observation's epoch.
+        published: Arc<PublishedWorkspace>,
         /// The observation's work, returned to the supervisor when nothing publishes.
         work: PendingWork,
     },
@@ -2328,6 +2384,13 @@ pub(crate) fn capture_rebuild(
 /// candidate leaves the next rebuild owing exactly what this one owed plus whatever landed
 /// while it ran.
 ///
+/// A stable candidate whose change set is empty, under the configuration the publication
+/// was built under, built nothing: `shared_workspace_candidate` shares the publication's
+/// read service when [`PathChanges::resolve`] dropped every observed path, so no file was
+/// read again and no lexical write is owed. Such a capture answers
+/// [`CapturedRebuild::Unchanged`], and the caller stamps the publication with the
+/// observation's epoch instead of publishing and handing on a twin of it.
+///
 /// The supervisor's cancellation is checked at the phase boundaries: before the capture
 /// runs, and before the candidate's lexical write is derived. A stop that lands during a
 /// long scan therefore ends the attempt at the next boundary, with its work returned.
@@ -2351,7 +2414,8 @@ pub(crate) fn capture_rebuild_with(
         validation.restore_pending(request.work);
         return Ok(CapturedRebuild::Cancelled);
     }
-    request.previous = Some(published.blocking_read().snapshot().0);
+    let previous = published.blocking_read().snapshot().0;
+    request.previous = Some(Arc::clone(&previous));
     let candidate = match capture(root, limits, &request) {
         Ok(candidate) => candidate,
         Err(error) => {
@@ -2371,6 +2435,14 @@ pub(crate) fn capture_rebuild_with(
         validation.restore_pending(request.work);
         return Ok(CapturedRebuild::Cancelled);
     }
+    let unchanged = change_set.is_empty()
+        && candidate.configuration.fingerprint == previous.configuration.fingerprint;
+    if unchanged {
+        return Ok(CapturedRebuild::Unchanged {
+            published: candidate,
+            work: request.work,
+        });
+    }
     let write = lexical_write(&candidate, &change_set);
     Ok(CapturedRebuild::Candidate {
         published: candidate,
@@ -2386,18 +2458,13 @@ pub(crate) fn finish_rebuild(
     validation: &IndexValidation,
     candidate: Arc<PublishedWorkspace>,
     work: PendingWork,
-    epoch: u64,
     lexical: Option<LexicalHandoff>,
 ) -> RebuildOutcome {
     let outcome = publish_rebuild_after(published, validation, candidate, lexical, || {});
-    match outcome {
-        RebuildOutcome::Published => {
-            trace_publication(epoch);
-            validation.changed.notify_waiters();
-        }
-        RebuildOutcome::Superseded | RebuildOutcome::Cancelled => {
-            validation.restore_pending(work);
-        }
+    if outcome == RebuildOutcome::Published {
+        validation.changed.notify_waiters();
+    } else {
+        validation.restore_pending(work);
     }
     outcome
 }
@@ -3760,13 +3827,14 @@ mod tests {
         let supervisor = super::IndexSupervisor {
             validation: Arc::clone(&validation),
         };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let error = supervisor
-            .shutdown()
+            .shutdown(deadline)
             .await
             .expect_err("a stuck supervisor must miss the shutdown deadline");
         assert_eq!(error.descriptor().code(), "temporarily_unavailable");
         supervisor
-            .shutdown()
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(30))
             .await
             .map_err(|error| format!("second shutdown must be idempotent: {error:?}"))?;
         Ok(())

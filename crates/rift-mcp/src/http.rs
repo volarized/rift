@@ -233,35 +233,43 @@ impl HttpServer {
         &self.identity
     }
 
-    /// Waits until the server stopped and its index supervisor shut down.
+    /// Waits until the server stopped and its index supervisor shut down,
+    /// bounded by `deadline`.
     ///
     /// Resolves after the serve loop ended - through the external shutdown
-    /// token, an authorized `POST /api/stop`, or the idle timeout - and the
-    /// workspace index supervisor finished within its shutdown deadline.
+    /// token, an authorized `POST /api/stop`, or the idle timeout. The engines
+    /// then shut down in parallel and the index supervisor joins, both under
+    /// `deadline`: it is the whole stop's shared deadline, so each stage takes
+    /// only what the one before it left, and work that outlasts it is killed
+    /// rather than waited on.
     ///
     /// # Errors
     ///
-    /// Returns [`HttpServeError`] when the supervisor missed its shutdown
-    /// deadline or a serving task failed.
+    /// Returns [`HttpServeError`] when the supervisor outlasted `deadline` or a
+    /// serving task failed.
     ///
     /// # Cancel safety
     ///
     /// Dropping this future detaches the serving tasks; a shutdown already
     /// triggered still completes in the background.
-    pub async fn stopped(self) -> Result<(), HttpServeError> {
+    pub async fn stopped(self, deadline: Instant) -> Result<(), HttpServeError> {
         let serve_result = classify_serve_outcome(self.serving.await);
         // The serve loop can end on its own I/O error, where nothing has
         // cancelled the token yet; cancelling here unblocks the idle watch
         // on every path.
         self.stop.cancel();
         let idle_outcome = self.idle_watch.await;
-        self.engines.shutdown().await;
+        let engines_stopped = tokio::time::timeout_at(deadline, self.engines.shutdown())
+            .await
+            .is_ok();
         let supervisor_outcome = self
             .supervisor
-            .shutdown()
+            .shutdown(deadline)
             .await
             .map_err(HttpServeFault::workspace);
-        let outcome = stop_outcome_label(supervisor_outcome.is_ok() && serve_result.is_ok());
+        let outcome = stop_outcome_label(
+            supervisor_outcome.is_ok() && serve_result.is_ok() && engines_stopped,
+        );
         tracing::info!(
             component = "mcp",
             transport = "http",

@@ -41,6 +41,7 @@ use rift_protocol::read::Language;
 use rift_protocol::retry::RestartPolicy;
 use rift_protocol::workspace::LspState;
 use tokio::sync::{Mutex, watch};
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use rift_lsp::session::EngineReadiness;
@@ -197,29 +198,25 @@ impl EnginePool {
         Some(*slot.reported_state.borrow())
     }
 
-    /// Ends every running engine with the session's own bounded shutdown.
+    /// Ends every running engine at once, each with the session's own bounded shutdown.
     ///
-    /// The walk locks one slot at a time, so a request in flight on an
-    /// engine finishes - or times out - before that engine is ended.
+    /// Each engine ends under its own slot's lock, so a request in flight on
+    /// it finishes - or times out - first; the engines end side by side, so
+    /// the pool's shutdown takes one session's bound rather than their sum.
     ///
     /// # Cancel safety
     ///
-    /// Dropping the future mid-walk leaves the remaining sessions in
-    /// their slots; dropping the pool then kills their children through
-    /// the session's kill-on-drop arming.
+    /// Dropping the future aborts every shutdown still running: a session an
+    /// aborted shutdown had taken is dropped with kill-on-drop armed, and one
+    /// still in its slot is killed the same way when the pool drops.
     pub async fn shutdown(&self) {
+        let mut ending = JoinSet::new();
         for slot in self.engines.values() {
-            let mut held = slot.state.lock().await;
-            if let Some(session) = held.session.take() {
-                let stderr = session.shutdown().await;
-                slot.report_state(LspState::Stopped);
-                let engine = slot.name();
-                tracing::debug!(
-                    component = "engine",
-                    engine,
-                    stderr_bytes = stderr.total_bytes,
-                    "language engine shut down"
-                );
+            ending.spawn(Arc::clone(slot).end_session());
+        }
+        while let Some(ended) = ending.join_next().await {
+            if let Err(error) = ended {
+                tracing::warn!(component = "engine", %error, "an engine shutdown task failed");
             }
         }
     }
@@ -236,11 +233,7 @@ impl EnginePool {
             if reused {
                 continue;
             }
-            let mut held = slot.state.lock().await;
-            if let Some(session) = held.session.take() {
-                let _stderr = session.shutdown().await;
-                slot.report_state(LspState::Stopped);
-            }
+            Arc::clone(slot).end_session().await;
         }
     }
 }
@@ -396,6 +389,23 @@ fn restart_may_help(error: &EngineError) -> bool {
 }
 
 impl EngineSlot {
+    /// Ends the running session under the slot's lock and reports the slot stopped.
+    async fn end_session(self: Arc<Self>) {
+        let mut held = self.state.lock().await;
+        let Some(session) = held.session.take() else {
+            return;
+        };
+        let stderr = session.shutdown().await;
+        self.report_state(LspState::Stopped);
+        let engine = self.name();
+        tracing::debug!(
+            component = "engine",
+            engine,
+            stderr_bytes = stderr.total_bytes,
+            "language engine shut down"
+        );
+    }
+
     /// Publishes one nonblocking workspace-resource state observation.
     fn report_state(&self, state: LspState) {
         self.reported_state.send_replace(state);

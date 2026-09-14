@@ -37,6 +37,9 @@ Callers read code through these tools:
 | [`search`](#tool-search) | ranked files and symbols across the workspace tree |
 | [`nodes`](#tool-nodes) | the syntax nodes covering one position, with witnessed addresses |
 
+The index never follows or indexes a symlink, so no read returns one; the file a link points
+at answers under its own path.
+
 `get_symbol` and `search` page by `page_index`. The request names the zero-based page under its
 `limit`, at most 10,000, and the result's `pagination` carries the served `page_index` and the
 true `total_pages`; a larger `limit` is refused as `invalid_request` naming the field. The server
@@ -155,7 +158,9 @@ from the served revision along the declaration's current path, bounded by the `m
 key in [`[providers.history]`](/docs/configuration#providers) and by a shallow clone's
 boundary, and classifies what each touching revision did: `introduced`, `body_changed`,
 `signature_changed`, `removed`, or `decorators_changed`. A revision whose source cannot be
-parsed, or where the symbol is absent, contributes no version.
+parsed, or where the symbol is absent, contributes no version. `complete` says whether the
+walk reached the repository's first commit; `false` means one of those bounds ended it first,
+so revisions older than the listed ones may have touched the symbol.
 
 ### Dependency scope [#get_symbol-scope]
 
