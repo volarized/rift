@@ -45,8 +45,12 @@ the last page returns an empty page whose `pagination` still carries the true `t
 
 Every read result also carries `warnings`. A `stale_index` warning reports an answer computed
 from an index that lags the tree the read captured, and names the two tree revision digests that
-disagree. A read served while the last rebuild's failure stands carries it too, with a `detail`
-naming the failure; the next filesystem event retries the rebuild.
+disagree.
+
+A read served while the last rebuild's failure stands carries `stale_index` too, with a `detail`
+naming the failure; the next filesystem event retries the rebuild. When its two digests are equal,
+the tree moved in recorded files outside the syntax-indexed ones or in the configuration file, and
+`detail` says which.
 
 The search ranking tiers carry their own warnings:
 
