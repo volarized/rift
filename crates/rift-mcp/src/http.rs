@@ -234,36 +234,49 @@ impl HttpServer {
     }
 
     /// Waits until the server stopped and its index supervisor shut down,
-    /// bounded by `budget` from the moment serving ended.
+    /// bounded by `budget` from the moment the stop began.
     ///
-    /// Resolves after the serve loop ended - through the external shutdown
-    /// token, an authorized `POST /api/stop`, or the idle timeout. The stop's
-    /// deadline is derived there, `budget` after the serving task joined, so
-    /// the span the server spent listening never spends it. The engines then
-    /// shut down in parallel and the index supervisor joins, both under that
-    /// deadline: each stage takes only what the one before it left, and work
-    /// that outlasts it is killed rather than waited on. The returned deadline
-    /// is that same instant, so the caller's later stop stages share it.
+    /// Resolves after the stop began - the external shutdown token, an
+    /// authorized `POST /api/stop`, or the idle timeout cancels this server's
+    /// token - or after the serve loop ended on its own I/O failure, which
+    /// cancels nothing. The deadline is derived there, so the span the server
+    /// spent listening never spends it. The serving task's drain of the
+    /// requests still in flight, the engines' shutdown, and the index
+    /// supervisor's join all run under that one deadline: each stage takes
+    /// only what the one before it left, and a stage that outlasts it is not
+    /// waited on. The drain takes its share of the same budget because the
+    /// process leaves either way; reported unfinished, it tells the caller
+    /// that requests were still running when the budget ran out and that
+    /// those callers get no answer, while the election releases and the
+    /// process exits on time. The returned deadline is that same instant, so
+    /// the caller's later stop stages share it.
     ///
     /// # Errors
     ///
     /// The second tuple element carries [`HttpServeError`] when the supervisor
-    /// outlasted the deadline or a serving task failed.
+    /// or the drain outlasted the deadline, or a serving task failed.
     ///
     /// # Cancel safety
     ///
     /// Dropping this future detaches the serving tasks; a shutdown already
     /// triggered still completes in the background.
     pub async fn stopped(self, budget: Duration) -> (Instant, Result<(), HttpServeError>) {
-        let serve_result = classify_serve_outcome(self.serving.await);
-        // The serving task runs for the server's whole life, so the stop's
-        // deadline starts where that task ended: a deadline taken before it
-        // joined is already spent when the stop arrives.
+        let mut serving = self.serving;
+        let ended_before_the_stop = tokio::select! {
+            outcome = &mut serving => Some(outcome),
+            () = self.stop.cancelled() => None,
+        };
+        // The stop's deadline starts where the stop began: one derived where
+        // the server began listening is already spent when the stop arrives.
         let deadline = Instant::now() + budget;
         // The serve loop can end on its own I/O error, where nothing has
         // cancelled the token yet; cancelling here unblocks the idle watch
         // on every path.
         self.stop.cancel();
+        let serve_result = match ended_before_the_stop {
+            Some(outcome) => classify_serve_outcome(outcome),
+            None => drained_serve_outcome(&mut serving, deadline).await,
+        };
         let idle_outcome = self.idle_watch.await;
         let engines_stopped = tokio::time::timeout_at(deadline, self.engines.shutdown())
             .await
@@ -299,6 +312,24 @@ fn classify_serve_outcome(
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(HttpServeFault::serve("http serve loop", error)),
         Err(error) => Err(HttpServeFault::serve("http serve task", error)),
+    }
+}
+
+/// Joins the serving task by `deadline`, the stop's shared deadline.
+///
+/// The drain runs the requests still in flight when the stop began, so it
+/// takes only what `deadline` leaves it: the process exits whether or not
+/// those requests finished, and every later stage of the stop - the engines,
+/// the index supervisor, the log drain, and the election's release - waits
+/// behind this one. A drain that outlasts the deadline is reported unfinished
+/// and left to the process's own exit.
+async fn drained_serve_outcome(
+    serving: &mut JoinHandle<Result<(), std::io::Error>>,
+    deadline: Instant,
+) -> Result<(), HttpServeError> {
+    match tokio::time::timeout_at(deadline, serving).await {
+        Ok(joined) => classify_serve_outcome(joined),
+        Err(elapsed) => Err(HttpServeFault::serve("http serve drain", elapsed)),
     }
 }
 
@@ -811,7 +842,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_stop_budget_starts_where_serving_ended() {
+    async fn the_stop_budget_starts_where_a_serve_loop_ended_on_its_own() {
         /// How long the server serves before its loop ends. It outlasts the
         /// budget, so a deadline taken where serving began is already spent.
         const SERVE_SPAN: Duration = Duration::from_secs(30);
@@ -850,8 +881,8 @@ mod tests {
         assert_eq!(
             deadline,
             served_until + STOP_BUDGET,
-            "the stop's deadline starts where serving ended: served_until={served_until:?}, \
-             budget={STOP_BUDGET:?}, deadline={deadline:?}"
+            "a serve loop that ended on its own begins the stop: \
+             served_until={served_until:?}, budget={STOP_BUDGET:?}, deadline={deadline:?}"
         );
         assert_eq!(
             Instant::now(),
@@ -860,6 +891,55 @@ mod tests {
         );
         let error = stopped.expect_err("a supervisor that never joins must miss the deadline");
         assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_serving_drain_that_never_ends_still_returns_by_the_deadline() {
+        /// The budget every stage of the stop shares.
+        const STOP_BUDGET: Duration = Duration::from_secs(8);
+
+        let directory = tempfile::tempdir().expect("the fixture root must be created");
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let stop = CancellationToken::new();
+        let server = HttpServer {
+            port: SERVER_PORT_MIN,
+            token: mint_token().expect("token must mint"),
+            identity: ProductIdentity {
+                version: "0.0.9".to_owned(),
+                executable_digest: "a".repeat(64),
+                schema_digest: "b".repeat(64),
+            },
+            stop: stop.clone(),
+            // A request the stop never finishes draining: axum's graceful
+            // shutdown holds the serving task until it completes.
+            serving: tokio::spawn(std::future::pending::<Result<(), std::io::Error>>()),
+            idle_watch: tokio::spawn(std::future::ready(())),
+            supervisor: IndexSupervisor { validation },
+            engines: Arc::new(EngineHold::new(
+                directory.path().to_path_buf(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )),
+        };
+
+        let started = Instant::now();
+        stop.cancel();
+        let (deadline, stopped) = server.stopped(STOP_BUDGET).await;
+        assert_eq!(
+            deadline,
+            started + STOP_BUDGET,
+            "the stop's deadline starts where the stop began: started={started:?}, \
+             budget={STOP_BUDGET:?}, deadline={deadline:?}"
+        );
+        assert_eq!(
+            Instant::now(),
+            deadline,
+            "an unfinished drain must give up exactly at the deadline"
+        );
+        let error = stopped.expect_err("a drain that never ends must report the stop unfinished");
+        let rendered = error.to_string();
+        assert!(rendered.contains("http serve drain"), "{rendered}");
     }
 
     #[test]

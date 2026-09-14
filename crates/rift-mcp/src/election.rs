@@ -604,7 +604,7 @@ impl ElectedServer {
     }
 
     /// Waits until the server stopped, bounded by `budget` from the moment
-    /// serving ended, and hands the election guard back so the caller
+    /// the stop began, and hands the election guard back so the caller
     /// releases it last.
     ///
     /// The document is not retired here: the caller drops the returned guard

@@ -42,12 +42,13 @@ const STOP_POLL_ATTEMPT_COUNT: u32 = 100;
 const STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the whole server-side stop has, shared by every stage under it.
 ///
-/// The stop derives its deadline from this span where serving ends, never
-/// where the server started listening. The span sits under [`STOP_WAIT_MAX`],
-/// so the process leaves before the CLI stop that asked for it gives up
-/// waiting. Serving ends, the engines shut down in parallel, the index
-/// supervisor joins, and the log drain's final flush runs, each taking only
-/// what the stage before it left of that deadline.
+/// The stop derives its deadline where the stop begins, never where the
+/// server started listening. The span sits under [`STOP_WAIT_MAX`], so the
+/// process leaves before the CLI stop that asked for it gives up waiting.
+/// The serving task drains the requests still in flight, the engines shut
+/// down in parallel, the index supervisor joins, and the log drain's final
+/// flush runs, each taking only what the stage before it left of that
+/// deadline.
 const SERVER_STOP_DEADLINE: Duration = Duration::from_secs(8);
 /// Wall-clock span between two polls of the store while following.
 const LOG_FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -431,7 +432,7 @@ pub(super) async fn run(
                 .await
                 .map(|()| None),
         },
-        ServerCommand::Stop => stop(root).await.map(Some),
+        ServerCommand::Stop => stop(root, STOP_POLL_ATTEMPT_COUNT).await.map(Some),
         ServerCommand::Restart => restart(root).await.map(Some),
         ServerCommand::Status => Ok(Some(status(root))),
         ServerCommand::Logs {
@@ -638,12 +639,12 @@ async fn await_election_released(
 /// tracing layer queued into the workspace database until the same token
 /// stops it.
 ///
-/// The stop runs in one order under [`SERVER_STOP_DEADLINE`]: serving ends,
-/// the engines and index supervisor shut down, the log drain's final flush
-/// runs, and only then is the election released, by dropping the guard right
-/// before the process exits - so a stop the CLI reports as success means the
-/// process is leaving. The deadline starts where serving ends, and each stage
-/// takes only what the one before it left of it.
+/// The stop runs in one order under [`SERVER_STOP_DEADLINE`]: the serving
+/// task drains, the engines and index supervisor shut down, the log drain's
+/// final flush runs, and only then is the election released, by dropping the
+/// guard right before the process exits - so a stop the CLI reports as
+/// success means the process is leaving. The deadline starts where the stop
+/// begins, and each stage takes only what the one before it left of it.
 async fn serve_foreground(
     root: &Path,
     drain: Option<LogDrain>,
@@ -748,14 +749,19 @@ fn foreground_refused(root: &Path, error: ElectionError) -> ServerCommandError {
 /// Stops the serving server, treating a workspace without one as done.
 ///
 /// A server still building has no port to ask: the outcome says it is
-/// starting, and a later stop reaches it once it serves. A server that
-/// stopped answering its port is already on its way out and retires its own
-/// document.
-async fn stop(root: &Path) -> Result<ServerOutcome, ServerCommandError> {
+/// starting, and a later stop reaches it once it serves. Every path that
+/// reports a stop first waits for the election to release, so a reported stop
+/// means the process is leaving: the port closes where the stop begins and
+/// the election releases where it ends, so a server that stopped answering
+/// its port is one step of that wait, never its answer. `attempt_count`
+/// bounds the wait; the commands pass [`STOP_POLL_ATTEMPT_COUNT`], which
+/// derives from [`STOP_WAIT_MAX`] over the poll interval.
+async fn stop(root: &Path, attempt_count: u32) -> Result<ServerOutcome, ServerCommandError> {
     let lock = match probe(root) {
         ServerPresence::Serving(lock) => lock,
         ServerPresence::Starting => return Ok(ServerOutcome::Starting { pid: None }),
-        ServerPresence::Stale(StaleReason::PortUnreachable { .. }) => {
+        ServerPresence::Stale(StaleReason::PortUnreachable { pid }) => {
+            await_election_released(root, pid, attempt_count).await?;
             return Ok(ServerOutcome::Stopped);
         }
         ServerPresence::Stale(_) => {
@@ -764,28 +770,19 @@ async fn stop(root: &Path) -> Result<ServerOutcome, ServerCommandError> {
         }
         ServerPresence::Absent => return Ok(ServerOutcome::NotRunning),
     };
-    match request_stop(&lock).await? {
-        StopAnswer::Accepted => {
-            await_stopped(root, lock, STOP_POLL_ATTEMPT_COUNT).await?;
-            Ok(ServerOutcome::Stopped)
-        }
-        StopAnswer::NothingListening => Ok(ServerOutcome::Stopped),
-    }
-}
-
-/// How the recorded server answered the stop request.
-#[derive(Debug)]
-enum StopAnswer {
-    /// `202`: the server accepted the stop and is shutting down.
-    Accepted,
-    /// The connection was refused: nothing listens on the recorded port,
-    /// so the server is already gone.
-    NothingListening,
+    request_stop(&lock).await?;
+    await_stopped(root, lock, attempt_count).await?;
+    Ok(ServerOutcome::Stopped)
 }
 
 /// Delivers the authorized stop request, bounded by
 /// [`STOP_REQUEST_TIMEOUT`].
-async fn request_stop(lock: &ServerLock) -> Result<StopAnswer, ServerCommandError> {
+///
+/// Two answers mean the stop was delivered: `202`, the server accepting it,
+/// and a refused connect, nothing listening on the recorded port because
+/// serving has already ended. Neither says the process is gone, so the
+/// caller waits for the election either way.
+async fn request_stop(lock: &ServerLock) -> Result<(), ServerCommandError> {
     let request_failed =
         |source: reqwest::Error| Error::new(ServerCommandFault::StopRequestFailed { source });
     let client = reqwest::Client::builder()
@@ -798,13 +795,11 @@ async fn request_stop(lock: &ServerLock) -> Result<StopAnswer, ServerCommandErro
         .send()
         .await;
     match answer {
-        Ok(response) if response.status() == reqwest::StatusCode::ACCEPTED => {
-            Ok(StopAnswer::Accepted)
-        }
+        Ok(response) if response.status() == reqwest::StatusCode::ACCEPTED => Ok(()),
         Ok(response) => Err(Error::new(ServerCommandFault::StopRefused {
             status: response.status(),
         })),
-        Err(error) if error.is_connect() => Ok(StopAnswer::NothingListening),
+        Err(error) if error.is_connect() => Ok(()),
         Err(error) => Err(request_failed(error)),
     }
 }
@@ -854,7 +849,7 @@ fn discard_stale_document(root: &Path) {
 
 /// Stops the serving server, then starts a fresh detached one.
 async fn restart(root: &Path) -> Result<ServerOutcome, ServerCommandError> {
-    stop(root).await?;
+    stop(root, STOP_POLL_ATTEMPT_COUNT).await?;
     start_detached(root).await
 }
 
@@ -1123,7 +1118,8 @@ mod tests {
         await_election_released, await_serving, await_stopped, discard_stale_document,
         foreground_refused, holder_evidence, label, level_glyph, logs_mode, logs_query,
         logs_unavailable, now_ms, print_logs, rendered_fields, rendered_line, rendered_timestamp,
-        stale_reason_phrase, start_detached, start_mode, status, stop, stop_log_drain,
+        request_stop, stale_reason_phrase, start_detached, start_mode, status, stop,
+        stop_log_drain,
     };
     use jiff::tz::{Offset, TimeZone};
     use rift_core::Error;
@@ -1764,7 +1760,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let _guard = rift_mcp::claim(directory.path())?;
         assert_eq!(
-            stop(directory.path()).await?,
+            stop(directory.path(), STOP_POLL_ATTEMPT_COUNT).await?,
             ServerOutcome::Starting { pid: None }
         );
         Ok(())
@@ -1791,18 +1787,56 @@ mod tests {
         assert_eq!(passed.descriptor().code(), "storage_failure");
     }
 
-    /// A holder whose port refuses is already shutting down and retires its own document.
+    /// A holder whose port refuses is shutting down, and the election it still holds
+    /// is what the stop waits on: a port that no longer answers is one step of that
+    /// wait, never the answer.
     #[tokio::test]
-    async fn stop_treats_a_dead_recorded_port_as_stopped() -> TestResult {
+    async fn stop_refuses_while_a_dead_port_holder_keeps_the_election() -> TestResult {
         let directory = tempfile::tempdir()?;
         let guard = rift_mcp::claim(directory.path())?;
-        guard.publish(&holder_on(dead_port()?))?;
-        let outcome = stop(directory.path()).await?;
-        assert_eq!(outcome, ServerOutcome::Stopped);
+        let holder = holder_on(dead_port()?);
+        guard.publish(&holder)?;
+        let error = stop(directory.path(), 1)
+            .await
+            .expect_err("a held election must refuse the stop");
+        assert!(
+            matches!(
+                error.fault(),
+                ServerCommandFault::ElectionUnreleased { pid } if *pid == holder.pid
+            ),
+            "the refusal must name the holder that kept the election: {error:?}"
+        );
         assert!(
             rift_mcp::document_path(directory.path()).exists(),
             "the stop leaves the document to its holder"
         );
+        Ok(())
+    }
+
+    /// A refused connect delivers the stop: nothing listens on the recorded port, so
+    /// serving has already ended and only the election is left to wait on.
+    #[tokio::test]
+    async fn stop_request_treats_a_refused_connect_as_delivered() -> TestResult {
+        request_stop(&holder_on(dead_port()?)).await?;
+        Ok(())
+    }
+
+    /// The stop reports success once the holder releases the election, even though its
+    /// port stopped answering first.
+    #[tokio::test]
+    async fn stop_reports_stopped_once_the_dead_port_holder_releases_the_election() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let guard = rift_mcp::claim(directory.path())?;
+        guard.publish(&holder_on(dead_port()?))?;
+        let released = tokio::spawn(async move {
+            tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
+            drop(guard);
+        });
+        assert_eq!(
+            stop(directory.path(), STOP_POLL_ATTEMPT_COUNT).await?,
+            ServerOutcome::Stopped
+        );
+        released.await?;
         Ok(())
     }
 
@@ -1818,7 +1852,7 @@ mod tests {
         );
         let serving = tokio::spawn(axum::serve(listener, refuser).into_future());
         guard.publish(&holder_on(port))?;
-        let error = stop(directory.path())
+        let error = stop(directory.path(), STOP_POLL_ATTEMPT_COUNT)
             .await
             .expect_err("a refusing server must fail the stop");
         serving.abort();
