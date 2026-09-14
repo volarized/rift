@@ -22,7 +22,8 @@ use rift_provider::{
     AssembledSymbol, Component, CompositionBuilder, NormalizedGraph, ProviderComposition,
 };
 use rift_syntax::{
-    SyntaxDocument, SyntaxError, SyntaxNode, SyntaxProvider, SyntaxSource, SyntaxSymbol, registry,
+    SyntaxDocument, SyntaxError, SyntaxNode, SyntaxProvider, SyntaxSource, SyntaxSymbol,
+    SyntaxViolation, registry,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -197,6 +198,41 @@ impl WorkspaceIndexFault {
             .and_then(|source| source.downcast_ref::<rift_history::HistoryError>())
     }
 
+    /// The provider failure behind this fault, which owns a `Syntax` violation's
+    /// registry identity. Only a `Syntax` violation carries a [`SyntaxError`] as
+    /// its source, so the downcast alone decides.
+    fn syntax_source(&self) -> Option<&SyntaxError> {
+        self.source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<SyntaxError>())
+    }
+
+    /// The warning naming `path` when this fault leaves that one file out of
+    /// the index instead of failing the build: a file past the per-file byte
+    /// bound, bytes that are not UTF-8, or a syntax tree the provider refused
+    /// under one of its bounds. `None` for every fault that fails the build.
+    #[must_use]
+    pub fn left_out_file(&self, path: ProjectPath) -> Option<WorkspaceIndexWarning> {
+        match self.violation {
+            WorkspaceIndexViolation::FileTooLarge => {
+                Some(WorkspaceIndexWarning::FileTooLarge(path))
+            }
+            WorkspaceIndexViolation::InvalidSource => {
+                Some(WorkspaceIndexWarning::InvalidUtf8Source(path))
+            }
+            WorkspaceIndexViolation::Syntax => self
+                .syntax_source()
+                .filter(|error| {
+                    error.descriptor().name() == ErrorName::Wire(ErrorCode::LimitExceeded)
+                })
+                .map(|error| WorkspaceIndexWarning::SyntaxTooLarge {
+                    path,
+                    violation: error.fault().violation(),
+                }),
+            _ => None,
+        }
+    }
+
     /// Returns involved filesystem path when available.
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
@@ -227,14 +263,10 @@ impl Fault for WorkspaceIndexFault {
                 ErrorName::Wire(ErrorCode::ContentUnavailable)
             }
             WorkspaceIndexViolation::Filesystem => ErrorName::Wire(ErrorCode::StorageFailure),
-            WorkspaceIndexViolation::Syntax => self
-                .source
-                .as_deref()
-                .and_then(|source| source.downcast_ref::<SyntaxError>())
-                .map_or_else(
-                    || ErrorName::Wire(ErrorCode::InternalError),
-                    |error| error.descriptor().name(),
-                ),
+            WorkspaceIndexViolation::Syntax => self.syntax_source().map_or_else(
+                || ErrorName::Wire(ErrorCode::InternalError),
+                |error| error.descriptor().name(),
+            ),
             WorkspaceIndexViolation::Provider => ErrorName::Wire(ErrorCode::InternalError),
             WorkspaceIndexViolation::History => self.history_source().map_or_else(
                 || ErrorName::Wire(ErrorCode::InternalError),
@@ -558,8 +590,9 @@ impl WorkspaceFingerprint {
     fn from_files(
         files: &BTreeMap<ProjectPath, Arc<IndexedFile>>,
         text_files: &BTreeMap<ProjectPath, Arc<TextSourceFile>>,
+        left_out: &BTreeMap<ProjectPath, LeftOutFileState>,
     ) -> Self {
-        Self::from_digests(&keyed_digests(files, text_files))
+        Self::from_digests(&keyed_digests(files, text_files, left_out))
     }
 
     /// Folds every visible file's digest in project-path order.
@@ -942,7 +975,7 @@ impl WorkspaceSourcePolicy {
     }
 }
 
-/// One file omitted from the baseline content catalog.
+/// One file the build left out of the index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceIndexWarning {
     /// File bytes are not valid UTF-8.
@@ -951,12 +984,131 @@ pub enum WorkspaceIndexWarning {
     BinarySource(ProjectPath),
     /// File exceeds the configured per-file byte bound.
     FileTooLarge(ProjectPath),
+    /// The syntax provider refused the file under one of its bounds.
+    SyntaxTooLarge {
+        /// The file left out.
+        path: ProjectPath,
+        /// Which bound the provider's refusal names.
+        violation: SyntaxViolation,
+    },
 }
 
-/// Outcome of reading one baseline catalog candidate.
-enum CatalogRead {
-    Included(TextSourceFile),
+/// Outcome of reading one file into the index: held, or left out with the
+/// warning that names it.
+enum IndexRead<File> {
+    Included(File),
     Skipped(WorkspaceIndexWarning),
+}
+
+impl<File> IndexRead<File> {
+    /// Leaves one file out, recording the warning that names it once, at the
+    /// build that read it.
+    fn left_out(warning: WorkspaceIndexWarning) -> Self {
+        tracing::warn!(
+            component = "index",
+            operation = "index.build",
+            path = warning.path().as_str(),
+            reason = %warning.reason(),
+            "file left out of the index"
+        );
+        Self::Skipped(warning)
+    }
+}
+
+/// What the index keeps of a file it read and left out: the two digests a capture of
+/// the tree and a watcher observation compare against, and nothing it could serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LeftOutFileState {
+    /// Digest of the bytes alone, what `WorkspaceIndex::digest` answers.
+    content: FileDigest,
+    /// Digest of the bytes and the executable bit, what `WorkspaceIndex::digests` answers.
+    state: FileDigest,
+}
+
+impl LeftOutFileState {
+    fn of(file: &TextSourceFile) -> Self {
+        Self {
+            content: file.digest(),
+            state: FileDigest::of_file_state(file.content().as_bytes(), file.executable()),
+        }
+    }
+}
+
+/// The files one build holds and the files it left out, gathered before the index is
+/// assembled over them.
+#[derive(Default)]
+struct IndexContents {
+    files: BTreeMap<ProjectPath, Arc<IndexedFile>>,
+    text_files: BTreeMap<ProjectPath, Arc<TextSourceFile>>,
+    left_out: BTreeMap<ProjectPath, LeftOutFileState>,
+    warnings: Vec<WorkspaceIndexWarning>,
+}
+
+impl IndexContents {
+    /// The previous index's contents, less every path `changes` names: a rebuild reads
+    /// those again, and a warning the previous index carried for one of them goes with it.
+    fn carried_from(index: &WorkspaceIndex, changes: &PathChanges) -> Self {
+        let touched: BTreeSet<&ProjectPath> = changes.paths().collect();
+        let mut contents = Self {
+            files: index.files.clone(),
+            text_files: index.text_files.clone(),
+            left_out: index.left_out.clone(),
+            warnings: index
+                .warnings
+                .iter()
+                .filter(|warning| !touched.contains(warning.path()))
+                .cloned()
+                .collect(),
+        };
+        for path in changes.paths() {
+            contents.files.remove(path);
+            contents.text_files.remove(path);
+            contents.left_out.remove(path);
+        }
+        contents
+    }
+
+    /// Holds one cataloged file a provider claims: in both maps when its syntax facts fit
+    /// the provider's bounds. A file the provider refuses under one of its bounds keeps
+    /// only its digests, so a capture of the tree still agrees with the index, and
+    /// `warnings` names it.
+    fn hold_source_file(
+        &mut self,
+        text_file: TextSourceFile,
+        context_path: &Path,
+        provider: &dyn SyntaxProvider,
+    ) -> Result<(), WorkspaceIndexError> {
+        match syntax_read(&text_file, context_path, provider)? {
+            IndexRead::Included(file) => {
+                self.files.insert(file.path().clone(), Arc::new(file));
+                self.hold_text_file(text_file);
+            }
+            IndexRead::Skipped(warning) => {
+                self.left_out
+                    .insert(text_file.path().clone(), LeftOutFileState::of(&text_file));
+                self.warnings.push(warning);
+            }
+        }
+        Ok(())
+    }
+
+    /// Holds one cataloged file no provider claims.
+    fn hold_text_file(&mut self, text_file: TextSourceFile) {
+        self.text_files
+            .insert(text_file.path().clone(), Arc::new(text_file));
+    }
+
+    /// Records one file the catalog read left out.
+    fn leave_out(&mut self, warning: WorkspaceIndexWarning) {
+        self.warnings.push(warning);
+    }
+
+    /// The same contents with the warnings in project-path order.
+    fn sorted(mut self) -> Self {
+        self.warnings
+            .sort_by(|left, right| left.path().cmp(right.path()));
+        self
+    }
 }
 
 impl WorkspaceIndexWarning {
@@ -964,8 +1116,23 @@ impl WorkspaceIndexWarning {
     #[must_use]
     pub fn path(&self) -> &ProjectPath {
         match self {
-            Self::InvalidUtf8Source(path) | Self::BinarySource(path) | Self::FileTooLarge(path) => {
-                path
+            Self::InvalidUtf8Source(path)
+            | Self::BinarySource(path)
+            | Self::FileTooLarge(path)
+            | Self::SyntaxTooLarge { path, .. } => path,
+        }
+    }
+
+    /// Why the file is absent from the index, as the clause that follows its
+    /// path.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        match self {
+            Self::InvalidUtf8Source(_) => "holds bytes that are not valid UTF-8".to_owned(),
+            Self::BinarySource(_) => "contains a NUL byte".to_owned(),
+            Self::FileTooLarge(_) => "exceeds the file byte limit".to_owned(),
+            Self::SyntaxTooLarge { violation, .. } => {
+                format!("exceeds a syntax bound ({})", fault_label(violation))
             }
         }
     }
@@ -981,6 +1148,7 @@ pub struct WorkspaceIndex {
     root: PathBuf,
     files: BTreeMap<ProjectPath, Arc<IndexedFile>>,
     text_files: BTreeMap<ProjectPath, Arc<TextSourceFile>>,
+    left_out: BTreeMap<ProjectPath, LeftOutFileState>,
     composition: ProviderComposition,
     limits: WorkspaceIndexLimits,
     language: Arc<WorkspaceLanguagePolicy>,
@@ -1044,29 +1212,28 @@ impl WorkspaceIndex {
         )?);
         let classified = discover(&root, limits, visibility, &language)?;
         let mut workspace_bytes = 0_usize;
-        let mut warnings = Vec::new();
-        let mut files = BTreeMap::new();
-        let mut text_files = BTreeMap::new();
+        let mut contents = IndexContents::default();
         for (path, provider) in classified.source {
             match read_catalog_file(&root, &path, limits, &mut workspace_bytes)? {
-                CatalogRead::Included(text_file) => {
-                    let file = indexed_file_from_catalog(&text_file, &path, provider)?;
-                    files.insert(file.path().clone(), Arc::new(file));
-                    text_files.insert(text_file.path().clone(), Arc::new(text_file));
+                IndexRead::Included(text_file) => {
+                    contents.hold_source_file(text_file, &path, provider)?;
                 }
-                CatalogRead::Skipped(warning) => warnings.push(warning),
+                IndexRead::Skipped(warning) => contents.leave_out(warning),
             }
         }
         for path in classified.text {
             match read_catalog_file(&root, &path, limits, &mut workspace_bytes)? {
-                CatalogRead::Included(file) => {
-                    text_files.insert(file.path().clone(), Arc::new(file));
-                }
-                CatalogRead::Skipped(warning) => warnings.push(warning),
+                IndexRead::Included(file) => contents.hold_text_file(file),
+                IndexRead::Skipped(warning) => contents.leave_out(warning),
             }
         }
-        warnings.sort_by(|left, right| left.path().cmp(right.path()));
-        let fingerprint = WorkspaceFingerprint::from_files(&files, &text_files);
+        let IndexContents {
+            files,
+            text_files,
+            left_out,
+            warnings,
+        } = contents.sorted();
+        let fingerprint = WorkspaceFingerprint::from_files(&files, &text_files, &left_out);
         let semantics = WorkspaceSemantics::build(
             files.values().map(|file| file.syntax()),
             &project_path_list(&files, &text_files),
@@ -1079,6 +1246,7 @@ impl WorkspaceIndex {
             root,
             files,
             text_files,
+            left_out,
             composition,
             limits,
             language,
@@ -1108,31 +1276,18 @@ impl WorkspaceIndex {
     /// one, and a warning naming it replaces any warning the previous index carried for
     /// that path.
     pub fn rebuilt(&self, changes: &PathChanges) -> Result<Self, WorkspaceIndexError> {
-        let mut files = self.files.clone();
-        let mut text_files = self.text_files.clone();
-        for path in changes.paths() {
-            files.remove(path);
-            text_files.remove(path);
-        }
-        let mut workspace_bytes = Self::indexed_bytes(&files, &text_files);
-        let touched: BTreeSet<&ProjectPath> = changes.paths().collect();
-        let mut warnings: Vec<WorkspaceIndexWarning> = self
-            .warnings
-            .iter()
-            .filter(|warning| !touched.contains(warning.path()))
-            .cloned()
-            .collect();
+        let mut contents = IndexContents::carried_from(self, changes);
+        let mut workspace_bytes = Self::indexed_bytes(&contents.files, &contents.text_files);
         for path in changes.indexed() {
-            self.read_indexed_path(
-                path,
-                &mut files,
-                &mut text_files,
-                &mut workspace_bytes,
-                &mut warnings,
-            )?;
+            self.read_indexed_path(path, &mut contents, &mut workspace_bytes)?;
         }
-        warnings.sort_by(|left, right| left.path().cmp(right.path()));
-        let fingerprint = WorkspaceFingerprint::from_files(&files, &text_files);
+        let IndexContents {
+            files,
+            text_files,
+            left_out,
+            warnings,
+        } = contents.sorted();
+        let fingerprint = WorkspaceFingerprint::from_files(&files, &text_files, &left_out);
         let semantics = WorkspaceSemantics::build(
             files.values().map(|file| file.syntax()),
             &project_path_list(&files, &text_files),
@@ -1145,6 +1300,7 @@ impl WorkspaceIndex {
             root: self.root.clone(),
             files,
             text_files,
+            left_out,
             composition: composition()?,
             limits: self.limits,
             language: Arc::clone(&self.language),
@@ -1160,10 +1316,8 @@ impl WorkspaceIndex {
     fn read_indexed_path(
         &self,
         path: &ProjectPath,
-        files: &mut BTreeMap<ProjectPath, Arc<IndexedFile>>,
-        text_files: &mut BTreeMap<ProjectPath, Arc<TextSourceFile>>,
+        contents: &mut IndexContents,
         workspace_bytes: &mut usize,
-        warnings: &mut Vec<WorkspaceIndexWarning>,
     ) -> Result<(), WorkspaceIndexError> {
         let absolute = self.root.join(path.as_str());
         if !absolute.is_file() {
@@ -1173,14 +1327,13 @@ impl WorkspaceIndex {
             return Ok(());
         };
         match read_catalog_file(&self.root, &absolute, self.limits, workspace_bytes)? {
-            CatalogRead::Included(text_file) => {
-                if let ClassifiedPath::Source(provider) = class {
-                    let indexed_file = indexed_file_from_catalog(&text_file, &absolute, provider)?;
-                    files.insert(indexed_file.path().clone(), Arc::new(indexed_file));
+            IndexRead::Included(text_file) => match class {
+                ClassifiedPath::Source(provider) => {
+                    contents.hold_source_file(text_file, &absolute, provider)?;
                 }
-                text_files.insert(text_file.path().clone(), Arc::new(text_file));
-            }
-            CatalogRead::Skipped(warning) => warnings.push(warning),
+                ClassifiedPath::Text => contents.hold_text_file(text_file),
+            },
+            IndexRead::Skipped(warning) => contents.leave_out(warning),
         }
         Ok(())
     }
@@ -1216,7 +1369,8 @@ impl WorkspaceIndex {
     ) -> Result<Self, WorkspaceIndexError> {
         let files = keyed_by_path(files, IndexedFile::path);
         let text_files = keyed_by_path(text_files, TextSourceFile::path);
-        let fingerprint = WorkspaceFingerprint::from_files(&files, &text_files);
+        let left_out = BTreeMap::new();
+        let fingerprint = WorkspaceFingerprint::from_files(&files, &text_files, &left_out);
         let binding = BindingPolicy::default();
         let semantics = WorkspaceSemantics::build(
             files.values().map(|file| file.syntax()),
@@ -1230,6 +1384,7 @@ impl WorkspaceIndex {
             root,
             files,
             text_files,
+            left_out,
             composition,
             limits,
             language,
@@ -1275,16 +1430,27 @@ impl WorkspaceIndex {
         self.text_files.len()
     }
 
-    /// Every indexed file's digest, in project-path order.
-    ///
-    /// A request that captured the tree itself compares its capture with this to name the
-    /// files that moved.
+    /// How many files this build left out: each past the per-file byte bound,
+    /// not UTF-8, holding a NUL byte, or refused by its syntax provider under
+    /// one of its bounds. Bounded by the walk's own `files_max`, since every
+    /// warning names one walked file.
     #[must_use]
-    pub fn digests(&self) -> WorkspaceDigests {
-        keyed_digests(&self.files, &self.text_files)
+    pub fn left_out_file_count(&self) -> usize {
+        self.warnings.len()
     }
 
-    /// Returns the digest of the bytes indexed at `path`, whichever class holds it.
+    /// Every file's digest this build read, held or left out, in project-path order.
+    ///
+    /// A request that captured the tree itself compares its capture with this to name the
+    /// files that moved, so a file the build left out keeps its digest here: the capture
+    /// reads it without parsing and would otherwise report it as new on every read.
+    #[must_use]
+    pub fn digests(&self) -> WorkspaceDigests {
+        keyed_digests(&self.files, &self.text_files, &self.left_out)
+    }
+
+    /// Returns the digest of the bytes read at `path`, whichever class holds it, the
+    /// files left out included.
     ///
     /// This is what resolves an observation into a change set: the caller hashes the
     /// path's current bytes and compares them with what this publication indexed.
@@ -1294,6 +1460,7 @@ impl WorkspaceIndex {
             .get(path)
             .map(|file| file.digest())
             .or_else(|| self.text_files.get(path).map(|file| file.digest()))
+            .or_else(|| self.left_out.get(path).map(|state| state.content))
     }
 
     /// Derives lexical search units from this index: one unit per indexed symbol, carrying
@@ -1409,10 +1576,11 @@ impl WorkspaceIndex {
             .ok_or_else(|| provider_error(ReadableSymbolMissing { identity }))
     }
 
-    /// Files omitted from baseline content catalog, in project-path order.
+    /// Files the build left out of the index, in project-path order.
     ///
-    /// Build and rebuild continue after invalid UTF-8, NUL bytes, or a file beyond
-    /// configured per-file byte bound.
+    /// Build and rebuild continue after invalid UTF-8, NUL bytes, a file beyond
+    /// the configured per-file byte bound, or a syntax tree the provider refuses
+    /// under one of its bounds.
     #[must_use]
     pub fn warnings(&self) -> &[WorkspaceIndexWarning] {
         &self.warnings
@@ -1610,7 +1778,7 @@ impl WorkspaceIndex {
             if files.len() >= files_max {
                 return Err(index_error_at(WorkspaceIndexViolation::TooManyFiles, path));
             }
-            if let CatalogRead::Included(file) =
+            if let IndexRead::Included(file) =
                 read_catalog_file(&self.root, path, self.limits, &mut extra_bytes)?
             {
                 files.push(file);
@@ -2077,10 +2245,11 @@ impl WorkspaceDigests {
     }
 }
 
-/// One file-state set over both file classes, keyed by project path.
+/// One file-state set over both file classes and the files left out, keyed by project path.
 fn keyed_digests(
     files: &BTreeMap<ProjectPath, Arc<IndexedFile>>,
     text_files: &BTreeMap<ProjectPath, Arc<TextSourceFile>>,
+    left_out: &BTreeMap<ProjectPath, LeftOutFileState>,
 ) -> WorkspaceDigests {
     WorkspaceDigests::new(
         files
@@ -2096,7 +2265,12 @@ fn keyed_digests(
                     path.clone(),
                     FileDigest::of_file_state(file.content().as_bytes(), file.executable()),
                 )
-            })),
+            }))
+            .chain(
+                left_out
+                    .iter()
+                    .map(|(path, state)| (path.clone(), state.state)),
+            ),
     )
 }
 
@@ -2241,6 +2415,22 @@ fn read_file(
     Ok(file)
 }
 
+/// Reads one cataloged file's syntax facts, leaving the file out when the
+/// provider refuses it under one of its bounds.
+fn syntax_read(
+    file: &TextSourceFile,
+    context_path: &Path,
+    provider: &dyn SyntaxProvider,
+) -> Result<IndexRead<IndexedFile>, WorkspaceIndexError> {
+    match indexed_file_from_catalog(file, context_path, provider) {
+        Ok(indexed) => Ok(IndexRead::Included(indexed)),
+        Err(error) => match error.fault().left_out_file(file.path().clone()) {
+            Some(warning) => Ok(IndexRead::left_out(warning)),
+            None => Err(error),
+        },
+    }
+}
+
 pub(crate) fn indexed_file_from_catalog(
     file: &TextSourceFile,
     context_path: &Path,
@@ -2330,7 +2520,7 @@ fn read_catalog_file(
     path: &Path,
     limits: WorkspaceIndexLimits,
     workspace_bytes: &mut usize,
-) -> Result<CatalogRead, WorkspaceIndexError> {
+) -> Result<IndexRead<TextSourceFile>, WorkspaceIndexError> {
     let handle = fs::File::open(path).map_err(|error| {
         index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
     })?;
@@ -2346,23 +2536,23 @@ fn read_catalog_file(
         })?;
     let project_path = project_path_below(root, path)?;
     if bytes.len() > limits.file_bytes_max() {
-        return Ok(CatalogRead::Skipped(WorkspaceIndexWarning::FileTooLarge(
+        return Ok(IndexRead::left_out(WorkspaceIndexWarning::FileTooLarge(
             project_path,
         )));
     }
     if bytes.contains(&0) {
-        return Ok(CatalogRead::Skipped(WorkspaceIndexWarning::BinarySource(
+        return Ok(IndexRead::left_out(WorkspaceIndexWarning::BinarySource(
             project_path,
         )));
     }
     if std::str::from_utf8(&bytes).is_err() {
-        return Ok(CatalogRead::Skipped(
+        return Ok(IndexRead::left_out(
             WorkspaceIndexWarning::InvalidUtf8Source(project_path),
         ));
     }
     let mut file = included_text_file(project_path, bytes, path, limits, workspace_bytes)?;
     file.executable = metadata_is_executable(&metadata);
-    Ok(CatalogRead::Included(file))
+    Ok(IndexRead::Included(file))
 }
 
 #[cfg(unix)]
@@ -4815,6 +5005,187 @@ mod tests {
                 WorkspaceIndexWarning::FileTooLarge(ProjectPath::new("large.rs").expect("path")),
             ]
         );
+        assert_eq!(index.left_out_file_count(), 2);
+    }
+
+    /// Parenthesis nesting past the shipped syntax depth bound of 512.
+    const DEEP_NESTING: usize = 600;
+
+    /// A Rust source whose syntax tree runs deeper than the provider accepts.
+    fn deep_source() -> String {
+        format!(
+            "pub fn deep() -> i32 {{ {open}1{close} }}\n",
+            open = "(".repeat(DEEP_NESTING),
+            close = ")".repeat(DEEP_NESTING),
+        )
+    }
+
+    #[test]
+    fn test_build_leaves_a_file_past_a_syntax_bound_out_and_keeps_the_rest() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        fs::create_dir_all(root.join("src")).expect("fixture directory");
+        fs::write(root.join("src/lib.rs"), "pub fn kept() {}\n").expect("source");
+        fs::write(root.join("src/deep.rs"), deep_source()).expect("deep source");
+        let index = indexed(root, &TextFileInclusion::default());
+        let deep = ProjectPath::new("src/deep.rs").expect("path");
+        assert!(index.file(&deep).is_none(), "the deep file is not indexed");
+        assert!(
+            index.text_file(&deep).is_none(),
+            "the deep file is absent from the text catalog too"
+        );
+        assert!(has_symbol(&index, "kept"), "the normal file still serves");
+        assert_eq!(index.file_count(), 1);
+        assert_eq!(index.left_out_file_count(), 1);
+        // A request-time capture reads the deep file without parsing it, so the index
+        // keeps that file's digest or every read would see a tree that never settles.
+        let capture = capture_digests(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )
+        .expect("the capture must read the tree");
+        assert_eq!(capture.fingerprint(), index.digests().fingerprint());
+        assert_eq!(
+            index.digest(&deep),
+            Some(FileDigest::of(deep_source().as_bytes())),
+            "the left-out file's bytes still resolve an observation"
+        );
+        assert_eq!(
+            index.warnings(),
+            &[WorkspaceIndexWarning::SyntaxTooLarge {
+                path: deep,
+                violation: SyntaxViolation::TooDeep,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_rebuild_leaves_a_file_turned_deep_out_and_holds_it_again_once_repaired() {
+        let directory = fixture();
+        let root = directory.path();
+        let index = indexed(root, &TextFileInclusion::default());
+        let lib_path = ProjectPath::new("src/lib.rs").expect("path");
+        assert!(index.file(&lib_path).is_some());
+
+        fs::write(root.join("src/lib.rs"), deep_source()).expect("deep source");
+        let changes = resolved(&index, root, &["src/lib.rs"]);
+        let deep = index
+            .rebuilt(&changes)
+            .expect("one deep file must not fail rebuild");
+        assert!(deep.file(&lib_path).is_none());
+        assert!(deep.text_file(&lib_path).is_none());
+        assert_eq!(deep.left_out_file_count(), 1);
+        assert_eq!(
+            deep.digest(&lib_path),
+            Some(FileDigest::of(deep_source().as_bytes()))
+        );
+        assert_eq!(
+            deep.warnings(),
+            &[WorkspaceIndexWarning::SyntaxTooLarge {
+                path: lib_path.clone(),
+                violation: SyntaxViolation::TooDeep,
+            }]
+        );
+
+        fs::write(root.join("src/lib.rs"), "pub struct Rift;\n").expect("repaired source");
+        let changes = resolved(&deep, root, &["src/lib.rs"]);
+        let repaired = deep
+            .rebuilt(&changes)
+            .expect("the repaired file must rebuild");
+        assert!(
+            repaired.file(&lib_path).is_some(),
+            "the repaired file is held again"
+        );
+        assert_eq!(repaired.left_out_file_count(), 0);
+        assert_eq!(repaired.digests().fingerprint(), *repaired.fingerprint());
+    }
+
+    #[test]
+    fn test_left_out_file_names_the_per_file_faults_and_no_other() {
+        let path = ProjectPath::new("src/deep.rs").expect("path");
+        let context = Path::new("src/deep.rs");
+        let warning_for = |violation| {
+            index_error_at(violation, context)
+                .fault()
+                .left_out_file(path.clone())
+        };
+        assert_eq!(
+            warning_for(WorkspaceIndexViolation::FileTooLarge),
+            Some(WorkspaceIndexWarning::FileTooLarge(path.clone()))
+        );
+        assert_eq!(
+            warning_for(WorkspaceIndexViolation::InvalidSource),
+            Some(WorkspaceIndexWarning::InvalidUtf8Source(path.clone()))
+        );
+        assert_eq!(
+            warning_for(WorkspaceIndexViolation::WorkspaceTooLarge),
+            None
+        );
+        assert_eq!(warning_for(WorkspaceIndexViolation::Filesystem), None);
+        assert_eq!(
+            warning_for(WorkspaceIndexViolation::Syntax),
+            None,
+            "a syntax fault with no provider refusal behind it fails the build"
+        );
+
+        let strict = RustSyntaxProvider::new(SyntaxLimits::new(1, 1, 1).expect("positive bounds"));
+        let text = TextSourceFile::from_content(path.clone(), "pub fn deep() {}\n".to_owned());
+        let refused = indexed_file_from_catalog(&text, context, &strict)
+            .expect_err("the provider's byte bound refuses the file");
+        assert_eq!(
+            refused.fault().left_out_file(path.clone()),
+            Some(WorkspaceIndexWarning::SyntaxTooLarge {
+                path,
+                violation: SyntaxViolation::SourceTooLarge,
+            })
+        );
+    }
+
+    /// A provider failing outside its bounds: the fault is not one that leaves the file
+    /// out, so the read keeps failing the build.
+    #[derive(Debug)]
+    struct RefusingProvider {
+        language: rift_protocol::read::Language,
+    }
+
+    impl SyntaxProvider for RefusingProvider {
+        fn language(&self) -> &rift_protocol::read::Language {
+            &self.language
+        }
+
+        fn source_bytes_max(&self) -> usize {
+            4_096
+        }
+
+        fn analyze(&self, _source: SyntaxSource<'_>) -> Result<SyntaxDocument, SyntaxError> {
+            Err(rift_core::Error::new(
+                rift_syntax::SyntaxFault::UnknownNodeKind {
+                    kind: "beacon".to_owned(),
+                },
+            ))
+        }
+
+        fn node_facets(&self, _kind: &str) -> Vec<rift_protocol::read::NodeFacet> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn test_syntax_read_keeps_failing_the_build_on_a_provider_fault_outside_its_bounds() {
+        let path = ProjectPath::new("lib.rs").expect("valid path");
+        let text = TextSourceFile::from_content(path.clone(), "pub fn beacon() {}\n".to_owned());
+        let provider = RefusingProvider {
+            language: rift_protocol::read::Language::from_identity_segment("rust")
+                .expect("rust is a language"),
+        };
+
+        let Err(error) = syntax_read(&text, Path::new("/workspace/lib.rs"), &provider) else {
+            panic!("a provider fault outside its bounds fails the build");
+        };
+
+        assert_eq!(error.fault().violation(), WorkspaceIndexViolation::Syntax);
+        assert_eq!(error.fault().left_out_file(path), None);
     }
 
     #[cfg(unix)]

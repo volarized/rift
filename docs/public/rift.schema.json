@@ -712,8 +712,16 @@
     },
     "LexicalSearchConfiguration": {
       "additionalProperties": false,
-      "description": "The `[search.lexical]` table: what the lexical ranking contributes to a\nfused score.",
+      "description": "The `[search.lexical]` table: what the lexical ranking contributes to a\nfused score, and how many units the lexical index holds.",
       "properties": {
+        "units_max": {
+          "default": 1000000,
+          "description": "Most units the lexical index holds: one per indexed file, text chunk,\nand declaration, 1000 to 50000000. A workspace past it refuses its\nrebuild naming this key.",
+          "format": "uint64",
+          "maximum": 50000000,
+          "minimum": 1000,
+          "type": "integer"
+        },
         "weight": {
           "default": 0.7,
           "description": "The lexical ranking's share of a fused score, 0.0 to 1.0. It and\n`[search.semantic].weight` must sum to 1: a fused score is the weighted\naverage of the two rankings, and a pair summing to anything else scales\nevery score rather than trading one ranking against the other.",
@@ -730,7 +738,7 @@
       "description": "The `[logs]` table. The server records its own diagnostics in the workspace\ndatabase, where `rift://logs` reads them back, and this table bounds how\nmany records the store keeps, how many one read returns, and which targets\nare captured at all. The server reads the table at startup, so a change\napplies on the next start.",
       "properties": {
         "capture": {
-          "default": "rift=info,rift_mcp=info,rift_server=info",
+          "default": "rift=info,rift_mcp=info,rift_server=info,rift_index=warn",
           "description": "Which targets are recorded, in the `RUST_LOG` spelling `tracing` takes:\ncomma-separated `target=level` pairs. A target this filter excludes\nnever reaches the store, whatever the stderr diagnostics carry.",
           "maxLength": 512,
           "type": "string"
@@ -1021,6 +1029,7 @@
         "lexical": {
           "$ref": "#/$defs/LexicalSearchConfiguration",
           "default": {
+            "units_max": 1000000,
             "weight": 0.7
           },
           "description": "The lexical ranking's share of a fused score."
@@ -1353,7 +1362,7 @@
     "logs": {
       "$ref": "#/$defs/LogsConfiguration",
       "default": {
-        "capture": "rift=info,rift_mcp=info,rift_server=info",
+        "capture": "rift=info,rift_mcp=info,rift_server=info,rift_index=warn",
         "page_records": 500,
         "retention_records": 50000
       },
@@ -1400,6 +1409,7 @@
         "busy_timeout": "5s",
         "fusion_k": 60,
         "lexical": {
+          "units_max": 1000000,
           "weight": 0.7
         },
         "pool_slots": 4,

@@ -918,9 +918,10 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
-    /// A claimed file's bytes are not valid UTF-8, so the index omits it: it answers no
-    /// search or lookup, and addressing it directly still refuses `content_unavailable`.
-    /// Every other file in the workspace stays available.
+    /// A claimed file is left out of the index - its bytes are not valid UTF-8, or it
+    /// crosses a per-file bound - so it answers no search or lookup, and addressing it
+    /// directly still refuses `content_unavailable`. Every other file in the workspace
+    /// stays available.
     SourceUnavailable {
         /// The file whose bytes could not be read.
         unit: FileId,

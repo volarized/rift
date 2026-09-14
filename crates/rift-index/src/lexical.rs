@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use rift_core::{
     Error, ErrorCode, ErrorContext, ErrorName, Fault, LimitEvidence, ProjectPath, fault_label,
 };
+use rift_protocol::configuration::LEXICAL_UNITS_MAX_DEFAULT;
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -26,8 +27,6 @@ use toasty::stmt::{Type, Value};
 
 use crate::database::WorkspaceDatabase;
 
-/// Default maximum indexed lexical units per index.
-const LEXICAL_UNITS_MAX_DEFAULT: u32 = 20_000;
 /// Default maximum content bytes accepted for one lexical unit (1 MiB).
 const LEXICAL_UNIT_BYTES_MAX_DEFAULT: u32 = 1_048_576;
 /// Default maximum distinct query terms accepted per search.
@@ -370,15 +369,26 @@ impl LexicalIndexLimits {
     pub const fn busy_timeout_ms(self) -> u32 {
         self.busy_timeout_ms
     }
+
+    /// Narrows one accepted `[search.lexical] units_max` value to this
+    /// adapter's width.
+    ///
+    /// Acceptance caps the key at `LEXICAL_UNITS_MAX_MAX`, which `u32` holds,
+    /// so the refusal arm cannot be reached by an accepted value; it answers
+    /// the width's ceiling.
+    #[must_use]
+    pub fn accepted_units_max(units_max: u64) -> u32 {
+        u32::try_from(units_max).unwrap_or(u32::MAX)
+    }
 }
 
 impl Default for LexicalIndexLimits {
-    /// Defaults accept 20,000 units, 1 MiB per unit, 32 distinct query terms,
-    /// 1,000 returned matches, 4 pooled connections, and a 1,000ms busy
-    /// timeout.
+    /// Defaults accept the `[search.lexical] units_max` default of 1,000,000
+    /// units, 1 MiB per unit, 32 distinct query terms, 1,000 returned matches,
+    /// 4 pooled connections, and a 5,000ms busy timeout.
     fn default() -> Self {
         Self::new(
-            LEXICAL_UNITS_MAX_DEFAULT,
+            Self::accepted_units_max(LEXICAL_UNITS_MAX_DEFAULT),
             LEXICAL_UNIT_BYTES_MAX_DEFAULT,
             LEXICAL_QUERY_TERMS_MAX_DEFAULT,
             LEXICAL_MATCHES_MAX_DEFAULT,
@@ -1243,8 +1253,24 @@ mod tests {
     #[test]
     fn test_lexical_index_limits_default_accepts_documented_pool_and_timeout() {
         let limits = LexicalIndexLimits::default();
+        assert_eq!(limits.units_max(), 1_000_000);
         assert_eq!(limits.pool_slots(), 4);
         assert_eq!(limits.busy_timeout_ms(), 5_000);
+    }
+
+    #[test]
+    fn test_accepted_units_max_keeps_the_accepted_range_and_answers_the_ceiling_past_it() {
+        use rift_protocol::configuration::{LEXICAL_UNITS_MAX_MAX, LEXICAL_UNITS_MAX_MIN};
+
+        assert_eq!(
+            LexicalIndexLimits::accepted_units_max(LEXICAL_UNITS_MAX_MIN),
+            1_000
+        );
+        assert_eq!(
+            LexicalIndexLimits::accepted_units_max(LEXICAL_UNITS_MAX_MAX),
+            50_000_000
+        );
+        assert_eq!(LexicalIndexLimits::accepted_units_max(u64::MAX), u32::MAX);
     }
 
     fn symbol_unit_with_name(name: String) -> LexicalUnit {
