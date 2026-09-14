@@ -4950,10 +4950,8 @@ pub fn beacon() -> u64 {
         let directory = tempfile::tempdir()?;
         let matches_max = rift_index::LexicalIndexLimits::default().matches_max();
         for index in 0..=matches_max {
-            fs::write(
-                directory.path().join(format!("beacon_{index}.rs")),
-                "pub fn beacon() {}\n",
-            )?;
+            let beacon = directory.path().join(format!("beacon_{index}.rs"));
+            fs::write(beacon, "pub fn beacon() {}\n")?;
         }
         fs::write(directory.path().join("lantern.rs"), "pub fn lantern() {}\n")?;
         super::hermetic_workspace(directory.path(), "")?;
