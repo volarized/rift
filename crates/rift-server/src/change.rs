@@ -731,6 +731,10 @@ impl ChangeService {
     /// parses refuses before anything is written, the same check
     /// `apply_rename` runs.
     ///
+    /// After the move lands, the changed tree is swept for surviving
+    /// occurrences of the old path, the same sweep `apply_rename` runs for
+    /// the old name.
+    ///
     /// # Errors
     ///
     /// Returns `ReadError` for filesystem failure; failed conditions
@@ -777,10 +781,13 @@ impl ChangeService {
         rewrites.push(FileRewrite::delete(plan.from.clone(), &plan.moved_source));
         rewrites.sort_by(|first, second| first.path.as_str().cmp(second.path.as_str()));
         let mut result = self.apply_rewrites(reads, &rewrites)?;
-        if let ChangeResult::Applied { summary } = &mut result
-            && let Some(reason) = &plan.references_not_updated
-        {
-            summary.diagnostics.push(reason.diagnostic());
+        if let ChangeResult::Applied { summary } = &mut result {
+            if let Some(reason) = &plan.references_not_updated {
+                summary.diagnostics.push(reason.diagnostic());
+            }
+            summary
+                .diagnostics
+                .extend(crate::move_file::moved_path_findings(reads, plan));
         }
         Ok(result)
     }

@@ -883,22 +883,41 @@ fn converted_offset(
 }
 
 /// Findings for word-boundary occurrences of the old name that survive in
-/// the changed tree, bounded by files, bytes, and finding count.
+/// the changed tree.
 ///
-/// The changed tree is the served snapshot's visible file set with each
-/// rewritten file's new bytes substituted: a rename rewrites existing
-/// files and never creates one, so the set is exact and no fresh scan
-/// races the publish.
+/// A rename rewrites existing files and never creates one, so the swept set
+/// is exact.
 pub(crate) fn survivor_findings(reads: &ReadService, plan: &RenamePlan) -> Vec<Diagnostic> {
     let rewritten: BTreeMap<&CoreProjectPath, &str> = plan
         .rewrites
         .iter()
         .map(|rewrite| (&rewrite.path, rewrite.next_source.as_str()))
         .collect();
-    let mut findings = Vec::new();
+    surviving_occurrences(reads, &rewritten, &plan.old_name)
+        .iter()
+        .map(|(path, offset)| survivor_diagnostic(&plan.old_name, path, *offset))
+        .collect()
+}
+
+/// Word-boundary occurrences of `name` that survive one applied change, as
+/// the file holding each one and its byte offset.
+///
+/// The changed tree is the served snapshot's visible file set with each
+/// rewritten file's new bytes substituted, so no fresh scan races the
+/// publication; a file the change left nothing at substitutes empty bytes.
+/// `rename_symbol` sweeps for the declaration's old name and `move_file`
+/// for the moved file's old path, under the same three bounds:
+/// [`RENAME_SWEEP_FILES_MAX`], [`RENAME_SWEEP_BYTES_MAX`], and
+/// [`RENAME_SWEEP_FINDINGS_MAX`].
+pub(crate) fn surviving_occurrences(
+    reads: &ReadService,
+    rewritten: &BTreeMap<&CoreProjectPath, &str>,
+    name: &str,
+) -> Vec<(CoreProjectPath, usize)> {
+    let mut found: Vec<(CoreProjectPath, usize)> = Vec::new();
     let mut scanned_bytes: usize = 0;
     for file in reads.index().files().take(RENAME_SWEEP_FILES_MAX) {
-        if findings.len() >= RENAME_SWEEP_FINDINGS_MAX || scanned_bytes >= RENAME_SWEEP_BYTES_MAX {
+        if found.len() >= RENAME_SWEEP_FINDINGS_MAX || scanned_bytes >= RENAME_SWEEP_BYTES_MAX {
             break;
         }
         let text = rewritten
@@ -906,12 +925,12 @@ pub(crate) fn survivor_findings(reads: &ReadService, plan: &RenamePlan) -> Vec<D
             .copied()
             .unwrap_or_else(|| file.source());
         scanned_bytes = scanned_bytes.saturating_add(text.len());
-        let remaining = RENAME_SWEEP_FINDINGS_MAX - findings.len();
-        for offset in word_boundary_occurrences(text, &plan.old_name, remaining) {
-            findings.push(survivor_diagnostic(&plan.old_name, file.path(), offset));
+        let remaining = RENAME_SWEEP_FINDINGS_MAX - found.len();
+        for offset in word_boundary_occurrences(text, name, remaining) {
+            found.push((file.path().clone(), offset));
         }
     }
-    findings
+    found
 }
 
 /// Byte offsets where `name` occurs in `text` between word boundaries, at
