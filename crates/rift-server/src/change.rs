@@ -4976,6 +4976,81 @@ mod tests {
         Ok(())
     }
 
+    /// A planned source the `[source]` policy no longer makes visible refuses at the
+    /// write gate, before its bytes are read.
+    #[test]
+    fn apply_move_refuses_a_source_the_source_policy_hides() -> TestResult {
+        let hub = "pub fn hub() {}\n";
+        let (directory, reads, changes) =
+            multi_file_fixture(&[(".gitignore", "hidden.rs\n"), ("hidden.rs", hub)])?;
+        let plan = move_plan("hidden.rs", "spoke.rs", (hub, hub), vec![], None);
+        let result = changes.apply_move(&reads, &plan)?;
+        let ChangeResult::Refused {
+            reason,
+            diagnostics,
+            ..
+        } = result
+        else {
+            panic!("a hidden source must refuse, got {result:?}");
+        };
+        assert_eq!(reason, RefusalReason::Unsupported);
+        assert!(
+            diagnostics[0].message.contains("hidden.rs")
+                && diagnostics[0].message.contains("[source]"),
+            "{diagnostics:?}"
+        );
+        assert!(
+            !directory.path().join("spoke.rs").exists(),
+            "a refusal leaves the tree untouched"
+        );
+        Ok(())
+    }
+
+    /// A planned source whose bytes on disk are not UTF-8 fails the read; the base
+    /// cannot be proven, so nothing is refused and nothing lands.
+    #[test]
+    fn apply_move_fails_when_the_source_bytes_are_not_utf8() -> TestResult {
+        let hub = "pub fn hub() {}\n";
+        let (directory, reads, changes) = multi_file_fixture(&[("hub.rs", hub)])?;
+        let plan = move_plan("hub.rs", "spoke.rs", (hub, hub), vec![], None);
+        fs::write(directory.path().join("hub.rs"), b"pub fn hub() {}\n\xff")?;
+        let error = changes
+            .apply_move(&reads, &plan)
+            .expect_err("bytes that are not UTF-8 must fail the base read");
+        assert_eq!(error.descriptor().code(), "storage_failure");
+        assert!(
+            error.to_string().contains("operation read") && error.to_string().contains("hub.rs"),
+            "the failure names the read and the file: {error}"
+        );
+        assert!(!directory.path().join("spoke.rs").exists());
+        Ok(())
+    }
+
+    /// A planned source below a directory this process cannot search fails at the
+    /// write gate's stat, before any read.
+    #[cfg(unix)]
+    #[test]
+    fn apply_move_fails_when_the_source_cannot_be_stat_at_the_write_gate() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+        let hub = "pub fn hub() {}\n";
+        let (directory, reads, changes) = multi_file_fixture(&[("lib.rs", hub)])?;
+        let sealed = directory.path().join("sealed");
+        fs::create_dir(&sealed)?;
+        fs::write(sealed.join("hub.rs"), hub)?;
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000))?;
+        let plan = move_plan("sealed/hub.rs", "spoke.rs", (hub, hub), vec![], None);
+        let result = changes.apply_move(&reads, &plan);
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o755))?;
+        let error = result.expect_err("a source below a sealed directory must fail the stat");
+        assert_eq!(error.descriptor().code(), "storage_failure");
+        assert!(
+            error.to_string().contains("operation stat")
+                && error.to_string().contains("sealed/hub.rs"),
+            "the failure names the stat and the file: {error}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn patch_against_a_multi_hunk_file_counts_every_hunk_it_landed() -> TestResult {
         let filler = "// pad\n".repeat(50);

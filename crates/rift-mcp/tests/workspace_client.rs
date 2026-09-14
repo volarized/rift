@@ -87,7 +87,7 @@ fn laid_out_workspace(
 }
 
 /// Serves the workspace at `root` to one client over an in-process duplex.
-async fn served_root(
+pub(crate) async fn served_root(
     root: &Path,
 ) -> TestResult<(
     rmcp::service::RunningService<rmcp::RoleClient, ()>,

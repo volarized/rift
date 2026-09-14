@@ -18,6 +18,7 @@ use rift_core::{
     LanguageFileSelections, LimitEvidence, PortableSymbolFacts, ProjectPath, ProviderId,
     SourceVisibility, SymbolId, TextFileInclusion, fault_label, symbol_identity,
 };
+use rift_protocol::search::FORCE_INCLUDE_FIELD;
 use rift_protocol::source::{SOURCE_FILES_FIELD, SOURCE_WORKSPACE_SIZE_FIELD};
 use rift_provider::{
     AssembledSymbol, Component, CompositionBuilder, NormalizedGraph, ProviderComposition,
@@ -29,7 +30,7 @@ use rift_syntax::{
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
-use crate::change_set::{FileDigest, PathChanges, WorkspaceDigests};
+use crate::change_set::{FileDigest, PathChanges, WorkspaceDigests, tree_revision_of};
 use crate::chunk::text_chunks;
 use crate::glob::PathMatcher;
 use crate::language::{ClassifiedPath, LanguagePolicyError, WorkspaceLanguagePolicy};
@@ -1561,6 +1562,14 @@ impl WorkspaceIndex {
         keyed_digests(&self.files, &self.text_files, &self.left_out)
     }
 
+    /// The tree revision this build's syntax-indexed files fold to, at full SHA-256
+    /// length: each file's path and content digest in project-path order. A request-time
+    /// capture of the same tree folds to the same value.
+    #[must_use]
+    pub fn tree_revision(&self) -> String {
+        tree_revision_of(self.files.iter().map(|(path, file)| (path, file.digest())))
+    }
+
     /// Returns the digest of the bytes read at `path`, whichever class holds it, the
     /// files left out included.
     ///
@@ -1847,7 +1856,11 @@ impl WorkspaceIndex {
         Ok(files)
     }
 
-    /// Walks request-selected visible files into baseline content catalog.
+    /// Walks request-selected visible files into baseline content catalog. Past `files_max`
+    /// the walk reads nothing more and counts the selector's remaining matches, so the
+    /// refusal carries the whole match count and names the first path past the bound; that
+    /// counting walk is bounded by the tree and `directory_depth_max`, the same bounds the
+    /// reading walk runs under.
     fn force_include_text_files(
         &self,
         force_include: &[String],
@@ -1859,6 +1872,8 @@ impl WorkspaceIndex {
         let matcher = PathMatcher::build(&self.root, force_include, &[])?;
         let mut extra_bytes = 0_usize;
         let mut files = Vec::new();
+        let mut match_count = 0_usize;
+        let mut first_excess: Option<PathBuf> = None;
         let walker = source_walk(
             &self.root,
             self.limits.directory_depth_max,
@@ -1887,8 +1902,10 @@ impl WorkspaceIndex {
             if self.text_file(&project_path).is_some() {
                 continue;
             }
+            match_count += 1;
             if files.len() >= files_max {
-                return Err(index_error_at(WorkspaceIndexViolation::TooManyFiles, path));
+                first_excess.get_or_insert_with(|| path.to_path_buf());
+                continue;
             }
             if let IndexRead::Included(file) =
                 read_catalog_file(&self.root, path, self.limits, &mut extra_bytes)?
@@ -1896,7 +1913,16 @@ impl WorkspaceIndex {
                 files.push(file);
             }
         }
-        Ok(files)
+        match first_excess {
+            Some(path) => Err(index_error_over_limit(
+                WorkspaceIndexViolation::TooManyFiles,
+                &path,
+                FORCE_INCLUDE_FIELD,
+                match_count,
+                files_max,
+            )),
+            None => Ok(files),
+        }
     }
 
     /// Builds one request index over files selected by force include.
@@ -2347,18 +2373,14 @@ fn capture_paths(
     paths: &DiscoveredPaths,
     limits: WorkspaceIndexLimits,
 ) -> Result<WorkspaceDigests, WorkspaceIndexError> {
-    let mut digests = BTreeMap::new();
     let mut workspace_bytes = 0_usize;
     let source: Vec<PathBuf> = paths.source.iter().map(|(path, _)| path.clone()).collect();
-    capture_path_class(&mut digests, &mut workspace_bytes, root, &source, limits)?;
-    capture_path_class(
-        &mut digests,
-        &mut workspace_bytes,
-        root,
-        &paths.text,
-        limits,
-    )?;
-    Ok(WorkspaceDigests::new(digests))
+    let source = capture_path_class(&mut workspace_bytes, root, &source, limits)?;
+    let text = capture_path_class(&mut workspace_bytes, root, &paths.text, limits)?;
+    Ok(WorkspaceDigests::classified(
+        source,
+        text.into_iter().map(|(path, state, _)| (path, state)),
+    ))
 }
 
 /// Reads every visible file's digest below `root`, without parsing syntax.
@@ -2404,14 +2426,15 @@ pub fn capture_digests_with_languages(
     capture_paths(&root, &classified, limits)
 }
 
-/// Reads one path class into captured file states.
+/// Reads one path class into captured file states: each kept file's project path, its
+/// file-state digest, and its content digest, in walk order.
 fn capture_path_class(
-    digests: &mut BTreeMap<ProjectPath, FileDigest>,
     workspace_bytes: &mut usize,
     root: &Path,
     paths: &[PathBuf],
     limits: WorkspaceIndexLimits,
-) -> Result<(), WorkspaceIndexError> {
+) -> Result<Vec<(ProjectPath, FileDigest, FileDigest)>, WorkspaceIndexError> {
+    let mut captured = Vec::with_capacity(paths.len());
     for path in paths {
         let mut handle = fs::File::open(path).map_err(|error| {
             index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
@@ -2442,12 +2465,11 @@ fn capture_path_class(
             ));
         }
         let project_path = project_path_below(root, path)?;
-        digests.insert(
-            project_path,
-            FileDigest::of_file_state(&bytes, metadata_is_executable(&metadata)),
-        );
+        let (content, state) =
+            FileDigest::of_content_and_file_state(&bytes, metadata_is_executable(&metadata));
+        captured.push((project_path, state, content));
     }
-    Ok(())
+    Ok(captured)
 }
 
 impl WorkspaceDigests {
@@ -2464,21 +2486,22 @@ fn keyed_digests(
     text_files: &BTreeMap<ProjectPath, Arc<TextSourceFile>>,
     left_out: &BTreeMap<ProjectPath, LeftOutFileState>,
 ) -> WorkspaceDigests {
-    WorkspaceDigests::new(
-        files
+    WorkspaceDigests::classified(
+        files.iter().map(|(path, file)| {
+            (
+                path.clone(),
+                FileDigest::of_file_state(file.source().as_bytes(), file.executable()),
+                file.digest(),
+            )
+        }),
+        text_files
             .iter()
             .map(|(path, file)| {
                 (
                     path.clone(),
-                    FileDigest::of_file_state(file.source().as_bytes(), file.executable()),
-                )
-            })
-            .chain(text_files.iter().map(|(path, file)| {
-                (
-                    path.clone(),
                     FileDigest::of_file_state(file.content().as_bytes(), file.executable()),
                 )
-            }))
+            })
             .chain(
                 left_out
                     .iter()
@@ -3929,6 +3952,43 @@ mod tests {
         assert_eq!(
             bound_error.fault().violation(),
             WorkspaceIndexViolation::TooManyFiles
+        );
+    }
+
+    /// Past `files_max`, the walk keeps counting the selector's matches without reading
+    /// them, so the refusal names the first excess path and carries the bound and the
+    /// match count as evidence.
+    #[test]
+    fn test_force_include_past_the_file_bound_carries_the_match_count_as_evidence() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        fs::write(directory.path().join(".gitignore"), "*.rs\n").expect("root gitignore");
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            fs::write(directory.path().join(name), "pub fn hidden() {}\n").expect("hidden source");
+        }
+        let index = build_index(&directory, &SourceVisibility::default()).expect("index");
+
+        let error = index
+            .force_include_index(&["*.rs".to_owned()], 1)
+            .expect_err("three matches must refuse a one-file bound");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::TooManyFiles
+        );
+        assert!(
+            error
+                .fault()
+                .path()
+                .is_some_and(|path| path.ends_with("b.rs")),
+            "the refusal names the first path past the bound: {:?}",
+            error.fault().path()
+        );
+        assert_eq!(
+            error.fault().limit_evidence().map(|evidence| (
+                evidence.field,
+                evidence.limit,
+                evidence.required
+            )),
+            Some(("paths.force_include".to_owned(), 1, 3))
         );
     }
 
@@ -5929,6 +5989,68 @@ mod tests {
     }
 
     #[test]
+    fn test_included_file_over_limit_without_overflow_reports_workspace_too_large() {
+        let limits = WorkspaceIndexLimits::new(5, 1_000, 10, 4, 5).expect("limits");
+        let mut workspace_bytes = 6_usize;
+        let project_path = ProjectPath::new("big.rs").expect("fixture path");
+        let error = included_file(
+            project_path,
+            b"12345".to_vec(),
+            Path::new("big.rs"),
+            &RustSyntaxProvider::default(),
+            limits,
+            &mut workspace_bytes,
+        )
+        .expect_err(
+            "6 already-counted bytes plus 5 more must cross a ten-byte bound without overflowing",
+        );
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::WorkspaceTooLarge
+        );
+        assert_eq!(workspace_bytes, 11, "the refused file's bytes stay counted");
+        let message = error.to_string();
+        assert!(
+            message.contains(SOURCE_WORKSPACE_SIZE_FIELD) && message.contains("big.rs"),
+            "the refusal names the bound and the file: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_visible_digests_refuse_a_file_the_process_cannot_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().expect("workspace");
+        fs::write(directory.path().join("kept.txt"), "kept\n").expect("readable file");
+        let sealed = directory.path().join("sealed.txt");
+        fs::write(&sealed, "sealed\n").expect("sealed file");
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000))
+            .expect("fixture permissions set");
+        let policy = WorkspaceSourcePolicy::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("source policy");
+        let outcome = policy.visible_digests();
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o644))
+            .expect("fixture permissions restore");
+        let error = outcome.expect_err("a read this process cannot make fails the capture");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::Filesystem
+        );
+        assert!(
+            error
+                .fault()
+                .path()
+                .is_some_and(|path| path.ends_with("sealed.txt")),
+            "the refusal names the unreadable file: {error}"
+        );
+    }
+
+    #[test]
     fn test_visible_digests_leave_out_a_file_past_the_per_file_bound() {
         let directory = tempfile::tempdir().expect("workspace");
         fs::write(directory.path().join("small.txt"), "kept\n").expect("small file");
@@ -6226,5 +6348,59 @@ mod tests {
             "the revision must serve the syntax publication alone"
         );
         assert_eq!(index.file_count(), 1, "syntax facts stay served");
+    }
+
+    #[test]
+    fn test_a_capture_folds_the_tree_revision_the_build_stamps() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let root = directory.path();
+        fs::create_dir_all(root.join("src")).expect("fixture directory");
+        fs::write(root.join("src/lib.rs"), "pub fn beacon() {}\n").expect("source");
+        fs::write(root.join("src/main.rs"), "pub fn lantern() {}\n").expect("source");
+        fs::write(root.join("NOTES.txt"), "notes\n").expect("text");
+        let inclusion = TextFileInclusion::default();
+        let index = indexed(root, &inclusion);
+        let capture = |root: &Path| {
+            capture_digests_with_languages(
+                root,
+                WorkspaceIndexLimits::default(),
+                &SourceVisibility::default(),
+                &inclusion,
+                &LanguageFileSelections::default(),
+            )
+            .expect("the capture must read the tree")
+        };
+        let captured = capture(root);
+        assert_eq!(
+            captured.tree_revision(),
+            Some(index.tree_revision().as_str())
+        );
+        assert_eq!(
+            index.tree_revision().len(),
+            64,
+            "the build keeps the full hash"
+        );
+        assert_eq!(captured.fingerprint(), *index.fingerprint());
+
+        fs::write(root.join("NOTES.txt"), "edited notes\n").expect("text");
+        let text_moved = capture(root);
+        assert_eq!(
+            text_moved.tree_revision(),
+            Some(index.tree_revision().as_str()),
+            "a text file's bytes never enter the tree revision"
+        );
+        assert_ne!(text_moved.fingerprint(), *index.fingerprint());
+
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn beacon() {}\npub fn torch() {}\n",
+        )
+        .expect("source");
+        let source_moved = capture(root);
+        assert_ne!(
+            source_moved.tree_revision(),
+            Some(index.tree_revision().as_str()),
+            "a syntax-indexed file's bytes move the tree revision"
+        );
     }
 }

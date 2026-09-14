@@ -3,8 +3,9 @@
 //! from `read` so existing `rift_protocol::read::SearchParams`-style paths keep resolving.
 
 use crate::read::{
-    Language, NodeId, PAGE_INDEX_DEFAULT, Pagination, ProjectPath, ReadWarning, Relationship,
-    RelationshipFacet, RevisionId, SearchScope, SourceUnitId, Symbol, SymbolId, TextRange,
+    Language, NodeId, PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX, Pagination, ProjectPath, ReadWarning,
+    Relationship, RelationshipFacet, RevisionId, SearchScope, SourceUnitId, Symbol, SymbolId,
+    TextRange,
 };
 use crate::schema;
 use schemars::JsonSchema;
@@ -128,6 +129,10 @@ pub(crate) fn path_pattern_violation(value: &str) -> Option<PathPatternViolation
 fn is_dot_segment(segment: &str) -> bool {
     matches!(segment, "." | "..")
 }
+
+/// The field path the server names when a search's `paths.force_include` matches more
+/// files than one request may pull into the index.
+pub const FORCE_INCLUDE_FIELD: &str = "paths.force_include";
 
 /// Which files a query runs over, as three lists of globs matched against the project-relative
 /// path. The same glob engine backs the workspace's `[source]` policy. `include: ["src/**"]`
@@ -333,10 +338,11 @@ pub struct SearchParams {
     /// the caller requests only what it will read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include: Option<Vec<SearchInclude>>,
-    /// Most hits to return in one page. `max_page_items` from the workspace resource caps
-    /// it, and fewer may come back.
+    /// Most hits to return in one page, at most 10,000; the server refuses a larger
+    /// `limit` naming the field. The server's result bound caps the set itself, and an
+    /// answer whose set reached it warns `results_truncated`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1_u64, max = 10_000_u64))]
+    #[schemars(range(min = 1_u64, max = PAGE_LIMIT_MAX))]
     pub limit: Option<u64>,
     /// Zero-based page of the result set to serve, sized by `limit`. A `page_index` past
     /// the last page returns an empty page whose `pagination` carries the requested
@@ -578,9 +584,10 @@ pub enum TraversalDirection {
 #[cfg(test)]
 mod tests {
     use super::{
-        PAGE_INDEX_DEFAULT, PathPattern, PathPatternViolation, SEARCH_TRAVERSAL_DEPTH_DEFAULT,
-        SEARCH_TRAVERSAL_DEPTH_MAX, SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX,
-        SearchHit, SearchParams, SearchScope, SearchTraversal, TraversalDirection,
+        PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX, PathPattern, PathPatternViolation,
+        SEARCH_TRAVERSAL_DEPTH_DEFAULT, SEARCH_TRAVERSAL_DEPTH_MAX, SEARCH_TRAVERSAL_DEPTH_MIN,
+        SEARCH_TRAVERSAL_FACETS_MAX, SearchHit, SearchParams, SearchScope, SearchTraversal,
+        TraversalDirection,
     };
     use serde_json::json;
 
@@ -593,6 +600,17 @@ mod tests {
         assert_eq!(
             schema["properties"]["page_index"]["default"],
             json!(PAGE_INDEX_DEFAULT)
+        );
+    }
+
+    /// The schema's `maximum` on `limit` and `accepted_limit`'s refusal both read
+    /// `PAGE_LIMIT_MAX`; this pins the advertised maximum to that one constant.
+    #[test]
+    fn search_params_schema_limit_maximum_equals_the_enforced_constant() {
+        let schema = serde_json::to_value(schemars::schema_for!(SearchParams)).expect("schema");
+        assert_eq!(
+            schema["properties"]["limit"]["maximum"],
+            json!(PAGE_LIMIT_MAX)
         );
     }
 

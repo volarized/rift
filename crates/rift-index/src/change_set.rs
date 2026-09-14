@@ -35,6 +35,18 @@ impl FileDigest {
         Self(hasher.finalize().into())
     }
 
+    /// Digests one file's bytes once and returns both forms: the content digest
+    /// [`Self::of`] computes, then the file-state digest [`Self::of_file_state`] computes.
+    /// A capture that needs both pays one pass over the bytes.
+    #[must_use]
+    pub fn of_content_and_file_state(bytes: &[u8], executable: bool) -> (Self, Self) {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let content = Self(hasher.clone().finalize().into());
+        hasher.update([u8::from(executable)]);
+        (content, Self(hasher.finalize().into()))
+    }
+
     /// The digest's bytes, as workspace identity material absorbs them.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {
@@ -166,36 +178,97 @@ impl PathChanges {
 /// lets the same capture name the files that moved, so a request that finds the tree ahead
 /// of the publication asks for those files rather than for the whole workspace.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct WorkspaceDigests(BTreeMap<ProjectPath, FileDigest>);
+pub struct WorkspaceDigests {
+    files: BTreeMap<ProjectPath, FileDigest>,
+    /// The tree revision the syntax-indexed files fold to, known only to a capture that
+    /// classified what it read; a set collected without classes carries none.
+    tree_revision: Option<String>,
+}
 
 impl WorkspaceDigests {
-    /// Collects one digest set from path and digest pairs.
+    /// Collects one digest set from path and digest pairs, without a tree revision.
     pub fn new(digests: impl IntoIterator<Item = (ProjectPath, FileDigest)>) -> Self {
-        Self(digests.into_iter().collect())
+        Self {
+            files: digests.into_iter().collect(),
+            tree_revision: None,
+        }
+    }
+
+    /// Collects one classified digest set: `source` is the syntax-indexed class, each file
+    /// with its file-state digest and its content digest, and `others` is every other
+    /// recorded file. The content digests fold into the set's tree revision.
+    pub fn classified(
+        source: impl IntoIterator<Item = (ProjectPath, FileDigest, FileDigest)>,
+        others: impl IntoIterator<Item = (ProjectPath, FileDigest)>,
+    ) -> Self {
+        let mut contents = BTreeMap::new();
+        let mut files = BTreeMap::new();
+        for (path, state, content) in source {
+            contents.insert(path.clone(), content);
+            files.insert(path, state);
+        }
+        files.extend(others);
+        Self {
+            files,
+            tree_revision: Some(tree_revision_of(
+                contents.iter().map(|(path, digest)| (path, *digest)),
+            )),
+        }
+    }
+
+    /// The tree revision the syntax-indexed files fold to, or nothing when this set was
+    /// collected without classes.
+    #[must_use]
+    pub fn tree_revision(&self) -> Option<&str> {
+        self.tree_revision.as_deref()
     }
 
     /// The digest recorded at `path`, or nothing when no file was recorded there.
     #[must_use]
     pub fn get(&self, path: &ProjectPath) -> Option<FileDigest> {
-        self.0.get(path).copied()
+        self.files.get(path).copied()
     }
 
     /// How many files this set records.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.files.len()
     }
 
     /// Whether this set records no file at all.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.files.is_empty()
     }
 
     /// Every recorded path with its digest, in project-path order.
     pub fn iter(&self) -> impl Iterator<Item = (&ProjectPath, FileDigest)> {
-        self.0.iter().map(|(path, digest)| (path, *digest))
+        self.files.iter().map(|(path, digest)| (path, *digest))
     }
+}
+
+/// Separates one path from its content digest in tree-revision material.
+const TREE_REVISION_PATH_SEPARATOR: u8 = 0;
+/// Separates adjacent files in tree-revision material.
+const TREE_REVISION_FILE_SEPARATOR: u8 = 0xff;
+
+/// The tree revision `files` fold to: the full SHA-256 hex over each syntax-indexed file's
+/// path and content digest, absorbed in the order given, which every caller keeps as
+/// project-path order.
+///
+/// A build and a request-time capture of one tree both fold here, so the revision a
+/// build stamps and the one a capture names cannot disagree over an unchanged tree.
+pub(crate) fn tree_revision_of<'a>(
+    files: impl IntoIterator<Item = (&'a ProjectPath, FileDigest)>,
+) -> String {
+    let mut hasher = Sha256::new();
+    for (path, digest) in files {
+        hasher.update(path.as_str().as_bytes());
+        hasher.update([TREE_REVISION_PATH_SEPARATOR]);
+        hasher.update(digest.as_bytes());
+        hasher.update([TREE_REVISION_FILE_SEPARATOR]);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 /// What one rebuild covers.
@@ -239,7 +312,7 @@ mod tests {
 
     use rift_core::ProjectPath;
 
-    use super::{ChangeSet, FileDigest, PathChange, PathChanges};
+    use super::{ChangeSet, FileDigest, PathChange, PathChanges, WorkspaceDigests};
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -347,5 +420,51 @@ mod tests {
         assert_eq!(FileDigest::of(b"same"), FileDigest::of(b"same"));
         assert_ne!(FileDigest::of(b"one"), FileDigest::of(b"two"));
         assert_eq!(FileDigest::of(b"").as_bytes().len(), 32);
+    }
+
+    #[test]
+    fn test_one_pass_digests_agree_with_the_two_single_forms() {
+        for executable in [false, true] {
+            let (content, state) = FileDigest::of_content_and_file_state(b"bytes", executable);
+            assert_eq!(content, FileDigest::of(b"bytes"));
+            assert_eq!(state, FileDigest::of_file_state(b"bytes", executable));
+        }
+    }
+
+    #[test]
+    fn test_a_classified_set_folds_its_tree_revision_over_the_source_class_alone() -> TestResult {
+        let source = [
+            (
+                path("src/lib.rs")?,
+                FileDigest::of(b"state"),
+                FileDigest::of(b"lib"),
+            ),
+            (
+                path("src/main.rs")?,
+                FileDigest::of(b"state"),
+                FileDigest::of(b"main"),
+            ),
+        ];
+        let text = [(path("README.md")?, FileDigest::of(b"readme"))];
+        let classified = WorkspaceDigests::classified(source.clone(), text.clone());
+        let expected =
+            super::tree_revision_of([(&source[0].0, source[0].2), (&source[1].0, source[1].2)]);
+        assert_eq!(classified.tree_revision(), Some(expected.as_str()));
+        assert_eq!(expected.len(), 64, "the fold keeps the full hash");
+        assert_eq!(classified.len(), 3, "every class is recorded");
+        assert_eq!(classified.get(&source[0].0), Some(source[0].1));
+
+        let other_text = [(path("README.md")?, FileDigest::of(b"edited"))];
+        let text_moved = WorkspaceDigests::classified(source.clone(), other_text);
+        assert_eq!(
+            text_moved.tree_revision(),
+            classified.tree_revision(),
+            "a text file's bytes never enter the tree revision"
+        );
+        assert_ne!(text_moved.fingerprint(), classified.fingerprint());
+
+        let unclassified = WorkspaceDigests::new(text);
+        assert_eq!(unclassified.tree_revision(), None);
+        Ok(())
     }
 }
