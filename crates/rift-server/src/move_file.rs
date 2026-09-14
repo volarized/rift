@@ -204,12 +204,11 @@ async fn planned_move(
     .await?;
     match proposal {
         EngineProposal::Nothing(reason) => Ok(unedited_plan(from, to, source.text, Some(reason))),
-        EngineProposal::Answered { edit, encoding } => {
+        EngineProposal::Answered(proposal) => {
             compiled_move(
                 workspace_root,
                 reads.dependency_catalog(),
-                &edit,
-                encoding,
+                &proposal,
                 from,
                 to,
                 source.text,
@@ -395,10 +394,16 @@ enum EngineProposal {
     /// applied move as its warning.
     Nothing(ReferencesNotUpdated),
     /// The engine proposed at least one reference edit.
-    Answered {
-        edit: WorkspaceEdit,
-        encoding: PositionEncoding,
-    },
+    Answered(AnsweredProposal),
+}
+
+/// The engine's proposal to compile, with the negotiated encoding and the
+/// version the moved file's `didOpen` carried.
+#[derive(Debug)]
+struct AnsweredProposal {
+    edit: WorkspaceEdit,
+    encoding: PositionEncoding,
+    version: i32,
 }
 
 /// One will-rename exchange's outcome on a running session.
@@ -409,6 +414,9 @@ enum MoveExchange {
     Answered {
         edit: Option<WorkspaceEdit>,
         encoding: PositionEncoding,
+        /// The version the moved file's `didOpen` carried; an edit the
+        /// engine versions on that file compiles at this version alone.
+        version: i32,
         /// The engine's own readiness as of this answer, read right after
         /// it: whatever the answer says, this is what the engine had
         /// proven about itself when it said it.
@@ -450,6 +458,7 @@ async fn engine_proposal(
         Ok(MoveExchange::Answered {
             edit,
             encoding,
+            version,
             readiness,
         }) => {
             if proposes_no_edit(edit.as_ref()) {
@@ -458,10 +467,11 @@ async fn engine_proposal(
                     readiness,
                 )))
             } else {
-                Ok(EngineProposal::Answered {
+                Ok(EngineProposal::Answered(AnsweredProposal {
                     edit: edit.unwrap_or_default(),
                     encoding,
-                })
+                    version,
+                }))
             }
         }
         Err(error) => {
@@ -523,11 +533,13 @@ async fn will_rename_on_session(
     if capabilities.will_rename_files() && !capabilities.will_rename_matches(from.as_str()) {
         return Ok(MoveExchange::FilterMismatch);
     }
+    let version = session.document_version();
     let edit = session.will_rename_files(from, to).await?;
     let readiness = session.readiness();
     Ok(MoveExchange::Answered {
         edit,
         encoding,
+        version,
         readiness,
     })
 }
@@ -537,12 +549,13 @@ async fn will_rename_on_session(
 ///
 /// An edit addressed to either the source or the destination path applies
 /// to the moved file's bytes, and the edited bytes land at the
-/// destination.
+/// destination. The source is the document the exchange opened, so an
+/// edit the engine versions on it compiles at the version its `didOpen`
+/// carried and refuses at any other.
 async fn compiled_move(
     workspace_root: &Path,
     catalog: &DependencyCatalog,
-    edit: &WorkspaceEdit,
-    encoding: PositionEncoding,
+    proposal: &AnsweredProposal,
     from: CoreProjectPath,
     to: CoreProjectPath,
     moved_source: String,
@@ -551,12 +564,13 @@ async fn compiled_move(
     let context = ProposalContext {
         operation: MOVE_OPERATION,
         addresses: Vec::new(),
-        opened: None,
+        opened: Some((&from, proposal.version)),
         bases: BTreeMap::from([(&from, moved_source.as_str()), (&to, moved_source.as_str())]),
     };
-    let documents = proposal_documents(edit, &roots, &context)?;
+    let documents = proposal_documents(&proposal.edit, &roots, &context)?;
     let documents = merged_moved_documents(documents, &from, &to);
-    let compiled = compiled_rewrites(workspace_root, documents, encoding, &context).await?;
+    let compiled =
+        compiled_rewrites(workspace_root, documents, proposal.encoding, &context).await?;
     let mut moved_next = moved_source.clone();
     let mut rewrites = Vec::with_capacity(compiled.len());
     for rewrite in compiled {
