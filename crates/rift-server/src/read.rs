@@ -1531,7 +1531,7 @@ fn wire_index_warning(warning: &WorkspaceIndexWarning) -> ReadWarning {
 /// out: the first [`SOURCE_WARNINGS_MAX`] in project-path order, the order the index
 /// keeps them in, then - when more were left out - one more counting the rest, which
 /// `rift://logs` names one by one.
-fn source_warnings(left_out: &[WorkspaceIndexWarning]) -> Vec<ReadWarning> {
+pub(crate) fn source_warnings(left_out: &[WorkspaceIndexWarning]) -> Vec<ReadWarning> {
     let mut warnings: Vec<ReadWarning> = left_out
         .iter()
         .take(SOURCE_WARNINGS_MAX)

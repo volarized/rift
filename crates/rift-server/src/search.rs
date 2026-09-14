@@ -15,16 +15,16 @@ use rift_index::{
     WorkspaceIndex,
 };
 use rift_protocol::read::{
-    MatchedField, PathPattern, PathSelector, ProjectPath as WireProjectPath, ResultOrder,
-    SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget, SearchResult,
-    SearchScope, SourceUnitId, Symbol, SymbolId,
+    MatchedField, PathPattern, PathSelector, ProjectPath as WireProjectPath, ReadWarning,
+    ResultOrder, SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget,
+    SearchResult, SearchScope, SourceUnitId, Symbol, SymbolId,
 };
 use rift_search::{Declaration, DescribedUnit, RankedUnit};
 use rift_syntax::{ByteRange, SyntaxSymbol};
 
 use crate::read::{
     ReadError, ReadFault, ReadService, accepted_limit, dependency_symbol, dependency_warnings,
-    excerpt, page, project_path, text_range, validate_common, wire_symbol,
+    excerpt, page, project_path, source_warnings, text_range, validate_common, wire_symbol,
 };
 use crate::traversal::{collect_traversal_hits, traversal_truncation_warning, validate_traversal};
 
@@ -72,6 +72,7 @@ impl ReadService {
         let dependencies = self.dependency_index(params.scope)?;
 
         let mut results = Vec::new();
+        let mut warnings = self.warnings();
         if let Some(query) = query {
             let criteria = SearchCriteria {
                 query,
@@ -90,13 +91,13 @@ impl ReadService {
                 if results.len() < fetch_limit
                     && let Some(selector) = selector
                 {
-                    collect_force_include_hits(
+                    warnings.extend(collect_force_include_hits(
                         self.index(),
                         selector,
                         criteria,
                         fetch_limit,
                         &mut results,
-                    )?;
+                    )?);
                 }
                 let index = self.index();
                 let matcher = matcher.as_ref();
@@ -132,7 +133,6 @@ impl ReadService {
             results,
             pagination,
             warnings: {
-                let mut warnings = self.warnings();
                 if traversal_truncated {
                     warnings.push(traversal_truncation_warning());
                 }
@@ -384,16 +384,17 @@ fn collect_indexed_content_hits(
     Ok(())
 }
 
-/// Reaches request-selected files outside persistent index.
+/// Reaches request-selected files outside the persistent index, answering the
+/// `source_unavailable` warnings for the files the on-demand index left out.
 fn collect_force_include_hits(
     index: &WorkspaceIndex,
     selector: &PathSelector,
     criteria: SearchCriteria<'_>,
     fetch_limit: usize,
     results: &mut Vec<SearchHit>,
-) -> Result<(), ReadError> {
+) -> Result<Vec<ReadWarning>, ReadError> {
     if selector.force_include.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let SearchCriteria {
         query,
@@ -435,7 +436,7 @@ fn collect_force_include_hits(
             }
         }
     }
-    Ok(())
+    Ok(source_warnings(extra.warnings()))
 }
 
 /// Public declarations from the cataloged packages: `index` answers `query` up to
@@ -2040,6 +2041,63 @@ pub fn compute() -> i32 {
             results.is_empty(),
             "the hard floor must stay unreachable via force_include"
         );
+        Ok(())
+    }
+
+    /// A force-included file holding a declaration the Contribution contract refuses is
+    /// left out of the on-demand index, and the answer names it in `source_unavailable`
+    /// instead of failing the request.
+    #[test]
+    fn search_force_include_leaves_out_a_file_the_contract_refuses_and_warns() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join(".gitignore"), "wide.rs\n")?;
+        fs::write(directory.path().join("lib.rs"), "pub fn kept() {}\n")?;
+        fs::write(
+            directory.path().join("wide.rs"),
+            format!(
+                "pub struct {};\n",
+                "S".repeat(rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX)
+            ),
+        )?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let plain: SearchParams = serde_json::from_value(json!({"query": "kept"}))?;
+        let plain_value = serde_json::to_value(service.search(&plain, &[])?)?;
+        let names_nothing = plain_value["warnings"].as_array().is_none_or(|warnings| {
+            warnings
+                .iter()
+                .all(|warning| warning["code"] != "source_unavailable")
+        });
+        assert!(
+            names_nothing,
+            "the walk never reaches the ignored file: {plain_value:#}"
+        );
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "kept",
+            "paths": {"force_include": ["wide.rs"]}
+        }))?;
+        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        assert!(
+            value["results"]
+                .as_array()
+                .is_some_and(|results| results.iter().any(|hit| hit["path"] == "lib.rs")),
+            "{value:#}"
+        );
+        let names_wide = value["warnings"].as_array().is_some_and(|warnings| {
+            warnings.iter().any(|warning| {
+                warning["code"] == "source_unavailable"
+                    && warning["unit"] == "rift://file/wide.rs"
+                    && warning["detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.contains("provider_symbol"))
+            })
+        });
+        assert!(names_wide, "{value:#}");
         Ok(())
     }
 
