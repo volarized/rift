@@ -881,7 +881,10 @@ impl ChangeService {
             Ok(patch) => patch,
             Err(refusal) => return Ok(refusal),
         };
-        let segments = patch::split_file_segments(&patch)?;
+        let segments = match patch::split_file_segments(&patch)? {
+            Ok(segments) => segments,
+            Err(refusal) => return Ok(refusal),
+        };
         let mut rewrites: Vec<FileRewrite> = Vec::with_capacity(segments.len());
         for (index, segment) in segments.iter().enumerate() {
             match patch::resolve_segment(&self.root, reads, segment, index + 1)? {
