@@ -1254,7 +1254,7 @@
     },
     "SourceConfiguration": {
       "additionalProperties": false,
-      "description": "The `[source]` table: which files below the workspace root the index and reads consider\nvisible. `.git`, `.rift`, and `target` stay invisible whatever this table says.",
+      "description": "The `[source]` table: which files below the workspace root the index and reads consider\nvisible, and how many files and bytes the index holds together. `.git`, `.rift`, and\n`target` stay invisible whatever this table says.",
       "properties": {
         "exclude": {
           "default": [],
@@ -1264,6 +1264,14 @@
           },
           "maxItems": 512,
           "type": "array"
+        },
+        "files": {
+          "default": 100000,
+          "description": "Most files the index holds, 1000 to 5000000. A workspace past it refuses its rebuild\nnaming this key.",
+          "format": "uint64",
+          "maximum": 5000000,
+          "minimum": 1000,
+          "type": "integer"
         },
         "include": {
           "default": [],
@@ -1278,6 +1286,15 @@
           "default": true,
           "description": "Whether the workspace's own `.gitignore` files, root and nested, hide the paths they\nmatch. Global and parent-directory gitignore sources are never read.",
           "type": "boolean"
+        },
+        "workspace_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "512mb",
+          "description": "Most source bytes the index holds together, 16mb to 64gb. A workspace past it\nrefuses its rebuild naming this key.",
+          "rift:range": {
+            "max": "64gb",
+            "min": "16mb"
+          }
         }
       },
       "type": "object"
@@ -1451,10 +1468,12 @@
       "$ref": "#/$defs/SourceConfiguration",
       "default": {
         "exclude": [],
+        "files": 100000,
         "include": [],
-        "respect_gitignore": true
+        "respect_gitignore": true,
+        "workspace_size": "512mb"
       },
-      "description": "Which files below the workspace root the index and reads consider visible."
+      "description": "Which files below the workspace root the index and reads consider visible, and how\nmany files and bytes the index holds together."
     }
   },
   "title": "WorkspaceConfiguration",

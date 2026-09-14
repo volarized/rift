@@ -395,7 +395,8 @@ pub struct WorkspaceConfiguration {
     pub execution: ExecutionConfiguration,
     /// Search ranking, visible text chunking, and storage bounds.
     pub search: SearchConfiguration,
-    /// Which files below the workspace root the index and reads consider visible.
+    /// Which files below the workspace root the index and reads consider visible, and how
+    /// many files and bytes the index holds together.
     pub source: SourceConfiguration,
     /// Whether the dependency index runs, how the catalog is resolved, which
     /// cataloged packages it indexes, and the bounds it indexes under.

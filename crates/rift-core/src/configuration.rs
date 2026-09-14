@@ -243,6 +243,7 @@ mod tests {
             include: vec![PathPattern("src/**".to_owned())],
             exclude: vec![PathPattern("src/generated/**".to_owned())],
             respect_gitignore: false,
+            ..SourceConfiguration::default()
         };
         let visibility = SourceVisibility::from(&source);
         assert_eq!(visibility.include(), ["src/**"]);

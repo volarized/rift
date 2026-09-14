@@ -12,13 +12,16 @@ use std::path::PathBuf;
 use rift_core::constants::WORKSPACE_IGNORED_DIRECTORIES;
 use rift_core::{CompositionId, ProjectPath, SourceVisibility};
 use rift_history::{REVISION_TREE_ENTRIES_MAX, Repository, ResolvedRevision};
+use rift_protocol::source::SOURCE_FILES_FIELD;
 use rift_provider::CompositionBuilder;
 use rift_provider::ProviderComposition;
 
 use crate::glob::PathMatcher;
+use crate::language::ClassifiedPath;
 use crate::workspace::{
-    ReadIndex, RustFacts, WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits,
+    IndexContents, ReadIndex, RustFacts, WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits,
     WorkspaceIndexViolation, component, composition_error, index_error_at, index_error_caused_by,
+    index_error_over_limit,
 };
 
 #[derive(Debug)]
@@ -51,6 +54,11 @@ impl WorkspaceIndex {
 
     /// Builds one committed-tree index with configured language entries.
     ///
+    /// A committed file the index leaves out is absent from the index, as it is under
+    /// the workspace scan: a blob past the per-file byte bound, bytes that are not UTF-8,
+    /// or a syntax tree the provider refuses under one of its bounds. The index's
+    /// warnings name each refused syntax tree.
+    ///
     /// # Errors
     ///
     /// Returns [`WorkspaceIndexError`] for invalid paths, configuration,
@@ -76,8 +84,7 @@ impl WorkspaceIndex {
             .tree_files(revision, &includes, REVISION_TREE_ENTRIES_MAX)
             .map_err(history_error)?;
         let mut catalog_bytes = 0_usize;
-        let mut files = Vec::with_capacity(listed.len().min(limits.files_max()));
-        let mut text_files = Vec::with_capacity(listed.len().min(limits.files_max()));
+        let mut contents = IndexContents::default();
         for tree_file in &listed {
             let context_path = PathBuf::from(tree_file.path());
             if directory_depth(tree_file.path()) > limits.directory_depth_max() {
@@ -104,10 +111,13 @@ impl WorkspaceIndex {
             let Some(class) = language.classifies(&context_path)? else {
                 continue;
             };
-            if text_files.len() >= limits.files_max() {
-                return Err(index_error_at(
+            if contents.held_count() >= limits.files_max() {
+                return Err(index_error_over_limit(
                     WorkspaceIndexViolation::TooManyFiles,
                     &context_path,
+                    SOURCE_FILES_FIELD,
+                    contents.held_count().saturating_add(1),
+                    limits.files_max(),
                 ));
             }
             let project_path = ProjectPath::new(tree_file.path().to_owned()).map_err(|error| {
@@ -124,19 +134,16 @@ impl WorkspaceIndex {
                 limits,
                 &mut catalog_bytes,
             )?;
-            if let crate::language::ClassifiedPath::Source(provider) = class {
-                files.push(super::workspace::indexed_file_from_catalog(
-                    &text_file,
-                    &context_path,
-                    provider,
-                )?);
+            match class {
+                ClassifiedPath::Source(provider) => {
+                    contents.hold_source_file(text_file, &context_path, provider)?;
+                }
+                ClassifiedPath::Text => contents.hold_text_file(text_file),
             }
-            text_files.push(text_file);
         }
         Self::from_parts(
             root,
-            files,
-            text_files,
+            contents,
             composition,
             limits,
             language,
@@ -499,5 +506,45 @@ mod tests {
                 .text_file(&ProjectPath::new("evil.rs").expect("path"))
                 .is_none()
         );
+    }
+
+    /// A committed file the syntax provider refuses under its depth bound is left out the
+    /// way the workspace scan leaves it out: the revision index still serves the file
+    /// beside it, and its warnings name the refused one.
+    #[test]
+    fn test_at_revision_leaves_out_a_file_past_a_syntax_bound_and_serves_the_rest() {
+        let directory = committed_workspace();
+        let deep = format!(
+            "pub fn deep() -> i32 {{ {open}1{close} }}\n",
+            open = "(".repeat(600),
+            close = ")".repeat(600),
+        );
+        fs::write(directory.path().join("src/deep.rs"), deep).expect("deep source");
+        commit_all(
+            directory.path(),
+            "commit a source past the syntax depth bound",
+        );
+        let index = revision_index(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )
+        .expect("a refused syntax tree must not fail the revision build");
+        assert!(
+            has_symbol(&index, "committed"),
+            "the file beside it answers"
+        );
+        assert!(
+            !has_symbol(&index, "deep"),
+            "the refused file answers nothing"
+        );
+        let deep_path = ProjectPath::new("src/deep.rs").expect("path");
+        assert!(index.file(&deep_path).is_none());
+        assert!(index.text_file(&deep_path).is_none());
+        assert_eq!(index.left_out_file_count(), 1);
+        assert!(matches!(
+            index.warnings(),
+            [crate::WorkspaceIndexWarning::SyntaxTooLarge { path, .. }] if *path == deep_path
+        ));
     }
 }

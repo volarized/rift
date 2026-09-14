@@ -418,6 +418,26 @@ pub fn declare_text_ranges(schema: &mut Schema) {
     );
 }
 
+/// A [`SourceConfiguration`](crate::source::SourceConfiguration) states its `ByteSize`
+/// bound as `rift:range` on the key: schema validation alone cannot compare `"512mb"`
+/// against a ceiling, so the server enforces the bound at load and the schema carries it
+/// for readers.
+pub fn declare_source_ranges(schema: &mut Schema) {
+    use crate::configuration::ByteSize;
+    use crate::source::{
+        SOURCE_WORKSPACE_BYTES_MAX, SOURCE_WORKSPACE_BYTES_MIN, SourceConfiguration,
+    };
+    annotate_property(
+        schema,
+        property!(SourceConfiguration, workspace_size),
+        RIFT_RANGE,
+        range(
+            &ByteSize::from_bytes(SOURCE_WORKSPACE_BYTES_MIN),
+            &ByteSize::from_bytes(SOURCE_WORKSPACE_BYTES_MAX),
+        ),
+    );
+}
+
 /// A [`DependenciesConfiguration`](crate::dependencies::DependenciesConfiguration) states
 /// its `ByteSize` and `Duration` bounds as `rift:range` on each key: schema validation
 /// alone cannot compare `"4mb"` against a ceiling, so the server enforces the bounds at

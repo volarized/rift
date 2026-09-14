@@ -2137,6 +2137,57 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
+    /// A committed file the syntax provider refuses under its depth bound is absent from
+    /// the revision index, so a revision search still answers from the file beside it.
+    #[test]
+    fn search_at_a_revision_leaves_out_a_file_past_a_syntax_bound_and_serves_the_rest() -> TestResult
+    {
+        let directory = tempfile::tempdir()?;
+        rift_history::fixture::init(directory.path());
+        let committed = "pub fn committed_probe() {}\n";
+        fs::write(directory.path().join("lib.rs"), committed)?;
+        let deep = format!(
+            "pub fn deep_probe() -> i32 {{ {open}1{close} }}\n",
+            open = "(".repeat(600),
+            close = ")".repeat(600),
+        );
+        fs::write(directory.path().join("deep.rs"), deep)?;
+        rift_history::fixture::commit_all(
+            directory.path(),
+            "introduce a probe beside a refused file",
+        );
+        let root = directory.path();
+        let revision = rift_protocol::read::RevisionId("HEAD".to_owned());
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let history = HistoryConfiguration::default();
+        let service = ReadService::at_revision(root, &revision, limits, &visibility, history)?;
+        let committed: SearchParams =
+            serde_json::from_value(json!({"query": "committed_probe", "rev": "HEAD"}))?;
+        let value = serde_json::to_value(service.search(&committed, &[])?)?;
+        assert!(
+            value["results"]
+                .as_array()
+                .is_some_and(|results| !results.is_empty()),
+            "{value:#}"
+        );
+        let names_deep = value["warnings"].as_array().is_some_and(|warnings| {
+            warnings.iter().any(|warning| {
+                warning["code"] == "source_unavailable" && warning["unit"] == "rift://file/deep.rs"
+            })
+        });
+        assert!(names_deep, "{value:#}");
+        let refused: SearchParams =
+            serde_json::from_value(json!({"query": "deep_probe", "rev": "HEAD"}))?;
+        let refused_value = serde_json::to_value(service.search(&refused, &[])?)?;
+        assert_eq!(
+            refused_value["results"].as_array().map(Vec::len),
+            Some(0),
+            "{refused_value:#}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn search_finds_every_explicitly_included_utf8_file() -> TestResult {
         let directory = tempfile::tempdir()?;

@@ -113,7 +113,7 @@
             "type": "integer"
           },
           "name": {
-            "description": "The declaration name to look up - a name, not a full `SymbolId` or free-text\nquery; `search` takes free text. An exact symbol name ranks first, then prefix\nmatches, then qualified-name substrings.",
+            "description": "The declaration name to look up - a name, not a full `SymbolId` or free-text\nquery; `search` takes free text. Matching is case-insensitive. An exact symbol\nname ranks first, then prefix matches, then qualified-name substrings; every tier\njoins the result set, so a substring match still answers, after the exact and\nprefix matches.",
             "maxLength": 4096,
             "minLength": 1,
             "type": "string"
@@ -587,7 +587,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A claimed file is left out of the index - its bytes are not valid UTF-8, or it\ncrosses a per-file bound - so it answers no search or lookup, and addressing it\ndirectly still refuses `content_unavailable`. Every other file in the workspace\nstays available.",
+                "description": "A claimed file is left out of the index - its bytes are not valid UTF-8, or it\ncrosses a per-file bound - so it answers no search or lookup, and addressing it\ndirectly still refuses `content_unavailable`. Every other file in the workspace\nstays available. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in\nproject-path order; when more files are left out, one more carries no `unit` and\ncounts the rest, and `rift://logs` names each of them.",
                 "properties": {
                   "code": {
                     "const": "source_unavailable",
@@ -599,13 +599,19 @@
                     "type": "string"
                   },
                   "unit": {
-                    "$ref": "#/$defs/FileId",
-                    "description": "The file whose bytes could not be read."
+                    "anyOf": [
+                      {
+                        "$ref": "#/$defs/FileId"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "The file whose bytes could not be read. Absent on the one warning that counts\nthe files past `SOURCE_WARNINGS_MAX`."
                   }
                 },
                 "required": [
                   "code",
-                  "unit",
                   "detail"
                 ],
                 "type": "object"
@@ -5130,7 +5136,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A claimed file is left out of the index - its bytes are not valid UTF-8, or it\ncrosses a per-file bound - so it answers no search or lookup, and addressing it\ndirectly still refuses `content_unavailable`. Every other file in the workspace\nstays available.",
+                "description": "A claimed file is left out of the index - its bytes are not valid UTF-8, or it\ncrosses a per-file bound - so it answers no search or lookup, and addressing it\ndirectly still refuses `content_unavailable`. Every other file in the workspace\nstays available. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in\nproject-path order; when more files are left out, one more carries no `unit` and\ncounts the rest, and `rift://logs` names each of them.",
                 "properties": {
                   "code": {
                     "const": "source_unavailable",
@@ -5142,13 +5148,19 @@
                     "type": "string"
                   },
                   "unit": {
-                    "$ref": "#/$defs/FileId",
-                    "description": "The file whose bytes could not be read."
+                    "anyOf": [
+                      {
+                        "$ref": "#/$defs/FileId"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "The file whose bytes could not be read. Absent on the one warning that counts\nthe files past `SOURCE_WARNINGS_MAX`."
                   }
                 },
                 "required": [
                   "code",
-                  "unit",
                   "detail"
                 ],
                 "type": "object"
@@ -12322,7 +12334,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A claimed file is left out of the index - its bytes are not valid UTF-8, or it\ncrosses a per-file bound - so it answers no search or lookup, and addressing it\ndirectly still refuses `content_unavailable`. Every other file in the workspace\nstays available.",
+                "description": "A claimed file is left out of the index - its bytes are not valid UTF-8, or it\ncrosses a per-file bound - so it answers no search or lookup, and addressing it\ndirectly still refuses `content_unavailable`. Every other file in the workspace\nstays available. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in\nproject-path order; when more files are left out, one more carries no `unit` and\ncounts the rest, and `rift://logs` names each of them.",
                 "properties": {
                   "code": {
                     "const": "source_unavailable",
@@ -12334,13 +12346,19 @@
                     "type": "string"
                   },
                   "unit": {
-                    "$ref": "#/$defs/FileId",
-                    "description": "The file whose bytes could not be read."
+                    "anyOf": [
+                      {
+                        "$ref": "#/$defs/FileId"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "The file whose bytes could not be read. Absent on the one warning that counts\nthe files past `SOURCE_WARNINGS_MAX`."
                   }
                 },
                 "required": [
                   "code",
-                  "unit",
                   "detail"
                 ],
                 "type": "object"
