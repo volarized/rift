@@ -28,8 +28,8 @@ pub use encoder::{Encoder, EncoderLimits, ModelFiles};
 pub use error::{SearchError, SearchFault, SearchViolation};
 pub use fusion::{DeclarationMatch, FusedRank, Ranking, best_per_file, fuse, spread_per_file};
 pub use index::{
-    DescribedUnit, Embedding, RankedUnit, SearchIndex, SearchIndexLimits, SearchIndexLimitsBuilder,
-    SemanticReadiness,
+    DescribedUnit, Embedding, FusedRanking, RankedUnit, SearchIndex, SearchIndexLimits,
+    SearchIndexLimitsBuilder, SemanticReadiness,
 };
 pub use rift_index::RevisionScoped;
 pub use similarity::{SemanticMatch, nearest};

@@ -1847,7 +1847,7 @@ impl<Store: LexicalStore> LexicalTask<Store> {
         };
         let outcome = match ended {
             Ok(Ok(())) => return Ok(()),
-            Ok(Err(error)) => ReadFault::unavailable("lexical index commit", error.to_string()),
+            Ok(Err(error)) => ReadFault::unavailable("lexical index commit", error.detail()),
             Err(_) => lexical_unavailable("the lexical transaction's task ended without an answer"),
         };
         record_commit_failure(&tree_revision, form, &outcome);
@@ -3831,13 +3831,12 @@ mod tests {
 
     /// One unit `bytes` long at `path`, for the bound cases.
     fn unit_of(path: &str, identity: &str, bytes: usize) -> TestResult<rift_index::LexicalUnit> {
-        Ok(rift_index::LexicalUnit::new(
-            identity,
-            rift_core::ProjectPath::new(path)?,
-            rift_index::LexicalUnitKind::Symbol,
-            Some(identity.to_owned()),
-            "x".repeat(bytes),
-        )?)
+        let project_path = rift_core::ProjectPath::new(path)?;
+        let kind = rift_index::LexicalUnitKind::Symbol;
+        let name = Some(identity.to_owned());
+        let text = "x".repeat(bytes);
+        let unit = rift_index::LexicalUnit::new(identity, project_path, kind, name, text)?;
+        Ok(unit)
     }
 
     #[test]
@@ -3900,10 +3899,8 @@ mod tests {
     {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        fs::write(
-            directory.path().join("blob.rs"),
-            format!("pub const BLOB: &str = \"{}\";\n", "b".repeat(96)),
-        )?;
+        let blob = format!("pub const BLOB: &str = \"{}\";\n", "b".repeat(96));
+        fs::write(directory.path().join("blob.rs"), blob)?;
         let published = stable_candidate(directory.path(), 0)?;
         let index = Arc::new(search_index_bounded(&directory.path().join("search.db"), 64).await?);
         let cancellation = CancellationToken::new();
@@ -4715,7 +4712,7 @@ mod tests {
         limit: u32,
     ) -> TestResult<Vec<rift_search::RankedUnit>> {
         match index.search(tree_revision, query, limit).await? {
-            RevisionScoped::Matched(ranked) => Ok(ranked),
+            RevisionScoped::Matched(ranked) => Ok(ranked.into_units()),
             other => Err(format!("the store must hold {tree_revision}: {other:?}").into()),
         }
     }

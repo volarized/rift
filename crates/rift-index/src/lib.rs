@@ -26,7 +26,7 @@ pub use glob::PathMatcher;
 pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
 pub use lexical::{
     LexicalChange, LexicalIndexError, LexicalIndexFault, LexicalIndexLimits, LexicalIndexViolation,
-    LexicalMatch, LexicalSearchIndex, LexicalUnit, LexicalUnitKind, RevisionScoped,
+    LexicalMatch, LexicalRanking, LexicalSearchIndex, LexicalUnit, LexicalUnitKind, RevisionScoped,
 };
 pub use log::{
     LOG_BATCH_RECORDS_MAX, LOG_FIELDS_BYTES_MAX, LOG_LABEL_BYTES_MAX, LOG_LEVELS,

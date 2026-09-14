@@ -119,7 +119,7 @@ pub struct ErrorCause {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LimitEvidence {
-    /// The limit's field path, such as `max_page_items`.
+    /// The limit's field path, such as `source.files`.
     #[schemars(length(min = 1, max = 128))]
     pub field: String,
     /// The value in force when the request was rejected.
@@ -174,18 +174,18 @@ mod tests {
     fn error_data_round_trips_through_json() {
         let data = ErrorData {
             code: ErrorCode::LimitExceeded,
-            message: "response exceeded max_page_items".to_owned(),
+            message: "the workspace holds more files than source.files admits".to_owned(),
             retry: RetryDirective::SameRequest,
             phase: ErrorPhase::Read,
             diagnostics: Vec::new(),
             limit: Some(LimitEvidence {
-                field: "max_page_items".to_owned(),
+                field: "source.files".to_owned(),
                 limit: 100,
                 required: 250,
             }),
             causes: vec![ErrorCause {
                 code: ErrorCode::LimitExceeded,
-                message: "search page exceeded max_page_items".to_owned(),
+                message: "the index build crossed source.files".to_owned(),
                 retry: RetryDirective::SameRequest,
             }],
         };

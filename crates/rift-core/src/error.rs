@@ -369,20 +369,25 @@ impl ErrorContext {
 /// human-readable form; the same information travels as JSON in `ErrorData`.
 #[must_use]
 pub fn render_failure(descriptor: ErrorDescriptor, context: &[ErrorContext]) -> String {
+    format!(
+        "{}; {}",
+        render_detail(descriptor, context),
+        descriptor.action()
+    )
+}
+
+/// Renders what failed and which values caused it, with no action:
+/// `explanation: key value, key value`, or the explanation alone without evidence.
+fn render_detail(descriptor: ErrorDescriptor, context: &[ErrorContext]) -> String {
     let evidence = context
         .iter()
         .map(|entry| format!("{} {}", entry.key(), entry.value()))
         .collect::<Vec<_>>()
         .join(", ");
     if evidence.is_empty() {
-        format!("{}; {}", descriptor.explanation(), descriptor.action())
+        descriptor.explanation().to_owned()
     } else {
-        format!(
-            "{}: {}; {}",
-            descriptor.explanation(),
-            evidence,
-            descriptor.action()
-        )
+        format!("{}: {}", descriptor.explanation(), evidence)
     }
 }
 
@@ -494,6 +499,16 @@ impl<K: Fault> Error<K> {
         let mut context = self.kind.context();
         context.extend(self.context.iter().cloned());
         context
+    }
+
+    /// Renders the failure's explanation and evidence without its action.
+    ///
+    /// A fault that carries this failure as its own `detail` renders the registry action
+    /// for its own identity, so the carried failure brings none: an action rendered by
+    /// both would tell the caller the same next step twice.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        render_detail(self.descriptor(), &self.context())
     }
 }
 
@@ -739,6 +754,41 @@ mod tests {
              limit search.results_max 100, required 250; \
              resize the request below the named limit, or raise that limit \
              in the workspace configuration"
+        );
+    }
+
+    #[test]
+    fn detail_renders_explanation_and_evidence_without_the_action() {
+        let error = RiftError::new(ErrorName::Wire(ErrorCode::TemporarilyUnavailable))
+            .with_context(ErrorContext::new("attempts", "8"));
+        assert_eq!(
+            error.detail(),
+            "the server cannot serve this request yet: attempts 8"
+        );
+        let bare = RiftError::new(ErrorName::Wire(ErrorCode::TemporarilyUnavailable));
+        assert_eq!(bare.detail(), "the server cannot serve this request yet");
+    }
+
+    /// A failure carrying another failure's `detail` renders one action: its own.
+    #[test]
+    fn a_carried_detail_renders_the_action_once() {
+        let inner = RiftError::new(ErrorName::Wire(ErrorCode::TemporarilyUnavailable))
+            .with_context(ErrorContext::new("attempts", "8"));
+        let outer = RiftError::new(ErrorName::Wire(ErrorCode::TemporarilyUnavailable))
+            .with_context(ErrorContext::new("detail", inner.detail()));
+
+        let rendered = outer.to_string();
+
+        assert_eq!(
+            rendered
+                .matches("resend the same request after a short delay")
+                .count(),
+            1,
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("detail the server cannot serve this request yet: attempts 8"),
+            "{rendered}"
         );
     }
 

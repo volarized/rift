@@ -1,6 +1,7 @@
 //! The bounds a large workspace meets first, proven through the served surface: the
 //! lexical index's `[search.lexical] units_max` key, the `[source] workspace_size` key,
-//! and one file a syntax provider refuses under its own bounds.
+//! one file a syntax provider refuses under its own bounds, and the file bound on
+//! `search`'s `paths.force_include`.
 //!
 //! A workspace past `workspace_size` refuses to build naming the key and its maximum, and
 //! the same workspace under the default serves; lowering `workspace_size` on a served
@@ -8,7 +9,8 @@
 //! `stale_index` naming the key. A workspace past `units_max` serves, and `search` answers
 //! from identifier matching with `lexical_ranking_unavailable` naming the key and its
 //! maximum. A workspace holding one file past the syntax depth bound still answers
-//! `search` from its other file, with the deep file absent.
+//! `search` from its other file, with the deep file absent. A `force_include` matching
+//! more files than its bound refuses naming the field, the bound, and the count.
 
 mod hermetic_search;
 #[allow(dead_code)]
@@ -16,6 +18,7 @@ mod workspace_client;
 
 use std::fs;
 
+use rift_core::constants::FORCE_INCLUDE_FILES_MAX;
 use rift_index::WorkspaceIndexLimits;
 use rift_mcp::RiftMcp;
 use serde_json::{Value, json};
@@ -268,6 +271,63 @@ async fn the_same_workspace_serves_under_the_default_workspace_size_and_a_change
         },
     )
     .await?;
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// Text files below `extra/`, two past the file bound one `paths.force_include` may reach.
+const FORCE_INCLUDE_FILE_COUNT: usize = FORCE_INCLUDE_FILES_MAX + 2;
+
+/// One normal source file, a `.gitignore` leaving `extra/` out of the index, and
+/// `FORCE_INCLUDE_FILE_COUNT` one-line text files below it.
+fn force_include_files() -> Vec<(String, String)> {
+    let mut files = vec![
+        ("lib.rs".to_owned(), "pub fn beacon() {}\n".to_owned()),
+        (".gitignore".to_owned(), "extra/\n".to_owned()),
+    ];
+    files.extend((0..FORCE_INCLUDE_FILE_COUNT).map(|index| {
+        (
+            format!("extra/note-{index:04}.txt"),
+            format!("note {index}\n"),
+        )
+    }));
+    files
+}
+
+/// The wire `data` of one refused tool call.
+fn refusal_data(error: rmcp::ServiceError) -> Value {
+    match error {
+        rmcp::ServiceError::McpError(data) => data.data.expect("wire error data must be present"),
+        other => panic!("expected a protocol-level McpError, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_force_include_past_its_file_bound_refuses_with_the_match_count_as_evidence() -> TestResult
+{
+    let files = force_include_files();
+    let (_directory, client, server_task) = served_workspace(&borrowed(&files), None).await?;
+
+    let refused = client
+        .call_tool(tool_request(
+            "search",
+            &json!({ "query": "note", "paths": { "force_include": ["extra/**"] } }),
+        ))
+        .await
+        .expect_err("a force_include past its file bound refuses the request");
+    let wire = refusal_data(refused);
+    assert_eq!(wire["code"], json!("limit_exceeded"), "{wire:#}");
+    assert_eq!(
+        wire["limit"],
+        json!({
+            "field": "paths.force_include",
+            "limit": FORCE_INCLUDE_FILES_MAX,
+            "required": FORCE_INCLUDE_FILE_COUNT
+        }),
+        "the refusal must carry typed wire evidence: {wire:#}"
+    );
 
     client.cancel().await?;
     server_task.await?;

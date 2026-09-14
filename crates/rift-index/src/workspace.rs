@@ -18,6 +18,7 @@ use rift_core::{
     LimitEvidence, PortableSymbolFacts, ProjectPath, ProviderId, SourceVisibility, SymbolId,
     TextFileInclusion, fault_label, symbol_identity,
 };
+use rift_protocol::search::FORCE_INCLUDE_FIELD;
 use rift_protocol::source::{SOURCE_FILES_FIELD, SOURCE_WORKSPACE_SIZE_FIELD};
 use rift_provider::{
     AssembledSymbol, Component, CompositionBuilder, NormalizedGraph, ProviderComposition,
@@ -1809,7 +1810,11 @@ impl WorkspaceIndex {
         Ok(files)
     }
 
-    /// Walks request-selected visible files into baseline content catalog.
+    /// Walks request-selected visible files into baseline content catalog. Past `files_max`
+    /// the walk reads nothing more and counts the selector's remaining matches, so the
+    /// refusal carries the whole match count and names the first path past the bound; that
+    /// counting walk is bounded by the tree and `directory_depth_max`, the same bounds the
+    /// reading walk runs under.
     fn force_include_text_files(
         &self,
         force_include: &[String],
@@ -1821,6 +1826,8 @@ impl WorkspaceIndex {
         let matcher = PathMatcher::build(&self.root, force_include, &[])?;
         let mut extra_bytes = 0_usize;
         let mut files = Vec::new();
+        let mut match_count = 0_usize;
+        let mut first_excess: Option<PathBuf> = None;
         let walker = source_walk(
             &self.root,
             self.limits.directory_depth_max,
@@ -1849,8 +1856,10 @@ impl WorkspaceIndex {
             if self.text_file(&project_path).is_some() {
                 continue;
             }
+            match_count += 1;
             if files.len() >= files_max {
-                return Err(index_error_at(WorkspaceIndexViolation::TooManyFiles, path));
+                first_excess.get_or_insert_with(|| path.to_path_buf());
+                continue;
             }
             if let IndexRead::Included(file) =
                 read_catalog_file(&self.root, path, self.limits, &mut extra_bytes)?
@@ -1858,7 +1867,16 @@ impl WorkspaceIndex {
                 files.push(file);
             }
         }
-        Ok(files)
+        match first_excess {
+            Some(path) => Err(index_error_over_limit(
+                WorkspaceIndexViolation::TooManyFiles,
+                &path,
+                FORCE_INCLUDE_FIELD,
+                match_count,
+                files_max,
+            )),
+            None => Ok(files),
+        }
     }
 
     /// Builds one request index over files selected by force include.
@@ -3808,6 +3826,43 @@ mod tests {
         );
     }
 
+    /// Past `files_max`, the walk keeps counting the selector's matches without reading
+    /// them, so the refusal names the first excess path and carries the bound and the
+    /// match count as evidence.
+    #[test]
+    fn test_force_include_past_the_file_bound_carries_the_match_count_as_evidence() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        fs::write(directory.path().join(".gitignore"), "*.rs\n").expect("root gitignore");
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            fs::write(directory.path().join(name), "pub fn hidden() {}\n").expect("hidden source");
+        }
+        let index = build_index(&directory, &SourceVisibility::default()).expect("index");
+
+        let error = index
+            .force_include_index(&["*.rs".to_owned()], 1)
+            .expect_err("three matches must refuse a one-file bound");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::TooManyFiles
+        );
+        assert!(
+            error
+                .fault()
+                .path()
+                .is_some_and(|path| path.ends_with("b.rs")),
+            "the refusal names the first path past the bound: {:?}",
+            error.fault().path()
+        );
+        assert_eq!(
+            error.fault().limit_evidence().map(|evidence| (
+                evidence.field,
+                evidence.limit,
+                evidence.required
+            )),
+            Some(("paths.force_include".to_owned(), 1, 3))
+        );
+    }
+
     #[test]
     fn test_force_include_reports_too_deep_like_the_ordinary_scan() {
         // `outer/` is gitignored, so the ordinary scan never walks deep enough to see `inner/`
@@ -5684,6 +5739,68 @@ mod tests {
         assert_eq!(
             error.fault().violation(),
             WorkspaceIndexViolation::WorkspaceTooLarge
+        );
+    }
+
+    #[test]
+    fn test_included_file_over_limit_without_overflow_reports_workspace_too_large() {
+        let limits = WorkspaceIndexLimits::new(5, 1_000, 10, 4, 5).expect("limits");
+        let mut workspace_bytes = 6_usize;
+        let project_path = ProjectPath::new("big.rs").expect("fixture path");
+        let error = included_file(
+            project_path,
+            b"12345".to_vec(),
+            Path::new("big.rs"),
+            &RustSyntaxProvider::default(),
+            limits,
+            &mut workspace_bytes,
+        )
+        .expect_err(
+            "6 already-counted bytes plus 5 more must cross a ten-byte bound without overflowing",
+        );
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::WorkspaceTooLarge
+        );
+        assert_eq!(workspace_bytes, 11, "the refused file's bytes stay counted");
+        let message = error.to_string();
+        assert!(
+            message.contains(SOURCE_WORKSPACE_SIZE_FIELD) && message.contains("big.rs"),
+            "the refusal names the bound and the file: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_visible_digests_refuse_a_file_the_process_cannot_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().expect("workspace");
+        fs::write(directory.path().join("kept.txt"), "kept\n").expect("readable file");
+        let sealed = directory.path().join("sealed.txt");
+        fs::write(&sealed, "sealed\n").expect("sealed file");
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000))
+            .expect("fixture permissions set");
+        let policy = WorkspaceSourcePolicy::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("source policy");
+        let outcome = policy.visible_digests();
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o644))
+            .expect("fixture permissions restore");
+        let error = outcome.expect_err("a read this process cannot make fails the capture");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::Filesystem
+        );
+        assert!(
+            error
+                .fault()
+                .path()
+                .is_some_and(|path| path.ends_with("sealed.txt")),
+            "the refusal names the unreadable file: {error}"
         );
     }
 

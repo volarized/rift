@@ -31,8 +31,8 @@ use rift_protocol::workspace::{
     WorkspaceLspSummary, WorkspaceResourcePage, WorkspaceSourceUnit,
 };
 use rift_search::{
-    AcquisitionLimits, ModelSource, RankedUnit, RevisionScoped, SearchError, SearchIndex,
-    SearchIndexLimits, SemanticReadiness,
+    AcquisitionLimits, FusedRanking, ModelSource, RankedUnit, RevisionScoped, SearchError,
+    SearchIndex, SearchIndexLimits, SemanticReadiness,
 };
 use rift_server::{
     ChangeService, DependencyStore, EnginePool, HookSnapshot, HookStatus, LspProcessKey,
@@ -701,19 +701,25 @@ fn changed_paths_to_reparse(
 /// Nothing means the store has moved past the captured tree to a newer publication, which
 /// asks the request to capture the publication the store already answers for. A store
 /// that does not hold the captured tree while the lane is still committing it, or after
-/// the lane missed a commit, ranks nothing and says which, naming the revision.
+/// the lane missed a commit, ranks nothing and says which, naming the revision. A ranking
+/// the lexical store cut at its bound carries that cut as a warning, since hits past the
+/// bound never reach a page.
 fn ranking_of(
-    searched: RevisionScoped<Vec<RankedUnit>>,
+    searched: RevisionScoped<FusedRanking>,
     readiness: SemanticReadiness,
     files: u64,
     tree_revision: &str,
     commit_state: LexicalCommitState,
 ) -> Option<SearchRanking> {
     match (searched, commit_state) {
-        (RevisionScoped::Matched(units), _) => Some(SearchRanking {
-            units,
-            warnings: readiness_warnings(readiness, files),
-        }),
+        (RevisionScoped::Matched(ranking), _) => {
+            let mut warnings = readiness_warnings(readiness, files);
+            warnings.extend(ranking.lexical_truncated_at().map(lexical_truncated));
+            Some(SearchRanking {
+                units: ranking.into_units(),
+                warnings,
+            })
+        }
         (_, LexicalCommitState::Committing) => Some(SearchRanking::unavailable(&format!(
             "the lexical index is still committing tree revision {tree_revision}, so the \
              answer was ranked by identifier matching alone; resend the request once the \
@@ -737,6 +743,14 @@ fn ranking_of(
                  alone; rift://logs names what the lexical lane did, and a restart retries it"
             )))
         }
+    }
+}
+
+/// The warning a lexical ranking cut at `matches_max` carries: hits past that bound never
+/// reach a page, so the caller narrows `query` rather than paging on.
+fn lexical_truncated(matches_max: u32) -> ReadWarning {
+    ReadWarning::LexicalRankingTruncated {
+        matches_max: u64::from(matches_max),
     }
 }
 
@@ -2556,7 +2570,7 @@ mod tests {
     };
     use rift_protocol::lock::ProductIdentity;
     use rift_protocol::read::{GetSymbolResult, ReadWarning, SearchParams, SearchResult};
-    use rift_search::{ModelSource, RevisionScoped, SemanticReadiness};
+    use rift_search::{FusedRanking, ModelSource, RevisionScoped, SemanticReadiness};
     use rift_server::{ChangeService, ConfigurationFault, LspProcessKey, ReadError, ReadFault};
 
     use rmcp::ServiceError;
@@ -4052,10 +4066,8 @@ pub fn beacon() -> u64 {
         };
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        fs::write(
-            directory.path().join("rift.toml"),
-            "[source]\nfiles = 1000\n",
-        )?;
+        let configuration = directory.path().join("rift.toml");
+        fs::write(configuration, "[source]\nfiles = 1000\n")?;
         let candidate = stable_candidate(directory.path(), 0)?;
         let (validation, _receiver) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
@@ -4865,13 +4877,11 @@ pub fn beacon() -> u64 {
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
         let unit_bytes_max =
             usize::try_from(rift_index::LexicalIndexLimits::default().unit_bytes_max())?;
-        fs::write(
-            directory.path().join("src/blob.rs"),
-            format!(
-                "pub const BLOB: &str = \"{}\";\n",
-                "b".repeat(unit_bytes_max)
-            ),
-        )?;
+        let blob = format!(
+            "pub const BLOB: &str = \"{}\";\n",
+            "b".repeat(unit_bytes_max)
+        );
+        fs::write(directory.path().join("src/blob.rs"), blob)?;
         super::hermetic_workspace(directory.path(), "")?;
         let (sink, mut drain) = crate::logs::log_capture();
         let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
@@ -5292,7 +5302,7 @@ pub fn beacon() -> u64 {
     #[test]
     fn a_matched_store_ranks_its_units_and_carries_the_readiness_warning() -> TestResult {
         let ranking = super::ranking_of(
-            RevisionScoped::Matched(Vec::new()),
+            RevisionScoped::Matched(FusedRanking::new(Vec::new(), None)),
             SemanticReadiness::Preparing {
                 prepared: 1,
                 total: 4,
@@ -5310,6 +5320,23 @@ pub fn beacon() -> u64 {
             1,
             "a matched store's rows answer whatever the lane still holds"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_matched_store_cut_at_its_bound_carries_the_truncation_warning() -> TestResult {
+        let ranking = super::ranking_of(
+            RevisionScoped::Matched(FusedRanking::new(Vec::new(), Some(1_000))),
+            SemanticReadiness::Ready,
+            10,
+            "bbbbbbbb",
+            LexicalCommitState::Settled,
+        )
+        .ok_or("a matched store ranks")?;
+        let warnings = serde_json::to_value(&ranking.warnings)?;
+        assert_eq!(warnings[0]["code"], json!("lexical_ranking_truncated"));
+        assert_eq!(warnings[0]["matches_max"], json!(1_000));
+        assert_eq!(warnings[1], json!(null), "exactly one warning is raised");
         Ok(())
     }
 
@@ -5519,7 +5546,7 @@ pub fn beacon() -> u64 {
             return Ok(Vec::new());
         };
         match index.search(&stamped, query, 8).await? {
-            RevisionScoped::Matched(ranked) => Ok(ranked),
+            RevisionScoped::Matched(ranked) => Ok(ranked.into_units()),
             other => Err(format!("the store moved while it was being read: {other:?}").into()),
         }
     }
@@ -5564,6 +5591,43 @@ pub fn beacon() -> u64 {
             answer.warnings
         )
         .into())
+    }
+
+    /// The lexical store ranks at most `matches_max` units for one request. A workspace
+    /// whose matches exceed that bound carries the cut as a warning naming the bound; the
+    /// same workspace answers a query under the bound with no such warning.
+    #[tokio::test]
+    async fn search_past_the_lexical_bound_carries_the_truncation_warning() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let matches_max = rift_index::LexicalIndexLimits::default().matches_max();
+        for index in 0..=matches_max {
+            let beacon = directory.path().join(format!("beacon_{index}.rs"));
+            fs::write(beacon, "pub fn beacon() {}\n")?;
+        }
+        fs::write(directory.path().join("lantern.rs"), "pub fn lantern() {}\n")?;
+        super::hermetic_workspace(directory.path(), "")?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+
+        let cut = search_after_population(&server, "beacon").await?;
+        assert!(
+            cut.warnings
+                .contains(&ReadWarning::LexicalRankingTruncated {
+                    matches_max: u64::from(matches_max),
+                }),
+            "one match past the bound must carry the cut: {:?}",
+            cut.warnings
+        );
+
+        let whole = search_after_population(&server, "lantern").await?;
+        assert!(
+            !whole
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::LexicalRankingTruncated { .. })),
+            "a ranking under the bound is not cut: {:?}",
+            whole.warnings
+        );
+        Ok(())
     }
 
     /// `fetch_limit` no longer scales with the requested `limit`, so `total_pages` reflects

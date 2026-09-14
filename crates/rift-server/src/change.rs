@@ -811,9 +811,12 @@ impl ChangeService {
         Ok(result)
     }
 
-    /// The first rewrite precondition that fails: a planned file gone from
-    /// the index, or one whose disk bytes drifted from the bytes the plan
-    /// was compiled against. Nothing when every file still matches.
+    /// The first rewrite precondition that fails: a planned file the write
+    /// gate refuses or the filesystem no longer holds, or one whose disk
+    /// bytes drifted from the bytes the plan was compiled against. Nothing
+    /// when every file still matches. Index membership proves nothing here:
+    /// a visible file no syntax provider parses is a legal move source the
+    /// index never holds.
     fn rewrite_precondition_failure<'plan>(
         &self,
         reads: &ReadService,
@@ -821,21 +824,10 @@ impl ChangeService {
         checks: impl Iterator<Item = (&'plan CoreProjectPath, &'plan str)>,
     ) -> Result<Option<ChangeResult>, ReadError> {
         for (path, base_source) in checks {
-            if reads.index().file(path).is_none() {
-                return Ok(Some(ChangeResult::refused(
-                    RefusalReason::UnmetPrecondition,
-                    vec![OperationPrecondition::new(
-                        OperationPreconditionKind::TargetExists,
-                        OperationPreconditionStatus::Failed,
-                        addresses.to_vec(),
-                        vec![path.as_str().to_owned()],
-                        PreconditionValue::Boolean { value: true },
-                        PreconditionValue::Boolean { value: false },
-                    )],
-                )));
-            }
-            let disk = fs::read_to_string(self.root.join(path.as_str()))
-                .map_err(|error| ReadFault::storage(path.as_str(), "read", &error))?;
+            let disk = match self.base_on_disk(reads, addresses, path)? {
+                Ok(disk) => disk,
+                Err(refusal) => return Ok(Some(refusal)),
+            };
             if disk != base_source {
                 return Ok(Some(ChangeResult::refused(
                     RefusalReason::UnmetPrecondition,
@@ -855,6 +847,45 @@ impl ChangeService {
             }
         }
         Ok(None)
+    }
+
+    /// The bytes `path` holds on disk, for a planned rewrite to prove its base
+    /// against. The path is resolved through the write gate every write tool
+    /// resolves its targets through, so one the `[source]` policy no longer
+    /// makes visible refuses there; one the filesystem no longer holds refuses
+    /// `target_exists`.
+    fn base_on_disk(
+        &self,
+        reads: &ReadService,
+        addresses: &[PreconditionAddress],
+        path: &CoreProjectPath,
+    ) -> Result<Result<String, ChangeResult>, ReadError> {
+        let target = match crate::publish::resolve_write_target(
+            reads,
+            &self.root,
+            path,
+            crate::publish::SymlinkResolution::Addressed,
+        )? {
+            Ok(target) => target,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        match fs::read_to_string(target.absolute()) {
+            Ok(disk) => Ok(Ok(disk)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Err(ChangeResult::refused(
+                    RefusalReason::UnmetPrecondition,
+                    vec![OperationPrecondition::new(
+                        OperationPreconditionKind::TargetExists,
+                        OperationPreconditionStatus::Failed,
+                        addresses.to_vec(),
+                        vec![path.as_str().to_owned()],
+                        PreconditionValue::Boolean { value: true },
+                        PreconditionValue::Boolean { value: false },
+                    )],
+                )))
+            }
+            Err(error) => Err(ReadFault::storage(path.as_str(), "read", &error)),
+        }
     }
 
     /// Applies unified-diff hunks to workspace files atomically.
@@ -4914,6 +4945,108 @@ mod tests {
             fs::read_to_string(directory.path().join("old/hub.rs"))?,
             hub,
             "the source never left"
+        );
+        Ok(())
+    }
+
+    /// A visible file no syntax provider parses is a legal move source the
+    /// index never holds: the apply proves its base against the disk, the way
+    /// the plan did, and lands the move.
+    #[test]
+    fn apply_move_lands_an_unclaimed_file() -> TestResult {
+        let note = "moved note\n";
+        let (directory, reads, changes) =
+            multi_file_fixture(&[("lib.rs", "pub fn beacon() {}\n"), ("notes.txt", note)])?;
+        let plan = move_plan(
+            "notes.txt",
+            "moved/notes.txt",
+            (note, note),
+            Vec::new(),
+            None,
+        );
+
+        let summary = applied_summary(changes.apply_move(&reads, &plan)?);
+
+        assert!(!directory.path().join("notes.txt").exists());
+        assert_eq!(
+            fs::read_to_string(directory.path().join("moved/notes.txt"))?,
+            note
+        );
+        assert!(!summary.files.is_empty(), "{summary:#?}");
+        Ok(())
+    }
+
+    /// A planned source the `[source]` policy no longer makes visible refuses at the
+    /// write gate, before its bytes are read.
+    #[test]
+    fn apply_move_refuses_a_source_the_source_policy_hides() -> TestResult {
+        let hub = "pub fn hub() {}\n";
+        let (directory, reads, changes) =
+            multi_file_fixture(&[(".gitignore", "hidden.rs\n"), ("hidden.rs", hub)])?;
+        let plan = move_plan("hidden.rs", "spoke.rs", (hub, hub), vec![], None);
+        let result = changes.apply_move(&reads, &plan)?;
+        let ChangeResult::Refused {
+            reason,
+            diagnostics,
+            ..
+        } = result
+        else {
+            panic!("a hidden source must refuse, got {result:?}");
+        };
+        assert_eq!(reason, RefusalReason::Unsupported);
+        assert!(
+            diagnostics[0].message.contains("hidden.rs")
+                && diagnostics[0].message.contains("[source]"),
+            "{diagnostics:?}"
+        );
+        assert!(
+            !directory.path().join("spoke.rs").exists(),
+            "a refusal leaves the tree untouched"
+        );
+        Ok(())
+    }
+
+    /// A planned source whose bytes on disk are not UTF-8 fails the read; the base
+    /// cannot be proven, so nothing is refused and nothing lands.
+    #[test]
+    fn apply_move_fails_when_the_source_bytes_are_not_utf8() -> TestResult {
+        let hub = "pub fn hub() {}\n";
+        let (directory, reads, changes) = multi_file_fixture(&[("hub.rs", hub)])?;
+        let plan = move_plan("hub.rs", "spoke.rs", (hub, hub), vec![], None);
+        fs::write(directory.path().join("hub.rs"), b"pub fn hub() {}\n\xff")?;
+        let error = changes
+            .apply_move(&reads, &plan)
+            .expect_err("bytes that are not UTF-8 must fail the base read");
+        assert_eq!(error.descriptor().code(), "storage_failure");
+        assert!(
+            error.to_string().contains("operation read") && error.to_string().contains("hub.rs"),
+            "the failure names the read and the file: {error}"
+        );
+        assert!(!directory.path().join("spoke.rs").exists());
+        Ok(())
+    }
+
+    /// A planned source below a directory this process cannot search fails at the
+    /// write gate's stat, before any read.
+    #[cfg(unix)]
+    #[test]
+    fn apply_move_fails_when_the_source_cannot_be_stat_at_the_write_gate() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+        let hub = "pub fn hub() {}\n";
+        let (directory, reads, changes) = multi_file_fixture(&[("lib.rs", hub)])?;
+        let sealed = directory.path().join("sealed");
+        fs::create_dir(&sealed)?;
+        fs::write(sealed.join("hub.rs"), hub)?;
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000))?;
+        let plan = move_plan("sealed/hub.rs", "spoke.rs", (hub, hub), vec![], None);
+        let result = changes.apply_move(&reads, &plan);
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o755))?;
+        let error = result.expect_err("a source below a sealed directory must fail the stat");
+        assert_eq!(error.descriptor().code(), "storage_failure");
+        assert!(
+            error.to_string().contains("operation stat")
+                && error.to_string().contains("sealed/hub.rs"),
+            "the failure names the stat and the file: {error}"
         );
         Ok(())
     }

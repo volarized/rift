@@ -80,6 +80,29 @@ async fn applied_move_without_an_engine_carries_the_warning() -> TestResult {
     Ok(())
 }
 
+/// A visible file no syntax provider parses moves the same way a parsed one does: the
+/// server proves it against the disk, since the index never holds it.
+#[tokio::test]
+async fn applied_move_of_an_unclaimed_file_lands() -> TestResult {
+    let note = "moved note\n";
+    let (directory, client, server_task) =
+        served_workspace(&[("hub.rs", HUB), ("notes.txt", note)], None).await?;
+
+    let structured =
+        call_retrying_acceptance(&client, move_request("notes.txt", "moved/notes.txt")).await?;
+    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
+    assert!(!directory.path().join("notes.txt").exists());
+    assert_eq!(
+        fs::read_to_string(directory.path().join("moved/notes.txt"))?,
+        note,
+        "the unclaimed file lands at the destination with its bytes unchanged"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn missing_source_and_occupied_destination_refuse() -> TestResult {
     let (directory, client, server_task) = served_workspace(

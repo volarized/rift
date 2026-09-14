@@ -6,8 +6,8 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::constants::DIGEST_WIRE_CHARS;
 use rift_core::{
-    Error, ErrorCode, ErrorContext, ErrorName, Fault, LanguageFileSelections, SourceVisibility,
-    TextFileInclusion, line,
+    Error, ErrorCode, ErrorContext, ErrorName, Fault, LanguageFileSelections, LimitEvidence,
+    SourceVisibility, TextFileInclusion, line,
 };
 use rift_dependency::DependencyCatalog;
 use rift_history::{HistoryError, Repository};
@@ -23,8 +23,9 @@ use rift_protocol::map::WorkspaceMap;
 use rift_protocol::read::{
     DEPENDENCY_WARNINGS_MAX, Digest, ExactKind, Extensions, FileId, GetSymbolHit, GetSymbolInclude,
     GetSymbolParams, GetSymbolResult, Language, Node, NodeFacet, NodeId, NodesParams, NodesResult,
-    PackageIdentity, Pagination, ProjectPath, ReadWarning, RevisionId, SOURCE_WARNINGS_MAX,
-    SearchScope, SourceLocationKind, SourceUnitId, Symbol, SymbolId, SymbolOrigin, TextRange,
+    PAGE_LIMIT_MAX, PackageIdentity, Pagination, ProjectPath, ReadWarning, RevisionId,
+    SOURCE_WARNINGS_MAX, SearchScope, SourceLocationKind, SourceUnitId, Symbol, SymbolId,
+    SymbolOrigin, TextRange,
 };
 use rift_syntax::{ByteRange, SyntaxNode, SyntaxProvider, SyntaxSymbol, registry};
 use sha2::{Digest as _, Sha256};
@@ -181,6 +182,25 @@ impl Fault for ReadFault {
                 ErrorContext::new("operation", *operation),
                 ErrorContext::new("timeout_ms", timeout_ms.to_string()),
             ],
+        }
+    }
+
+    fn limit_evidence(&self) -> Option<LimitEvidence> {
+        match self {
+            Self::Index(source) => source.fault().limit_evidence(),
+            Self::History(source) => source.fault().limit_evidence(),
+            Self::Engine(source) => source.fault().limit_evidence(),
+            Self::Dependency(source) => source.fault().limit_evidence(),
+            Self::Unsupported { .. }
+            | Self::UnclaimedExtension { .. }
+            | Self::Invalid { .. }
+            | Self::NotFound { .. }
+            | Self::SourceUnavailable { .. }
+            | Self::Storage { .. }
+            | Self::Task { .. }
+            | Self::Unavailable { .. }
+            | Self::CapacityTimeout { .. }
+            | Self::LockPoisoned { .. } => None,
         }
     }
 
@@ -605,14 +625,15 @@ impl ReadService {
 
     /// The catalog an incremental rebuild over `changes` carries: the standing one while
     /// no changed path is a resolution input or a manifest a resolver claims, a fresh
-    /// resolution otherwise. A degraded catalog is also resolved again, since the machine
-    /// may have gained the toolchain or the cache the resolvers missed.
+    /// resolution otherwise. A degraded catalog keeps its resolution too: resolving it on
+    /// every rebuild ran every resolver over every manifest for each edit of a workspace
+    /// whose degradation never clears, and the index fell behind the tree.
     fn catalog_after(&self, changes: &PathChanges) -> Result<Arc<DependencyCatalog>, ReadError> {
         let touches_input = changes.paths().any(|path| {
             let path = project_path(path);
             self.catalog.depends_on(&path) || rift_dependency::is_claimed_manifest(&path)
         });
-        if !touches_input && !self.catalog.is_degraded() {
+        if !touches_input {
             return Ok(Arc::clone(&self.catalog));
         }
         let source_policy = self.source_policy.as_deref().unwrap_or_else(|| {
@@ -955,19 +976,9 @@ impl ReadService {
         // own `results_max` bound, so `pagination.total_pages` counts the full result
         // set the pages divide.
         let results_max = self.index.results_max();
-        let mut candidates: Vec<RankedMatch<'_>> = Vec::new();
-        if params.scope != SearchScope::Dependencies {
-            let project = self
-                .index
-                .symbols(&params.name, results_max)
-                .map_err(ReadFault::index)?;
-            candidates.extend(project.into_iter().map(RankedMatch::Project));
-        }
         let dependencies = self.dependency_index(params.scope)?;
-        if let Some(index) = dependencies.as_deref() {
-            let found = index.symbols(&params.name, results_max);
-            candidates.extend(found.into_iter().map(RankedMatch::Dependency));
-        }
+        let (mut candidates, bound_reached) =
+            self.ranked_candidates(params, dependencies.as_deref(), results_max)?;
         if params.scope == SearchScope::All {
             // A stable sort: each side keeps its own order inside one rank.
             candidates.sort_by_key(|candidate| (candidate.rank(), candidate.is_dependency()));
@@ -1000,6 +1011,9 @@ impl ReadService {
         }
         let mut warnings = self.warnings();
         warnings.extend(disagreements);
+        if bound_reached {
+            warnings.push(results_truncation_warning(results_max));
+        }
         if reaches_dependencies {
             warnings.extend(dependency_warnings(dependencies.as_deref(), &self.catalog));
         }
@@ -1008,6 +1022,33 @@ impl ReadService {
             pagination,
             warnings,
         })
+    }
+
+    /// Every ranked match the project index and the attached dependency index hold for
+    /// `params.name` under `params.scope`, each set collected up to `results_max`, and
+    /// whether either set reached that bound.
+    fn ranked_candidates<'a>(
+        &'a self,
+        params: &GetSymbolParams,
+        dependencies: Option<&'a DependencyIndex>,
+        results_max: usize,
+    ) -> Result<(Vec<RankedMatch<'a>>, bool), ReadError> {
+        let mut candidates: Vec<RankedMatch<'a>> = Vec::new();
+        let mut bound_reached = false;
+        if params.scope != SearchScope::Dependencies {
+            let project = self
+                .index
+                .symbols(&params.name, results_max)
+                .map_err(ReadFault::index)?;
+            bound_reached |= project.len() >= results_max;
+            candidates.extend(project.into_iter().map(RankedMatch::Project));
+        }
+        if let Some(index) = dependencies {
+            let found = index.symbols(&params.name, results_max);
+            bound_reached |= found.len() >= results_max;
+            candidates.extend(found.into_iter().map(RankedMatch::Dependency));
+        }
+        Ok((candidates, bound_reached))
     }
 
     /// Refuses a `scope` that reaches dependencies while the `[dependencies]` table
@@ -1098,15 +1139,25 @@ impl ReadService {
     }
 }
 
-/// Accepts a caller-supplied result limit: positive, and inside this
-/// platform's addressable range.
+/// Accepts a caller-supplied result limit: positive and at most `PAGE_LIMIT_MAX`. The
+/// maximum fits `usize` on every platform, so the conversion below cannot fail.
 pub(crate) fn accepted_limit(requested: u64) -> Result<usize, ReadError> {
     if requested == 0 {
         return Err(ReadFault::invalid("limit", "zero"));
     }
-    usize::try_from(requested)
-        .map_err(|_| ReadFault::invalid("limit", format!("{requested} exceeds this platform")))
+    if requested > PAGE_LIMIT_MAX {
+        return Err(ReadFault::invalid(
+            "limit",
+            format!("{requested} exceeds the maximum {PAGE_LIMIT_MAX}"),
+        ));
+    }
+    let Ok(limit) = usize::try_from(requested) else {
+        unreachable!("a limit at or under PAGE_LIMIT_MAX fits usize: requested={requested}")
+    };
+    Ok(limit)
 }
+
+const _: () = assert!(PAGE_LIMIT_MAX <= usize::MAX as u64);
 
 /// The one checkpoint every read call passes before its own validation. `projection`
 /// left the wire, so `rev` is the only field this still takes; a caller-supplied `rev`
@@ -1266,6 +1317,14 @@ pub(crate) fn page<T>(results: Vec<T>, page_index: u64, limit: usize) -> (Vec<T>
         _ => Vec::new(),
     };
     (window, pagination)
+}
+
+/// The warning a result set that reached `results_max` carries: hits past that bound
+/// never reach a page, so the caller narrows the request rather than paging on.
+pub(crate) fn results_truncation_warning(results_max: usize) -> ReadWarning {
+    ReadWarning::ResultsTruncated {
+        results_max: u64::try_from(results_max).unwrap_or(u64::MAX),
+    }
 }
 
 fn wire_node(file: &IndexedFile, node: &SyntaxNode) -> Node {
@@ -1806,8 +1865,9 @@ pub(crate) mod tests {
     use rift_protocol::configuration::{LanguageConfiguration, WorkspaceConfiguration};
     use rift_protocol::read::{
         DEPENDENCY_WARNINGS_MAX, GetSymbolInclude, GetSymbolParams, Language, NodeFacet,
-        NodesParams, NodesResult, PackageIdentity, Pagination, ProjectPath, ReadWarning,
-        RevisionId, SOURCE_WARNINGS_MAX, SearchScope, SourceLocationKind, SourceUnitId,
+        NodesParams, NodesResult, PAGE_LIMIT_MAX, PackageIdentity, Pagination, ProjectPath,
+        ReadWarning, RevisionId, SOURCE_WARNINGS_MAX, SearchScope, SourceLocationKind,
+        SourceUnitId,
     };
     use rift_syntax::{ByteRange, ShippedLanguage};
     use serde_json::json;
@@ -1815,7 +1875,7 @@ pub(crate) mod tests {
 
     use super::{
         BindingPolicy, DependenciesConfiguration, DependencyStore, HistoryConfiguration, ReadFault,
-        ReadService, WorkspaceIndex, WorkspaceIndexLimits, file_id,
+        ReadService, WorkspaceIndex, WorkspaceIndexLimits, accepted_limit, file_id,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -1858,6 +1918,49 @@ pub(crate) mod tests {
         let text_inclusion = rift_core::TextFileInclusion::default();
         let service = reads_with(directory.path(), limits, &text_inclusion, &languages)?;
         Ok((directory, service))
+    }
+    #[test]
+    fn a_degraded_catalog_keeps_its_resolution_across_an_unrelated_change() -> TestResult {
+        let directory = TempDir::new()?;
+        fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        assert!(
+            service.catalog.is_degraded(),
+            "a manifest with no lockfile degrades the Cargo resolver"
+        );
+        let changed = |path: &str| {
+            rift_index::PathChanges::between(
+                &rift_index::WorkspaceDigests::new([]),
+                &rift_index::WorkspaceDigests::new([(
+                    rift_core::ProjectPath::new(path).expect("fixture path"),
+                    rift_index::FileDigest::of(b"changed"),
+                )]),
+            )
+        };
+
+        let kept = service.catalog_after(&changed("src/lib.rs"))?;
+        let resolved = service.catalog_after(&changed("Cargo.toml"))?;
+
+        assert!(
+            std::sync::Arc::ptr_eq(&kept, &service.catalog),
+            "a change outside the resolution inputs keeps the standing catalog"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&resolved, &service.catalog),
+            "a manifest change resolves the catalog again"
+        );
+        Ok(())
     }
 
     #[test]
@@ -2991,11 +3094,8 @@ pub fn compute() -> i32 {
             })
         );
 
-        fs::remove_file(
-            directory
-                .path()
-                .join(format!("invalid-{SOURCE_WARNINGS_MAX}.rs")),
-        )?;
+        let past_the_bound = format!("invalid-{SOURCE_WARNINGS_MAX}.rs");
+        fs::remove_file(directory.path().join(past_the_bound))?;
         let service = nodes_service(directory.path(), &SourceVisibility::default())?;
         let result = service.get_symbol(&params)?;
         assert_eq!(result.warnings.len(), SOURCE_WARNINGS_MAX);
@@ -4601,6 +4701,75 @@ pub fn compute() -> i32 {
         assert_eq!(
             value["pagination"],
             json!({ "page_index": 40, "total_pages": 2 })
+        );
+        Ok(())
+    }
+
+    /// `limit` at the advertised maximum is accepted; one over is refused naming the field
+    /// and the maximum.
+    #[test]
+    fn accepted_limit_admits_the_maximum_and_refuses_one_over() {
+        assert_eq!(
+            accepted_limit(PAGE_LIMIT_MAX).ok(),
+            usize::try_from(PAGE_LIMIT_MAX).ok()
+        );
+        let error =
+            accepted_limit(PAGE_LIMIT_MAX + 1).expect_err("one over the maximum must refuse");
+        assert!(matches!(error.fault(), ReadFault::Invalid { .. }));
+        assert_eq!(
+            error.to_string(),
+            "the request does not match the documented form: field limit, violation 10001 \
+             exceeds the maximum 10000; correct the reported field and resend the request"
+        );
+    }
+
+    /// Each index's match set is collected up to `results_max`; a set that reached it warns
+    /// `results_truncated` naming the bound, and `total_pages` counts only what fit.
+    #[test]
+    fn get_symbol_at_the_result_bound_warns_results_truncated() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("src"))?;
+        fs::write(
+            directory.path().join("src/lib.rs"),
+            "pub struct Beacon;\nimpl Beacon { pub fn signal(&self) {} }\n",
+        )?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::new(10, 4_096, 8_192, 8, 1)?,
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let params: GetSymbolParams =
+            serde_json::from_value(json!({"name": "Beacon", "limit": 5}))?;
+        let value = serde_json::to_value(service.get_symbol(&params)?)?;
+        assert_eq!(value["hits"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            value["pagination"],
+            json!({ "page_index": 0, "total_pages": 1 })
+        );
+        assert!(
+            value["warnings"].as_array().is_some_and(|warnings| {
+                warnings.contains(&json!({ "code": "results_truncated", "results_max": 1 }))
+            }),
+            "{value:#}"
+        );
+        Ok(())
+    }
+
+    /// A match set under `results_max` carries no `results_truncated` warning.
+    #[test]
+    fn get_symbol_under_the_result_bound_carries_no_results_truncated_warning() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let params: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
+        let result = service.get_symbol(&params)?;
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::ResultsTruncated { .. })),
+            "{:?}",
+            result.warnings
         );
         Ok(())
     }

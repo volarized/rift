@@ -317,7 +317,7 @@ pub(crate) fn name_positions(source: &str, name_offset: usize) -> Result<NamePos
         index.position(encoding, name_offset).map_err(|error| {
             PlanEnd::Failed(ReadFault::task(
                 "rename position conversion",
-                error.to_string(),
+                error.detail(),
             ))
         })
     };
@@ -533,7 +533,7 @@ fn package_root(entry: &CatalogEntry, source_root: &Path) -> Result<PackageRoot,
 
 /// The plan failure for a root the URI conversion refuses.
 fn root_conversion_failed(operation: &'static str, error: &UriError) -> PlanEnd {
-    PlanEnd::Failed(ReadFault::task(operation, error.to_string()))
+    PlanEnd::Failed(ReadFault::task(operation, error.detail()))
 }
 
 /// Compiles per-file text edits into whole-file rewrites, dropping a file

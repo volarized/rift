@@ -474,7 +474,7 @@ async fn checked_references(
             } else {
                 Ok(ReferenceCheck::Unanswered {
                     engine,
-                    detail: error.to_string(),
+                    detail: error.detail(),
                 })
             }
         }
@@ -1556,6 +1556,14 @@ mod tests {
         assert!(
             rendered.contains("engine fake did not answer the reference check"),
             "{rendered}"
+        );
+        assert_eq!(
+            rendered
+                .matches("resend the same request after a short delay")
+                .count(),
+            1,
+            "the refusal renders its action once, never the engine's own beside it: \
+             {rendered}"
         );
         let untouched =
             std::fs::read_to_string(directory.path().join("lib.rs")).expect("fixture file reads");
