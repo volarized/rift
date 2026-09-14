@@ -603,29 +603,30 @@ impl ElectedServer {
         self.server.port()
     }
 
-    /// Waits until the server stopped, bounded by `deadline`, then retires the
-    /// lock document.
+    /// Waits until the server stopped, bounded by `deadline`, and hands the
+    /// election guard back so the caller releases it last.
     ///
-    /// The transport shutdown takes only what remains of `deadline`.
+    /// The document is not retired here: the caller drops the returned guard
+    /// after every later stop stage, the log drain's final flush included, so
+    /// the election releases immediately before the process leaves. The
+    /// transport shutdown takes only what remains of `deadline`.
     ///
     /// # Errors
     ///
-    /// Returns the transport's shutdown failure; the document is retired
-    /// and the election released on every path.
+    /// The second tuple element carries the transport's shutdown failure.
     ///
     /// # Cancel safety
     ///
     /// Dropping this future retires the document and releases the election
     /// through the guard's drop; the serving tasks detach and complete a
     /// shutdown already triggered in the background.
-    pub async fn stopped(self, deadline: Instant) -> Result<(), ElectionError> {
+    pub async fn stopped(self, deadline: Instant) -> (ElectionGuard, Result<(), ElectionError>) {
         let outcome = self
             .server
             .stopped(deadline)
             .await
             .map_err(ElectionFault::serve);
-        self.guard.retire();
-        outcome
+        (self.guard, outcome)
     }
 }
 
@@ -1311,6 +1312,35 @@ mod tests {
                 }
             ),
             "the publish failure must surface: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_document_outlives_the_transport_stop_and_the_caller_retires_it() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(directory.path(), "")?;
+        let shutdown = CancellationToken::new();
+        let elected = serve_elected(directory.path(), shutdown.clone()).await?;
+        let document = document_path(directory.path());
+        assert!(
+            document.is_file(),
+            "a served election publishes its document"
+        );
+
+        shutdown.cancel();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        let (guard, outcome) = elected.stopped(deadline).await;
+        outcome.map_err(|error| format!("the transport must stop cleanly: {error:?}"))?;
+        assert!(
+            document.is_file(),
+            "the document outlives the transport stop; only the caller retires it"
+        );
+
+        guard.retire();
+        assert!(
+            !document.exists(),
+            "the caller's retire removes the document"
         );
         Ok(())
     }

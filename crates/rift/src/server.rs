@@ -636,9 +636,12 @@ async fn await_election_released(
 /// tracing layer queued into the workspace database until the same token
 /// stops it.
 ///
-/// The whole stop is bounded by [`SERVER_STOP_DEADLINE`]: the transport
-/// shutdown and the log drain's final flush each take only what the stage
-/// before it left of it.
+/// The stop runs in one order under [`SERVER_STOP_DEADLINE`]: serving ends,
+/// the engines and index supervisor shut down, the log drain's final flush
+/// runs, and only then is the election released, by dropping the guard right
+/// before the process exits - so a stop the CLI reports as success means the
+/// process is leaving. Each stage takes only what the one before it left of
+/// the deadline.
 async fn serve_foreground(
     root: &Path,
     drain: Option<LogDrain>,
@@ -681,14 +684,16 @@ async fn serve_foreground(
     );
     let interrupt = tokio::spawn(cancel_on_interrupt(shutdown.clone()));
     let deadline = tokio::time::Instant::now() + SERVER_STOP_DEADLINE;
-    let stopped = server
-        .stopped(deadline)
-        .await
-        .map_err(|error| Error::new(ServerCommandFault::Election(Box::new(error))));
+    let (guard, stopped) = server.stopped(deadline).await;
+    let stopped =
+        stopped.map_err(|error| Error::new(ServerCommandFault::Election(Box::new(error))));
     shutdown.cancel();
     interrupt.abort();
     let _ = interrupt.await;
     stop_log_drain(log_drain, deadline).await;
+    // The election releases last: dropping the guard retires the document and
+    // unlocks, immediately before the process exits.
+    drop(guard);
     stopped
 }
 

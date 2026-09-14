@@ -36,6 +36,9 @@ const LARGE_FIXTURE_FILES: usize = 3_000;
 /// Declarations per file in that fixture: one lexical unit each, so the whole commit
 /// that runs behind the publication takes seconds on a development machine.
 const LARGE_FIXTURE_DECLARATIONS: usize = 12;
+/// How long after rewriting the large fixture the stop is issued: long enough for the
+/// capture to be running and the previous rebuild's lexical transaction to hold the write turn.
+const STOP_DELAY_AFTER_REWRITE: Duration = Duration::from_millis(200);
 
 /// Serializes the tests: the served port range is machine-global.
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -402,6 +405,72 @@ fn stop_during_a_running_capture_ends_the_process() -> TestResult {
     assert!(
         status.success(),
         "a stopped foreground server exits cleanly: {status:?}"
+    );
+    let output = child.wait_with_output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("MCP server stopped"),
+        "serving ended before the process left: {stderr}"
+    );
+    assert!(
+        !document_path(root).exists(),
+        "a graceful stop retires server.json"
+    );
+    Ok(())
+}
+
+#[test]
+fn stop_issued_during_a_rebuild_ends_the_process_before_the_document_goes() -> TestResult {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let directory = workspace()?;
+    let root = directory.path();
+    write_large_fixture(root)?;
+    let _cleanup = StopOnDrop::new(root);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rift"))
+        .args(["server", "start", "--foreground"])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let serving = wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
+        serving_document(root)
+    })?;
+    assert_eq!(serving.pid, child.id(), "the child itself must serve");
+
+    // Rewriting every file streams invalidations into a capture while the rebuild behind
+    // the publication is still replacing every lexical unit in one transaction that holds
+    // the database's write turn. The stop lands with both in flight.
+    write_large_fixture(root)?;
+    std::thread::sleep(STOP_DELAY_AFTER_REWRITE);
+    let stopped = rift(root, &["server", "stop"])?;
+    require_success(&stopped, "stop during the rebuild")?;
+
+    // Each poll reads the document before the process, so the one order the stop forbids
+    // - the document gone while the process still runs - can only be observed, never
+    // produced by the poll's own ordering.
+    let mut observations = Vec::with_capacity(GONE_POLL_ATTEMPT_COUNT as usize);
+    let status = wait_for(
+        GONE_POLL_ATTEMPT_COUNT,
+        "the stopped server's process to exit while its rebuild runs",
+        || {
+            let document_present = document_path(root).exists();
+            let exited = child.try_wait().ok().flatten();
+            observations.push((document_present, exited.is_some()));
+            exited
+        },
+    )?;
+    assert!(
+        status.success(),
+        "a stopped foreground server exits cleanly: {status:?}"
+    );
+    assert!(
+        observations
+            .iter()
+            .all(|&(document_present, exited)| document_present || exited),
+        "server.json goes only once the process is gone; observed (document present, \
+         process exited) per poll: {observations:?}"
     );
     let output = child.wait_with_output()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
