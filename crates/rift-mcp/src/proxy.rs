@@ -856,10 +856,10 @@ mod tests {
 
     use super::{
         ConnectAttemptFailure, ProxyFault, RiftProxy, SpawnPollOutcome, StartupCapture, Upstream,
-        UpstreamSlot, adopt_serving, connect_recorded, fallback_info, forwarded_error,
-        lost_start_election, mirrored_info, quit_reason_result, require_identity_match,
-        reuse_current, serve_connection, server_start_failed, spawn_poll_outcome, transport_failed,
-        upstream_unavailable,
+        UpstreamSlot, adopt_serving, connect_recorded, connect_upstream, fallback_info,
+        forwarded_error, lost_start_election, mirrored_info, quit_reason_result,
+        require_identity_match, reuse_current, serve_connection, server_start_failed,
+        spawn_poll_outcome, transport_failed, upstream_unavailable,
     };
     use crate::election::claim;
     use rift_core::{CapturedStream, Error};
@@ -1416,6 +1416,32 @@ mod tests {
                 .is_none(),
             "a recorded server that answers nothing must be treated as stale"
         );
+        Ok(())
+    }
+
+    /// A server another starter elected is still building: the connect spawns nothing
+    /// and waits for that holder's document, refusing once the start window closes.
+    #[tokio::test(start_paused = true)]
+    async fn connect_spawns_nothing_while_another_starter_holds_the_election() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let _guard = claim(directory.path())?;
+        let refusal = connect_upstream(directory.path(), &test_identity())
+            .await
+            .expect_err("a holder that never publishes must exhaust the start window");
+        assert_eq!(refusal.message, upstream_unavailable().message);
+        Ok(())
+    }
+
+    /// A spawn that cannot launch is reported, and the poll still gives a concurrently
+    /// started server its window before refusing.
+    #[tokio::test(start_paused = true)]
+    async fn connect_reports_a_spawn_that_cannot_launch_and_still_polls() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let missing = directory.path().join("missing");
+        let refusal = connect_upstream(&missing, &test_identity())
+            .await
+            .expect_err("a workspace nobody serves must exhaust the start window");
+        assert_eq!(refusal.message, upstream_unavailable().message);
         Ok(())
     }
 

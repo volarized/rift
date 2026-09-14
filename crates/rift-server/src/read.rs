@@ -3049,11 +3049,8 @@ pub fn compute() -> i32 {
             })
         );
 
-        fs::remove_file(
-            directory
-                .path()
-                .join(format!("invalid-{SOURCE_WARNINGS_MAX}.rs")),
-        )?;
+        let past_the_bound = format!("invalid-{SOURCE_WARNINGS_MAX}.rs");
+        fs::remove_file(directory.path().join(past_the_bound))?;
         let service = nodes_service(directory.path(), &SourceVisibility::default())?;
         let result = service.get_symbol(&params)?;
         assert_eq!(result.warnings.len(), SOURCE_WARNINGS_MAX);

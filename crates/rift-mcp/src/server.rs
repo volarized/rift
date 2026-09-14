@@ -3776,10 +3776,8 @@ pub fn beacon() -> u64 {
         };
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        fs::write(
-            directory.path().join("rift.toml"),
-            "[source]\nfiles = 1000\n",
-        )?;
+        let configuration = directory.path().join("rift.toml");
+        fs::write(configuration, "[source]\nfiles = 1000\n")?;
         let candidate = stable_candidate(directory.path(), 0)?;
         let (validation, _receiver) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
@@ -4298,13 +4296,11 @@ pub fn beacon() -> u64 {
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
         let unit_bytes_max =
             usize::try_from(rift_index::LexicalIndexLimits::default().unit_bytes_max())?;
-        fs::write(
-            directory.path().join("src/blob.rs"),
-            format!(
-                "pub const BLOB: &str = \"{}\";\n",
-                "b".repeat(unit_bytes_max)
-            ),
-        )?;
+        let blob = format!(
+            "pub const BLOB: &str = \"{}\";\n",
+            "b".repeat(unit_bytes_max)
+        );
+        fs::write(directory.path().join("src/blob.rs"), blob)?;
         super::hermetic_workspace(directory.path(), "")?;
         let (sink, mut drain) = crate::logs::log_capture();
         let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));

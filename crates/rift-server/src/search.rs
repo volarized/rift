@@ -2144,10 +2144,8 @@ pub fn compute() -> i32 {
     {
         let directory = tempfile::tempdir()?;
         rift_history::fixture::init(directory.path());
-        fs::write(
-            directory.path().join("lib.rs"),
-            "pub fn committed_probe() {}\n",
-        )?;
+        let committed = "pub fn committed_probe() {}\n";
+        fs::write(directory.path().join("lib.rs"), committed)?;
         let deep = format!(
             "pub fn deep_probe() -> i32 {{ {open}1{close} }}\n",
             open = "(".repeat(600),
@@ -2158,13 +2156,12 @@ pub fn compute() -> i32 {
             directory.path(),
             "introduce a probe beside a refused file",
         );
-        let service = ReadService::at_revision(
-            directory.path(),
-            &rift_protocol::read::RevisionId("HEAD".to_owned()),
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            HistoryConfiguration::default(),
-        )?;
+        let root = directory.path();
+        let revision = rift_protocol::read::RevisionId("HEAD".to_owned());
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let history = HistoryConfiguration::default();
+        let service = ReadService::at_revision(root, &revision, limits, &visibility, history)?;
         let committed: SearchParams =
             serde_json::from_value(json!({"query": "committed_probe", "rev": "HEAD"}))?;
         let value = serde_json::to_value(service.search(&committed, &[])?)?;

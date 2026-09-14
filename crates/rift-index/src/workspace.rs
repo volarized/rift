@@ -5683,6 +5683,68 @@ mod tests {
     }
 
     #[test]
+    fn test_included_file_over_limit_without_overflow_reports_workspace_too_large() {
+        let limits = WorkspaceIndexLimits::new(5, 1_000, 10, 4, 5).expect("limits");
+        let mut workspace_bytes = 6_usize;
+        let project_path = ProjectPath::new("big.rs").expect("fixture path");
+        let error = included_file(
+            project_path,
+            b"12345".to_vec(),
+            Path::new("big.rs"),
+            &RustSyntaxProvider::default(),
+            limits,
+            &mut workspace_bytes,
+        )
+        .expect_err(
+            "6 already-counted bytes plus 5 more must cross a ten-byte bound without overflowing",
+        );
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::WorkspaceTooLarge
+        );
+        assert_eq!(workspace_bytes, 11, "the refused file's bytes stay counted");
+        let message = error.to_string();
+        assert!(
+            message.contains(SOURCE_WORKSPACE_SIZE_FIELD) && message.contains("big.rs"),
+            "the refusal names the bound and the file: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_visible_digests_refuse_a_file_the_process_cannot_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().expect("workspace");
+        fs::write(directory.path().join("kept.txt"), "kept\n").expect("readable file");
+        let sealed = directory.path().join("sealed.txt");
+        fs::write(&sealed, "sealed\n").expect("sealed file");
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000))
+            .expect("fixture permissions set");
+        let policy = WorkspaceSourcePolicy::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("source policy");
+        let outcome = policy.visible_digests();
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o644))
+            .expect("fixture permissions restore");
+        let error = outcome.expect_err("a read this process cannot make fails the capture");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::Filesystem
+        );
+        assert!(
+            error
+                .fault()
+                .path()
+                .is_some_and(|path| path.ends_with("sealed.txt")),
+            "the refusal names the unreadable file: {error}"
+        );
+    }
+
+    #[test]
     fn test_visible_digests_leave_out_a_file_past_the_per_file_bound() {
         let directory = tempfile::tempdir().expect("workspace");
         fs::write(directory.path().join("small.txt"), "kept\n").expect("small file");
