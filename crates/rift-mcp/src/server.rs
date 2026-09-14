@@ -543,6 +543,55 @@ impl ReadAnswer for NodesResult {
 /// for it, applied to a failure's rendering before it reaches the wire.
 const WARNING_DETAIL_BYTES_MAX: usize = 4096;
 
+/// What a request-time capture found moved against the publication a read is served
+/// from, when the two do not match: the recorded files, the configuration file, or both.
+///
+/// The `stale_index` detail names it when the syntax-indexed files still fold to the
+/// published tree revision, since the two digests the warning carries are then equal
+/// and say nothing about what moved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureMovement {
+    /// Recorded files moved; the configuration file did not.
+    RecordedFiles,
+    /// The configuration file moved; no recorded file did.
+    Configuration,
+    /// Recorded files and the configuration file moved.
+    RecordedFilesAndConfiguration,
+}
+
+impl CaptureMovement {
+    /// Classifies `captured` against `published`: its recorded files path by path, and
+    /// the configuration file's state against the published one. Nothing when the
+    /// capture matches the publication.
+    fn between(
+        published: &PublishedWorkspace,
+        captured: &WorkspaceDigests,
+        configuration: ConfigurationFingerprint,
+    ) -> Option<Self> {
+        let recorded_files_moved =
+            !PathChanges::between(&published.reads.workspace_digests(), captured).is_empty();
+        let configuration_moved = published.configuration.fingerprint != configuration;
+        match (recorded_files_moved, configuration_moved) {
+            (true, false) => Some(Self::RecordedFiles),
+            (false, true) => Some(Self::Configuration),
+            (true, true) => Some(Self::RecordedFilesAndConfiguration),
+            (false, false) => None,
+        }
+    }
+
+    /// The clause naming what moved, for a detail whose two tree revisions are equal:
+    /// every recorded file that moved then lies outside the syntax-indexed ones.
+    const fn clause(self) -> &'static str {
+        match self {
+            Self::RecordedFiles => "recorded files outside them moved",
+            Self::Configuration => "the configuration file moved",
+            Self::RecordedFilesAndConfiguration => {
+                "recorded files outside them and the configuration file moved"
+            }
+        }
+    }
+}
+
 /// The rebuild failure recorded past the served publication, as one request meets it.
 #[derive(Clone, Debug)]
 struct RecordedRebuildFailure {
@@ -581,18 +630,20 @@ impl RecordedRebuildFailure {
     }
 
     /// The `stale_index` warning an answer served from `published` carries after this
-    /// failure, naming the tree revision `captured` folds to.
+    /// failure, naming the tree revision `captured` folds to and, when that is the
+    /// published one, what `moved` instead.
     fn stale_index(
         &self,
         published: &PublishedWorkspace,
         captured: &WorkspaceDigests,
+        moved: CaptureMovement,
     ) -> ReadWarning {
         let captured_tree_revision = captured
             .tree_revision()
             .unwrap_or_else(|| unreachable!("a classified capture folds its tree revision"));
         let index_tree_revision = Digest(published.reads.tree_revision().to_owned());
         let captured_tree_revision = wire_digest(captured_tree_revision);
-        let detail = self.detail(&index_tree_revision, &captured_tree_revision);
+        let detail = self.detail(&index_tree_revision, &captured_tree_revision, moved);
         ReadWarning::StaleIndex {
             index_tree_revision,
             captured_tree_revision,
@@ -601,19 +652,36 @@ impl RecordedRebuildFailure {
     }
 
     /// The failure's own rendering with its causes, bounded by
-    /// `WARNING_DETAIL_BYTES_MAX`, naming the failed and observed epochs and the
-    /// retry.
-    fn detail(&self, index_tree_revision: &Digest, captured_tree_revision: &Digest) -> String {
+    /// `WARNING_DETAIL_BYTES_MAX`, naming the failed and observed epochs, what the
+    /// answer was served from, and the retry.
+    fn detail(
+        &self,
+        index_tree_revision: &Digest,
+        captured_tree_revision: &Digest,
+        moved: CaptureMovement,
+    ) -> String {
         use std::fmt::Write as _;
 
+        let served = if index_tree_revision == captured_tree_revision {
+            format!(
+                "; the syntax-indexed files still fold to tree revision {index}, and {moved}, \
+                 so the answer was served from the published snapshot",
+                index = index_tree_revision.0,
+                moved = moved.clause(),
+            )
+        } else {
+            format!(
+                ", so the answer was served from the snapshot at tree revision {index} rather \
+                 than the captured tree revision {captured}",
+                index = index_tree_revision.0,
+                captured = captured_tree_revision.0,
+            )
+        };
         let mut detail = format!(
             "the index rebuild for filesystem epoch {failed} failed and the tree is at epoch \
-             {observed}, so the answer was served from the snapshot at tree revision {index} \
-             rather than the captured tree revision {captured}: {error}",
+             {observed}{served}: {error}",
             failed = self.epoch,
             observed = self.observed_epoch,
-            index = index_tree_revision.0,
-            captured = captured_tree_revision.0,
             error = self.error,
         );
         for cause in rift_core::causes(&*self.error) {
@@ -1824,7 +1892,8 @@ impl RiftMcp {
             }
             if let Some(failure) = rebuild_failure {
                 current.configuration.accepted(phase)?;
-                let stale = (!tree_matches).then(|| failure.stale_index(&current, &digests));
+                let stale = CaptureMovement::between(&current, &digests, configuration_fingerprint)
+                    .map(|moved| failure.stale_index(&current, &digests, moved));
                 return Ok(ResolvedWorkspace {
                     published: current,
                     stale,
@@ -4178,27 +4247,30 @@ pub fn beacon() -> u64 {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         super::hermetic_workspace(directory.path(), "")?;
+        let assembled = unsupervised_server(directory.path()).await?;
+        Ok((directory, assembled))
+    }
+
+    /// Assembles a server over `root` and drops its watcher.
+    async fn unsupervised_server(root: &std::path::Path) -> TestResult<UnsupervisedServer> {
         let super::AssembledServer {
             server,
             watcher,
             invalidations,
             context,
         } = RiftMcp::assemble(
-            super::absolute_root(directory.path())?,
+            super::absolute_root(root)?,
             WorkspaceIndexLimits::default(),
             None,
             LexicalLane::spawn,
         )
         .await?;
         drop(watcher);
-        Ok((
-            directory,
-            UnsupervisedServer {
-                server,
-                context,
-                _invalidations: invalidations,
-            },
-        ))
+        Ok(UnsupervisedServer {
+            server,
+            context,
+            _invalidations: invalidations,
+        })
     }
 
     /// Writes a second declaration into the fixture's `lib.rs`, observes that path
@@ -4213,13 +4285,29 @@ pub fn beacon() -> u64 {
             root.join("lib.rs"),
             "pub fn beacon() {}\npub fn lantern() {}\n",
         )?;
+        fail_rebuild_after_observing(server, "lib.rs", events).await
+    }
+
+    /// Observes `path` `events` times and records one rebuild failure at the epoch the
+    /// last observation reached.
+    async fn fail_rebuild_after_observing(
+        server: &RiftMcp,
+        path: &str,
+        events: u64,
+    ) -> TestResult<u64> {
         let mut epoch = 0;
         for _event in 0..events {
             epoch = server
                 .validation
-                .observe_paths([CoreProjectPath::new("lib.rs")?])
+                .observe_paths([CoreProjectPath::new(path)?])
                 .map_err(|error| format!("observation must land: {error:?}"))?;
         }
+        record_failure_at(server, epoch).await?;
+        Ok(epoch)
+    }
+
+    /// Records one rebuild failure at `epoch`, the one the last observation reached.
+    async fn record_failure_at(server: &RiftMcp, epoch: u64) -> TestResult {
         let published = Arc::clone(&server.published);
         let validation = Arc::clone(&server.validation);
         let recorded = tokio::task::spawn_blocking(move || {
@@ -4235,7 +4323,7 @@ pub fn beacon() -> u64 {
             recorded,
             "the failure must be recorded at the observed epoch"
         );
-        Ok(epoch)
+        Ok(())
     }
 
     /// The one `stale_index` warning `warnings` carries.
@@ -4289,10 +4377,130 @@ pub fn beacon() -> u64 {
             detail.contains("filesystem epoch 3 failed and the tree is at epoch 3"),
             "{detail}"
         );
+        assert!(
+            detail.contains(&format!(
+                "served from the snapshot at tree revision {index} rather than the captured \
+                 tree revision {captured}"
+            )),
+            "{detail}"
+        );
         assert!(detail.contains("injected failure"), "{detail}");
         assert!(
             detail.contains("the next filesystem event retries"),
             "{detail}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_read_under_a_rebuild_failure_after_a_text_file_moved_names_the_recorded_files()
+    -> TestResult {
+        let (directory, assembled) = unsupervised_fixture().await?;
+        let server = &assembled.server;
+        fs::write(directory.path().join("notes.txt"), "beacon notes\n")?;
+        fail_rebuild_after_observing(server, "notes.txt", 1).await?;
+
+        let answer = tokio::time::timeout(UNWAITED_READ_MAX, run_search(server, "beacon"))
+            .await
+            .map_err(|_| "a read under a recorded failure must not wait")??;
+
+        assert!(!answer.results.is_empty(), "the published snapshot answers");
+        let (index, captured, detail) = stale_index_of(&answer.warnings)?;
+        assert_eq!(captured, index, "a text file folds into no tree revision");
+        assert!(
+            detail.contains(&format!(
+                "the tree is at epoch 1; the syntax-indexed files still fold to tree revision \
+                 {index}, and recorded files outside them moved, so the answer was served \
+                 from the published snapshot: "
+            )),
+            "{detail}"
+        );
+        assert!(!detail.contains("the configuration file moved"), "{detail}");
+        assert!(detail.contains("injected failure"), "{detail}");
+        Ok(())
+    }
+
+    /// The configuration file is itself syntax-indexed unless the `[source]` policy leaves
+    /// it out, so this workspace excludes it: a write to it then moves the configuration
+    /// and no recorded file.
+    #[tokio::test]
+    async fn a_read_under_a_rebuild_failure_after_the_configuration_moved_names_the_file()
+    -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let excluding = "[source]\nexclude = [\"rift.toml\"]\n";
+        super::hermetic_workspace(directory.path(), excluding)?;
+        let assembled = unsupervised_server(directory.path()).await?;
+        let server = &assembled.server;
+        super::hermetic_workspace(directory.path(), &format!("{excluding}# moved\n"))?;
+        let epoch = server
+            .validation
+            .observe_whole_workspace()
+            .map_err(|error| format!("observation must land: {error:?}"))?;
+        record_failure_at(server, epoch).await?;
+
+        let answer = tokio::time::timeout(UNWAITED_READ_MAX, get_symbol(server, "beacon"))
+            .await
+            .map_err(|_| "a read under a recorded failure must not wait")??;
+
+        assert_eq!(answer.hits.len(), 1, "the published snapshot answers");
+        let (index, captured, detail) = stale_index_of(&answer.warnings)?;
+        assert_eq!(
+            captured, index,
+            "an excluded configuration file folds into no tree revision"
+        );
+        assert!(
+            detail.contains(&format!(
+                "the syntax-indexed files still fold to tree revision {index}, and the \
+                 configuration file moved, so the answer was served from the published \
+                 snapshot: "
+            )),
+            "{detail}"
+        );
+        assert!(!detail.contains("recorded files"), "{detail}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_capture_movement_names_the_recorded_files_and_the_configuration_file() -> TestResult
+    {
+        use super::CaptureMovement;
+
+        let (directory, assembled) = unsupervised_fixture().await?;
+        let server = &assembled.server;
+        let current = Arc::clone(&server.published.read().await.current);
+        let (matching, configuration) = server.capture_tree(&current).await?;
+        assert_eq!(
+            CaptureMovement::between(&current, &matching, configuration),
+            None,
+            "a capture matching its publication moved nothing"
+        );
+        assert_eq!(
+            CaptureMovement::between(
+                &current,
+                &matching,
+                super::ConfigurationFingerprint::MissingOrUnreadable
+            ),
+            Some(CaptureMovement::Configuration)
+        );
+
+        fs::write(directory.path().join("notes.txt"), "beacon notes\n")?;
+        let (with_text, configuration) = server.capture_tree(&current).await?;
+        assert_eq!(
+            CaptureMovement::between(&current, &with_text, configuration),
+            Some(CaptureMovement::RecordedFiles)
+        );
+        assert_eq!(
+            CaptureMovement::between(
+                &current,
+                &with_text,
+                super::ConfigurationFingerprint::MissingOrUnreadable
+            ),
+            Some(CaptureMovement::RecordedFilesAndConfiguration)
+        );
+        assert_eq!(
+            CaptureMovement::RecordedFilesAndConfiguration.clause(),
+            "recorded files outside them and the configuration file moved"
         );
         Ok(())
     }
