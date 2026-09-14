@@ -512,14 +512,15 @@ impl ReadService {
 
     /// The catalog an incremental rebuild over `changes` carries: the standing one while
     /// no changed path is a resolution input or a manifest a resolver claims, a fresh
-    /// resolution otherwise. A degraded catalog is also resolved again, since the machine
-    /// may have gained the toolchain or the cache the resolvers missed.
+    /// resolution otherwise. A degraded catalog keeps its resolution too: resolving it on
+    /// every rebuild ran every resolver over every manifest for each edit of a workspace
+    /// whose degradation never clears, and the index fell behind the tree.
     fn catalog_after(&self, changes: &PathChanges) -> Result<Arc<DependencyCatalog>, ReadError> {
         let touches_input = changes.paths().any(|path| {
             let path = project_path(path);
             self.catalog.depends_on(&path) || rift_dependency::is_claimed_manifest(&path)
         });
-        if !touches_input && !self.catalog.is_degraded() {
+        if !touches_input {
             return Ok(Arc::clone(&self.catalog));
         }
         let source_policy = self.source_policy.as_deref().unwrap_or_else(|| {
@@ -1523,6 +1524,49 @@ mod tests {
         let text_inclusion = rift_core::TextFileInclusion::default();
         let service = reads_with(directory.path(), limits, &text_inclusion, &languages)?;
         Ok((directory, service))
+    }
+    #[test]
+    fn a_degraded_catalog_keeps_its_resolution_across_an_unrelated_change() -> TestResult {
+        let directory = TempDir::new()?;
+        fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        assert!(
+            service.catalog.is_degraded(),
+            "a manifest with no lockfile degrades the Cargo resolver"
+        );
+        let changed = |path: &str| {
+            rift_index::PathChanges::between(
+                &rift_index::WorkspaceDigests::new([]),
+                &rift_index::WorkspaceDigests::new([(
+                    rift_core::ProjectPath::new(path).expect("fixture path"),
+                    rift_index::FileDigest::of(b"changed"),
+                )]),
+            )
+        };
+
+        let kept = service.catalog_after(&changed("src/lib.rs"))?;
+        let resolved = service.catalog_after(&changed("Cargo.toml"))?;
+
+        assert!(
+            std::sync::Arc::ptr_eq(&kept, &service.catalog),
+            "a change outside the resolution inputs keeps the standing catalog"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&resolved, &service.catalog),
+            "a manifest change resolves the catalog again"
+        );
+        Ok(())
     }
 
     #[test]
