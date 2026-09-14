@@ -368,6 +368,16 @@ pub struct TextSourceFile {
 }
 
 impl TextSourceFile {
+    /// One catalog file from its path and UTF-8 content, digested over that content.
+    pub(crate) fn from_content(path: ProjectPath, content: String) -> Self {
+        Self {
+            path,
+            digest: FileDigest::of(content.as_bytes()),
+            content,
+            executable: false,
+        }
+    }
+
     /// Returns project-relative path.
     #[must_use]
     pub const fn path(&self) -> &ProjectPath {
@@ -417,6 +427,11 @@ impl ReadableSymbol {
     fn new(assembled: AssembledSymbol) -> Option<Self> {
         let facts = assembled.facts()?.clone();
         Some(Self { assembled, facts })
+    }
+
+    /// The readable symbol `semantics` assembles for one syntax-provider identity.
+    pub(crate) fn assembled_by(semantics: &WorkspaceSemantics, identity: &str) -> Option<Self> {
+        semantics.assembled(identity).and_then(Self::new)
     }
 
     /// Returns complete normalized assembly.
@@ -1390,9 +1405,7 @@ impl WorkspaceIndex {
             matched.file.path().as_str(),
             &matched.symbol.qualified_name,
         );
-        self.semantics
-            .assembled(&identity)
-            .and_then(ReadableSymbol::new)
+        ReadableSymbol::assembled_by(&self.semantics, &identity)
             .ok_or_else(|| provider_error(ReadableSymbolMissing { identity }))
     }
 
@@ -1656,6 +1669,20 @@ pub fn symbol_matches<'a>(
     query: &str,
     limit: usize,
 ) -> Vec<SymbolMatch<'a>> {
+    symbol_matches_where(files, query, limit, |_, _| true)
+}
+
+/// The ranking kernel behind [`symbol_matches`], over the declarations `included` accepts.
+///
+/// The predicate runs before ranking and truncation, so a filtered answer fills
+/// `limit` from what it includes; the dependency index passes its public-declaration
+/// rule here.
+pub(crate) fn symbol_matches_where<'a>(
+    files: impl IntoIterator<Item = &'a IndexedFile>,
+    query: &str,
+    limit: usize,
+    included: impl Fn(&IndexedFile, &SyntaxSymbol) -> bool,
+) -> Vec<SymbolMatch<'a>> {
     let query = query.to_lowercase();
     let mut matches = files
         .into_iter()
@@ -1665,7 +1692,9 @@ pub fn symbol_matches<'a>(
                 .iter()
                 .map(move |symbol| (file, symbol))
         })
-        .filter(|(_, symbol)| symbol.qualified_name.to_lowercase().contains(&query))
+        .filter(|(file, symbol)| {
+            included(file, symbol) && symbol.qualified_name.to_lowercase().contains(&query)
+        })
         .map(|(file, symbol)| SymbolMatch {
             file,
             symbol,
@@ -2366,12 +2395,7 @@ pub(crate) fn included_text_file(
         ));
     }
     let content = source_utf8(bytes, context_path)?;
-    Ok(TextSourceFile {
-        path: project_path,
-        digest: FileDigest::of(content.as_bytes()),
-        content,
-        executable: false,
-    })
+    Ok(TextSourceFile::from_content(project_path, content))
 }
 
 /// Decides whether bytes read for one claimed file are valid UTF-8 source: the single
@@ -2400,7 +2424,7 @@ fn project_path_below(root: &Path, absolute: &Path) -> Result<ProjectPath, Works
     relative_path(relative)
 }
 
-fn relative_path(path: &Path) -> Result<ProjectPath, WorkspaceIndexError> {
+pub(crate) fn relative_path(path: &Path) -> Result<ProjectPath, WorkspaceIndexError> {
     let value = path
         .components()
         .map(|component| component.as_os_str().to_str())

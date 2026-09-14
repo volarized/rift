@@ -3,6 +3,7 @@
 mod change_set;
 mod chunk;
 mod database;
+mod dependency;
 mod glob;
 mod language;
 mod lexical;
@@ -16,6 +17,12 @@ mod workspace;
 
 pub use change_set::{ChangeSet, FileDigest, PathChange, PathChanges, WorkspaceDigests};
 pub use database::{DatabasePool, WorkspaceDatabase};
+pub use dependency::{
+    DIRECTORY_DEPTH_MAX_DEFAULT, DependencyIndex, DependencyIndexLimits, DependencySymbolMatch,
+    PACKAGE_BYTES_MAX_DEFAULT, PACKAGE_FILES_MAX_DEFAULT, PackageFiles, PackageIndex,
+    PackageIndexError, PackageIndexFault, PackageIndexViolation, SkippedPackage,
+    TOTAL_BYTES_MAX_DEFAULT, WALK_ENTRIES_MAX_DEFAULT, package_files,
+};
 pub use glob::PathMatcher;
 pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
 pub use lexical::{
