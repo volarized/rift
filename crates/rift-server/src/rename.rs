@@ -537,9 +537,14 @@ fn root_conversion_failed(operation: &'static str, error: &UriError) -> PlanEnd 
 }
 
 /// Compiles per-file text edits into whole-file rewrites, dropping a file
-/// whose edits change nothing. Each rewrite writes its file whole and
-/// carries the regions the engine's own edits named, which is what the
-/// result reports.
+/// whose edits change nothing.
+///
+/// A compiled rewrite whose next source equals its base is no rewrite at
+/// all: the file is not written, not proven against the disk, and not
+/// reparsed, so an edit that lands a file's own bytes back never reports
+/// the findings that file already carried. Each surviving rewrite writes
+/// its file whole and carries the regions the engine's own edits named,
+/// which is what the result reports.
 pub(crate) async fn compiled_rewrites(
     workspace_root: &Path,
     documents: Vec<(CoreProjectPath, Vec<TextEdit>)>,
@@ -1616,6 +1621,74 @@ mod tests {
             RENAME_SWEEP_FINDINGS_MAX,
             "findings stop at the bound before the sweep reaches zed.rs"
         );
+    }
+
+    #[tokio::test]
+    async fn a_no_op_edit_beside_a_real_one_compiles_the_real_file_alone() {
+        let (directory, _reads) = workspace(&[
+            ("lib.rs", "pub fn beacon() {}\n"),
+            ("main.rs", "fn main() { beacon(); }\n"),
+        ]);
+        let documents = vec![
+            (project_path("lib.rs"), vec![edit((0, 7), (0, 13), "flare")]),
+            (
+                project_path("main.rs"),
+                vec![edit((0, 12), (0, 18), "beacon")],
+            ),
+        ];
+        let rewrites = compiled_rewrites(
+            directory.path(),
+            documents,
+            PositionEncoding::Utf8,
+            &plain_context(),
+        )
+        .await
+        .expect("the proposal compiles");
+        assert_eq!(
+            rewrites.len(),
+            1,
+            "only the file whose bytes changed is written, witnessed, and reparsed"
+        );
+        assert_eq!(rewrites[0].path.as_str(), "lib.rs");
+        assert_eq!(rewrites[0].next_source, "pub fn flare() {}\n");
+    }
+
+    #[tokio::test]
+    async fn a_proposal_of_only_no_op_edits_refuses_as_one_proposing_none() {
+        let (directory, reads) = workspace(&[("lib.rs", "pub fn beacon() {}\n")]);
+        let roots =
+            engine_roots(directory.path(), reads.dependency_catalog()).expect("fixture roots");
+        let document = roots
+            .tree()
+            .document_uri(&project_path("lib.rs"))
+            .expect("fixture uri composes");
+        let proposal = changes_proposal(vec![(document, vec![edit((0, 7), (0, 13), "beacon")])]);
+        let target = RenameTarget {
+            path: project_path("lib.rs"),
+            language: Language::from_identity_segment("rust").expect("rust is a served language"),
+            old_name: "beacon".to_owned(),
+            name_offset: 7,
+            indexed_source: "pub fn beacon() {}\n".to_owned(),
+        };
+        let refused = refusal(
+            compiled_plan(
+                directory.path(),
+                reads.dependency_catalog(),
+                &proposal,
+                PositionEncoding::Utf8,
+                1,
+                &address(),
+                &target,
+            )
+            .await
+            .expect_err("a proposal that changes no bytes refuses"),
+        );
+        assert_eq!(refusal_reason(&refused), RefusalReason::UnmetPrecondition);
+        assert_eq!(
+            first_precondition_kind(&refused),
+            OperationPreconditionKind::EngineProposedEdits
+        );
+        assert_eq!(refusal_detail(&refused), "the engine proposed no edits");
     }
 
     #[test]

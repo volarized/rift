@@ -1392,6 +1392,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reference_edit_landing_the_same_bytes_compiles_no_rewrite() {
+        let (directory, reads, roots) = compile_workspace();
+        let reply = WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Edits(vec![
+                document_edit(
+                    &roots,
+                    "lib.rs",
+                    Some(OPENED_VERSION),
+                    edit_at((0, 0), (0, 0), "//! moved\n"),
+                ),
+                document_edit(&roots, "main.rs", None, edit_at((0, 4), (0, 7), "lib")),
+            ])),
+            ..WorkspaceEdit::default()
+        };
+        let plan = compiled_reply(directory.path(), &reads, reply)
+            .await
+            .expect("the proposal compiles");
+        assert_eq!(plan.moved_next, "//! moved\npub fn beacon() {}\n");
+        assert!(
+            plan.rewrites.is_empty(),
+            "a reference edit that lands the file's own bytes is no rewrite"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_proposal_of_only_no_op_edits_moves_the_bytes_unchanged() {
+        let (directory, reads, roots) = compile_workspace();
+        let reply = WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Edits(vec![
+                document_edit(
+                    &roots,
+                    "lib.rs",
+                    Some(OPENED_VERSION),
+                    edit_at((0, 7), (0, 13), "beacon"),
+                ),
+                document_edit(&roots, "main.rs", None, edit_at((0, 4), (0, 7), "lib")),
+            ])),
+            ..WorkspaceEdit::default()
+        };
+        let plan = compiled_reply(directory.path(), &reads, reply)
+            .await
+            .expect("the proposal compiles");
+        assert_eq!(plan.moved_next, "pub fn beacon() {}\n");
+        assert_eq!(plan.moved_next, plan.moved_source);
+        assert!(plan.rewrites.is_empty());
+    }
+
+    #[tokio::test]
     async fn an_edit_on_the_opened_file_at_another_version_refuses_unsupported() {
         let (directory, reads, roots) = compile_workspace();
         let reply = will_rename_reply(&roots, Some(OPENED_VERSION + 1));
