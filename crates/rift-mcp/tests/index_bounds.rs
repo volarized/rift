@@ -2,11 +2,13 @@
 //! lexical index's `[search.lexical] units_max` key, the `[source] workspace_size` key,
 //! and one file a syntax provider refuses under its own bounds.
 //!
-//! A workspace past `units_max` or `workspace_size` refuses to build naming the key and
-//! its maximum, and the same workspace under the default serves; lowering
-//! `workspace_size` on a served workspace rebuilds the index and refuses the next
-//! request the same way. A workspace holding one file past the syntax depth bound still
-//! answers `search` from its other file, with the deep file absent.
+//! A workspace past `workspace_size` refuses to build naming the key and its maximum, and
+//! the same workspace under the default serves; lowering `workspace_size` on a served
+//! workspace fails the rebuild, and the next request answers from the last snapshot with
+//! `stale_index` naming the key. A workspace past `units_max` serves, and `search` answers
+//! from identifier matching with `lexical_ranking_unavailable` naming the key and its
+//! maximum. A workspace holding one file past the syntax depth bound still answers
+//! `search` from its other file, with the deep file absent.
 
 mod hermetic_search;
 #[allow(dead_code)]
@@ -17,7 +19,13 @@ use std::fs;
 use rift_index::WorkspaceIndexLimits;
 use rift_mcp::RiftMcp;
 use serde_json::{Value, json};
-use workspace_client::{TestResult, served_workspace, tool_request};
+use workspace_client::{TestResult, served_root, served_workspace, tool_request};
+
+/// Polls of one served answer a test waits on before it gives up: two seconds, at
+/// [`ANSWER_POLL`] each.
+const ANSWER_ATTEMPTS_MAX: usize = 100;
+/// Wait between two polls of a served answer.
+const ANSWER_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Text files past `units_max = 1000`, one lexical unit each.
 const UNIT_FILE_COUNT: usize = 1_100;
@@ -78,8 +86,36 @@ async fn search_page(
         .ok_or_else(|| "search answers with structured content".into())
 }
 
+/// The `detail` of the first warning on `answer` whose code is `code`, when one is.
+fn warning_detail<'a>(answer: &'a Value, code: &str) -> Option<&'a str> {
+    answer["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|warning| warning["code"] == code)
+        .and_then(|warning| warning["detail"].as_str())
+}
+
+/// Polls `search` for `query` under a bound until `accept` takes the answer.
+async fn search_until(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    query: &str,
+    what: &str,
+    accept: impl Fn(&Value) -> bool,
+) -> TestResult<Value> {
+    let mut answer = search_page(client, query).await?;
+    for _attempt in 0..ANSWER_ATTEMPTS_MAX {
+        if accept(&answer) {
+            return Ok(answer);
+        }
+        tokio::time::sleep(ANSWER_POLL).await;
+        answer = search_page(client, query).await?;
+    }
+    Err(format!("{what}; the last answer was {answer:#}").into())
+}
+
 #[tokio::test]
-async fn a_workspace_past_units_max_refuses_to_build_naming_the_key() -> TestResult {
+async fn a_workspace_past_units_max_serves_and_search_names_the_key() -> TestResult {
     let directory = tempfile::tempdir()?;
     for (name, source) in unit_files() {
         fs::write(directory.path().join(name), source)?;
@@ -87,15 +123,28 @@ async fn a_workspace_past_units_max_refuses_to_build_naming_the_key() -> TestRes
     let mut configuration = hermetic_search::SEMANTIC_DISABLED.to_owned();
     configuration.push_str(UNITS_MAX_CONFIGURATION);
     fs::write(directory.path().join("rift.toml"), configuration)?;
+    let (client, server_task) = served_root(directory.path()).await?;
 
-    let refusal = match RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await {
-        Ok(_server) => return Err("a workspace past units_max must refuse to build".into()),
-        Err(error) => error.to_string(),
-    };
+    // The lexical commit runs behind the publication, so the store's refusal reaches the
+    // answer once the lane has run it; until then the answer names the commit it waits on.
+    let answer = search_until(
+        &client,
+        "beacon",
+        "the refused commit never reached search",
+        |answer| {
+            warning_detail(answer, "lexical_ranking_unavailable").is_some_and(|detail| {
+                detail.contains("units_max") && detail.contains("maximum 1000")
+            })
+        },
+    )
+    .await?;
     assert!(
-        refusal.contains("units_max") && refusal.contains("maximum 1000"),
-        "the refusal must name the key and its maximum: {refusal}"
+        hit_paths(&answer).contains(&"lib.rs"),
+        "identifier matching still answers: {answer:#}"
     );
+
+    client.cancel().await?;
+    server_task.await?;
     Ok(())
 }
 
@@ -158,14 +207,6 @@ fn workspace_files() -> Vec<(String, String)> {
     files
 }
 
-/// The message of one refused tool call.
-fn refusal_message(error: rmcp::ServiceError) -> String {
-    match error {
-        rmcp::ServiceError::McpError(data) => data.message.into_owned(),
-        other => panic!("expected a protocol-level McpError, got {other:?}"),
-    }
-}
-
 #[tokio::test]
 async fn a_workspace_past_workspace_size_refuses_to_build_naming_the_key() -> TestResult {
     let directory = tempfile::tempdir()?;
@@ -201,14 +242,15 @@ async fn the_same_workspace_serves_under_the_default_workspace_size_and_a_change
     let mut lowered = hermetic_search::SEMANTIC_DISABLED.to_owned();
     lowered.push_str(WORKSPACE_SIZE_CONFIGURATION);
     fs::write(directory.path().join("rift.toml"), lowered)?;
-    let refused = client
-        .call_tool(tool_request("search", &json!({"query": "beacon"})))
-        .await
-        .expect_err("the rebuild under the lowered bound refuses the request");
-    let message = refusal_message(refused);
+    // The rebuild under the lowered bound fails, and the read answers from the last
+    // snapshot with the failure rather than waiting for a rebuild that cannot land.
+    let stale = search_page(&client, "beacon").await?;
+    assert!(hit_paths(&stale).contains(&"lib.rs"), "{stale:#}");
+    let detail = warning_detail(&stale, "stale_index")
+        .ok_or_else(|| format!("the answer carries stale_index: {stale:#}"))?;
     assert!(
-        message.contains("source.workspace_size"),
-        "the refusal must name the key: {message}"
+        detail.contains("source.workspace_size") && detail.contains("maximum 16777216"),
+        "the warning must name the key and its maximum: {detail}"
     );
 
     // The restored file reaches the server through the filesystem watcher, so the
@@ -217,21 +259,15 @@ async fn the_same_workspace_serves_under_the_default_workspace_size_and_a_change
         directory.path().join("rift.toml"),
         hermetic_search::SEMANTIC_DISABLED,
     )?;
-    let mut recovered = false;
-    for _attempt in 0..100 {
-        if search_page(&client, "beacon")
-            .await
-            .is_ok_and(|answer| hit_paths(&answer).contains(&"lib.rs"))
-        {
-            recovered = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    assert!(
-        recovered,
-        "the restored bound must serve the workspace again"
-    );
+    search_until(
+        &client,
+        "beacon",
+        "the restored bound must serve the workspace again without a warning",
+        |answer| {
+            hit_paths(answer).contains(&"lib.rs") && warning_detail(answer, "stale_index").is_none()
+        },
+    )
+    .await?;
 
     client.cancel().await?;
     server_task.await?;
