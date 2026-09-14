@@ -418,6 +418,45 @@ pub fn declare_text_ranges(schema: &mut Schema) {
     );
 }
 
+/// A [`DependenciesConfiguration`](crate::dependencies::DependenciesConfiguration) states
+/// its `ByteSize` and `Duration` bounds as `rift:range` on each key: schema validation
+/// alone cannot compare `"4mb"` against a ceiling, so the server enforces the bounds at
+/// load and the schema carries them for readers.
+pub fn declare_dependencies_ranges(schema: &mut Schema) {
+    use crate::configuration::{ByteSize, Duration};
+    use crate::dependencies::{
+        DEPENDENCIES_COMMAND_TIMEOUT_MS_MAX, DEPENDENCIES_COMMAND_TIMEOUT_MS_MIN,
+        DEPENDENCIES_INDEX_BYTES_MAX, DEPENDENCIES_INDEX_BYTES_MIN, DEPENDENCIES_PACKAGE_BYTES_MAX,
+        DEPENDENCIES_PACKAGE_BYTES_MIN, DependenciesConfiguration,
+    };
+    let ranges = [
+        (
+            property!(DependenciesConfiguration, package_size),
+            range(
+                &ByteSize::from_bytes(DEPENDENCIES_PACKAGE_BYTES_MIN),
+                &ByteSize::from_bytes(DEPENDENCIES_PACKAGE_BYTES_MAX),
+            ),
+        ),
+        (
+            property!(DependenciesConfiguration, index_size),
+            range(
+                &ByteSize::from_bytes(DEPENDENCIES_INDEX_BYTES_MIN),
+                &ByteSize::from_bytes(DEPENDENCIES_INDEX_BYTES_MAX),
+            ),
+        ),
+        (
+            property!(DependenciesConfiguration, command_timeout),
+            range(
+                &Duration::from_millis(DEPENDENCIES_COMMAND_TIMEOUT_MS_MIN),
+                &Duration::from_millis(DEPENDENCIES_COMMAND_TIMEOUT_MS_MAX),
+            ),
+        ),
+    ];
+    for (name, range) in ranges {
+        annotate_property(schema, name, RIFT_RANGE, range);
+    }
+}
+
 /// Declares [`CommandHook`](crate::configuration::CommandHook) schema rules.
 ///
 /// Duration and byte-size ceilings use `rift:range`; server enforces them

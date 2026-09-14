@@ -6,31 +6,29 @@
 //! declarations through the ranking and assembly the project index uses.
 //! [`DependencyIndex`] holds every indexed package keyed by identity, with the
 //! bookkeeping a background pass needs: which packages are pending, which were
-//! refused, and which the catalog holds no source for.
+//! refused, and which the catalog holds no source for. [`PackageSelection`]
+//! decides which cataloged packages the index plans at all.
 
 mod failure;
 #[cfg(test)]
 mod fixture;
 mod package;
+mod selection;
 mod walk;
 
 pub use failure::{PackageIndexError, PackageIndexFault, PackageIndexViolation};
 pub use package::PackageIndex;
+pub use selection::PackageSelection;
 pub use walk::{PackageFiles, package_files};
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use rift_dependency::{CatalogEntry, DependencyCatalog, PackageLocation};
+use rift_protocol::dependencies::DependenciesConfiguration;
 use rift_protocol::read::PackageIdentity;
 
 use crate::workspace::SymbolMatch;
 
-/// Default bound on one package's selected source bytes: 4 MiB.
-pub const PACKAGE_BYTES_MAX_DEFAULT: u64 = 4 * 1024 * 1024;
-/// Default bound on the bytes every indexed package holds together: 256 MiB.
-pub const TOTAL_BYTES_MAX_DEFAULT: u64 = 256 * 1024 * 1024;
-/// Default bound on one package's selected file count.
-pub const PACKAGE_FILES_MAX_DEFAULT: usize = 2_000;
 /// Default bound on directory depth below one package's source root.
 pub const DIRECTORY_DEPTH_MAX_DEFAULT: usize = 16;
 /// Default bound on the directory entries one package walk examines.
@@ -52,6 +50,8 @@ const WALK_ENTRIES_MAX_FIELD: &str = "walk_entries_max";
 /// `package_bytes_max` and `package_files_max` bound one package's selected
 /// files; `directory_depth_max` and `walk_entries_max` bound the walk that
 /// selects them; `total_bytes_max` bounds every indexed package together.
+/// The `[dependencies]` table sets the first three; the walk bounds are this
+/// crate's own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DependencyIndexLimits {
     /// Most selected source bytes one package may hold.
@@ -66,15 +66,25 @@ pub struct DependencyIndexLimits {
     pub walk_entries_max: usize,
 }
 
-impl Default for DependencyIndexLimits {
-    fn default() -> Self {
+impl From<&DependenciesConfiguration> for DependencyIndexLimits {
+    /// The table's `package_size`, `index_size`, and `package_files` under this
+    /// crate's walk bounds. A file count past `usize` saturates, which the table's
+    /// own ceiling keeps unreachable.
+    fn from(configuration: &DependenciesConfiguration) -> Self {
         Self {
-            package_bytes_max: PACKAGE_BYTES_MAX_DEFAULT,
-            total_bytes_max: TOTAL_BYTES_MAX_DEFAULT,
-            package_files_max: PACKAGE_FILES_MAX_DEFAULT,
+            package_bytes_max: configuration.package_size.bytes(),
+            total_bytes_max: configuration.index_size.bytes(),
+            package_files_max: usize::try_from(configuration.package_files).unwrap_or(usize::MAX),
             directory_depth_max: DIRECTORY_DEPTH_MAX_DEFAULT,
             walk_entries_max: WALK_ENTRIES_MAX_DEFAULT,
         }
+    }
+}
+
+impl Default for DependencyIndexLimits {
+    /// The default `[dependencies]` table's bounds.
+    fn default() -> Self {
+        Self::from(&DependenciesConfiguration::default())
     }
 }
 
@@ -132,10 +142,13 @@ fn identity_key(identity: &PackageIdentity) -> IdentityKey {
 ///
 /// `pending` holds cataloged packages with a source root not yet indexed, in
 /// pass order; `skipped` holds the ones a build refused, with the reason; and
-/// `unrooted` holds the ones the catalog found no source for.
+/// `unrooted` holds the ones the catalog found no source for. A cataloged
+/// package `selection` drops is in none of them: the catalog and the map still
+/// list it, and the index never plans it.
 #[derive(Debug)]
 pub struct DependencyIndex {
     limits: DependencyIndexLimits,
+    selection: PackageSelection,
     packages: BTreeMap<IdentityKey, PackageIndex>,
     pending: Vec<PackageIdentity>,
     skipped: Vec<SkippedPackage>,
@@ -144,11 +157,16 @@ pub struct DependencyIndex {
 }
 
 impl DependencyIndex {
-    /// An empty index with every cataloged package pending or unrooted.
+    /// An empty index with every selected cataloged package pending or unrooted.
     #[must_use]
-    pub fn planned(catalog: &DependencyCatalog, limits: DependencyIndexLimits) -> Self {
+    pub fn planned(
+        catalog: &DependencyCatalog,
+        limits: DependencyIndexLimits,
+        selection: PackageSelection,
+    ) -> Self {
         let mut index = Self {
             limits,
+            selection,
             packages: BTreeMap::new(),
             pending: Vec::new(),
             skipped: Vec::new(),
@@ -226,6 +244,22 @@ impl DependencyIndex {
         self.queue_catalog(catalog);
     }
 
+    /// Follows one request: replans over `catalog` when `limits` or `selection` differ
+    /// from this index's, since every held build and refusal was decided under the old
+    /// ones, and follows the catalog alone otherwise.
+    pub fn follow(
+        &mut self,
+        catalog: &DependencyCatalog,
+        limits: DependencyIndexLimits,
+        selection: &PackageSelection,
+    ) {
+        if self.limits != limits || self.selection != *selection {
+            *self = Self::planned(catalog, limits, selection.clone());
+            return;
+        }
+        self.retain_catalog(catalog);
+    }
+
     /// Public declarations matching `query` across every indexed package.
     ///
     /// Merged by rank, then package identity, then qualified name, and cut to
@@ -301,14 +335,28 @@ impl DependencyIndex {
         self.total_bytes
     }
 
-    /// Queues every cataloged package neither held nor refused: rooted ones pending
-    /// in pass order, the rest unrooted.
+    /// The bounds every held build was read under.
+    #[must_use]
+    pub const fn limits(&self) -> DependencyIndexLimits {
+        self.limits
+    }
+
+    /// The selection every pending and held package passed.
+    #[must_use]
+    pub const fn selection(&self) -> &PackageSelection {
+        &self.selection
+    }
+
+    /// Queues every selected cataloged package neither held nor refused: rooted ones
+    /// pending in pass order, the rest unrooted.
     fn queue_catalog(&mut self, catalog: &DependencyCatalog) {
         let mut queued: Vec<&CatalogEntry> = catalog
             .entries()
             .iter()
             .filter(|entry| {
-                !self.is_indexed(entry.identity()) && !self.is_skipped(entry.identity())
+                self.selection.selects(entry.identity())
+                    && !self.is_indexed(entry.identity())
+                    && !self.is_skipped(entry.identity())
             })
             .collect();
         queued.sort_by_key(|entry| PassOrder::of(entry));
@@ -337,24 +385,57 @@ mod tests {
 
     use rift_core::{ErrorCode, ErrorName};
     use rift_dependency::{CatalogEntry, DependencyCatalog, PackageLocation};
+    use rift_protocol::configuration::ByteSize;
+    use rift_protocol::dependencies::{DependenciesConfiguration, PackageNamePattern};
     use rift_syntax::ShippedLanguage;
 
     use super::fixture::{catalog, identity, language, names, rust_package, violation_of};
     use super::{
-        DIRECTORY_DEPTH_MAX_DEFAULT, DependencyIndex, DependencyIndexLimits,
-        PACKAGE_BYTES_MAX_DEFAULT, PACKAGE_FILES_MAX_DEFAULT, PackageIndexViolation,
-        TOTAL_BYTES_MAX_DEFAULT, WALK_ENTRIES_MAX_DEFAULT,
+        DIRECTORY_DEPTH_MAX_DEFAULT, DependencyIndex, DependencyIndexLimits, PackageIndexViolation,
+        PackageSelection, WALK_ENTRIES_MAX_DEFAULT,
     };
     use crate::workspace::SymbolMatchRank;
 
+    /// A selection dropping the packages `exclude` names.
+    fn without(exclude: &[&str]) -> PackageSelection {
+        let configuration = DependenciesConfiguration {
+            exclude: exclude
+                .iter()
+                .map(|pattern| PackageNamePattern((*pattern).to_owned()))
+                .collect(),
+            ..DependenciesConfiguration::default()
+        };
+        PackageSelection::compile(&configuration).expect("valid globs")
+    }
+
+    /// One rooted cargo dependency of `name`.
+    fn held(name: &str) -> CatalogEntry {
+        CatalogEntry::dependency(
+            identity("cargo", name, "1.0.0"),
+            language(ShippedLanguage::Rust),
+            Some(PathBuf::from("/cache")),
+            false,
+        )
+    }
+
     #[test]
-    fn test_limits_defaults_are_the_named_constants() {
-        let limits = DependencyIndexLimits::default();
-        assert_eq!(limits.package_bytes_max, PACKAGE_BYTES_MAX_DEFAULT);
-        assert_eq!(limits.total_bytes_max, TOTAL_BYTES_MAX_DEFAULT);
-        assert_eq!(limits.package_files_max, PACKAGE_FILES_MAX_DEFAULT);
+    fn test_limits_follow_the_dependencies_table_under_the_walk_bounds() {
+        let table = DependenciesConfiguration {
+            package_size: ByteSize::from_bytes(1 << 20),
+            index_size: ByteSize::from_bytes(8 << 20),
+            package_files: 12,
+            ..DependenciesConfiguration::default()
+        };
+        let limits = DependencyIndexLimits::from(&table);
+        assert_eq!(limits.package_bytes_max, 1 << 20);
+        assert_eq!(limits.total_bytes_max, 8 << 20);
+        assert_eq!(limits.package_files_max, 12);
         assert_eq!(limits.directory_depth_max, DIRECTORY_DEPTH_MAX_DEFAULT);
         assert_eq!(limits.walk_entries_max, WALK_ENTRIES_MAX_DEFAULT);
+        assert_eq!(
+            DependencyIndexLimits::default(),
+            DependencyIndexLimits::from(&DependenciesConfiguration::default())
+        );
     }
 
     #[test]
@@ -392,7 +473,11 @@ mod tests {
             ),
         ]);
 
-        let index = DependencyIndex::planned(&catalog, DependencyIndexLimits::default());
+        let index = DependencyIndex::planned(
+            &catalog,
+            DependencyIndexLimits::default(),
+            PackageSelection::default(),
+        );
 
         assert_eq!(index.pending_count(), 4);
         assert_eq!(
@@ -417,21 +502,113 @@ mod tests {
         assert_eq!(index.skipped()[0].reason, "not built here");
     }
 
+    /// A package the selection drops is planned nowhere: it is neither pending nor
+    /// unrooted, and a later catalog still naming it changes nothing.
+    #[test]
+    fn test_dependency_index_planned_leaves_a_dropped_package_out_of_every_list() {
+        let ghost = CatalogEntry::new(
+            identity("cargo", "helper-ghost", "0.1.0"),
+            PackageLocation::Dependency,
+            language(ShippedLanguage::Rust),
+        );
+        let catalog = catalog(vec![held("helper"), held("tokio"), ghost]);
+
+        let mut index = DependencyIndex::planned(
+            &catalog,
+            DependencyIndexLimits::default(),
+            without(&["cargo/helper*"]),
+        );
+
+        assert_eq!(
+            index.next_pending(),
+            Some(&identity("cargo", "tokio", "1.0.0"))
+        );
+        assert_eq!(index.pending_count(), 1);
+        assert!(index.unrooted().is_empty(), "{:?}", index.unrooted());
+        assert!(index.skipped().is_empty());
+        assert_eq!(index.selection().exclude(), ["cargo/helper*"]);
+        assert_eq!(index.limits(), DependencyIndexLimits::default());
+
+        index.retain_catalog(&catalog);
+
+        assert_eq!(index.pending_count(), 1);
+        assert!(index.unrooted().is_empty());
+    }
+
+    /// A request under other bounds or another selection replans from nothing: a held
+    /// build, a refusal, and a pending entry all belong to the old ones. Under the same
+    /// bounds and selection the index follows the catalog alone.
+    #[test]
+    fn test_dependency_index_follow_replans_on_changed_bounds_or_selection() {
+        let alpha = rust_package("alpha", "pub fn alpha() {}\n");
+        let mut index = DependencyIndex::planned(
+            &catalog(vec![held("alpha"), held("beta"), held("gamma")]),
+            DependencyIndexLimits::default(),
+            PackageSelection::default(),
+        );
+        index.insert(alpha).expect("alpha fits");
+        index.skip(identity("cargo", "gamma", "1.0.0"), "refused".to_owned());
+
+        index.follow(
+            &catalog(vec![
+                held("alpha"),
+                held("beta"),
+                held("gamma"),
+                held("delta"),
+            ]),
+            DependencyIndexLimits::default(),
+            &PackageSelection::default(),
+        );
+
+        assert!(index.is_indexed(&identity("cargo", "alpha", "1.0.0")));
+        assert_eq!(index.skipped().len(), 1, "same bounds keep the refusal");
+        assert_eq!(index.pending_count(), 2, "beta and delta await a build");
+
+        let raised = DependencyIndexLimits {
+            package_files_max: DependencyIndexLimits::default().package_files_max + 1,
+            ..DependencyIndexLimits::default()
+        };
+        index.follow(
+            &catalog(vec![held("alpha"), held("gamma")]),
+            raised,
+            &PackageSelection::default(),
+        );
+
+        assert_eq!(index.limits(), raised);
+        assert_eq!(
+            index.indexed_count(),
+            0,
+            "a held build was read under old bounds"
+        );
+        assert_eq!(index.total_bytes(), 0);
+        assert!(
+            index.skipped().is_empty(),
+            "a refusal was decided under old bounds"
+        );
+        assert_eq!(index.pending_count(), 2);
+
+        index.follow(
+            &catalog(vec![held("alpha"), held("gamma")]),
+            raised,
+            &without(&["cargo/gamma"]),
+        );
+
+        assert_eq!(index.pending_count(), 1);
+        assert_eq!(
+            index.next_pending(),
+            Some(&identity("cargo", "alpha", "1.0.0"))
+        );
+        assert_eq!(index.selection().exclude(), ["cargo/gamma"]);
+    }
+
     #[test]
     fn test_dependency_index_retain_catalog_drops_departed_and_queues_arrived() {
         let alpha = rust_package("alpha", "pub fn alpha() {}\n");
         let beta = rust_package("beta", "pub fn beta() {}\n");
-        let held = |name: &str| {
-            CatalogEntry::dependency(
-                identity("cargo", name, "1.0.0"),
-                language(ShippedLanguage::Rust),
-                Some(PathBuf::from("/cache")),
-                false,
-            )
-        };
         let mut index = DependencyIndex::planned(
             &catalog(vec![held("alpha"), held("beta"), held("gamma")]),
             DependencyIndexLimits::default(),
+            PackageSelection::default(),
         );
         let alpha_bytes = alpha.byte_count();
         index.insert(alpha).expect("alpha fits");
@@ -471,6 +648,7 @@ mod tests {
         let mut index = DependencyIndex::planned(
             &DependencyCatalog::default(),
             DependencyIndexLimits::default(),
+            PackageSelection::default(),
         );
         index
             .insert(rust_package("zeta", "pub fn spawn() {}\n"))
@@ -518,7 +696,11 @@ mod tests {
             total_bytes_max: alpha.byte_count(),
             ..DependencyIndexLimits::default()
         };
-        let mut index = DependencyIndex::planned(&DependencyCatalog::default(), limits);
+        let mut index = DependencyIndex::planned(
+            &DependencyCatalog::default(),
+            limits,
+            PackageSelection::default(),
+        );
         index.insert(alpha).expect("exactly the bound is accepted");
 
         let error = index
@@ -541,6 +723,7 @@ mod tests {
         let mut index = DependencyIndex::planned(
             &DependencyCatalog::default(),
             DependencyIndexLimits::default(),
+            PackageSelection::default(),
         );
         index
             .insert(rust_package("alpha", "pub fn first() {}\n"))

@@ -8,6 +8,7 @@
 
 pub mod change;
 pub mod configuration;
+pub mod dependencies;
 pub mod diagnostic;
 pub mod error;
 pub mod lock;

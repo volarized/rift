@@ -206,14 +206,20 @@ dependency declaration is a [`Symbol`](/docs/protocol/reference#Symbol) like any
 answers a [`get_symbol`](/docs/protocol/mcp#get_symbol-scope) lookup whose `scope` reaches
 dependencies.
 
-The index is bounded per package and in total, and the bounds are fixed in this release:
-`package_files_max` (2,000 selected files), `package_bytes_max` (4 MiB of selected source),
-`directory_depth_max` (16 directories below the root), `walk_entries_max` (50,000 directory
-entries examined), and `total_bytes_max` (256 MiB across every indexed package). A package
-that crosses one is skipped, and a lookup reports it as `dependency_package_skipped` naming
-the bound that refused it. The Rust standard library the Cargo resolver catalogs from the
-toolchain's `rust-src` holds more than `package_files_max` files, so it is skipped in this
-release.
+The index is bounded per package and in total: the `package_size`, `package_files`, and
+`index_size` keys of the [`[dependencies]`](/docs/configuration#dependencies) table set the
+bounds, and the walk below one source root stops at a directory depth and an entry count of
+the index's own. A package that crosses a bound is skipped, and a lookup reports it as
+`dependency_package_skipped` naming the bound that refused it. The Rust standard library the
+Cargo resolver catalogs from the toolchain's `rust-src` holds more files than the default
+`package_files` allows, so it is skipped unless the bound is raised.
+
+The same table selects which cataloged packages the index plans at all: `include` and
+`exclude` are globs over each package's `<manager>/<name>`, and a package they drop stays in
+the catalog and on the map without ever being pending or skipped. `enabled = false` turns the
+index off and refuses every dependency-scoped lookup. `resolution = "static"` keeps the
+resolvers off the toolchains, so a catalog comes from the lockfiles and package caches alone,
+and `command_timeout` bounds each run `auto` makes.
 
 Indexing runs behind the answers. Each publication hands its catalog to the dependency lane,
 which builds one package at a time on the worker pool: direct dependencies first, then the

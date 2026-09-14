@@ -345,6 +345,91 @@
         }
       ]
     },
+    "DependenciesConfiguration": {
+      "additionalProperties": false,
+      "description": "The `[dependencies]` table. The dependency index reads the packages the resolvers\ncatalog; this table turns the index off, selects how the catalog is resolved and\nwhich cataloged packages are indexed, and bounds what the index reads and holds.\n`include` and `exclude` are globs over `<manager>/<name>`: an empty `include` selects\nevery cataloged package, and an `exclude` match drops a package `include` selected.",
+      "properties": {
+        "command_timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "2m",
+          "description": "Wall-clock bound one toolchain run may take before it is killed, 1s to 1h.",
+          "rift:range": {
+            "max": "1h",
+            "min": "1s"
+          }
+        },
+        "enabled": {
+          "default": true,
+          "description": "Whether the dependency index runs. `false` keeps the catalog resolved for\n`rift://map` and refuses a `scope` beyond `project` as `capability_unavailable`.",
+          "type": "boolean"
+        },
+        "exclude": {
+          "default": [],
+          "description": "Globs over `<manager>/<name>` dropped from indexing. A match here is dropped\neven when `include` also matches it.",
+          "items": {
+            "$ref": "#/$defs/PackageNamePattern"
+          },
+          "maxItems": 64,
+          "type": "array"
+        },
+        "include": {
+          "default": [],
+          "description": "Globs over `<manager>/<name>` a cataloged package must match to be indexed.\nEmpty selects every cataloged package.",
+          "items": {
+            "$ref": "#/$defs/PackageNamePattern"
+          },
+          "maxItems": 64,
+          "type": "array"
+        },
+        "index_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "256mb",
+          "description": "Bytes every indexed package may hold together, 1mb to 16gb. A package that\nwould cross it is skipped.",
+          "rift:range": {
+            "max": "16gb",
+            "min": "1mb"
+          }
+        },
+        "package_files": {
+          "default": 2000,
+          "description": "Files one package's selection may hold, 1 to 100000. A package past it is\nskipped.",
+          "format": "uint64",
+          "maximum": 100000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "package_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "4mb",
+          "description": "Bytes one package's selected source may hold, 64kb to 1gb. A package past it is\nskipped.",
+          "rift:range": {
+            "max": "1gb",
+            "min": "64kb"
+          }
+        },
+        "resolution": {
+          "$ref": "#/$defs/DependencyResolution",
+          "default": "auto",
+          "description": "How the catalog is resolved: `auto` runs each toolchain, `static` reads the\nlockfiles and package caches alone."
+        }
+      },
+      "type": "object"
+    },
+    "DependencyResolution": {
+      "description": "How the resolvers reach a package graph: through each toolchain, or from the\nstatic inputs alone.",
+      "oneOf": [
+        {
+          "const": "auto",
+          "description": "Each resolver runs its toolchain and answers from its static inputs when the run\nfails.",
+          "type": "string"
+        },
+        {
+          "const": "static",
+          "description": "No toolchain runs. Each resolver answers from its static inputs, and an entry only\na toolchain can name is reported as a degradation.",
+          "type": "string"
+        }
+      ]
+    },
     "Determinism": {
       "description": "Whether an identical tree and environment are expected to reproduce a\nhook's result.",
       "oneOf": [
@@ -770,6 +855,16 @@
         }
       },
       "type": "object"
+    },
+    "PackageNamePattern": {
+      "description": "One glob over a package's `<manager>/<name>`, such as `cargo/tokio`, `npm/@types/*`,\nor `stdlib/*`. Forward-slash separated and at most 256 bytes; `*` never crosses `/`\nand `**` does.",
+      "examples": [
+        "npm/@types/*"
+      ],
+      "maxLength": 256,
+      "minLength": 1,
+      "pattern": "^(?!/)(?!\\.\\.?(/|$))(?!.*(/\\.\\.?)(/|$))[^\\\\\\u0000-\\u001F\\u007F]+$",
+      "type": "string"
     },
     "PathPattern": {
       "description": "Project-relative glob using *, ?, **, and character classes. Forward-slash separated on\nevery platform, whatever separator the host OS uses natively.",
@@ -1210,6 +1305,20 @@
   "additionalProperties": false,
   "description": "The whole `rift.toml`. Every table is optional and defaults to the\nbehavior documented on it; any key outside these definitions refuses the\nfile as `configuration_invalid`.",
   "properties": {
+    "dependencies": {
+      "$ref": "#/$defs/DependenciesConfiguration",
+      "default": {
+        "command_timeout": "2m",
+        "enabled": true,
+        "exclude": [],
+        "include": [],
+        "index_size": "256mb",
+        "package_files": 2000,
+        "package_size": "4mb",
+        "resolution": "auto"
+      },
+      "description": "Whether the dependency index runs, how the catalog is resolved, which\ncataloged packages it indexes, and the bounds it indexes under."
+    },
     "execution": {
       "$ref": "#/$defs/ExecutionConfiguration",
       "default": {

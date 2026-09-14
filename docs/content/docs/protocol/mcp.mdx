@@ -153,7 +153,9 @@ package. The hit carries no `node`, since a package is never an edit target, and
 `history`.
 
 The server refuses `rev` together with a scope beyond `project` as `invalid_request`: the
-dependency index serves the current tree alone.
+dependency index serves the current tree alone. While the workspace's
+[`[dependencies]`](/docs/configuration#dependencies) table sets `enabled = false`, the server
+refuses a scope beyond `project` as `capability_unavailable`, naming the switch.
 
 This lookup reaches the `helper` crate a workspace's `Cargo.toml` names by path:
 
@@ -418,7 +420,9 @@ contributes declarations alone, so `target: "file"` answers nothing from it.
 The server refuses `rev` together with a scope beyond `project` as `invalid_request`, since
 the dependency index serves the current tree alone, and refuses `traversal` together with
 `dependencies` the same way, since the relationship graph serves the project alone; `all`
-still walks the project graph. The three dependency warnings under [Reads](#reads) ride a
+still walks the project graph. While the workspace's `[dependencies]` table sets
+`enabled = false`, the server refuses a scope beyond `project` as `capability_unavailable`,
+as it does on `get_symbol`. The three dependency warnings under [Reads](#reads) ride a
 `search` answer whose `scope` reaches dependencies, as they ride a `get_symbol` answer.
 
 This search reaches the `helper` crate the `get_symbol` lookup above reaches:

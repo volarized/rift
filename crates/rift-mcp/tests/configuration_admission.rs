@@ -231,6 +231,24 @@ async fn unknown_binding_key_fails_reads_typed() -> TestResult {
 }
 
 #[tokio::test]
+async fn out_of_range_dependencies_package_files_fails_reads_naming_the_field() -> TestResult {
+    let directory = workspace_with(Some("[dependencies]\npackage_files = 0\n"))?;
+    let client = client_for(directory.path()).await?;
+
+    let read = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
+    assert_eq!(read["code"], json!("configuration_invalid"));
+    assert_eq!(read["retry"], json!("operator_action"));
+    let message = read["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("dependencies.package_files") && message.contains("1..=100000"),
+        "the refusal must name the field and its range: {message}"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn invalid_search_text_configuration_fails_reads_typed() -> TestResult {
     let directory = workspace_with(Some(INVALID_TEXT_CONFIGURATION))?;
     let client = client_for(directory.path()).await?;

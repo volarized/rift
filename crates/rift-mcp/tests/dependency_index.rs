@@ -33,6 +33,10 @@ const HELPER_UNIT: &str = "rift://source/cargo/helper@0.1.0/src/lib.rs";
 const HELPER_SOURCE: &str =
     "pub fn helper_beacon() {}\nfn helper_private() {}\npub fn beacon() {}\n";
 
+/// A second helper source file, so the crate selects two files and a `package_files`
+/// bound of one refuses it.
+const HELPER_EXTRA_SOURCE: &str = "pub fn helper_extra() {}\n";
+
 /// A v4 lockfile naming the project and its path dependency: what
 /// `cargo metadata --locked --offline` accepts without the network and without
 /// rewriting the file.
@@ -62,8 +66,9 @@ struct DependentWorkspace {
 }
 
 /// Lays the helper crate out in its own directory and serves a project that depends on it
-/// by path. The path is spelled as a TOML literal string, so no separator needs escaping.
-async fn served_dependent_workspace() -> TestResult<DependentWorkspace> {
+/// by path, with `configuration` appended to the served `rift.toml`. The path is spelled
+/// as a TOML literal string, so no separator needs escaping.
+async fn served_dependent_workspace(configuration: Option<&str>) -> TestResult<DependentWorkspace> {
     let helper = tempfile::tempdir()?;
     fs::create_dir_all(helper.path().join("src"))?;
     fs::write(
@@ -71,6 +76,7 @@ async fn served_dependent_workspace() -> TestResult<DependentWorkspace> {
         "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
     )?;
     fs::write(helper.path().join("src/lib.rs"), HELPER_SOURCE)?;
+    fs::write(helper.path().join("src/extra.rs"), HELPER_EXTRA_SOURCE)?;
     let manifest = format!(
         "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
          [dependencies]\nhelper = {{ path = '{}' }}\n",
@@ -82,7 +88,7 @@ async fn served_dependent_workspace() -> TestResult<DependentWorkspace> {
             ("Cargo.lock", LOCK_WITH_HELPER),
             ("src/lib.rs", "pub fn beacon() {}\n"),
         ],
-        None,
+        configuration.map(str::to_owned),
     )
     .await?;
     Ok(DependentWorkspace {
@@ -107,20 +113,29 @@ async fn search(
     call_retrying_acceptance(client, tool_request("search", &arguments)).await
 }
 
-/// The wire `ErrorData` one refused `search` carries. The caller has already proven the
-/// workspace answers, so the refusal is the request's own rather than acceptance's.
-async fn refused_search(
+/// The wire `ErrorData` one refused `tool` call carries. The caller has already proven
+/// the workspace answers, so the refusal is the request's own rather than acceptance's.
+async fn refused_call(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    tool: &'static str,
     arguments: Value,
 ) -> TestResult<Value> {
     let error = client
-        .call_tool(tool_request("search", &arguments))
+        .call_tool(tool_request(tool, &arguments))
         .await
         .expect_err("the request must be refused");
     let rmcp::ServiceError::McpError(data) = error else {
         panic!("expected protocol-level McpError, got {error:?}");
     };
     Ok(data.data.ok_or("wire error data must be present")?)
+}
+
+/// The wire `ErrorData` one refused `search` carries.
+async fn refused_search(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    arguments: Value,
+) -> TestResult<Value> {
+    refused_call(client, "search", arguments).await
 }
 
 /// Each symbol hit's declaration name and whether it is addressed by `unit`.
@@ -195,7 +210,7 @@ fn assert_one_location(hit: &Value) {
 
 #[tokio::test]
 async fn a_dependency_scoped_lookup_answers_the_package_declaration() -> TestResult {
-    let workspace = served_dependent_workspace().await?;
+    let workspace = served_dependent_workspace(None).await?;
     let (_directory, client, server_task) = workspace.served;
 
     let answer = helper_indexed(&client).await?;
@@ -240,7 +255,7 @@ async fn a_dependency_scoped_lookup_answers_the_package_declaration() -> TestRes
 
 #[tokio::test]
 async fn a_private_declaration_is_not_served() -> TestResult {
-    let workspace = served_dependent_workspace().await?;
+    let workspace = served_dependent_workspace(None).await?;
     let (_directory, client, server_task) = workspace.served;
     helper_indexed(&client).await?;
 
@@ -259,7 +274,7 @@ async fn a_private_declaration_is_not_served() -> TestResult {
 
 #[tokio::test]
 async fn the_project_scope_leaves_the_package_out() -> TestResult {
-    let workspace = served_dependent_workspace().await?;
+    let workspace = served_dependent_workspace(None).await?;
     let (_directory, client, server_task) = workspace.served;
     helper_indexed(&client).await?;
 
@@ -283,7 +298,7 @@ async fn the_project_scope_leaves_the_package_out() -> TestResult {
 
 #[tokio::test]
 async fn the_all_scope_lists_the_project_hit_before_the_package_hit() -> TestResult {
-    let workspace = served_dependent_workspace().await?;
+    let workspace = served_dependent_workspace(None).await?;
     let (_directory, client, server_task) = workspace.served;
     helper_indexed(&client).await?;
 
@@ -309,7 +324,7 @@ async fn the_all_scope_lists_the_project_hit_before_the_package_hit() -> TestRes
 
 #[tokio::test]
 async fn a_dependency_scoped_search_answers_the_package_declaration_by_unit() -> TestResult {
-    let workspace = served_dependent_workspace().await?;
+    let workspace = served_dependent_workspace(None).await?;
     let (_directory, client, server_task) = workspace.served;
     helper_indexed(&client).await?;
 
@@ -361,7 +376,7 @@ async fn a_dependency_scoped_search_answers_the_package_declaration_by_unit() ->
 
 #[tokio::test]
 async fn the_all_scope_search_answers_project_and_package_hits() -> TestResult {
-    let workspace = served_dependent_workspace().await?;
+    let workspace = served_dependent_workspace(None).await?;
     let (_directory, client, server_task) = workspace.served;
     helper_indexed(&client).await?;
 
@@ -403,7 +418,7 @@ async fn the_all_scope_search_answers_project_and_package_hits() -> TestResult {
 
 #[tokio::test]
 async fn a_dependency_scoped_search_with_traversal_refuses_invalid_request() -> TestResult {
-    let workspace = served_dependent_workspace().await?;
+    let workspace = served_dependent_workspace(None).await?;
     let (_directory, client, server_task) = workspace.served;
     search(&client, json!({ "query": "beacon" })).await?;
 
@@ -432,7 +447,7 @@ async fn a_dependency_scoped_search_with_traversal_refuses_invalid_request() -> 
 
 #[tokio::test]
 async fn a_revision_search_with_a_dependency_scope_refuses_invalid_request() -> TestResult {
-    let workspace = served_dependent_workspace().await?;
+    let workspace = served_dependent_workspace(None).await?;
     let (directory, client, server_task) = workspace.served;
     // A committed baseline, so `main` resolves and the scope rule is what refuses; the
     // workspace database stays out of the commit.
@@ -453,6 +468,186 @@ async fn a_revision_search_with_a_dependency_scope_refuses_invalid_request() -> 
             .as_str()
             .is_some_and(|message| message.contains("scope")),
         "the refusal names the field: {wire:#}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// Polls the helper lookup until the store has settled: no package is pending. The
+/// answer is whatever the settled store says, hits or warnings.
+async fn dependency_index_settled(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+) -> TestResult<Value> {
+    for _attempt in 0..INDEX_ATTEMPTS_MAX {
+        let answer = get_symbol(
+            client,
+            json!({ "name": "helper_beacon", "scope": "dependencies" }),
+        )
+        .await?;
+        if !warning_codes(&answer).contains(&"dependency_index_pending") {
+            return Ok(answer);
+        }
+        tokio::time::sleep(INDEX_POLL).await;
+    }
+    Err("the dependency lane never settled within the poll bound".into())
+}
+
+/// Polls the helper lookup until the helper is indexed, tolerating the refusal an
+/// earlier bound recorded: the lane replans once the raised bound publishes.
+async fn helper_reindexed(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+) -> TestResult<Value> {
+    for _attempt in 0..INDEX_ATTEMPTS_MAX {
+        let answer = get_symbol(
+            client,
+            json!({ "name": "helper_beacon", "scope": "dependencies" }),
+        )
+        .await?;
+        if answer["hits"]
+            .as_array()
+            .is_some_and(|hits| !hits.is_empty())
+        {
+            return Ok(answer);
+        }
+        tokio::time::sleep(INDEX_POLL).await;
+    }
+    Err("the dependency lane never indexed the helper again within the poll bound".into())
+}
+
+/// The `dependency_package_skipped` warning naming the helper, once the lane recorded it.
+async fn helper_skipped(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+) -> TestResult<Value> {
+    for _attempt in 0..INDEX_ATTEMPTS_MAX {
+        let answer = get_symbol(
+            client,
+            json!({ "name": "helper_beacon", "scope": "dependencies" }),
+        )
+        .await?;
+        let skipped = answer["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|warning| {
+                warning["code"] == json!("dependency_package_skipped")
+                    && warning["package"]["name"] == json!("helper")
+            })
+            .cloned();
+        if let Some(skipped) = skipped {
+            return Ok(skipped);
+        }
+        assert!(
+            answer["hits"].as_array().is_some_and(Vec::is_empty),
+            "a refused package answers no hit: {answer:#}"
+        );
+        tokio::time::sleep(INDEX_POLL).await;
+    }
+    Err("the dependency lane never refused the helper within the poll bound".into())
+}
+
+/// A package `[dependencies] exclude` drops is never planned: the lookup answers empty
+/// once the store settles, and no warning names it.
+#[tokio::test]
+async fn an_excluded_package_is_left_out_without_a_warning() -> TestResult {
+    let workspace =
+        served_dependent_workspace(Some("[dependencies]\nexclude = [\"cargo/helper\"]\n")).await?;
+    let (_directory, client, server_task) = workspace.served;
+
+    let answer = dependency_index_settled(&client).await?;
+
+    assert_eq!(answer["hits"], json!([]), "{answer:#}");
+    assert!(
+        answer["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|warning| warning["package"]["name"] != json!("helper")),
+        "an excluded package is neither pending nor skipped: {answer:#}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// `[dependencies] enabled = false` refuses every scope beyond `project` on both tools
+/// as `capability_unavailable` naming the switch; the project scope still answers.
+#[tokio::test]
+async fn a_disabled_index_refuses_a_dependency_scope_typed() -> TestResult {
+    let workspace = served_dependent_workspace(Some("[dependencies]\nenabled = false\n")).await?;
+    let (_directory, client, server_task) = workspace.served;
+    let project = search(&client, json!({ "query": "beacon" })).await?;
+    assert_eq!(located_names(&project), [("beacon".to_owned(), false)]);
+
+    for scope in ["dependencies", "all"] {
+        for (tool, arguments) in [
+            ("get_symbol", json!({ "name": "beacon", "scope": scope })),
+            ("search", json!({ "query": "beacon", "scope": scope })),
+        ] {
+            let wire = refused_call(&client, tool, arguments).await?;
+            assert_eq!(
+                wire["code"],
+                json!("capability_unavailable"),
+                "{tool} {scope}: {wire:#}"
+            );
+            assert_eq!(
+                wire["retry"],
+                json!("operator_action"),
+                "{tool} {scope}: {wire:#}"
+            );
+            assert!(
+                wire["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("[dependencies] enabled = false")),
+                "the refusal names the switch: {tool} {scope}: {wire:#}"
+            );
+        }
+    }
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A `package_files` bound the helper crosses records a refusal; raising the bound in
+/// `rift.toml` replans the index on the next publication, and the helper is indexed.
+#[tokio::test]
+async fn raising_package_files_after_a_refusal_reindexes_on_the_next_request() -> TestResult {
+    let workspace = served_dependent_workspace(Some("[dependencies]\npackage_files = 1\n")).await?;
+    let (directory, client, server_task) = workspace.served;
+    let skipped = helper_skipped(&client).await?;
+    assert!(
+        skipped["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("package_files_max=1")),
+        "the refusal names the bound: {skipped:#}"
+    );
+
+    fs::write(
+        directory.path().join("rift.toml"),
+        format!(
+            "{}[dependencies]\npackage_files = 2000\n",
+            hermetic_search::SEMANTIC_DISABLED
+        ),
+    )?;
+    let answer = helper_reindexed(&client).await?;
+
+    let hits = answer["hits"].as_array().ok_or("hits are an array")?;
+    assert_eq!(hits.len(), 1, "{answer:#}");
+    assert_eq!(
+        hits[0]["symbol"]["name"],
+        json!("helper_beacon"),
+        "{answer:#}"
+    );
+    assert!(
+        answer["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|warning| warning["package"]["name"] != json!("helper")),
+        "the replanned index holds the helper without a refusal: {answer:#}"
     );
 
     client.cancel().await?;

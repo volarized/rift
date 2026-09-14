@@ -23,6 +23,7 @@ use rift_protocol::configuration::{
     BindingConfiguration, HistoryConfiguration, LanguageLspConfiguration, LogsConfiguration,
     LspConfiguration, SearchConfiguration, ServerConfiguration, WorkspaceConfiguration,
 };
+use rift_protocol::dependencies::DependenciesConfiguration;
 use rift_protocol::error as wire;
 use rift_protocol::map::WorkspaceMap;
 use rift_search::{Embedding, SearchError, SearchIndex};
@@ -37,7 +38,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
-use crate::dependency::DependencyLane;
+use crate::dependency::{DependencyLane, DependencyPlan};
 use crate::failure::WireFailure;
 use crate::server::{BlockingExecutor, ChangeLane};
 
@@ -208,6 +209,9 @@ pub(crate) struct PublishedWorkspace {
     /// Workspace orientation snapshot served by `rift://map`, computed once for this
     /// publication and reused until the next one - a read costs a lookup, never a rebuild.
     pub(crate) map: Arc<WorkspaceMap>,
+    /// What the accepted `[dependencies]` table asks of the dependency index, compiled
+    /// once beside `reads` and handed to the dependency lane with the catalog.
+    pub(crate) dependency_plan: DependencyPlan,
     pub(crate) epoch: u64,
 }
 
@@ -387,12 +391,15 @@ impl ConfigurationState {
     /// Whether index-owned configuration differs from another acceptance.
     ///
     /// The `[providers.binding]` table counts as index-owned: its switch and bounds
-    /// shape the publication set the index bakes at build time.
+    /// shape the publication set the index bakes at build time. So does the
+    /// `[dependencies]` table: the read service resolves its catalog under the table's
+    /// resolution policy and gates dependency-scoped lookups on its switch.
     fn index_configuration_differs(&self, other: &Self) -> bool {
         self.source_visibility() != other.source_visibility()
             || self.text_inclusion() != other.text_inclusion()
             || self.language_file_selections() != other.language_file_selections()
             || self.binding_configuration() != other.binding_configuration()
+            || self.dependencies_configuration() != other.dependencies_configuration()
     }
 
     /// The `[providers.history]` table from the last acceptance, or the
@@ -410,6 +417,15 @@ impl ConfigurationState {
         self.accepted
             .as_ref()
             .map(|configuration| configuration.providers.binding.clone())
+            .unwrap_or_default()
+    }
+
+    /// The `[dependencies]` table from the last acceptance, or the default table
+    /// while `rift.toml` is invalid.
+    pub(crate) fn dependencies_configuration(&self) -> DependenciesConfiguration {
+        self.accepted
+            .as_ref()
+            .map(|configuration| configuration.dependencies.clone())
             .unwrap_or_default()
     }
 
@@ -1173,6 +1189,8 @@ fn whole_workspace_candidate(
     let text_inclusion = configuration.text_inclusion();
     let languages = configuration.language_file_selections();
     let binding = BindingPolicy::from(&configuration.binding_configuration());
+    let dependencies_configuration = configuration.dependencies_configuration();
+    let dependency_plan = DependencyPlan::compile(&dependencies_configuration)?;
     let reads = ReadService::build_with_languages(
         root,
         limits,
@@ -1181,6 +1199,7 @@ fn whole_workspace_candidate(
         &languages,
         binding,
         configuration.history_configuration(),
+        dependencies_configuration,
     )?
     .with_dependencies(Arc::clone(dependencies));
     let source_policy = reads.source_policy_handle().unwrap_or_else(|| {
@@ -1193,16 +1212,17 @@ fn whole_workspace_candidate(
         configuration,
         source_policy,
         map,
+        dependency_plan,
         epoch,
     })
 }
 
 /// Replaces the files `changes` names and shares every other file with `previous`.
 ///
-/// Index-owned configuration, the compiled source policy, and the dependency store carry
-/// over unchanged. Other accepted configuration may change without rebuilding source
-/// files. An empty change set still produces a candidate because current-tree requests
-/// wait for its observation epoch.
+/// Index-owned configuration, the compiled source policy, the dependency plan, and the
+/// dependency store carry over unchanged. Other accepted configuration may change without
+/// rebuilding source files. An empty change set still produces a candidate because
+/// current-tree requests wait for its observation epoch.
 fn shared_workspace_candidate(
     previous: &PublishedWorkspace,
     changes: &PathChanges,
@@ -1216,6 +1236,7 @@ fn shared_workspace_candidate(
             fingerprint: previous.fingerprint.clone(),
             source_policy: Arc::clone(&previous.source_policy),
             map: Arc::clone(&previous.map),
+            dependency_plan: previous.dependency_plan.clone(),
             epoch,
         });
     }
@@ -1227,6 +1248,7 @@ fn shared_workspace_candidate(
         configuration,
         source_policy: Arc::clone(&previous.source_policy),
         map,
+        dependency_plan: previous.dependency_plan.clone(),
         epoch,
     })
 }
@@ -1582,9 +1604,7 @@ pub(crate) async fn run_index_supervisor(
         match result {
             Ok(RebuildOutcome::Published) => {
                 let (current, _) = published.read().await.snapshot();
-                context
-                    .dependency_lane
-                    .request(Arc::clone(current.reads.dependency_catalog()));
+                context.dependency_lane.request_for(&current);
                 if let Some(lane) = population.as_ref() {
                     lane.request(current);
                 }
