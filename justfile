@@ -47,8 +47,8 @@ dashes:
 # one foreground server serves. `tools/mcp-conformance/expected-failures.yml`
 # carries the scenarios the served surface fails today; anything else fails
 # the gate.
-conformance:
-    uv run --script scripts/check_mcp_conformance.py
+conformance binary="":
+    uv run --script scripts/check_mcp_conformance.py {{ if binary == "" { "" } else { "--binary " + quote(binary) } }}
 
 
 clippy:
@@ -56,6 +56,10 @@ clippy:
 
 docs:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+
+# Stable Rust exposes doctests through rustdoc; nextest runs the other Rust tests.
+doctest:
+    cargo test --doc --workspace --all-features --locked
 
 audit:
     cargo audit
@@ -71,6 +75,11 @@ clean:
         fi
     done
 
+# CI transfers only nextest's runtime archive and the plain CLI used by conformance.
+fast-archive:
+    cargo llvm-cov nextest-archive --workspace --all-targets --all-features --locked --profile ci --archive-file target/fast.tar.zst
+    tar --zstd -cf target/fast-cli.tar.zst -C target/debug rift
+
 # One run of every suite, live engines and the live model hub included: the
 # engine tier's own code is only exercised against a real language server, and
 # the semantic search tier's acquisition only against the real hub, so a
@@ -78,22 +87,19 @@ clean:
 # toolchain, bun on the PATH, and network reach to huggingface.co; the model is
 # cached per machine, so only the first run pays for the download. Coverage is
 # this run's artifact, not a second run.
-test:
-    RIFT_ENGINE_LIVE=1 RIFT_SEARCH_LIVE=1 cargo llvm-cov --workspace --all-targets --all-features --lcov --output-path lcov.info --fail-under-lines 86
+test archive="":
+    mkdir -p "${CARGO_LLVM_COV_TARGET_DIR:-target/llvm-cov-target}"
+    RIFT_ENGINE_LIVE=1 RIFT_SEARCH_LIVE=1 cargo llvm-cov nextest {{ if archive == "" { "--workspace --all-targets --all-features --locked" } else { "--archive-file " + quote(archive) + " --extract-overwrite --workspace-remap ." } }} --profile ci --no-tests fail --lcov --output-path lcov.info --fail-under-lines 86
 
 # The live-engine suites alone, for iterating on them without paying for
 # the instrumented workspace run.
 engine-test:
-    RIFT_ENGINE_LIVE=1 cargo test -p rift-lsp --test live_rust_analyzer
-    RIFT_ENGINE_LIVE=1 cargo test -p rift-mcp --test live_rust_analyzer
-    RIFT_ENGINE_LIVE=1 cargo test -p rift-lsp --test live_typescript
-    RIFT_ENGINE_LIVE=1 cargo test -p rift-mcp --test live_typescript
-    RIFT_ENGINE_LIVE=1 cargo test -p rift-mcp --test live_toml
+    RIFT_ENGINE_LIVE=1 cargo nextest run --locked --no-tests fail -p rift-lsp -p rift-mcp --test live_rust_analyzer --test live_typescript --test live_toml
 
 # The live semantic-search suite alone, for iterating on it without paying for
 # the instrumented workspace run. Reaches the real model hub.
 search-test:
-    RIFT_SEARCH_LIVE=1 cargo test -p rift-mcp --test live_semantic_search
+    RIFT_SEARCH_LIVE=1 cargo nextest run --locked --no-tests fail -p rift-mcp --test live_semantic_search
 
 release-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_release.py
@@ -101,7 +107,12 @@ release-test:
 installer-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_installers.py
 
-rust-gate: format dashes generate-check conformance check clippy docs audit test release-test installer-test
+testing-check:
+    uv run --locked --python 3.12 --project scripts ruff check scripts
+    uv run --locked --python 3.12 --project scripts ty check --extra-search-path scripts --extra-search-path tools/rift-release/src scripts
+    uv run --locked --python 3.12 --project scripts pytest scripts
+
+rust-gate: format dashes generate-check conformance check clippy docs doctest audit test release-test installer-test testing-check
 
 # One signed tag on the commit `origin/main` names right now. The recipe reads
 # that commit from the remote, so the local checkout's branch and its uncommitted

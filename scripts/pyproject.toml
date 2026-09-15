@@ -1,0 +1,28 @@
+[project]
+name = "rift-testing"
+version = "0.0.0"
+description = "Rift corpus, agent, and release validation"
+requires-python = ">=3.12"
+dependencies = [
+    "jsonschema==4.26.0",
+    "mcp==1.26.0",
+    "psutil==7.2.2",
+    "pywin32==312; sys_platform == 'win32'",
+    "trustme==1.2.1",
+]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "PyYAML==6.0.3",
+    "ruff==0.16.7",
+    "ty==0.0.81",
+    "types-pywin32==312.0.0.20260827",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+pythonpath = ["."]
