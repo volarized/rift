@@ -71,8 +71,8 @@ pub enum DiagnosticCode {
     /// language, or the configured engine does not cover the move.
     #[serde(rename = "rift.move.references_not_updated")]
     MoveReferencesNotUpdated,
-    /// An occurrence of a moved file's old project path survives in the changed tree
-    /// after the move.
+    /// An occurrence of a moved file's old path, in any spelling a reference carries,
+    /// survives in the changed tree after the move.
     #[serde(rename = "rift.move.survivor")]
     MoveSurvivor,
     /// The language engine could not serve diagnostics over an applied change; the
