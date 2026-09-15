@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import random
 import re
 import sqlite3
 from contextlib import closing
@@ -19,12 +20,83 @@ from rift_test_client import (
 )
 
 SYMBOL_COUNT = 200
+SYMBOL_POOL_MAX = 4000
 READ_COUNT = 50
 SOURCE_WARNINGS_MAX = 9
 LEXICAL_UNITS_MAX = 1_000_000
 LEXICAL_BYTES_MAX = 512 * 1024 * 1024
 PROBE_PATH = "rift_corpus_probe.rs"
 PROBE_SOURCE = "pub fn corpus_probe(){}\n"
+
+
+def symbol_pool(candidates: list[JsonObject]) -> dict[str, JsonObject]:
+    """Deduplicate overlapping search pages while checking each emitted language."""
+    require(len(candidates) <= SYMBOL_POOL_MAX, "symbol pool exceeded 4000 hits")
+    identities: dict[str, JsonObject] = {}
+    for candidate in candidates:
+        symbol = object_value(
+            object_value(candidate.get("hit"), "search hit").get("symbol"), "symbol"
+        )
+        identity = string_value(symbol.get("id"), "symbol identity")
+        language = string_value(symbol.get("language"), "symbol language")
+        if identity in identities:
+            previous = object_value(
+                object_value(identities[identity].get("hit"), "search hit").get(
+                    "symbol"
+                ),
+                "symbol",
+            )
+            require(
+                previous.get("language") == language,
+                f"one identity named two languages: {identity}",
+            )
+        else:
+            identities[identity] = candidate
+    return identities
+
+
+def language_counts(candidates: list[JsonObject]) -> JsonObject:
+    counts: dict[str, int] = {}
+    for candidate in symbol_pool(candidates).values():
+        symbol = object_value(
+            object_value(candidate.get("hit"), "search hit").get("symbol"), "symbol"
+        )
+        language = string_value(symbol.get("language"), "symbol language")
+        counts[language] = counts.get(language, 0) + 1
+    return {language: count for language, count in sorted(counts.items())}
+
+
+def sample_symbols(
+    candidates: list[JsonObject], count: int, seed: int, required: set[str]
+) -> list[JsonObject]:
+    """Sample across emitted languages without losing rare languages or repeating IDs."""
+    require(0 < count <= SYMBOL_COUNT, "symbol sample count must be within 1..200")
+    pool = symbol_pool(candidates)
+    require(len(pool) >= count, f"symbol pool has fewer than {count} unique identities")
+    groups: dict[str, list[JsonObject]] = {}
+    for identity in sorted(pool):
+        candidate = pool[identity]
+        symbol = object_value(
+            object_value(candidate.get("hit"), "search hit").get("symbol"), "symbol"
+        )
+        language = string_value(symbol.get("language"), "symbol language")
+        groups.setdefault(language, []).append(candidate)
+    require(
+        required.issubset(groups),
+        f"symbol pool lost required languages: {sorted(required - groups.keys())}",
+    )
+    require(len(groups) <= count, "symbol count cannot represent every pooled language")
+    generator = random.Random(seed)
+    for language in sorted(groups):
+        generator.shuffle(groups[language])
+    selected: list[JsonObject] = []
+    for _ in range(count):
+        for language in sorted(groups):
+            if groups[language]:
+                selected.append(groups[language].pop())
+            if len(selected) == count:
+                return selected
+    raise AssertionError("symbol pool exhausted before the requested count")
 
 
 def records(answer: JsonObject) -> list[JsonObject]:

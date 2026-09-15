@@ -24,11 +24,13 @@ from corpus_assertions import (
     change_patch,
     exact_degradation,
     identity_resolved,
+    language_counts,
     lexical_breach,
     lexical_content,
     no_failed_builds,
     probe_units,
     records,
+    sample_symbols,
     warnings,
 )
 from corpus_cache import Measurement, Pin, git, measure, pins
@@ -125,6 +127,71 @@ class Measurements(unittest.TestCase):
             (root / "source.rs").write_text("fn changed() {}\n")
             with self.assertRaisesRegex(RuntimeError, "checkout changed"):
                 pin.verify(root)
+
+
+class SymbolSamples(unittest.TestCase):
+    @staticmethod
+    def hit(language: str, index: int) -> JsonObject:
+        return {
+            "hit": {
+                "symbol": {
+                    "id": f"rift://symbol/{language}/source/name_{index}",
+                    "language": language,
+                }
+            }
+        }
+
+    def test_sample_represents_languages_and_is_stable_across_page_order(self) -> None:
+        candidates = [
+            self.hit(language, index)
+            for language in ("javascript", "json", "rust", "typescript")
+            for index in range(100)
+        ]
+        selected = sample_symbols(candidates, 200, 34, {"rust", "typescript"})
+        self.assertEqual(
+            language_counts(selected),
+            {"javascript": 50, "json": 50, "rust": 50, "typescript": 50},
+        )
+        self.assertEqual(
+            selected,
+            sample_symbols(list(reversed(candidates)), 200, 34, {"rust", "typescript"}),
+        )
+        self.assertNotEqual(
+            selected, sample_symbols(candidates, 200, 35, {"rust", "typescript"})
+        )
+
+    def test_sample_keeps_scarce_languages_and_fills_all_200_unique_positions(
+        self,
+    ) -> None:
+        candidates = [self.hit("python", index) for index in range(300)]
+        candidates.extend([self.hit("rust", 0), self.hit("json", 0)])
+        selected = sample_symbols(candidates + candidates, 200, 34, {"python", "rust"})
+        self.assertEqual(len(selected), 200)
+        self.assertEqual(
+            language_counts(selected), {"json": 1, "python": 198, "rust": 1}
+        )
+
+    def test_sample_refuses_missing_languages_and_duplicate_only_capacity(self) -> None:
+        candidates = [self.hit("python", index) for index in range(200)]
+        with self.assertRaisesRegex(AssertionError, "required languages"):
+            sample_symbols(candidates, 200, 34, {"rust"})
+        with self.assertRaisesRegex(AssertionError, "unique identities"):
+            sample_symbols([candidates[0]] * 200, 200, 34, {"python"})
+        with self.assertRaisesRegex(AssertionError, "4000 hits"):
+            sample_symbols([candidates[0]] * 4001, 200, 34, {"python"})
+
+    def test_one_identity_cannot_change_language_across_pages(self) -> None:
+        original = self.hit("rust", 0)
+        conflicting: JsonObject = {
+            "hit": {
+                "symbol": {
+                    "id": "rift://symbol/rust/source/name_0",
+                    "language": "json",
+                }
+            }
+        }
+        with self.assertRaisesRegex(AssertionError, "two languages"):
+            sample_symbols([original, conflicting], 1, 34, {"rust"})
 
 
 class Decisions(unittest.TestCase):
