@@ -63,6 +63,8 @@ jobs:
     timeout-minutes: 30
     env:
       RIFT_TARGET: ${{ matrix.target }}
+      # Match the native gate's Python harness while Rift remains ARM64 on Windows ARM.
+      UV_PYTHON: ${{ matrix.os == 'windows-11-arm' && 'cpython-3.12-windows-x86_64-none' || '3.12' }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -80,7 +82,7 @@ jobs:
         run: cargo build --release --locked --target "${{ matrix.target }}" --package rift
       - name: Smoke test release binary
         run: >-
-          uv run --locked --python 3.12 --project scripts python scripts/check_artifact.py
+          uv run --locked --project scripts python scripts/check_artifact.py
           --binary "${{ matrix.binary }}"
           --version "${{ github.ref_name }}"
       - name: Package release archive

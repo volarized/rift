@@ -112,6 +112,22 @@ class GateTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_release_smoke_uses_native_gate_python_selection(self) -> None:
+        release = yaml.safe_load(
+            (ROOT / ".github/workflows/rift-release.yml").read_text()
+        )["jobs"]["build"]
+        gate = yaml.safe_load(
+            (ROOT / ".github/workflows/release-gate.yml").read_text()
+        )["jobs"]["release-gate"]
+        self.assertEqual(release["env"]["UV_PYTHON"], gate["env"]["UV_PYTHON"])
+        smoke = next(
+            step
+            for step in release["steps"]
+            if step.get("name") == "Smoke test release binary"
+        )
+        self.assertNotIn("--python", smoke["run"])
+        self.assertNotIn("UV_PYTHON", smoke.get("env", {}))
+
     def test_candidate_builds_are_required_and_draft_skips_are_explicit(self) -> None:
         workflow = yaml.safe_load(
             (ROOT / ".github/workflows/release-gate.yml").read_text()
