@@ -868,18 +868,30 @@ impl SearchRanking {
 /// The paths one applied change asks the next snapshot to reparse, or nothing when that
 /// snapshot has to read every visible file.
 ///
-/// A change names what it wrote, so an ordinary change reparses exactly those files. Three
-/// cases read everything instead: a workspace that declares hooks, because a hook runs
-/// after the change lands and may write anything; a written path that decides what the
-/// workspace includes, because `rift.toml` and every `.gitignore` reshape the whole file
-/// set; and a wire path the index cannot key, which is covered rather than narrowed away.
+/// A change names what it wrote, and a workspace that runs hooks names what they wrote
+/// beside it: [`ChangeService::finalize_hook_result`] rebuilds the summary from the
+/// captures taken around the run, so a hook declaring `writes = "workspace"` lands in the
+/// summary as the files whose bytes it moved, and a run that moved none adds nothing.
+/// Three cases read everything instead: more written paths than `paths_max`, the
+/// workspace's own file bound, which one observation cannot retain anyway; a written path
+/// that decides what the workspace includes, because `rift.toml` and every `.gitignore`
+/// reshape the whole file set; and a wire path the index cannot key, which is covered
+/// rather than narrowed away.
 fn changed_paths_to_reparse(
     root: &Path,
     current: &PublishedWorkspace,
-    configuration: &WorkspaceConfiguration,
+    paths_max: usize,
     summary: &ChangeSummary,
 ) -> Option<Vec<CoreProjectPath>> {
-    if !configuration.hooks.is_empty() {
+    if summary.files.len() > paths_max {
+        tracing::info!(
+            component = "index",
+            operation = "index.build",
+            trigger = "rift_change",
+            changed_count = summary.files.len(),
+            paths_max,
+            "change wrote past the workspace file bound; the next snapshot reads every visible file"
+        );
         return None;
     }
     let mut paths = Vec::with_capacity(summary.files.len());
@@ -2457,7 +2469,6 @@ impl RiftMcp {
                 root,
                 limits,
                 validation,
-                &configuration,
                 &current,
                 summary,
                 dependencies,
@@ -2479,15 +2490,15 @@ impl RiftMcp {
         root: &Path,
         limits: WorkspaceIndexLimits,
         validation: &IndexValidation,
-        configuration: &WorkspaceConfiguration,
         current: &Arc<PublishedWorkspace>,
         summary: &mut ChangeSummary,
         dependencies: &Arc<DependencyStore>,
     ) -> Option<AppliedCandidate> {
-        let observed = match changed_paths_to_reparse(root, current, configuration, summary) {
-            Some(paths) => validation.observe_paths(paths),
-            None => validation.observe_whole_workspace(),
-        };
+        let observed =
+            match changed_paths_to_reparse(root, current, validation.paths_max(), summary) {
+                Some(paths) => validation.observe_paths(paths),
+                None => validation.observe_whole_workspace(),
+            };
         if let Err(error) = observed {
             summary.diagnostics.push(stale_snapshot_diagnostic(&error));
             return None;
@@ -4402,6 +4413,160 @@ pub fn beacon() -> u64 {
         Ok(())
     }
 
+    /// The `rift.toml` a workspace-hook test serves: one transform hook that may rewrite
+    /// any source file, running `script` through `sh` from the tree root.
+    #[cfg(unix)]
+    fn workspace_hook_configuration(script: &str) -> String {
+        format!(
+            "[[hooks]]\n\
+             id = \"format\"\n\
+             kind = \"format\"\n\
+             command = [\"sh\", \"{script}\"]\n\
+             writes = \"workspace\"\n\
+             determinism = \"deterministic\"\n"
+        )
+    }
+
+    /// Runs one change that writes `source` to `lib.rs` under a workspace transform hook
+    /// running `script`, against a validation whose retention bound is `paths_max`.
+    #[cfg(unix)]
+    fn workspace_hook_change(
+        directory: &tempfile::TempDir,
+        script: &str,
+        paths_max: usize,
+        source: &'static str,
+    ) -> TestResult<super::SerializedChange> {
+        use rift_protocol::change::{
+            ChangeId, ChangeResult, ChangeSummary, FileChange, FileChangeKind,
+        };
+
+        fs::write(directory.path().join("format.sh"), script)?;
+        fs::write(
+            directory.path().join("rift.toml"),
+            workspace_hook_configuration("format.sh"),
+        )?;
+        let candidate = stable_candidate(directory.path(), 0)?;
+        let (validation, _receiver) = IndexValidation::new(paths_max);
+        let published = tokio::sync::RwLock::new(IndexState {
+            current: candidate,
+            failure: None,
+        });
+        let changes = ChangeService::new(directory.path());
+        let root = directory.path().to_path_buf();
+        let outcome = RiftMcp::change_serialized(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &published,
+            &validation,
+            &changes,
+            &empty_dependency_store(),
+            None,
+            move |_, _| {
+                fs::write(root.join("lib.rs"), source)
+                    .map_err(|error| ReadFault::task("test source write", error.to_string()))?;
+                Ok(ChangeResult::Applied {
+                    summary: ChangeSummary {
+                        id: ChangeId("0123abcd".to_owned()),
+                        files: vec![FileChange {
+                            path: rift_protocol::read::ProjectPath("lib.rs".to_owned()),
+                            kind: FileChangeKind::Modified,
+                            size_bytes: u64::try_from(source.len()).unwrap_or_default(),
+                            line_count: 1,
+                            lines_added: 1,
+                            lines_removed: 1,
+                        }],
+                        diagnostics: Vec::new(),
+                        guarantees: Vec::new(),
+                    },
+                })
+            },
+        )?;
+        Ok(outcome)
+    }
+
+    /// A hook declaring workspace-wide writes names what it rewrote through the summary
+    /// the hook pipeline finalizes, so the next snapshot reparses the change's own file
+    /// and the hook's instead of reading every visible file.
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_hook_that_rewrote_one_file_rebuilds_that_file_alone() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(directory.path().join("notes.txt"), "original note\n")?;
+        let outcome = workspace_hook_change(
+            &directory,
+            "echo 'formatted note' > notes.txt\n",
+            WorkspaceIndexLimits::default().files_max(),
+            "pub fn beacon() -> u8 { 1 }\n",
+        )?;
+        let publication = outcome
+            .publication
+            .ok_or("the applied change must publish a snapshot")?;
+        let rift_index::ChangeSet::Incremental(changes) = publication.change_set else {
+            panic!("a workspace hook's writes must keep the rebuild incremental");
+        };
+        assert_eq!(
+            changes
+                .iter()
+                .map(|(path, _)| path.as_str().to_owned())
+                .collect::<Vec<_>>(),
+            ["lib.rs", "notes.txt"],
+            "the rebuild must name the change's own file and the hook's, and no other"
+        );
+        Ok(())
+    }
+
+    /// A hook that rewrote nothing leaves the tree the publication already holds, so the
+    /// change moves no byte and nothing publishes.
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_hook_that_rewrote_nothing_publishes_no_rebuild() -> TestResult {
+        use rift_protocol::change::ChangeResult;
+
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let outcome = workspace_hook_change(
+            &directory,
+            "exit 0\n",
+            WorkspaceIndexLimits::default().files_max(),
+            "pub fn beacon() {}\n",
+        )?;
+        assert!(
+            outcome.publication.is_none(),
+            "a run that moved no byte must publish no rebuild"
+        );
+        let Ok(rmcp::Json(ChangeResult::Unchanged)) = outcome.result else {
+            panic!("a run that moved no byte must answer unchanged");
+        };
+        Ok(())
+    }
+
+    /// The workspace's own file bound is what one observation may retain, so a change
+    /// whose hook rewrote past it asks for every visible file instead of a path list the
+    /// retention would escalate anyway.
+    #[cfg(unix)]
+    #[test]
+    fn hook_writes_past_the_workspace_file_bound_rebuild_the_whole_workspace() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(directory.path().join("notes.txt"), "original note\n")?;
+        let outcome = workspace_hook_change(
+            &directory,
+            "echo 'formatted note' > notes.txt\n",
+            1,
+            "pub fn beacon() -> u8 { 1 }\n",
+        )?;
+        let publication = outcome
+            .publication
+            .ok_or("the applied change must publish a snapshot")?;
+        assert_eq!(
+            publication.change_set,
+            rift_index::ChangeSet::Full,
+            "two written paths past a one-path bound must read every visible file"
+        );
+        Ok(())
+    }
+
     #[test]
     fn applied_change_that_breaks_the_source_policy_rebuild_reports_stale_snapshot() -> TestResult {
         use rift_protocol::change::{
@@ -5006,7 +5171,7 @@ pub fn beacon() -> u64 {
         use rift_protocol::change::ChangeResult;
 
         let current = parts.published.blocking_read().snapshot().0;
-        let configuration = current
+        current
             .configuration
             .accepted(super::wire::ErrorPhase::Change)
             .map_err(|error| format!("the fixture's configuration must accept: {error:?}"))?;
@@ -5021,7 +5186,6 @@ pub fn beacon() -> u64 {
             &parts.root,
             WorkspaceIndexLimits::default(),
             &parts.validation,
-            &configuration,
             &current,
             &mut summary,
             &parts.dependencies,
