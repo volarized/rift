@@ -77,8 +77,9 @@ class Corpus:
     def __init__(
         self, pin: Pin, binary: Path, report: Path, case: str = "workspace"
     ) -> None:
-        require(case in ("workspace", "stop"), f"unknown corpus case: {case}")
+        require(case in ("workspace", "stop", "churn"), f"unknown corpus case: {case}")
         require(case != "stop" or pin.name == "bun", "only bun has a stop case")
+        require(case != "churn" or pin.name == "nextjs", "only nextjs has a churn case")
         self.pin = pin
         self.case = case
         self.binary = binary.resolve()
@@ -167,6 +168,9 @@ class Corpus:
         if self.case == "stop":
             await self.stop_states()
             return
+        if self.case == "churn":
+            await self.churn_case()
+            return
         await self.baseline()
         await self.symlink_root()
         if self.pin.name == "fastapi":
@@ -222,7 +226,6 @@ class Corpus:
                 await self.single_capture(client)
                 if self.pin.name == "nextjs":
                     await self.symlinks(client)
-                    await self.churn(client)
                 no_failed_builds(
                     records(await client.resource("rift://logs/component/index"))
                 )
@@ -535,6 +538,17 @@ class Corpus:
         )
         require(path not in workspace, "workspace map lists a symlink")
 
+    async def churn_case(self) -> None:
+        """Run sustained reads and edits in their own required bounded case."""
+        with self.server() as server:
+            async with server.connect() as client:
+                await self.churn(client)
+                no_failed_builds(
+                    records(await client.resource("rift://logs/component/index"))
+                )
+            server.stop()
+            self.record("stop", state="after_churn", process_gone=True)
+
     async def churn(self, client: Client) -> None:
         path = self.root / PROBE_PATH
         completed: list[Json] = []
@@ -823,7 +837,9 @@ def main() -> None:
     parser.add_argument("name", nargs="?", choices=("bun", "nextjs", "fastapi"))
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--report", type=Path)
-    parser.add_argument("--case", choices=("workspace", "stop"), default="workspace")
+    parser.add_argument(
+        "--case", choices=("workspace", "stop", "churn"), default="workspace"
+    )
     arguments = parser.parse_args()
     selected = pins()
     if arguments.name:

@@ -56,12 +56,16 @@ The `full` workflow runs nightly on `main`, through `workflow_dispatch`, on PRs 
 jobs have a 20-minute deadline, including setup and reports. Corpus and native candidate builds
 run in separate jobs with the release build's 30-minute deadline. Native unit tests run in
 separate 20-minute jobs after candidate builds, using the shared `native-tests` workflow.
+Candidate builds save the shared Rust cache; native test jobs only restore it. This keeps
+cache writes from canceling a completed test run.
 Draft publication and candidate release gates require those tests to pass. Nextest archives one
-instrumented corpus build for all four cases; each runner checks out the same source revision
+instrumented corpus build for all five cases; each runner checks out the same source revision
 and runs the archived binaries. The release gate downloads native candidate binaries without
 rebuilding them. Corpus execution also has its own
-deadline: FastAPI four minutes, each Bun case nine minutes, and Next.js twelve minutes. Bun's
-workspace checks and shutdown checks run as separate nextest tests on separate CI runners.
+deadline: FastAPI four minutes, each Bun case nine minutes, and each Next.js case twelve minutes.
+Bun's workspace and shutdown checks run as separate nextest tests on separate CI runners.
+Next.js workspace checks and sustained churn also run separately, preserving all 200 identity
+checks, 50 reads during edits every two seconds, and cleanup within each case's deadline.
 Archive execution creates its coverage target before extraction, including on a cold checkout.
 
 For local work, fetch the corpus once and run one repository at a time:
@@ -78,6 +82,8 @@ assertions, overflow checks, and line tables. Nextest's `corpus` profile runs on
 Live corpus tests are ignored by the fast tier; `just corpus-test` explicitly selects them.
 Select one Bun case with `just corpus-test bun test_bun_workspace` or
 `just corpus-test bun test_bun_stop`.
+Select one Next.js case with `just corpus-test nextjs test_nextjs_corpus` or
+`just corpus-test nextjs test_nextjs_churn`.
 Nextest enforces each case's deadline, allows 30 seconds for cleanup, and bounds one corpus
 invocation at 19 minutes. CI step deadlines leave an additional minute beyond each case's work
 deadline for cleanup and reports.

@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        allocator: [mimalloc, glibc]
+        allocator: [linked]
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -25,7 +25,7 @@ jobs:
         with:
           name: corpus-build
           path: target
-          run-id: 35022166873
+          run-id: 35028266268
           github-token: ${{ github.token }}
       - uses: taiki-e/install-action@v2.86.3
         with:
@@ -40,7 +40,7 @@ jobs:
       - name: Observe unchanged archive
         env:
           RIFT_CORPUS_REPORT: ${{ github.workspace }}/target/corpus/bun.json
-          CORPUS_DIAGNOSE_CASE: stop
+          CORPUS_DIAGNOSE_CASE: workspace
           CORPUS_DIAGNOSE_ALLOCATOR: ${{ matrix.allocator }}
         run: uv run --locked --python 3.12 --project scripts python scripts/corpus_diagnose.py
       - uses: actions/upload-artifact@v6.0.0
