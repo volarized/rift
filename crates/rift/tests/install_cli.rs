@@ -11,10 +11,13 @@ use std::process::{Command, Output};
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 fn rift(root: &Path, arguments: &[&str]) -> TestResult<Output> {
-    Ok(Command::new(env!("CARGO_BIN_EXE_rift"))
-        .args(arguments)
-        .current_dir(root)
-        .output()?)
+    Ok(Command::new(
+        std::env::var_os("CARGO_BIN_EXE_rift")
+            .ok_or("test runner must provide CARGO_BIN_EXE_rift")?,
+    )
+    .args(arguments)
+    .current_dir(root)
+    .output()?)
 }
 
 fn require_success(output: &Output, what: &str) -> TestResult {
@@ -91,12 +94,15 @@ fn user_scope_writes_under_the_overridden_home_and_never_touches_the_workspace()
     let workspace = tempfile::tempdir()?;
     let home = tempfile::tempdir()?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rift"))
-        .args(["install", "claude", "--user"])
-        .current_dir(workspace.path())
-        .env("HOME", home.path())
-        .env("USERPROFILE", home.path())
-        .output()?;
+    let output = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_rift")
+            .ok_or("test runner must provide CARGO_BIN_EXE_rift")?,
+    )
+    .args(["install", "claude", "--user"])
+    .current_dir(workspace.path())
+    .env("HOME", home.path())
+    .env("USERPROFILE", home.path())
+    .output()?;
     require_success(&output, "install claude --user")?;
 
     let user_skill_root = home.path().join(".claude").join("skills").join("rift");

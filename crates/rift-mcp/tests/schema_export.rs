@@ -34,9 +34,12 @@ fn check_request(directory: &tempfile::TempDir) -> TestResult<schema::ExportRequ
 #[test]
 fn run_without_arguments_writes_default_output_directory() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let output = Command::new(env!("CARGO_BIN_EXE_rift-schema-export"))
-        .current_dir(directory.path())
-        .output()?;
+    let output = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_rift-schema-export")
+            .ok_or("test runner must provide CARGO_BIN_EXE_rift-schema-export")?,
+    )
+    .current_dir(directory.path())
+    .output()?;
     assert!(output.status.success());
 
     let written = fs::read_to_string(directory.path().join("docs/public/mcp.json"))?;
@@ -104,10 +107,13 @@ fn configuration_schema_document_is_deterministic_and_validates_hooks() -> TestR
 #[test]
 fn run_with_unknown_flag_prints_error_and_fails() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let output = Command::new(env!("CARGO_BIN_EXE_rift-schema-export"))
-        .arg("--bogus")
-        .current_dir(directory.path())
-        .output()?;
+    let output = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_rift-schema-export")
+            .ok_or("test runner must provide CARGO_BIN_EXE_rift-schema-export")?,
+    )
+    .arg("--bogus")
+    .current_dir(directory.path())
+    .output()?;
     assert!(!output.status.success());
 
     let stderr = String::from_utf8(output.stderr)?;

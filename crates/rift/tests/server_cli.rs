@@ -23,6 +23,13 @@ use rift_protocol::lock::{
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+/// The executable supplied by the test runner, remapped when using an archive.
+fn rift_binary() -> TestResult<PathBuf> {
+    std::env::var_os("CARGO_BIN_EXE_rift")
+        .map(PathBuf::from)
+        .ok_or_else(|| "test runner must provide CARGO_BIN_EXE_rift".into())
+}
+
 /// Pause between polls of any awaited condition.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Poll attempts while waiting on a server to disappear, a child to exit,
@@ -122,7 +129,10 @@ impl StopOnDrop {
 
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
-        let _ = Command::new(env!("CARGO_BIN_EXE_rift"))
+        let Ok(binary) = rift_binary() else {
+            return;
+        };
+        let _ = Command::new(binary)
             .args(["server", "stop"])
             .current_dir(&self.root)
             .stdin(Stdio::null())
@@ -134,7 +144,7 @@ impl Drop for StopOnDrop {
 
 /// Runs the real binary with `arguments` inside the fixture workspace.
 fn rift(root: &Path, arguments: &[&str]) -> TestResult<Output> {
-    Ok(Command::new(env!("CARGO_BIN_EXE_rift"))
+    Ok(Command::new(rift_binary()?)
         .args(arguments)
         .current_dir(root)
         .stdin(Stdio::null())
@@ -341,7 +351,7 @@ fn foreground_start_serves_until_stopped_and_exits_cleanly() -> TestResult {
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rift"))
+    let mut child = Command::new(rift_binary()?)
         .args(["server", "start", "--foreground"])
         .current_dir(root)
         .stdin(Stdio::null())
@@ -382,7 +392,7 @@ fn a_stop_after_a_long_serving_span_still_runs_every_stage_inside_its_budget() -
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rift"))
+    let mut child = Command::new(rift_binary()?)
         .args(["server", "start", "--foreground"])
         .current_dir(root)
         .stdin(Stdio::null())
@@ -432,7 +442,7 @@ fn stop_during_the_lexical_commit_behind_the_publication_ends_the_process() -> T
     write_large_fixture(root)?;
     let _cleanup = StopOnDrop::new(root);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rift"))
+    let mut child = Command::new(rift_binary()?)
         .args(["server", "start", "--foreground"])
         .current_dir(root)
         .stdin(Stdio::null())
@@ -482,7 +492,7 @@ fn stop_during_a_running_capture_ends_the_process() -> TestResult {
     write_large_fixture(root)?;
     let _cleanup = StopOnDrop::new(root);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rift"))
+    let mut child = Command::new(rift_binary()?)
         .args(["server", "start", "--foreground"])
         .current_dir(root)
         .stdin(Stdio::null())
@@ -534,7 +544,7 @@ fn stop_issued_during_a_rebuild_ends_the_process_as_the_document_goes() -> TestR
     write_large_fixture(root)?;
     let _cleanup = StopOnDrop::new(root);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rift"))
+    let mut child = Command::new(rift_binary()?)
         .args(["server", "start", "--foreground"])
         .current_dir(root)
         .stdin(Stdio::null())
@@ -602,7 +612,7 @@ fn a_stop_reports_success_only_once_the_election_it_waited_on_released() -> Test
     write_large_fixture(root)?;
     let _cleanup = StopOnDrop::new(root);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rift"))
+    let mut child = Command::new(rift_binary()?)
         .args(["server", "start", "--foreground"])
         .current_dir(root)
         .stdin(Stdio::null())
@@ -688,7 +698,7 @@ fn concurrent_starts_agree_on_one_elected_server() -> TestResult {
     let mut children = Vec::with_capacity(CONCURRENT_START_COUNT);
     for _ in 0..CONCURRENT_START_COUNT {
         children.push(
-            Command::new(env!("CARGO_BIN_EXE_rift"))
+            Command::new(rift_binary()?)
                 .args(["server", "start"])
                 .current_dir(root)
                 .stdin(Stdio::null())
