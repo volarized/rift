@@ -28,7 +28,7 @@ use rift_protocol::dependencies::DependenciesConfiguration;
 use rift_protocol::error as wire;
 use rift_protocol::map::WorkspaceMap;
 use rift_protocol::source::SourceConfiguration;
-use rift_search::{Embedding, SearchError, SearchIndex};
+use rift_search::{Embedding, SearchError, SearchIndex, SemanticReadiness};
 use rift_server::{
     CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, DependencyStore, LspProcessKey, ReadError,
     ReadFault, ReadService, load_configuration,
@@ -1538,6 +1538,7 @@ fn shared_workspace_candidate(
 ///
 /// Population failure is a warning, never a request failure: the semantic tier reports its
 /// own readiness, and the next successful publication asks for another pass.
+/// A disabled semantic tier still reports chunked files, then skips declaration derivation.
 ///
 /// # Cancel safety
 ///
@@ -1557,6 +1558,9 @@ pub(crate) async fn populate_search(
             "a visible file exceeds search.text.max_chunk and was indexed in chunks; exclude it \
              in [source], or increase search.text.max_chunk, to avoid this"
         );
+    }
+    if index.readiness() == SemanticReadiness::Disabled {
+        return;
     }
     let units = published.reads.lexical_units();
     let described = published.reads.described_units(&units);
@@ -5900,6 +5904,57 @@ mod tests {
             },
             "a request the ended lane refused must leave the previous pass's readiness alone"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disabled_population_keeps_lexical_ranking_and_chunk_warnings() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(directory.path().join("guide.txt"), "word ".repeat(1000))?;
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[search.text]\nmax_chunk = \"1kb\"\n",
+        )?;
+        let published = stable_candidate(directory.path(), 0)?;
+        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+        let cancellation = CancellationToken::new();
+        let lane = LexicalLane::spawn(
+            Arc::clone(&index),
+            BlockingExecutor::isolated(2, 60_000),
+            cancellation.clone(),
+        );
+        committed_through(
+            &lane,
+            &index,
+            super::lexical_write(&published, &ChangeSet::Full),
+            &published,
+        )
+        .await?;
+        let revision = published.reads.tree_revision();
+        let before = ranked_at(&index, revision, "beacon", 8).await?;
+        assert!(
+            !before.is_empty(),
+            "the lexical lane must publish the declaration"
+        );
+        let (sink, mut drain) = crate::logs::log_capture();
+        let subscriber = tracing_subscriber::registry().with(sink);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        super::populate_search(&index, &published, rift_search::Embedding::Every).await;
+        assert_eq!(index.readiness(), SemanticReadiness::Disabled);
+        assert_eq!(index.tree_revision().await?.as_deref(), Some(revision));
+        assert_eq!(ranked_at(&index, revision, "beacon", 8).await?, before);
+        let records = queued_records(&mut drain);
+        let warning = records
+            .iter()
+            .find(|record| {
+                record.message().contains("was indexed in chunks")
+                    && record.fields().contains("guide.txt")
+            })
+            .ok_or("disabled semantics must still report the chunked guide")?;
+        assert_eq!(warning.level(), "warn");
+        assert_eq!(warning.component(), "search");
+        cancellation.cancel();
         Ok(())
     }
 
