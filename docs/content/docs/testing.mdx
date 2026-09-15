@@ -54,7 +54,9 @@ The Windows installer job also runs command ownership tests against the native p
 The `full` workflow runs nightly on `main`, through `workflow_dispatch`, on PRs labeled
 `full-gate`, and from the release workflow. Corpus repositories run on separate runners. Test
 jobs have a 20-minute deadline, including setup and reports. Corpus and native candidate builds
-run in separate jobs with the release build's 30-minute deadline. Nextest archives one
+run in separate jobs with the release build's 30-minute deadline. Native unit tests run in
+separate 20-minute jobs after candidate builds, using the shared `native-tests` workflow.
+Draft publication and candidate release gates require those tests to pass. Nextest archives one
 instrumented corpus build for all four cases; each runner checks out the same source revision
 and runs the archived binaries. The release gate downloads native candidate binaries without
 rebuilding them. Corpus execution also has its own
@@ -83,7 +85,10 @@ deadline for cleanup and reports.
 The cache lives under `~/.cache/rift-corpus`. Each suite creates a disposable checkout at the
 commit in `crates/rift/tests/corpus/pins.toml`. Fetches retain 50 commits of history; a separate
 depth-one checkout tests the shallow-history response. Every run compares Git tree counts and
-sizes with the pin before serving the tree. A repin must update those measurements.
+sizes with the pin and requires every reachable history object before serving the tree.
+Fetches include file contents from the retained history. `just corpus-sync` repairs older
+partial caches with one full shallow fetch after verifying the pin and tree. A test refuses
+missing history objects and names `just corpus-sync`. A repin must update the measurements.
 Corpus configuration disables semantic model downloads and preserves source, dependency, and
 lexical defaults.
 
@@ -218,7 +223,7 @@ allows coverage from an earlier commit to carry forward. JUnit results use `gate
 separate from line coverage. CI uploads corpus actions and release checksum evidence alongside
 test results so a failed run can be inspected and repeated.
 
-Each native build uploads `native-tests-<target>` with its nextest JUnit report.
+Each native test job uploads `native-tests-<target>` with its nextest JUnit report.
 
 The `fast-results` artifact contains fast LCOV and nextest JUnit reports. Each corpus artifact
 contains its LCOV, JUnit, actions, and server logs. Compare or merge reports from the same

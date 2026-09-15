@@ -400,7 +400,15 @@ class WorkflowTests(unittest.TestCase):
                     (ROOT / ".github/workflows" / name).read_text()
                 )
                 build = workflow["jobs"]["build"]
-                steps = build["steps"]
+                native = yaml.safe_load(
+                    (ROOT / ".github/workflows/native-tests.yml").read_text()
+                )["jobs"]["test"]
+                call = workflow["jobs"]["native-tests"]
+                self.assertEqual(call["needs"], "build")
+                self.assertEqual(call["uses"], "./.github/workflows/native-tests.yml")
+                self.assertEqual(native["timeout-minutes"], 20)
+                self.assertEqual(native["strategy"], build["strategy"])
+                steps = native["steps"]
                 test = next(
                     step
                     for step in steps
@@ -445,11 +453,13 @@ class WorkflowTests(unittest.TestCase):
                 self.assertIn('-E "$RIFT_NATIVE_TESTS"', test["run"])
                 cli = [
                     step
-                    for step in steps
+                    for step in build["steps"]
                     if "cargo build --release --locked" in step.get("run", "")
                 ]
                 self.assertEqual(len(cli), 1)
-                self.assertLess(steps.index(cli[0]), steps.index(test))
+                self.assertTrue(
+                    all("cargo build" not in step.get("run", "") for step in steps)
+                )
                 self.assertNotIn("continue-on-error", test)
                 report = next(
                     step
@@ -468,11 +478,13 @@ class WorkflowTests(unittest.TestCase):
         build = workflow["jobs"]["build"]
         gate = workflow["jobs"]["release-gate"]
         self.assertEqual(build["if"], "${{ !inputs.draft }}")
-        self.assertEqual(gate["needs"], "build")
+        self.assertEqual(gate["needs"], ["build", "native-tests"])
         self.assertEqual(
             gate["if"],
-            "${{ !cancelled() && ((inputs.draft && needs.build.result == 'skipped') "
-            "|| (!inputs.draft && needs.build.result == 'success')) }}",
+            "${{ !cancelled() && ((inputs.draft && needs.build.result == 'skipped' "
+            "&& needs.native-tests.result == 'skipped') "
+            "|| (!inputs.draft && needs.build.result == 'success' "
+            "&& needs.native-tests.result == 'success')) }}",
             "Only successful candidate builds or intentional draft skips may run gates",
         )
         self.assertEqual(build["timeout-minutes"], 30)
@@ -618,6 +630,7 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertEqual(jobs["deploy-docs"]["needs"], "promote")
         self.assertEqual(jobs["release-gate"]["needs"], "publish")
+        self.assertEqual(set(jobs["publish"]["needs"]), {"build", "native-tests", "docs"})
         self.assertEqual(jobs["release-gate"]["permissions"], {"contents": "write"})
         gate = yaml.safe_load((ROOT / ".github/workflows/release-gate.yml").read_text())
         self.assertNotIn("permissions", gate)
