@@ -801,12 +801,19 @@ async def observed(
     client: Client, uri: str, predicate: Callable[[list[JsonObject]], bool]
 ) -> list[JsonObject]:
     """Wait for the log drain under the documented asynchronous logging contract."""
-    async with asyncio.timeout(OBSERVATION_SECONDS):
-        for _ in range(int(OBSERVATION_SECONDS / POLL_SECONDS)):
-            found = records(await client.resource(uri))
-            if predicate(found):
-                return found
-            await asyncio.sleep(POLL_SECONDS)
+    found: list[JsonObject] = []
+    try:
+        async with asyncio.timeout(OBSERVATION_SECONDS):
+            for _ in range(int(OBSERVATION_SECONDS / POLL_SECONDS)):
+                found = records(await client.resource(uri))
+                if predicate(found):
+                    return found
+                await asyncio.sleep(POLL_SECONDS)
+    except TimeoutError:
+        Path("target/corpus/last-observation.json").write_text(
+            json.dumps({"uri": uri, "records": found}, indent=2) + "\n"
+        )
+        raise
     raise AssertionError(f"required record never reached {uri}")
 
 
