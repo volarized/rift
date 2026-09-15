@@ -1,0 +1,53 @@
+name: corpus-diagnose
+on:
+  push:
+    branches: [v0.0.34/diagnose-corpus]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 16
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [workspace, stop]
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v7.6.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: scripts/uv.lock
+      - uses: actions/download-artifact@v7.0.0
+        with:
+          name: corpus-build
+          path: target
+          run-id: 35022166873
+          github-token: ${{ github.token }}
+      - uses: taiki-e/install-action@v2.86.3
+        with:
+          tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
+      - run: uv sync --locked --python 3.12 --project scripts
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq gdb
+      - uses: actions/cache@v6.1.0
+        with:
+          path: ~/.cache/rift-corpus
+          key: corpus-bun-${{ hashFiles('crates/rift/tests/corpus/pins.toml') }}
+      - run: just corpus-sync bun
+      - name: Observe unchanged archive
+        env:
+          RIFT_CORPUS_REPORT: ${{ github.workspace }}/target/corpus/bun.json
+          CORPUS_DIAGNOSE_CASE: ${{ matrix.case }}
+        run: uv run --locked --python 3.12 --project scripts python scripts/corpus_diagnose.py
+      - uses: actions/upload-artifact@v6.0.0
+        if: always()
+        with:
+          name: diagnose-${{ matrix.case }}
+          path: |
+            target/corpus/
+            target/nextest/corpus/junit.xml
+          if-no-files-found: error
+          retention-days: 7

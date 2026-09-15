@@ -530,12 +530,40 @@ class Server:
         self._observe_descendants()
         budget = remaining_seconds(max(0.0, deadline - time.monotonic()))
         require(budget > 0, "server stop exceeded its deadline")
-        run_command(
-            [str(self.binary), "server", "stop"],
-            cwd=self.root,
-            env=self.env,
-            timeout_seconds=budget,
-        )
+        try:
+            run_command(
+                [str(self.binary), "server", "stop"],
+                cwd=self.root,
+                env=self.env,
+                timeout_seconds=budget,
+            )
+        except BaseException:
+            print(
+                f"stop failed: server_pid={self.process.pid} status={self.process.poll()}",
+                flush=True,
+            )
+            if self.process.poll() is None:
+                try:
+                    sample = run(
+                        [
+                            "sudo",
+                            "gdb",
+                            "--batch",
+                            "-p",
+                            str(self.process.pid),
+                            "-ex",
+                            "set pagination off",
+                            "-ex",
+                            "thread apply all bt 30",
+                            "-ex",
+                            "detach",
+                        ],
+                        timeout=12.0,
+                    )
+                except (RuntimeError, OSError) as error:
+                    sample = repr(error)
+                self.log_path.with_suffix(".stack.log").write_text(sample)
+            raise
         # The CLI waits for election release. Process exit may follow it.
         try:
             self.process.wait(
