@@ -347,7 +347,9 @@ def active_stdout(output: str, operation: str, epoch: str | None) -> str:
     message = (
         "index capture started" if operation == "rebuild" else "symbol history started"
     )
-    started = [index for index, row in enumerate(rows) if message in row]
+    wanted = "index.build" if operation == "rebuild" else "get_symbol"
+    marker = f'{message} component="index" operation="{wanted}" phase="start"'
+    started = [index for index, row in enumerate(rows) if marker in row]
     require(bool(started), f"{operation}: synchronous start record is absent")
     start = started[-1]
     if operation == "rebuild":

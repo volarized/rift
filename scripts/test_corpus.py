@@ -391,6 +391,9 @@ class Decisions(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 active_stdout(output, "rebuild", epoch)
         for output in (
+            start.replace('component="index"', 'component="dependency"'),
+            start.replace('operation="index.build"', 'operation="index.publish"'),
+            start.replace('phase="start"', 'phase="complete"'),
             start.replace("epoch=7", "epoch=0"),
             start.replace("epoch=7", ""),
             start + matching_close,
