@@ -1,0 +1,59 @@
+# The scenarios the served surface fails today, at the 2025-11-25 revision.
+#
+# The runner fails the gate on any other failure, and it also fails on a
+# scenario listed here that passed: a listed scenario that starts passing is
+# reported as a stale entry, so entries leave this file as the served
+# surface grows. Nothing listed here is a defect in what Rift serves. Each
+# scenario drives a fixture the specification's own test server publishes,
+# and Rift publishes one workspace's declarations instead.
+#
+# Scenarios the revision does not score are never listed: json-schema-2020-12
+# fails and is reported separately as unscored.
+
+server:
+  # The scenario calls a tool the fixture server publishes by name. Rift
+  # publishes its own tools, so the call answers `tool not found`.
+  - tools-call-simple-text
+  - tools-call-image
+  - tools-call-audio
+  - tools-call-embedded-resource
+  - tools-call-mixed-content
+  - tools-call-error
+  - tools-call-with-progress
+
+  # The same missing fixture tool, called to make the server ask the client
+  # for a completion or for input. Rift's tools ask for neither, so the
+  # sampling and elicitation exchanges have nothing to start them.
+  - tools-call-sampling
+  - tools-call-elicitation
+  - elicitation-sep1034-defaults
+  - elicitation-sep1330-enums
+
+  # The scenario reads a resource the fixture server publishes at a
+  # `test://` address. Rift publishes `rift://` resources over the served
+  # workspace, so the read answers that no resource is published there.
+  - resources-read-text
+  - resources-read-binary
+  - resources-templates-read
+
+  # The served surface declares `resources` and `tools` alone. These
+  # scenarios need a capability it does not carry, so the request answers
+  # method not found.
+  #
+  # `logging`: the server publishes no log level to set.
+  - logging-set-level
+  - tools-call-with-logging
+  # `resources.subscribe`: the server publishes no per-resource subscription.
+  - resources-subscribe
+  - resources-unsubscribe
+  # `prompts`: the server publishes no prompt to get.
+  - prompts-get-simple
+  - prompts-get-with-args
+  - prompts-get-embedded-resource
+  - prompts-get-with-image
+
+  # The transport serves each request on its own and creates no session, so
+  # it issues no `Mcp-Session-Id` and this scenario cannot open a second
+  # stream against one. Its check warns rather than failing, and a warning
+  # counts here the same way a failure does.
+  - server-sse-multiple-streams:server-sse-multiple-streams-session

@@ -1,0 +1,8 @@
+{
+  "name": "mcp-conformance",
+  "private": true,
+  "description": "Runner and baseline for the MCP conformance gate; driven by scripts/check_mcp_conformance.py",
+  "devDependencies": {
+    "@modelcontextprotocol/conformance": "0.2.0-alpha.11"
+  }
+}
