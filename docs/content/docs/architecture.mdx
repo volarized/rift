@@ -664,7 +664,7 @@ The projection is a real directory, at a predictable place below the workspace:
 ~/projects/charming-aurora/.rift/projections/my-feature-one
 ```
 
-That's deliberate: plenty of what a developer runs can't be handed a protocol - `cargo test`,
+That's deliberate: plenty of what a developer runs can't be handed a protocol - `cargo nextest run`,
 `prettier`, a linter your team wrote in 2019. They take a directory, so the projection is one,
 and the [projection resource](/docs/protocol/mcp#resource-projection) hands out its path.
 
@@ -819,7 +819,7 @@ bytes before writing, so a proposal computed against bytes that have since moved
 failed `source_unchanged` precondition.
 
 The engine works against the workspace directory, because a language server takes a directory,
-like `cargo test` and the linter before it. It reads the tree's bytes as the change tools write
+like `cargo nextest run` and the linter before it. It reads the tree's bytes as the change tools write
 them, so its analysis tracks the rename as it lands.
 
 An engine resolves beyond the tree - rust-analyzer through the whole crate graph, tsserver
@@ -973,7 +973,7 @@ Each served tree holds one contract:
       workspace["workspace tree"]:::store -- "pinned base" --> riftfs["Rift FS"]:::rift
       riftfs -- "serves" --> proj["projection<br/>my-feature-one"]:::store
       riftfs -- "serves" --> exec["execution copy"]:::store
-      tool["external tool<br/>cargo test, prettier"]:::agent -- "reads + writes" --> proj
+      tool["external tool<br/>cargo nextest run, prettier"]:::agent -- "reads + writes" --> proj
       riftfs -- "observed writes" --> server["rift server"]:::rift
       server -- "reindex changed paths" --> index["search index"]:::store
       server -- "notifies" --> ls["language server"]:::provider
