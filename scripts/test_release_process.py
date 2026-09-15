@@ -8,8 +8,10 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -22,14 +24,140 @@ import psutil
 from release_process import (
     OUTPUT_BYTES_MAX,
     Drain,
+    owned_environment,
     owned_process,
     run,
     run_bytes,
     signal_group,
 )
+from release_process_unix import OWNER_ENV
 
 
 class ProcessTests(unittest.TestCase):
+    @unittest.skipIf(sys.platform == "win32", "Unix process observation")
+    def test_observation_bound_still_stops_known_process_group(self) -> None:
+        program = (
+            "import subprocess,sys,time; "
+            "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+            "print(child.pid,flush=True); time.sleep(60)"
+        )
+        child: psutil.Process | None = None
+        try:
+            with (
+                tempfile.TemporaryFile() as stdin,
+                patch("release_process_unix.PROCESS_COUNT_MAX", 0),
+                self.assertRaisesRegex(RuntimeError, "observation exceeded"),
+                owned_process(
+                    [sys.executable, "-c", program], None, None, stdin
+                ) as process,
+            ):
+                assert process.stdout is not None and process.stderr is not None
+                child = psutil.Process(int(process.stdout.readline().strip()))
+                process.stdout.close()
+                process.stderr.close()
+            assert child is not None
+            self.assertTrue(
+                not child.is_running() or child.status() == psutil.STATUS_ZOMBIE
+            )
+        finally:
+            if child is not None:
+                try:
+                    child.kill()
+                except psutil.NoSuchProcess:
+                    pass
+
+    @unittest.skipIf(sys.platform == "win32", "Unix transport process observation")
+    def test_observation_failure_keeps_already_captured_transport_child(self) -> None:
+        child: psutil.Process | None = None
+        process: subprocess.Popen[bytes] | None = None
+        try:
+            with (
+                self.assertRaisesRegex(RuntimeError, "observation exceeded"),
+                patch("release_process_unix.PROCESS_COUNT_MAX", 1),
+                patch("release_process_unix.psutil.process_iter") as process_iter,
+                owned_environment({}) as environment,
+            ):
+                process = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    env=environment,
+                    start_new_session=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                child = psutil.Process(process.pid)
+                process_iter.return_value = [child, psutil.Process(os.getpid())]
+            assert child is not None
+            self.assertTrue(
+                not child.is_running() or child.status() == psutil.STATUS_ZOMBIE
+            )
+        finally:
+            if process is not None:
+                process.kill()
+                process.wait(timeout=5)
+
+    @unittest.skipIf(sys.platform == "win32", "Windows jobs own detached children")
+    def test_detached_child_is_found_after_immediate_parent_exit(self) -> None:
+        program = (
+            "import subprocess,sys; "
+            "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            "print(child.pid,flush=True)"
+        )
+        for _ in range(10):
+            pid = int(run([sys.executable, "-c", program], timeout=5).strip())
+            try:
+                child = psutil.Process(pid)
+                try:
+                    self.assertEqual(child.status(), psutil.STATUS_ZOMBIE)
+                finally:
+                    if child.is_running() and child.status() != psutil.STATUS_ZOMBIE:
+                        child.kill()
+            except psutil.NoSuchProcess:
+                pass
+
+    @unittest.skipIf(sys.platform == "win32", "Unix environment ownership contract")
+    def test_nested_command_keeps_outer_owner_with_replaced_environment(self) -> None:
+        previous = os.environ.get(OWNER_ENV)
+        program = (
+            "import json,os,sys; from release_process import run; "
+            "from release_process_unix import OWNER_ENV; "
+            "inner=run([sys.executable,'-c', 'import os,sys; print(os.environ[sys.argv[1]])',OWNER_ENV],environment={}); "
+            "print(json.dumps({'outer':os.environ[OWNER_ENV].split(','),'inner':inner.strip().split(',')}))"
+        )
+        document = json.loads(
+            run([sys.executable, "-c", program], cwd=Path(__file__).parent)
+        )
+        self.assertTrue(set(document["outer"]) < set(document["inner"]))
+        self.assertEqual(len(document["inner"]), len(document["outer"]) + 1)
+        self.assertEqual(os.environ.get(OWNER_ENV), previous)
+
+    @unittest.skipIf(sys.platform == "win32", "Unix transport environment ownership")
+    def test_transport_environment_owns_detached_child_after_parent_exit(self) -> None:
+        program = (
+            "import subprocess,sys; "
+            "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            "print(child.pid,flush=True)"
+        )
+        with owned_environment({}) as environment:
+            result = subprocess.run(
+                [sys.executable, "-c", program],
+                env=environment,
+                capture_output=True,
+                check=True,
+                timeout=5,
+            )
+            pid = int(result.stdout.strip())
+        try:
+            child = psutil.Process(pid)
+            try:
+                self.assertEqual(child.status(), psutil.STATUS_ZOMBIE)
+            finally:
+                if child.is_running() and child.status() != psutil.STATUS_ZOMBIE:
+                    child.kill()
+        except psutil.NoSuchProcess:
+            pass
+
     @unittest.skipUnless(sys.platform == "darwin", "XNU process-group zombie behavior")
     def test_darwin_zombie_group_is_complete_without_hiding_live_refusals(self) -> None:
         with (

@@ -38,7 +38,13 @@ from jsonschema import Draft202012Validator
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 from pydantic import AnyUrl
-from release_process import Drain, owned_process, run, termination_handler
+from release_process import (
+    Drain,
+    owned_environment,
+    owned_process,
+    run,
+    termination_handler,
+)
 
 Json: TypeAlias = None | bool | int | float | str | list["Json"] | dict[str, "Json"]
 JsonObject: TypeAlias = dict[str, Json]
@@ -483,23 +489,26 @@ class Server:
     async def connect(self, call_seconds: float = 120.0) -> AsyncIterator[Client]:
         """Connect through the SDK's real `rift mcp` stdio subprocess."""
         proxy_log = self.log_path.with_suffix(".mcp.log")
-        parameters = StdioServerParameters(
-            command=str(self.binary),
-            args=["mcp"],
-            cwd=str(self.root),
-            env=self.env,
-        )
-        with stderr_log(proxy_log) as log:
-            async with stdio_client(parameters, errlog=log) as (read, write):
-                async with ClientSession(
-                    read, write, timedelta(seconds=call_seconds)
-                ) as session:
-                    client = Client(session, call_seconds)
-                    await client.initialize()
-                    yield client
-                    self._check_log()
-                    if not self._stopped:
-                        self.check_running()
+        with (
+            stderr_log(proxy_log) as log,
+            owned_environment(self.env) as environment,
+        ):
+            parameters = StdioServerParameters(
+                command=str(self.binary),
+                args=["mcp"],
+                cwd=str(self.root),
+                env=environment,
+            )
+            async with (
+                stdio_client(parameters, errlog=log) as (read, write),
+                ClientSession(read, write, timedelta(seconds=call_seconds)) as session,
+            ):
+                client = Client(session, call_seconds)
+                await client.initialize()
+                yield client
+                self._check_log()
+                if not self._stopped:
+                    self.check_running()
 
     def _observe_descendants(self) -> None:
         try:
@@ -509,23 +518,27 @@ class Server:
             pass
 
     def stop(self, timeout_seconds: float = STOP_SECONDS) -> None:
-        """Require CLI stop to return within its deadline with owned processes gone."""
-        self._observe_descendants()
+        """Require CLI stop and owned process exit within one deadline."""
         started = time.monotonic()
+        deadline = started + timeout_seconds
+        self._observe_descendants()
+        budget = remaining_seconds(max(0.0, deadline - time.monotonic()))
+        require(budget > 0, "server stop exceeded its deadline")
         run_command(
             [str(self.binary), "server", "stop"],
             cwd=self.root,
             env=self.env,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=budget,
         )
-        require(
-            time.monotonic() - started <= timeout_seconds,
-            "server stop exceeded its deadline",
-        )
-        require(
-            self.process.poll() is not None,
-            "server stop returned while its process remained alive",
-        )
+        # The CLI waits for election release. Process exit may follow it.
+        try:
+            self.process.wait(
+                timeout=remaining_seconds(max(0.0, deadline - time.monotonic()))
+            )
+        except subprocess.TimeoutExpired as error:
+            raise AssertionError(
+                "server stop returned while its process remained alive"
+            ) from error
         alive = [process.pid for process in self._descendants if process_alive(process)]
         require(not alive, f"server stop left child processes alive: {alive}")
         require(
@@ -534,6 +547,10 @@ class Server:
         )
 
         self._check_log()
+        require(
+            time.monotonic() <= deadline,
+            "server stop exceeded its deadline",
+        )
         self._stopped = True
 
     def close(self) -> None:
