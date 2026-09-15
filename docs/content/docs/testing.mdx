@@ -108,8 +108,9 @@ lexical defaults.
 Suites check publication, manifest bounds, selected source bounds, paths served through symlinks,
 and 200 symbol identities per repository passed from reads to changes. Next.js adds 50 reads
 during file churn. Bun checks shutdown while idle, after edits, during a rebuild, and during
-history analysis. Logs must show the named operation has started before an active-work stop test
-sends the stop command.
+history analysis. Synchronous server output must show the named operation started without a
+matching completion before the test sends stop. Rebuild evidence names the epoch; history
+analysis must still have an unfinished request.
 The five-second shutdown bound covers the stop command and the server process's actual exit;
 releasing the server election alone does not complete the check.
 Foreground cleanup has four seconds, leaving time for command startup and process observation.

@@ -339,7 +339,7 @@ def active_operation(
 
 
 def active_stdout(output: str, operation: str, epoch: str | None) -> str:
-    """Check synchronous stderr so the persisted log drain cannot hide completion."""
+    """Require synchronous start without a later matching completion record."""
     require(
         output.endswith("\n"), f"{operation}: stderr ends with an incomplete record"
     )
@@ -350,12 +350,17 @@ def active_stdout(output: str, operation: str, epoch: str | None) -> str:
     started = [index for index, row in enumerate(rows) if message in row]
     require(bool(started), f"{operation}: synchronous start record is absent")
     start = started[-1]
-    epoch_pattern = rf"\bepoch={re.escape(epoch or '')}(?:[ }}]|$)"
     if operation == "rebuild":
+        captured = re.search(r"\bepoch=(\d+)(?:[ }]|$)", rows[start])
+        if captured is None:
+            raise AssertionError("rebuild start has no epoch")
+        observed_epoch = captured.group(1)
         require(
-            epoch is not None and re.search(epoch_pattern, rows[start]) is not None,
-            "rebuild stderr and persisted start epochs differ",
+            observed_epoch != "0" and (epoch is None or observed_epoch == epoch),
+            "rebuild start must name the current epoch after startup",
         )
+        epoch = observed_epoch
+    epoch_pattern = rf"\bepoch={re.escape(epoch or '')}(?:[ }}]|$)"
     for row in rows[start + 1 :]:
         if operation == "rebuild":
             closed = "index.build{" in row and "rift_mcp::validation: close" in row

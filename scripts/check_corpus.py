@@ -23,7 +23,6 @@ from corpus_assertions import (
     PROBE_SOURCE,
     READ_COUNT,
     SYMBOL_COUNT,
-    active_operation,
     active_stdout,
     capture_count,
     change_patch,
@@ -722,37 +721,19 @@ class Corpus:
         await self.stop_during("history")
 
     async def stop_during(self, operation: str) -> None:
-        """Observe through a second proxy while the operation occupies its HTTP connection."""
-        started_ms = time.time_ns() // 1_000_000
+        """Observe synchronous output while the operation can hold the database writer."""
         with self.server() as server:
-            async with (
-                server.connect() as client,
-                server.connect(
-                    log_path=server.log_path.with_suffix(".observer.mcp.log")
-                ) as observer,
-            ):
-                found = await observed(
-                    observer,
-                    "rift://logs/component/index",
-                    lambda rows: any(
-                        row.get("operation") == "index.publish"
-                        and fields(row).get("trigger") == "startup"
-                        and number(row.get("recorded_at_ms"), "recorded timestamp")
-                        >= started_ms
-                        for row in rows
-                    ),
+            async with server.connect() as client:
+                startup = await observed_output(
+                    server, 0, 'operation="index.publish" trigger="startup"'
                 )
-                last = max(
-                    (number(row["identity"], "record identity") for row in found),
-                    default=0,
-                )
-                log_offset = len(server.read_log())
+                log_offset = len(startup)
                 if operation == "rebuild":
                     (self.root / PROBE_PATH).write_text(PROBE_SOURCE)
                     pending = asyncio.create_task(
                         client.call("search", {"query": "corpus_probe"})
                     )
-                    wanted = "index.build"
+                    wanted = "index capture started"
                 else:
                     pending = asyncio.create_task(
                         client.call(
@@ -760,35 +741,18 @@ class Corpus:
                             {"name": "test", "include": ["history"], "limit": 200},
                         )
                     )
-                    wanted = "get_symbol"
+                    wanted = "symbol history started"
                 try:
-                    found = await observed(
-                        observer,
-                        "rift://logs/component/index",
-                        lambda rows: any(
-                            row.get("operation") == wanted
-                            and fields(row).get("phase") == "start"
-                            and number(row["identity"], "record identity") > last
-                            for row in rows
-                        ),
+                    output = await observed_output(server, log_offset, wanted)
+                    require(
+                        operation == "rebuild" or not pending.done(),
+                        "history request completed before stop",
                     )
-                    latest = active_operation(
-                        found, operation, last, not pending.done()
-                    )
-                    start = next(row for row in found if row.get("identity") == latest)
-                    epoch = (
-                        str(fields(start).get("epoch"))
-                        if operation == "rebuild"
-                        else None
-                    )
-                    evidence = active_stdout(
-                        server.read_log()[log_offset:], operation, epoch
-                    )
+                    evidence = active_stdout(output, operation, None)
                     await asyncio.to_thread(server.stop)
                     self.record(
                         "stop",
                         state=f"mid_{operation}",
-                        start=latest,
                         stderr=evidence,
                         process_gone=True,
                     )
@@ -796,6 +760,18 @@ class Corpus:
                     pending.cancel()
                     await asyncio.gather(pending, return_exceptions=True)
         (self.root / PROBE_PATH).unlink(missing_ok=True)
+
+
+async def observed_output(server: Server, offset: int, message: str) -> str:
+    """Read owned output without waiting for the log store's database write turn."""
+    async with asyncio.timeout(OBSERVATION_SECONDS):
+        for _ in range(int(OBSERVATION_SECONDS / POLL_SECONDS)):
+            server.check_running()
+            output = server.read_log()[offset:]
+            if output.endswith("\n") and message in output:
+                return output
+            await asyncio.sleep(POLL_SECONDS)
+    raise AssertionError(f"required record never reached server output: {message}")
 
 
 def objects(answer: JsonObject, key: str) -> list[JsonObject]:
