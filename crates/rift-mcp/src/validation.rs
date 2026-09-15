@@ -730,9 +730,10 @@ impl IndexValidation {
         self.observed_epoch.load(Ordering::SeqCst)
     }
 
-    /// Whether a successful capture was superseded after this publication was built.
-    pub(crate) fn superseded_after(&self, published_epoch: u64) -> bool {
-        self.superseded_epoch.load(Ordering::SeqCst) > published_epoch
+    /// Latest successful capture superseded after this publication was built, if any.
+    pub(crate) fn superseded_after(&self, published_epoch: u64) -> Option<u64> {
+        let epoch = self.superseded_epoch.load(Ordering::SeqCst);
+        (epoch > published_epoch).then_some(epoch)
     }
 
     /// Installs one publication under publication linearization.
@@ -4262,7 +4263,7 @@ mod tests {
         )?;
         assert!(matches!(outcome, super::CapturedRebuild::Superseded));
         assert!(
-            !validation.superseded_after(0),
+            validation.superseded_after(0).is_none(),
             "an unbuilt candidate cannot let reads answer stale"
         );
         Ok(())
@@ -4289,7 +4290,7 @@ mod tests {
         )?;
         assert!(matches!(outcome, super::CapturedRebuild::Superseded));
         assert!(
-            !validation.superseded_after(0),
+            validation.superseded_after(0).is_none(),
             "configuration movement cannot let reads answer stale"
         );
         assert_eq!(
@@ -6114,7 +6115,7 @@ mod tests {
         assert_eq!(snapshot.epoch, 0, "a cancelled rebuild publishes nothing");
         assert!(failure.is_none(), "a cancelled rebuild records no failure");
         assert!(
-            !validation.superseded_after(snapshot.epoch),
+            validation.superseded_after(snapshot.epoch).is_none(),
             "cancellation cannot let reads answer stale"
         );
         drop(state);
@@ -6268,7 +6269,10 @@ mod tests {
             RebuildOutcome::Cancelled
         );
         assert!(
-            !fixture.validation.superseded_after(fixture.before.epoch),
+            fixture
+                .validation
+                .superseded_after(fixture.before.epoch)
+                .is_none(),
             "cancelled publication cannot let reads answer stale"
         );
         let state = fixture.state.blocking_read();
