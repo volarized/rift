@@ -17,7 +17,7 @@ and this repository pins no revision of its own.
 The runner addresses a server by URL alone and sends no `Authorization`
 header, so the server this script starts runs under `--auth skip`, which the
 CLI accepts only together with `--foreground`. The served workspace is a
-throwaway two-file crate in a temporary directory, so the run indexes nothing
+throwaway source tree in a temporary directory, so the run indexes nothing
 of this repository and leaves nothing behind.
 
 Usage:
@@ -56,18 +56,24 @@ RUNNER_SECONDS_MAX = 300.0
 # Longest wait for the `rift` binary to build.
 BUILD_SECONDS_MAX = 1800.0
 
-FIXTURE_MANIFEST = """[package]
-name = "conformance-fixture"
-version = "0.0.0"
-edition = "2024"
+FIXTURE_CONFIGURATION = """[search.semantic]
+disabled = true
 """
 FIXTURE_SOURCE = 'fn main() {\n    println!("beacon");\n}\n'
 
 
 def lay_out_workspace(root: Path) -> None:
-    """Write the throwaway crate the server indexes."""
+    """Write the throwaway source tree the server indexes.
+
+    The tree carries no cargo manifest. A manifest without a lockfile makes
+    `cargo metadata --format-version 1 --locked --offline` refuse, and the
+    degraded resolution that follows rebuilds the index while the server is
+    still capturing its first tree, so the server exits before it publishes.
+    The configuration keeps the semantic tier off, so the run reaches no
+    model hub.
+    """
     (root / "src").mkdir(parents=True, exist_ok=True)
-    (root / "Cargo.toml").write_text(FIXTURE_MANIFEST, encoding="utf-8")
+    (root / "rift.toml").write_text(FIXTURE_CONFIGURATION, encoding="utf-8")
     (root / "src" / "main.rs").write_text(FIXTURE_SOURCE, encoding="utf-8")
 
 
