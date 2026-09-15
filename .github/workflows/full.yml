@@ -127,6 +127,7 @@ jobs:
           name: corpus-${{ matrix.repository }}-${{ matrix.case }}
           path: |
             target/corpus/
+            target/corpus.lcov
             target/nextest/corpus/junit.xml
           if-no-files-found: warn
           retention-days: 7

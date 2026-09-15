@@ -105,7 +105,8 @@ class Corpus:
             self.report.parent / f"{self.report.stem}.server-{self.sequence}.log",
             startup_seconds=180.0,
             env={
-                "RUST_LOG": "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info"
+                "RUST_LOG": "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info",
+                "NO_COLOR": "1",
             },
         )
 
