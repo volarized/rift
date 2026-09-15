@@ -10,6 +10,7 @@ import re
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+from urllib.parse import unquote
 
 from rift_test_client import (
     JsonObject,
@@ -27,6 +28,57 @@ LEXICAL_UNITS_MAX = 1_000_000
 LEXICAL_BYTES_MAX = 512 * 1024 * 1024
 PROBE_PATH = "rift_corpus_probe.rs"
 PROBE_SOURCE = "pub fn corpus_probe(){}\n"
+MAP_MODULES_MAX = 100_000
+
+
+def map_paths(answer: JsonObject) -> set[str]:
+    """Read exact paths from the map's named fields and escaped symbol identities."""
+    string_value(answer.get("revision"), "map revision")
+    object_value(answer.get("pagination"), "map pagination")
+    found = {
+        string_value(value, "map documentation path")
+        for value in array_value(answer.get("docs", []), "map documentation")
+    }
+    pending = [
+        object_value(value, "map module")
+        for value in array_value(answer.get("modules", []), "map modules")
+    ]
+    visited = 0
+    while pending:
+        module = pending.pop()
+        visited += 1
+        require(visited <= MAP_MODULES_MAX, "map module count exceeded 100000")
+        found.add(string_value(module.get("path"), "map module path"))
+        children = array_value(module.get("children", []), "map module children")
+        require(
+            visited + len(pending) + len(children) <= MAP_MODULES_MAX,
+            "map module count exceeded 100000",
+        )
+        pending.extend(object_value(child, "map module") for child in children)
+    symbols = list(array_value(answer.get("entry_points", []), "map entry points"))
+    symbols.extend(
+        object_value(value, "map hub").get("symbol")
+        for value in array_value(answer.get("hubs", []), "map hubs")
+    )
+    for value in symbols:
+        identity = string_value(value, "map symbol identity")
+        prefix = "rift://symbol/"
+        require(identity.startswith(prefix), f"invalid map symbol identity: {identity}")
+        language, separator, tail = identity.removeprefix(prefix).partition("/")
+        require(
+            bool(language and separator), f"map symbol lost its language: {identity}"
+        )
+        encoded, separator, name = tail.rpartition("/")
+        require(
+            bool(encoded and separator and name),
+            f"map symbol lost its path or name: {identity}",
+        )
+        require(
+            re.search(r"%(?![0-9A-Fa-f]{2})", encoded) is None,
+            f"map symbol path has an invalid percent escape: {identity}",
+        )
+        found.add(unquote(encoded, errors="strict"))
+    return found
 
 
 def symbol_pool(candidates: list[JsonObject]) -> dict[str, JsonObject]:
