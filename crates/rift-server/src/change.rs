@@ -2926,6 +2926,103 @@ mod tests {
         Ok(())
     }
 
+    /// One generic `impl` block and one plain one, each declaring a method
+    /// named `run`. The index holds `Holder::run` and `Plain::run`: the
+    /// generic arguments the block applies are not part of a method's name.
+    const GENERIC_AND_PLAIN_IMPLS: &str = "pub struct Holder<Store> {\n    store: Store,\n}\n\npub struct Plain;\n\n\
+         impl<Store: Clone> Holder<Store> {\n    pub fn run(&self) {}\n}\n\n\
+         impl Plain {\n    pub fn run(&self) {}\n}\n";
+
+    /// A method of a generic `impl` block is reached by the address the read
+    /// side answers with - the implemented type's own name, with no generic
+    /// arguments - and the plain block's method of the same name is untouched.
+    #[test]
+    fn replace_symbol_reaches_a_method_of_a_generic_impl_block() -> TestResult {
+        let (directory, reads, changes) = fixture(GENERIC_AND_PLAIN_IMPLS)?;
+        let summary = applied_summary(changes.replace_symbol(
+            &reads,
+            &ReplaceSymbolParams {
+                symbol: symbol("Holder::run"),
+                region: None,
+                body: "pub fn run(&self) -> u8 { 7 }".to_owned().into(),
+            },
+        )?);
+        assert_eq!(summary.files.len(), 1);
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert!(
+            written.contains("pub fn run(&self) -> u8 { 7 }"),
+            "the generic block's method is rewritten: {written}"
+        );
+        assert!(
+            written.contains("impl Plain {\n    pub fn run(&self) {}\n}"),
+            "the plain block keeps its own method: {written}"
+        );
+        Ok(())
+    }
+
+    /// `insert_symbol` anchors on that same address: the new declaration lands
+    /// beside the generic block's own method, inside that block and at its
+    /// column.
+    #[test]
+    fn insert_symbol_anchors_on_a_method_of_a_generic_impl_block() -> TestResult {
+        let (directory, reads, changes) = fixture(GENERIC_AND_PLAIN_IMPLS)?;
+        applied_summary(changes.insert_symbol(
+            &reads,
+            &InsertSymbolParams {
+                anchor: Some(symbol("Holder::run")),
+                file: None,
+                position: InsertPosition::After,
+                body: "pub fn ran(&self) -> bool { true }".to_owned().into(),
+                create_missing: false,
+            },
+        )?);
+        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
+        assert!(
+            written.contains(
+                "impl<Store: Clone> Holder<Store> {\n    pub fn run(&self) {}\n\n    \
+                 pub fn ran(&self) -> bool { true }\n}"
+            ),
+            "the new method lands beside the generic block's own: {written}"
+        );
+        Ok(())
+    }
+
+    /// The generic arguments an `impl` block applies are not part of its
+    /// methods' names, so an address spelling them names no declaration and
+    /// refuses `target_exists`, the way any other absent name does.
+    #[test]
+    fn replace_symbol_refuses_an_address_naming_no_declaration_of_a_generic_impl() -> TestResult {
+        let (_directory, reads, changes) = fixture(GENERIC_AND_PLAIN_IMPLS)?;
+        for absent in ["Holder<Store>::run", "Holder::vanished"] {
+            let refused = changes.replace_symbol(
+                &reads,
+                &ReplaceSymbolParams {
+                    symbol: symbol(absent),
+                    region: None,
+                    body: "pub fn run(&self) {}".to_owned().into(),
+                },
+            )?;
+            let ChangeResult::Refused {
+                reason,
+                preconditions,
+                ..
+            } = refused
+            else {
+                panic!("no declaration holds {absent}, so it must refuse");
+            };
+            assert_eq!(reason, RefusalReason::UnmetPrecondition);
+            assert_eq!(
+                preconditions[0].kind,
+                OperationPreconditionKind::TargetExists
+            );
+            assert_eq!(
+                preconditions[0].observed,
+                PreconditionValue::Boolean { value: false }
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn insert_symbol_lands_on_the_requested_side() -> TestResult {
         let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;

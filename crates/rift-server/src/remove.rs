@@ -1355,6 +1355,44 @@ mod tests {
         );
     }
 
+    /// A method of a generic `impl` block resolves for removal by the address
+    /// the read side answers with - the implemented type's own name, with no
+    /// generic arguments - and the plain block's method of the same name
+    /// stands.
+    #[tokio::test]
+    async fn plan_remove_symbol_reaches_a_method_of_a_generic_impl_block() {
+        let source = "pub struct Holder<Store> {\n    store: Store,\n}\n\npub struct Plain;\n\n\
+                      impl<Store: Clone> Holder<Store> {\n    pub fn run(&self) {}\n}\n\n\
+                      impl Plain {\n    pub fn run(&self) {}\n}\n";
+        let (directory, reads, engines) = workspace(&[("lib.rs", source)]);
+        let resolution = plan_remove_symbol(
+            &reads,
+            &engines,
+            directory.path(),
+            &RemoveSymbolParams {
+                symbol: symbol("Holder::run"),
+                force: false,
+            },
+        )
+        .await
+        .expect("the generic block's method resolves");
+        let RemoveResolution::Planned(plan) = resolution else {
+            panic!("a method of a generic impl block must resolve: {resolution:?}");
+        };
+        assert_eq!(
+            plan.next_source.matches("pub fn run").count(),
+            1,
+            "exactly one method is removed: {}",
+            plan.next_source
+        );
+        assert!(
+            plan.next_source
+                .contains("impl Plain {\n    pub fn run(&self) {}\n}"),
+            "the surviving method is the plain block's: {}",
+            plan.next_source
+        );
+    }
+
     #[tokio::test]
     async fn plan_remove_symbol_refuses_when_disk_drifted_from_snapshot() {
         let (directory, reads, engines) = workspace(&[("lib.rs", "pub fn beacon() {}\n")]);
