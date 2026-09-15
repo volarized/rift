@@ -1,0 +1,397 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["mcp==1.26.0", "jsonschema==4.26.0", "psutil==7.2.2", "pywin32==312; sys_platform == 'win32'"]
+# ///
+"""Exercise corpus measurements and refusal decisions without a live server."""
+
+from __future__ import annotations
+
+import dataclasses
+import sqlite3
+import tempfile
+import unittest
+from contextlib import closing
+from pathlib import Path
+from unittest.mock import patch
+
+from corpus_assertions import (
+    PROBE_PATH,
+    PROBE_SOURCE,
+    active_operation,
+    active_stdout,
+    capture_count,
+    change_patch,
+    exact_degradation,
+    identity_resolved,
+    lexical_breach,
+    lexical_content,
+    no_failed_builds,
+    probe_units,
+    records,
+    warnings,
+)
+from corpus_cache import Measurement, Pin, git, measure, pins
+from rift_test_client import JsonObject
+
+
+class Measurements(unittest.TestCase):
+    def test_git_tree_counts_symlink_bytes_and_preserves_path_bytes(self) -> None:
+        source = b"100644 blob " + b"a" * 40 + b" 12\tdir/package.json\0"
+        link = b"120000 blob " + b"b" * 40 + b" 4\talias\0"
+        foreign = b"100755 blob " + b"c" * 40 + b" 8\tdir/deeper/line\nfile\0"
+        self.assertEqual(measure(source + link + foreign), Measurement(3, 24, 1, 2, 1))
+
+    def test_measure_rejects_incomplete_and_invalid_tree(self) -> None:
+        invalid = [
+            b"missing terminator",
+            b"100644 blob a -1\tfile\0",
+            b"100644 blob a 1\t../file\0",
+            b"100600 blob a 1\tfile\0",
+        ]
+        for source in invalid:
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                measure(source)
+
+    def test_gitlink_is_not_counted_as_a_blob(self) -> None:
+        self.assertEqual(
+            measure(b"160000 commit a -\tsubmodule\0"), Measurement(0, 0, 0, 0, 0)
+        )
+
+    def test_pins_are_full_commits_with_expected_raw_measurements(self) -> None:
+        corpus = pins()
+        self.assertEqual(corpus["nextjs"].measurement.files, 31115)
+        self.assertEqual(corpus["bun"].measurement.symlinks, 9)
+        self.assertEqual(corpus["fastapi"].measurement.package_json, 0)
+        self.assertTrue(all(len(pin.commit) == 40 for pin in corpus.values()))
+
+    def test_pins_refuse_invalid_commit_and_boolean_count(self) -> None:
+        original = Path("crates/rift/tests/corpus/pins.toml").read_text()
+        variants = [
+            original.replace(
+                'commit = "744846f844374847c902b5e7fd59b4342a51ef99"', 'commit = "main"'
+            ),
+            original.replace("files = 19743", "files = true"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pins.toml"
+            for variant in variants:
+                path.write_text(variant)
+                with self.assertRaises(ValueError):
+                    pins(path)
+
+    def test_verified_cache_rejects_tracked_and_untracked_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            git(root, "init", "--quiet")
+            (root / "source.rs").write_text("fn beacon() {}\n")
+            git(root, "add", "source.rs")
+            git(
+                root,
+                "-c",
+                "user.name=Corpus",
+                "-c",
+                "user.email=corpus@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            )
+            commit = git(root, "rev-parse", "HEAD").decode().strip()
+            measured = measure(git(root, "ls-tree", "-r", "-l", "-z", commit))
+            pin = Pin("fixture", "owner/repository", "tag", commit, measured, "", 0, 60)
+            self.assertEqual(pin.verify(root), measured)
+            oversized = dataclasses.replace(
+                pin, oversized_path="source.rs", oversized_bytes=15
+            )
+            self.assertEqual(oversized.verify(root), measured)
+            for changed in (
+                dataclasses.replace(oversized, oversized_path="missing.rs"),
+                dataclasses.replace(oversized, oversized_bytes=16),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "oversized path"):
+                    changed.verify(root)
+            wrong = dataclasses.replace(
+                pin, measurement=dataclasses.replace(measured, bytes=0)
+            )
+            with self.assertRaisesRegex(RuntimeError, "remeasure"):
+                wrong.verify(root)
+            (root / "untracked").write_text("new")
+            with self.assertRaisesRegex(RuntimeError, "checkout changed"):
+                pin.verify(root)
+            (root / "untracked").unlink()
+            (root / "source.rs").write_text("fn changed() {}\n")
+            with self.assertRaisesRegex(RuntimeError, "checkout changed"):
+                pin.verify(root)
+
+
+class Decisions(unittest.TestCase):
+    def test_capture_requires_one_completed_capture_and_publication(self) -> None:
+        capture: JsonObject = {
+            "identity": 2,
+            "message": "index.build",
+            "target": "rift_server::read",
+            "fields": {
+                "span": "closed",
+                "changed_count": "1",
+                "files_count": "42",
+                "tree_revision": "abcdef01",
+                "outcome": "ok",
+            },
+        }
+        publication: JsonObject = {
+            "identity": 3,
+            "operation": "index.publish",
+            "fields": {"trigger": "rift_change"},
+        }
+        supervisor: JsonObject = {
+            "identity": 4,
+            "message": "index.build",
+            "target": "rift_mcp::validation",
+            "fields": {"span": "closed"},
+        }
+        self.assertEqual(capture_count([capture, publication, supervisor], 1), 1)
+        for found in (
+            [capture],
+            [publication],
+            [capture, capture, publication],
+            [capture, publication, publication],
+        ):
+            with self.assertRaises(AssertionError):
+                capture_count(found, 1)
+        wrong: JsonObject = {
+            **capture,
+            "fields": {"span": "closed", "changed_count": "2"},
+        }
+        with self.assertRaises(AssertionError):
+            capture_count([wrong, publication], 1)
+
+    def test_lexical_breach_requires_exact_field_maximum_and_overflow(self) -> None:
+        def answer(detail: str) -> JsonObject:
+            return {
+                "warnings": [{"code": "lexical_ranking_unavailable", "detail": detail}]
+            }
+
+        valid = "field units_max, observed 20001, maximum 20000; resize"
+        self.assertEqual(lexical_breach(answer(valid), 20000), 20001)
+        for wrong in (
+            valid.replace("units_max", "other"),
+            valid.replace("20001", "20000"),
+            valid.replace("maximum 20000", "maximum 200000"),
+            "still committing tree revision 20000",
+        ):
+            with self.assertRaises(AssertionError):
+                lexical_breach(answer(wrong), 20000)
+
+    def test_synchronous_rebuild_requires_matching_epoch_without_completion(
+        self,
+    ) -> None:
+        start = 'DEBUG rift_mcp::validation: index capture started component="index" operation="index.build" phase="start" epoch=7\n'
+        self.assertEqual(active_stdout(start, "rebuild", "7"), start.strip())
+        wrong_close = 'INFO index.build{component="index" epoch=6}: rift_mcp::validation: close time.busy=1s\n'
+        self.assertEqual(
+            active_stdout(start + wrong_close, "rebuild", "7"), start.strip()
+        )
+        matching_close = wrong_close.replace("epoch=6", "epoch=7")
+        for output, epoch in ((start, "8"), (start + matching_close, "7"), ("", "7")):
+            with self.assertRaises(AssertionError):
+                active_stdout(output, "rebuild", epoch)
+
+    def test_synchronous_history_refuses_finished_or_partial_records(self) -> None:
+        start = 'DEBUG rift_server::history: symbol history started component="index" operation="get_symbol" phase="start"\n'
+        self.assertEqual(active_stdout(start, "history", None), start.strip())
+        close = 'DEBUG get_symbol{component="index" operation="get_symbol" phase="history"}: rift_server::history: close time.busy=1s\n'
+        for output in (start + close, start.rstrip(), start + close.rstrip()):
+            with self.assertRaises(AssertionError):
+                active_stdout(output, "history", None)
+
+    def test_stop_requires_started_work_and_rejects_completed_history(self) -> None:
+        start: JsonObject = {
+            "identity": 2,
+            "operation": "get_symbol",
+            "fields": {"phase": "start"},
+        }
+        closed: JsonObject = {
+            "identity": 3,
+            "operation": "get_symbol",
+            "fields": {"span": "closed"},
+        }
+        self.assertEqual(active_operation([start], "history", 1, True), 2)
+        for found, pending in (
+            ([start], False),
+            ([start, closed], True),
+            ([start], True),
+        ):
+            after = 2 if found == [start] and pending else 1
+            with self.assertRaises(AssertionError):
+                active_operation(found, "history", after, pending)
+
+    def test_stop_rebuild_allows_answered_stale_read_but_refuses_matching_close(
+        self,
+    ) -> None:
+        start: JsonObject = {
+            "identity": 2,
+            "operation": "index.build",
+            "fields": {"phase": "start", "epoch": "7"},
+        }
+        closed: JsonObject = {
+            "identity": 3,
+            "operation": "",
+            "message": "index.build",
+            "fields": {"span": "closed", "epoch": "7"},
+        }
+        self.assertEqual(active_operation([start], "rebuild", 1, False), 2)
+        with self.assertRaises(AssertionError):
+            active_operation([start, closed], "rebuild", 1, True)
+
+    def test_identity_refuses_missing_target_but_accepts_equal_source(self) -> None:
+        refusal: JsonObject = {
+            "status": "refused",
+            "reason": "unmet_precondition",
+            "preconditions": [
+                {
+                    "kind": "target_exists",
+                    "status": "failed",
+                    "observed": {"kind": "boolean", "value": False},
+                },
+            ],
+        }
+        with self.assertRaisesRegex(AssertionError, "cannot be addressed"):
+            identity_resolved(refusal, "rift://symbol/rust/lib.rs/beacon")
+        refusal["preconditions"] = [{"kind": "source_unchanged", "status": "failed"}]
+        identity_resolved(refusal, "rift://symbol/rust/lib.rs/beacon")
+        with self.assertRaisesRegex(AssertionError, "unknown change outcome"):
+            identity_resolved({"status": "unknown"}, "symbol")
+
+    def test_log_page_refuses_missing_store_and_truncation(self) -> None:
+        answers: list[JsonObject] = [
+            {"unavailable": "failed", "records": []},
+            {"records": [{}] * 5000},
+        ]
+        for answer in answers:
+            with self.assertRaises(AssertionError):
+                records(answer)
+        self.assertEqual(records({"records": []}), [])
+
+    def test_manifest_degradation_requires_one_exact_record_per_resolver(self) -> None:
+        expected = "585 of 841 package.json manifests were not read: at most 256 are read per workspace"
+        npm: JsonObject = {
+            "message": "dependency resolution degraded",
+            "fields": {"resolver": "npm", "reason": expected},
+        }
+        bun: JsonObject = {
+            "message": "dependency resolution degraded",
+            "fields": {"resolver": "bun", "reason": expected},
+        }
+        exact_degradation([npm, bun], expected)
+        for found in ([], [npm], [npm, npm], [npm, bun, bun]):
+            with self.assertRaises(AssertionError):
+                exact_degradation(found, expected)
+        with self.assertRaises(AssertionError):
+            exact_degradation([npm], None)
+
+    def test_build_failure_and_warning_overflow_fail_closed(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "index build failed"):
+            no_failed_builds([{"message": "index rebuild failed"}])
+        with self.assertRaisesRegex(AssertionError, "source warnings exceeded"):
+            warnings({"warnings": [{"code": "source_unavailable"}] * 10})
+        self.assertEqual(
+            len(warnings({"warnings": [{"code": "source_unavailable"}] * 9})), 9
+        )
+
+    def test_fixture_patch_keeps_exact_bytes(self) -> None:
+        self.assertEqual(len(PROBE_SOURCE.encode()), 24)
+        self.assertIn(
+            "@@ -0,0 +1,1 @@\n+" + PROBE_SOURCE,
+            change_patch(PROBE_PATH, "", PROBE_SOURCE),
+        )
+        self.assertIn("+++ /dev/null", change_patch(PROBE_PATH, PROBE_SOURCE, ""))
+
+
+class PersistedContent(unittest.TestCase):
+    def test_reads_close_connections_on_success_and_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".rift").mkdir()
+            with closing(sqlite3.connect(root / ".rift/db")) as fixture:
+                fixture.execute(
+                    "CREATE TABLE lexical_units(identity TEXT, path TEXT, kind TEXT, name TEXT, byte_length INTEGER, content TEXT)"
+                )
+                fixture.execute(
+                    "INSERT INTO lexical_units VALUES ('id','source.rs','symbol','beacon',15,'fn beacon() {}')"
+                )
+                fixture.commit()
+            connect = sqlite3.connect
+            opened: list[sqlite3.Connection] = []
+
+            def tracked(
+                database: str, *, uri: bool, timeout: float
+            ) -> sqlite3.Connection:
+                connection = connect(database, uri=uri, timeout=timeout)
+                opened.append(connection)
+                return connection
+
+            with patch("corpus_assertions.sqlite3.connect", side_effect=tracked):
+                self.assertEqual(probe_units(root), 0)
+                self.assertEqual(lexical_content(root).units, 1)
+                with (
+                    patch("corpus_assertions.LEXICAL_UNITS_MAX", 0),
+                    self.assertRaises(AssertionError),
+                ):
+                    lexical_content(root)
+            self.assertEqual(len(opened), 3)
+            for connection in opened:
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connection.execute("SELECT 1")
+
+    def test_edit_preserves_unrelated_rows_and_detects_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".rift").mkdir()
+            with sqlite3.connect(root / ".rift/db") as connection:
+                connection.execute(
+                    "CREATE TABLE lexical_units(identity TEXT, path TEXT, kind TEXT, name TEXT, byte_length INTEGER, content TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO lexical_units VALUES ('id','source.rs','symbol','beacon',15,'fn beacon() {}')"
+                )
+                connection.commit()
+                before = lexical_content(root)
+                connection.execute(
+                    "INSERT INTO lexical_units VALUES ('probe',?,'symbol','corpus_probe',24,?)",
+                    (PROBE_PATH, PROBE_SOURCE),
+                )
+                connection.commit()
+                self.assertEqual(lexical_content(root), before)
+                connection.execute(
+                    "UPDATE lexical_units SET content='changed' WHERE identity='id'"
+                )
+                connection.commit()
+                self.assertNotEqual(lexical_content(root), before)
+
+    def test_empty_or_over_budget_store_is_not_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".rift").mkdir()
+            with sqlite3.connect(root / ".rift/db") as connection:
+                connection.execute(
+                    "CREATE TABLE lexical_units(identity TEXT, path TEXT, kind TEXT, name TEXT, byte_length INTEGER, content TEXT)"
+                )
+                connection.commit()
+                with self.assertRaisesRegex(AssertionError, "empty"):
+                    lexical_content(root)
+                connection.execute(
+                    "INSERT INTO lexical_units VALUES ('id','source.rs','symbol','beacon',15,'fn beacon() {}')"
+                )
+                connection.commit()
+                with (
+                    patch("corpus_assertions.LEXICAL_UNITS_MAX", 0),
+                    self.assertRaisesRegex(AssertionError, "row count"),
+                ):
+                    lexical_content(root)
+
+
+if __name__ == "__main__":
+    unittest.main()

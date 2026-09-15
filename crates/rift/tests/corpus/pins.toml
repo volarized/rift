@@ -1,0 +1,39 @@
+# Corpus trees are immutable Git commits. Measurements include symlink blobs.
+[bun]
+repository = "oven-sh/bun"
+tag = "bun-v1.4.2"
+commit = "744846f844374847c902b5e7fd59b4342a51ef99"
+files = 19743
+bytes = 197365136
+symlinks = 9
+depth = 10
+package_json = 632
+oversized_path = "src/jsc/bindings/sqlite/sqlite3.c"
+oversized_bytes = 9508000
+seconds = 540
+
+[nextjs]
+repository = "vercel/next.js"
+tag = "v16.3.5"
+commit = "ca2c75eb7f8d9dd012a8bb83c06132149fe221f9"
+files = 31115
+bytes = 157964029
+symlinks = 32
+depth = 15
+package_json = 841
+oversized_path = "turbopack/crates/turbopack-ecmascript/tests/benches/packages-bundle.js"
+oversized_bytes = 2158740
+seconds = 720
+
+[fastapi]
+repository = "fastapi/fastapi"
+tag = "0.141.1"
+commit = "95f8322ee1dcda7ceace7b1c4f6c9915b36d748f"
+files = 3137
+bytes = 34759910
+symlinks = 0
+depth = 6
+package_json = 0
+oversized_path = ""
+oversized_bytes = 0
+seconds = 240
