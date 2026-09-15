@@ -2104,10 +2104,15 @@ impl<Store: LexicalStore> LexicalTask<Store> {
     /// commit after a restart replaces the whole unit set.
     async fn transaction(&self, commit: LexicalCommit, whole_owed: bool) -> Result<(), ReadError> {
         let LexicalCommit { write, published } = commit;
-        let write = if whole_owed {
-            self.whole_set(&published).await?
-        } else {
-            write
+        let tree_revision = published.reads.tree_revision().to_owned();
+        let write = match (whole_owed, write) {
+            (true, LexicalWrite::Change(_)) => self.whole_set(published).await?,
+            (_, write) => {
+                // The prepared write owns its units. Release the old publication on the
+                // blocking pool before SQL waits, without blocking the lane on its Drop.
+                drop(tokio::task::spawn_blocking(move || drop(published)));
+                write
+            }
         };
         let (write, left_out) = write.within_unit_bound(self.unit_bytes_max);
         record_units_left_out(&left_out, self.unit_bytes_max);
@@ -2116,7 +2121,6 @@ impl<Store: LexicalStore> LexicalTask<Store> {
         }
         let deadline = commit_deadline(write.unit_count());
         let form = write.form();
-        let tree_revision = published.reads.tree_revision().to_owned();
         let store = Arc::clone(&self.store);
         let stamped = tree_revision.clone();
         let mut running = tokio::spawn(async move { write.commit_to(&*store, &stamped).await });
@@ -2143,16 +2147,15 @@ impl<Store: LexicalStore> LexicalTask<Store> {
     /// The whole unit set `published` derives, on the worker pool.
     async fn whole_set(
         &self,
-        published: &Arc<PublishedWorkspace>,
+        published: Arc<PublishedWorkspace>,
     ) -> Result<LexicalWrite, ReadError> {
-        let tree_revision = published.reads.tree_revision();
-        let deriving = Arc::clone(published);
+        let tree_revision = published.reads.tree_revision().to_owned();
         self.blocking
             .run("lexical unit derivation", move || {
-                Ok(LexicalWrite::Whole(deriving.reads.lexical_units()))
+                Ok(LexicalWrite::Whole(published.reads.lexical_units()))
             })
             .await
-            .inspect_err(|error| record_commit_failure(tree_revision, "whole", error))
+            .inspect_err(|error| record_commit_failure(&tree_revision, "whole", error))
     }
 }
 
@@ -4865,6 +4868,99 @@ mod tests {
             "the commit leaves the published unit set searchable"
         );
         cancellation.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_commit_releases_its_publication_while_the_store_holds_the_write() -> TestResult {
+        for (whole_owed, change) in [(false, false), (false, true), (true, true)] {
+            let directory = tempfile::tempdir()?;
+            let published = candidate_declaring(directory.path(), 0, "beacon")?;
+            let revision = published.reads.tree_revision().to_owned();
+            let retired = Arc::downgrade(&published);
+            let write = if change {
+                change_naming_lib()?
+            } else {
+                super::lexical_write(&published, &ChangeSet::Full)
+            };
+            let double = StoreDouble::new();
+            let cancellation = CancellationToken::new();
+            let _cancel = cancellation.clone().drop_guard();
+            let lane = LexicalLane::spawn_over(
+                Arc::clone(&double),
+                usize::MAX,
+                BlockingExecutor::isolated(2, 60_000),
+                cancellation.clone(),
+            );
+            if whole_owed {
+                lane.queue
+                    .locked()
+                    .owe_whole("the previous transaction failed".to_owned());
+            }
+            lane.request(write, published);
+            let form = if change && !whole_owed {
+                "apply"
+            } else {
+                "replace"
+            };
+            assert_eq!(
+                double.calls_within_bound(1).await?,
+                vec![(form, revision.clone())]
+            );
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while retired.upgrade().is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            assert_eq!(lane.commit_state(&revision), LexicalCommitState::Committing);
+            assert_eq!(double.dropped_while_held(), 0);
+            double.release_one();
+            commit_state_within_bound(&lane, &revision, LexicalCommitState::Settled).await?;
+            cancellation.cancel();
+            ended_within_bound(&lane).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_whole_write_pays_a_whole_replace_without_deriving_units_again() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let published = candidate_declaring(directory.path(), 0, "beacon")?;
+        let revision = published.reads.tree_revision().to_owned();
+        let write = super::lexical_write(&published, &ChangeSet::Full);
+        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+        let double = StoreDouble::new();
+        double.attach(Arc::clone(&index));
+        let blocking = BlockingExecutor::isolated(1, 60_000);
+        let occupied = Arc::clone(&blocking.operations).acquire_owned().await?;
+        let cancellation = CancellationToken::new();
+        let _cancel = cancellation.clone().drop_guard();
+        let lane = LexicalLane::spawn_over(
+            Arc::clone(&double),
+            usize::MAX,
+            blocking,
+            cancellation.clone(),
+        );
+        lane.queue
+            .locked()
+            .owe_whole("the previous transaction failed".to_owned());
+        lane.request(write, published);
+        assert_eq!(
+            double.calls_within_bound(1).await?,
+            vec![("replace", revision.clone())]
+        );
+        double.release_one();
+        commit_state_within_bound(&lane, &revision, LexicalCommitState::Settled).await?;
+        assert_eq!(
+            index.tree_revision().await?.as_deref(),
+            Some(revision.as_str())
+        );
+        assert!(!ranked_at(&index, &revision, "beacon", 8).await?.is_empty());
+        assert!(!lane.owes_whole());
+        cancellation.cancel();
+        ended_within_bound(&lane).await?;
+        drop(occupied);
         Ok(())
     }
 
