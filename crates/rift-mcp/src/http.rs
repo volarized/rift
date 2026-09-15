@@ -297,6 +297,11 @@ impl HttpServer {
     /// process exits on time. The returned deadline is that same instant, so
     /// the caller's later stop stages share it.
     ///
+    /// The retired supervisor's published index is released on the blocking
+    /// pool after shutdown. Its data can take longer to free than serving took
+    /// to stop; the runtime owns that release while the caller completes its
+    /// later stop stages.
+    ///
     /// # Errors
     ///
     /// The second tuple element carries [`HttpServeError`] when the supervisor
@@ -332,6 +337,12 @@ impl HttpServer {
             .shutdown(deadline)
             .await
             .map_err(HttpServeFault::workspace);
+        // The last supervisor can own the whole published index. Freeing it here
+        // would block this future before the caller drains logs and releases its
+        // election. Tokio owns the detached release; an embedded runtime reclaims
+        // it, and the foreground CLI already exits without waiting on its pool.
+        let retired = self.supervisor;
+        drop(tokio::task::spawn_blocking(move || drop(retired)));
         let outcome = stop_outcome_label(
             supervisor_outcome.is_ok() && serve_result.is_ok() && engines_stopped,
         );
@@ -890,6 +901,73 @@ mod tests {
     fn stop_outcome_label_names_both_outcomes() {
         assert_eq!(stop_outcome_label(true), "ok");
         assert_eq!(stop_outcome_label(false), "error");
+    }
+
+    #[test]
+    fn stopping_retires_index_data_without_waiting_for_its_release() {
+        const WAIT_MAX: Duration = Duration::from_secs(2);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("the fixture runtime must start");
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().expect("the fixture root must be created");
+            let (validation, _invalidations) =
+                IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+            let retired = Arc::downgrade(&validation);
+            let server = HttpServer {
+                port: SERVER_PORT_MIN,
+                token: mint_token().expect("token must mint"),
+                identity: ProductIdentity {
+                    version: "0.0.9".to_owned(),
+                    executable_digest: "a".repeat(64),
+                    schema_digest: "b".repeat(64),
+                },
+                stop: CancellationToken::new(),
+                serving: tokio::spawn(std::future::ready(Ok::<(), std::io::Error>(()))),
+                idle_watch: tokio::spawn(std::future::ready(())),
+                supervisor: IndexSupervisor { validation },
+                engines: Arc::new(EngineHold::new(
+                    directory.path().to_path_buf(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                )),
+            };
+            let (occupied, ready) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::sync_channel(1);
+            let blocking = tokio::task::spawn_blocking(move || {
+                occupied
+                    .send(())
+                    .expect("the fixture must observe the worker");
+                // A failed assertion cannot leave Runtime::drop waiting on this worker.
+                let _released = released.recv_timeout(WAIT_MAX);
+            });
+            ready.await.expect("the blocking worker must start");
+
+            let result = tokio::time::timeout(WAIT_MAX, server.stopped(WAIT_MAX)).await;
+            let retained_while_queued = retired.upgrade().is_some();
+            let _released = release.send(());
+            let (_deadline, stopped) = result.expect("stopping must not wait for index release");
+            stopped.expect("the serving tasks must stop successfully");
+            assert!(
+                retained_while_queued,
+                "retired index data must wait on the blocking pool, outside the stop"
+            );
+            blocking.await.expect("the occupied worker must finish");
+            tokio::time::timeout(WAIT_MAX, async {
+                while retired.upgrade().is_some() {
+                    tokio::task::yield_now().await;
+                }
+                // A zero strong count can precede Drop's return. The sole blocking
+                // worker cannot run this marker until that earlier Drop completes.
+                tokio::task::spawn_blocking(|| ())
+                    .await
+                    .expect("index release must leave the blocking worker usable");
+            })
+            .await
+            .expect("an embedded runtime must eventually release the retired index");
+        });
     }
 
     #[tokio::test(start_paused = true)]

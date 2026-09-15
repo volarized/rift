@@ -109,6 +109,10 @@ queue, and a worker picks it up when one is free. This behavior is configurable 
 `num_workers` and `worker_queue_timeout` keys in the
 [`[server]` section](/docs/configuration#server).
 
+Freeing a large index can take longer than closing the listener. After the index supervisor
+stops, the blocking pool releases its retained index while the foreground process finishes
+the log drain and releases the election.
+
 A stopped server leaves its process as soon as serving has ended and the log drain has stopped,
 through the process exit rather than by returning from `main`. Dropping the runtime would wait
 for every blocking task still running, and a lexical transaction or a dependency pass that
