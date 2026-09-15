@@ -43,6 +43,13 @@ const LOG_WRITE_ATTEMPTS_MAX: u32 = 5;
 /// Wall-clock span between two attempts at the same batch.
 const LOG_WRITE_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Bytes of one span's own fields the close record keeps, at most. A longer set
+/// is cut at a character boundary, the way a message past
+/// [`rift_index::LOG_MESSAGE_BYTES_MAX`] is, and the bound leaves the close
+/// record's `span` and `elapsed_ms` members room under
+/// [`rift_index::LOG_FIELDS_BYTES_MAX`].
+const SPAN_FIELDS_BYTES_MAX: usize = 1 << 10;
+
 /// The `tracing` layer that copies admitted events into the queue.
 ///
 /// Cloning shares one queue: the layer is installed once, and a clone held for
@@ -232,11 +239,31 @@ where
         };
         let mut fields = RecordedFields::default();
         attributes.record(&mut fields);
+        let members = bounded(&fields.members(), SPAN_FIELDS_BYTES_MAX);
         span.extensions_mut().insert(SpanLabels {
             component: fields.component,
             operation: fields.operation,
+            fields: members,
             opened_at: Instant::now(),
         });
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        context: Context<'_, S>,
+    ) {
+        let Some(span) = context.span(id) else {
+            return;
+        };
+        let mut fields = RecordedFields::default();
+        values.record(&mut fields);
+        let members = fields.members();
+        let mut extensions = span.extensions_mut();
+        if let Some(labels) = extensions.get_mut::<SpanLabels>() {
+            labels.extend(&members);
+        }
     }
 
     fn on_close(&self, id: tracing::span::Id, context: Context<'_, S>) {
@@ -248,6 +275,15 @@ where
             return;
         };
         let elapsed_ms = labels.opened_at.elapsed().as_millis();
+        let mut fields = String::from("{");
+        if !labels.fields.is_empty() {
+            fields.push_str(&labels.fields);
+            fields.push(',');
+        }
+        let _ = write!(
+            fields,
+            "\"span\":\"closed\",\"elapsed_ms\":\"{elapsed_ms}\"}}"
+        );
         self.send(LogRecord::new(
             now_ms(),
             span.metadata().level().as_str(),
@@ -255,7 +291,7 @@ where
             &labels.component,
             &labels.operation,
             span.name(),
-            &format!("{{\"span\":\"closed\",\"elapsed_ms\":\"{elapsed_ms}\"}}"),
+            &fields,
         ));
     }
 
@@ -314,17 +350,37 @@ where
 }
 
 /// The labels one span carries, kept in its extensions for the events inside
-/// it, with the moment the span opened.
+/// it, with its remaining fields and the moment the span opened.
 ///
 /// The moment is what lets a closing span record how long it took. Stderr gets
 /// that from the fmt layer's own close line, which no other layer ever sees, so
 /// a store fed by events alone could say a rebuild happened and never how long
 /// it ran - the first question a wedged workspace raises.
+///
+/// `fields` carries every other field the span recorded, as JSON object members,
+/// so the close record says what the span did and not only that it ended. It is
+/// cut at [`SPAN_FIELDS_BYTES_MAX`] on a character boundary.
 #[derive(Debug)]
 struct SpanLabels {
     component: String,
     operation: String,
+    fields: String,
     opened_at: Instant,
+}
+
+impl SpanLabels {
+    /// Appends `members` to the fields the close record carries, cut back to
+    /// [`SPAN_FIELDS_BYTES_MAX`] at a character boundary.
+    fn extend(&mut self, members: &str) {
+        if members.is_empty() {
+            return;
+        }
+        if !self.fields.is_empty() {
+            self.fields.push(',');
+        }
+        self.fields.push_str(members);
+        self.fields = bounded(&self.fields, SPAN_FIELDS_BYTES_MAX);
+    }
 }
 
 /// The fields one event or span recorded: its message, the two labels the
@@ -338,17 +394,21 @@ struct RecordedFields {
 }
 
 impl RecordedFields {
-    /// The remaining fields as a JSON object, always well formed.
-    fn rendered(&self) -> String {
-        let mut rendered = String::from("{");
+    /// The remaining fields as JSON object members, without the enclosing braces.
+    fn members(&self) -> String {
+        let mut members = String::new();
         for (index, (name, value)) in self.rest.iter().enumerate() {
             if index > 0 {
-                rendered.push(',');
+                members.push(',');
             }
-            let _ = write!(rendered, "{}:{}", quoted(name), quoted(value));
+            let _ = write!(members, "{}:{}", quoted(name), quoted(value));
         }
-        rendered.push('}');
-        rendered
+        members
+    }
+
+    /// The remaining fields as a JSON object, always well formed.
+    fn rendered(&self) -> String {
+        format!("{{{}}}", self.members())
     }
 
     /// Files one recorded field under the member it belongs to.
@@ -420,6 +480,15 @@ fn caused_by(error: &(dyn std::error::Error + 'static)) -> String {
     rendered
 }
 
+/// `value` cut to at most `maximum` UTF-8 bytes, at a character boundary.
+fn bounded(value: &str, maximum: usize) -> String {
+    let mut cut = value.len().min(maximum);
+    while !value.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    value[..cut].to_owned()
+}
+
 /// Bytes of a panic payload the recorded event keeps, at most.
 pub const PANIC_PAYLOAD_BYTES_MAX: usize = 4 << 10;
 
@@ -467,11 +536,7 @@ fn panic_payload(payload: &(dyn std::any::Any + Send)) -> String {
         .map(|text| (*text).to_owned())
         .or_else(|| payload.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "<payload is not text>".to_owned());
-    let mut cut = text.len().min(PANIC_PAYLOAD_BYTES_MAX);
-    while !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    text[..cut].to_owned()
+    bounded(&text, PANIC_PAYLOAD_BYTES_MAX)
 }
 
 /// Milliseconds since the Unix epoch, or zero on a clock before it.
@@ -494,8 +559,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        LOG_QUEUE_RECORDS, PANIC_PAYLOAD_BYTES_MAX, RecordedFields, caused_by, install_panic_hook,
-        log_capture, panic_payload, quoted,
+        LOG_QUEUE_RECORDS, PANIC_PAYLOAD_BYTES_MAX, RecordedFields, SPAN_FIELDS_BYTES_MAX,
+        caused_by, install_panic_hook, log_capture, panic_payload, quoted,
     };
     use tracing::field::Visit;
     use tracing_subscriber::layer::SubscriberExt;
@@ -610,6 +675,108 @@ mod tests {
             closed.fields().contains("elapsed_ms"),
             "{}",
             closed.fields()
+        );
+    }
+
+    /// The one span-close record a case wrote.
+    fn closed(records: Vec<rift_index::LogRecord>) -> rift_index::LogRecord {
+        records
+            .into_iter()
+            .find(|record| record.fields().contains("\"span\":\"closed\""))
+            .expect("a closed span is recorded")
+    }
+
+    /// A span records what it opened with and what it recorded later, so a reader of
+    /// `rift://logs` sees the fields standard error shows.
+    #[test]
+    fn a_closing_span_records_the_fields_it_carried() {
+        let (sink, mut drain) = log_capture();
+        let subscriber = tracing_subscriber::registry().with(sink);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                "index.build",
+                component = "index",
+                operation = "index.rebuild",
+                trigger = "filesystem",
+                epoch = 7,
+                changed_count = tracing::field::Empty,
+            );
+            span.record("changed_count", 3);
+            span.in_scope(|| {});
+        });
+
+        let closed = closed(queued(&mut drain));
+        assert!(
+            closed.fields().starts_with(
+                "{\"trigger\":\"filesystem\",\"epoch\":\"7\",\"changed_count\":\"3\",\
+                 \"span\":\"closed\","
+            ),
+            "{}",
+            closed.fields()
+        );
+        assert!(
+            closed.fields().contains("\"elapsed_ms\":"),
+            "{}",
+            closed.fields()
+        );
+    }
+
+    /// A span carrying nothing past its two labels records how long it ran alone.
+    #[test]
+    fn a_span_without_fields_records_how_long_it_ran_alone() {
+        let (sink, mut drain) = log_capture();
+        let subscriber = tracing_subscriber::registry().with(sink);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                "index.build",
+                component = "index",
+                operation = "index.rebuild"
+            );
+            span.in_scope(|| {});
+        });
+
+        let closed = closed(queued(&mut drain));
+        assert!(
+            closed
+                .fields()
+                .starts_with("{\"span\":\"closed\",\"elapsed_ms\":\""),
+            "{}",
+            closed.fields()
+        );
+    }
+
+    /// A span whose fields run past [`SPAN_FIELDS_BYTES_MAX`] records the cut form and
+    /// nothing longer, with the cut on a character boundary.
+    #[test]
+    fn a_span_past_the_field_bound_records_the_cut_fields() {
+        let (sink, mut drain) = log_capture();
+        let subscriber = tracing_subscriber::registry().with(sink);
+        let long = "é".repeat(SPAN_FIELDS_BYTES_MAX);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                "index.build",
+                component = "index",
+                operation = "index.rebuild",
+                detail = long.as_str()
+            );
+            span.in_scope(|| {});
+        });
+
+        let closed = closed(queued(&mut drain));
+        let fields = closed.fields();
+        let closing = fields
+            .find(",\"span\":\"closed\"")
+            .unwrap_or_else(|| panic!("the close members follow the span's own: {fields}"));
+        assert_eq!(closing, 1 + SPAN_FIELDS_BYTES_MAX);
+        assert!(fields.starts_with("{\"detail\":\"é"), "{fields}");
+        assert!(
+            fields[11..closing]
+                .chars()
+                .all(|character| character == 'é'),
+            "{fields}"
         );
     }
 

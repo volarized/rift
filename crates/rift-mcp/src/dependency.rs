@@ -231,6 +231,29 @@ struct IndexPass<'a> {
 }
 
 impl IndexPass<'_> {
+    /// Runs one pass under one `dependency.index` span, which records what the pass
+    /// left in the store when it closes.
+    ///
+    /// The span names the pass, not the package: a catalog of three hundred packages
+    /// writes one INFO record instead of three hundred, so a `rift://logs` page taken
+    /// after a pass still holds the rest of the lane's story. Per-package timing sits
+    /// on the `debug_span!` each build opens, which the default `[logs] capture`
+    /// filter leaves out.
+    async fn run(self) {
+        let span = tracing::info_span!(
+            "dependency.index",
+            component = "dependency",
+            operation = "dependency.index",
+            packages = self.request.catalog.entries().len(),
+            indexed = tracing::field::Empty,
+            skipped = tracing::field::Empty,
+            deferred = tracing::field::Empty,
+            bytes = tracing::field::Empty,
+        );
+        self.index_catalog().instrument(span.clone()).await;
+        self.record_totals(&span);
+    }
+
     /// Follows the request, then builds each pending package until none is left.
     ///
     /// Every iteration takes the store's next pending package and removes it from the
@@ -238,7 +261,7 @@ impl IndexPass<'_> {
     /// times. It ends early when a newer request arrived, when the worker pool refused a
     /// build, or when the store cannot be reached; the packages still pending wait for the
     /// next request.
-    async fn run(self) {
+    async fn index_catalog(&self) {
         let entries: BTreeMap<IdentityKey<'_>, &CatalogEntry> = self
             .request
             .catalog
@@ -271,6 +294,21 @@ impl IndexPass<'_> {
         }
     }
 
+    /// Records what the store holds once the pass ends: the packages it indexed, the
+    /// ones a build refused, the ones still pending, and the bytes they hold together.
+    ///
+    /// A store that cannot be locked records nothing here; `store_unreachable` already
+    /// reported the refusal that ended the pass.
+    fn record_totals(&self, span: &tracing::Span) {
+        let Ok(index) = self.store.read() else {
+            return;
+        };
+        span.record("indexed", index.indexed_count());
+        span.record("skipped", index.skipped().len());
+        span.record("deferred", index.pending_count());
+        span.record("bytes", index.total_bytes());
+    }
+
     /// Makes the store follow the request: a fresh plan under changed bounds or
     /// selection, else the packages the catalog no longer lists dropped and the arrivals
     /// queued.
@@ -297,10 +335,14 @@ impl IndexPass<'_> {
     /// A pool refusal - the queue wait spent, or the build's thread lost - is not a fact
     /// about the package, so it ends the pass and leaves the package pending for the next
     /// request; a build refusal skips the package with the refusal's own text.
+    ///
+    /// The span is a `debug_span!`, so the pass writes one INFO record rather than one per
+    /// package; a reader who wants this package's own timing raises `[logs] capture` to
+    /// `debug` in `rift.toml`.
     async fn index_package(&self, entry: &CatalogEntry) -> ControlFlow<()> {
         let identity = entry.identity().clone();
-        let span = tracing::info_span!(
-            "dependency.index",
+        let span = tracing::debug_span!(
+            "dependency.package",
             component = "dependency",
             manager = %identity.manager,
             package = %identity.name,
@@ -427,7 +469,8 @@ mod tests {
     use std::time::Duration;
 
     use rift_dependency::{CatalogEntry, DependencyCatalog, Resolution, ResolverName};
-    use rift_index::{DependencyIndex, DependencyIndexLimits, PackageSelection};
+    use rift_index::{DependencyIndex, DependencyIndexLimits, LogRecord, PackageSelection};
+    use rift_protocol::configuration::LogsConfiguration;
     use rift_protocol::dependencies::{DependenciesConfiguration, PackageNamePattern};
     use rift_protocol::read::{Language, PackageIdentity};
     use rift_server::DependencyStore;
@@ -867,6 +910,144 @@ mod tests {
         let index = store.read()?;
         assert_eq!(index.pending_count(), 1);
         assert_eq!(index.indexed_count(), 0);
+        Ok(())
+    }
+
+    /// `count` packages, each named apart and rooted at `root`.
+    fn rooted_packages(root: &Path, count: usize) -> Arc<DependencyCatalog> {
+        catalog(
+            (0..count)
+                .map(|index| {
+                    CatalogEntry::dependency(
+                        PackageIdentity {
+                            manager: "cargo".to_owned(),
+                            name: format!("helper{index}"),
+                            version: "0.1.0".to_owned(),
+                        },
+                        rust(),
+                        Some(root.to_path_buf()),
+                        true,
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// Runs one pass with the log sink installed under the default `[logs] capture`
+    /// filter, and returns what the sink queued.
+    async fn recorded_pass(
+        store: &DependencyStore,
+        request: &DependencyRequest,
+        blocking: &BlockingExecutor,
+        requests: &watch::Receiver<DependencyRequest>,
+    ) -> TestResult<Vec<LogRecord>> {
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let (sink, mut drain) = crate::logs::log_capture();
+        let filter = tracing_subscriber::EnvFilter::try_new(LogsConfiguration::default().capture)?;
+        let guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(sink.with_filter(filter)),
+        );
+
+        pass(store, request, blocking, requests).run().await;
+
+        drop(guard);
+        let mut records = Vec::new();
+        while let Ok(record) = drain.try_recv_record() {
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    /// The span-close records a recorded pass wrote.
+    fn closed(records: &[LogRecord]) -> Vec<&LogRecord> {
+        records
+            .iter()
+            .filter(|record| record.fields().contains("\"span\":\"closed\""))
+            .collect()
+    }
+
+    /// One pass writes one closed `dependency.index` record, whatever the catalog's
+    /// size, and that record carries what the pass left in the store.
+    #[tokio::test]
+    async fn a_pass_records_one_closed_dependency_index_span() -> TestResult {
+        let root = tempfile::tempdir()?;
+        write_helper_crate(root.path(), "pub fn helper_beacon() {}\n")?;
+        let store = empty_dependency_store();
+        let request = requested(rooted_packages(root.path(), 3));
+        let (_sender, requests) = watch::channel(requested(Arc::new(DependencyCatalog::default())));
+        let blocking = BlockingExecutor::isolated(1, 60_000);
+
+        let records = recorded_pass(&store, &request, &blocking, &requests).await?;
+
+        let closed = closed(&records);
+        assert_eq!(closed.len(), 1, "{records:?}");
+        assert_eq!(closed[0].message(), "dependency.index");
+        assert_eq!(closed[0].component(), "dependency");
+        assert_eq!(closed[0].operation(), "dependency.index");
+        let fields = closed[0].fields();
+        assert!(fields.contains("\"packages\":\"3\""), "{fields}");
+        assert!(fields.contains("\"indexed\":\"3\""), "{fields}");
+        assert!(fields.contains("\"skipped\":\"0\""), "{fields}");
+        assert!(fields.contains("\"deferred\":\"0\""), "{fields}");
+        assert!(fields.contains("\"bytes\":\""), "{fields}");
+        Ok(())
+    }
+
+    /// A package a build refuses keeps its own WARN record, and the pass's span counts
+    /// the refusal.
+    #[tokio::test]
+    async fn a_refused_package_keeps_its_skip_warning() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let store = empty_dependency_store();
+        let request = requested(rooted_helper(&root.path().join("absent")));
+        let (_sender, requests) = watch::channel(requested(Arc::new(DependencyCatalog::default())));
+        let blocking = BlockingExecutor::isolated(1, 60_000);
+
+        let records = recorded_pass(&store, &request, &blocking, &requests).await?;
+
+        let warned = records
+            .iter()
+            .find(|record| record.message() == "dependency package skipped")
+            .unwrap_or_else(|| panic!("the skip keeps its warning: {records:?}"));
+        assert_eq!(warned.level(), "warn");
+        assert_eq!(warned.component(), "dependency");
+        let closed = closed(&records);
+        assert_eq!(closed.len(), 1, "{records:?}");
+        assert!(
+            closed[0].fields().contains("\"skipped\":\"1\""),
+            "{}",
+            closed[0].fields()
+        );
+        Ok(())
+    }
+
+    /// The per-package span is a debug span, which the default capture filter leaves
+    /// out: a pass over three packages records no per-package line.
+    #[tokio::test]
+    async fn the_per_package_span_stays_out_under_the_default_capture() -> TestResult {
+        let root = tempfile::tempdir()?;
+        write_helper_crate(root.path(), "pub fn helper_beacon() {}\n")?;
+        let store = empty_dependency_store();
+        let request = requested(rooted_packages(root.path(), 3));
+        let (_sender, requests) = watch::channel(requested(Arc::new(DependencyCatalog::default())));
+        let blocking = BlockingExecutor::isolated(1, 60_000);
+
+        let records = recorded_pass(&store, &request, &blocking, &requests).await?;
+
+        assert!(
+            records
+                .iter()
+                .all(|record| record.message() != "dependency.package"),
+            "{records:?}"
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| !record.fields().contains("\"package\":")),
+            "{records:?}"
+        );
         Ok(())
     }
 }
