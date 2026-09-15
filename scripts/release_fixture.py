@@ -257,8 +257,10 @@ def trusted_certificate(certificate: Path) -> Iterator[None]:
             keychain,
         ]
     else:
-        add = ["certutil", "-user", "-addstore", "Root", str(certificate)]
-        remove = ["certutil", "-user", "-delstore", "Root", thumbprint]
+        # Hosted Windows runners are administrators with UAC disabled. Use the
+        # machine store; the user-store import timed out on both native runners.
+        add = ["certutil", "-f", "-addstore", "Root", str(certificate)]
+        remove = ["certutil", "-delstore", "Root", thumbprint]
         delete = None
     try:
         run(add, timeout=60)

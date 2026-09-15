@@ -116,6 +116,8 @@ corpus-archive:
 # Each repository runs alone. --no-report preserves the fast tier's profiles
 # so full-gate can merge coverage without running those tests a second time.
 corpus-test name test_name="" archive="":
+    # Nextest requires the archive extraction destination to exist on a cold checkout.
+    mkdir -p "${CARGO_LLVM_COV_TARGET_DIR:-target/llvm-cov-target}"
     cargo llvm-cov nextest --no-report --profile corpus --no-tests fail --run-ignored all {{ if archive == "" { "--locked -p rift --test " + quote("corpus_" + name) + " --cargo-profile corpus" } else { "--archive-file " + quote(archive) + " --extract-overwrite -E " + quote("binary(=corpus_" + name + ")") } }} {{ if test_name == "" { "" } else { "-- --exact " + quote(test_name) } }}
 
 artifact-test *args:

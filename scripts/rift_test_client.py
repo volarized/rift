@@ -486,9 +486,15 @@ class Server:
         )
 
     @asynccontextmanager
-    async def connect(self, call_seconds: float = 120.0) -> AsyncIterator[Client]:
-        """Connect through the SDK's real `rift mcp` stdio subprocess."""
-        proxy_log = self.log_path.with_suffix(".mcp.log")
+    async def connect(
+        self, call_seconds: float = 120.0, *, log_path: Path | None = None
+    ) -> AsyncIterator[Client]:
+        """Connect through the SDK's real `rift mcp` stdio subprocess.
+
+        An explicit log_path keeps concurrent connections' stderr files separate.
+        """
+        proxy_log = log_path or self.log_path.with_suffix(".mcp.log")
+        outside_workspace(proxy_log, self.root)
         with (
             stderr_log(proxy_log) as log,
             owned_environment(self.env) as environment,

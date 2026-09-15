@@ -355,6 +355,62 @@ def test_connection_accepts_only_a_verified_stop(
             asyncio.run(operation())
 
 
+def test_concurrent_connections_preserve_separate_proxy_logs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+    from collections.abc import AsyncIterator
+    from contextlib import asynccontextmanager
+    from typing import TextIO
+    from unittest.mock import Mock
+
+    import rift_test_client
+
+    server = Server(tmp_path / "rift", tmp_path / "workspace", tmp_path / "server.log")
+    process = Mock(spec=subprocess.Popen)
+    process.poll.return_value = None
+    process.returncode = None
+    server.process = process
+    count = 0
+
+    @asynccontextmanager
+    async def transport(
+        *args: object, errlog: TextIO, **kwargs: object
+    ) -> AsyncIterator[tuple[None, None]]:
+        nonlocal count
+        count += 1
+        errlog.write(f"connection-{count}")
+        errlog.flush()
+        yield None, None
+
+    session = AsyncMock(spec=ClientSession)
+    monkeypatch.setattr(rift_test_client, "stdio_client", transport)
+    monkeypatch.setattr(rift_test_client, "ClientSession", lambda *args: session)
+    monkeypatch.setattr(Client, "initialize", AsyncMock())
+    observer_log = tmp_path / "observer.mcp.log"
+
+    async def operation() -> None:
+        async with server.connect(), server.connect(log_path=observer_log):
+            assert count == 2
+
+    asyncio.run(operation())
+    assert (tmp_path / "server.mcp.log").read_bytes() == b"connection-1"
+    assert observer_log.read_bytes() == b"connection-2"
+
+
+def test_explicit_proxy_log_cannot_enter_served_workspace(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    server = Server(tmp_path / "rift", root, tmp_path / "server.log")
+
+    async def operation() -> None:
+        async with server.connect(log_path=root / "observer.log"):
+            pytest.fail("connection must refuse a log inside its workspace")
+
+    with pytest.raises(AssertionError, match="outside the served workspace"):
+        asyncio.run(operation())
+    assert not root.exists()
+
+
 def test_sdk_stderr_overflow_is_bounded(tmp_path: Path) -> None:
     import subprocess
 
