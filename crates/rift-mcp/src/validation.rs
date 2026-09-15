@@ -1122,6 +1122,18 @@ pub(crate) fn workspace_capture(
 
 /// Runs the bounded capture loop over an injectable capture, so tests can
 /// force each retry arm deterministically instead of racing the filesystem.
+///
+/// An attempt publishes when what it built answers the observations that landed while it
+/// was building. The filesystem epoch counts observations rather than content:
+/// [`IndexValidation::observe_locked`] increments it for every classified event, and
+/// [`watch_path_impact`] classifies from the path and the event kind without reading a
+/// byte, so an epoch that moved says nothing about whether the tree did. Two content
+/// comparisons answer that instead, and either one publishes: [`answered_candidate`], the
+/// same comparison a rebuild makes, when the observation names paths the candidate
+/// already holds; and a rescan that folds to the fingerprint the previous attempt folded
+/// to under an unmoved `rift.toml`, which is two scans taken at two epochs agreeing on
+/// every visible byte. A watch the backend reported broken publishes under neither,
+/// because the server no longer learns what moved.
 pub(crate) async fn initial_workspace_with(
     root: &Path,
     limits: WorkspaceIndexLimits,
@@ -1129,6 +1141,7 @@ pub(crate) async fn initial_workspace_with(
     blocking: &BlockingExecutor,
     capture: impl CaptureWorkspace + Clone + Send + 'static,
 ) -> Result<(Arc<PublishedWorkspace>, LexicalWrite), ReadError> {
+    let mut rescanned = None;
     for attempt in 1..=INDEX_CAPTURE_ATTEMPTS_MAX {
         let request = validation.take_pending();
         let epoch = request.epoch;
@@ -1160,28 +1173,36 @@ pub(crate) async fn initial_workspace_with(
         let Some((built, write)) = built else {
             continue;
         };
-        let stable_epoch = validation.observed_epoch() == epoch;
-        let watch_healthy = !validation.watch_failed.load(Ordering::Acquire);
-        if stable_epoch && watch_healthy {
-            let mut publication = validation.locked_pending();
-            if validation.observed_epoch() != epoch
-                || validation.watch_failed.load(Ordering::Acquire)
+        let scanned_the_same_tree = rescanned.as_ref() == Some(&built.fingerprint);
+        if !validation.watch_failed.load(Ordering::Acquire) {
+            let publication = validation.locked_pending();
+            let observed_epoch = validation.observed_epoch();
+            let answering = if validation.watch_failed.load(Ordering::Acquire) {
+                None
+            } else if scanned_the_same_tree
+                && built.configuration.fingerprint == configuration_fingerprint(root)
             {
-                publication.escalate();
+                Some(Arc::new(
+                    built.under(built.configuration.clone(), observed_epoch),
+                ))
+            } else {
+                answered_candidate(root, &built, &publication, observed_epoch)
+            };
+            if let Some(answering) = answering {
+                validation.replace_publication_locked(&answering);
                 drop(publication);
-                continue;
+                tracing::info!(
+                    component = "index",
+                    operation = "index.publish",
+                    trigger = "startup",
+                    epoch = observed_epoch,
+                    "index snapshot published"
+                );
+                return Ok((answering, write));
             }
-            validation.replace_publication_locked(&built);
             drop(publication);
-            tracing::info!(
-                component = "index",
-                operation = "index.publish",
-                trigger = "startup",
-                epoch,
-                "index snapshot published"
-            );
-            return Ok((built, write));
         }
+        rescanned = Some(built.fingerprint.clone());
     }
     Err(ReadFault::unavailable(
         "initial index build",
@@ -4076,28 +4097,72 @@ mod tests {
         Ok(())
     }
 
+    /// An epoch that moves while every scan folds to the same tree is an observation that
+    /// changed no byte, so the startup build publishes instead of spending its bound.
     #[tokio::test]
-    async fn initial_capture_fails_after_bounded_attempts_of_epoch_movement() -> TestResult {
+    async fn initial_capture_publishes_when_every_scan_folds_the_same_tree() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let (validation, _receiver) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
         let blocking = crate::server::BlockingExecutor::isolated(2, 60_000);
         let moving = Arc::clone(&validation);
+        let (published, _write) = super::initial_workspace_with(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &validation,
+            &blocking,
+            move |root, limits, request| {
+                // Every capture observes one more filesystem event, so no attempt ever
+                // sees a stable epoch, and none of those events changes a byte.
+                moving.observe_whole_workspace()?;
+                super::build_workspace_candidate(root, limits, request, &empty_dependency_store())
+            },
+        )
+        .await?;
+        assert_eq!(
+            published.epoch,
+            validation.observed_epoch(),
+            "the publication answers the epoch the observations reached"
+        );
+        Ok(())
+    }
+
+    /// A workspace whose every scan folds a different tree is genuinely moving, so the
+    /// bounded attempts still refuse rather than publish a scan nothing confirmed.
+    #[tokio::test]
+    async fn initial_capture_fails_when_every_scan_folds_a_different_tree() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let (validation, _receiver) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let blocking = crate::server::BlockingExecutor::isolated(2, 60_000);
+        let moving = Arc::clone(&validation);
+        let written = directory.path().to_path_buf();
         let error = super::initial_workspace_with(
             directory.path(),
             WorkspaceIndexLimits::default(),
             &validation,
             &blocking,
-            move |root, limits, epoch| {
-                // Every capture observes one more filesystem event, so no
-                // attempt ever sees a stable epoch.
+            move |root, limits, request| {
+                let candidate = super::build_workspace_candidate(
+                    root,
+                    limits,
+                    request,
+                    &empty_dependency_store(),
+                )?;
+                // The next scan reads bytes this one never held.
+                fs::write(
+                    written.join("lib.rs"),
+                    format!("pub fn beacon{}() {{}}\n", request.epoch),
+                )
+                .expect("the fixture write lands");
                 moving.observe_whole_workspace()?;
-                super::build_workspace_candidate(root, limits, epoch, &empty_dependency_store())
+                Ok(candidate)
             },
         )
         .await
-        .expect_err("movement during every capture must exhaust bounded attempts");
+        .expect_err("a tree that moves on every attempt must exhaust bounded attempts");
         assert_eq!(error.descriptor().code(), "temporarily_unavailable");
         Ok(())
     }
