@@ -36,6 +36,15 @@ def test_bun_cases_preserve_each_server_log(tmp_path: Path) -> None:
     ]
 
 
+def test_corpus_logs_disable_ansi_even_when_parent_allows_color(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("NO_COLOR", "")
+    corpus = Corpus(pins()["bun"], tmp_path / "rift", tmp_path / "report.json")
+    corpus.root = tmp_path / "workspace"
+    assert corpus.server().env["NO_COLOR"] == "1"
+
+
 @pytest.mark.parametrize("failing_read", [None, 3])
 def test_churn_writes_before_reads_and_keeps_writer_cadence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_read: int | None

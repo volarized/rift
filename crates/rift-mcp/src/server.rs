@@ -4263,7 +4263,10 @@ pub fn beacon() -> u64 {
         );
 
         let skipped = get_symbol(&reads, "beacon").await?;
-        assert!(skipped.hits.is_empty());
+        assert!(
+            skipped.hits.is_empty(),
+            "oversized source must leave the symbol index: {skipped:#?}"
+        );
         assert!(skipped.warnings.iter().any(|warning| matches!(
             warning,
             ReadWarning::SourceUnavailable { unit: Some(unit), detail }
