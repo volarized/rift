@@ -77,21 +77,27 @@ def lay_out_workspace(root: Path) -> None:
     (root / "src" / "main.rs").write_text(FIXTURE_SOURCE, encoding="utf-8")
 
 
-def build_server_binary() -> Path:
+def build_server_binary(*, release: bool = False, target: str | None = None) -> Path:
     """Build `rift` and answer the executable Cargo wrote.
 
     The build runs in this repository, where `rust-toolchain.toml` selects
     the compiler; the server itself then runs with the served workspace as
     its working directory, which is the root `rift server` serves.
     """
+    command = [
+        "cargo",
+        "build",
+        "--locked",
+        "-p",
+        "rift",
+        "--message-format=json-render-diagnostics",
+    ]
+    if release:
+        command.append("--release")
+    if target is not None:
+        command.extend(["--target", target])
     completed = subprocess.run(
-        [
-            "cargo",
-            "build",
-            "-p",
-            "rift",
-            "--message-format=json-render-diagnostics",
-        ],
+        command,
         cwd=REPOSITORY,
         check=True,
         capture_output=True,
@@ -103,9 +109,12 @@ def build_server_binary() -> Path:
             message = json.loads(line)
         except ValueError:
             continue
-        if message.get("reason") == "compiler-artifact" and message.get("executable"):
-            if message.get("target", {}).get("name") == "rift":
-                return Path(message["executable"])
+        if (
+            message.get("reason") == "compiler-artifact"
+            and message.get("executable")
+            and message.get("target", {}).get("name") == "rift"
+        ):
+            return Path(message["executable"])
     raise RuntimeError("the build reported no rift executable")
 
 

@@ -58,10 +58,9 @@ pub(crate) fn rust_engine_configuration() -> String {
 /// keeps indexing afterwards, so the bounds are generous - and still
 /// bounds: a wedged engine fails the suite instead of hanging it.
 ///
-/// Coverage starts several cold rust-analyzer processes in parallel. Its
-/// fixture retry table keeps shipped pacing but extends attempts to 16, a
-/// 25.75s wait bound, so instrumented process contention cannot turn this
-/// engine test into a machine-speed test.
+/// Retries use the shipped policy. Diagnostic settlement can consume the
+/// full retry table for each changed document, and one fixture operation
+/// may change several documents.
 pub(crate) fn fixture() -> EngineFixture {
     EngineFixture {
         placement: LspPlacement::Named,
@@ -69,6 +68,6 @@ pub(crate) fn fixture() -> EngineFixture {
         program: RUSTUP_PROGRAM,
         arguments: RUST_ANALYZER_ARGUMENTS.to_vec(),
         languages: vec!["rust"],
-        extra_toml: "\n[lsp.rust.retry]\nattempts = 16\n".to_owned(),
+        extra_toml: String::new(),
     }
 }

@@ -79,7 +79,7 @@ clean:
 # cached per machine, so only the first run pays for the download. Coverage is
 # this run's artifact, not a second run.
 test:
-    RIFT_ENGINE_LIVE=1 RIFT_SEARCH_LIVE=1 cargo llvm-cov --workspace --all-targets --all-features --lcov --output-path lcov.info --fail-under-lines 86
+    RIFT_ENGINE_LIVE=1 RIFT_SEARCH_LIVE=1 cargo llvm-cov nextest --workspace --all-targets --all-features --locked --profile ci --lcov --output-path lcov.info --fail-under-lines 86
 
 # The live-engine suites alone, for iterating on them without paying for
 # the instrumented workspace run.
@@ -101,7 +101,12 @@ release-test:
 installer-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_installers.py
 
-rust-gate: format dashes generate-check conformance check clippy docs audit test release-test installer-test
+testing-check:
+    uv run --locked --python 3.12 --project scripts ruff check scripts
+    uv run --locked --python 3.12 --project scripts ty check --extra-search-path scripts --extra-search-path tools/rift-release/src scripts
+    uv run --locked --python 3.12 --project scripts pytest scripts
+
+rust-gate: format dashes generate-check conformance check clippy docs audit test release-test installer-test testing-check
 
 # One signed tag on the commit `origin/main` names right now. The recipe reads
 # that commit from the remote, so the local checkout's branch and its uncommitted

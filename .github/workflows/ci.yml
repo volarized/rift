@@ -15,6 +15,7 @@ permissions:
 jobs:
   docs:
     runs-on: ubuntu-latest
+    timeout-minutes: 3
     defaults:
       run:
         working-directory: docs
@@ -87,6 +88,7 @@ jobs:
 
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     permissions:
       contents: read
 
@@ -103,7 +105,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7.6.0
       - uses: taiki-e/install-action@v2.86.3
         with:
-          tool: just,cargo-audit,cargo-deny,cargo-llvm-cov
+          tool: just,cargo-audit,cargo-deny,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
 
       # `rustup help toolchain install` documents a comma-separated component
       # list. Install every CI component from the pinned release in one step.
@@ -126,16 +128,31 @@ jobs:
       # coverage step: `just test` is the one instrumented run, and its
       # lcov output is the artifact uploaded below.
       - run: just format
+        timeout-minutes: 1
       - run: just dashes
+        timeout-minutes: 1
       - run: just generate-check
+        timeout-minutes: 2
       - run: just conformance
+        timeout-minutes: 3
       - run: just check
+        timeout-minutes: 2
       - run: just clippy
+        timeout-minutes: 2
       - run: just docs
+        timeout-minutes: 1
       - run: just audit
+        timeout-minutes: 1
+      - run: just testing-check
+        timeout-minutes: 1
       - run: just test
+        id: rust_tests
+        timeout-minutes: 10
+        env:
+          NEXTEST_PROFILE: ci
       - name: Test release tooling
         id: release_tests
+        timeout-minutes: 1
         run: just release-test
         env:
           PYTEST_ADDOPTS: >-
@@ -155,6 +172,7 @@ jobs:
 
       - name: Test installers
         id: installer_tests
+        timeout-minutes: 1
         run: just installer-test
         env:
           PYTEST_ADDOPTS: >-
@@ -182,6 +200,18 @@ jobs:
           name: rift-cli
           token: ${{ secrets.CODECOV_TOKEN }}
 
+      - name: Upload Rust test results
+        if: ${{ !cancelled() && steps.rust_tests.outcome != 'skipped' }}
+        uses: codecov/codecov-action@v5.5.5
+        with:
+          disable_search: true
+          fail_ci_if_error: true
+          files: target/nextest/ci/junit.xml
+          flags: gate
+          name: rift-gate
+          report_type: test_results
+          token: ${{ secrets.CODECOV_TOKEN }}
+
   # Feature resolution is per target: a dependency graph that compiles on
   # Linux proves nothing about the Windows graph (v0.0.2 shipped a Windows
   # build break CI never saw). Every OS in the release build matrix needs a
@@ -204,7 +234,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -221,7 +251,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, windows-2025]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 2
     steps:
       - uses: actions/checkout@v7.0.1
         with:
