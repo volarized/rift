@@ -189,7 +189,8 @@ impl std::str::FromStr for RustGrammarNodeKind {
 enum RustGrammarField {
     /// `name` field on declaration items.
     Name,
-    /// `type` field on `impl_item`.
+    /// `type` field on `impl_item`, and on the `generic_type` an `impl_item`
+    /// carries when it implements a generic type.
     Type,
     /// `body` field on block-bodied declaration items.
     Body,
@@ -473,7 +474,7 @@ impl GrammarRules for RustGrammarRules {
             }
             RustGrammarNodeKind::ImplItem => {
                 let item = node.child_by_field_name(RustGrammarField::Type.as_str())?;
-                text.get(item.byte_range())
+                text.get(implemented_type(item).byte_range())
                     .map(|value| value.split_whitespace().collect::<String>())
             }
             _ => None,
@@ -508,6 +509,22 @@ fn rust_parser() -> Result<Parser, SyntaxError> {
 fn declaration_name(node: Node<'_>, text: &str) -> Option<String> {
     let name = node.child_by_field_name(RustGrammarField::Name.as_str())?;
     text.get(name.byte_range()).map(Into::into)
+}
+
+/// Grammar spelling of a type applying generic arguments, from
+/// tree-sitter-rust 0.24.2 `node-types.json`.
+const GENERIC_TYPE_KIND: &str = "generic_type";
+
+/// The type an `impl` block implements, without the generic arguments the
+/// block applies to it: methods of `impl<T> Holder<T>` qualify through
+/// `Holder`, the name the `struct` itself declares. A self type the grammar
+/// does not spell as a `generic_type` is already its own name.
+fn implemented_type(node: Node<'_>) -> Node<'_> {
+    if node.kind() != GENERIC_TYPE_KIND {
+        return node;
+    }
+    node.child_by_field_name(RustGrammarField::Type.as_str())
+        .unwrap_or(node)
 }
 
 /// The attribute that exports a `macro_rules!` macro from its crate.
@@ -695,6 +712,32 @@ mod tests {
             .map(|symbol| symbol.container.as_deref())
             .collect::<Vec<_>>();
         assert_eq!(containers, [None, Some("café"), Some("café::Item")]);
+    }
+
+    /// The qualified name the index holds for a method of a generic `impl`
+    /// block, beside the one it holds for a method of a plain block: both
+    /// qualify through the implemented type's own name, so the generic
+    /// arguments the block applies never reach a method's address, and each
+    /// method's container names the `struct` that declares the type.
+    #[test]
+    fn test_a_generic_impl_qualifies_its_methods_through_the_implemented_type() {
+        let text = "pub struct Holder<Store> {\n    store: Store,\n}\n\n\
+                    pub struct Plain;\n\n\
+                    impl<Store: Clone> Holder<Store> {\n    pub fn run(&self) {}\n}\n\n\
+                    impl Plain {\n    pub fn run(&self) {}\n}\n";
+        let document = analyze(text);
+        let names = document
+            .symbols()
+            .iter()
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["Holder", "Plain", "Holder::run", "Plain::run"]);
+        let containers = document
+            .symbols()
+            .iter()
+            .map(|symbol| symbol.container.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(containers, [None, None, Some("Holder"), Some("Plain")]);
     }
 
     #[test]
