@@ -2392,11 +2392,9 @@ fn compiled_gitignore(path: &Path) -> Result<Gitignore, WorkspaceIndexError> {
     })
 }
 
-/// Hashes one already-discovered source and text path set without parsing syntax. Source
-/// paths enforce [`WorkspaceIndexLimits::file_bytes_max`] per file, matching the bound the
-/// index build applies; text paths carry no per-file bound, matching
-/// [`included_text_file`] - both classes still count against the shared aggregate
-/// `workspace_bytes_max`.
+/// Hashes one already-discovered source and text path set without parsing syntax. Both
+/// classes enforce [`WorkspaceIndexLimits::file_bytes_max`] before counting accepted bytes
+/// against `workspace_bytes_max`, matching the catalog read the index build applies.
 fn capture_paths(
     root: &Path,
     paths: &DiscoveredPaths,
@@ -2465,16 +2463,13 @@ fn capture_path_class(
 ) -> Result<Vec<(ProjectPath, FileDigest, FileDigest)>, WorkspaceIndexError> {
     let mut captured = Vec::with_capacity(paths.len());
     for path in paths {
-        let mut handle = fs::File::open(path).map_err(|error| {
+        let handle = fs::File::open(path).map_err(|error| {
             index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
         })?;
         let metadata = handle.metadata().map_err(|error| {
             index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
         })?;
-        let mut bytes = Vec::new();
-        handle.read_to_end(&mut bytes).map_err(|error| {
-            index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
-        })?;
+        let bytes = read_file_bytes(handle, path, limits)?;
         if bytes.len() > limits.file_bytes_max()
             || bytes.contains(&0)
             || std::str::from_utf8(&bytes).is_err()
@@ -2677,13 +2672,7 @@ fn read_file(
     let metadata = handle.metadata().map_err(|error| {
         index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
     })?;
-    let mut bytes = Vec::new();
-    handle
-        .take(limits.file_bytes_max().saturating_add(1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|error| {
-            index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
-        })?;
+    let bytes = read_file_bytes(handle, path, limits)?;
     let project_path = project_path_below(root, path)?;
     let mut file = included_file(project_path, bytes, path, provider, limits, workspace_bytes)?;
     file.executable = metadata_is_executable(&metadata);
@@ -2805,13 +2794,7 @@ fn read_catalog_file(
     let metadata = handle.metadata().map_err(|error| {
         index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
     })?;
-    let mut bytes = Vec::new();
-    handle
-        .take(limits.file_bytes_max().saturating_add(1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|error| {
-            index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
-        })?;
+    let bytes = read_file_bytes(handle, path, limits)?;
     let project_path = project_path_below(root, path)?;
     if bytes.len() > limits.file_bytes_max() {
         return Ok(IndexRead::left_out(WorkspaceIndexWarning::FileTooLarge(
@@ -2843,6 +2826,23 @@ fn metadata_is_executable(metadata: &fs::Metadata) -> bool {
 #[cfg(not(unix))]
 fn metadata_is_executable(_metadata: &fs::Metadata) -> bool {
     false
+}
+
+/// Reads at most one byte beyond the file bound, so callers can classify an oversized
+/// file without reading its remaining bytes. Capture, catalog, and syntax reads share it.
+fn read_file_bytes(
+    reader: impl std::io::Read,
+    path: &Path,
+    limits: WorkspaceIndexLimits,
+) -> Result<Vec<u8>, WorkspaceIndexError> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limits.file_bytes_max().saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
+        })?;
+    Ok(bytes)
 }
 
 /// Includes one UTF-8 file in the baseline content catalog.
@@ -4749,6 +4749,51 @@ mod tests {
             source: source.into_iter().map(|path| (path, provider)).collect(),
             text: Vec::new(),
         }
+    }
+
+    #[test]
+    fn file_byte_reads_stop_after_the_oversize_marker() {
+        let limits = WorkspaceIndexLimits::new(5, 4, 100, 4, 5).expect("limits");
+        let mut reader = std::io::Cursor::new(b"123456789".as_slice());
+        let bytes = super::read_file_bytes(&mut reader, Path::new("large.rs"), limits)
+            .expect("the bounded prefix reads");
+        assert_eq!(
+            bytes, b"12345",
+            "one excess byte proves the file is oversized"
+        );
+        assert_eq!(reader.position(), 5, "remaining bytes must not be consumed");
+
+        let mut empty = std::io::empty();
+        assert!(
+            super::read_file_bytes(&mut empty, Path::new("empty.rs"), limits)
+                .expect("empty file reads")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn file_byte_reads_preserve_errors_within_the_bound() {
+        struct FailedReader;
+
+        impl std::io::Read for FailedReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("capture read failed"))
+            }
+        }
+
+        let limits = WorkspaceIndexLimits::new(5, 4, 100, 4, 5).expect("limits");
+        let error = super::read_file_bytes(FailedReader, Path::new("failed.rs"), limits)
+            .expect_err("a failed read must not become an omitted file");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::Filesystem
+        );
+        assert!(error.to_string().contains("failed.rs"), "{error}");
+        assert!(
+            rift_core::causes(&error)
+                .iter()
+                .any(|cause| cause.contains("capture read failed"))
+        );
     }
 
     #[test]
