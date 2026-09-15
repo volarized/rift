@@ -53,8 +53,9 @@ The Windows installer job also runs command ownership tests against the native p
 
 The `full` workflow runs nightly on `main`, through `workflow_dispatch`, on PRs labeled
 `full-gate`, and from the release workflow. Corpus repositories run on separate runners. Test
-jobs have a 20-minute deadline, including setup and reports. Corpus and native candidate builds
-run in separate jobs with the release build's 30-minute deadline. Native unit tests run in
+jobs have a 20-minute deadline, including setup and reports. Corpus builds have a separate
+30-minute job. Native candidate compilation has a 30-minute step inside a 35-minute job,
+leaving time for setup, artifacts, and cache writes after compilation. Native unit tests run in
 separate 20-minute jobs after candidate builds, using the shared `native-tests` workflow.
 Candidate builds save the shared Rust cache; native test jobs only restore it. This keeps
 cache writes from canceling a completed test run.
@@ -111,6 +112,8 @@ history analysis. Logs must show the named operation has started before an activ
 sends the stop command.
 The five-second shutdown bound covers the stop command and the server process's actual exit;
 releasing the server election alone does not complete the check.
+Foreground cleanup has four seconds, leaving time for command startup and process observation.
+Transaction cancellation remains active after a lexical write's diagnostic deadline.
 
 An edit must produce one changed-file capture and one publication. Lexical persistence checks
 hash the ordered rows for every unchanged path and compare them after an edit. Database and WAL
@@ -119,7 +122,7 @@ cannot prove that unchanged source rows stayed unchanged.
 
 Reports record the commit, seed, case, selected identities and languages, actions, elapsed time,
 and failure. Set `RIFT_CORPUS_REPORT` to choose the JSON report location. Bun adds `.workspace`
-or `.stop` before the extension so both cases retain their report. Other repositories use the
+or `.stop` before the extension; Next.js adds `.workspace` or `.churn`. FastAPI uses the
 exact supplied path. Harness logs and reports stay outside the
 served checkout; only deliberate source and configuration edits enter it.
 

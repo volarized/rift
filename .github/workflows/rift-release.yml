@@ -60,7 +60,7 @@ jobs:
             target: aarch64-pc-windows-msvc
             binary: target/aarch64-pc-windows-msvc/release/rift.exe
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 35
     env:
       RIFT_TARGET: ${{ matrix.target }}
       # Match the native gate's Python harness while Rift remains ARM64 on Windows ARM.
@@ -79,6 +79,7 @@ jobs:
       - name: Install target
         run: rustup target add "${{ matrix.target }}"
       - name: Build release binary
+        timeout-minutes: 30
         run: cargo build --release --locked --target "${{ matrix.target }}" --package rift
       - name: Smoke test release binary
         run: >-

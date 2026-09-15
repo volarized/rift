@@ -56,7 +56,7 @@ jobs:
             target: aarch64-pc-windows-msvc
             binary: target/aarch64-pc-windows-msvc/release/rift.exe
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 35
     defaults:
       run:
         shell: bash
@@ -68,6 +68,7 @@ jobs:
         with:
           shared-key: release-${{ matrix.target }}
       - name: Build candidate binary
+        timeout-minutes: 30
         run: |
           rustup target add "${{ matrix.target }}"
           cargo build --release --locked --target "${{ matrix.target }}" --package rift
