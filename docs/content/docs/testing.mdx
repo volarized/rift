@@ -25,17 +25,31 @@ The gate checks formatting, dashes, generated files, MCP conformance, crate boun
 Rust documentation, dependency policy, coverage, release archives, installers, and Python scripts.
 `just test` runs the Rust suites once under `cargo llvm-cov nextest`; that same run produces
 `lcov.info` and must reach 86 percent line coverage. It does not run a second uninstrumented suite.
+`just engine-test` and `just search-test` select live suites through the same nextest runner.
+`just doctest` runs Rust documentation examples through `cargo test --doc`, as nextest does not
+support doctests on stable Rust. Python helper tests and the upstream MCP conformance runner
+check their own implementations.
 
 The Rust CI job has a 12-minute deadline. Nextest terminates a fast test after 60 seconds, allows
-10 seconds for cleanup, and does not retry failures. Live engine and model tests share one test
+10 seconds for Unix process cleanup, and does not retry failures. On Windows it terminates the
+test's Job Object immediately. Live engine and model tests share one test
 group because each nextest test runs in its own process.
+CI runs all selected tests after a failure and prints failed output immediately and at the end.
+An empty selection or leaked output handle fails the run. Nextest writes JUnit results under
+`target/nextest/<profile>/junit.xml`; CI retains them after test failure.
+The Windows installer job also runs command ownership tests against the native pywin32 wrapper.
 
 ## Full tier
 
 The `full` workflow runs nightly on `main`, through `workflow_dispatch`, on PRs labeled
-`full-gate`, and from the release workflow. Corpus repositories run on separate runners. Each
-job has a 20-minute deadline, including setup and compilation. Corpus execution also has its own
-deadline: FastAPI four minutes, Bun nine minutes, and Next.js twelve minutes.
+`full-gate`, and from the release workflow. Corpus repositories run on separate runners. Test
+jobs have a 20-minute deadline, including setup and reports. Corpus and native candidate builds
+run in separate jobs with the release build's 30-minute deadline. Nextest archives one
+instrumented corpus build for all four cases; each runner checks out the same source revision
+and runs the archived binaries. The release gate downloads native candidate binaries without
+rebuilding them. Corpus execution also has its own
+deadline: FastAPI four minutes, each Bun case nine minutes, and Next.js twelve minutes. Bun's
+workspace checks and shutdown checks run as separate nextest tests on separate CI runners.
 
 For local work, fetch the corpus once and run one repository at a time:
 
@@ -45,6 +59,15 @@ just corpus-test fastapi
 just corpus-test bun
 just corpus-test nextjs
 ```
+
+Corpus suites use the optimized Cargo `corpus` profile with coverage instrumentation, debug
+assertions, overflow checks, and line tables. Nextest's `corpus` profile runs one test at a time.
+Live corpus tests are ignored by the fast tier; `just corpus-test` explicitly selects them.
+Select one Bun case with `just corpus-test bun test_bun_workspace` or
+`just corpus-test bun test_bun_stop`.
+Nextest enforces each case's deadline, allows 30 seconds for cleanup, and bounds one corpus
+invocation at 19 minutes. CI step deadlines leave an additional minute beyond each case's work
+deadline for cleanup and reports.
 
 The cache lives under `~/.cache/rift-corpus`. Each suite creates a disposable checkout at the
 commit in `crates/rift/tests/corpus/pins.toml`. Fetches retain 50 commits of history; a separate
@@ -72,8 +95,10 @@ hash the ordered rows for every unchanged path and compare them after an edit. D
 sizes are recorded separately: `.rift/db` also stores logs, so file size or whole-file equality
 cannot prove that unchanged source rows stayed unchanged.
 
-Reports record the commit, seed, actions, elapsed time, and failure. Set `RIFT_CORPUS_REPORT` to
-an exact JSON path to choose the report location. Harness logs and reports stay outside the
+Reports record the commit, seed, case, selected identities and languages, actions, elapsed time,
+and failure. Set `RIFT_CORPUS_REPORT` to choose the JSON report location. Bun adds `.workspace`
+or `.stop` before the extension so both cases retain their report. Other repositories use the
+exact supplied path. Harness logs and reports stay outside the
 served checkout; only deliberate source and configuration edits enter it.
 
 ## Artifact and agent checks
@@ -106,8 +131,9 @@ configuration, then sees a new file. A second phase selects a missing engine and
 recorded launch failure while reads remain available.
 
 `just full-gate` runs the fast tier, all corpus suites, artifact, agent, and cold checks in
-sequence. On macOS, pass the Linux binary as `just full-gate <linux-binary>`. The final coverage
-report includes profiles from the fast tier and corpus without rerunning the fast tests.
+sequence and requires `lcov` to merge reports from the fast and optimized corpus builds. On
+macOS, pass the Linux binary as `just full-gate <linux-binary>`. The final coverage report
+includes both builds without rerunning the fast tests and must reach 86 percent line coverage.
 The workflow also runs the six-target installer and upgrade checks described below; those
 checks use disposable runners and are not part of the local `full-gate` recipe.
 
@@ -119,6 +145,12 @@ Each installed binary must match its verified archive and pass the artifact suit
 from the authentic published binary with the greatest stable version below the candidate, runs
 its existing updater, and checks the resulting bytes and served behavior.
 
+Windows Arm64 uses an x86-64 Python harness because the certificate dependency has no Arm64
+wheel. Rift binaries still run as Arm64. The gate checks each Windows archive's PE machine field
+before installation. It also checks Mach-O CPU fields on macOS and ELF machine fields on Linux,
+so emulation cannot hide a package with the wrong architecture. Each target requires its own
+single-architecture executable.
+
 For a published candidate, the commands are:
 
 ```sh
@@ -129,7 +161,10 @@ just upgrade-test v0.0.33 v0.0.34 aarch64-unknown-linux-gnu --published
 Omit `--published` to test a draft accessible to the authenticated GitHub CLI. For a local
 candidate, pass `--candidate-binary <path>`. Linux runs can use a temporary CA through
 `SSL_CERT_FILE`; macOS and Windows native trust changes are restricted to disposable GitHub
-runners.
+runners. On macOS, cleanup sets only the test CA's trust result to `unspecified`, deletes its
+certificate, and requires native verification to reject it as untrusted. An inert trust setting
+remains until the runner is destroyed. Removing the last setting can request interactive
+authorization even when run as root.
 
 The GitHub CLI downloads archives and checksum manifests before the test starts. A loopback
 HTTPS fixture serves those verified bytes through the URLs used by the installers and compiled

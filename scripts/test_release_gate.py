@@ -112,6 +112,46 @@ class GateTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_candidate_builds_are_required_and_draft_skips_are_explicit(self) -> None:
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/release-gate.yml").read_text()
+        )
+        build = workflow["jobs"]["build"]
+        gate = workflow["jobs"]["release-gate"]
+        self.assertEqual(build["if"], "${{ !inputs.draft }}")
+        self.assertEqual(gate["needs"], "build")
+        self.assertEqual(
+            gate["if"],
+            "${{ !cancelled() && ((inputs.draft && needs.build.result == 'skipped') "
+            "|| (!inputs.draft && needs.build.result == 'success')) }}",
+            "Only successful candidate builds or intentional draft skips may run gates",
+        )
+        self.assertEqual(build["timeout-minutes"], 30)
+        self.assertEqual(gate["timeout-minutes"], 20)
+        targets = build["strategy"]["matrix"]["include"]
+        self.assertEqual(targets, gate["strategy"]["matrix"]["include"])
+        self.assertEqual(
+            {target["target"] for target in targets}, set(SUPPORTED_TARGETS)
+        )
+        for job in (build, gate):
+            self.assertNotIn("continue-on-error", job)
+            self.assertTrue(
+                all("continue-on-error" not in step for step in job["steps"])
+            )
+        upload = next(
+            step for step in build["steps"] if "upload-artifact" in step.get("uses", "")
+        )
+        download = next(
+            step
+            for step in gate["steps"]
+            if "download-artifact" in step.get("uses", "")
+        )
+        self.assertEqual(upload["with"]["name"], download["with"]["name"])
+        self.assertEqual(upload["with"]["if-no-files-found"], "error")
+        self.assertTrue(
+            all("cargo build" not in step.get("run", "") for step in gate["steps"])
+        )
+
     def test_promotion_requires_every_target_and_unchanged_github_asset_digests(
         self,
     ) -> None:

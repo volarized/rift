@@ -31,7 +31,58 @@ on:
 # The release caller supplies contents: write; the full caller supplies contents: read.
 
 jobs:
+  build:
+    if: ${{ !inputs.draft }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: target/x86_64-unknown-linux-gnu/release/rift
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: target/aarch64-unknown-linux-gnu/release/rift
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: target/x86_64-apple-darwin/release/rift
+          - os: macos-15
+            target: aarch64-apple-darwin
+            binary: target/aarch64-apple-darwin/release/rift
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: target/x86_64-pc-windows-msvc/release/rift.exe
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            binary: target/aarch64-pc-windows-msvc/release/rift.exe
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          shared-key: release-${{ matrix.target }}
+      - name: Build candidate binary
+        run: |
+          rustup target add "${{ matrix.target }}"
+          cargo build --release --locked --target "${{ matrix.target }}" --package rift
+      - uses: actions/upload-artifact@v6.0.0
+        with:
+          name: candidate-${{ matrix.target }}
+          path: ${{ matrix.binary }}
+          if-no-files-found: error
+          retention-days: 7
+
   release-gate:
+    needs: build
+    # Explicit status check permits the intentional build skip for draft assets.
+    # Candidate gates require every native build to succeed.
+    if: ${{ !cancelled() && ((inputs.draft && needs.build.result == 'skipped') || (!inputs.draft && needs.build.result == 'success')) }}
     strategy:
       fail-fast: false
       matrix:
@@ -56,6 +107,10 @@ jobs:
             binary: target/aarch64-pc-windows-msvc/release/rift.exe
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    env:
+      # cryptography has no Windows ARM wheel. Only the Python harness runs under
+      # x64 emulation; the installer and updater execute the verified ARM64 binary.
+      UV_PYTHON: ${{ matrix.os == 'windows-11-arm' && 'cpython-3.12-windows-x86_64-none' || '3.12' }}
     defaults:
       run:
         shell: bash
@@ -63,15 +118,23 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/download-artifact@v7.0.0
+        if: ${{ !inputs.draft }}
+        with:
+          name: candidate-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release
+      - name: Restore candidate execution permission
+        if: ${{ !inputs.draft && runner.os != 'Windows' }}
+        run: chmod +x "${{ matrix.binary }}"
       - uses: astral-sh/setup-uv@v7.6.0
         with:
           enable-cache: true
           cache-dependency-glob: scripts/uv.lock
       - name: Install gate dependencies
-        run: uv sync --locked --python 3.12 --project scripts
+        run: uv sync --locked --project scripts
       - name: Verify command ownership
         timeout-minutes: 1
-        run: uv run --locked --python 3.12 --project scripts python scripts/test_release_process.py
+        run: uv run --locked --project scripts python scripts/test_release_process.py
       - name: Install Linux shell
         if: matrix.os == 'ubuntu-24.04'
         run: |
@@ -79,15 +142,6 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y zsh
           fi
-      - uses: Swatinem/rust-cache@v2.9.2
-        if: ${{ !inputs.draft }}
-        with:
-          shared-key: release-${{ matrix.target }}
-      - name: Build candidate binary
-        if: ${{ !inputs.draft }}
-        run: |
-          rustup target add "${{ matrix.target }}"
-          cargo build --release --locked --target "${{ matrix.target }}" --package rift
       - name: Install and upgrade verified release bytes
         timeout-minutes: 8
         env:
@@ -102,7 +156,7 @@ jobs:
           if [[ "$RIFT_GATE_DRAFT" != true ]]; then args+=(--candidate-binary "${{ matrix.binary }}"); fi
           if [[ "$RUNNER_OS" == Linux ]]; then args+=(--coldstart); fi
           if [[ "${{ matrix.os }}" == ubuntu-24.04 ]]; then args+=(--agent); fi
-          uv run --locked --python 3.12 --project scripts python scripts/check_release_gate.py "${args[@]}"
+          uv run --locked --project scripts python scripts/check_release_gate.py "${args[@]}"
       - uses: actions/upload-artifact@v6.0.0
         if: always()
         with:
