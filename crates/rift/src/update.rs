@@ -959,7 +959,9 @@ fn publish_candidate(current: &Path, candidate: &Path) -> Result<OldBinaryCleanu
     }
     fs::copy(candidate, &prepared)
         .map_err(|error| publish_error("copying the downloaded binary to", &prepared, error))?;
-    fs::File::open(&prepared)
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&prepared)
         .and_then(|file| file.sync_all())
         .map_err(|error| publish_error("flushing the staged binary", &prepared, error))?;
     fs::rename(current, &backup)
@@ -1524,6 +1526,36 @@ mod tests {
         );
         assert_eq!(fs::read(&current)?, b"new");
         assert_eq!(fs::metadata(&current)?.permissions().mode() & 0o777, 0o751);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_publish_flushes_staging_and_preserves_backup() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let current = directory.path().join("rift.exe");
+        let candidate = directory.path().join("candidate.exe");
+        let prepared = directory.path().join(super::WINDOWS_UPDATE_PREPARED_NAME);
+        let backup = directory.path().join(super::WINDOWS_UPDATE_BACKUP_NAME);
+        fs::write(&current, b"old")?;
+        fs::write(&candidate, b"new")?;
+        fs::write(&prepared, b"stale")?;
+
+        // Windows FlushFileBuffers requires a handle with write access.
+        let read_only_flush = fs::File::open(&prepared)?
+            .sync_all()
+            .expect_err("a read-only staged handle must reject flushing on Windows");
+        assert_eq!(read_only_flush.kind(), std::io::ErrorKind::PermissionDenied);
+
+        // The fixture bytes cannot launch a cleanup process, so the backup remains.
+        assert_eq!(
+            AtomicPublisher.publish(&current, &candidate).await?,
+            OldBinaryCleanup::Remaining(backup.clone())
+        );
+        assert_eq!(fs::read(&current)?, b"new");
+        assert_eq!(fs::read(&candidate)?, b"new");
+        assert_eq!(fs::read(&backup)?, b"old");
+        assert!(!prepared.exists());
         Ok(())
     }
 
