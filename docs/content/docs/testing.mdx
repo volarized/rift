@@ -1,0 +1,147 @@
+---
+title: Testing
+---
+
+<VersionBadge version="v0.0.34" />
+
+Rift has two test tiers. The fast tier checks each PR and push to `main`. The full tier serves
+three pinned repositories and validates release artifacts, installers, and upgrades before a
+release leaves draft.
+
+## Fast tier
+
+Install the pinned Rust toolchain, `uv`, `just`, `cargo-audit`, `cargo-deny`, `cargo-llvm-cov`,
+and `cargo-nextest`. Live tests also need `rust-analyzer`, Bun, and network access to the model
+hub. The model cache is reused after the first download. Python scripts use Python 3.12 and
+`scripts/uv.lock`.
+CI pins `cargo-llvm-cov` 0.8.7 and `cargo-nextest` 0.9.140. Use those versions for the same
+instrumentation and test-result paths locally.
+
+```sh
+just rust-gate
+```
+
+The gate checks formatting, dashes, generated files, MCP conformance, crate boundaries, Clippy,
+Rust documentation, dependency policy, coverage, release archives, installers, and Python scripts.
+`just test` runs the Rust suites once under `cargo llvm-cov nextest`; that same run produces
+`lcov.info` and must reach 86 percent line coverage. It does not run a second uninstrumented suite.
+
+The Rust CI job has a 12-minute deadline. Nextest terminates a fast test after 60 seconds, allows
+10 seconds for cleanup, and does not retry failures. Live engine and model tests share one test
+group because each nextest test runs in its own process.
+
+## Full tier
+
+The `full` workflow runs nightly on `main`, through `workflow_dispatch`, on PRs labeled
+`full-gate`, and from the release workflow. Corpus repositories run on separate runners. Each
+job has a 20-minute deadline, including setup and compilation. Corpus execution also has its own
+deadline: FastAPI four minutes, Bun nine minutes, and Next.js twelve minutes.
+
+For local work, fetch the corpus once and run one repository at a time:
+
+```sh
+just corpus-sync
+just corpus-test fastapi
+just corpus-test bun
+just corpus-test nextjs
+```
+
+The cache lives under `~/.cache/rift-corpus`. Each suite creates a disposable checkout at the
+commit in `crates/rift/tests/corpus/pins.toml`. Fetches retain 50 commits of history; a separate
+depth-one checkout tests the shallow-history response. Every run compares Git tree counts and
+sizes with the pin before serving the tree. A repin must update those measurements.
+Corpus configuration disables semantic model downloads and preserves source, dependency, and
+lexical defaults.
+
+| Repository | Tracked files | Tracked bytes | Symlinks | Maximum path depth |
+| --- | ---: | ---: | ---: | ---: |
+| Bun | 19,743 | 197,365,136 | 9 | 10 |
+| Next.js | 31,115 | 157,964,029 | 32 | 15 |
+| FastAPI | 3,137 | 34,759,910 | 0 | 6 |
+
+Suites check publication, manifest bounds, selected source bounds, paths served through symlinks,
+and 200 symbol identities per repository passed from reads to changes. Next.js adds 50 reads
+during file churn. Bun checks shutdown while idle, after edits, during a rebuild, and during
+history analysis. Logs must show the named operation has started before an active-work stop test
+sends the stop command.
+
+An edit must produce one changed-file capture and one publication. Lexical persistence checks
+hash the ordered rows for every unchanged path and compare them after an edit. Database and WAL
+sizes are recorded separately: `.rift/db` also stores logs, so file size or whole-file equality
+cannot prove that unchanged source rows stayed unchanged.
+
+Reports record the commit, seed, actions, elapsed time, and failure. Set `RIFT_CORPUS_REPORT` to
+an exact JSON path to choose the report location. Harness logs and reports stay outside the
+served checkout; only deliberate source and configuration edits enter it.
+
+## Artifact and agent checks
+
+```sh
+just artifact-test
+just agent-test
+```
+
+Both commands build the native release binary unless `--binary <path>` is supplied. A supplied
+binary is tested unchanged. `--target <triple>` selects a Cargo target when building.
+
+The artifact suite starts the actual binary from a temporary workspace and validates search,
+symbol reads, an applied patch with source and read-back checks, and shutdown. The agent suite
+uses the pinned Python MCP SDK and JSON
+Schema validator over stdio. It lists all 12 tools, requires all nine change tools to apply,
+checks stale-address refusal without source changes, and reads all three resource documents.
+The independent MCP conformance runner remains part of the fast tier.
+
+The cold suite needs Docker and a Linux binary matching the container architecture:
+
+```sh
+just coldstart-test --binary target/release/rift
+```
+
+On Linux, omitting `--binary` builds the native release binary. On macOS, supply a Linux build;
+a macOS executable cannot run inside the container. The container has no network, language
+servers, language toolchains, or existing Rift cache. It first serves an empty workspace without
+configuration, then sees a new file. A second phase selects a missing engine and checks the
+recorded launch failure while reads remain available.
+
+`just full-gate` runs the fast tier, all corpus suites, artifact, agent, and cold checks in
+sequence. On macOS, pass the Linux binary as `just full-gate <linux-binary>`. The final coverage
+report includes profiles from the fast tier and corpus without rerunning the fast tests.
+The workflow also runs the six-target installer and upgrade checks described below; those
+checks use disposable runners and are not part of the local `full-gate` recipe.
+
+## Install and upgrade checks
+
+`release-gate` runs on Linux, macOS, and Windows, each on x86-64 and Arm64. It tests the documented
+Bash installer command from each selected Unix shell and the PowerShell installer on Windows.
+Each installed binary must match its verified archive and pass the artifact suite. Upgrade starts
+from the authentic published binary with the greatest stable version below the candidate, runs
+its existing updater, and checks the resulting bytes and served behavior.
+
+For a published candidate, the commands are:
+
+```sh
+just installer-live-test v0.0.34 aarch64-unknown-linux-gnu --published
+just upgrade-test v0.0.33 v0.0.34 aarch64-unknown-linux-gnu --published
+```
+
+Omit `--published` to test a draft accessible to the authenticated GitHub CLI. For a local
+candidate, pass `--candidate-binary <path>`. Linux runs can use a temporary CA through
+`SSL_CERT_FILE`; macOS and Windows native trust changes are restricted to disposable GitHub
+runners.
+
+The GitHub CLI downloads archives and checksum manifests before the test starts. A loopback
+HTTPS fixture serves those verified bytes through the URLs used by the installers and compiled
+into the historical updater. Certificate validation remains enabled. GitHub credentials do not reach the
+fixture, installer, or updater.
+
+The release workflow uploads six archives and their checksum manifest to a draft. Promotion
+requires every release gate and full-tier job to pass, then compares the tested archive and
+manifest digests with the current draft assets. Only after promotion does the workflow deploy
+documentation and installers.
+
+## Reports
+
+Codecov receives fast coverage under `cli` and corpus coverage under `corpus`. Only `corpus`
+allows coverage from an earlier commit to carry forward. JUnit results use `gate` and remain
+separate from line coverage. CI uploads corpus actions and release checksum evidence alongside
+test results so a failed run can be inspected and repeated.

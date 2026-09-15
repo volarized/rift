@@ -123,6 +123,12 @@ agent-test *args:
 coldstart-test *args:
     uv run --locked --python 3.12 --project scripts python scripts/check_coldstart.py {{ args }}
 
+installer-live-test tag target *args:
+    uv run --locked --python 3.12 --project scripts python scripts/check_release_gate.py --mode install --tag {{ quote(tag) }} --target {{ quote(target) }} {{ args }}
+
+upgrade-test from_tag to_tag target *args:
+    uv run --locked --python 3.12 --project scripts python scripts/check_release_gate.py --mode upgrade --from-tag {{ quote(from_tag) }} --tag {{ quote(to_tag) }} --target {{ quote(target) }} {{ args }}
+
 # One large workspace at a time on the development machine. The CI full tier
 # runs these repositories on separate runners with separate job budgets.
 full-gate linux_binary="":
