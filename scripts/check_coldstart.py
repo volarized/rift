@@ -26,7 +26,7 @@ from check_artifact import symbol_hit, symbol_id
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.shared.exceptions import McpError
-from release_process import run
+from release_process import owned_environment, run
 from rift_test_client import (
     Client,
     array_value,
@@ -217,10 +217,13 @@ async def check_coldstart(binary: Path, image: str, version: str | None = None) 
                     observed == f"rift {version.removeprefix('v')}",
                     f"unexpected version: {observed}",
                 )
-            with stderr_log() as log:
+            with (
+                stderr_log() as log,
+                owned_environment(dict(os.environ)) as environment,
+            ):
                 parameters = StdioServerParameters(
                     command="docker",
-                    env=dict(os.environ),
+                    env=environment,
                     args=[
                         "exec",
                         "-i",
