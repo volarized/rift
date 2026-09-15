@@ -167,8 +167,11 @@ JUnit names the historical refusal and installer recovery separately. Evidence r
 `installer-recovery`, including the historical error and staged path; promotion requires
 that record for the approved Windows version pair. Ordinary upgrades record `update`.
 The production updater has no recovery fallback. Its v0.0.34 publisher opens the staged file
-with write access. Both native Windows builds run the filesystem regression through nextest
-before uploading release bytes. The historical staging file remains after installer recovery;
+with write access. Both native Windows builds run two publisher regressions through nextest
+before uploading release bytes. One checks staging file access. The other publishes the actual candidate
+from a running copy of the test executable, then verifies the candidate's bytes and version,
+and removal of the backup and staging files. It requires the built CLI and runs explicitly
+with `--run-ignored all`. The historical staging file remains after installer recovery;
 the current updater removes stale staging before its next publication.
 
 Windows Arm64 uses an x86-64 Python harness because the certificate dependency has no Arm64

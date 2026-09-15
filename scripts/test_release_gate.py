@@ -383,6 +383,34 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("--python", smoke["run"])
         self.assertNotIn("UV_PYTHON", smoke.get("env", {}))
 
+    def test_windows_publication_runs_both_regressions_with_candidate_binary(
+        self,
+    ) -> None:
+        for name in ("release-gate.yml", "rift-release.yml"):
+            with self.subTest(workflow=name):
+                workflow = yaml.safe_load(
+                    (ROOT / ".github/workflows" / name).read_text()
+                )
+                steps = workflow["jobs"]["build"]["steps"]
+                test = next(
+                    step
+                    for step in steps
+                    if step.get("name") == "Test Windows update publication"
+                )
+                self.assertEqual(test["if"], "runner.os == 'Windows'")
+                self.assertEqual(
+                    test["env"]["RIFT_UPDATE_TEST_BINARY"],
+                    "${{ github.workspace }}/${{ matrix.binary }}",
+                )
+                self.assertIn("--run-ignored all", test["run"])
+                self.assertIn("--no-tests fail", test["run"])
+                for case in (
+                    "windows_publish_flushes_staging_and_preserves_backup",
+                    "windows_publish_replaces_running_binary_and_cleans_backup",
+                ):
+                    self.assertIn(f"test(=update::tests::{case})", test["run"])
+                self.assertNotIn("continue-on-error", test)
+
     def test_candidate_builds_are_required_and_draft_skips_are_explicit(self) -> None:
         workflow = yaml.safe_load(
             (ROOT / ".github/workflows/release-gate.yml").read_text()
