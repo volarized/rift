@@ -86,10 +86,12 @@ Startup runs one cycle:
 `rift mcp` each allow 30 seconds for publication. A start whose child is still indexing when
 that window closes reports the server as starting rather than failing, and a start that finds
 the election already held reports the same without spawning. `rift server stop` sends the
-authorized stop request and waits for the election to release; `rift server restart` chains
-the two. `rift server status` reports the workspace's current state - a serving server with
-its port, pid, and version, a server still indexing, a stale `.rift/server.json` with the
-reason it went stale, or no server - and changes nothing. A probe counts a server as serving
+authorized stop request and waits for that process to exit or release its election. A proxy
+can start a replacement during this wait; the replacement does not extend the original stop.
+`rift server restart` chains stop and start. `rift server status` reports the workspace's
+current state - a serving server with its port, pid, and version, a server still indexing,
+a stale `.rift/server.json` with the reason it went stale, or no server - and changes nothing.
+A probe counts a server as serving
 only when its election is held and its recorded port accepts a connect. `--foreground` keeps
 the cycle in the calling process, where Ctrl-C stops it.
 
@@ -106,6 +108,10 @@ Blocking tasks run on a Tokio-controlled worker pool. A request for blocking wor
 queue, and a worker picks it up when one is free. This behavior is configurable via the
 `num_workers` and `worker_queue_timeout` keys in the
 [`[server]` section](/docs/configuration#server).
+
+Freeing a large index can take longer than closing the listener. After the index supervisor
+stops, the blocking pool releases its retained index while the foreground process finishes
+the log drain and releases the election.
 
 A stopped server leaves its process as soon as serving has ended and the log drain has stopped,
 through the process exit rather than by returning from `main`. Dropping the runtime would wait

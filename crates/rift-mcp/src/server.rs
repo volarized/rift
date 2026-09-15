@@ -2105,8 +2105,8 @@ impl RiftMcp {
         let waited_ms = timeout.as_millis();
         if published == observed {
             return format!(
-                "the index settled at epoch {published} but the tree kept moving under the \
-                 request for {waited_ms}ms; read rift://logs for the rebuilds it made"
+                "the index settled at epoch {published}, but workspace validation did not finish \
+                 within {waited_ms}ms; read rift://logs for capture and rebuild records"
             );
         }
         format!(
@@ -6181,13 +6181,17 @@ pub fn beacon() -> u64 {
     }
 
     #[tokio::test]
-    async fn a_stall_after_the_epoch_settled_names_tree_movement() -> TestResult {
+    async fn a_stall_after_the_epoch_settled_names_unfinished_validation() -> TestResult {
         let (_directory, server) = fixture().await?;
 
         let detail = server.readiness_stall(Duration::from_millis(25)).await;
 
         assert!(detail.contains("the index settled at epoch 0"), "{detail}");
-        assert!(detail.contains("tree kept moving"), "{detail}");
+        assert!(
+            detail.contains("workspace validation did not finish"),
+            "{detail}"
+        );
+        assert!(detail.contains("capture and rebuild records"), "{detail}");
         assert!(detail.contains("25ms"), "{detail}");
         Ok(())
     }
