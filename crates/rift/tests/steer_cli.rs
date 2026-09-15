@@ -17,7 +17,10 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 const HOOK_STDIN_BYTES_MAX: usize = 1_048_576;
 
 fn run_steer(root: &Path, stdin: &str, env: &[(&str, &str)]) -> TestResult<Output> {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_rift"));
+    let mut command = Command::new(
+        std::env::var_os("CARGO_BIN_EXE_rift")
+            .ok_or("test runner must provide CARGO_BIN_EXE_rift")?,
+    );
     command
         .arg("steer")
         .current_dir(root)
