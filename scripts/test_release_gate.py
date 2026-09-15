@@ -430,12 +430,18 @@ class WorkflowTests(unittest.TestCase):
         self,
     ) -> None:
         tag = "v0.0.34"
+        staged = r"C:\release-gate\upgrade\.rift-update-new.exe"
+        recovery = {
+            "method": "installer-recovery",
+            "historical_error": windows_flush_error(staged),
+            "staged_path": staged,
+        }
         evidence: list[dict[str, object]] = [
             {
                 "tag": tag,
                 "target": target,
                 "from_tag": "v0.0.33",
-                "upgrade": {"method": "update"},
+                "upgrade": recovery if "windows" in target else {"method": "update"},
                 "archive_sha256": "a" * 64,
                 "manifest_sha256": "b" * 64,
             }
@@ -455,6 +461,28 @@ class WorkflowTests(unittest.TestCase):
             "assets": assets,
         }
         require_promotion(tag, document, evidence)
+        for item in evidence:
+            if "windows" in str(item["target"]):
+                with (
+                    self.subTest(target=item["target"]),
+                    self.assertRaisesRegex(ValueError, "requires installer recovery"),
+                ):
+                    item["upgrade"] = {"method": "update"}
+                    require_promotion(tag, document, evidence)
+                item["upgrade"] = recovery
+        future_tag = "v0.0.35"
+        future_document = document | {
+            "tagName": future_tag,
+            "assets": [
+                asset | {"name": asset["name"].replace(tag, future_tag)}
+                for asset in assets
+            ],
+        }
+        future_evidence = [
+            item | {"tag": future_tag, "upgrade": {"method": "update"}}
+            for item in evidence
+        ]
+        require_promotion(future_tag, future_document, future_evidence)
         with self.assertRaisesRegex(ValueError, "every release target"):
             require_promotion(tag, document, evidence[:-1])
         with self.assertRaisesRegex(ValueError, "every release target"):
@@ -462,16 +490,11 @@ class WorkflowTests(unittest.TestCase):
         windows = next(
             item for item in evidence if item["target"] == "x86_64-pc-windows-msvc"
         )
-        staged = r"C:\release-gate\upgrade\.rift-update-new.exe"
-        recovery = {
-            "method": "installer-recovery",
-            "historical_error": windows_flush_error(staged),
-            "staged_path": staged,
-        }
         windows["upgrade"] = recovery
         require_promotion(tag, document, evidence)
         for invalid in (
             None,
+            {"method": "update"},
             {"method": "install"},
             {"method": "installer-recovery"},
             recovery | {"historical_error": "other failure"},
@@ -495,7 +518,7 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "limited to Windows"):
             require_promotion(tag, document, evidence)
         linux["upgrade"] = {"method": "update"}
-        windows["upgrade"] = {"method": "update"}
+        windows["upgrade"] = recovery
         assets[0]["digest"] = "sha256:" + "c" * 64
         with self.assertRaisesRegex(ValueError, "changed after verification"):
             require_promotion(tag, document, evidence)

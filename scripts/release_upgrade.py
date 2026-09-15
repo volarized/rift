@@ -35,6 +35,10 @@ def require_upgrade_evidence(
     if not isinstance(evidence, dict):
         raise TypeError("promotion requires upgrade method evidence")
     if evidence == {"method": "update"}:
+        if windows_v33_recovery(from_tag, tag, target):
+            raise ValueError(
+                "Windows v0.0.33 -> v0.0.34 requires installer recovery evidence"
+            )
         return
     if (
         set(evidence) != {"method", "historical_error", "staged_path"}
