@@ -383,33 +383,83 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("--python", smoke["run"])
         self.assertNotIn("UV_PYTHON", smoke.get("env", {}))
 
-    def test_windows_publication_runs_both_regressions_with_candidate_binary(
+    def test_native_builds_select_process_exit_and_platform_publication_cases(
         self,
     ) -> None:
+        portable = (
+            "server::tests::stopped_process_does_not_wait_for_a_replacement_election",
+            "server::tests::changed_or_missing_document_does_not_prove_process_exit",
+            "server::tests::already_exited_process_does_not_wait_for_a_building_holder",
+            "server::tests::process_observation_errors_keep_waiting_and_retain_their_cause",
+            "server::tests::await_stopped_times_out_while_the_holder_keeps_the_election",
+            "server::tests::await_election_released_returns_once_the_holder_is_gone",
+        )
         for name in ("release-gate.yml", "rift-release.yml"):
             with self.subTest(workflow=name):
                 workflow = yaml.safe_load(
                     (ROOT / ".github/workflows" / name).read_text()
                 )
-                steps = workflow["jobs"]["build"]["steps"]
+                build = workflow["jobs"]["build"]
+                steps = build["steps"]
                 test = next(
                     step
                     for step in steps
-                    if step.get("name") == "Test Windows update publication"
+                    if step.get("name")
+                    == "Test native process exit and update publication"
                 )
-                self.assertEqual(test["if"], "runner.os == 'Windows'")
+                installer = next(
+                    step
+                    for step in steps
+                    if step.get("with", {}).get("tool") == "cargo-nextest@0.9.140"
+                )
+                self.assertNotIn("if", installer)
+                self.assertNotIn("if", test)
+                self.assertEqual(build["timeout-minutes"], 30)
+                self.assertEqual(test["shell"], "bash")
                 self.assertEqual(
                     test["env"]["RIFT_UPDATE_TEST_BINARY"],
                     "${{ github.workspace }}/${{ matrix.binary }}",
                 )
-                self.assertIn("--run-ignored all", test["run"])
-                self.assertIn("--no-tests fail", test["run"])
+                common, conditional = test["env"]["RIFT_NATIVE_TESTS"].split("${{", 1)
+                self.assertEqual(
+                    {part.strip() for part in common.split("or ")},
+                    {f"test(={case})" for case in portable},
+                )
+                self.assertTrue(
+                    conditional.startswith(" runner.os == 'Windows' && 'or ")
+                )
+                self.assertTrue(conditional.endswith("' || '' }}"))
                 for case in (
                     "windows_publish_flushes_staging_and_preserves_backup",
                     "windows_publish_replaces_running_binary_and_cleans_backup",
                 ):
-                    self.assertIn(f"test(=update::tests::{case})", test["run"])
+                    self.assertIn(f"test(=update::tests::{case})", conditional)
+                self.assertNotIn("probe", test["env"]["RIFT_NATIVE_TESTS"])
+                self.assertIn("--bin rift", test["run"])
+                self.assertNotIn("--test ", test["run"])
+                self.assertIn("--no-tests fail", test["run"])
+                self.assertIn(
+                    "${{ runner.os == 'Windows' && '--run-ignored all' || '' }}",
+                    test["run"],
+                )
+                self.assertIn('-E "$RIFT_NATIVE_TESTS"', test["run"])
+                cli = [
+                    step
+                    for step in steps
+                    if "cargo build --release --locked" in step.get("run", "")
+                ]
+                self.assertEqual(len(cli), 1)
+                self.assertLess(steps.index(cli[0]), steps.index(test))
                 self.assertNotIn("continue-on-error", test)
+                report = next(
+                    step
+                    for step in steps
+                    if step.get("with", {}).get("name")
+                    == "native-tests-${{ matrix.target }}"
+                )
+                self.assertEqual(report["if"], "always()")
+                self.assertEqual(report["with"]["path"], "target/nextest/ci/junit.xml")
+                self.assertEqual(report["with"]["if-no-files-found"], "error")
 
     def test_candidate_builds_are_required_and_draft_skips_are_explicit(self) -> None:
         workflow = yaml.safe_load(

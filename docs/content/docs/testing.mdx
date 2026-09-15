@@ -167,8 +167,11 @@ JUnit names the historical refusal and installer recovery separately. Evidence r
 `installer-recovery`, including the historical error and staged path; promotion requires
 that record for the approved Windows version pair. Ordinary upgrades record `update`.
 The production updater has no recovery fallback. Its v0.0.34 publisher opens the staged file
-with write access. Both native Windows builds run two publisher regressions through nextest
-before uploading release bytes. One checks staging file access. The other publishes the actual candidate
+with write access. Native builds compile the CLI with production dependency features, then
+run focused unit tests through nextest. All six targets test process exit when the election
+changes or remains held, when the lock document changes or disappears, and when process
+observation fails. Windows additionally runs two publisher regressions before uploading
+release bytes. One checks staging file access. The other publishes the actual candidate
 from a running copy of the test executable, then verifies the candidate's bytes and version,
 and removal of the backup and staging files. It requires the built CLI and runs explicitly
 with `--run-ignored all`. The historical staging file remains after installer recovery;
@@ -214,6 +217,8 @@ Codecov receives fast coverage under `cli` and corpus coverage under `corpus`. O
 allows coverage from an earlier commit to carry forward. JUnit results use `gate` and remain
 separate from line coverage. CI uploads corpus actions and release checksum evidence alongside
 test results so a failed run can be inspected and repeated.
+
+Each native build uploads `native-tests-<target>` with its nextest JUnit report.
 
 The `fast-results` artifact contains fast LCOV and nextest JUnit reports. Each corpus artifact
 contains its LCOV, JUnit, actions, and server logs. Compare or merge reports from the same
