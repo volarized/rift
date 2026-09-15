@@ -93,6 +93,15 @@ reason it went stale, or no server - and changes nothing. A probe counts a serve
 only when its election is held and its recorded port accepts a connect. `--foreground` keeps
 the cycle in the calling process, where Ctrl-C stops it.
 
+<VersionBadge version="v0.0.33" />
+
+`--auth skip` serves every request that clears the loopback boundary without the bearer check.
+The MCP specification's own conformance runner forced it: the runner addresses a server by URL
+alone and sends no `Authorization` header, so a checked server refuses it at the door. The CLI
+accepts the flag only together with `--foreground`, so no detached server ever serves
+unchecked; the server still mints its token and writes it into `.rift/server.json`, so
+`rift mcp` reaches it unchanged; and the serving process records one `WARN` naming the run.
+
 Blocking tasks run on a Tokio-controlled worker pool. A request for blocking work lands in a
 queue, and a worker picks it up when one is free. This behavior is configurable via the
 `num_workers` and `worker_queue_timeout` keys in the
