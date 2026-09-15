@@ -647,6 +647,14 @@ impl IndexValidation {
         result
     }
 
+    /// How many paths one observation may retain before it escalates to the whole
+    /// workspace. A caller that already knows how many paths it is about to name reads
+    /// this bound and asks for the whole workspace itself, so the escalation is stated
+    /// where it is decided rather than discovered inside the retention.
+    pub(crate) const fn paths_max(&self) -> usize {
+        self.paths_max
+    }
+
     /// Marks watcher unhealthy and records invalidation in one critical section.
     pub(crate) fn observe_watch_failure(&self) -> Result<u64, ReadError> {
         let mut publication = self.locked_pending();
