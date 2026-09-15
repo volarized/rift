@@ -1128,20 +1128,60 @@ pub(crate) fn workspace_capture(
     }
 }
 
+/// What one startup attempt's scan folded, kept so the next attempt compares content
+/// instead of counters.
+struct ScannedTree {
+    /// Every recorded file's digest: the syntax-indexed files, the baseline text files,
+    /// and the files the build left out. This is the whole set
+    /// [`WorkspaceFingerprint`](rift_index::WorkspaceFingerprint) folds, so two scans that
+    /// agree here read one tree.
+    digests: rift_index::WorkspaceDigests,
+    /// The `rift.toml` state the candidate was built under.
+    ///
+    /// [`configuration_fingerprint`] folds that one file and nothing else: its absence or
+    /// unreadability, its length once past `CONFIGURATION_FILE_BYTES_MAX`, and otherwise
+    /// the SHA-256 of its bytes.
+    configuration: ConfigurationFingerprint,
+}
+
+impl ScannedTree {
+    /// Which set moved between this scan and `later`, for a refusal that has to say why
+    /// the two disagreed.
+    fn moved_to(&self, later: &Self) -> &'static str {
+        if self.configuration != later.configuration {
+            return "the configuration file moved between two scans";
+        }
+        if self.digests.tree_revision() != later.digests.tree_revision() {
+            return "the syntax-indexed files moved between two scans";
+        }
+        if self.digests != later.digests {
+            return "files recorded outside the syntax index moved between two scans";
+        }
+        "two scans folded one tree, so the watch state refused the capture rather than \
+         anything the scans read"
+    }
+}
+
 /// Runs the bounded capture loop over an injectable capture, so tests can
 /// force each retry arm deterministically instead of racing the filesystem.
 ///
-/// An attempt publishes when what it built answers the observations that landed while it
-/// was building. The filesystem epoch counts observations rather than content:
-/// [`IndexValidation::observe_locked`] increments it for every classified event, and
-/// [`watch_path_impact`] classifies from the path and the event kind without reading a
-/// byte, so an epoch that moved says nothing about whether the tree did. Two content
-/// comparisons answer that instead, and either one publishes: [`answered_candidate`], the
-/// same comparison a rebuild makes, when the observation names paths the candidate
-/// already holds; and a rescan that folds to the fingerprint the previous attempt folded
-/// to under an unmoved `rift.toml`, which is two scans taken at two epochs agreeing on
-/// every visible byte. A watch the backend reported broken publishes under neither,
-/// because the server no longer learns what moved.
+/// An attempt publishes on content, never on the filesystem epoch.
+/// [`IndexValidation::observe_locked`] increments that epoch for every classified event,
+/// and [`watch_path_impact`] classifies from the path and the event kind without reading a
+/// byte, so an epoch that moved says nothing about whether the tree did. Two scans that
+/// fold one [`ScannedTree`] - the same recorded set
+/// [`WorkspaceFingerprint`](rift_index::WorkspaceFingerprint) folds, under one `rift.toml`
+/// state - publish, whatever the counter reads and whatever the pending work escalated to.
+///
+/// [`answered_candidate`] keeps its branch for the case it covers, but it cannot be the
+/// startup answer: [`IndexValidation::source_project_path`] returns `None` while no
+/// publication is installed, so before the first one every non-floored event classifies
+/// [`WatchImpact::WholeWorkspace`], and `answered_candidate` refuses a candidate whose
+/// pending work covers the whole workspace.
+///
+/// A capture that comes back [`WorkspaceCandidate::ConfigurationChanged`] folds no tree at
+/// all, so it contributes no scan to compare; the span records it and the refusal names it
+/// rather than reporting the workspace as having changed.
 pub(crate) async fn initial_workspace_with(
     root: &Path,
     limits: WorkspaceIndexLimits,
@@ -1149,7 +1189,8 @@ pub(crate) async fn initial_workspace_with(
     blocking: &BlockingExecutor,
     capture: impl CaptureWorkspace + Clone + Send + 'static,
 ) -> Result<(Arc<PublishedWorkspace>, LexicalWrite), ReadError> {
-    let mut rescanned = None;
+    let mut scanned: Option<ScannedTree> = None;
+    let mut moved = "no attempt folded a tree to compare";
     for attempt in 1..=INDEX_CAPTURE_ATTEMPTS_MAX {
         let request = validation.take_pending();
         let epoch = request.epoch;
@@ -1159,8 +1200,13 @@ pub(crate) async fn initial_workspace_with(
             component = "index",
             trigger = "startup",
             epoch,
-            attempt
+            attempt,
+            fingerprint = tracing::field::Empty,
+            outcome = tracing::field::Empty,
         );
+        // The clone outlives the instrumented future, so the fields recorded after it
+        // reach the span's close record and `rift server logs`, not standard error alone.
+        let recorded = span.clone();
         let attempt_capture = capture.clone();
         let built = blocking
             .run("initial index build", move || {
@@ -1179,17 +1225,27 @@ pub(crate) async fn initial_workspace_with(
             .instrument(span)
             .await?;
         let Some((built, write)) = built else {
+            recorded.record("outcome", "configuration_changed");
+            moved = "the configuration file moved during every capture that read the tree";
             continue;
         };
-        let scanned_the_same_tree = rescanned.as_ref() == Some(&built.fingerprint);
+        let current = ScannedTree {
+            digests: built.reads.workspace_digests(),
+            configuration: built.configuration.fingerprint,
+        };
+        recorded.record(
+            "fingerprint",
+            current.digests.fingerprint().wire_revision().as_str(),
+        );
+        let settled = scanned.as_ref().is_some_and(|previous| {
+            previous.digests == current.digests && previous.configuration == current.configuration
+        });
         if !validation.watch_failed.load(Ordering::Acquire) {
             let publication = validation.locked_pending();
             let observed_epoch = validation.observed_epoch();
             let answering = if validation.watch_failed.load(Ordering::Acquire) {
                 None
-            } else if scanned_the_same_tree
-                && built.configuration.fingerprint == configuration_fingerprint(root)
-            {
+            } else if settled && current.configuration == configuration_fingerprint(root) {
                 Some(Arc::new(
                     built.under(built.configuration.clone(), observed_epoch),
                 ))
@@ -1199,6 +1255,7 @@ pub(crate) async fn initial_workspace_with(
             if let Some(answering) = answering {
                 validation.replace_publication_locked(&answering);
                 drop(publication);
+                recorded.record("outcome", "published");
                 tracing::info!(
                     component = "index",
                     operation = "index.publish",
@@ -1210,11 +1267,15 @@ pub(crate) async fn initial_workspace_with(
             }
             drop(publication);
         }
-        rescanned = Some(built.fingerprint.clone());
+        recorded.record("outcome", "superseded");
+        if let Some(previous) = scanned.as_ref() {
+            moved = previous.moved_to(&current);
+        }
+        scanned = Some(current);
     }
     Err(ReadFault::unavailable(
         "initial index build",
-        "workspace kept changing across bounded capture attempts",
+        format!("workspace kept changing across bounded capture attempts: {moved}"),
     ))
 }
 
@@ -4105,8 +4166,11 @@ mod tests {
         Ok(())
     }
 
-    /// An epoch that moves while every scan folds to the same tree is an observation that
-    /// changed no byte, so the startup build publishes instead of spending its bound.
+    /// An epoch that moves while every scan folds the same tree is an observation that
+    /// changed no byte, so the startup build publishes on the second scan. Every one of
+    /// those observations escalates to the whole workspace, which is what makes
+    /// `answered_candidate` refuse: the assertion pins that the content comparison, not
+    /// that one, is what published.
     #[tokio::test]
     async fn initial_capture_publishes_when_every_scan_folds_the_same_tree() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -4115,12 +4179,15 @@ mod tests {
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
         let blocking = crate::server::BlockingExecutor::isolated(2, 60_000);
         let moving = Arc::clone(&validation);
+        let scans = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counted = Arc::clone(&scans);
         let (published, _write) = super::initial_workspace_with(
             directory.path(),
             WorkspaceIndexLimits::default(),
             &validation,
             &blocking,
             move |root, limits, request| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Every capture observes one more filesystem event, so no attempt ever
                 // sees a stable epoch, and none of those events changes a byte.
                 moving.observe_whole_workspace()?;
@@ -4128,10 +4195,111 @@ mod tests {
             },
         )
         .await?;
+
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the second scan is the first that has a previous one to agree with"
+        );
         assert_eq!(
             published.epoch,
             validation.observed_epoch(),
             "the publication answers the epoch the observations reached"
+        );
+        assert!(
+            validation.locked_pending().covers_whole_workspace(),
+            "every startup observation escalates, so answered_candidate could not publish"
+        );
+        Ok(())
+    }
+
+    /// A baseline text file folds into the recorded set but not into the syntax-indexed
+    /// tree revision, which is the shape a startup failure showed: the tree revision held
+    /// on every attempt while the folded set moved. The scan that first sees the file
+    /// disagrees with the one before it, and the pair that follows agrees and publishes.
+    #[tokio::test]
+    async fn initial_capture_publishes_once_a_moved_text_set_settles() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let (validation, _receiver) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let blocking = crate::server::BlockingExecutor::isolated(2, 60_000);
+        let moving = Arc::clone(&validation);
+        let written = directory.path().to_path_buf();
+        let revisions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&revisions);
+        let (published, _write) = super::initial_workspace_with(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &validation,
+            &blocking,
+            move |root, limits, request| {
+                let candidate = super::build_workspace_candidate(
+                    root,
+                    limits,
+                    request,
+                    &empty_dependency_store(),
+                )?;
+                let mut seen = seen.lock().expect("the fixture lock is clean");
+                if let WorkspaceCandidate::Stable { published, .. } = &candidate {
+                    seen.push(published.reads.tree_revision().to_owned());
+                }
+                if seen.len() == 1 {
+                    // No language claims this path, so the default `[search.text]`
+                    // `include` of `["**"]` takes it as baseline text: recorded, folded
+                    // into the digest set, and outside the syntax-indexed tree revision.
+                    fs::write(written.join("notes.txt"), "beacon notes\n")
+                        .expect("the fixture write lands");
+                }
+                drop(seen);
+                moving.observe_whole_workspace()?;
+                Ok(candidate)
+            },
+        )
+        .await?;
+
+        let revisions = revisions.lock().expect("the fixture lock is clean");
+        assert_eq!(
+            revisions.len(),
+            3,
+            "the first two scans disagree, so the settled pair is the second and third"
+        );
+        assert!(
+            revisions.windows(2).all(|pair| pair[0] == pair[1]),
+            "the syntax-indexed tree revision holds while the recorded set moves: \
+             {revisions:?}"
+        );
+        assert_eq!(published.epoch, validation.observed_epoch());
+        Ok(())
+    }
+
+    /// A capture that comes back `ConfigurationChanged` folds no tree, so it leaves
+    /// nothing to compare. The refusal names the configuration file rather than reporting
+    /// the workspace as having changed.
+    #[tokio::test]
+    async fn initial_capture_refuses_and_names_a_configuration_that_kept_moving() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let (validation, _receiver) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let blocking = crate::server::BlockingExecutor::isolated(2, 60_000);
+
+        let error = super::initial_workspace_with(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &validation,
+            &blocking,
+            move |_root, _limits, _request| Ok(super::WorkspaceCandidate::ConfigurationChanged),
+        )
+        .await
+        .expect_err("a configuration that moves during every capture must refuse");
+
+        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+        assert!(
+            error
+                .to_string()
+                .contains("the configuration file moved during every capture"),
+            "{error}"
         );
         Ok(())
     }
@@ -4172,6 +4340,12 @@ mod tests {
         .await
         .expect_err("a tree that moves on every attempt must exhaust bounded attempts");
         assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+        assert!(
+            error
+                .to_string()
+                .contains("the syntax-indexed files moved between two scans"),
+            "{error}"
+        );
         Ok(())
     }
 
