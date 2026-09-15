@@ -209,6 +209,17 @@ jobs:
           report_type: test_results
           token: ${{ secrets.CODECOV_TOKEN }}
 
+      - name: Preserve Rust coverage and test results
+        if: ${{ !cancelled() && steps.rust_tests.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v6.0.0
+        with:
+          name: fast-results
+          path: |
+            lcov.info
+            target/nextest/ci/junit.xml
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Test installers
         id: installer_tests
         timeout-minutes: 1
