@@ -154,14 +154,54 @@ class FixtureTests(unittest.TestCase):
             finally:
                 fixture.server_close()
 
-    def test_local_macos_never_changes_native_trust(self) -> None:
-        with (
-            patch("release_fixture.sys.platform", "darwin"),
-            patch.dict(os.environ, {}, clear=True),
-            self.assertRaisesRegex(RuntimeError, "GitHub-hosted"),
-            trusted_certificate(Path("unused")),
-        ):
-            self.fail("local trust must refuse")
+    def test_local_macos_and_windows_never_change_native_trust(self) -> None:
+        for platform in ("darwin", "win32"):
+            with (
+                self.subTest(platform=platform),
+                patch("release_fixture.sys.platform", platform),
+                patch.dict(os.environ, {}, clear=True),
+                self.assertRaisesRegex(RuntimeError, "GitHub-hosted"),
+                trusted_certificate(Path("unused")),
+            ):
+                self.fail("local trust must refuse")
+
+    def test_windows_machine_store_removes_only_owned_certificate_after_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ReleaseFixture(Path(directory), {})
+            fixture.server_close()
+            certificate = fixture.certificate
+            der = ssl.PEM_cert_to_DER_cert(certificate.read_text(encoding="ascii"))
+            thumbprint = hashlib.sha1(der, usedforsecurity=False).hexdigest()
+            for add_result in ("", RuntimeError("import failed")):
+                with (
+                    self.subTest(add_result=add_result),
+                    patch("release_fixture.sys.platform", "win32"),
+                    patch.dict(
+                        os.environ,
+                        {
+                            "GITHUB_ACTIONS": "true",
+                            "RUNNER_ENVIRONMENT": "github-hosted",
+                        },
+                    ),
+                    patch(
+                        "release_process.run", side_effect=[add_result, ""]
+                    ) as command,
+                    self.assertRaisesRegex(RuntimeError, "failed"),
+                    trusted_certificate(certificate),
+                ):
+                    raise RuntimeError("gate failed")
+                add, remove = command.call_args_list
+                self.assertEqual(
+                    add.args[0],
+                    ["certutil", "-f", "-addstore", "Root", str(certificate)],
+                )
+                self.assertEqual(
+                    remove.args[0], ["certutil", "-delstore", "Root", thumbprint]
+                )
+                self.assertEqual(add.kwargs["timeout"], 60)
+                self.assertEqual(remove.kwargs["timeout"], 60)
 
     def test_macos_cleanup_clears_only_owned_trust_and_requires_native_rejection(
         self,
