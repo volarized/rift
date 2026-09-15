@@ -47,6 +47,9 @@ flate2.workspace = true
 nix.workspace = true
 tar.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+mimalloc.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
 zip.workspace = true
