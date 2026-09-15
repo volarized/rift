@@ -530,7 +530,8 @@ terminal. When the queue fills, the task drops later events and records the drop
 The answer is a JSON object carrying `records` and `record_count`. Each record names its
 `identity` (the store's own ascending number), `recorded_at_ms`, `level`, `target`,
 `component`, `operation`, `message`, and the remaining `fields` as an object. A span that
-closed carries its `elapsed_ms`, which is how long the work it wrapped took.
+closed carries the fields it recorded beside `elapsed_ms`, which is how long the work it
+wrapped took.
 
 The read never waits on workspace readiness. A request that refuses because the index will not
 settle is exactly the request whose reason these records hold, so the log read answers while
