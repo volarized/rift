@@ -30,10 +30,17 @@ Rust documentation, dependency policy, coverage, release archives, installers, a
 support doctests on stable Rust. Python helper tests and the upstream MCP conformance runner
 check their own implementations.
 
-The Rust CI job has a 12-minute deadline. Nextest terminates a fast test after 60 seconds, allows
+CI compiles Rust and checks generated files, crate boundaries, Clippy, and documentation in a
+build job with a 30-minute deadline. It transfers the CLI and instrumented nextest archive to
+a separate job with a 12-minute deadline for test execution and the remaining checks. A cold
+dependency build does not consume a test's deadline, and an absent cache does not skip a gate.
+Nextest terminates a fast test after 60 seconds, allows
 10 seconds for Unix process cleanup, and does not retry failures. On Windows it terminates the
 test's Job Object immediately. Live engine and model tests share one test
 group because each nextest test runs in its own process.
+The complete nextest run has a 480-second deadline inside a 600-second step, leaving time for
+archive extraction, cleanup, and coverage reporting. Tests read executable paths supplied by
+nextest at runtime so an archive can run from a different build directory.
 CI runs all selected tests after a failure and prints failed output immediately and at the end.
 An empty selection or leaked output handle fails the run. Nextest writes JUnit results under
 `target/nextest/<profile>/junit.xml`; CI retains them after test failure.
@@ -50,6 +57,7 @@ and runs the archived binaries. The release gate downloads native candidate bina
 rebuilding them. Corpus execution also has its own
 deadline: FastAPI four minutes, each Bun case nine minutes, and Next.js twelve minutes. Bun's
 workspace checks and shutdown checks run as separate nextest tests on separate CI runners.
+Archive execution creates its coverage target before extraction, including on a cold checkout.
 
 For local work, fetch the corpus once and run one repository at a time:
 
@@ -165,6 +173,8 @@ runners. On macOS, cleanup sets only the test CA's trust result to `unspecified`
 certificate, and requires native verification to reject it as untrusted. An inert trust setting
 remains until the runner is destroyed. Removing the last setting can request interactive
 authorization even when run as root.
+Windows uses the hosted administrator's machine Root store and removes only the test CA's
+exact certificate thumbprint after the gate.
 
 The GitHub CLI downloads archives and checksum manifests before the test starts. A loopback
 HTTPS fixture serves those verified bytes through the URLs used by the installers and compiled

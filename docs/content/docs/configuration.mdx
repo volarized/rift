@@ -664,7 +664,7 @@ The keys that shape how the command runs:
 - `failure_severity` - `"warning"` or `"error"` on the diagnostic a hook failure contributes
 
 A hook runs in the tree it checks, so it executes the agent's change each time one applies -
-`cargo test` compiles the very change it's checking.
+`cargo nextest run` compiles the very change it's checking.
 
 `id`, `kind`, `command`, and `determinism` are required. `changed_paths` and `writes` default to
 `"none"`; `failure_severity` defaults to `"error"`; `working_directory`, `environment`,
