@@ -656,6 +656,21 @@ impl WorkspaceFingerprint {
         Ok(capture_digests(root, limits, visibility)?.fingerprint())
     }
 
+    /// Eight-hex-character rendering of this fold, for spans and diagnostics.
+    ///
+    /// The fold covers every recorded file, so this moves when a baseline text file or a
+    /// left-out file moves and the syntax-indexed tree revision does not. A diagnostic
+    /// that carries both tells those two apart.
+    #[must_use]
+    pub fn wire_revision(&self) -> String {
+        let mut revision = String::with_capacity(8);
+        for byte in &self.0[..4] {
+            use std::fmt::Write as _;
+            let _ = write!(revision, "{byte:02x}");
+        }
+        revision
+    }
+
     /// Folds one publication's own files, absorbing each file's digest rather than its
     /// bytes. Files already carry the digest of what the index read, so this costs one
     /// hash update per file however large the workspace's sources are.

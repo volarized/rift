@@ -546,6 +546,16 @@ const WARNING_DETAIL_BYTES_MAX: usize = 4096;
 /// Most moved paths one `stale_index` detail names before it counts the rest.
 const STALE_INDEX_PATHS_MAX: usize = 5;
 
+/// Publications a read waits for before it answers from the one it holds.
+///
+/// A workspace with a rebuild in flight lands it on the first of these, so a read that
+/// can answer for the tree as it stands still does. A workspace whose hook rewrites files
+/// with the bytes they already hold never lets the published and observed epochs meet,
+/// and this bound is what stops such a read from spending its whole readiness budget on a
+/// wait that cannot converge. A publication that never lands at all still parks the read
+/// until its readiness deadline, which is the refusal a stalled index owes its caller.
+const READ_PUBLICATION_WAITS_MAX: usize = 3;
+
 /// Why an answer is served from a publication the request-time capture found behind the
 /// tree.
 enum StaleIndexReason<'a> {
@@ -2226,10 +2236,24 @@ impl RiftMcp {
     /// rebuild failure means for this request: a read answers from the publication and
     /// carries the failure, a change refuses with it at the observed epoch and waits for
     /// the retry at an older one.
+    ///
+    /// A read never waits for the two epochs to agree. The epoch counts observations and
+    /// the capture compares content, so a workspace whose hook rewrites files with the
+    /// bytes they already hold moves the epoch forever and the wait can never be
+    /// satisfied; the read takes the publication this loop already holds and lets
+    /// `reconcile_workspace`'s capture decide whether it answers. A change keeps the
+    /// wait and its budget, because a write resolves its address against the tree it is
+    /// about to modify.
+    ///
+    /// Every other job of this loop stands for a read: a watcher the backend reported
+    /// broken refuses, a supervisor that stopped refuses while the epochs disagree, and a
+    /// recorded rebuild failure is resolved before the read goes on, so the answer still
+    /// carries that failure's `stale_index`.
     async fn await_current_workspace(
         &self,
         phase: wire::ErrorPhase,
     ) -> Result<(Arc<PublishedWorkspace>, Option<RecordedRebuildFailure>), ErrorData> {
+        let mut waited = 0_usize;
         loop {
             let changed = self.validation.changed.notified();
             tokio::pin!(changed);
@@ -2279,7 +2303,11 @@ impl RiftMcp {
                     FailureVerdict::Wait => {}
                 }
             }
+            if matches!(phase, wire::ErrorPhase::Read) && waited >= READ_PUBLICATION_WAITS_MAX {
+                return Ok((current, None));
+            }
             changed.as_mut().await;
+            waited += 1;
         }
     }
 
@@ -5339,6 +5367,100 @@ pub fn beacon() -> u64 {
             "{refusal:?}"
         );
         Ok(())
+    }
+
+    /// A workspace whose publications keep landing while the observed epoch stays ahead of
+    /// them: the shape a hook that rewrites files with the bytes they already hold leaves
+    /// behind. The read waits for a bounded number of those publications and then answers
+    /// from the one it holds, rather than spending its whole readiness budget to refuse
+    /// with "the index is N filesystem events behind the tree". The capture finds the tree
+    /// ahead, so the answer carries `stale_index`.
+    #[tokio::test]
+    async fn a_read_whose_epoch_runs_ahead_answers_within_its_wait_bound() -> TestResult {
+        let (directory, assembled) = unsupervised_fixture().await?;
+        let server = &assembled.server;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn beacon() {}\npub fn lantern() {}\n",
+        )?;
+        let epoch = observe_without_recording_a_failure(server, "lib.rs", 3)?;
+        assert_eq!(epoch, 3);
+        assert_eq!(server.published.read().await.current.epoch, 0);
+        // The publications a churning workspace keeps landing, without ever catching the
+        // observations: what the read spends its bounded waits on.
+        let landing = Arc::clone(&server.validation);
+        let churn = tokio::spawn(async move {
+            loop {
+                landing.changed.notify_waiters();
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
+
+        let answer = tokio::time::timeout(UNWAITED_READ_MAX, get_symbol(server, "beacon"))
+            .await
+            .map_err(|_| "a read whose epoch runs ahead must answer inside its wait bound")??;
+
+        churn.abort();
+        let (index, captured, detail) = stale_index_of(&answer.warnings)?;
+        assert_ne!(
+            captured, index,
+            "the captured tree is ahead of the snapshot"
+        );
+        assert!(
+            detail.contains("bounded reconciliation attempts"),
+            "{detail}"
+        );
+        Ok(())
+    }
+
+    /// The same condition on the change path: a write resolves its address against the
+    /// tree it is about to modify, so it keeps waiting for the two epochs and refuses
+    /// when its readiness budget is spent.
+    #[tokio::test]
+    async fn a_change_whose_epoch_runs_ahead_refuses_within_its_budget() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "[server]\nreadiness_timeout = \"1s\"\n")?;
+        let assembled = unsupervised_server(directory.path()).await?;
+        let server = &assembled.server;
+        observe_without_recording_a_failure(server, "lib.rs", 3)?;
+        let params = serde_json::from_value(json!({
+            "patch": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1,2 @@\n pub fn beacon() {}\n+pub fn lantern() {}\n"
+        }))?;
+
+        let refusal = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            server.patch(Parameters(params)),
+        )
+        .await
+        .map_err(|_| "a change whose epoch runs ahead must refuse inside its budget")?
+        .map(|_applied| ())
+        .expect_err("a change whose epoch runs ahead must refuse");
+
+        assert!(
+            refusal
+                .message
+                .contains("filesystem events behind the tree"),
+            "{refusal:?}"
+        );
+        Ok(())
+    }
+
+    /// Observes `path` `events` times and records no rebuild failure, so the observed
+    /// epoch runs ahead of the published one with nothing to resolve it.
+    fn observe_without_recording_a_failure(
+        server: &RiftMcp,
+        path: &str,
+        events: u64,
+    ) -> TestResult<u64> {
+        let mut epoch = 0;
+        for _event in 0..events {
+            epoch = server
+                .validation
+                .observe_paths([CoreProjectPath::new(path)?])
+                .map_err(|error| format!("observation must land: {error:?}"))?;
+        }
+        Ok(epoch)
     }
 
     #[test]
