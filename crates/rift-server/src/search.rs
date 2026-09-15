@@ -101,6 +101,7 @@ impl ReadService {
         }
         let results_max_reached = order_and_bound_hits(&mut results, params.order, fetch_limit);
         let (mut results, pagination) = page(results, params.page_index, limit);
+        populate_symbol_lines(&mut results, self.index(), selected.force_include.as_ref())?;
         if !payloads.score {
             for hit in &mut results {
                 hit.score = None;
@@ -269,10 +270,12 @@ fn force_include_requested(params: &SearchParams) -> bool {
 
 /// Which extra payload `params.include` asked to attach to every hit, derived once per
 /// request: `source` attaches the excerpt, `score` attaches the fused ranking value.
+/// Project symbol lines wait for pagination when this is a search request.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct HitPayloads {
     source: bool,
     score: bool,
+    defer_line: bool,
 }
 
 impl HitPayloads {
@@ -281,6 +284,7 @@ impl HitPayloads {
         Self {
             source: include.contains(&SearchInclude::Source),
             score: include.contains(&SearchInclude::Score),
+            defer_line: true,
         }
     }
 }
@@ -613,6 +617,8 @@ fn assembled_symbol_hit(
     matched_by: Vec<MatchedField>,
     payloads: HitPayloads,
 ) -> SearchHit {
+    let line = (!payloads.defer_line || path.is_none())
+        .then(|| line::line_number_at(matched.file.source(), matched.symbol.range.start));
     SearchHit {
         hit: SearchHitTarget::Symbol {
             symbol: Box::new(symbol),
@@ -623,15 +629,42 @@ fn assembled_symbol_hit(
             .source
             .then(|| excerpt(matched.file, matched.symbol.range)),
         range: Some(text_range(matched.symbol.range)),
-        line: Some(line::line_number_at(
-            matched.file.source(),
-            matched.symbol.range.start,
-        )),
+        line,
         path,
         unit,
         traversal_path: None,
         distance: None,
     }
+}
+
+/// Resolves project symbol lines only for the returned page. Line numbers never take part
+/// in ordering or merging, and source comes from the same held index that supplied the hit.
+/// Dependency hits already carry their lines from their package's held source.
+fn populate_symbol_lines(
+    results: &mut [SearchHit],
+    index: &WorkspaceIndex,
+    force_include: Option<&WorkspaceIndex>,
+) -> Result<(), ReadError> {
+    for hit in results {
+        if hit.line.is_some() || !matches!(hit.hit, SearchHitTarget::Symbol { .. }) {
+            continue;
+        }
+        let (Some(path), Some(range)) = (hit.path.as_ref(), hit.range.as_ref()) else {
+            unreachable!(
+                "a deferred project symbol carries its path and range: has_path={}, has_range={}",
+                hit.path.is_some(),
+                hit.range.is_some()
+            );
+        };
+        let path = ProjectPath::new(path.0.clone())
+            .map_err(|error| ReadFault::invalid("path", error.to_string()))?;
+        let file = index
+            .file(&path)
+            .or_else(|| force_include.and_then(|extra| extra.file(&path)))
+            .ok_or_else(|| ReadFault::not_found(path.as_str()))?;
+        hit.line = Some(line::line_number_at(file.source(), range.start));
+    }
+    Ok(())
 }
 
 /// Builds one file hit wire value.
@@ -1143,6 +1176,107 @@ pub fn compute() -> i32 {
             HistoryConfiguration::default(),
         )?;
         Ok((directory, service))
+    }
+
+    #[test]
+    fn project_symbol_lines_wait_for_paging_and_use_the_held_source() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let source = "// café\r\npub fn page_a() {}\r\n\r\npub fn page_b() {}";
+        fs::write(directory.path().join("lib.rs"), source)?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let params: SearchParams = serde_json::from_value(json!({"query": "page"}))?;
+        let mut hits = Vec::new();
+        super::collect_indexed_hits(
+            service.index(),
+            None,
+            directory.path(),
+            super::SearchCriteria {
+                query: "page",
+                target: SearchParamsTarget::Symbol,
+                payloads: super::HitPayloads::requested(&params),
+            },
+            10,
+            &mut hits,
+        )?;
+        assert_eq!(hits.len(), 2);
+        assert!(
+            hits.iter().all(|hit| hit.line.is_none()),
+            "unpaged hits must not scan source for lines"
+        );
+        super::order_hits(&mut hits, ResultOrder::Identity);
+        let (mut selected, _) = crate::read::page(hits, 1, 1);
+        fs::write(directory.path().join("lib.rs"), "pub fn moved() {}\n")?;
+        super::populate_symbol_lines(&mut selected, service.index(), None)?;
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].line,
+            Some(4),
+            "line must come from the held CRLF source"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn symbol_lines_and_order_stay_exact_across_search_pages() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join(".gitignore"), "forced.rs\n")?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "// café\r\npub fn page_a() {}\r\n\r\npub fn page_b() {}\r\npub fn page_c() {}",
+        )?;
+        fs::write(
+            directory.path().join("forced.rs"),
+            "// café\n\npub fn page_forced() {}\n",
+        )?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let ranked = ranked_units(&directory.path().join("search.db"), &service, "page").await?;
+        for order in ["relevance", "identity", "path"] {
+            let mut request = json!({
+                "query": "page", "target": "symbol", "limit": 10,
+                "order": order, "include": ["source", "score"],
+                "paths": {"force_include": ["forced.rs"]}
+            });
+            let full = service.search(&serde_json::from_value(request.clone())?, &ranked)?;
+            assert_eq!(full.results.len(), 4);
+            for hit in &full.results {
+                let SearchHitTarget::Symbol { symbol } = &hit.hit else {
+                    return Err("fixture must return symbols".into());
+                };
+                let line = match symbol.name.as_str() {
+                    "page_a" => 2,
+                    "page_b" => 4,
+                    "page_c" => 5,
+                    "page_forced" => 3,
+                    other => return Err(format!("unexpected symbol: {other}").into()),
+                };
+                assert_eq!(hit.line, Some(line));
+            }
+            request["limit"] = json!(1);
+            let mut pages = Vec::new();
+            for page_index in 0..4 {
+                request["page_index"] = json!(page_index);
+                let page = service.search(&serde_json::from_value(request.clone())?, &ranked)?;
+                assert_eq!(page.warnings, full.warnings);
+                pages.extend(page.results);
+            }
+            assert_eq!(
+                pages, full.results,
+                "paging must preserve every hit and order: {order}"
+            );
+        }
+        Ok(())
     }
 
     /// Symbol hits from a TypeScript file carry the `typescript` language
