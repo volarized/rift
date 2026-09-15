@@ -285,6 +285,9 @@ pub(crate) struct IndexValidation {
     pub(crate) watch_failed: Arc<AtomicBool>,
     pub(crate) invalidations: mpsc::Sender<()>,
     pub(crate) changed: Arc<Notify>,
+    /// Latest successful candidate whose publication was superseded. A publication at
+    /// or beyond this epoch makes the recorded movement obsolete.
+    superseded_epoch: AtomicU64,
     /// The publication linearization point, holding the work the next rebuild owes.
     /// Observation and publication both take it, so a path observed between a rebuild's
     /// capture and its publication cannot be lost.
@@ -615,6 +618,7 @@ impl IndexValidation {
                 supervisor_running: Arc::new(AtomicBool::new(true)),
                 invalidations,
                 changed: Arc::new(Notify::new()),
+                superseded_epoch: AtomicU64::new(0),
                 publication_lane: SyncMutex::new(PendingWork::default()),
                 paths_max,
                 published: SyncRwLock::new(None),
@@ -724,6 +728,11 @@ impl IndexValidation {
     /// Returns latest filesystem-event epoch.
     pub(crate) fn observed_epoch(&self) -> u64 {
         self.observed_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Whether a successful capture was superseded after this publication was built.
+    pub(crate) fn superseded_after(&self, published_epoch: u64) -> bool {
+        self.superseded_epoch.load(Ordering::SeqCst) > published_epoch
     }
 
     /// Installs one publication under publication linearization.
@@ -2417,9 +2426,9 @@ async fn publish_rebuild_failure(context: &IndexSupervisorContext, epoch: u64, e
 /// [`RebuildOutcome::Unchanged`]: nothing is recorded as a publication, and the supervisor
 /// hands nothing to the lanes.
 ///
-/// A superseded candidate hands nothing to the lane. Its workspace never publishes, and
-/// pending requests keep waiting because the observed epoch still differs from the
-/// published one.
+/// A superseded candidate hands nothing to the lane. A successful capture superseded at
+/// publication records its epoch and wakes reads, so they can check the tree and answer
+/// stale while changes keep waiting for a current publication.
 ///
 /// Each blocking operation races the supervisor's cancellation token. A stop that lands
 /// while the capture scans a large tree answers [`RebuildOutcome::Cancelled`] at once
@@ -2664,6 +2673,12 @@ pub(crate) fn finish_rebuild(
         validation.changed.notify_waiters();
     } else {
         validation.restore_pending(work);
+        if outcome == RebuildOutcome::Superseded {
+            validation
+                .superseded_epoch
+                .fetch_max(candidate.epoch, Ordering::SeqCst);
+            validation.changed.notify_waiters();
+        }
     }
     outcome
 }
@@ -4246,6 +4261,10 @@ mod tests {
             super::workspace_capture(&empty_dependency_store()),
         )?;
         assert!(matches!(outcome, super::CapturedRebuild::Superseded));
+        assert!(
+            !validation.superseded_after(0),
+            "an unbuilt candidate cannot let reads answer stale"
+        );
         Ok(())
     }
 
@@ -4269,6 +4288,10 @@ mod tests {
             |_, _, _| Ok(WorkspaceCandidate::ConfigurationChanged),
         )?;
         assert!(matches!(outcome, super::CapturedRebuild::Superseded));
+        assert!(
+            !validation.superseded_after(0),
+            "configuration movement cannot let reads answer stale"
+        );
         assert_eq!(
             validation.observed_epoch(),
             1,
@@ -6090,6 +6113,10 @@ mod tests {
         let (snapshot, failure) = state.snapshot();
         assert_eq!(snapshot.epoch, 0, "a cancelled rebuild publishes nothing");
         assert!(failure.is_none(), "a cancelled rebuild records no failure");
+        assert!(
+            !validation.superseded_after(snapshot.epoch),
+            "cancellation cannot let reads answer stale"
+        );
         drop(state);
         assert!(
             validation.locked_pending().covers_whole_workspace(),
@@ -6227,6 +6254,22 @@ mod tests {
                 &fixture.after
             ),
             RebuildOutcome::Cancelled
+        );
+        let work = fixture.validation.take_pending().work;
+        assert_eq!(
+            super::finish_rebuild(
+                fixture.root(),
+                &fixture.state,
+                &fixture.validation,
+                &fixture.after,
+                work,
+                None,
+            ),
+            RebuildOutcome::Cancelled
+        );
+        assert!(
+            !fixture.validation.superseded_after(fixture.before.epoch),
+            "cancelled publication cannot let reads answer stale"
         );
         let state = fixture.state.blocking_read();
         assert_workspace_identity(&state.current, &fixture.before);
