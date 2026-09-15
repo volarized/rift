@@ -183,6 +183,16 @@ manifests and lockfiles the resolvers read, so a change to any of them re-catalo
 publication while every other file change leaves the catalog untouched. `rift://map` lists the
 packages the manifests declare directly.
 
+Each resolver reads at most 256 manifests per workspace, taken in path order from the visible
+paths carrying its manifest file name. Selecting the top-level manifests compares every manifest
+pair, so that work grows with the square of the manifest count.
+
+A workspace holding more manifests catalogs the packages those 256 resolve, and the resolver
+reports the rest as a degradation. A read whose `scope` reaches dependencies carries it as a
+`dependency_resolver_degraded` warning: the next.js repository holds 876 `package.json` files,
+so the warning reads `620 of 876 package.json manifests were not read: at most 256 are read
+per workspace`.
+
 Each readable file becomes a [`SourceUnit`](/docs/protocol/reference#SourceUnit) in the
 source catalog. Its `location` says whether it belongs to the project, a dependency, the standard
 library, or an external source. Its `source_kind` separately says whether a human authored it or a

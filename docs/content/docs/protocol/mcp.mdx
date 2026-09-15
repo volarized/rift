@@ -461,6 +461,9 @@ still walks the project graph. While the workspace's `[dependencies]` table sets
 as it does on `get_symbol`. The three dependency warnings under [Reads](#reads) ride a
 `search` answer whose `scope` reaches dependencies, as they ride a `get_symbol` answer.
 
+The resolvers read at most 256 manifests per workspace, taken in path order, so a `dependencies`
+or `all` search over a workspace holding more answers from the packages those manifests declare.
+
 This search reaches the `helper` crate the `get_symbol` lookup above reaches:
 
 **Request:**
@@ -597,6 +600,9 @@ the Cargo resolver reads the resolved graph from `cargo metadata` and falls back
 `uv.lock`, `package-lock.json`, and `bun.lock`. Each entry is a
 [`PackageIdentity`](/docs/protocol/reference#PackageIdentity). The list follows the lockfile:
 a lockfile rewritten while the server runs is re-cataloged on the next publication.
+
+A resolver reads at most 256 manifests per workspace, taken in path order, so `packages` over a
+workspace holding more lists what the manifests it read declare.
 
 **Request:** `rift://map`
 
