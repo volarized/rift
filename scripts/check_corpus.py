@@ -99,6 +99,14 @@ class Corpus:
 
     def server(self, root: Path | None = None) -> Server:
         self.sequence += 1
+        allocator: dict[str, str] = {}
+        selected = os.environ.get("CORPUS_DIAGNOSE_ALLOCATOR")
+        if selected == "mimalloc":
+            libraries = list(Path("/usr/lib").glob("*/libmimalloc.so.2"))
+            require(len(libraries) == 1, "expected one installed allocator library")
+            allocator["LD_PRELOAD"] = str(libraries[0])
+        elif selected == "glibc":
+            allocator["MALLOC_ARENA_MAX"] = "1"
         return Server(
             self.binary,
             root or self.root,
@@ -107,6 +115,7 @@ class Corpus:
             env={
                 "RUST_LOG": "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info",
                 "NO_COLOR": "1",
+                **allocator,
             },
         )
 

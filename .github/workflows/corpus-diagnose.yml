@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        case: [workspace, stop]
+        allocator: [mimalloc, glibc]
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -31,7 +31,7 @@ jobs:
         with:
           tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
       - run: uv sync --locked --python 3.12 --project scripts
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq gdb
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq gdb libmimalloc2.0
       - uses: actions/cache@v6.1.0
         with:
           path: ~/.cache/rift-corpus
@@ -40,12 +40,13 @@ jobs:
       - name: Observe unchanged archive
         env:
           RIFT_CORPUS_REPORT: ${{ github.workspace }}/target/corpus/bun.json
-          CORPUS_DIAGNOSE_CASE: ${{ matrix.case }}
+          CORPUS_DIAGNOSE_CASE: stop
+          CORPUS_DIAGNOSE_ALLOCATOR: ${{ matrix.allocator }}
         run: uv run --locked --python 3.12 --project scripts python scripts/corpus_diagnose.py
       - uses: actions/upload-artifact@v6.0.0
         if: always()
         with:
-          name: diagnose-${{ matrix.case }}
+          name: diagnose-${{ matrix.allocator }}
           path: |
             target/corpus/
             target/nextest/corpus/junit.xml
