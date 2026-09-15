@@ -57,7 +57,8 @@ def termination_handler() -> Iterator[None]:
     previous = signal.getsignal(signal.SIGTERM)
 
     def interrupted(_number: int, _frame: object) -> None:
-        raise InterruptedError("test command interrupted by SIGTERM")
+        # Selectors treat InterruptedError as an interrupted OS wait and suppress it.
+        raise RuntimeError("test command interrupted by SIGTERM")
 
     signal.signal(signal.SIGTERM, interrupted)
     try:
