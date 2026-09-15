@@ -459,6 +459,8 @@ impl ReadService {
             "index.build",
             component = "index",
             files_count = tracing::field::Empty,
+            text_files_count = tracing::field::Empty,
+            left_out_count = tracing::field::Empty,
             tree_revision = tracing::field::Empty,
             outcome = tracing::field::Empty,
         );
@@ -490,6 +492,8 @@ impl ReadService {
         let policy = ResolutionPolicy::from(&dependencies);
         let catalog = Arc::new(resolved_catalog(root, &source_policy, policy)?);
         span.record("files_count", index.file_count());
+        span.record("text_files_count", index.text_file_count());
+        span.record("left_out_count", index.left_out_file_count());
         span.record("tree_revision", revisions.wire_tree_revision());
         span.record("outcome", "ok");
         Ok(Self {
