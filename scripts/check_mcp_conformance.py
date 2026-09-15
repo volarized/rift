@@ -22,11 +22,12 @@ of this repository and leaves nothing behind.
 
 Usage:
 
-    uv run --script scripts/check_mcp_conformance.py
+    uv run --script scripts/check_mcp_conformance.py [--binary path/to/rift]
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import signal
@@ -34,6 +35,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parent.parent
@@ -242,10 +244,17 @@ def run_suite(port: int) -> int:
     return completed.returncode
 
 
-def main() -> int:
+def main(arguments: Sequence[str] | None = None) -> int:
     """Serve one throwaway workspace and score it against the baseline."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--binary", type=Path, help="Use this supplied binary without building"
+    )
+    supplied: Path | None = parser.parse_args(arguments).binary
+    binary = supplied.resolve() if supplied is not None else build_server_binary()
+    if not binary.is_file():
+        raise RuntimeError(f"conformance binary does not exist: {binary}")
     install_runner()
-    binary = build_server_binary()
     with (
         tempfile.TemporaryDirectory(prefix="rift-conformance-") as directory,
         tempfile.TemporaryDirectory(prefix="rift-conformance-log-") as log_directory,

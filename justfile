@@ -47,8 +47,8 @@ dashes:
 # one foreground server serves. `tools/mcp-conformance/expected-failures.yml`
 # carries the scenarios the served surface fails today; anything else fails
 # the gate.
-conformance:
-    uv run --script scripts/check_mcp_conformance.py
+conformance binary="":
+    uv run --script scripts/check_mcp_conformance.py {{ if binary == "" { "" } else { "--binary " + quote(binary) } }}
 
 
 clippy:
@@ -75,6 +75,11 @@ clean:
         fi
     done
 
+# CI transfers only nextest's runtime archive and the plain CLI used by conformance.
+fast-archive:
+    cargo llvm-cov nextest-archive --workspace --all-targets --all-features --locked --profile ci --archive-file target/fast.tar.zst
+    tar --zstd -cf target/fast-cli.tar.zst -C target/debug rift
+
 # One run of every suite, live engines and the live model hub included: the
 # engine tier's own code is only exercised against a real language server, and
 # the semantic search tier's acquisition only against the real hub, so a
@@ -82,8 +87,9 @@ clean:
 # toolchain, bun on the PATH, and network reach to huggingface.co; the model is
 # cached per machine, so only the first run pays for the download. Coverage is
 # this run's artifact, not a second run.
-test:
-    RIFT_ENGINE_LIVE=1 RIFT_SEARCH_LIVE=1 cargo llvm-cov nextest --workspace --all-targets --all-features --locked --profile ci --no-tests fail --lcov --output-path lcov.info --fail-under-lines 86
+test archive="":
+    mkdir -p "${CARGO_LLVM_COV_TARGET_DIR:-target/llvm-cov-target}"
+    RIFT_ENGINE_LIVE=1 RIFT_SEARCH_LIVE=1 cargo llvm-cov nextest {{ if archive == "" { "--workspace --all-targets --all-features --locked" } else { "--archive-file " + quote(archive) + " --extract-overwrite --workspace-remap ." } }} --profile ci --no-tests fail --lcov --output-path lcov.info --fail-under-lines 86
 
 # The live-engine suites alone, for iterating on them without paying for
 # the instrumented workspace run.
