@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -20,7 +21,7 @@ from release_process import run
 def observe(stopped: threading.Event, path: Path) -> None:
     owner = psutil.Process()
     with path.open("w", encoding="utf-8") as output:
-        for _ in range(960):
+        for sample in range(960):
             memory = psutil.virtual_memory()
             processes: list[dict[str, str | int | float]] = []
             for process in owner.children(recursive=True)[:128]:
@@ -45,10 +46,13 @@ def observe(stopped: threading.Event, path: Path) -> None:
                 "available": memory.available,
                 "total": memory.total,
                 "swap_used": psutil.swap_memory().used,
+                "disk_free": shutil.disk_usage(Path.cwd()).free,
                 "processes": processes,
             }
             output.write(json.dumps(row) + "\n")
             output.flush()
+            if sample % 5 == 0:
+                print(json.dumps(row), flush=True)
             if stopped.wait(1.0):
                 return
 
