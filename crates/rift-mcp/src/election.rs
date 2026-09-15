@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 use crate::http::serve_http;
-use crate::http::{HttpServeError, HttpServer, serve_http_with_storage};
+use crate::http::{HttpServeError, HttpServer, TokenCheck, serve_http_with_storage};
 use crate::storage::WorkspaceStorage;
 
 /// The zero-byte election file's name under the `.rift` state directory.
@@ -456,6 +456,8 @@ fn served_document(
 /// again - bounded by `UNPUBLISHED_SHUTDOWN_DEADLINE` - before the error
 /// returns, so no unreachable serving loop survives.
 ///
+/// Requests are served under [`TokenCheck::Required`].
+///
 /// # Errors
 ///
 /// Returns [`ElectionFault::AlreadyServing`] when another process holds the
@@ -472,10 +474,11 @@ pub async fn serve_elected(
     shutdown: CancellationToken,
 ) -> Result<ElectedServer, ElectionError> {
     let storage = WorkspaceStorage::open(root).await;
-    serve_elected_with_storage(root, shutdown, storage).await
+    serve_elected_with_storage(root, shutdown, storage, TokenCheck::Required).await
 }
 
-/// Serves the workspace through storage already opened by this process.
+/// Serves the workspace through storage already opened by this process,
+/// under one token policy.
 ///
 /// # Errors
 ///
@@ -488,12 +491,20 @@ pub async fn serve_elected_with_storage(
     root: &Path,
     shutdown: CancellationToken,
     storage: WorkspaceStorage,
+    check: TokenCheck,
 ) -> Result<ElectedServer, ElectionError> {
-    serve_elected_at(root, shutdown, storage, WorkspaceIndexLimits::default()).await
+    serve_elected_at(
+        root,
+        shutdown,
+        storage,
+        WorkspaceIndexLimits::default(),
+        check,
+    )
+    .await
 }
 
-/// Serves the workspace under explicit index bounds, recording a start that
-/// fails before it returns.
+/// Serves the workspace under explicit index bounds and one token policy,
+/// recording a start that fails before it returns.
 ///
 /// This is the server's whole startup: the election claim, the index build,
 /// the transport, and the publication. A failure anywhere in it is what the
@@ -515,8 +526,9 @@ pub(crate) async fn serve_elected_at(
     shutdown: CancellationToken,
     storage: WorkspaceStorage,
     limits: WorkspaceIndexLimits,
+    check: TokenCheck,
 ) -> Result<ElectedServer, ElectionError> {
-    let elected = elect_and_serve(root, shutdown, storage, limits).await;
+    let elected = elect_and_serve(root, shutdown, storage, limits, check).await;
     if let Err(error) = &elected {
         record_start_failure(error);
     }
@@ -549,10 +561,11 @@ async fn elect_and_serve(
     shutdown: CancellationToken,
     storage: WorkspaceStorage,
     limits: WorkspaceIndexLimits,
+    check: TokenCheck,
 ) -> Result<ElectedServer, ElectionError> {
     let guard = claim(root)?;
     let serving_stop = shutdown.child_token();
-    let server = serve_http_with_storage(root, serving_stop.clone(), storage, limits)
+    let server = serve_http_with_storage(root, serving_stop.clone(), storage, limits, check)
         .await
         .map_err(ElectionFault::serve)?;
     let document = served_document(
@@ -643,7 +656,7 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
 
-    use crate::http::HttpServeFault;
+    use crate::http::{HttpServeFault, TokenCheck};
 
     use super::{
         ElectionFault, SERVER_ELECTION_FILE_NAME, ServerPresence, StaleReason, claim, probe,
@@ -1023,9 +1036,15 @@ mod tests {
         let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
         let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
 
-        let error = serve_elected_at(directory.path(), CancellationToken::new(), storage, limits)
-            .await
-            .expect_err("a workspace over files_max must fail the start");
+        let error = serve_elected_at(
+            directory.path(),
+            CancellationToken::new(),
+            storage,
+            limits,
+            TokenCheck::Required,
+        )
+        .await
+        .expect_err("a workspace over files_max must fail the start");
 
         assert_eq!(error.descriptor().code(), "limit_exceeded", "{error}");
         let recorded = loop {
@@ -1281,7 +1300,8 @@ mod tests {
         crate::server::hermetic_workspace(directory.path(), "")?;
         let shutdown = CancellationToken::new();
         let serving_stop = shutdown.child_token();
-        let server = serve_http(directory.path(), serving_stop.clone()).await?;
+        let server =
+            serve_http(directory.path(), serving_stop.clone(), TokenCheck::Required).await?;
         let failure = Error::new(ElectionFault::AlreadyServing);
         let returned = shut_down_unpublished(server, &serving_stop, failure).await;
         assert!(

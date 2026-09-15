@@ -122,14 +122,44 @@ impl HttpServeFault {
     }
 }
 
-/// Serves the workspace at `root` over authenticated loopback Streamable HTTP.
+/// Whether the served routes check the minted bearer token.
+///
+/// The token separates OS users sharing the machine, and the loopback bind
+/// is the network boundary under either value. `Skipped` drops the token
+/// check for one run, which the MCP conformance runner needs: it addresses
+/// a server by URL alone and sends no `Authorization` header. The CLI
+/// accepts `--auth skip` only beside `--foreground`, so no detached server
+/// ever serves unchecked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TokenCheck {
+    /// Every request presents `Bearer` followed by the minted token.
+    #[default]
+    Required,
+    /// Every request that clears the loopback boundary is served, whatever
+    /// it presents.
+    Skipped,
+}
+
+impl TokenCheck {
+    /// Whether one request's `Authorization` value passes this policy.
+    fn accepts(self, authorization: Option<&str>, token: &str) -> bool {
+        match self {
+            Self::Required => bearer_authorized(authorization, token),
+            Self::Skipped => true,
+        }
+    }
+}
+
+/// Serves the workspace at `root` over loopback Streamable HTTP, behind
+/// `check`.
 ///
 /// The workspace builds exactly as stdio serving does - an invalid
 /// `rift.toml` still serves, refusing each request as
 /// `configuration_invalid` under default policies - then a bearer token is
 /// minted and the first free port of the accepted `[server]` selection is
 /// bound: the pinned `port`, the configured `port_range`, or the default
-/// serving range.
+/// serving range. The token is minted and published under either `check`,
+/// so `rift mcp` reaches the server the same way.
 /// The returned handle's listener is already accepting. Serving ends when
 /// `shutdown` cancels, an authorized `POST /api/stop` arrives, or the
 /// accepted `server.idle_timeout` passes after the last authorized request
@@ -150,18 +180,27 @@ impl HttpServeFault {
 pub async fn serve_http(
     root: &Path,
     shutdown: CancellationToken,
+    check: TokenCheck,
 ) -> Result<HttpServer, HttpServeError> {
     let storage = WorkspaceStorage::open(root).await;
-    serve_http_with_storage(root, shutdown, storage, WorkspaceIndexLimits::default()).await
+    serve_http_with_storage(
+        root,
+        shutdown,
+        storage,
+        WorkspaceIndexLimits::default(),
+        check,
+    )
+    .await
 }
 
 /// Serves HTTP through storage already opened by the serving process, under
-/// explicit index bounds.
+/// explicit index bounds and one token policy.
 pub(crate) async fn serve_http_with_storage(
     root: &Path,
     shutdown: CancellationToken,
     storage: WorkspaceStorage,
     limits: WorkspaceIndexLimits,
+    check: TokenCheck,
 ) -> Result<HttpServer, HttpServeError> {
     tracing::info!(component = "mcp", transport = "http", "MCP server starting");
     let server = RiftMcp::build_with_storage(root, limits, storage)
@@ -176,7 +215,14 @@ pub(crate) async fn serve_http_with_storage(
     let (port, listener) = bind_loopback_listener(server_table.serving_ports())?;
     let stop = shutdown.child_token();
     let idle = Arc::new(IdleTracker::new());
-    let router = authenticated_router(server, &token, &stop, &idle);
+    if matches!(check, TokenCheck::Skipped) {
+        tracing::warn!(
+            component = "mcp",
+            transport = "http",
+            "the bearer token check is off for this run: every loopback request is answered"
+        );
+    }
+    let router = authenticated_router(server, &token, check, &stop, &idle);
     let serving = tokio::spawn(
         axum::serve(listener, router)
             .with_graceful_shutdown(stop.clone().cancelled_owned())
@@ -386,13 +432,15 @@ fn bind_loopback_listener(
     Ok((port, listener))
 }
 
-/// Assembles the bearer-guarded routes over one served workspace.
+/// Assembles the routes over one served workspace, behind `check` and the
+/// loopback boundary.
 ///
 /// Requests run statelessly: the service clones the server per request, and
 /// no session is ever created.
 fn authenticated_router(
     server: RiftMcp,
     token: &str,
+    check: TokenCheck,
     stop: &CancellationToken,
     idle: &Arc<IdleTracker>,
 ) -> Router {
@@ -406,6 +454,7 @@ fn authenticated_router(
     );
     let gate = RequestGate {
         token: Arc::from(token),
+        check,
         idle: Arc::clone(idle),
     };
     Router::new()
@@ -487,15 +536,17 @@ async fn stop_server(State(stop): State<CancellationToken>) -> StatusCode {
 }
 
 /// Per-request policy shared by every route: the token requests must
-/// present, and the activity instant authorized requests refresh.
+/// present, whether that token is checked at all, and the activity instant
+/// served requests refresh.
 #[derive(Clone, Debug)]
 struct RequestGate {
     token: Arc<str>,
+    check: TokenCheck,
     idle: Arc<IdleTracker>,
 }
 
-/// Refuses requests without the exact bearer token, tracking every request
-/// that passes until its response completes.
+/// Refuses requests the token policy does not accept, tracking every
+/// request that passes until its response completes.
 ///
 /// The token separates OS users sharing the machine; the loopback bind is
 /// the network boundary.
@@ -508,7 +559,7 @@ async fn authorize_request(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    if !bearer_authorized(authorization, &gate.token) {
+    if !gate.check.accepts(authorization, &gate.token) {
         return unauthorized();
     }
     let activity = gate.idle.begin();
@@ -687,7 +738,7 @@ mod tests {
     use crate::validation::{IndexSupervisor, IndexValidation};
 
     use super::{
-        HttpServeFault, HttpServer, IdleTracker, bearer_authorized, bind_first_free,
+        HttpServeFault, HttpServer, IdleTracker, TokenCheck, bearer_authorized, bind_first_free,
         classify_serve_outcome, mint_token, stop_outcome_label, unauthorized, watch_idle,
     };
 
@@ -1002,6 +1053,21 @@ mod tests {
     #[test]
     fn missing_authorization_is_refused() {
         assert!(!bearer_authorized(None, "secret"));
+    }
+
+    #[test]
+    fn the_required_check_is_the_default_and_the_bearer_gate() {
+        assert_eq!(TokenCheck::default(), TokenCheck::Required);
+        assert!(TokenCheck::Required.accepts(Some("Bearer secret"), "secret"));
+        assert!(!TokenCheck::Required.accepts(Some("Bearer wrong!"), "secret"));
+        assert!(!TokenCheck::Required.accepts(None, "secret"));
+    }
+
+    #[test]
+    fn a_skipped_check_accepts_what_the_request_presents() {
+        assert!(TokenCheck::Skipped.accepts(None, "secret"));
+        assert!(TokenCheck::Skipped.accepts(Some("Bearer wrong!"), "secret"));
+        assert!(TokenCheck::Skipped.accepts(Some("Basic secret"), "secret"));
     }
 
     #[test]

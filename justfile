@@ -43,6 +43,13 @@ dashes:
         docs/content docs/src/app crates README.md docs/public .github \
         plugins .claude-plugin
 
+# The MCP specification's own conformance runner, over a throwaway workspace
+# one foreground server serves. `tools/mcp-conformance/expected-failures.yml`
+# carries the scenarios the served surface fails today; anything else fails
+# the gate.
+conformance:
+    uv run --script scripts/check_mcp_conformance.py
+
 
 clippy:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -94,7 +101,7 @@ release-test:
 installer-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_installers.py
 
-rust-gate: format dashes generate-check check clippy docs audit test release-test installer-test
+rust-gate: format dashes generate-check conformance check clippy docs audit test release-test installer-test
 
 # One signed tag on the commit `origin/main` names right now. The recipe reads
 # that commit from the remote, so the local checkout's branch and its uncommitted

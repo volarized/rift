@@ -128,6 +128,7 @@ jobs:
       - run: just format
       - run: just dashes
       - run: just generate-check
+      - run: just conformance
       - run: just check
       - run: just clippy
       - run: just docs

@@ -31,6 +31,22 @@ updates:
       docs-minor-patch:
         update-types: [minor, patch]
 
+  # tools/mcp-conformance JavaScript: the MCP specification's own conformance
+  # runner. Following its releases is how the gate picks up new scenarios and
+  # new requirement sets, so the version tracks the specification's own.
+  - package-ecosystem: bun
+    directory: /tools/mcp-conformance
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "🤖 build"
+      prefix-development: "🤖 build"
+      include: scope
+    groups:
+      conformance-minor-patch:
+        update-types: [minor, patch]
+
   - package-ecosystem: cargo
     directory: /
     schedule:
