@@ -747,9 +747,9 @@ impl IndexValidation {
     /// Classifies and observes one event within the publication critical section, so the
     /// paths it names cannot be lost between the classification and the epoch that
     /// promises to cover them.
-    fn observe_event(&self, root: &Path, event: &Event) -> Result<Option<u64>, ReadError> {
+    fn observe_event(&self, roots: &WatchRoots, event: &Event) -> Result<Option<u64>, ReadError> {
         let mut publication = self.locked_pending();
-        let result = match watch_event_impact(root, self, event) {
+        let result = match watch_event_impact(roots, self, event) {
             WatchImpact::None => Ok(None),
             WatchImpact::WholeWorkspace => {
                 publication.escalate();
@@ -877,21 +877,82 @@ impl IndexSupervisor {
     }
 }
 
+/// The two spellings one watcher compares an event path against.
+///
+/// `canonical` is the root the index scan and the published source policy use; `watched`
+/// is the spelling the server was started with, which a platform whose temporary root
+/// reaches the watcher through a symlink hands back in its events.
+/// [`WorkspaceSourcePolicy`](rift_index::WorkspaceSourcePolicy) carries the same pair for
+/// the same reason and answers for it once a publication is installed; this pair answers
+/// from the first event, which is the window the initial index build runs in.
+#[derive(Clone, Debug)]
+pub(crate) struct WatchRoots {
+    canonical: PathBuf,
+    watched: PathBuf,
+}
+
+impl WatchRoots {
+    /// The spellings a watch over `root` compares against.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when `root` cannot be canonicalized.
+    pub(crate) fn resolve(root: &Path) -> Result<Self, ReadError> {
+        let canonical = std::fs::canonicalize(root)
+            .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
+        Ok(Self {
+            canonical,
+            watched: root.to_path_buf(),
+        })
+    }
+
+    /// The canonical root, which every comparison runs against.
+    pub(crate) fn canonical(&self) -> &Path {
+        &self.canonical
+    }
+
+    /// One spelling standing for both, for a test whose root is not on disk to
+    /// canonicalize.
+    #[cfg(test)]
+    pub(crate) fn at(root: &Path) -> Self {
+        Self {
+            canonical: root.to_path_buf(),
+            watched: root.to_path_buf(),
+        }
+    }
+
+    /// `path`'s project-relative form under either spelling, or nothing when it lies
+    /// under neither.
+    fn relative<'a>(&self, path: &'a Path) -> Option<&'a Path> {
+        path.strip_prefix(&self.canonical)
+            .or_else(|_| path.strip_prefix(&self.watched))
+            .ok()
+    }
+
+    /// `path` under the canonical root, or nothing when it lies under neither spelling.
+    fn placed<'a>(&self, path: &'a Path) -> Option<std::borrow::Cow<'a, Path>> {
+        if path.strip_prefix(&self.canonical).is_ok() {
+            return Some(std::borrow::Cow::Borrowed(path));
+        }
+        let relative = path.strip_prefix(&self.watched).ok()?;
+        Some(std::borrow::Cow::Owned(self.canonical.join(relative)))
+    }
+}
+
 /// Creates one native watcher rooted before the initial index scan.
 pub(crate) fn workspace_watcher(
     root: &Path,
     validation: &Arc<IndexValidation>,
 ) -> Result<notify::RecommendedWatcher, ReadError> {
-    let watched_root = std::fs::canonicalize(root)
-        .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
-    let event_root = watched_root.clone();
+    let roots = WatchRoots::resolve(root)?;
+    let event_roots = roots.clone();
     let validation = Arc::clone(validation);
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
-        report_watch_outcome(&event_root, &validation, result);
+        report_watch_outcome(&event_roots, &validation, result);
     })
     .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
     watcher
-        .watch(&watched_root, RecursiveMode::Recursive)
+        .watch(roots.canonical(), RecursiveMode::Recursive)
         .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
     Ok(watcher)
 }
@@ -899,7 +960,7 @@ pub(crate) fn workspace_watcher(
 /// Observes one watcher callback: a delivered event enters the inclusion filter, and a
 /// backend failure marks the watch unhealthy.
 pub(crate) fn report_watch_outcome(
-    root: &Path,
+    roots: &WatchRoots,
     validation: &IndexValidation,
     outcome: notify::Result<Event>,
 ) {
@@ -912,7 +973,7 @@ pub(crate) fn report_watch_outcome(
         );
         return;
     };
-    if validation.observe_event(root, &event).is_err() {
+    if validation.observe_event(roots, &event).is_err() {
         tracing::error!(
             component = "index",
             operation = "watch.observe",
@@ -982,7 +1043,7 @@ impl WatchImpact {
 
 /// What one native event asks the next rebuild to cover.
 pub(crate) fn watch_event_impact(
-    root: &Path,
+    roots: &WatchRoots,
     validation: &IndexValidation,
     event: &Event,
 ) -> WatchImpact {
@@ -992,15 +1053,27 @@ pub(crate) fn watch_event_impact(
     event
         .paths
         .iter()
-        .filter(|path| hard_floor_includes_watch_path(root, path))
-        .map(|path| watch_path_impact(root, validation, event.kind, path))
+        .filter(|path| hard_floor_includes_watch_path(roots, path))
+        .map(|path| watch_path_impact(roots, validation, event.kind, path))
         .fold(WatchImpact::None, WatchImpact::absorb)
 }
 
-/// Rejects paths below Rift's hard-floor directories.
-pub(crate) fn hard_floor_includes_watch_path(root: &Path, path: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(root) else {
-        return true;
+/// Whether one event path stays above Rift's hard floor.
+///
+/// The path is placed under the canonical root first, because the watcher reports
+/// whatever spelling the platform hands it, and the floor's names say nothing about a
+/// path it cannot place. A path under neither spelling is dropped. This arm used to admit
+/// such a path instead, and what it admitted was the server's own `.rift` state: the
+/// workspace database moves continuously while SQLite runs, so every one of those writes
+/// moved the filesystem epoch that reads and the initial build both wait on.
+///
+/// Dropping an unplaceable path is safe only beside that placement. On a platform whose
+/// root reaches the watcher through a symlink every event carries the other spelling, so
+/// a floor that dropped them without mapping first would leave the index never
+/// invalidated at all.
+pub(crate) fn hard_floor_includes_watch_path(roots: &WatchRoots, path: &Path) -> bool {
+    let Some(relative) = roots.relative(path) else {
+        return false;
     };
     !relative.components().any(|component| {
         component
@@ -1011,6 +1084,10 @@ pub(crate) fn hard_floor_includes_watch_path(root: &Path, path: &Path) -> bool {
 }
 
 /// What one event path asks for, without trusting editor-specific event shapes.
+///
+/// The path is placed under the canonical root first, so every comparison below runs on
+/// the spelling the index and the published source policy use rather than on the bytes
+/// the event carried.
 ///
 /// A policy file rewrites what the workspace includes and a directory event can add or
 /// drop many files at once, so both ask for the whole workspace. Only a path that is
@@ -1023,11 +1100,16 @@ pub(crate) fn hard_floor_includes_watch_path(root: &Path, path: &Path) -> bool {
 /// rename it over the target; the publication holds nothing under that staging name, so
 /// its name event takes the per-path route a file event takes.
 pub(crate) fn watch_path_impact(
-    root: &Path,
+    roots: &WatchRoots,
     validation: &IndexValidation,
     kind: EventKind,
     path: &Path,
 ) -> WatchImpact {
+    let Some(placed) = roots.placed(path) else {
+        return WatchImpact::None;
+    };
+    let path = placed.as_ref();
+    let root = roots.canonical();
     if validation.is_workspace_configuration(root, path) {
         return ProjectPath::new(WORKSPACE_CONFIGURATION_FILE.to_owned())
             .map_or(WatchImpact::WholeWorkspace, |path| {
@@ -1145,20 +1227,25 @@ struct ScannedTree {
 }
 
 impl ScannedTree {
-    /// Which set moved between this scan and `later`, for a refusal that has to say why
-    /// the two disagreed.
-    fn moved_to(&self, later: &Self) -> &'static str {
+    /// Which set moved between this scan and `later`, and the paths that carried it, for
+    /// a refusal that has to say why the two disagreed.
+    ///
+    /// The configuration arm names no path: it names a file the reader already holds.
+    fn moved_to(&self, later: &Self) -> String {
         if self.configuration != later.configuration {
-            return "the configuration file moved between two scans";
+            return "the configuration file moved between two scans".to_owned();
         }
-        if self.digests.tree_revision() != later.digests.tree_revision() {
-            return "the syntax-indexed files moved between two scans";
+        let changes = PathChanges::between(&self.digests, &later.digests);
+        let Some(named) = crate::server::moved_paths(&changes) else {
+            return "two scans folded one tree, so the watch state refused the capture \
+                    rather than anything the scans read"
+                .to_owned();
+        };
+        if self.digests.tree_revision() == later.digests.tree_revision() {
+            format!("files recorded outside the syntax index moved between two scans: {named}")
+        } else {
+            format!("the syntax-indexed files moved between two scans: {named}")
         }
-        if self.digests != later.digests {
-            return "files recorded outside the syntax index moved between two scans";
-        }
-        "two scans folded one tree, so the watch state refused the capture rather than \
-         anything the scans read"
     }
 }
 
@@ -1190,7 +1277,7 @@ pub(crate) async fn initial_workspace_with(
     capture: impl CaptureWorkspace + Clone + Send + 'static,
 ) -> Result<(Arc<PublishedWorkspace>, LexicalWrite), ReadError> {
     let mut scanned: Option<ScannedTree> = None;
-    let mut moved = "no attempt folded a tree to compare";
+    let mut moved = "no attempt folded a tree to compare".to_owned();
     for attempt in 1..=INDEX_CAPTURE_ATTEMPTS_MAX {
         let request = validation.take_pending();
         let epoch = request.epoch;
@@ -1226,7 +1313,8 @@ pub(crate) async fn initial_workspace_with(
             .await?;
         let Some((built, write)) = built else {
             recorded.record("outcome", "configuration_changed");
-            moved = "the configuration file moved during every capture that read the tree";
+            "the configuration file moved during every capture that read the tree"
+                .clone_into(&mut moved);
             continue;
         };
         let current = ScannedTree {
@@ -3170,7 +3258,11 @@ mod tests {
         ];
         for (kind, path, expected, reason) in expectations {
             assert_eq!(
-                super::watch_event_impact(&watched_root, &validation, &event(kind, path)),
+                super::watch_event_impact(
+                    &super::WatchRoots::resolve(&watched_root)?,
+                    &validation,
+                    &event(kind, path)
+                ),
                 expected,
                 "{path}: {reason}"
             );
@@ -3429,7 +3521,7 @@ mod tests {
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
         let root = std::path::Path::new("/rift-workspace");
         super::report_watch_outcome(
-            root,
+            &super::WatchRoots::at(root),
             &validation,
             Err(notify::Error::generic("test backend failure")),
         );
@@ -3443,7 +3535,7 @@ mod tests {
         drop(receiver);
         let root = std::path::Path::new("/rift-workspace");
         let event = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join("rift.toml"));
-        super::report_watch_outcome(root, &validation, Ok(event));
+        super::report_watch_outcome(&super::WatchRoots::at(root), &validation, Ok(event));
         assert!(validation.watch_failed.load(Ordering::Acquire));
     }
 
@@ -3457,11 +3549,14 @@ mod tests {
         let (validation, _invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
         validation.install_publication(&current);
+        // The watch is registered under one spelling and the events arrive in another,
+        // which is what `WatchRoots` maps between before the floor reads a path.
+        let roots = super::WatchRoots::resolve(&watched_root)?;
         let event = |kind, path: &str| Event::new(kind).add_path(event_root.join(path));
 
         assert_eq!(
             super::watch_event_impact(
-                &watched_root,
+                &roots,
                 &validation,
                 &event(EventKind::Modify(ModifyKind::Any), "src/lib.rs")
             ),
@@ -3470,7 +3565,7 @@ mod tests {
         );
         assert_eq!(
             super::watch_event_impact(
-                &watched_root,
+                &roots,
                 &validation,
                 &event(EventKind::Modify(ModifyKind::Any), ".gitignore")
             ),
@@ -3479,7 +3574,7 @@ mod tests {
         );
         assert_eq!(
             super::watch_event_impact(
-                &watched_root,
+                &roots,
                 &validation,
                 &event(EventKind::Modify(ModifyKind::Any), "rift.toml")
             ),
@@ -3491,13 +3586,110 @@ mod tests {
         );
         assert_eq!(
             super::watch_event_impact(
-                &watched_root,
+                &roots,
                 &validation,
                 &event(EventKind::Remove(RemoveKind::Folder), "src")
             ),
             super::WatchImpact::WholeWorkspace,
             "a directory that disappears takes an unknown set of files with it"
         );
+        Ok(())
+    }
+
+    /// A server does not index its own state. The walk's hard floor prunes `.rift` by
+    /// name before either lane sees it, so neither the syntax-indexed files nor the
+    /// recorded set holds the workspace database, whose bytes move for as long as SQLite
+    /// runs.
+    #[test]
+    fn the_index_holds_no_path_under_the_state_directory() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let state = directory
+            .path()
+            .join(rift_core::constants::RIFT_STATE_DIRECTORY);
+        fs::create_dir_all(&state)?;
+        for name in ["db", "db-shm", "db-wal", "server.json"] {
+            fs::write(state.join(name), "state\n")?;
+        }
+
+        let candidate = super::build_workspace_candidate(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &super::RebuildRequest::initial(0),
+            &empty_dependency_store(),
+        )?;
+        let WorkspaceCandidate::Stable { published, .. } = candidate else {
+            return Err("the fixture capture must be stable".into());
+        };
+
+        let digests = published.reads.workspace_digests();
+        let held: Vec<&str> = digests.iter().map(|(path, _)| path.as_str()).collect();
+        assert!(
+            held.iter()
+                .all(|path| !path.starts_with(rift_core::constants::RIFT_STATE_DIRECTORY)),
+            "the recorded set holds no state file: {held:?}"
+        );
+        assert!(held.contains(&"lib.rs"), "{held:?}");
+        Ok(())
+    }
+
+    /// A server does not observe its own state either, under any spelling of its root.
+    ///
+    /// No publication is installed, which is the startup window the initial build runs
+    /// in: `source_path_is_relevant` is wide open there and `source_project_path` answers
+    /// nothing, so every path the floor admits escalates to the whole workspace. The
+    /// floor is the only guard left, and it places the event path against both spellings
+    /// before reading it, so the database writes that run for the life of the server move
+    /// no filesystem epoch. The last assertion is what makes dropping an unplaceable path
+    /// safe: a source write under the symlinked spelling is still observed.
+    #[test]
+    fn a_state_file_event_reaches_no_impact_under_every_root_spelling() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let canonical = directory.path().canonicalize()?;
+        let state = canonical
+            .join(rift_core::constants::RIFT_STATE_DIRECTORY)
+            .join("db");
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let written = |path: &std::path::Path| {
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path.to_path_buf())
+        };
+
+        for root in [directory.path().to_path_buf(), directory.path().join(".")] {
+            assert_eq!(
+                super::watch_event_impact(
+                    &super::WatchRoots::resolve(&root)?,
+                    &validation,
+                    &written(&state)
+                ),
+                super::WatchImpact::None,
+                "a state write is not observed under root spelling {}",
+                root.display()
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let elsewhere = tempfile::tempdir()?;
+            let linked = elsewhere.path().join("workspace");
+            std::os::unix::fs::symlink(directory.path(), &linked)?;
+            let roots = super::WatchRoots::resolve(&linked)?;
+            let linked_state = linked
+                .join(rift_core::constants::RIFT_STATE_DIRECTORY)
+                .join("db");
+            assert_eq!(
+                super::watch_event_impact(&roots, &validation, &written(&linked_state)),
+                super::WatchImpact::None,
+                "a state write is not observed through a symlinked root"
+            );
+            assert_eq!(
+                super::watch_event_impact(&roots, &validation, &written(&linked.join("lib.rs"))),
+                super::WatchImpact::WholeWorkspace,
+                "a source write through a symlinked root is still observed, which is what \
+                 makes dropping an unplaceable path safe"
+            );
+        }
         Ok(())
     }
 
@@ -3518,7 +3710,11 @@ mod tests {
         .add_path(event_root.join("src/after.rs"));
 
         assert_eq!(
-            super::watch_event_impact(&watched_root, &validation, &renamed),
+            super::watch_event_impact(
+                &super::WatchRoots::resolve(&watched_root)?,
+                &validation,
+                &renamed
+            ),
             super::WatchImpact::Paths(vec![
                 rift_core::ProjectPath::new("src/before.rs")?,
                 rift_core::ProjectPath::new("src/after.rs")?,
@@ -3557,7 +3753,11 @@ mod tests {
         let staged = name_event(&event_root, ".tmpk3v9q2");
 
         assert_eq!(
-            super::watch_event_impact(&event_root, &validation, &staged),
+            super::watch_event_impact(
+                &super::WatchRoots::resolve(&event_root)?,
+                &validation,
+                &staged
+            ),
             super::WatchImpact::Paths(vec![rift_core::ProjectPath::new(".tmpk3v9q2")?]),
             "the publisher renames an extensionless staged file over its target; the \
              publication holds nothing under that name, so the event names the path alone"
@@ -3577,7 +3777,11 @@ mod tests {
         let renamed_away = name_event(&event_root, "src");
 
         assert_eq!(
-            super::watch_event_impact(&event_root, &validation, &renamed_away),
+            super::watch_event_impact(
+                &super::WatchRoots::resolve(&event_root)?,
+                &validation,
+                &renamed_away
+            ),
             super::WatchImpact::WholeWorkspace,
             "a directory renamed away is gone from the disk, and the publication still \
              holds src/lib.rs below its old spelling"
@@ -3595,7 +3799,11 @@ mod tests {
         let moved_in = name_event(&event_root, "examples");
 
         assert_eq!(
-            super::watch_event_impact(&event_root, &validation, &moved_in),
+            super::watch_event_impact(
+                &super::WatchRoots::resolve(&event_root)?,
+                &validation,
+                &moved_in
+            ),
             super::WatchImpact::WholeWorkspace,
             "a directory the publication holds nothing under is still one on disk, and \
              what moved in with it is unknown"
@@ -3612,7 +3820,11 @@ mod tests {
         let renamed = name_event(&event_root, "LICENSE");
 
         assert_eq!(
-            super::watch_event_impact(&event_root, &validation, &renamed),
+            super::watch_event_impact(
+                &super::WatchRoots::resolve(&event_root)?,
+                &validation,
+                &renamed
+            ),
             super::WatchImpact::Paths(vec![rift_core::ProjectPath::new("LICENSE")?]),
             "a file the publication holds is read again by itself, whatever its name"
         );
@@ -3916,12 +4128,17 @@ mod tests {
         let path = root.join("lib.rs");
         let event = Event::new(EventKind::Access(AccessKind::Any)).add_path(path.clone());
         assert_eq!(
-            super::watch_event_impact(root, &validation, &event),
+            super::watch_event_impact(&super::WatchRoots::at(root), &validation, &event),
             super::WatchImpact::None,
             "an access event never reaches the inclusion predicate"
         );
         assert_eq!(
-            super::watch_path_impact(root, &validation, EventKind::Access(AccessKind::Any), &path),
+            super::watch_path_impact(
+                &super::WatchRoots::at(root),
+                &validation,
+                EventKind::Access(AccessKind::Any),
+                &path
+            ),
             super::WatchImpact::None
         );
     }
