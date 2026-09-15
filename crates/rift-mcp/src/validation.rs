@@ -1396,6 +1396,13 @@ pub(crate) fn build_workspace_candidate(
     request: &RebuildRequest,
     dependencies: &Arc<DependencyStore>,
 ) -> Result<WorkspaceCandidate, ReadError> {
+    tracing::debug!(
+        component = "index",
+        operation = "index.build",
+        phase = "start",
+        epoch = request.epoch,
+        "index capture started"
+    );
     let configuration = ConfigurationState::accept(root);
     let change_set = request.change_set(root, &configuration);
     let candidate = match &change_set {

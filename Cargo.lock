@@ -3928,6 +3928,7 @@ dependencies = [
  "fs4",
  "indicatif",
  "jiff",
+ "nix",
  "reqwest",
  "rift-core",
  "rift-index",

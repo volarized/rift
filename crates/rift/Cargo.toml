@@ -55,6 +55,21 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["net", "test-util"] }
 unicode-width.workspace = true
 
+[target.'cfg(unix)'.dev-dependencies]
+nix.workspace = true
+
+[[test]]
+name = "corpus_bun"
+path = "tests/corpus_bun.rs"
+
+[[test]]
+name = "corpus_nextjs"
+path = "tests/corpus_nextjs.rs"
+
+[[test]]
+name = "corpus_fastapi"
+path = "tests/corpus_fastapi.rs"
+
 [[test]]
 name = "end_to_end"
 path = "tests/end_to_end.rs"

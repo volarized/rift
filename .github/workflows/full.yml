@@ -1,0 +1,148 @@
+name: full
+
+on:
+  schedule:
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+  workflow_call:
+    inputs:
+      skip-release-gate:
+        description: Reuse the release workflow's installer and upgrade checks
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  corpus:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-gate')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - repository: fastapi
+            minutes: 4
+          - repository: bun
+            minutes: 9
+          - repository: nextjs
+            minutes: 12
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v7.6.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: scripts/uv.lock
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          shared-key: corpus
+      - uses: taiki-e/install-action@v2.86.3
+        with:
+          tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
+      - name: Install validating client
+        run: uv sync --locked --python 3.12 --project scripts
+      - uses: actions/cache@v6.1.0
+        with:
+          path: ~/.cache/rift-corpus
+          key: corpus-${{ matrix.repository }}-${{ hashFiles('crates/rift/tests/corpus/pins.toml') }}
+      - name: Fetch pinned repository
+        run: just corpus-sync "${{ matrix.repository }}"
+      - name: Build instrumented corpus suite
+        run: |
+          cargo llvm-cov clean --workspace
+          rift_coverage_env="$(cargo llvm-cov show-env --sh)"
+          eval "$rift_coverage_env"
+          cargo nextest run --no-run --locked -p rift --test "corpus_${{ matrix.repository }}" --target-dir target/llvm-cov-target
+      - name: Run corpus suite
+        id: corpus
+        timeout-minutes: ${{ matrix.minutes }}
+        env:
+          RIFT_CORPUS_REPORT: ${{ github.workspace }}/target/corpus/${{ matrix.repository }}.json
+        run: just corpus-test "${{ matrix.repository }}"
+      - name: Report corpus coverage
+        if: ${{ !cancelled() && steps.corpus.outcome != 'skipped' }}
+        run: cargo llvm-cov report --lcov --output-path target/corpus.lcov
+      - uses: codecov/codecov-action@v5.5.5
+        if: ${{ !cancelled() && steps.corpus.outcome != 'skipped' }}
+        with:
+          disable_search: true
+          fail_ci_if_error: true
+          files: target/corpus.lcov
+          flags: corpus
+          name: corpus-${{ matrix.repository }}
+          token: ${{ secrets.CODECOV_TOKEN }}
+      - uses: codecov/codecov-action@v5.5.5
+        if: ${{ !cancelled() && steps.corpus.outcome != 'skipped' }}
+        with:
+          disable_search: true
+          fail_ci_if_error: true
+          files: target/nextest/corpus/junit.xml
+          flags: gate
+          name: corpus-${{ matrix.repository }}
+          report_type: test_results
+          token: ${{ secrets.CODECOV_TOKEN }}
+      - uses: actions/upload-artifact@v6.0.0
+        if: always()
+        with:
+          name: corpus-${{ matrix.repository }}
+          path: |
+            target/corpus/
+            target/nextest/corpus/junit.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+  agent:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-gate')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v7.6.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: scripts/uv.lock
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          shared-key: release-native
+      - name: Install validating client
+        run: uv sync --locked --python 3.12 --project scripts
+      - name: Build candidate binary
+        run: cargo build --release --locked -p rift
+      - name: Serve candidate artifact
+        timeout-minutes: 4
+        run: uv run --locked --python 3.12 --project scripts python scripts/check_artifact.py --binary target/release/rift --junit target/full-gate/artifact.xml
+      - name: Exercise every served tool
+        timeout-minutes: 5
+        run: uv run --locked --python 3.12 --project scripts python scripts/check_agent.py --binary target/release/rift --junit target/full-gate/agent.xml
+      - name: Prove cold first use
+        timeout-minutes: 4
+        run: uv run --locked --python 3.12 --project scripts python scripts/check_coldstart.py --binary target/release/rift --junit target/full-gate/coldstart.xml
+      - uses: codecov/codecov-action@v5.5.5
+        if: always()
+        with:
+          disable_search: true
+          fail_ci_if_error: true
+          files: target/full-gate/artifact.xml,target/full-gate/agent.xml,target/full-gate/coldstart.xml
+          flags: gate
+          name: rift-full-gate
+          report_type: test_results
+          token: ${{ secrets.CODECOV_TOKEN }}
+      - uses: actions/upload-artifact@v6.0.0
+        if: always()
+        with:
+          name: full-gate
+          path: target/full-gate/
+          if-no-files-found: warn
+          retention-days: 7

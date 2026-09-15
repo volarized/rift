@@ -16,13 +16,10 @@ use crate::{
     SourcePath,
 };
 
-/// ASCII bytes percent-encoded inside one segment of a `rift://` identity.
+/// ASCII bytes percent-encoded inside the path of a `rift://` identity.
 ///
 /// The kept characters are the RFC 3986 path set; every other byte, including each byte of a
-/// multi-byte UTF-8 sequence, is `%XX`-escaped. This is a display spelling, not a
-/// round-trip-parseable encoding: unlike [`SourceUnitId`]'s hand-rolled percent-encoding,
-/// nothing decodes a `rift://symbol/...`, `rift://file/...`, or `rift://node/...` identity
-/// back into its segments.
+/// multi-byte UTF-8 sequence, is `%XX`-escaped. Slashes remain path separators.
 const RIFT_PATH_ESCAPE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'.')
     .remove(b'_')
@@ -43,11 +40,15 @@ const RIFT_PATH_ESCAPE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'/')
     .remove(b'-');
 
-/// Percent-encodes one segment of a `rift://` identity, keeping the RFC 3986 path set
+/// ASCII bytes percent-encoded inside a symbol's final qualified-name segment.
+/// Slashes in declaration names must not become project path separators.
+const RIFT_SYMBOL_ESCAPE_SET: &AsciiSet = &RIFT_PATH_ESCAPE_SET.add(b'/');
+
+/// Percent-encodes the path of a `rift://` identity, keeping the RFC 3986 path set
 /// literal and escaping everything else.
 ///
-/// The read service and the lexical index share this one function so a project path or
-/// qualified name is escaped identically wherever a wire identity is minted from it.
+/// The read service and the lexical index share this one function so a project path
+/// is escaped identically wherever a wire identity is minted from it.
 #[must_use]
 pub fn encode_path(value: &str) -> String {
     utf8_percent_encode(value, RIFT_PATH_ESCAPE_SET).to_string()
@@ -60,13 +61,14 @@ pub fn encode_path(value: &str) -> String {
 /// `name:dialect` - as `Language::identity_segment` mints it. The read service mints this as
 /// a declaration's `SymbolId`, and the lexical index mints the same spelling as a symbol
 /// lexical unit's identity, so a lexical hit's identity equals the id `get_symbol` returns
-/// for that declaration.
+/// for that declaration. The qualified name is one segment: its slashes are escaped
+/// so the final literal slash always separates the project path from the name.
 #[must_use]
 pub fn symbol_identity(language_segment: &str, path: &str, qualified_name: &str) -> String {
     format!(
         "rift://symbol/{language_segment}/{}/{}",
         encode_path(path),
-        encode_path(qualified_name)
+        utf8_percent_encode(qualified_name, RIFT_SYMBOL_ESCAPE_SET)
     )
 }
 
@@ -522,6 +524,25 @@ mod tests {
             identity,
             "rift://symbol/rust/src/caf%C3%A9%20mod.rs/Rift::separated%20name"
         );
+    }
+
+    #[test]
+    fn symbol_identity_keeps_slashes_inside_the_qualified_name() {
+        for (name, encoded) in [
+            (
+                "js/bun/test/expect.test.ts",
+                "js%2Fbun%2Ftest%2Fexpect.test.ts",
+            ),
+            ("js%2Fbun", "js%252Fbun"),
+            ("café/test", "caf%C3%A9%2Ftest"),
+            ("/leading//trailing/", "%2Fleading%2F%2Ftrailing%2F"),
+        ] {
+            assert_eq!(
+                symbol_identity("json", "test/expected-durations.json", name),
+                format!("rift://symbol/json/test/expected-durations.json/{encoded}"),
+                "qualified-name slashes must stay separate from path separators: {name}"
+            );
+        }
     }
 
     /// Pins a shipped rust `SymbolId` byte-for-byte: generalizing the minting

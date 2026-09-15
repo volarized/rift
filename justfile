@@ -106,6 +106,14 @@ testing-check:
     uv run --locked --python 3.12 --project scripts ty check --extra-search-path scripts --extra-search-path tools/rift-release/src scripts
     uv run --locked --python 3.12 --project scripts pytest scripts
 
+corpus-sync name="":
+    uv run --locked --python 3.12 --project scripts python scripts/check_corpus.py sync {{ if name == "" { "" } else { quote(name) } }}
+
+# Each repository runs alone. --no-report preserves the fast tier's profiles
+# so full-gate can merge coverage without running those tests a second time.
+corpus-test name:
+    RIFT_CORPUS_LIVE=1 cargo llvm-cov nextest --no-report --locked -p rift --test {{ quote("corpus_" + name) }} --profile corpus
+
 artifact-test *args:
     uv run --locked --python 3.12 --project scripts python scripts/check_artifact.py {{ args }}
 
@@ -114,6 +122,20 @@ agent-test *args:
 
 coldstart-test *args:
     uv run --locked --python 3.12 --project scripts python scripts/check_coldstart.py {{ args }}
+
+# One large workspace at a time on the development machine. The CI full tier
+# runs these repositories on separate runners with separate job budgets.
+full-gate linux_binary="":
+    @echo "Full gate runs the instrumented suite, then corpus and artifact checks in sequence."
+    just test
+    just corpus-sync
+    just corpus-test fastapi
+    just corpus-test bun
+    just corpus-test nextjs
+    cargo llvm-cov report --lcov --output-path lcov.info --fail-under-lines 86
+    just artifact-test
+    just agent-test
+    just coldstart-test {{ if linux_binary == "" { "" } else { "--binary " + quote(linux_binary) } }}
 
 rust-gate: format dashes generate-check conformance check clippy docs audit test release-test installer-test testing-check
 

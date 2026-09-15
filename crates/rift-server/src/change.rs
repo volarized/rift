@@ -2771,6 +2771,62 @@ mod tests {
         Ok(())
     }
 
+    /// JSON keys containing slashes must stay inside the qualified-name segment when
+    /// the read identity is used for an edit. Literal percent escapes stay distinct.
+    #[test]
+    fn json_symbol_address_with_slashes_round_trips_from_read_to_replacement() -> TestResult {
+        for key in [
+            "js/bun/test/expect-stack-overflow-crash.test.ts",
+            "js%2Fbun",
+            "café/test",
+            "/leading//trailing/",
+        ] {
+            let directory = tempfile::tempdir()?;
+            fs::create_dir(directory.path().join("test"))?;
+            let path = directory.path().join("test/expected-durations.json");
+            let source = format!("{{\"{key}\": 1, \"untouched\": 2}}\n");
+            fs::write(&path, &source)?;
+            let reads = ReadService::build(
+                directory.path(),
+                WorkspaceIndexLimits::default(),
+                &SourceVisibility::default(),
+                &rift_core::TextFileInclusion::default(),
+                HistoryConfiguration::default(),
+            )?;
+            let params = serde_json::from_value(serde_json::json!({"name": key}))?;
+            let hits = reads.get_symbol(&params)?.hits;
+            assert_eq!(hits.len(), 1, "fixture must return exactly one key: {key}");
+            let identity = hits[0]
+                .symbol
+                .id
+                .clone()
+                .ok_or("missing JSON key identity")?;
+            let parsed = super::parse_symbol_address(&identity.0)?;
+            assert_eq!(parsed.path.as_str(), "test/expected-durations.json");
+            assert_eq!(parsed.qualified_name, key, "decode the name exactly once");
+            let changes = ChangeService::new(directory.path());
+            let result = changes.replace_symbol(
+                &reads,
+                &ReplaceSymbolParams {
+                    symbol: identity,
+                    region: None,
+                    body: format!("\"{key}\": 3").into(),
+                },
+            )?;
+            let summary = applied_summary(result);
+            assert!(
+                summary.diagnostics.is_empty(),
+                "JSON replacement must parse"
+            );
+            assert_eq!(
+                fs::read(path)?,
+                format!("{{\"{key}\": 3, \"untouched\": 2}}\n").as_bytes(),
+                "only the addressed member changes: {key}"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn replace_symbol_refuses_when_disk_drifted_from_snapshot() -> TestResult {
         let (directory, reads, changes) = fixture("pub fn beacon() {}\n")?;
