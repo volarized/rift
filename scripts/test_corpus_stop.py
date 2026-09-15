@@ -20,9 +20,9 @@ def test_stop_observes_active_work_while_log_writes_are_pending(
     async def exercise() -> None:
         startup = 'INFO index snapshot published operation="index.publish" trigger="startup" epoch=0\n'
         started = (
-            'DEBUG index capture started operation="index.build" phase="start" epoch=1\n'
+            'DEBUG index capture started component="index" operation="index.build" phase="start" epoch=1\n'
             if operation == "rebuild"
-            else 'DEBUG symbol history started operation="get_symbol" phase="start"\n'
+            else 'DEBUG symbol history started component="index" operation="get_symbol" phase="start"\n'
         )
         output = startup
         cancelled = asyncio.Event()
