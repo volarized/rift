@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock
@@ -159,6 +160,77 @@ def fake_binary(tmp_path: Path, behavior: str) -> Path:
     binary.write_text(f"#!{sys.executable}\n" + behavior, encoding="utf-8")
     binary.chmod(0o755)
     return binary
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fixture executable uses a Unix shebang")
+@pytest.mark.parametrize("interruption", ["timeout", "sigterm"])
+def test_active_sdk_request_interruption_reaps_every_owned_process(
+    tmp_path: Path, interruption: str
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    binary = fake_binary(
+        tmp_path,
+        """import asyncio,json,os,pathlib,signal,subprocess,sys,time
+from mcp.server.fastmcp import FastMCP
+
+if sys.argv[1:]==['server','start','--foreground','--auth','skip']:
+    pathlib.Path('.rift').mkdir()
+    pathlib.Path('.rift/server.json').write_text(json.dumps({'pid':os.getpid(),'port':12000}))
+    time.sleep(30)
+else:
+    app = FastMCP('interrupted request')
+
+    @app.tool()
+    async def wait() -> dict[str, str]:
+        child = subprocess.Popen(
+            [sys.executable, '-c', 'import time; time.sleep(30)'],
+            start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        pathlib.Path('active.json').write_text(json.dumps([os.getpid(), child.pid]))
+        if os.environ['RIFT_TEST_INTERRUPTION'] == 'sigterm':
+            await asyncio.sleep(0.05)
+            os.kill(os.getppid(), signal.SIGTERM)
+        await asyncio.sleep(30)
+        return {'status': 'finished'}
+
+    app.run(transport='stdio')
+""",
+    )
+    server = Server(
+        binary,
+        root,
+        tmp_path / "server.log",
+        env={"RIFT_TEST_INTERRUPTION": interruption},
+    )
+
+    async def operation() -> None:
+        with server:
+            async with server.connect() as client:
+                async with asyncio.timeout(2):
+                    await client.call("wait", {})
+
+    started = time.monotonic()
+    expected = RuntimeError if interruption == "sigterm" else TimeoutError
+    with pytest.RaisesGroup(
+        pytest.RaisesExc(
+            expected,
+            match="interrupted by SIGTERM" if interruption == "sigterm" else None,
+        ),
+        allow_unwrapped=True,
+        flatten_subgroups=True,
+    ):
+        asyncio.run(operation())
+    assert time.monotonic() - started < 10
+    assert server.process.poll() is not None
+    assert not psutil.pid_exists(server.process.pid)
+    proxy, detached = json.loads((root / "active.json").read_text())
+    assert not psutil.pid_exists(proxy)
+    try:
+        child = psutil.Process(detached)
+        assert child.status() == psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        pass
 
 
 @pytest.mark.skipif(os.name == "nt", reason="fixture executable uses a Unix shebang")
