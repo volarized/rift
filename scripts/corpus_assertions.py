@@ -23,7 +23,7 @@ from rift_test_client import (
 SYMBOL_COUNT = 200
 SYMBOL_POOL_MAX = 4000
 READ_COUNT = 50
-SOURCE_WARNINGS_MAX = 9
+SOURCE_WARNINGS_MAX = 8
 LEXICAL_UNITS_MAX = 1_000_000
 LEXICAL_BYTES_MAX = 512 * 1024 * 1024
 PROBE_PATH = "rift_corpus_probe.rs"
@@ -180,9 +180,16 @@ def warnings(answer: JsonObject) -> list[JsonObject]:
     source = [
         warning for warning in found if warning.get("code") == "source_unavailable"
     ]
+    named = [warning for warning in source if warning.get("unit") is not None]
+    summaries = [warning for warning in source if warning.get("unit") is None]
     require(
-        len(source) <= SOURCE_WARNINGS_MAX,
-        f"source warnings exceeded {SOURCE_WARNINGS_MAX}: {source}",
+        len(named) <= SOURCE_WARNINGS_MAX and len(summaries) <= 1,
+        f"source warnings exceeded {SOURCE_WARNINGS_MAX} named and one summary: {source}",
+    )
+    require(
+        not summaries
+        or (len(named) == SOURCE_WARNINGS_MAX and source[-1] == summaries[0]),
+        f"source warning summary must follow {SOURCE_WARNINGS_MAX} named entries: {source}",
     )
     return found
 

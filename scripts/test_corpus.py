@@ -405,9 +405,26 @@ class Decisions(unittest.TestCase):
             no_failed_builds([{"message": "index rebuild failed"}])
         with self.assertRaisesRegex(AssertionError, "source warnings exceeded"):
             warnings({"warnings": [{"code": "source_unavailable"}] * 10})
-        self.assertEqual(
-            len(warnings({"warnings": [{"code": "source_unavailable"}] * 9})), 9
-        )
+
+    def test_source_warning_summary_follows_eight_named_files(self) -> None:
+        named: list[JsonObject] = [
+            {"code": "source_unavailable", "unit": f"rift://file/{number}.rs"}
+            for number in range(8)
+        ]
+        summary: JsonObject = {
+            "code": "source_unavailable",
+            "detail": "remaining files",
+        }
+        self.assertEqual(len(warnings({"warnings": [*named, summary]})), 9)
+        self.assertEqual(len(warnings({"warnings": named})), 8)
+        for source in (
+            [*named, named[0]],
+            [*named, summary, summary],
+            [summary, *named],
+            [summary],
+        ):
+            with self.subTest(source=source), self.assertRaises(AssertionError):
+                warnings({"warnings": source})
 
     def test_fixture_patch_keeps_exact_bytes(self) -> None:
         self.assertEqual(len(PROBE_SOURCE.encode()), 24)
