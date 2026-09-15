@@ -71,6 +71,23 @@ jobs:
         run: |
           rustup target add "${{ matrix.target }}"
           cargo build --release --locked --target "${{ matrix.target }}" --package rift
+      - uses: taiki-e/install-action@v2.86.3
+        if: runner.os == 'Windows'
+        with:
+          tool: cargo-nextest@0.9.140
+      - name: Test Windows update publication
+        if: runner.os == 'Windows'
+        run: >-
+          cargo nextest run --release --locked --target "${{ matrix.target }}"
+          --package rift --bin rift --profile ci --no-tests fail
+          -E 'test(=update::tests::windows_publish_flushes_staging_and_preserves_backup)'
+      - uses: actions/upload-artifact@v6.0.0
+        if: ${{ always() && runner.os == 'Windows' }}
+        with:
+          name: update-tests-${{ matrix.target }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: error
+          retention-days: 7
       - uses: actions/upload-artifact@v6.0.0
         with:
           name: candidate-${{ matrix.target }}

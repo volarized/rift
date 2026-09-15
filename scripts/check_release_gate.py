@@ -39,6 +39,7 @@ from release_fixture import (
     trusted_certificate,
 )
 from release_process import run
+from release_upgrade import windows_flush_error, windows_v33_recovery
 from rift_release.release import binary_name, release_version
 from rift_test_client import xml_text
 
@@ -61,6 +62,14 @@ class Options:
     shell: list[str] | None
     junit: Path
     evidence: Path
+
+
+@dataclass(frozen=True)
+class UpgradeResult:
+    """Keep the resulting binary and the operation that installed its verified bytes."""
+
+    binary: Path
+    evidence: dict[str, str]
 
 
 def host_shells() -> tuple[str, ...]:
@@ -153,28 +162,110 @@ def upgrade(
     candidate: ReleaseAssets,
     directory: Path,
     fixture: ReleaseFixture,
-) -> Path:
+    report: Report,
+) -> UpgradeResult:
     """Execute the installed historical updater without patching or rebuilding its bytes."""
     deadline = time.monotonic() + STAGE_SECONDS_MAX
-    binary = install(
-        previous, directory / "upgrade", host_shells()[0], fixture, deadline=deadline
+    binary = report.check(
+        "install-previous",
+        lambda: install(
+            previous,
+            directory / "upgrade",
+            host_shells()[0],
+            fixture,
+            deadline=deadline,
+        ),
     )
-    before = len(fixture.requests)
-    run(
-        [str(binary), "update"],
-        environment=fixture.environment(),
-        cwd=directory,
-        timeout=180,
-        deadline=deadline,
-    )
-    expected = set(candidate.responses()) | {(API_HOST, LATEST_PATH)}
-    if set(fixture.requests[before:]) != expected:
-        raise AssertionError(
-            "historical updater did not fetch candidate metadata and verified assets"
+    if (
+        sys.platform == "win32"
+        and previous.target == candidate.target
+        and windows_v33_recovery(previous.tag, candidate.tag, candidate.target)
+    ):
+        evidence = report.check(
+            "historical-update-refusal",
+            lambda: windows_refusal(
+                previous, candidate, binary, directory, fixture, deadline
+            ),
         )
-    candidate.verify_installed(binary, fixture.environment(), deadline=deadline)
-    smoke(binary, candidate.tag, fixture.environment(), deadline=deadline)
-    return binary
+        recovered = report.check(
+            "installer-recovery",
+            lambda: install(
+                candidate, binary.parent, "pwsh", fixture, deadline=deadline
+            ),
+        )
+        report.check(
+            "recovered-artifact",
+            lambda: smoke(
+                recovered, candidate.tag, fixture.environment(), deadline=deadline
+            ),
+        )
+        return UpgradeResult(recovered, evidence)
+
+    def update_and_serve() -> None:
+        run_historical_update(binary, candidate, directory, fixture, deadline)
+        candidate.verify_installed(binary, fixture.environment(), deadline=deadline)
+        smoke(binary, candidate.tag, fixture.environment(), deadline=deadline)
+
+    report.check("upgrade", update_and_serve)
+    return UpgradeResult(binary, {"method": "update"})
+
+
+def run_historical_update(
+    binary: Path,
+    candidate: ReleaseAssets,
+    directory: Path,
+    fixture: ReleaseFixture,
+    deadline: float,
+) -> None:
+    """Require the historical updater's requests even when publication refuses."""
+    before = len(fixture.requests)
+    try:
+        run(
+            [str(binary), "update"],
+            environment=fixture.environment(),
+            cwd=directory,
+            timeout=180,
+            deadline=deadline,
+        )
+    finally:
+        expected = set(candidate.responses()) | {(API_HOST, LATEST_PATH)}
+        if set(fixture.requests[before:]) != expected:
+            raise AssertionError(
+                "historical updater did not fetch candidate metadata and verified assets"
+            )
+
+
+def windows_refusal(
+    previous: ReleaseAssets,
+    candidate: ReleaseAssets,
+    binary: Path,
+    directory: Path,
+    fixture: ReleaseFixture,
+    deadline: float,
+) -> dict[str, str]:
+    """Prove the immutable v0.0.33 failure before the approved installer recovery."""
+    staged = binary.parent / ".rift-update-new.exe"
+    try:
+        run_historical_update(binary, candidate, directory, fixture, deadline)
+    except RuntimeError as error:
+        recorded = str(error).replace("\r\n", "\n").rstrip("\n")
+        if recorded != windows_flush_error(str(staged)):
+            raise
+    else:
+        raise AssertionError(
+            "historical Windows v0.0.33 updater did not reproduce its flush failure"
+        )
+    previous.verify_installed(binary, fixture.environment(), deadline=deadline)
+    candidate.verify_installed(staged, fixture.environment(), deadline=deadline)
+    if (binary.parent / ".rift-update-old.exe").exists():
+        raise AssertionError(
+            "historical flush refusal must precede creation of the backup"
+        )
+    return {
+        "method": "installer-recovery",
+        "historical_error": recorded,
+        "staged_path": str(staged),
+    }
 
 
 class Report:
@@ -257,6 +348,7 @@ def run_gate(options: Options) -> None:
             | {(API_HOST, LATEST_PATH): metadata(tag)}
         )
         cleanup = ExitStack()
+        upgrade_result: UpgradeResult | None = None
 
         def start_fixture() -> ReleaseFixture:
             fixture = ReleaseFixture(directory, responses)
@@ -283,9 +375,10 @@ def run_gate(options: Options) -> None:
 
                     report.check(f"install-{shell}", install_and_serve)
             if options.mode in ("all", "upgrade"):
-                binary = report.check(
-                    "upgrade", lambda: upgrade(previous, candidate, directory, fixture)
+                upgrade_result = upgrade(
+                    previous, candidate, directory, fixture, report
                 )
+                binary = upgrade_result.binary
                 environment = fixture.environment()
                 for enabled, suite, seconds in (
                     (options.coldstart, "coldstart", 240.0),
@@ -317,6 +410,7 @@ def run_gate(options: Options) -> None:
             "manifest_sha256": hashlib.sha256(candidate.manifest).hexdigest(),
             "binary_sha256": candidate.binary_sha256,
             "requests": fixture.requests,
+            "upgrade": upgrade_result.evidence if upgrade_result is not None else None,
         }
 
         def write_evidence() -> None:

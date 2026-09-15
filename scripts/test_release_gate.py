@@ -7,23 +7,38 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from typing import cast
+from unittest.mock import Mock, patch
 
 import yaml
-from check_release_gate import Options, Report, installer_command, run_gate
+from check_release_gate import (
+    Options,
+    Report,
+    UpgradeResult,
+    installer_command,
+    run_gate,
+    upgrade,
+)
 from check_release_promotion import require_promotion
 from release_assets import (
     ROOT,
     ReleaseAssets,
 )
 from release_fixture import (
+    API_HOST,
+    LATEST_PATH,
     ReleaseFixture,
 )
+from release_upgrade import windows_flush_error
 from rift_release.release import SUPPORTED_TARGETS, archive_name
 
 
@@ -110,6 +125,246 @@ class GateTests(unittest.TestCase):
                 report.check("upgrade", failed)
             self.assertIsNotNone(ET.parse(path).find("testcase/failure"))
 
+    def test_recovery_evidence_keeps_method_and_historical_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            options = replace(
+                self.options(Path(temporary)),
+                mode="upgrade",
+                target="x86_64-pc-windows-msvc",
+            )
+            previous = ReleaseAssets(
+                "v0.0.33", options.target, b"old", b"manifest", "a" * 64
+            )
+            candidate = ReleaseAssets(
+                options.tag, options.target, b"new", b"manifest", "b" * 64
+            )
+            staged = r"C:\upgrade\.rift-update-new.exe"
+            evidence = {
+                "method": "installer-recovery",
+                "historical_error": windows_flush_error(staged),
+                "staged_path": staged,
+            }
+            fixture = Mock(spec=ReleaseFixture)
+            fixture.requests = []
+            fixture.certificate = None
+            fixture.running.return_value = nullcontext()
+            with (
+                patch("check_release_gate.prepare", return_value=(previous, candidate)),
+                patch("check_release_gate.ReleaseFixture", return_value=fixture),
+                patch(
+                    "check_release_gate.trusted_certificate", return_value=nullcontext()
+                ),
+                patch(
+                    "check_release_gate.upgrade",
+                    return_value=UpgradeResult(Path("unused"), evidence),
+                ),
+            ):
+                run_gate(options)
+            self.assertEqual(
+                json.loads(options.evidence.read_text())["upgrade"], evidence
+            )
+
+
+class UpgradeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.installed: list[tuple[str, Path]] = []
+        self.smoked: list[Path] = []
+
+    def attempt(
+        self,
+        *,
+        target: str = "x86_64-pc-windows-msvc",
+        from_tag: str = "v0.0.33",
+        tag: str = "v0.0.34",
+        platform: str = "win32",
+        fault: str = "",
+    ) -> UpgradeResult:
+        previous = ReleaseAssets(
+            from_tag,
+            target,
+            b"old archive",
+            b"manifest",
+            hashlib.sha256(b"old").hexdigest(),
+        )
+        candidate = ReleaseAssets(
+            tag, target, b"new archive", b"manifest", hashlib.sha256(b"new").hexdigest()
+        )
+        mock_fixture = Mock(spec=ReleaseFixture)
+        mock_fixture.requests = []
+        mock_fixture.environment.return_value = {}
+        fixture = cast(ReleaseFixture, mock_fixture)
+        binary = (
+            self.directory / "upgrade" / ("rift.exe" if "windows" in target else "rift")
+        )
+        staged = binary.parent / ".rift-update-new.exe"
+
+        def install_assets(
+            assets: ReleaseAssets,
+            prefix: Path,
+            _shell: str,
+            _fixture: ReleaseFixture,
+            *,
+            deadline: float | None = None,
+        ) -> Path:
+            self.assertIsNotNone(deadline)
+            self.installed.append((assets.tag, prefix))
+            if assets is candidate and fault == "reinstall-failure":
+                raise RuntimeError("installer failed")
+            prefix.mkdir(exist_ok=True)
+            binary.write_bytes(b"old" if assets is previous else b"new")
+            return binary
+
+        def invoke_update(command: Sequence[str], **_options: object) -> str:
+            self.assertEqual(list(command), [str(binary), "update"])
+            fixture.requests.extend(candidate.responses())
+            if fault != "missing-request":
+                fixture.requests.append((API_HOST, LATEST_PATH))
+            staged.write_bytes(b"bad" if fault == "staged-bytes" else b"new")
+            if fault == "old-bytes":
+                binary.write_bytes(b"bad")
+            if fault == "backup":
+                (binary.parent / ".rift-update-old.exe").write_bytes(b"old")
+            if fault == "updater-success":
+                binary.write_bytes(b"new")
+                return ""
+            # Exact stderr recorded on both native Windows v0.0.33 updaters.
+            error = (
+                "rift.exe exited 1: rift: error[update_publish_failed]: "
+                "Rift update could not be published: flushing the staged binary "
+                f"`{staged}` failed: Access is denied. (os error 5): "
+                "ensure the directory is writable and retry `rift update`\n"
+                "  caused by: Access is denied. (os error 5)"
+            )
+            replacements = {
+                "wrong-exit": ("exited 1", "exited 2"),
+                "wrong-code": ("update_publish_failed", "update_download_failed"),
+                "wrong-stage": ("flushing the staged binary", "replacing"),
+                "wrong-os-error": ("os error 5", "os error 32"),
+                "wrong-path": (str(staged), str(binary)),
+            }
+            if fault in replacements:
+                error = error.replace(*replacements[fault])
+            if fault == "timeout":
+                error = "rift.exe exceeded 180s"
+            raise RuntimeError(error + "\n")
+
+        def binary_version(command: Sequence[str], **_options: object) -> str:
+            path = Path(command[0])
+            if (path == binary and fault == "old-version") or (
+                path == staged and fault == "staged-version"
+            ):
+                return "rift 0.0.99"
+            version = from_tag if path.read_bytes() == b"old" else tag
+            return f"rift {version.removeprefix('v')}"
+
+        def smoke_binary(
+            path: Path, _tag: str, _environment: Mapping[str, str], **_options: object
+        ) -> None:
+            self.assertEqual(path.read_bytes(), b"new")
+            self.smoked.append(path)
+            if fault == "smoke-failure":
+                raise RuntimeError("smoke failed")
+
+        with (
+            patch("check_release_gate.sys.platform", platform),
+            patch("check_release_gate.install", side_effect=install_assets),
+            patch("check_release_gate.run", side_effect=invoke_update),
+            patch("release_assets.run", side_effect=binary_version),
+            patch("check_release_gate.smoke", side_effect=smoke_binary),
+        ):
+            return upgrade(
+                previous,
+                candidate,
+                self.directory,
+                fixture,
+                Report(self.directory / "junit.xml"),
+            )
+
+    def test_both_windows_targets_recover_only_after_verifying_historical_state(
+        self,
+    ) -> None:
+        for target in ("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"):
+            with self.subTest(target=target):
+                self.installed.clear()
+                result = self.attempt(target=target)
+                self.assertEqual(result.evidence["method"], "installer-recovery")
+                self.assertEqual(
+                    result.evidence["historical_error"],
+                    windows_flush_error(result.evidence["staged_path"]),
+                )
+                self.assertEqual(
+                    self.installed,
+                    [
+                        ("v0.0.33", result.binary.parent),
+                        ("v0.0.34", result.binary.parent),
+                    ],
+                )
+                self.assertEqual(self.smoked[-1], result.binary)
+                suite = ET.parse(self.directory / "junit.xml").getroot()
+                self.assertEqual(suite.get("failures"), "0")
+                self.assertIsNotNone(
+                    suite.find("testcase[@name='historical-update-refusal']")
+                )
+                self.assertIsNotNone(suite.find("testcase[@name='installer-recovery']"))
+                self.assertIsNone(suite.find("testcase[@name='upgrade']"))
+
+    def test_other_errors_or_changed_historical_state_never_reinstall(self) -> None:
+        for fault in (
+            "wrong-exit",
+            "wrong-code",
+            "wrong-stage",
+            "wrong-os-error",
+            "wrong-path",
+            "timeout",
+            "old-bytes",
+            "old-version",
+            "staged-bytes",
+            "staged-version",
+            "missing-request",
+            "updater-success",
+            "backup",
+        ):
+            with self.subTest(fault=fault):
+                self.installed.clear()
+                with self.assertRaises((RuntimeError, ValueError, AssertionError)):
+                    self.attempt(fault=fault)
+                self.assertEqual(len(self.installed), 1)
+                self.assertFalse(self.smoked)
+                self.assertEqual(
+                    ET.parse(self.directory / "junit.xml").getroot().get("failures"),
+                    "1",
+                )
+
+    def test_other_releases_targets_and_hosts_keep_failure(self) -> None:
+        for options in (
+            {"from_tag": "v0.0.32"},
+            {"tag": "v0.0.35"},
+            {"target": "x86_64-unknown-linux-gnu"},
+            {"platform": "linux"},
+        ):
+            with self.subTest(options=options):
+                self.installed.clear()
+                with self.assertRaises(RuntimeError):
+                    self.attempt(**options)
+                self.assertEqual(len(self.installed), 1)
+
+    def test_reinstall_or_smoke_failure_remains_a_failed_gate(self) -> None:
+        for fault in ("reinstall-failure", "smoke-failure"):
+            with self.subTest(fault=fault), self.assertRaises(RuntimeError):
+                self.attempt(fault=fault)
+            self.assertEqual(
+                ET.parse(self.directory / "junit.xml").getroot().get("failures"), "1"
+            )
+
+    def test_normal_upgrade_records_update_without_installer_recovery(self) -> None:
+        result = self.attempt(tag="v0.0.35", fault="updater-success")
+        self.assertEqual(result.evidence, {"method": "update"})
+        self.assertEqual(len(self.installed), 1)
+        self.assertEqual(self.smoked, [result.binary])
+
 
 class WorkflowTests(unittest.TestCase):
     def test_release_smoke_uses_native_gate_python_selection(self) -> None:
@@ -155,7 +410,10 @@ class WorkflowTests(unittest.TestCase):
                 all("continue-on-error" not in step for step in job["steps"])
             )
         upload = next(
-            step for step in build["steps"] if "upload-artifact" in step.get("uses", "")
+            step
+            for step in build["steps"]
+            if "upload-artifact" in step.get("uses", "")
+            and step["with"]["name"].startswith("candidate-")
         )
         download = next(
             step
@@ -176,6 +434,8 @@ class WorkflowTests(unittest.TestCase):
             {
                 "tag": tag,
                 "target": target,
+                "from_tag": "v0.0.33",
+                "upgrade": {"method": "update"},
                 "archive_sha256": "a" * 64,
                 "manifest_sha256": "b" * 64,
             }
@@ -199,6 +459,43 @@ class WorkflowTests(unittest.TestCase):
             require_promotion(tag, document, evidence[:-1])
         with self.assertRaisesRegex(ValueError, "every release target"):
             require_promotion(tag, document, evidence[:-1] + [evidence[0]])
+        windows = next(
+            item for item in evidence if item["target"] == "x86_64-pc-windows-msvc"
+        )
+        staged = r"C:\release-gate\upgrade\.rift-update-new.exe"
+        recovery = {
+            "method": "installer-recovery",
+            "historical_error": windows_flush_error(staged),
+            "staged_path": staged,
+        }
+        windows["upgrade"] = recovery
+        require_promotion(tag, document, evidence)
+        for invalid in (
+            None,
+            {"method": "install"},
+            {"method": "installer-recovery"},
+            recovery | {"historical_error": "other failure"},
+            recovery | {"staged_path": r"C:\other\.rift-update-new.exe"},
+        ):
+            with (
+                self.subTest(upgrade=invalid),
+                self.assertRaises((ValueError, TypeError)),
+            ):
+                windows["upgrade"] = invalid
+                require_promotion(tag, document, evidence)
+        windows["upgrade"] = recovery
+        windows["from_tag"] = "v0.0.32"
+        with self.assertRaisesRegex(ValueError, "limited to Windows"):
+            require_promotion(tag, document, evidence)
+        windows["from_tag"] = "v0.0.33"
+        linux = next(
+            item for item in evidence if item["target"] == "x86_64-unknown-linux-gnu"
+        )
+        linux["upgrade"] = recovery
+        with self.assertRaisesRegex(ValueError, "limited to Windows"):
+            require_promotion(tag, document, evidence)
+        linux["upgrade"] = {"method": "update"}
+        windows["upgrade"] = {"method": "update"}
         assets[0]["digest"] = "sha256:" + "c" * 64
         with self.assertRaisesRegex(ValueError, "changed after verification"):
             require_promotion(tag, document, evidence)

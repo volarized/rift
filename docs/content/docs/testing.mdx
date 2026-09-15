@@ -156,6 +156,21 @@ Each installed binary must match its verified archive and pass the artifact suit
 from the authentic published binary with the greatest stable version below the candidate, runs
 its existing updater, and checks the resulting bytes and served behavior.
 
+Windows v0.0.33 has one test-only exception when the candidate is v0.0.34. Its updater opens
+the staged executable read-only, so Windows rejects the flush with `update_publish_failed`
+and OS error 5. The gate requires that exact failure, verifies that the installed v0.0.33
+binary is unchanged, checks the staged candidate against its archive, and requires no backup
+file. It then runs the official PowerShell installer into the same directory and tests the
+installed v0.0.34 binary. Recovery with any other failure or version pair fails the gate.
+
+JUnit names the historical refusal and installer recovery separately. Evidence records
+`installer-recovery`, including the historical error and staged path; promotion requires
+that record for the approved Windows version pair. Ordinary upgrades record `update`.
+The production updater has no recovery fallback. Its v0.0.34 publisher opens the staged file
+with write access. Both native Windows builds run the filesystem regression through nextest
+before uploading release bytes. The historical staging file remains after installer recovery;
+the current updater removes stale staging before its next publication.
+
 Windows Arm64 uses an x86-64 Python harness because the certificate dependency has no Arm64
 wheel. Rift binaries still run as Arm64. The gate checks each Windows archive's PE machine field
 before installation. It also checks Mach-O CPU fields on macOS and ELF machine fields on Linux,
@@ -186,7 +201,8 @@ fixture, installer, or updater.
 
 The release workflow uploads six archives and their checksum manifest to a draft. Promotion
 requires every release gate and full-tier job to pass, then compares the tested archive and
-manifest digests with the current draft assets. Only after promotion does the workflow deploy
+manifest digests with the current draft assets and validates the recorded upgrade method.
+Install-only evidence cannot authorize promotion. Only after promotion does the workflow deploy
 documentation and installers.
 
 ## Reports

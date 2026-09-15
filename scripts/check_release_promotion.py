@@ -17,6 +17,7 @@ from release_assets import (
     release_document,
     require_release,
 )
+from release_upgrade import require_upgrade_evidence
 from rift_release.release import SUPPORTED_TARGETS, archive_name
 
 
@@ -49,6 +50,7 @@ def require_promotion(
         target = item.get("target")
         if item.get("tag") != tag or not isinstance(target, str):
             raise ValueError("gate evidence must name the candidate tag and target")
+        require_upgrade_evidence(item.get("from_tag"), tag, target, item.get("upgrade"))
         expected = {
             archive_name(tag, target): item.get("archive_sha256"),
             f"rift-{tag}-checksums.sha256": item.get("manifest_sha256"),
