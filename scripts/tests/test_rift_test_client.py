@@ -196,6 +196,44 @@ time.sleep(30)
     assert not psutil.pid_exists(server.process.pid)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="fixture executable uses a Unix shebang")
+def test_stop_waits_for_owned_process_within_remaining_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    binary = fake_binary(
+        tmp_path,
+        """import json,os,pathlib,sys,time
+if sys.argv[1:]==['server','stop']:
+    pathlib.Path('stop.request').write_text('requested')
+    sys.exit(0)
+pathlib.Path('.rift').mkdir()
+pathlib.Path('.rift/server.json').write_text(json.dumps({'pid':os.getpid(),'port':12000}))
+while not pathlib.Path('stop.release').exists():
+    time.sleep(0.01)
+""",
+    )
+    with Server(binary, root, tmp_path / "server.log") as server:
+        wait = server.process.wait
+        budgets: list[float] = []
+
+        def release_and_wait(timeout: float | None = None) -> int:
+            if server.process.poll() is None:
+                assert (root / "stop.request").exists()
+                assert timeout is not None
+                budgets.append(timeout)
+                (root / "stop.release").write_text("released")
+            return wait(timeout=timeout)
+
+        monkeypatch.setattr(server.process, "wait", release_and_wait)
+        server.stop(timeout_seconds=1.0)
+        assert server.process.returncode == 0
+        assert len(budgets) == 1
+        assert 0 < budgets[0] < 1.0
+    assert not psutil.pid_exists(server.process.pid)
+
+
 @pytest.mark.parametrize("fails", [False, True])
 def test_junit_records_success_and_failure(tmp_path: Path, fails: bool) -> None:
     import xml.etree.ElementTree as element_tree
@@ -420,3 +458,32 @@ def test_gate_deadline_limits_a_synchronous_command() -> None:
 
     with pytest.raises(RuntimeError, match="exceeded"):
         asyncio.run(operation())
+
+
+@pytest.mark.parametrize("phase", ["_observe_descendants", "_check_log"])
+def test_stop_deadline_includes_observation_and_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    import subprocess
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import rift_test_client
+
+    clock = [100.0]
+    monkeypatch.setattr(
+        rift_test_client, "time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    server = Server(tmp_path / "rift", tmp_path / "workspace", tmp_path / "server.log")
+    process = Mock(spec=subprocess.Popen)
+    process.returncode = 0
+    server.process = process
+    monkeypatch.setattr(rift_test_client, "run_command", lambda *args, **kwargs: "")
+
+    def exceed_deadline() -> None:
+        clock[0] += 6.0
+
+    monkeypatch.setattr(server, phase, exceed_deadline)
+    with pytest.raises(AssertionError, match="stop exceeded its deadline"):
+        server.stop()
+    assert not server._stopped

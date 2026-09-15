@@ -10,12 +10,13 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, BinaryIO, Final
 
 import psutil
+from release_process_unix import UnixOwner
 
 OUTPUT_BYTES_MAX: Final = 4 * 1024 * 1024
 COMMAND_SECONDS_MAX: Final = 300.0
@@ -95,11 +96,55 @@ def descendants(pid: int) -> list[psutil.Process]:
         return []
 
 
-def stop_unix_process(process: subprocess.Popen[bytes]) -> None:
-    """Bound cleanup across nested owners, including children in private process groups."""
+def stop_children(children: Sequence[psutil.Process], deadline: float) -> None:
+    """Kill captured identities, then check their exit within the cleanup deadline."""
+    for child in reversed(children):
+        try:
+            child.kill()
+        except psutil.NoSuchProcess:
+            continue
+    _, alive = psutil.wait_procs(children, timeout=max(0, deadline - time.monotonic()))
+    for child in alive:
+        try:
+            if child.is_running() and child.status() != psutil.STATUS_ZOMBIE:
+                raise RuntimeError(f"command descendant {child.pid} did not stop")
+        except psutil.NoSuchProcess:
+            continue
+
+
+@contextmanager
+def owned_environment(
+    environment: Mapping[str, str] | None,
+) -> Iterator[dict[str, str]]:
+    """Track cooperating Unix children around a transport that creates its own subprocess.
+
+    SDK transports receive this complete environment explicitly. Windows keeps
+    its existing transport cleanup; this scope changes only Unix ownership.
+    """
+    if sys.platform == "win32":
+        yield dict(os.environ if environment is None else environment)
+        return
+    owner = UnixOwner(environment)
+    owner.attach(os.getpid())
+    with owner.active():
+        try:
+            yield owner.environment
+        finally:
+            deadline = time.monotonic() + JOIN_SECONDS_MAX
+            children: list[psutil.Process] = []
+            try:
+                children.extend(owner.processes())
+            finally:
+                stop_children(children, deadline)
+
+
+def stop_unix_process(process: subprocess.Popen[bytes], owner: UnixOwner) -> None:
+    """Stop captured children and detached children retaining the inherited owner token."""
     deadline = time.monotonic() + JOIN_SECONDS_MAX
-    children = descendants(process.pid)
+    children: list[psutil.Process] = []
     try:
+        children.extend(descendants(process.pid))
+        children.extend(owner.processes())
         if process.poll() is None:
             signal_group(process.pid, signal.SIGTERM)
             try:
@@ -109,28 +154,16 @@ def stop_unix_process(process: subprocess.Popen[bytes]) -> None:
             except subprocess.TimeoutExpired:
                 pass
     finally:
-        children.extend(descendants(process.pid))
         try:
-            signal_group(process.pid, signal.SIGKILL)
+            children.extend(descendants(process.pid))
+            children.extend(owner.processes())
         finally:
-            # Process.kill validates the cached creation time before sending SIGKILL.
-            # Capture before SIGTERM so an exited middle owner cannot hide its child.
-            for child in reversed(children):
-                try:
-                    child.kill()
-                except psutil.NoSuchProcess:
-                    continue
-            _, alive = psutil.wait_procs(
-                children, timeout=max(0, deadline - time.monotonic())
-            )
-            for child in alive:
-                try:
-                    if child.is_running() and child.status() != psutil.STATUS_ZOMBIE:
-                        raise RuntimeError(
-                            f"command descendant {child.pid} did not stop"
-                        )
-                except psutil.NoSuchProcess:
-                    continue
+            try:
+                signal_group(process.pid, signal.SIGKILL)
+            finally:
+                # Process.kill checks identity even after a middle owner has exited.
+                # Discovery failures must still stop the known group and identities.
+                stop_children(children, deadline)
 
 
 @contextmanager
@@ -144,39 +177,45 @@ def owned_process(
 ) -> Iterator[subprocess.Popen[bytes]]:
     """Own a Unix process group or Windows job before the command can spawn children."""
     job = None
+    owner = None
     flags = 0
     if sys.platform == "win32":
         from release_process_windows import WindowsJob
 
         job = WindowsJob()
         flags = job.creation_flags
+    else:
+        owner = UnixOwner(environment)
     process: subprocess.Popen[bytes] | None = None
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            env=environment,
-            stdin=stdin,
-            stdout=subprocess.PIPE,
-            stderr=stderr,
-            start_new_session=sys.platform != "win32",
-            creationflags=flags,
-        )
-        if job is not None:
-            job.assign(process.pid)
-            psutil.Process(process.pid).resume()
-        yield process
-    finally:
+    with owner.active() if owner is not None else nullcontext():
         try:
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                env=owner.environment if owner is not None else environment,
+                stdin=stdin,
+                stdout=subprocess.PIPE,
+                stderr=stderr,
+                start_new_session=sys.platform != "win32",
+                creationflags=flags,
+            )
+            if owner is not None:
+                owner.attach(process.pid)
             if job is not None:
-                job.close()
-            elif process is not None:
-                stop_unix_process(process)
+                job.assign(process.pid)
+                psutil.Process(process.pid).resume()
+            yield process
         finally:
-            if process is not None:
-                if process.poll() is None:
-                    process.kill()
-                process.wait(timeout=JOIN_SECONDS_MAX)
+            try:
+                if job is not None:
+                    job.close()
+                elif process is not None and owner is not None:
+                    stop_unix_process(process, owner)
+            finally:
+                if process is not None:
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait(timeout=JOIN_SECONDS_MAX)
 
 
 def run_bytes(
@@ -193,8 +232,9 @@ def run_bytes(
     """Return exact stdout, with separately bounded stderr, input, and process lifetime.
 
     Children inherit the environment unless the caller supplies its complete
-    replacement. Stream drains stop after their sentinel byte. The process
-    owner kills descendants even when the original command already exited.
+    replacement. Stream drains stop after their sentinel byte.
+    On Unix, detached children must retain the inherited owner token and a
+    readable same-user environment. Windows jobs own descendants independently.
     """
     if deadline is not None:
         timeout = min(timeout, deadline - time.monotonic())
