@@ -41,7 +41,7 @@ filter = 'binary(=corpus_bun) & (test(=test_bun_workspace) | test(=test_bun_stop
 slow-timeout = { period = "540s", terminate-after = 1, grace-period = "30s" }
 
 [[profile.corpus.overrides]]
-filter = 'binary(=corpus_nextjs) & test(=test_nextjs_corpus)'
+filter = 'binary(=corpus_nextjs) & (test(=test_nextjs_corpus) | test(=test_nextjs_churn))'
 slow-timeout = { period = "720s", terminate-after = 1, grace-period = "30s" }
 
 [profile.corpus.junit]

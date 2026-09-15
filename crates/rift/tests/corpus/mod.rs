@@ -71,7 +71,7 @@ fn runtime_paths(
     ))
 }
 
-/// Bun cases add their name before the extension so one environment cannot overwrite either report.
+/// Repositories with two cases add the case before the extension to preserve both reports.
 fn report_path(
     root: &Path,
     name: &str,
@@ -83,7 +83,7 @@ fn report_path(
             "target/test-results/corpus/{name}/{case}/report.json"
         )));
     };
-    if name != "bun" {
+    if !matches!(name, "bun" | "nextjs") {
         return Ok(path.to_path_buf());
     }
     let mut filename = path
@@ -332,10 +332,29 @@ mod report_tests {
     #[test]
     fn test_other_repositories_keep_exact_report_path() -> Result<(), std::io::Error> {
         let supplied = Path::new("reports/exact.json");
-        for name in ["fastapi", "nextjs"] {
+        assert_eq!(
+            report_path(
+                Path::new("workspace"),
+                "fastapi",
+                "workspace",
+                Some(supplied)
+            )?,
+            supplied
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_nextjs_cases_keep_both_supplied_reports() -> Result<(), std::io::Error> {
+        for case in ["workspace", "churn"] {
             assert_eq!(
-                report_path(Path::new("workspace"), name, "workspace", Some(supplied))?,
-                supplied
+                report_path(
+                    Path::new("workspace"),
+                    "nextjs",
+                    case,
+                    Some(Path::new("report.json"))
+                )?,
+                PathBuf::from(format!("report.{case}.json"))
             );
         }
         Ok(())
