@@ -141,6 +141,8 @@ jobs:
         timeout-minutes: 2
       - run: just docs
         timeout-minutes: 1
+      - run: just doctest
+        timeout-minutes: 1
       - run: just audit
         timeout-minutes: 1
       - run: just testing-check
