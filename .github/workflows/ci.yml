@@ -86,21 +86,69 @@ jobs:
       # images. Drop the ignores once fumadocs picks up a fixed image-size.
       - run: bun audit --audit-level=high --ignore=GHSA-w3rx-r6r6-pgpr --ignore=GHSA-5p2g-fcmc-qvqq
 
+  rust-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          cache-on-failure: true
+      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: taiki-e/install-action@v2.86.3
+        with:
+          tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
+      - run: >-
+          rustup toolchain install 1.98 --profile minimal
+          --component rustfmt,clippy
+
+      # These checks invoke the compiler. Their cold builds belong within the
+      # build budget, so correctness does not depend on finding a previous cache.
+      - run: just generate-check
+      - run: just check
+      - run: just clippy
+      - run: just docs
+      - run: just doctest
+      - name: Archive instrumented tests and plain CLI
+        run: just fast-archive
+      - uses: actions/upload-artifact@v6.0.0
+        with:
+          name: fast-build
+          path: |
+            target/fast.tar.zst
+            target/fast-cli.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+
   rust:
-    runs-on: ubuntu-latest
+    needs: rust-build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 12
     permissions:
       contents: read
 
     steps:
+      - name: Require successful build
+        if: ${{ !cancelled() && needs.rust-build.result != 'success' }}
+        run: |
+          echo "::error::Rust build did not succeed"
+          exit 1
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
-      # rust-toolchain.toml and this live-engine install select the same
-      # compiler release. Keep rustfmt, clippy, and rust-analyzer available
-      # from that release.
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: actions/download-artifact@v7.0.0
+        with:
+          name: fast-build
+          path: target
+      - name: Extract plain CLI
+        run: |
+          mkdir -p target/fast-cli
+          tar --zstd -xf target/fast-cli.tar.zst -C target/fast-cli
 
       - uses: astral-sh/setup-uv@v7.6.0
       - uses: taiki-e/install-action@v2.86.3
@@ -111,7 +159,7 @@ jobs:
       # list. Install every CI component from the pinned release in one step.
       - run: >-
           rustup toolchain install 1.98 --profile minimal
-          --component rust-analyzer,rustfmt,clippy
+          --component rust-analyzer,rustfmt,clippy,llvm-tools-preview
 
       - uses: oven-sh/setup-bun@v2.2.0
         with:
@@ -124,30 +172,19 @@ jobs:
           uv tool install tombi
           tombi --version
 
-      # Each local gate target is its own CI step. There is no separate
-      # coverage step: `just test` is the one instrumented run, and its
-      # lcov output is the artifact uploaded below.
+      # The build job supplies the test binaries and CLI. This job runs tests once;
+      # the same instrumented run supplies the coverage report below.
       - run: just format
         timeout-minutes: 1
       - run: just dashes
         timeout-minutes: 1
-      - run: just generate-check
-        timeout-minutes: 2
-      - run: just conformance
+      - run: just conformance target/fast-cli/rift
         timeout-minutes: 3
-      - run: just check
-        timeout-minutes: 2
-      - run: just clippy
-        timeout-minutes: 2
-      - run: just docs
-        timeout-minutes: 1
-      - run: just doctest
-        timeout-minutes: 1
       - run: just audit
         timeout-minutes: 1
       - run: just testing-check
         timeout-minutes: 1
-      - run: just test
+      - run: just test target/fast.tar.zst
         id: rust_tests
         timeout-minutes: 10
         env:

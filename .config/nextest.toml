@@ -18,7 +18,7 @@ filter = 'binary(/^live_/)'
 test-group = 'live'
 
 [profile.ci]
-global-timeout = "600s"
+global-timeout = "480s"
 fail-fast = false
 failure-output = "immediate-final"
 

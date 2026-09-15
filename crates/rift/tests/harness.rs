@@ -24,6 +24,13 @@ use serde_json::json;
 
 pub(crate) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+/// The executable supplied by the test runner, remapped when using an archive.
+pub(crate) fn rift_binary() -> PathBuf {
+    std::env::var_os("CARGO_BIN_EXE_rift")
+        .expect("test runner must provide CARGO_BIN_EXE_rift")
+        .into()
+}
+
 /// Bound on one proxied round trip that may include a server election. A
 /// refusal can wait out two start windows - the warmup's and the request's
 /// own - before it surfaces.
@@ -113,19 +120,21 @@ pub(crate) fn laid_out_workspace(
 /// Stops the fixture's server when a test unwinds, best effort.
 pub(crate) struct StopOnDrop {
     root: PathBuf,
+    binary: PathBuf,
 }
 
 impl StopOnDrop {
     pub(crate) fn new(root: &Path) -> Self {
         Self {
             root: root.to_owned(),
+            binary: rift_binary(),
         }
     }
 }
 
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
-        let _ = std::process::Command::new(env!("CARGO_BIN_EXE_rift"))
+        let _ = std::process::Command::new(&self.binary)
             .args(["server", "stop"])
             .current_dir(&self.root)
             .stdin(Stdio::null())
@@ -141,7 +150,7 @@ pub(crate) async fn run_rift(root: &Path, arguments: &[&str]) -> TestResult<std:
     let root = root.to_owned();
     let arguments: Vec<String> = arguments.iter().map(|&argument| argument.into()).collect();
     let output = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(env!("CARGO_BIN_EXE_rift"))
+        std::process::Command::new(rift_binary())
             .args(&arguments)
             .current_dir(&root)
             .stdin(Stdio::null())
@@ -177,7 +186,7 @@ pub(crate) async fn within<Value>(
 /// The base `rift mcp` child command for one fixture workspace, before either
 /// the rmcp transport wrapper or a raw-pipe session spawns it.
 fn base_command(root: &Path) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_rift"));
+    let mut command = tokio::process::Command::new(rift_binary());
     command
         .arg("mcp")
         .current_dir(root)
