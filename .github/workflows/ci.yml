@@ -259,7 +259,15 @@ jobs:
       - uses: astral-sh/setup-uv@v7.6.0
         with:
           enable-cache: true
-          cache-dependency-glob: tools/rift-release/uv.lock
+          cache-dependency-glob: |
+            tools/rift-release/uv.lock
+            scripts/uv.lock
+      - name: Verify Windows command ownership
+        if: runner.os == 'Windows'
+        timeout-minutes: 1
+        run: >-
+          uv run --locked --python 3.12 --project scripts --no-build python
+          scripts/test_release_process.py
       - run: >-
           uv run --locked --project tools/rift-release pytest
           tools/rift-release/tests/test_installers.py

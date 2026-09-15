@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Callable
 from typing import Protocol, cast
 
@@ -24,10 +25,10 @@ class WindowsJob:
     creation_flags = win32con.CREATE_SUSPENDED
 
     def __init__(self) -> None:
-        # pywin32 b312 win32/src/win32job.i declares PyHANDLE CreateJobObject;
-        # types-pywin32 declares None. Keep that stub correction at this call.
-        create = cast(Callable[[object, str | None], Handle], win32job.CreateJobObject)
-        self.handle = create(None, None)
+        # pywin32 b312 requires a WCHAR string and returns PyHANDLE; its stub
+        # incorrectly declares the return as None. A unique name avoids sharing jobs.
+        create = cast(Callable[[object, str], Handle], win32job.CreateJobObject)
+        self.handle = create(None, f"rift-test-{uuid.uuid4().hex}")
         try:
             limits = win32job.QueryInformationJobObject(
                 int(self.handle), win32job.JobObjectExtendedLimitInformation
