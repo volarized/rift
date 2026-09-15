@@ -234,6 +234,10 @@ class ProcessTests(unittest.TestCase):
                 pass
 
     def test_child_environment_is_inherited_or_replaced_explicitly(self) -> None:
+        # subprocess requires SystemRoot for Windows side-by-side assemblies.
+        replacement = (
+            {"SystemRoot": os.environ["SystemRoot"]} if sys.platform == "win32" else {}
+        )
         command = [
             sys.executable,
             "-c",
@@ -248,7 +252,7 @@ class ProcessTests(unittest.TestCase):
                 ).strip(),
                 "overlay",
             )
-            self.assertEqual(run(command, environment={}).strip(), "absent")
+            self.assertEqual(run(command, environment=replacement).strip(), "absent")
 
     def test_failed_timed_out_and_flooding_children_fail_gate(self) -> None:
         for program in [

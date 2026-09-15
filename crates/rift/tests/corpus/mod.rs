@@ -1,5 +1,6 @@
 //! Launches each corpus suite through the validating Python MCP client.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -9,22 +10,16 @@ const RUN_SECONDS_MAX: Duration = Duration::from_mins(19);
 /// Python unwinds its owned server and proxy before the outer runner forces exit.
 const CLEANUP_SECONDS_MAX: Duration = Duration::from_secs(30);
 
-/// Runs one suite when requested, inheriting the complete test environment.
+/// Runs one explicitly selected suite, inheriting the complete test environment.
 ///
 /// In particular, `LLVM_PROFILE_FILE` reaches uv, Python, and the compiled
 /// `rift` child. Output goes directly to the test runner, which owns its
 /// output budget. The Python harness bounds each server and joins its children.
-pub(super) async fn run(name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::var_os("RIFT_CORPUS_LIVE").is_none() {
-        eprintln!("skipped: RIFT_CORPUS_LIVE unset");
-        return Ok(());
-    }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+pub(super) async fn run(name: &str, case: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let (root, binary) = runtime_paths(|name| std::env::var_os(name))?;
     let script = root.join("scripts/check_corpus.py");
-    let report = std::env::var_os("RIFT_CORPUS_REPORT").map_or_else(
-        || root.join(format!("target/test-results/corpus/{name}/report.json")),
-        PathBuf::from,
-    );
+    let supplied_report = std::env::var_os("RIFT_CORPUS_REPORT").map(PathBuf::from);
+    let report = report_path(&root, name, case, supplied_report.as_deref())?;
     let mut command = tokio::process::Command::new("uv");
     command
         .arg("run")
@@ -32,7 +27,9 @@ pub(super) async fn run(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         .arg(root.join("scripts"))
         .arg("python")
         .arg(script)
-        .args(["test", name, "--binary", env!("CARGO_BIN_EXE_rift")])
+        .args(["test", name, "--binary"])
+        .arg(binary)
+        .args(["--case", case])
         .arg("--report")
         .arg(report)
         .current_dir(root)
@@ -56,6 +53,50 @@ pub(super) async fn run(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("{name} corpus failed: {status}").into());
     }
     Ok(())
+}
+
+/// Nextest remaps runtime Cargo paths when extracting an archive into another checkout.
+fn runtime_paths(
+    environment: impl Fn(&str) -> Option<OsString>,
+) -> Result<(PathBuf, PathBuf), std::io::Error> {
+    let path = |name: &str| {
+        environment(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| std::io::Error::other(format!("corpus requires runtime {name}")))
+    };
+    Ok((
+        path("CARGO_MANIFEST_DIR")?.join("../.."),
+        path("CARGO_BIN_EXE_rift")?,
+    ))
+}
+
+/// Bun cases add their name before the extension so one environment cannot overwrite either report.
+fn report_path(
+    root: &Path,
+    name: &str,
+    case: &str,
+    supplied: Option<&Path>,
+) -> Result<PathBuf, std::io::Error> {
+    let Some(path) = supplied else {
+        return Ok(root.join(format!(
+            "target/test-results/corpus/{name}/{case}/report.json"
+        )));
+    };
+    if name != "bun" {
+        return Ok(path.to_path_buf());
+    }
+    let mut filename = path
+        .file_stem()
+        .ok_or_else(|| std::io::Error::other("corpus report path must name a file"))?
+        .to_os_string();
+    filename.push(".");
+    filename.push(case);
+    if let Some(extension) = path.extension() {
+        filename.push(".");
+        filename.push(extension);
+    }
+    Ok(path.with_file_name(filename))
 }
 
 /// `uv run` forwards SIGTERM to Python, whose registered handler closes its process owners.
@@ -228,5 +269,93 @@ mod tests {
 
         assert_eq!(child.try_wait()?, Some(status));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::{report_path, runtime_paths};
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn test_runtime_paths_use_the_relocated_checkout_and_binary() -> Result<(), std::io::Error> {
+        let (root, binary) = runtime_paths(|name| match name {
+            "CARGO_MANIFEST_DIR" => Some(OsString::from("relocated/source/crates/rift")),
+            "CARGO_BIN_EXE_rift" => Some(OsString::from("extracted/target/corpus/rift")),
+            _ => None,
+        })?;
+        assert_eq!(root, PathBuf::from("relocated/source/crates/rift/../.."));
+        assert_eq!(binary, PathBuf::from("extracted/target/corpus/rift"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_runtime_paths_refuse_missing_or_empty_values() {
+        for missing in ["CARGO_MANIFEST_DIR", "CARGO_BIN_EXE_rift"] {
+            for value in [None, Some(OsString::new())] {
+                let error = runtime_paths(|name| {
+                    if name == missing {
+                        value.clone()
+                    } else {
+                        Some(OsString::from("present"))
+                    }
+                })
+                .expect_err("runtime paths must be present before a corpus can start");
+                assert_eq!(
+                    error.to_string(),
+                    format!("corpus requires runtime {missing}")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_bun_cases_keep_both_supplied_reports() -> Result<(), std::io::Error> {
+        let root = Path::new("workspace");
+        let supplied = Some(Path::new("reports/release.json"));
+        assert_eq!(
+            report_path(root, "bun", "workspace", supplied)?,
+            PathBuf::from("reports/release.workspace.json")
+        );
+        assert_eq!(
+            report_path(root, "bun", "stop", supplied)?,
+            PathBuf::from("reports/release.stop.json")
+        );
+        assert_eq!(
+            report_path(root, "bun", "stop", Some(Path::new("report")))?,
+            PathBuf::from("report.stop")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_other_repositories_keep_exact_report_path() -> Result<(), std::io::Error> {
+        let supplied = Path::new("reports/exact.json");
+        for name in ["fastapi", "nextjs"] {
+            assert_eq!(
+                report_path(Path::new("workspace"), name, "workspace", Some(supplied))?,
+                supplied
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_default_report_path_separates_cases() -> Result<(), std::io::Error> {
+        for case in ["workspace", "stop"] {
+            assert_eq!(
+                report_path(Path::new("workspace"), "bun", case, None)?,
+                PathBuf::from(format!(
+                    "workspace/target/test-results/corpus/bun/{case}/report.json"
+                ))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_bun_report_path_requires_filename() {
+        assert!(report_path(Path::new("workspace"), "bun", "stop", Some(Path::new(""))).is_err());
     }
 }

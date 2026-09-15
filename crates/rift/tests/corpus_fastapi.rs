@@ -3,6 +3,7 @@
 mod corpus;
 
 #[tokio::test]
+#[ignore = "requires the pinned corpus"]
 async fn test_fastapi_corpus() -> Result<(), Box<dyn std::error::Error>> {
-    corpus::run("fastapi").await
+    corpus::run("fastapi", "workspace").await
 }

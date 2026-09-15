@@ -108,6 +108,13 @@ must_use_candidate = "warn"
 [profile.test]
 debug = "line-tables-only"
 
+# Corpus tests serve large repositories with coverage instrumentation enabled.
+[profile.corpus]
+inherits = "release"
+debug = "line-tables-only"
+debug-assertions = true
+overflow-checks = true
+
 # The product identity digests this executable at every server and proxy start
 # (`rift-mcp/src/identity.rs`). A debug or instrumented test binary is over 130 MB,
 # and sha2 at opt-level 0 needs about four seconds for it; optimized, well under one.

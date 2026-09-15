@@ -21,18 +21,53 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  corpus-build:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-gate')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          shared-key: corpus
+      - uses: taiki-e/install-action@v2.86.3
+        with:
+          tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
+      - name: Build and archive instrumented corpus tests
+        run: just corpus-archive
+      - uses: actions/upload-artifact@v6.0.0
+        with:
+          name: corpus-build
+          path: target/corpus.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+
   corpus:
+    needs: corpus-build
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-gate')
     strategy:
       fail-fast: false
       matrix:
         include:
           - repository: fastapi
-            minutes: 4
+            case: workspace
+            test: test_fastapi_corpus
+            minutes: 5
           - repository: bun
-            minutes: 9
+            case: workspace
+            test: test_bun_workspace
+            minutes: 10
+          - repository: bun
+            case: stop
+            test: test_bun_stop
+            minutes: 10
           - repository: nextjs
-            minutes: 12
+            case: workspace
+            test: test_nextjs_corpus
+            minutes: 13
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -43,9 +78,10 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: scripts/uv.lock
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: actions/download-artifact@v7.0.0
         with:
-          shared-key: corpus
+          name: corpus-build
+          path: target
       - uses: taiki-e/install-action@v2.86.3
         with:
           tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
@@ -57,21 +93,15 @@ jobs:
           key: corpus-${{ matrix.repository }}-${{ hashFiles('crates/rift/tests/corpus/pins.toml') }}
       - name: Fetch pinned repository
         run: just corpus-sync "${{ matrix.repository }}"
-      - name: Build instrumented corpus suite
-        run: |
-          cargo llvm-cov clean --workspace
-          rift_coverage_env="$(cargo llvm-cov show-env --sh)"
-          eval "$rift_coverage_env"
-          cargo nextest run --no-run --locked -p rift --test "corpus_${{ matrix.repository }}" --target-dir target/llvm-cov-target
       - name: Run corpus suite
         id: corpus
         timeout-minutes: ${{ matrix.minutes }}
         env:
           RIFT_CORPUS_REPORT: ${{ github.workspace }}/target/corpus/${{ matrix.repository }}.json
-        run: just corpus-test "${{ matrix.repository }}"
+        run: just corpus-test "${{ matrix.repository }}" "${{ matrix.test }}" target/corpus.tar.zst
       - name: Report corpus coverage
         if: ${{ !cancelled() && steps.corpus.outcome != 'skipped' }}
-        run: cargo llvm-cov report --lcov --output-path target/corpus.lcov
+        run: cargo llvm-cov report --nextest-archive-file target/corpus.tar.zst --lcov --output-path target/corpus.lcov
       - uses: codecov/codecov-action@v5.5.5
         if: ${{ !cancelled() && steps.corpus.outcome != 'skipped' }}
         with:
@@ -79,7 +109,7 @@ jobs:
           fail_ci_if_error: true
           files: target/corpus.lcov
           flags: corpus
-          name: corpus-${{ matrix.repository }}
+          name: corpus-${{ matrix.repository }}-${{ matrix.case }}
           token: ${{ secrets.CODECOV_TOKEN }}
       - uses: codecov/codecov-action@v5.5.5
         if: ${{ !cancelled() && steps.corpus.outcome != 'skipped' }}
@@ -88,13 +118,13 @@ jobs:
           fail_ci_if_error: true
           files: target/nextest/corpus/junit.xml
           flags: gate
-          name: corpus-${{ matrix.repository }}
+          name: corpus-${{ matrix.repository }}-${{ matrix.case }}
           report_type: test_results
           token: ${{ secrets.CODECOV_TOKEN }}
       - uses: actions/upload-artifact@v6.0.0
         if: always()
         with:
-          name: corpus-${{ matrix.repository }}
+          name: corpus-${{ matrix.repository }}-${{ matrix.case }}
           path: |
             target/corpus/
             target/nextest/corpus/junit.xml

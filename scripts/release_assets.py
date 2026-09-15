@@ -167,7 +167,53 @@ def binary_digest(archive: bytes, tag: str, target: str) -> str:
                 data = source.read(BINARY_BYTES_MAX + 1)
     if not data or len(data) > BINARY_BYTES_MAX:
         raise ValueError("release binary is empty or exceeds its byte bound")
+    require_machine(data, target)
     return hashlib.sha256(data).hexdigest()
+
+
+def require_machine(data: bytes, target: str) -> None:
+    """Require the archive's machine even when the host can emulate another one."""
+    if target.endswith("windows-msvc"):
+        require_windows_machine(data, target)
+        return
+    if target.endswith("apple-darwin"):
+        # Apple mach_header_64: eight 32-bit fields, with cputype after magic.
+        # Rust's individual targets emit one little-endian machine, never fat files.
+        if len(data) < 32 or data[:4] != b"\xcf\xfa\xed\xfe":
+            raise ValueError("release binary requires a single 64-bit Mach-O header")
+        actual = int.from_bytes(data[4:8], "little")
+        expected = {
+            "x86_64-apple-darwin": 0x01000007,
+            "aarch64-apple-darwin": 0x0100000C,
+        }
+    elif target.endswith("unknown-linux-gnu"):
+        # System V ELF64: ident names class, encoding, and version; e_machine
+        # follows the 16-byte ident and 2-byte e_type in the 64-byte header.
+        if len(data) < 64 or data[:7] != b"\x7fELF\x02\x01\x01":
+            raise ValueError("release binary requires a little-endian ELF64 header")
+        actual = int.from_bytes(data[18:20], "little")
+        expected = {
+            "x86_64-unknown-linux-gnu": 62,
+            "aarch64-unknown-linux-gnu": 183,
+        }
+    else:
+        raise ValueError(f"unsupported release target: {target}")
+    if actual != expected.get(target):
+        raise ValueError(f"release binary machine does not match {target}")
+
+
+def require_windows_machine(data: bytes, target: str) -> None:
+    """Check the PE machine field so Windows emulation cannot hide a wrong archive."""
+    # Microsoft PE format: offset 0x3c names the PE signature; the next two bytes
+    # identify the machine. Archive size was bounded before this check.
+    if len(data) < 64 or data[:2] != b"MZ":
+        raise ValueError("release binary has no DOS header")
+    offset = int.from_bytes(data[0x3C:0x40], "little")
+    if offset < 64 or offset + 6 > len(data) or data[offset : offset + 4] != b"PE\0\0":
+        raise ValueError("release binary has no bounded PE signature")
+    expected = {"x86_64-pc-windows-msvc": 0x8664, "aarch64-pc-windows-msvc": 0xAA64}
+    if int.from_bytes(data[offset + 4 : offset + 6], "little") != expected[target]:
+        raise ValueError(f"release binary machine does not match {target}")
 
 
 @dataclass(frozen=True)
