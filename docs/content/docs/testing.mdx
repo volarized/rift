@@ -152,7 +152,7 @@ checks use disposable runners and are not part of the local `full-gate` recipe.
 
 `release-gate` runs on Linux, macOS, and Windows, each on x86-64 and Arm64. It tests the documented
 Bash installer command from each selected Unix shell and the PowerShell installer on Windows.
-Each installed binary must match its verified archive and pass the artifact suite. Upgrade starts
+Each installed candidate must match its verified archive and pass the artifact suite. Upgrade starts
 from the authentic published binary with the greatest stable version below the candidate, runs
 its existing updater, and checks the resulting bytes and served behavior.
 
