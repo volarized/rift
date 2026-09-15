@@ -581,12 +581,18 @@ impl StaleIndexReason<'_> {
         let served = served_from(index_tree_revision, captured_tree_revision, moved);
         let detail = match self {
             Self::RebuildFailed(failure) => failure.detail(&served),
-            Self::TreeKeptMoving { changes } => format!(
-                "the workspace changed again on every one of {INDEX_CAPTURE_ATTEMPTS_MAX} \
-                 bounded reconciliation attempts, and the last capture found \
-                 {found}{served}; the rebuild those changes asked for publishes next",
-                found = found_ahead(changes),
-            ),
+            Self::TreeKeptMoving { changes } => {
+                let found = moved_paths(changes).map_or_else(
+                    || "the configuration file moved".to_owned(),
+                    |named| format!("{named} moved"),
+                );
+                format!(
+                    "the workspace changed again on every one of \
+                     {INDEX_CAPTURE_ATTEMPTS_MAX} bounded reconciliation attempts, and \
+                     the last capture found {found}{served}; the rebuild those changes \
+                     asked for publishes next"
+                )
+            }
         };
         bounded_detail(detail, WARNING_DETAIL_BYTES_MAX)
     }
@@ -639,21 +645,24 @@ fn served_from(
     }
 }
 
-/// The paths one capture found ahead of the publication, at most `STALE_INDEX_PATHS_MAX`
-/// of them with the rest counted, or the configuration file when no recorded file moved.
-fn found_ahead(changes: &PathChanges) -> String {
+/// The paths one comparison found moved, at most `STALE_INDEX_PATHS_MAX` of them with
+/// the rest counted, or nothing when no path moved.
+///
+/// Shared with the startup capture's own refusal, so both name what moved in one
+/// spelling under one bound.
+pub(crate) fn moved_paths(changes: &PathChanges) -> Option<String> {
     let mut paths = changes.iter().map(|(path, _)| path.as_str());
     let named: Vec<&str> = paths.by_ref().take(STALE_INDEX_PATHS_MAX).collect();
     if named.is_empty() {
-        return "the configuration file moved".to_owned();
+        return None;
     }
     let remaining = paths.count();
     let named = named.join(", ");
-    if remaining == 0 {
-        format!("{named} moved")
+    Some(if remaining == 0 {
+        named
     } else {
-        format!("{named} and {remaining} more moved")
-    }
+        format!("{named} and {remaining} more")
+    })
 }
 
 /// The request-time capture a test forces in place of reading the tree.
