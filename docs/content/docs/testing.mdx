@@ -211,3 +211,7 @@ Codecov receives fast coverage under `cli` and corpus coverage under `corpus`. O
 allows coverage from an earlier commit to carry forward. JUnit results use `gate` and remain
 separate from line coverage. CI uploads corpus actions and release checksum evidence alongside
 test results so a failed run can be inspected and repeated.
+
+The `fast-results` artifact contains fast LCOV and nextest JUnit reports. Each corpus artifact
+contains its LCOV, JUnit, actions, and server logs. Compare or merge reports from the same
+commit when reviewing a release.
