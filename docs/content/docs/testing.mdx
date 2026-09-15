@@ -64,6 +64,8 @@ and 200 symbol identities per repository passed from reads to changes. Next.js a
 during file churn. Bun checks shutdown while idle, after edits, during a rebuild, and during
 history analysis. Logs must show the named operation has started before an active-work stop test
 sends the stop command.
+The five-second shutdown bound covers the stop command and the server process's actual exit;
+releasing the server election alone does not complete the check.
 
 An edit must produce one changed-file capture and one publication. Lexical persistence checks
 hash the ordered rows for every unchanged path and compare them after an edit. Database and WAL
