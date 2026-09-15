@@ -56,6 +56,8 @@ The `full` workflow runs nightly on `main`, through `workflow_dispatch`, on PRs 
 jobs have a 20-minute deadline, including setup and reports. Corpus and native candidate builds
 run in separate jobs with the release build's 30-minute deadline. Native unit tests run in
 separate 20-minute jobs after candidate builds, using the shared `native-tests` workflow.
+Candidate builds save the shared Rust cache; native test jobs only restore it. This keeps
+cache writes from canceling a completed test run.
 Draft publication and candidate release gates require those tests to pass. Nextest archives one
 instrumented corpus build for all five cases; each runner checks out the same source revision
 and runs the archived binaries. The release gate downloads native candidate binaries without
