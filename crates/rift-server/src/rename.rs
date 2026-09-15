@@ -893,28 +893,40 @@ pub(crate) fn survivor_findings(reads: &ReadService, plan: &RenamePlan) -> Vec<D
         .iter()
         .map(|rewrite| (&rewrite.path, rewrite.next_source.as_str()))
         .collect();
-    surviving_occurrences(reads, &rewritten, &plan.old_name)
+    surviving_occurrences(reads, &rewritten, |_| vec![plan.old_name.clone()])
         .iter()
-        .map(|(path, offset)| survivor_diagnostic(&plan.old_name, path, *offset))
+        .map(|found| survivor_diagnostic(&plan.old_name, &found.path, found.offset))
         .collect()
 }
 
-/// Word-boundary occurrences of `name` that survive one applied change, as
-/// the file holding each one and its byte offset.
+/// One occurrence that survived an applied change: the file holding it,
+/// its byte offset, and the length of the spelling that matched.
+pub(crate) struct SurvivingOccurrence {
+    /// The file the occurrence stands in.
+    pub(crate) path: CoreProjectPath,
+    /// The occurrence's UTF-8 byte offset in that file.
+    pub(crate) offset: usize,
+    /// The matched spelling's length in UTF-8 bytes.
+    pub(crate) length: usize,
+}
+
+/// Word-boundary occurrences that survive one applied change.
 ///
 /// The changed tree is the served snapshot's visible file set with each
 /// rewritten file's new bytes substituted, so no fresh scan races the
 /// publication; a file the change left nothing at substitutes empty bytes.
-/// `rename_symbol` sweeps for the declaration's old name and `move_file`
-/// for the moved file's old path, under the same three bounds:
+/// `spellings` answers, for one swept file, every form a reference to the
+/// changed name or path can take there: `rename_symbol` answers the
+/// declaration's old name alone, `move_file` the moved file's old path in
+/// every spelling a reference carries. The three bounds are
 /// [`RENAME_SWEEP_FILES_MAX`], [`RENAME_SWEEP_BYTES_MAX`], and
 /// [`RENAME_SWEEP_FINDINGS_MAX`].
 pub(crate) fn surviving_occurrences(
     reads: &ReadService,
     rewritten: &BTreeMap<&CoreProjectPath, &str>,
-    name: &str,
-) -> Vec<(CoreProjectPath, usize)> {
-    let mut found: Vec<(CoreProjectPath, usize)> = Vec::new();
+    spellings: impl Fn(&CoreProjectPath) -> Vec<String>,
+) -> Vec<SurvivingOccurrence> {
+    let mut found: Vec<SurvivingOccurrence> = Vec::new();
     let mut scanned_bytes: usize = 0;
     for file in reads.index().files().take(RENAME_SWEEP_FILES_MAX) {
         if found.len() >= RENAME_SWEEP_FINDINGS_MAX || scanned_bytes >= RENAME_SWEEP_BYTES_MAX {
@@ -925,12 +937,45 @@ pub(crate) fn surviving_occurrences(
             .copied()
             .unwrap_or_else(|| file.source());
         scanned_bytes = scanned_bytes.saturating_add(text.len());
-        let remaining = RENAME_SWEEP_FINDINGS_MAX - found.len();
-        for offset in word_boundary_occurrences(text, name, remaining) {
-            found.push((file.path().clone(), offset));
+        for (offset, length) in distinct_occurrences(text, &spellings(file.path())) {
+            if found.len() >= RENAME_SWEEP_FINDINGS_MAX {
+                break;
+            }
+            found.push(SurvivingOccurrence {
+                path: file.path().clone(),
+                offset,
+                length,
+            });
         }
     }
     found
+}
+
+/// Word-boundary occurrences of every spelling in `spellings`, by ascending
+/// offset, with a match overlapping one already taken dropped.
+///
+/// Two spellings can cover one stretch of text: a reference written
+/// `../hub.rs` carries the file name inside the relative path. Taking the
+/// longer match first and dropping what overlaps it reports that stretch
+/// once.
+fn distinct_occurrences(text: &str, spellings: &[String]) -> Vec<(usize, usize)> {
+    let mut matched: Vec<(usize, usize)> = Vec::new();
+    for spelling in spellings {
+        for offset in word_boundary_occurrences(text, spelling, RENAME_SWEEP_FINDINGS_MAX) {
+            matched.push((offset, spelling.len()));
+        }
+    }
+    matched.sort_unstable_by(|left, right| left.0.cmp(&right.0).then(right.1.cmp(&left.1)));
+    let mut taken: Vec<(usize, usize)> = Vec::new();
+    let mut taken_end: usize = 0;
+    for (offset, length) in matched {
+        if offset < taken_end {
+            continue;
+        }
+        taken_end = offset.saturating_add(length);
+        taken.push((offset, length));
+    }
+    taken
 }
 
 /// Byte offsets where `name` occurs in `text` between word boundaries, at

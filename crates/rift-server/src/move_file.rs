@@ -627,9 +627,9 @@ fn merged_moved_documents(
     merged.into_iter().collect()
 }
 
-/// Findings for occurrences of the moved file's old project path that
-/// survive in the changed tree, under the same bounds and the same
-/// substitution of rewritten bytes the rename sweep runs.
+/// Findings for occurrences of the moved file's old path that survive in
+/// the changed tree, under the same bounds and the same substitution of
+/// rewritten bytes the rename sweep runs.
 ///
 /// The moved file substitutes empty bytes: nothing stands at the old path
 /// once the move lands, and the destination has no index entry until the
@@ -642,15 +642,62 @@ pub(crate) fn moved_path_findings(reads: &ReadService, plan: &MovePlan) -> Vec<D
         .map(|rewrite| (&rewrite.path, rewrite.next_source.as_str()))
         .collect();
     rewritten.insert(&plan.from, "");
-    surviving_occurrences(reads, &rewritten, plan.from.as_str())
+    surviving_occurrences(reads, &rewritten, |referrer| {
+        old_path_spellings(plan.from.as_str(), referrer.as_str())
+    })
+    .iter()
+    .map(|found| moved_path_diagnostic(plan.from.as_str(), &found.path, found.offset, found.length))
+    .collect()
+}
+
+/// Every spelling one reference in `referrer` can carry for the moved
+/// file's old path: the project-relative path, the file name alone, and the
+/// old path written relative to the referring file's own directory.
+///
+/// A `#[path = "../hub.rs"]` attribute carries the third spelling and
+/// neither of the first two, so a sweep taking the project-relative path
+/// alone reads past it.
+fn old_path_spellings(old_path: &str, referrer: &str) -> Vec<String> {
+    let file_name = old_path.rsplit_once('/').map_or(old_path, |(_, name)| name);
+    let mut spellings = vec![
+        old_path.to_owned(),
+        file_name.to_owned(),
+        spelled_from(old_path, referrer),
+    ];
+    spellings.sort_unstable();
+    spellings.dedup();
+    spellings
+}
+
+/// The moved file's old path written relative to the directory holding
+/// `referrer`, one `../` per directory the referring file sits below the
+/// deepest directory the two paths share.
+fn spelled_from(old_path: &str, referrer: &str) -> String {
+    let referring_directory: Vec<&str> = referrer
+        .rsplit_once('/')
+        .map_or_else(Vec::new, |(directory, _)| directory.split('/').collect());
+    let target: Vec<&str> = old_path.split('/').collect();
+    let shared = referring_directory
         .iter()
-        .map(|(path, offset)| moved_path_diagnostic(plan.from.as_str(), path, *offset))
-        .collect()
+        .zip(target.iter())
+        .take_while(|(left, right)| left == right)
+        .count()
+        .min(target.len().saturating_sub(1));
+    let mut spelling = "../".repeat(referring_directory.len().saturating_sub(shared));
+    spelling.push_str(&target[shared..].join("/"));
+    spelling
 }
 
 /// One surviving occurrence of the moved file's old path, as a warning
-/// finding naming the old path and the file that still holds it.
-fn moved_path_diagnostic(old_path: &str, path: &CoreProjectPath, offset: usize) -> Diagnostic {
+/// finding naming the old path and the file that still holds it. The span
+/// covers the spelling that matched, which the referring file may write
+/// relative to its own directory.
+fn moved_path_diagnostic(
+    old_path: &str,
+    path: &CoreProjectPath,
+    offset: usize,
+    length: usize,
+) -> Diagnostic {
     let start = offset as u64;
     let mut diagnostic = plan_diagnostic(format!(
         "an occurrence of the moved file's old path {old_path} survives the move in {}",
@@ -661,7 +708,7 @@ fn moved_path_diagnostic(old_path: &str, path: &CoreProjectPath, offset: usize) 
         unit: file_id(path),
         range: TextRange {
             start,
-            end: start + old_path.len() as u64,
+            end: start + length as u64,
         },
     });
     diagnostic
@@ -706,7 +753,11 @@ mod tests {
     fn workspace(files: &[(&str, &str)]) -> (tempfile::TempDir, ReadService, EnginePool) {
         let directory = tempfile::tempdir().expect("fixture directory");
         for (name, source) in files {
-            fs::write(directory.path().join(name), source).expect("fixture file writes");
+            let path = directory.path().join(name);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("fixture directories");
+            }
+            fs::write(path, source).expect("fixture file writes");
         }
         let reads = ReadService::build(
             directory.path(),
@@ -1651,10 +1702,16 @@ mod tests {
     /// A move plan for `hub.rs` to `spoke.rs` whose bytes land unchanged,
     /// carrying the given reference rewrites.
     fn sweep_plan(rewrites: Vec<(&str, &str)>) -> MovePlan {
+        sweep_plan_for("hub.rs", "spoke.rs", rewrites)
+    }
+
+    /// A move plan from `from` to `to` whose bytes land unchanged, carrying
+    /// the given reference rewrites.
+    fn sweep_plan_for(from: &str, to: &str, rewrites: Vec<(&str, &str)>) -> MovePlan {
         let moved = "pub fn hub() {}\n".to_owned();
         MovePlan {
-            from: CoreProjectPath::new("hub.rs").expect("fixture path"),
-            to: CoreProjectPath::new("spoke.rs").expect("fixture path"),
+            from: CoreProjectPath::new(from).expect("fixture path"),
+            to: CoreProjectPath::new(to).expect("fixture path"),
             moved_next: moved.clone(),
             moved_source: moved,
             rewrites: rewrites
@@ -1714,5 +1771,41 @@ mod tests {
             RENAME_SWEEP_FINDINGS_MAX,
             "findings stop at the bound the rename sweep already enforces"
         );
+    }
+
+    /// A `#[path]` attribute spells the moved file relative to the
+    /// referring file's own directory, and the sweep takes that spelling.
+    /// The file name standing inside it is the same occurrence, taken once.
+    #[test]
+    fn the_sweep_names_a_reference_spelled_relative_to_the_referring_file() {
+        let (_directory, reads, _engines) = workspace(&[
+            ("nested/hub.rs", "pub fn hub() {}\n"),
+            ("nested/deep/mod.rs", "#[path = \"../hub.rs\"]\nmod hub;\n"),
+        ]);
+        let plan = sweep_plan_for("nested/hub.rs", "nested/spoke.rs", Vec::new());
+        let findings = moved_path_findings(&reads, &plan);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].code.as_deref(), Some("rift.move.survivor"));
+        let span = findings[0]
+            .span
+            .as_ref()
+            .expect("a survivor names its place");
+        assert_eq!(span.unit.0, "rift://file/nested/deep/mod.rs");
+        assert_eq!(
+            span.range.end - span.range.start,
+            "../hub.rs".len() as u64,
+            "the span covers the relative spelling, taken once"
+        );
+    }
+
+    /// The moved file's stem written as an ordinary word is no reference to
+    /// the file: every spelling the sweep takes ends in the file name.
+    #[test]
+    fn the_sweep_passes_over_the_moved_file_stem_as_a_word() {
+        let (_directory, reads, _engines) = workspace(&[
+            ("hub.rs", "pub fn hub() {}\n"),
+            ("notes.md", "The hub joins every spoke; hub again.\n"),
+        ]);
+        assert!(moved_path_findings(&reads, &sweep_plan(Vec::new())).is_empty());
     }
 }
