@@ -543,6 +543,162 @@ impl ReadAnswer for NodesResult {
 /// for it, applied to a failure's rendering before it reaches the wire.
 const WARNING_DETAIL_BYTES_MAX: usize = 4096;
 
+/// Most moved paths one `stale_index` detail names before it counts the rest.
+const STALE_INDEX_PATHS_MAX: usize = 5;
+
+/// Why an answer is served from a publication the request-time capture found behind the
+/// tree.
+enum StaleIndexReason<'a> {
+    /// The rebuild recorded past that publication failed.
+    RebuildFailed(&'a RecordedRebuildFailure),
+    /// Every reconciliation attempt found the tree moved again, so the request never
+    /// captured the tree the publication was built for.
+    TreeKeptMoving {
+        /// What the last attempt's capture found ahead of the publication.
+        changes: &'a PathChanges,
+    },
+}
+
+impl StaleIndexReason<'_> {
+    /// The reason's own rendering, with what the answer was served from, bounded by
+    /// `WARNING_DETAIL_BYTES_MAX`.
+    fn detail(
+        &self,
+        index_tree_revision: &Digest,
+        captured_tree_revision: &Digest,
+        moved: CaptureMovement,
+    ) -> String {
+        let served = served_from(index_tree_revision, captured_tree_revision, moved);
+        let detail = match self {
+            Self::RebuildFailed(failure) => failure.detail(&served),
+            Self::TreeKeptMoving { changes } => format!(
+                "the workspace changed again on every one of {INDEX_CAPTURE_ATTEMPTS_MAX} \
+                 bounded reconciliation attempts, and the last capture found \
+                 {found}{served}; the rebuild those changes asked for publishes next",
+                found = found_ahead(changes),
+            ),
+        };
+        bounded_detail(detail, WARNING_DETAIL_BYTES_MAX)
+    }
+}
+
+/// The `stale_index` warning an answer served from `published` carries, naming the tree
+/// revision `captured` folds to and, when that is the published one, what `moved`
+/// instead. `reason` says why the publication answered.
+fn stale_index_warning(
+    published: &PublishedWorkspace,
+    captured: &WorkspaceDigests,
+    moved: CaptureMovement,
+    reason: &StaleIndexReason<'_>,
+) -> ReadWarning {
+    let captured_tree_revision = captured
+        .tree_revision()
+        .unwrap_or_else(|| unreachable!("a classified capture folds its tree revision"));
+    let index_tree_revision = Digest(published.reads.tree_revision().to_owned());
+    let captured_tree_revision = wire_digest(captured_tree_revision);
+    let detail = reason.detail(&index_tree_revision, &captured_tree_revision, moved);
+    ReadWarning::StaleIndex {
+        index_tree_revision,
+        captured_tree_revision,
+        detail,
+    }
+}
+
+/// What the answer was served from: the published snapshot when the syntax-indexed files
+/// still fold to its tree revision, and that snapshot rather than the captured tree
+/// revision when they do not.
+fn served_from(
+    index_tree_revision: &Digest,
+    captured_tree_revision: &Digest,
+    moved: CaptureMovement,
+) -> String {
+    if index_tree_revision == captured_tree_revision {
+        format!(
+            "; the syntax-indexed files still fold to tree revision {index}, and {moved}, \
+             so the answer was served from the published snapshot",
+            index = index_tree_revision.0,
+            moved = moved.clause(),
+        )
+    } else {
+        format!(
+            ", so the answer was served from the snapshot at tree revision {index} rather \
+             than the captured tree revision {captured}",
+            index = index_tree_revision.0,
+            captured = captured_tree_revision.0,
+        )
+    }
+}
+
+/// The paths one capture found ahead of the publication, at most `STALE_INDEX_PATHS_MAX`
+/// of them with the rest counted, or the configuration file when no recorded file moved.
+fn found_ahead(changes: &PathChanges) -> String {
+    let mut paths = changes.iter().map(|(path, _)| path.as_str());
+    let named: Vec<&str> = paths.by_ref().take(STALE_INDEX_PATHS_MAX).collect();
+    if named.is_empty() {
+        return "the configuration file moved".to_owned();
+    }
+    let remaining = paths.count();
+    let named = named.join(", ");
+    if remaining == 0 {
+        format!("{named} moved")
+    } else {
+        format!("{named} and {remaining} more moved")
+    }
+}
+
+/// The request-time capture a test forces in place of reading the tree.
+#[cfg(test)]
+type ForcedTreeCapture = dyn Fn(&PublishedWorkspace) -> Result<(WorkspaceDigests, ConfigurationFingerprint), ReadError>
+    + Send
+    + Sync;
+
+/// The forced capture one server holds, absent in every served run.
+///
+/// Reaching every retry arm of the bounded reconciliation loop by racing real filesystem
+/// events is not reproducible; forcing the capture the loop runs makes each arm a plain
+/// function call.
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct ForcedCapture(Arc<std::sync::Mutex<Option<Arc<ForcedTreeCapture>>>>);
+
+#[cfg(test)]
+impl ForcedCapture {
+    /// The forced capture, when one is installed.
+    fn installed(&self) -> Option<Arc<ForcedTreeCapture>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for ForcedCapture {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ForcedCapture")
+    }
+}
+
+#[cfg(test)]
+impl RiftMcp {
+    /// Forces `capture` as the request-time capture every later request runs.
+    fn force_capture(
+        &self,
+        capture: impl Fn(
+            &PublishedWorkspace,
+        ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), ReadError>
+        + Send
+        + Sync
+        + 'static,
+    ) {
+        *self
+            .forced_capture
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(capture));
+    }
+}
+
 /// What a request-time capture found moved against the publication a read is served
 /// from, when the two do not match: the recorded files, the configuration file, or both.
 ///
@@ -638,45 +794,22 @@ impl RecordedRebuildFailure {
         captured: &WorkspaceDigests,
         moved: CaptureMovement,
     ) -> ReadWarning {
-        let captured_tree_revision = captured
-            .tree_revision()
-            .unwrap_or_else(|| unreachable!("a classified capture folds its tree revision"));
-        let index_tree_revision = Digest(published.reads.tree_revision().to_owned());
-        let captured_tree_revision = wire_digest(captured_tree_revision);
-        let detail = self.detail(&index_tree_revision, &captured_tree_revision, moved);
-        ReadWarning::StaleIndex {
-            index_tree_revision,
-            captured_tree_revision,
-            detail,
-        }
+        stale_index_warning(
+            published,
+            captured,
+            moved,
+            &StaleIndexReason::RebuildFailed(self),
+        )
     }
 
-    /// The failure's own rendering with its causes, bounded by
-    /// `WARNING_DETAIL_BYTES_MAX`, naming the failed and observed epochs, what the
-    /// answer was served from, and the retry.
-    fn detail(
-        &self,
-        index_tree_revision: &Digest,
-        captured_tree_revision: &Digest,
-        moved: CaptureMovement,
-    ) -> String {
+    /// The failure's own rendering with its causes, naming the failed and observed
+    /// epochs, what `served` says the answer came from, and the retry.
+    ///
+    /// [`StaleIndexReason::detail`] renders `served` and applies
+    /// `WARNING_DETAIL_BYTES_MAX` to the whole line.
+    fn detail(&self, served: &str) -> String {
         use std::fmt::Write as _;
 
-        let served = if index_tree_revision == captured_tree_revision {
-            format!(
-                "; the syntax-indexed files still fold to tree revision {index}, and {moved}, \
-                 so the answer was served from the published snapshot",
-                index = index_tree_revision.0,
-                moved = moved.clause(),
-            )
-        } else {
-            format!(
-                ", so the answer was served from the snapshot at tree revision {index} rather \
-                 than the captured tree revision {captured}",
-                index = index_tree_revision.0,
-                captured = captured_tree_revision.0,
-            )
-        };
         let mut detail = format!(
             "the index rebuild for filesystem epoch {failed} failed and the tree is at epoch \
              {observed}{served}: {error}",
@@ -688,7 +821,7 @@ impl RecordedRebuildFailure {
             let _ = write!(detail, "; caused by: {cause}");
         }
         detail.push_str("; the next filesystem event retries the rebuild");
-        bounded_detail(detail, WARNING_DETAIL_BYTES_MAX)
+        detail
     }
 }
 
@@ -1002,6 +1135,10 @@ pub struct RiftMcp {
     /// writes records holds its own.
     logs: Option<Arc<LogStore>>,
     engines: Arc<EngineHold>,
+    /// The capture a test forces in place of reading the tree, so every retry arm of the
+    /// bounded reconciliation loop is reached without racing filesystem events.
+    #[cfg(test)]
+    forced_capture: ForcedCapture,
     tool_router: ToolRouter<Self>,
 }
 
@@ -1239,6 +1376,8 @@ impl RiftMcp {
             dependency_lane,
             logs,
             engines,
+            #[cfg(test)]
+            forced_capture: ForcedCapture::default(),
             tool_router: Self::tool_router(),
         };
         Ok(AssembledServer {
@@ -1437,30 +1576,44 @@ impl RiftMcp {
     /// Each attempt's wait for a lexical commit in flight gets the full
     /// `[server] readiness_timeout`: the workspace wait's own deadline stays inside
     /// `published_workspace`, so what remains of it is not at hand here.
+    ///
+    /// A request whose attempts are spent answers from the publication it holds, with the
+    /// ranked tier reported unavailable. Capturing the publication the store holds is what
+    /// the attempts already try and cannot reach while rebuilds keep landing: the lexical
+    /// lane stamps the store as each candidate publishes, `published_workspace` resolves
+    /// the publication separately, and under back-to-back rebuilds the second trails the
+    /// first every time the pair is read. `ReadService::search` answers identifier
+    /// matching from the publication itself, so an answer without a ranking is still one
+    /// snapshot's own rows; the ranked lane contributes the ordering alone, and its
+    /// absence is what the warning states.
     async fn current_tree_search(
         &self,
         params: SearchParams,
     ) -> Result<Json<SearchResult>, ErrorData> {
         let budget = self.readiness_timeout().await;
-        for _attempt in 0..INDEX_CAPTURE_ATTEMPTS_MAX {
-            let resolved = self.published_workspace(wire::ErrorPhase::Read).await?;
-            let Some(SearchRanking { units, warnings }) =
-                self.ranking(&params, &resolved.published, budget).await?
-            else {
-                continue;
-            };
-            let executed = params.clone();
-            let mut answer = self
-                .current_tree_read(&resolved, move |reads| reads.search(&executed, &units))
-                .await?;
-            answer.0.warnings.extend(warnings);
-            return Ok(answer);
+        let mut resolved = self.published_workspace(wire::ErrorPhase::Read).await?;
+        let mut ranking = self.ranking(&params, &resolved.published, budget).await?;
+        for _retry in 1..INDEX_CAPTURE_ATTEMPTS_MAX {
+            if ranking.is_some() {
+                break;
+            }
+            resolved = self.published_workspace(wire::ErrorPhase::Read).await?;
+            ranking = self.ranking(&params, &resolved.published, budget).await?;
         }
-        Err(ReadFault::unavailable(
-            "current workspace search",
-            "the search store moved past the captured tree across bounded attempts",
-        )
-        .tool_error(wire::ErrorPhase::Read))
+        let SearchRanking { units, warnings } = ranking.unwrap_or_else(|| {
+            SearchRanking::unavailable(
+                "the lexical index is stamped for a publication newer than the one this \
+                 request captured, and the workspace kept publishing across the bounded \
+                 attempts, so the answer was ranked by identifier matching alone; resend \
+                 the request once the rebuilds settle",
+            )
+        });
+        let executed = params;
+        let mut answer = self
+            .current_tree_read(&resolved, move |reads| reads.search(&executed, &units))
+            .await?;
+        answer.0.warnings.extend(warnings);
+        Ok(answer)
     }
 
     /// Runs the search index for one request against `published` - the exact snapshot the
@@ -1946,10 +2099,31 @@ impl RiftMcp {
     /// whole workspace. A read that finds the tree ahead of a publication whose rebuild
     /// failed waits for nothing: it answers from that publication and says so, and the
     /// next filesystem event retries the rebuild.
+    ///
+    /// Two relaxations serve a read alone. A change phase keeps refusing under both,
+    /// because a write resolves its address against the tree it is about to modify, and
+    /// only `Read` and `Change` reach here: every `published_workspace` call names one of
+    /// the two.
+    ///
+    /// The first is the filesystem epoch, which counts observations rather than content.
+    /// [`IndexValidation::observe_locked`] increments it for every classified event, and
+    /// [`watch_path_impact`] classifies from the path and the event kind without reading a
+    /// byte, so a write that lands the bytes a file already held moves the epoch while
+    /// every digest stays equal. The capture is the content comparison: a read accepts the
+    /// publication whenever the capture folds to its fingerprint under its configuration,
+    /// whatever the epoch counter reads, while a change still waits for the two to agree.
+    ///
+    /// The second is the attempt budget. A read that spends it answers from the
+    /// publication the last attempt resolved and carries a `stale_index` warning naming
+    /// what that attempt's capture found ahead. Refusing instead leaves a workspace under
+    /// back-to-back rebuilds with no readable index at all, and the rebuild each attempt
+    /// asked for still publishes behind the answer.
     async fn reconcile_workspace(
         &self,
         phase: wire::ErrorPhase,
     ) -> Result<ResolvedWorkspace, ErrorData> {
+        let answers_stale = matches!(phase, wire::ErrorPhase::Read);
+        let mut spent = None;
         for _attempt in 0..INDEX_CAPTURE_ATTEMPTS_MAX {
             let (current, rebuild_failure) = self.await_current_workspace(phase).await?;
             let capture = self.capture_tree(&current).await;
@@ -1965,7 +2139,7 @@ impl RiftMcp {
             let tree_matches =
                 digests.fingerprint() == current.fingerprint && configuration_matches;
             let epoch_matches = current.epoch == self.validation.observed_epoch();
-            if tree_matches && epoch_matches {
+            if tree_matches && (epoch_matches || answers_stale) {
                 current.configuration.accepted(phase)?;
                 return Ok(ResolvedWorkspace::current(current));
             }
@@ -1986,6 +2160,24 @@ impl RiftMcp {
                 self.validation.observe_whole_workspace()
             };
             observed.map_err(|error| error.tool_error(phase))?;
+            spent = Some((current, digests, configuration_fingerprint));
+        }
+        if answers_stale && let Some((current, digests, configuration_fingerprint)) = spent {
+            current.configuration.accepted(phase)?;
+            let changes = PathChanges::between(&current.reads.workspace_digests(), &digests);
+            let stale = CaptureMovement::between(&current, &digests, configuration_fingerprint)
+                .map(|moved| {
+                    stale_index_warning(
+                        &current,
+                        &digests,
+                        moved,
+                        &StaleIndexReason::TreeKeptMoving { changes: &changes },
+                    )
+                });
+            return Ok(ResolvedWorkspace {
+                published: current,
+                stale,
+            });
         }
         Err(ReadFault::unavailable(
             "current workspace read",
@@ -2000,6 +2192,10 @@ impl RiftMcp {
         &self,
         current: &PublishedWorkspace,
     ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), ReadError> {
+        #[cfg(test)]
+        if let Some(forced) = self.forced_capture.installed() {
+            return forced(current);
+        }
         let root = self.root.clone();
         let limits = current.configuration.index_limits(self.limits)?;
         let visibility = current.configuration.source_visibility();
@@ -4950,6 +5146,197 @@ pub fn beacon() -> u64 {
         assert!(
             error.message.contains("injected failure"),
             "the refusal carries the recorded failure: {error:?}"
+        );
+        Ok(())
+    }
+
+    /// Most one test waits for a request the bounded loop answers on its own.
+    const RECONCILED_READ_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// The capture a served request runs: every visible file's digest under `current`'s
+    /// accepted policy, and the configuration file's state.
+    fn captured_tree(
+        root: &std::path::Path,
+        current: &super::PublishedWorkspace,
+    ) -> Result<(super::WorkspaceDigests, super::ConfigurationFingerprint), super::ReadError> {
+        let limits = current
+            .configuration
+            .index_limits(WorkspaceIndexLimits::default())?;
+        let visibility = current.configuration.source_visibility();
+        let text_inclusion = current.configuration.text_inclusion();
+        let languages = current.configuration.language_file_selections();
+        let digests = super::capture_digests_with_languages(
+            root,
+            limits,
+            &visibility,
+            &text_inclusion,
+            &languages,
+        )
+        .map_err(|error| super::ReadError::from(ReadFault::Index(error)))?;
+        Ok((digests, super::configuration_fingerprint(root)))
+    }
+
+    /// Forces every request's capture to rewrite `lib.rs` before it reads the tree, so no
+    /// attempt ever captures the tree the publication it resolved was built for.
+    fn capture_a_tree_that_keeps_moving(server: &RiftMcp, root: &std::path::Path) {
+        let root = root.to_path_buf();
+        let rounds = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        server.force_capture(move |current| {
+            let round = rounds.fetch_add(1, Ordering::Relaxed);
+            fs::write(
+                root.join("lib.rs"),
+                format!("pub fn beacon{round}() {{}}\n"),
+            )
+            .expect("the fixture write must land");
+            captured_tree(&root, current)
+        });
+    }
+
+    /// A tree that moves on every attempt spends the read's whole attempt budget, and the
+    /// read answers from the publication with a `stale_index` warning naming what the last
+    /// capture found ahead, inside the detail's advertised bound.
+    #[tokio::test]
+    async fn a_read_whose_tree_keeps_moving_answers_stale() -> TestResult {
+        let (directory, server) = fixture().await?;
+        capture_a_tree_that_keeps_moving(&server, directory.path());
+
+        let answer = tokio::time::timeout(RECONCILED_READ_MAX, get_symbol(&server, "beacon"))
+            .await
+            .map_err(|_| "a read whose tree keeps moving must answer within the bound")??;
+
+        let (index, captured, detail) = stale_index_of(&answer.warnings)?;
+        assert_ne!(
+            captured, index,
+            "the captured tree is ahead of the snapshot"
+        );
+        assert!(
+            detail.contains("bounded reconciliation attempts"),
+            "{detail}"
+        );
+        assert!(detail.contains("lib.rs moved"), "{detail}");
+        assert!(
+            detail.contains("the rebuild those changes asked for publishes next"),
+            "{detail}"
+        );
+        assert!(detail.len() <= super::WARNING_DETAIL_BYTES_MAX, "{detail}");
+        Ok(())
+    }
+
+    /// The same condition on a node listing: the listing answers from the publication and
+    /// carries the same warning.
+    #[tokio::test]
+    async fn a_node_listing_whose_tree_keeps_moving_answers_stale() -> TestResult {
+        let (directory, server) = fixture().await?;
+        capture_a_tree_that_keeps_moving(&server, directory.path());
+        let params = serde_json::from_value(json!({"path": "lib.rs", "position": 8}))?;
+
+        let answer = tokio::time::timeout(RECONCILED_READ_MAX, server.nodes(Parameters(params)))
+            .await
+            .map_err(|_| "a node listing whose tree keeps moving must answer within the bound")??
+            .0;
+
+        let (_index, _captured, detail) = stale_index_of(&answer.warnings)?;
+        assert!(
+            detail.contains("bounded reconciliation attempts"),
+            "{detail}"
+        );
+        Ok(())
+    }
+
+    /// The same condition on `search`: the answer carries the publication's own rows and
+    /// the warning, rather than the refusal the spent bound used to raise.
+    #[tokio::test]
+    async fn a_search_whose_tree_keeps_moving_answers_stale() -> TestResult {
+        let (directory, server) = fixture().await?;
+        capture_a_tree_that_keeps_moving(&server, directory.path());
+
+        let answer = tokio::time::timeout(RECONCILED_READ_MAX, run_search(&server, "beacon"))
+            .await
+            .map_err(|_| "a search whose tree keeps moving must answer within the bound")??;
+
+        let (_index, _captured, detail) = stale_index_of(&answer.warnings)?;
+        assert!(
+            detail.contains("bounded reconciliation attempts"),
+            "{detail}"
+        );
+        Ok(())
+    }
+
+    /// An epoch that moves while every digest stays equal is an observation that changed
+    /// no byte: the capture folds to the publication's fingerprint, so the read answers
+    /// from it with nothing to warn about.
+    #[tokio::test]
+    async fn a_read_whose_epoch_moves_with_every_digest_equal_answers() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        let validation = Arc::clone(&server.validation);
+        let unit = CoreProjectPath::new("lib.rs")?;
+        server.force_capture(move |current| {
+            // What a write that lands the bytes a file already held leaves behind.
+            validation.observe_paths([unit.clone()])?;
+            Ok((
+                current.reads.workspace_digests(),
+                current.configuration.fingerprint,
+            ))
+        });
+
+        let answer = tokio::time::timeout(RECONCILED_READ_MAX, get_symbol(&server, "beacon"))
+            .await
+            .map_err(|_| "an observation that changed no byte must not make a read wait")??;
+
+        assert_eq!(answer.hits.len(), 1, "the publication answers: {answer:?}");
+        assert!(
+            stale_index_of(&answer.warnings).is_err(),
+            "a publication that answers for the tree warns about nothing: {:?}",
+            answer.warnings
+        );
+        Ok(())
+    }
+
+    /// A capture that fails says nothing about the tree, so the read refuses with the
+    /// capture's own failure rather than answering from a publication nothing checked.
+    #[tokio::test]
+    async fn a_read_whose_capture_fails_refuses() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        server.force_capture(|_current| {
+            Err(ReadFault::unavailable(
+                "test capture",
+                "injected capture failure",
+            ))
+        });
+
+        let refusal = tokio::time::timeout(RECONCILED_READ_MAX, get_symbol(&server, "beacon"))
+            .await
+            .map_err(|_| "a failed capture must refuse within the bound")?
+            .expect_err("a failed capture must refuse");
+
+        assert!(
+            refusal.message.contains("injected capture failure"),
+            "{refusal:?}"
+        );
+        Ok(())
+    }
+
+    /// A change resolves its address against the tree it is about to modify, so the same
+    /// condition keeps refusing on the change path.
+    #[tokio::test]
+    async fn a_change_whose_tree_keeps_moving_refuses() -> TestResult {
+        let (directory, server) = fixture().await?;
+        capture_a_tree_that_keeps_moving(&server, directory.path());
+        let params = serde_json::from_value(json!({
+            "patch": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1,2 @@\n pub fn beacon() {}\n+pub fn lantern() {}\n"
+        }))?;
+
+        let refusal = tokio::time::timeout(RECONCILED_READ_MAX, server.patch(Parameters(params)))
+            .await
+            .map_err(|_| "a change whose tree keeps moving must refuse within the bound")?
+            .map(|_applied| ())
+            .expect_err("a change whose tree keeps moving must refuse");
+
+        assert!(
+            refusal
+                .message
+                .contains("workspace changed across bounded reconciliation attempts"),
+            "{refusal:?}"
         );
         Ok(())
     }
