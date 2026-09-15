@@ -195,6 +195,7 @@ async fn breaking_the_file_after_boot_gates_the_next_request() -> TestResult {
     fs::write(directory.path().join("rift.toml"), contents)?;
     let refused = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
     assert_eq!(refused["code"], json!("configuration_invalid"));
+    assert_eq!(refused["phase"], json!("read"));
 
     client.cancel().await?;
     Ok(())

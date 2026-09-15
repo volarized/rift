@@ -112,6 +112,20 @@ testing-check:
     uv run --locked --python 3.12 --project scripts ty check --extra-search-path scripts --extra-search-path tools/rift-release/src scripts
     uv run --locked --python 3.12 --project scripts pytest scripts
 
+corpus-sync name="":
+    uv run --locked --python 3.12 --project scripts python scripts/check_corpus.py sync {{ if name == "" { "" } else { quote(name) } }}
+
+# The same instrumented build supplies every CI corpus case through nextest's archive.
+corpus-archive:
+    cargo llvm-cov nextest-archive --locked -p rift --test corpus_bun --test corpus_nextjs --test corpus_fastapi --cargo-profile corpus --profile corpus --archive-file target/corpus.tar.zst
+
+# Each repository runs alone. --no-report preserves the fast tier's profiles
+# so full-gate can merge coverage without running those tests a second time.
+corpus-test name test_name="" archive="":
+    # Nextest requires the archive extraction destination to exist on a cold checkout.
+    mkdir -p "${CARGO_LLVM_COV_TARGET_DIR:-target/llvm-cov-target}"
+    cargo llvm-cov nextest --no-report --profile corpus --no-tests fail --run-ignored all {{ if archive == "" { "--locked -p rift --test " + quote("corpus_" + name) + " --cargo-profile corpus" } else { "--archive-file " + quote(archive) + " --extract-overwrite -E " + quote("binary(=corpus_" + name + ")") } }} {{ if test_name == "" { "" } else { "-- --exact " + quote(test_name) } }}
+
 artifact-test *args:
     uv run --locked --python 3.12 --project scripts python scripts/check_artifact.py {{ args }}
 
@@ -120,6 +134,24 @@ agent-test *args:
 
 coldstart-test *args:
     uv run --locked --python 3.12 --project scripts python scripts/check_coldstart.py {{ args }}
+
+# One large workspace at a time on the development machine. The CI full tier
+# runs these repositories on separate runners with separate job budgets.
+full-gate linux_binary="":
+    command -v lcov
+    @echo "Full gate runs the instrumented suite, then corpus and artifact checks in sequence."
+    just test
+    cp lcov.info target/fast.lcov
+    just corpus-sync
+    just corpus-test fastapi
+    just corpus-test bun
+    just corpus-test nextjs
+    cargo llvm-cov report --profile corpus --lcov --output-path target/corpus.lcov
+    lcov --add-tracefile target/fast.lcov --add-tracefile target/corpus.lcov --output-file lcov.info --no-markers
+    lcov --summary lcov.info --fail-under-lines 86 --no-markers
+    just artifact-test
+    just agent-test
+    just coldstart-test {{ if linux_binary == "" { "" } else { "--binary " + quote(linux_binary) } }}
 
 rust-gate: format dashes generate-check conformance check clippy docs doctest audit test release-test installer-test testing-check
 
