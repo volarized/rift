@@ -24,3 +24,25 @@ failure-output = "immediate-final"
 
 [profile.ci.junit]
 path = "junit.xml"
+
+[profile.corpus]
+test-threads = 1
+global-timeout = "19m"
+fail-fast = false
+failure-output = "immediate-final"
+slow-timeout = { period = "60s", terminate-after = 1, grace-period = "30s" }
+
+[[profile.corpus.overrides]]
+filter = 'binary(=corpus_fastapi) & test(=test_fastapi_corpus)'
+slow-timeout = { period = "240s", terminate-after = 1, grace-period = "30s" }
+
+[[profile.corpus.overrides]]
+filter = 'binary(=corpus_bun) & (test(=test_bun_workspace) | test(=test_bun_stop))'
+slow-timeout = { period = "540s", terminate-after = 1, grace-period = "30s" }
+
+[[profile.corpus.overrides]]
+filter = 'binary(=corpus_nextjs) & test(=test_nextjs_corpus)'
+slow-timeout = { period = "720s", terminate-after = 1, grace-period = "30s" }
+
+[profile.corpus.junit]
+path = "junit.xml"
