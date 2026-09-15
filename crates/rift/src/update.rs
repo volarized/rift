@@ -1559,6 +1559,133 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(windows)]
+    const WINDOWS_UPDATE_TEST_BINARY_ENV: &str = "RIFT_UPDATE_TEST_BINARY";
+    #[cfg(windows)]
+    const WINDOWS_UPDATE_TEST_CURRENT_ENV: &str = "RIFT_UPDATE_TEST_CURRENT";
+
+    #[cfg(windows)]
+    async fn windows_wait_update_child(child: &mut tokio::process::Child) -> TestResult {
+        use std::time::Duration;
+
+        match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+            Ok(status) => {
+                assert!(status?.success(), "Windows update child must succeed");
+                Ok(())
+            }
+            Err(error) => {
+                let termination = child.start_kill();
+                let cleanup = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                Err(format!(
+                    "Windows update child exceeded its deadline: {error}; termination: {termination:?}; cleanup: {cleanup:?}"
+                )
+                .into())
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "requires RIFT_UPDATE_TEST_BINARY naming the native release CLI"]
+    async fn windows_publish_replaces_running_binary_and_cleans_backup() -> TestResult {
+        use std::io::Read as _;
+        use std::process::Stdio;
+        use std::time::Duration;
+
+        let candidate = fs::canonicalize(
+            std::env::var_os(WINDOWS_UPDATE_TEST_BINARY_ENV)
+                .ok_or("RIFT_UPDATE_TEST_BINARY must name the native release CLI")?,
+        )?;
+        let expected_digest = super::sha256(&candidate)?;
+        let original = std::env::current_exe()?;
+        assert_ne!(super::sha256(&original)?, expected_digest);
+        let directory = tempfile::tempdir()?;
+        let current = directory.path().join("rift.exe");
+        let prepared = directory.path().join(super::WINDOWS_UPDATE_PREPARED_NAME);
+        let backup = directory.path().join(super::WINDOWS_UPDATE_BACKUP_NAME);
+        fs::copy(&original, &current)?;
+
+        let mut child = tokio::process::Command::new(&current)
+            .args([
+                "--exact",
+                "update::tests::windows_publish_running_binary_probe",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(WINDOWS_UPDATE_TEST_BINARY_ENV, &candidate)
+            .env(WINDOWS_UPDATE_TEST_CURRENT_ENV, fs::canonicalize(&current)?)
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()?;
+        windows_wait_update_child(&mut child).await?;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while backup.try_exists()? {
+                tokio::time::sleep(super::CLEANUP_RETRY_DELAY).await;
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await??;
+        assert!(!prepared.try_exists()?);
+        assert_eq!(super::sha256(&current)?, expected_digest);
+        assert_eq!(super::sha256(&candidate)?, expected_digest);
+
+        let version_path = directory.path().join("version.txt");
+        let mut version = tokio::process::Command::new(&current)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(fs::File::create(&version_path)?)
+            .kill_on_drop(true)
+            .spawn()?;
+        windows_wait_update_child(&mut version).await?;
+        let mut version_text = String::new();
+        fs::File::open(&version_path)?
+            .take(256)
+            .read_to_string(&mut version_text)?;
+        assert_eq!(
+            version_text.trim(),
+            concat!("rift ", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(fs::metadata(&version_path)?.len() < 256);
+
+        // Bound temporary-file removal even if Windows retains an executable handle briefly.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fs::remove_file(&current).is_err() {
+                tokio::time::sleep(super::CLEANUP_RETRY_DELAY).await;
+            }
+        })
+        .await?;
+        directory.close()?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "child of windows_publish_replaces_running_binary_and_cleans_backup"]
+    async fn windows_publish_running_binary_probe() -> TestResult {
+        let current = std::env::current_exe()?;
+        let expected_current = std::env::var_os(WINDOWS_UPDATE_TEST_CURRENT_ENV)
+            .ok_or("RIFT_UPDATE_TEST_CURRENT must name the copied test executable")?;
+        assert_eq!(
+            fs::canonicalize(&current)?,
+            fs::canonicalize(expected_current)?
+        );
+        let candidate = std::env::var_os(WINDOWS_UPDATE_TEST_BINARY_ENV)
+            .ok_or("RIFT_UPDATE_TEST_BINARY must name the native release CLI")?;
+        assert_eq!(
+            AtomicPublisher
+                .publish(&current, std::path::Path::new(&candidate))
+                .await?,
+            OldBinaryCleanup::Scheduled
+        );
+        assert!(
+            !current
+                .with_file_name(super::WINDOWS_UPDATE_PREPARED_NAME)
+                .try_exists()?
+        );
+        Ok(())
+    }
+
     #[test]
     fn error_constructors_name_paths_and_causes() {
         let cause = || std::io::Error::other("fixture cause");
