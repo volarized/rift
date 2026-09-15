@@ -422,7 +422,13 @@ class WorkflowTests(unittest.TestCase):
                 )
                 self.assertNotIn("if", installer)
                 self.assertNotIn("if", test)
-                self.assertEqual(build["timeout-minutes"], 30)
+                self.assertEqual(build["timeout-minutes"], 35)
+                compile_step = next(
+                    step
+                    for step in build["steps"]
+                    if "cargo build --release" in step.get("run", "")
+                )
+                self.assertEqual(compile_step["timeout-minutes"], 30)
                 self.assertEqual(test["shell"], "bash")
                 self.assertEqual(
                     test["env"]["RIFT_UPDATE_TEST_BINARY"],
@@ -487,7 +493,7 @@ class WorkflowTests(unittest.TestCase):
             "&& needs.native-tests.result == 'success')) }}",
             "Only successful candidate builds or intentional draft skips may run gates",
         )
-        self.assertEqual(build["timeout-minutes"], 30)
+        self.assertEqual(build["timeout-minutes"], 35)
         self.assertEqual(gate["timeout-minutes"], 20)
         targets = build["strategy"]["matrix"]["include"]
         self.assertEqual(targets, gate["strategy"]["matrix"]["include"])

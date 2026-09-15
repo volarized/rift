@@ -2125,14 +2125,10 @@ impl<Store: LexicalStore> LexicalTask<Store> {
         let stamped = tree_revision.clone();
         let mut running = tokio::spawn(async move { write.commit_to(&*store, &stamped).await });
         let ended = tokio::select! {
-            ended = &mut running => ended,
+            ended = wait_for_transaction(&mut running, &tree_revision, form, deadline) => ended,
             () = self.cancellation.cancelled() => {
                 abort_transaction(running).await;
                 return Err(lexical_unavailable("the lexical lane ended while the transaction ran"));
-            }
-            () = tokio::time::sleep(deadline) => {
-                record_commit_delay(&tree_revision, form, deadline);
-                running.await
             }
         };
         let outcome = match ended {
@@ -2156,6 +2152,22 @@ impl<Store: LexicalStore> LexicalTask<Store> {
             })
             .await
             .inspect_err(|error| record_commit_failure(&tree_revision, "whole", error))
+    }
+}
+
+/// Waits for a transaction, recording its diagnostic deadline once without ending the wait.
+/// The caller races this entire future against cancellation, including the delayed wait.
+async fn wait_for_transaction(
+    running: &mut JoinHandle<Result<(), SearchError>>,
+    tree_revision: &str,
+    form: &'static str,
+    deadline: Duration,
+) -> Result<Result<(), SearchError>, tokio::task::JoinError> {
+    if let Ok(ended) = tokio::time::timeout(deadline, &mut *running).await {
+        ended
+    } else {
+        record_commit_delay(tree_revision, form, deadline);
+        running.await
     }
 }
 
@@ -5606,6 +5618,50 @@ mod tests {
             "the held write's future lives while the lane runs"
         );
 
+        cancellation.cancel();
+        tokio::time::timeout(LEXICAL_COMMIT_TIMEOUT / 10, ended_within_bound(&lane))
+            .await
+            .map_err(|_| "the lane must end far under the commit timeout")??;
+        assert_eq!(
+            double.dropped_while_held(),
+            1,
+            "the abort dropped the transaction the store still held"
+        );
+        let LexicalCommitState::Owed { cause } = lane.commit_state(published.reads.tree_revision())
+        else {
+            return Err("an aborted transaction leaves a whole replace owed".into());
+        };
+        assert!(
+            cause.contains("the lexical lane ended while the transaction ran"),
+            "the owed cause names the cancellation: {cause}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_lane_aborts_a_transaction_past_its_deadline() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let published = candidate_declaring(directory.path(), 0, "beacon")?;
+        let double = StoreDouble::new();
+        let cancellation = CancellationToken::new();
+        let lane = LexicalLane::spawn_over(
+            Arc::clone(&double),
+            usize::MAX,
+            BlockingExecutor::isolated(2, 60_000),
+            cancellation.clone(),
+        );
+        lane.request(
+            super::lexical_write(&published, &ChangeSet::Full),
+            Arc::clone(&published),
+        );
+        double.calls_within_bound(1).await?;
+        assert_eq!(
+            double.dropped_while_held(),
+            0,
+            "the held write's future lives while the lane runs"
+        );
+
+        tokio::time::sleep(LEXICAL_COMMIT_TIMEOUT + Duration::from_millis(1)).await;
         cancellation.cancel();
         tokio::time::timeout(LEXICAL_COMMIT_TIMEOUT / 10, ended_within_bound(&lane))
             .await

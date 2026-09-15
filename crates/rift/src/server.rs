@@ -45,13 +45,14 @@ const STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the whole server-side stop has, shared by every stage under it.
 ///
 /// The stop derives its deadline where the stop begins, never where the
-/// server started listening. The span sits under [`STOP_WAIT_MAX`], so the
-/// process leaves before the CLI stop that asked for it gives up waiting.
+/// server started listening. Four seconds leave time for command startup and
+/// process observation within the five-second stop bound. The span
+/// also sits under [`STOP_WAIT_MAX`], so the CLI can observe the process leaving.
 /// The serving task drains the requests still in flight, the engines shut
 /// down in parallel, the index supervisor joins, and the log drain's final
 /// flush runs, each taking only what the stage before it left of that
 /// deadline.
-const SERVER_STOP_DEADLINE: Duration = Duration::from_secs(8);
+const SERVER_STOP_DEADLINE: Duration = Duration::from_secs(4);
 /// Wall-clock span between two polls of the store while following.
 const LOG_FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// The form `--tail` accepts, named in every refusal.
@@ -1388,13 +1389,14 @@ mod tests {
         });
         tokio::task::yield_now().await;
 
-        stop_log_drain(
-            Some(drain),
-            tokio::time::Instant::now() + SERVER_STOP_DEADLINE,
-        )
-        .await;
+        let started = tokio::time::Instant::now();
+        stop_log_drain(Some(drain), started + SERVER_STOP_DEADLINE).await;
 
         assert!(stopped.load(Ordering::Acquire));
+        assert!(
+            started.elapsed() < super::STOP_REQUEST_TIMEOUT,
+            "the final log drain must leave time for a five-second stop to observe process exit"
+        );
     }
 
     #[test]
