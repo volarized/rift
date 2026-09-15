@@ -5,7 +5,8 @@
 //! building; `stop` asks the recorded server to shut down over its own stop
 //! route; `restart` chains the two; `status` prints one probe's
 //! classification and changes nothing. Every wait is a bounded poll over
-//! [`rift_mcp::probe`] - the election module itself never polls.
+//! [`rift_mcp::probe`] and, when stopping, the original process handle.
+//! The election module itself never polls.
 
 use std::fmt;
 use std::io;
@@ -30,6 +31,7 @@ use rift_mcp::{
 use rift_protocol::lock::ServerLock;
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
+use waitpid_any::WaitHandle;
 
 /// Longest wait for an asked server to leave the serving state.
 ///
@@ -645,8 +647,8 @@ fn leftover_unscrubbed(root: &Path, stale_bytes: Option<&[u8]>) -> bool {
     }
 }
 
-/// Polls until no process holds the election, bounded by `attempt_count`
-/// probes.
+/// Polls until the named process exits or releases the election, bounded by
+/// `attempt_count` probes. A replacement still building must not extend this wait.
 ///
 /// The caller passes [`STOP_POLL_ATTEMPT_COUNT`], which derives from
 /// [`STOP_WAIT_MAX`] over the poll interval; `pid` names the holder in the
@@ -656,13 +658,108 @@ async fn await_election_released(
     pid: u32,
     attempt_count: u32,
 ) -> Result<(), ServerCommandError> {
+    let mut process = ProcessExit::open(pid);
     for _ in 0..attempt_count {
-        if !probe(root).election_held() {
+        if process.exited() || !probe(root).election_held() {
             return Ok(());
         }
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
     }
-    Err(Error::new(ServerCommandFault::ElectionUnreleased { pid }))
+    Err(process.refused(ServerCommandFault::ElectionUnreleased { pid }))
+}
+
+/// Exit of the process named before the stop request. The handle stays bound to that
+/// process when another server takes the election or the OS reuses its process id.
+#[derive(Debug)]
+enum ProcessExit {
+    Waiting {
+        handle: WaitHandle,
+        last_error: Option<io::Error>,
+    },
+    Exited,
+    Unknown(io::Error),
+}
+
+impl ProcessExit {
+    fn open(pid: u32) -> Self {
+        let Ok(pid) = i32::try_from(pid) else {
+            return Self::Unknown(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "process id exceeds the process handle bound",
+            ));
+        };
+        if pid == 0 {
+            return Self::Unknown(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "process id must be positive",
+            ));
+        }
+        Self::observed(WaitHandle::open(pid))
+    }
+
+    fn observed(result: io::Result<WaitHandle>) -> Self {
+        match result {
+            Ok(handle) => Self::Waiting {
+                handle,
+                last_error: None,
+            },
+            Err(error) if process_absent(&error) => Self::Exited,
+            Err(error) => Self::Unknown(error),
+        }
+    }
+
+    fn exited(&mut self) -> bool {
+        match self {
+            Self::Exited => true,
+            Self::Unknown(_) => false,
+            Self::Waiting { handle, last_error } => match handle.wait_timeout(Duration::ZERO) {
+                Ok(Some(())) => {
+                    *self = Self::Exited;
+                    true
+                }
+                Ok(None) => {
+                    *last_error = None;
+                    false
+                }
+                Err(error) => {
+                    *last_error = Some(error);
+                    false
+                }
+            },
+        }
+    }
+
+    fn refused(self, fault: ServerCommandFault) -> ServerCommandError {
+        let error = Error::new(fault);
+        match self {
+            Self::Unknown(source)
+            | Self::Waiting {
+                last_error: Some(source),
+                ..
+            } => error.with_context(ErrorContext::new(
+                "detail",
+                format!("process exit could not be observed: {source}"),
+            )),
+            Self::Exited
+            | Self::Waiting {
+                last_error: None, ..
+            } => error,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn process_absent(error: &io::Error) -> bool {
+    error.raw_os_error().map(nix::errno::Errno::from_raw) == Some(nix::errno::Errno::ESRCH)
+}
+
+#[cfg(windows)]
+fn process_absent(error: &io::Error) -> bool {
+    // OpenProcess uses ERROR_INVALID_PARAMETER for a process id that no longer exists.
+    error
+        .raw_os_error()
+        .and_then(|code| u32::try_from(code).ok())
+        == Some(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER)
 }
 
 /// Serves the workspace in this process until interrupted or stopped,
@@ -786,8 +883,8 @@ fn foreground_refused(root: &Path, error: ElectionError) -> ServerCommandError {
 ///
 /// A server still building has no port to ask: the outcome says it is
 /// starting, and a later stop reaches it once it serves. Every path that
-/// reports a stop first waits for the election to release, so a reported stop
-/// means the process is leaving: the port closes where the stop begins and
+/// reports a stop first waits for the original process to exit or release its
+/// election, so a reported stop means the process is leaving: the port closes where the stop begins and
 /// the election releases where it ends, so a server that stopped answering
 /// its port is one step of that wait, never its answer. `attempt_count`
 /// bounds the wait; the commands pass [`STOP_POLL_ATTEMPT_COUNT`], which
@@ -806,8 +903,9 @@ async fn stop(root: &Path, attempt_count: u32) -> Result<ServerOutcome, ServerCo
         }
         ServerPresence::Absent => return Ok(ServerOutcome::NotRunning),
     };
+    let process = ProcessExit::open(lock.pid);
     request_stop(&lock).await?;
-    await_stopped(root, lock, attempt_count).await?;
+    await_stopped(root, lock, process, attempt_count).await?;
     Ok(ServerOutcome::Stopped)
 }
 
@@ -840,25 +938,27 @@ async fn request_stop(lock: &ServerLock) -> Result<(), ServerCommandError> {
     }
 }
 
-/// Polls until the stopped server releases the election, bounded by
+/// Polls until the stopped server exits or releases the election, bounded by
 /// `attempt_count` probes.
 ///
 /// The caller passes [`STOP_POLL_ATTEMPT_COUNT`], which derives from
 /// [`STOP_WAIT_MAX`] over the poll interval. The port closes before the
 /// election releases, so a wait on the port alone would let a restart's
-/// spawn lose the election to the process it has only just asked to stop.
+/// spawn lose the election to the process it has only just asked to stop. The process
+/// handle also proves completion when a replacement takes the election between probes.
 async fn await_stopped(
     root: &Path,
     holder: ServerLock,
+    mut process: ProcessExit,
     attempt_count: u32,
 ) -> Result<(), ServerCommandError> {
     for _ in 0..attempt_count {
-        if !probe(root).election_held() {
+        if process.exited() || !probe(root).election_held() {
             return Ok(());
         }
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
     }
-    Err(Error::new(ServerCommandFault::StopTimedOut {
+    Err(process.refused(ServerCommandFault::StopTimedOut {
         holder: Box::new(holder),
     }))
 }
@@ -1148,10 +1248,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{
-        AuthMode, ChildWatch, LogLevel, LogsMode, PRESENCE_POLL_INTERVAL, SERVER_STOP_DEADLINE,
-        START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, STOP_POLL_ATTEMPT_COUNT, STOP_WAIT_MAX,
-        ServerCommandFault, ServerOutcome, StaleReason, StartMode, TailCount, TokenCheck,
-        await_election_released, await_serving, await_stopped, discard_stale_document,
+        AuthMode, ChildWatch, LogLevel, LogsMode, PRESENCE_POLL_INTERVAL, ProcessExit,
+        SERVER_STOP_DEADLINE, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, STOP_POLL_ATTEMPT_COUNT,
+        STOP_WAIT_MAX, ServerCommandFault, ServerOutcome, StaleReason, StartMode, TailCount,
+        TokenCheck, await_election_released, await_serving, await_stopped, discard_stale_document,
         foreground_refused, holder_evidence, label, level_glyph, logs_mode, logs_query,
         logs_unavailable, now_ms, print_logs, rendered_fields, rendered_line, rendered_timestamp,
         request_stop, stale_reason_phrase, start_detached, start_mode, status, stop,
@@ -1736,9 +1836,13 @@ mod tests {
     async fn await_stopped_times_out_while_the_holder_keeps_the_election() -> TestResult {
         let directory = tempfile::tempdir()?;
         let guard = rift_mcp::claim(directory.path())?;
-        let document = holder();
+        let document = ServerLock {
+            pid: std::process::id(),
+            ..holder()
+        };
         guard.publish(&document)?;
-        let error = await_stopped(directory.path(), document, 1)
+        let process = ProcessExit::open(document.pid);
+        let error = await_stopped(directory.path(), document, process, 1)
             .await
             .expect_err("a holder that keeps the election must time the wait out");
         assert!(
@@ -1748,22 +1852,177 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    #[ignore = "child process used by the process exit tests"]
+    fn stopped_process_probe() -> TestResult {
+        use std::io::Read as _;
+        let mut byte = [0];
+        assert_eq!(
+            std::io::stdin().read(&mut byte)?,
+            0,
+            "parent closes fixture input"
+        );
+        Ok(())
+    }
+
+    fn stopped_process_child() -> TestResult<tokio::process::Child> {
+        use std::process::Stdio;
+        Ok(tokio::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "server::tests::stopped_process_probe",
+                "--ignored",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()?)
+    }
+
+    #[tokio::test]
+    async fn stopped_process_does_not_wait_for_a_replacement_election() -> TestResult {
+        for serving in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let mut child = stopped_process_child()?;
+            let original = ServerLock {
+                pid: child.id().expect("child must still have a process id"),
+                ..holder()
+            };
+            let process = ProcessExit::open(original.pid);
+            assert!(
+                matches!(process, ProcessExit::Waiting { .. }),
+                "{process:?}"
+            );
+
+            // The old election has released. A replacement keeps it for the whole wait,
+            // either before publication or after publishing its own serving document.
+            let replacement = rift_mcp::claim(directory.path())?;
+            let (listener, port) = answering_port()?;
+            if serving {
+                replacement.publish(&ServerLock {
+                    pid: std::process::id(),
+                    ..holder_on(port)
+                })?;
+            }
+            let presence = rift_mcp::probe(directory.path());
+            assert!(
+                if serving {
+                    matches!(presence, rift_mcp::ServerPresence::Serving(_))
+                } else {
+                    matches!(presence, rift_mcp::ServerPresence::Starting)
+                },
+                "{presence:?}"
+            );
+
+            drop(child.stdin.take());
+            // No Child::wait or try_wait occurs before this returns. The process handle
+            // must observe exit even while the original child remains unreaped on Unix.
+            await_stopped(directory.path(), original, process, 20).await?;
+            assert!(rift_mcp::probe(directory.path()).election_held());
+            assert!(child.wait().await?.success());
+            drop((replacement, listener));
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn changed_or_missing_document_does_not_prove_process_exit() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let guard = rift_mcp::claim(directory.path())?;
+        let original = ServerLock {
+            pid: std::process::id(),
+            ..holder()
+        };
+        let (listener, port) = answering_port()?;
+        for document in [None, Some(holder_on(port))] {
+            if let Some(document) = document {
+                guard.publish(&document)?;
+            }
+            let error = await_stopped(
+                directory.path(),
+                original.clone(),
+                ProcessExit::open(original.pid),
+                1,
+            )
+            .await
+            .expect_err("a live original process and held election must keep waiting");
+            assert!(
+                matches!(error.fault(), ServerCommandFault::StopTimedOut { .. }),
+                "{error:?}"
+            );
+        }
+        drop(listener);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn already_exited_process_does_not_wait_for_a_building_holder() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let mut child = stopped_process_child()?;
+        let pid = child.id().expect("child must have a process id");
+        drop(child.stdin.take());
+        assert!(child.wait().await?.success());
+        let _replacement = rift_mcp::claim(directory.path())?;
+        let mut process = ProcessExit::open(pid);
+        assert!(
+            process.exited(),
+            "already-exited process must be observed: {process:?}"
+        );
+        await_election_released(directory.path(), pid, 1).await?;
+        assert!(rift_mcp::probe(directory.path()).election_held());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn process_observation_errors_keep_waiting_and_retain_their_cause() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let _guard = rift_mcp::claim(directory.path())?;
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::Other,
+        ] {
+            let process =
+                ProcessExit::observed(Err(std::io::Error::new(kind, "process observation failed")));
+            let error = await_stopped(directory.path(), holder(), process, 1)
+                .await
+                .expect_err("observation failure must not prove process exit");
+            assert!(matches!(
+                error.fault(),
+                ServerCommandFault::StopTimedOut { .. }
+            ));
+            assert!(
+                error.to_string().contains("process observation failed"),
+                "{error}"
+            );
+        }
+        for pid in [0, u32::MAX] {
+            assert!(
+                !ProcessExit::open(pid).exited(),
+                "invalid process id must not prove exit"
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test(start_paused = true)]
     async fn await_election_released_returns_once_the_holder_is_gone() -> TestResult {
         let directory = tempfile::tempdir()?;
         let guard = rift_mcp::claim(directory.path())?;
-        let error = await_election_released(directory.path(), 4_242, 1)
+        let pid = std::process::id();
+        let error = await_election_released(directory.path(), pid, 1)
             .await
             .expect_err("a held election must time the wait out");
         assert!(
             matches!(
                 error.fault(),
-                ServerCommandFault::ElectionUnreleased { pid: 4_242 }
+                ServerCommandFault::ElectionUnreleased { pid: observed } if *observed == pid
             ),
             "{error:?}"
         );
         drop(guard);
-        await_election_released(directory.path(), 4_242, 1).await?;
+        await_election_released(directory.path(), pid, 1).await?;
         Ok(())
     }
 
@@ -1774,12 +2033,17 @@ mod tests {
     {
         let directory = tempfile::tempdir()?;
         let guard = rift_mcp::claim(directory.path())?;
-        guard.publish(&holder_on(dead_port()?))?;
+        let document = ServerLock {
+            pid: std::process::id(),
+            ..holder_on(dead_port()?)
+        };
+        guard.publish(&document)?;
         let error = start_detached(directory.path())
             .await
             .expect_err("a holder that keeps the election past the stop window refuses the start");
         let fault = error.fault();
-        let unreleased = matches!(fault, ServerCommandFault::ElectionUnreleased { pid: 4_242 });
+        let unreleased =
+            matches!(fault, ServerCommandFault::ElectionUnreleased { pid } if *pid == document.pid);
         assert!(unreleased, "{error:?}");
         drop(guard);
         Ok(())
@@ -1837,7 +2101,10 @@ mod tests {
     async fn stop_refuses_while_a_dead_port_holder_keeps_the_election() -> TestResult {
         let directory = tempfile::tempdir()?;
         let guard = rift_mcp::claim(directory.path())?;
-        let holder = holder_on(dead_port()?);
+        let holder = ServerLock {
+            pid: std::process::id(),
+            ..holder_on(dead_port()?)
+        };
         guard.publish(&holder)?;
         let error = stop(directory.path(), 1)
             .await
@@ -1870,7 +2137,10 @@ mod tests {
     async fn stop_reports_stopped_once_the_dead_port_holder_releases_the_election() -> TestResult {
         let directory = tempfile::tempdir()?;
         let guard = rift_mcp::claim(directory.path())?;
-        guard.publish(&holder_on(dead_port()?))?;
+        guard.publish(&ServerLock {
+            pid: std::process::id(),
+            ..holder_on(dead_port()?)
+        })?;
         let released = tokio::spawn(async move {
             tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
             drop(guard);
