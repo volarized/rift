@@ -27,6 +27,7 @@ from corpus_assertions import (
     language_counts,
     lexical_breach,
     lexical_content,
+    map_paths,
     no_failed_builds,
     probe_units,
     records,
@@ -195,6 +196,46 @@ class SymbolSamples(unittest.TestCase):
 
 
 class Decisions(unittest.TestCase):
+    def test_map_paths_keep_nested_names_distinct_and_decode_only_symbol_paths(
+        self,
+    ) -> None:
+        answer: JsonObject = {
+            "revision": "abcdef01",
+            "pagination": {"page_index": 0, "total_pages": 1},
+            "docs": ["nested/readme.md"],
+            "modules": [{"path": "src", "children": [{"path": "src/nested"}]}],
+            "entry_points": ["rift://symbol/rust/src/a%20b.rs/main"],
+            "hubs": [{"symbol": "rift://symbol/json/data.json/name%2Fwith%2Fslashes"}],
+        }
+        found = map_paths(answer)
+        self.assertEqual(
+            found, {"nested/readme.md", "src", "src/nested", "src/a b.rs", "data.json"}
+        )
+        self.assertNotIn("readme.md", found)
+        with (
+            patch("corpus_assertions.MAP_MODULES_MAX", 1),
+            self.assertRaisesRegex(AssertionError, "module count"),
+        ):
+            map_paths(answer)
+
+    def test_map_paths_refuse_missing_map_and_malformed_symbol_addresses(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "map revision"):
+            map_paths({})
+        for identity in (
+            "other://symbol/rust/file.rs/main",
+            "rift://symbol/rust",
+            "rift://symbol/rust/main",
+            "rift://symbol/rust/source%ZZ.rs/main",
+        ):
+            with self.subTest(identity=identity), self.assertRaises(AssertionError):
+                map_paths(
+                    {
+                        "revision": "abcdef01",
+                        "pagination": {"page_index": 0, "total_pages": 1},
+                        "entry_points": [identity],
+                    }
+                )
+
     def test_capture_requires_one_completed_capture_and_publication(self) -> None:
         capture: JsonObject = {
             "identity": 2,
@@ -364,9 +405,26 @@ class Decisions(unittest.TestCase):
             no_failed_builds([{"message": "index rebuild failed"}])
         with self.assertRaisesRegex(AssertionError, "source warnings exceeded"):
             warnings({"warnings": [{"code": "source_unavailable"}] * 10})
-        self.assertEqual(
-            len(warnings({"warnings": [{"code": "source_unavailable"}] * 9})), 9
-        )
+
+    def test_source_warning_summary_follows_eight_named_files(self) -> None:
+        named: list[JsonObject] = [
+            {"code": "source_unavailable", "unit": f"rift://file/{number}.rs"}
+            for number in range(8)
+        ]
+        summary: JsonObject = {
+            "code": "source_unavailable",
+            "detail": "remaining files",
+        }
+        self.assertEqual(len(warnings({"warnings": [*named, summary]})), 9)
+        self.assertEqual(len(warnings({"warnings": named})), 8)
+        for source in (
+            [*named, named[0]],
+            [*named, summary, summary],
+            [summary, *named],
+            [summary],
+        ):
+            with self.subTest(source=source), self.assertRaises(AssertionError):
+                warnings({"warnings": source})
 
     def test_fixture_patch_keeps_exact_bytes(self) -> None:
         self.assertEqual(len(PROBE_SOURCE.encode()), 24)

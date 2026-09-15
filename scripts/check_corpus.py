@@ -34,6 +34,7 @@ from corpus_assertions import (
     language_counts,
     lexical_breach,
     lexical_content,
+    map_paths,
     no_failed_builds,
     number,
     probe_units,
@@ -73,16 +74,26 @@ REQUIRED_LANGUAGES = {
 class Corpus:
     """One disposable corpus checkout, its external evidence, and tested actions."""
 
-    def __init__(self, pin: Pin, binary: Path, report: Path) -> None:
+    def __init__(
+        self, pin: Pin, binary: Path, report: Path, case: str = "workspace"
+    ) -> None:
+        require(case in ("workspace", "stop"), f"unknown corpus case: {case}")
+        require(case != "stop" or pin.name == "bun", "only bun has a stop case")
         self.pin = pin
+        self.case = case
         self.binary = binary.resolve()
         self.report = report.resolve()
         self.actions: list[Json] = []
         self.root = Path()
         self.sequence = 0
+        self.started = time.monotonic()
 
     def record(self, action: str, **values: Json) -> None:
-        entry: JsonObject = {"action": action, **values}
+        entry: JsonObject = {
+            "action": action,
+            **values,
+            "elapsed_seconds": time.monotonic() - self.started,
+        }
         self.actions.append(entry)
         print(json.dumps(entry), flush=True)
 
@@ -91,7 +102,7 @@ class Corpus:
         return Server(
             self.binary,
             root or self.root,
-            self.report.parent / f"server-{self.sequence}.log",
+            self.report.parent / f"{self.report.stem}.server-{self.sequence}.log",
             startup_seconds=180.0,
             env={
                 "RUST_LOG": "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info"
@@ -101,6 +112,7 @@ class Corpus:
     async def run(self) -> None:
         """A timeout fails the suite after server cleanup writes its evidence."""
         started = time.monotonic()
+        self.started = started
         status = "failed"
         failure = ""
         self.report.parent.mkdir(parents=True, exist_ok=True)
@@ -124,6 +136,7 @@ class Corpus:
                 json.dumps(
                     {
                         "corpus": self.pin.name,
+                        "case": self.case,
                         "commit": self.pin.commit,
                         "seed": SEED,
                         "status": status,
@@ -141,6 +154,9 @@ class Corpus:
         self.root = directory / "workspace"
         self.pin.checkout(self.root)
         self.configure()
+        if self.case == "stop":
+            await self.stop_states()
+            return
         await self.baseline()
         await self.symlink_root()
         if self.pin.name == "fastapi":
@@ -149,7 +165,6 @@ class Corpus:
             await self.source_bound()
         if self.pin.name == "bun":
             await self.lexical_bound()
-            await self.stop_states()
 
     def configure(self, extra: str = "", root: Path | None = None) -> None:
         """Disable model downloads while preserving source, lexical, and dependency defaults."""
@@ -334,11 +349,25 @@ class Corpus:
         selected = sample_symbols(
             pool, SYMBOL_COUNT, SEED, REQUIRED_LANGUAGES[self.pin.name]
         )
+        details: list[Json] = []
+        for hit in selected:
+            symbol = object_value(
+                object_value(hit.get("hit"), "search hit").get("symbol"), "symbol"
+            )
+            details.append(
+                {
+                    "identity": symbol.get("id"),
+                    "language": symbol.get("language"),
+                    "path": hit.get("path"),
+                    "range": hit.get("range"),
+                }
+            )
         self.record(
             "identity_languages",
             initial=initial,
             pool=language_counts(pool),
             sample=language_counts(selected),
+            selected=details,
         )
         identities: set[str] = set()
         for hit in selected:
@@ -440,7 +469,21 @@ class Corpus:
         )
 
     async def symlinks(self, client: Client) -> None:
-        workspace = json.dumps(await client.resource("rift://map"))
+        workspace = map_paths(await client.resource("rift://map"))
+        control = await client.call(
+            "search",
+            {
+                "query": "next",
+                "paths": {"include": ["package.json"], "exclude": ["*/**"]},
+                "limit": 100,
+            },
+        )
+        control_hits = objects(control, "results")
+        require(
+            bool(control_hits)
+            and all(hit.get("path") == "package.json" for hit in control_hits),
+            "root-only selector lost the regular package.json control",
+        )
         chain = "test/development/app-dir/hmr-symlink/app/symlink-chain/page.tsx"
         chain_path = self.root / chain
         require(
@@ -450,10 +493,17 @@ class Corpus:
         for path in ("readme.md", chain):
             await self.symlink_refused(client, path, workspace)
         self.record(
-            "symlinks", nodes="resource_not_found", search=0, paths=["readme.md", chain]
+            "symlinks",
+            nodes="resource_not_found",
+            search=0,
+            paths=["readme.md", chain],
+            control="package.json",
+            control_hits=len(control_hits),
         )
 
-    async def symlink_refused(self, client: Client, path: str, workspace: str) -> None:
+    async def symlink_refused(
+        self, client: Client, path: str, workspace: set[str]
+    ) -> None:
         require((self.root / path).is_symlink(), f"{path}: pinned symlink is absent")
         try:
             await client.call("nodes", {"path": path, "position": 0})
@@ -465,10 +515,14 @@ class Corpus:
             )
         else:
             raise AssertionError("nodes accepted a symlink")
-        answer = await client.call(
-            "search", {"query": "next", "paths": {"include": [path]}}
+        selector: JsonObject = {"include": [path]}
+        if "/" not in path:
+            selector["exclude"] = ["*/**"]
+        answer = await client.call("search", {"query": "next", "paths": selector})
+        require(
+            not objects(answer, "results"),
+            f"search indexed symlink {path}: {answer}",
         )
-        require(not objects(answer, "results"), "search indexed a symlink")
         require(path not in workspace, "workspace map lists a symlink")
 
     async def churn(self, client: Client) -> None:
@@ -744,6 +798,7 @@ def main() -> None:
     parser.add_argument("name", nargs="?", choices=("bun", "nextjs", "fastapi"))
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--report", type=Path)
+    parser.add_argument("--case", choices=("workspace", "stop"), default="workspace")
     arguments = parser.parse_args()
     selected = pins()
     if arguments.name:
@@ -765,9 +820,9 @@ def main() -> None:
                 "test requires one corpus name and --binary",
             )
             report = arguments.report or Path(
-                f"target/test-results/corpus/{pin.name}/report.json"
+                f"target/test-results/corpus/{pin.name}/{arguments.case}/report.json"
             )
-            asyncio.run(Corpus(pin, arguments.binary, report).run())
+            asyncio.run(Corpus(pin, arguments.binary, report, arguments.case).run())
 
 
 if __name__ == "__main__":

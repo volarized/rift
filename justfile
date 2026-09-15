@@ -57,6 +57,10 @@ clippy:
 docs:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 
+# Stable Rust exposes doctests through rustdoc; nextest runs the other Rust tests.
+doctest:
+    cargo test --doc --workspace --all-features --locked
+
 audit:
     cargo audit
     cargo deny check
@@ -79,21 +83,17 @@ clean:
 # cached per machine, so only the first run pays for the download. Coverage is
 # this run's artifact, not a second run.
 test:
-    RIFT_ENGINE_LIVE=1 RIFT_SEARCH_LIVE=1 cargo llvm-cov nextest --workspace --all-targets --all-features --locked --profile ci --lcov --output-path lcov.info --fail-under-lines 86
+    RIFT_ENGINE_LIVE=1 RIFT_SEARCH_LIVE=1 cargo llvm-cov nextest --workspace --all-targets --all-features --locked --profile ci --no-tests fail --lcov --output-path lcov.info --fail-under-lines 86
 
 # The live-engine suites alone, for iterating on them without paying for
 # the instrumented workspace run.
 engine-test:
-    RIFT_ENGINE_LIVE=1 cargo test -p rift-lsp --test live_rust_analyzer
-    RIFT_ENGINE_LIVE=1 cargo test -p rift-mcp --test live_rust_analyzer
-    RIFT_ENGINE_LIVE=1 cargo test -p rift-lsp --test live_typescript
-    RIFT_ENGINE_LIVE=1 cargo test -p rift-mcp --test live_typescript
-    RIFT_ENGINE_LIVE=1 cargo test -p rift-mcp --test live_toml
+    RIFT_ENGINE_LIVE=1 cargo nextest run --locked --no-tests fail -p rift-lsp -p rift-mcp --test live_rust_analyzer --test live_typescript --test live_toml
 
 # The live semantic-search suite alone, for iterating on it without paying for
 # the instrumented workspace run. Reaches the real model hub.
 search-test:
-    RIFT_SEARCH_LIVE=1 cargo test -p rift-mcp --test live_semantic_search
+    RIFT_SEARCH_LIVE=1 cargo nextest run --locked --no-tests fail -p rift-mcp --test live_semantic_search
 
 release-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_release.py
@@ -109,10 +109,14 @@ testing-check:
 corpus-sync name="":
     uv run --locked --python 3.12 --project scripts python scripts/check_corpus.py sync {{ if name == "" { "" } else { quote(name) } }}
 
+# The same instrumented build supplies every CI corpus case through nextest's archive.
+corpus-archive:
+    cargo llvm-cov nextest-archive --locked -p rift --test corpus_bun --test corpus_nextjs --test corpus_fastapi --cargo-profile corpus --profile corpus --archive-file target/corpus.tar.zst
+
 # Each repository runs alone. --no-report preserves the fast tier's profiles
 # so full-gate can merge coverage without running those tests a second time.
-corpus-test name:
-    RIFT_CORPUS_LIVE=1 cargo llvm-cov nextest --no-report --locked -p rift --test {{ quote("corpus_" + name) }} --profile corpus
+corpus-test name test_name="" archive="":
+    cargo llvm-cov nextest --no-report --profile corpus --no-tests fail --run-ignored all {{ if archive == "" { "--locked -p rift --test " + quote("corpus_" + name) + " --cargo-profile corpus" } else { "--archive-file " + quote(archive) + " --extract-overwrite -E " + quote("binary(=corpus_" + name + ")") } }} {{ if test_name == "" { "" } else { "-- --exact " + quote(test_name) } }}
 
 artifact-test *args:
     uv run --locked --python 3.12 --project scripts python scripts/check_artifact.py {{ args }}
@@ -126,18 +130,22 @@ coldstart-test *args:
 # One large workspace at a time on the development machine. The CI full tier
 # runs these repositories on separate runners with separate job budgets.
 full-gate linux_binary="":
+    command -v lcov
     @echo "Full gate runs the instrumented suite, then corpus and artifact checks in sequence."
     just test
+    cp lcov.info target/fast.lcov
     just corpus-sync
     just corpus-test fastapi
     just corpus-test bun
     just corpus-test nextjs
-    cargo llvm-cov report --lcov --output-path lcov.info --fail-under-lines 86
+    cargo llvm-cov report --profile corpus --lcov --output-path target/corpus.lcov
+    lcov --add-tracefile target/fast.lcov --add-tracefile target/corpus.lcov --output-file lcov.info --no-markers
+    lcov --summary lcov.info --fail-under-lines 86 --no-markers
     just artifact-test
     just agent-test
     just coldstart-test {{ if linux_binary == "" { "" } else { "--binary " + quote(linux_binary) } }}
 
-rust-gate: format dashes generate-check conformance check clippy docs audit test release-test installer-test testing-check
+rust-gate: format dashes generate-check conformance check clippy docs doctest audit test release-test installer-test testing-check
 
 # One signed tag on the commit `origin/main` names right now. The recipe reads
 # that commit from the remote, so the local checkout's branch and its uncommitted

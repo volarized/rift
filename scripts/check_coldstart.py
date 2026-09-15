@@ -66,6 +66,14 @@ server_status=$?
 printf '%s\n' "$server_status" > /server.exit
 exec sleep infinity
 """
+STOP = r"""
+set -eu
+"$1" server stop >&2
+while kill -0 "$2" 2>/dev/null || test ! -s "$3"; do
+    sleep 0.01
+done
+cat "$3"
+"""
 
 
 def container_command(name: str, arguments: list[str], timeout: float = 30.0) -> str:
@@ -90,6 +98,20 @@ def await_publication(name: str) -> int:
             return int(str(pid))
         time.sleep(0.1)
     raise AssertionError(f"cold server did not publish within {timeout_seconds}s")
+
+
+def stop_container(name: str, pid: int) -> None:
+    """Require CLI stop, process exit, and exit status within the same deadline."""
+    deadline = time.monotonic() + STOP_SECONDS
+    budget = remaining_seconds(max(0.0, deadline - time.monotonic()))
+    require(budget > 0, "cold server stop exceeded its deadline")
+    status = container_command(
+        name,
+        ["sh", "-c", STOP, "sh", "/rift", str(pid), "/server.exit"],
+        timeout=budget,
+    ).strip()
+    require(status == "0", f"cold server exited {status}")
+    require(time.monotonic() <= deadline, "cold server stop exceeded its deadline")
 
 
 async def check_first_use(client: Client, name: str) -> None:
@@ -243,12 +265,7 @@ async def check_coldstart(binary: Path, image: str, version: str | None = None) 
                     client = Client(session, START_SECONDS)
                     await client.initialize()
                     await check_first_use(client, name)
-            stop = '/rift server stop && ! kill -0 "$1" 2>/dev/null'
-            container_command(
-                name, ["sh", "-c", stop, "sh", str(pid)], timeout=STOP_SECONDS
-            )
-            status = container_command(name, ["cat", "/server.exit"]).strip()
-            require(status == "0", f"cold server exited {status}")
+            stop_container(name, pid)
         except BaseException as error:
             failure = error
             try:
