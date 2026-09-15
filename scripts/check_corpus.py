@@ -529,19 +529,22 @@ class Corpus:
         path = self.root / PROBE_PATH
         completed: list[Json] = []
 
-        async def writer() -> None:
-            for edit in range(self.pin.seconds // 2):
-                path.write_text(
-                    f"pub fn corpus_probe() {{ let value = {edit}; }}\n",
-                    encoding="utf-8",
-                )
-                completed.append(edit)
-                await asyncio.sleep(2.0)
+        def write(edit: int) -> None:
+            path.write_text(
+                f"pub fn corpus_probe() {{ let value = {edit}; }}\n",
+                encoding="utf-8",
+            )
+            completed.append(edit)
 
+        async def writer() -> None:
+            for edit in range(1, self.pin.seconds // 2):
+                await asyncio.sleep(2.0)
+                write(edit)
+
+        write(0)
         task = asyncio.create_task(writer())
         try:
             for read in range(READ_COUNT):
-                await asyncio.sleep(1.0)
                 answer = await client.call("search", {"query": "test", "limit": 1})
                 warnings(answer)
                 require(not task.done(), f"churn ended before read {read}")
