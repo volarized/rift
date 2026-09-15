@@ -12,7 +12,6 @@ import asyncio
 import dataclasses
 import json
 import os
-import random
 import tempfile
 import time
 import traceback
@@ -32,12 +31,14 @@ from corpus_assertions import (
     exact_degradation,
     fields,
     identity_resolved,
+    language_counts,
     lexical_breach,
     lexical_content,
     no_failed_builds,
     number,
     probe_units,
     records,
+    sample_symbols,
     warnings,
 )
 from corpus_cache import Pin, git, measure, pins
@@ -57,6 +58,16 @@ SEED = 34
 POLL_SECONDS = 0.1
 OBSERVATION_SECONDS = 60.0
 CONFIGURATION = '[search.semantic]\ndisabled = true\n[logs]\npage_records = 5000\ncapture = "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info"\n'
+SAMPLE_LANGUAGES = {
+    "bun": ("rust", "typescript", "typescript:tsx"),
+    "nextjs": ("rust", "typescript", "typescript:tsx"),
+    "fastapi": ("python",),
+}
+REQUIRED_LANGUAGES = {
+    "bun": {"rust", "typescript"},
+    "nextjs": {"typescript"},
+    "fastapi": {"python"},
+}
 
 
 class Corpus:
@@ -293,7 +304,42 @@ class Corpus:
 
     async def symbols(self, client: Client, candidates: list[JsonObject]) -> None:
         """Issue #264: exercise 200 emitted addresses without changing their bytes."""
-        selected = random.Random(SEED).sample(candidates, SYMBOL_COUNT)
+        initial = language_counts(candidates)
+        pool = list(candidates)
+        workspace = await client.resource("rift://workspace")
+        configured = objects(workspace, "languages")
+        for language in SAMPLE_LANGUAGES[self.pin.name]:
+            matching = [row for row in configured if row.get("language") == language]
+            require(len(matching) == 1, f"workspace lost language {language}")
+            row = matching[0]
+            require(
+                row.get("enabled") is True and row.get("syntax") is True,
+                f"workspace does not serve syntax for {language}",
+            )
+            included = array_value(row.get("include"), "language include patterns")
+            require(bool(included), f"workspace lost include patterns for {language}")
+            paths: JsonObject = {"include": included, "exclude": row.get("exclude", [])}
+            answer = await client.call(
+                "search",
+                {
+                    "query": "test",
+                    "target": "symbol",
+                    "paths": paths,
+                    "limit": 1000,
+                    "order": "identity",
+                },
+            )
+            warnings(answer)
+            pool.extend(objects(answer, "results"))
+        selected = sample_symbols(
+            pool, SYMBOL_COUNT, SEED, REQUIRED_LANGUAGES[self.pin.name]
+        )
+        self.record(
+            "identity_languages",
+            initial=initial,
+            pool=language_counts(pool),
+            sample=language_counts(selected),
+        )
         identities: set[str] = set()
         for hit in selected:
             symbol = object_value(
