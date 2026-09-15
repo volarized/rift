@@ -1,5 +1,5 @@
 //! Proves the Streamable-HTTP serving core through live rmcp clients: token
-//! auth, tool round trips, the stop route, the idle timeout, and shutdown.
+//! policies, tool round trips, the stop route, the idle timeout, and shutdown.
 
 mod hermetic_search;
 
@@ -8,7 +8,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use rift_mcp::{HttpServer, schema, serve_http};
+use rift_mcp::{HttpServer, TokenCheck, schema, serve_http};
 use rift_protocol::lock::ProductIdentity;
 use rmcp::ServiceExt as _;
 use rmcp::model::CallToolRequestParams;
@@ -73,8 +73,15 @@ fn workspace_with(configuration: Option<&str>) -> TestResult<tempfile::TempDir> 
 }
 
 async fn served(root: &Path) -> TestResult<(CancellationToken, HttpServer)> {
+    served_under(root, TokenCheck::Required).await
+}
+
+async fn served_under(
+    root: &Path,
+    check: TokenCheck,
+) -> TestResult<(CancellationToken, HttpServer)> {
     let shutdown = CancellationToken::new();
-    let server = serve_http(root, shutdown.clone()).await?;
+    let server = serve_http(root, shutdown.clone(), check).await?;
     Ok((shutdown, server))
 }
 
@@ -232,6 +239,41 @@ async fn wrong_or_missing_bearer_is_refused_with_the_scheme() -> TestResult {
 
     shutdown.cancel();
     stopped_within_deadline(server).await
+}
+
+/// The MCP conformance runner addresses a server by URL alone and sends no
+/// `Authorization` header, so a skipped token check has to answer a bare
+/// request; the default still refuses it.
+#[tokio::test]
+async fn a_skipped_token_check_serves_a_request_the_default_refuses() -> TestResult {
+    let directory = workspace_with(None)?;
+    let (shutdown, server) = served_under(directory.path(), TokenCheck::Skipped).await?;
+    let http = reqwest::Client::new();
+
+    let unauthenticated = http
+        .post(mcp_url(&server))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+        .send()
+        .await?;
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::OK);
+
+    shutdown.cancel();
+    stopped_within_deadline(server).await?;
+
+    let (shutdown, checked) = served(directory.path()).await?;
+    let refused = http
+        .post(mcp_url(&checked))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+        .send()
+        .await?;
+    assert_eq!(refused.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    shutdown.cancel();
+    stopped_within_deadline(checked).await
 }
 
 #[tokio::test]

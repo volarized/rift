@@ -24,7 +24,7 @@ use rift_index::{
 };
 use rift_mcp::{
     ElectionError, ElectionFault, LogDrain, PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT,
-    START_WAIT_MAX, ServerPresence, SpawnedServer, StaleReason, WorkspaceStorage,
+    START_WAIT_MAX, ServerPresence, SpawnedServer, StaleReason, TokenCheck, WorkspaceStorage,
     install_panic_hook, probe, read_serving, serve_elected_with_storage, spawn_detached_server,
 };
 use rift_protocol::lock::ServerLock;
@@ -225,6 +225,15 @@ pub(super) enum ServerCommand {
         /// Serve in this process instead of spawning a detached one.
         #[arg(long)]
         foreground: bool,
+        /// How served requests authenticate; `skip` needs --foreground.
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = AuthMode::Token,
+            value_name = "MODE",
+            requires_if("skip", "foreground")
+        )]
+        auth: AuthMode,
     },
     /// Stop this workspace's server.
     Stop,
@@ -322,6 +331,29 @@ fn logs_mode(follow: bool) -> LogsMode {
         LogsMode::Following
     } else {
         LogsMode::Once
+    }
+}
+
+/// How a started server authenticates the requests it serves.
+///
+/// `Skip` exists for the MCP conformance runner, which addresses a server
+/// by URL alone and sends no `Authorization` header. It is accepted only
+/// beside `--foreground`, so a detached server always checks its token.
+/// The variants carry no documentation of their own: clap renders a value's
+/// doc comment as per-value help, which turns the whole command's help into
+/// its long form.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub(super) enum AuthMode {
+    #[default]
+    Token,
+    Skip,
+}
+
+/// The clap `--auth` value as the policy the transport applies.
+fn token_check(auth: AuthMode) -> TokenCheck {
+    match auth {
+        AuthMode::Token => TokenCheck::Required,
+        AuthMode::Skip => TokenCheck::Skipped,
     }
 }
 
@@ -426,11 +458,13 @@ pub(super) async fn run(
 ) -> Result<Option<ServerOutcome>, ServerCommandError> {
     let root = Path::new(".");
     match command {
-        ServerCommand::Start { foreground } => match start_mode(foreground) {
+        ServerCommand::Start { foreground, auth } => match start_mode(foreground) {
             StartMode::Detached => start_detached(root).await.map(Some),
-            StartMode::Foreground => serve_foreground(root, drain, retention_records)
-                .await
-                .map(|()| None),
+            StartMode::Foreground => {
+                serve_foreground(root, drain, retention_records, token_check(auth))
+                    .await
+                    .map(|()| None)
+            }
         },
         ServerCommand::Stop => stop(root, STOP_POLL_ATTEMPT_COUNT).await.map(Some),
         ServerCommand::Restart => restart(root).await.map(Some),
@@ -631,7 +665,8 @@ async fn await_election_released(
     Err(Error::new(ServerCommandFault::ElectionUnreleased { pid }))
 }
 
-/// Serves the workspace in this process until interrupted or stopped.
+/// Serves the workspace in this process until interrupted or stopped,
+/// under `check`.
 ///
 /// The listening line prints before blocking. Ctrl-C cancels the shutdown
 /// token; an authorized stop request and the idle timeout end serving the
@@ -649,6 +684,7 @@ async fn serve_foreground(
     root: &Path,
     drain: Option<LogDrain>,
     retention_records: u64,
+    check: TokenCheck,
 ) -> Result<(), ServerCommandError> {
     // A detached server's panic reaches its stderr file at best; the hook
     // records it through the same lane every other diagnostic takes.
@@ -666,7 +702,7 @@ async fn serve_foreground(
         ))),
         _ => None,
     };
-    let server = match serve_elected_with_storage(root, shutdown.clone(), storage).await {
+    let server = match serve_elected_with_storage(root, shutdown.clone(), storage, check).await {
         Ok(server) => server,
         Err(error) => {
             shutdown.cancel();
@@ -1112,14 +1148,14 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{
-        ChildWatch, LogLevel, LogsMode, PRESENCE_POLL_INTERVAL, SERVER_STOP_DEADLINE,
+        AuthMode, ChildWatch, LogLevel, LogsMode, PRESENCE_POLL_INTERVAL, SERVER_STOP_DEADLINE,
         START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, STOP_POLL_ATTEMPT_COUNT, STOP_WAIT_MAX,
-        ServerCommandFault, ServerOutcome, StaleReason, StartMode, TailCount,
+        ServerCommandFault, ServerOutcome, StaleReason, StartMode, TailCount, TokenCheck,
         await_election_released, await_serving, await_stopped, discard_stale_document,
         foreground_refused, holder_evidence, label, level_glyph, logs_mode, logs_query,
         logs_unavailable, now_ms, print_logs, rendered_fields, rendered_line, rendered_timestamp,
         request_stop, stale_reason_phrase, start_detached, start_mode, status, stop,
-        stop_log_drain,
+        stop_log_drain, token_check,
     };
     use jiff::tz::{Offset, TimeZone};
     use rift_core::Error;
@@ -1215,6 +1251,13 @@ mod tests {
     fn foreground_flag_selects_the_mode() {
         assert!(matches!(start_mode(true), StartMode::Foreground));
         assert!(matches!(start_mode(false), StartMode::Detached));
+    }
+
+    #[test]
+    fn the_auth_flag_selects_the_token_policy() {
+        assert_eq!(token_check(AuthMode::Token), TokenCheck::Required);
+        assert_eq!(token_check(AuthMode::Skip), TokenCheck::Skipped);
+        assert_eq!(AuthMode::default(), AuthMode::Token);
     }
 
     #[tokio::test]

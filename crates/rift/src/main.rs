@@ -69,7 +69,10 @@ impl Cli {
         matches!(
             &self.command,
             Some(CliCommand::Server {
-                command: server::ServerCommand::Start { foreground: true }
+                command: server::ServerCommand::Start {
+                    foreground: true,
+                    ..
+                }
             })
         )
     }
@@ -423,12 +426,18 @@ mod tests {
                 command:
                     super::server::ServerCommand::Start {
                         foreground: parsed_flag,
+                        auth,
                     },
             }) = parsed.command
             else {
                 panic!("start must parse into the server subcommand: {parsed:?}");
             };
             assert_eq!(parsed_flag, foreground);
+            assert_eq!(
+                auth,
+                super::server::AuthMode::Token,
+                "an unflagged start checks its token"
+            );
         }
         assert!(matches!(
             Cli::try_parse_from(["rift", "server", "stop"])
@@ -466,6 +475,32 @@ mod tests {
             Cli::try_parse_from(["rift", "server", "stop", "--foreground"]).is_err(),
             "--foreground belongs to start alone"
         );
+    }
+
+    /// `--auth skip` serves every loopback request unchecked, so it is
+    /// accepted only in the process the operator is watching: a detached
+    /// start that carried it would leave an unchecked server behind.
+    #[test]
+    fn skipping_the_token_check_needs_a_foreground_start() {
+        let refused = Cli::try_parse_from(["rift", "server", "start", "--auth", "skip"])
+            .expect_err("--auth skip without --foreground must be refused");
+        let rendered = refused.to_string();
+        assert!(rendered.contains("--foreground"), "{rendered}");
+        assert!(rendered.contains("--auth"), "{rendered}");
+
+        let parsed =
+            Cli::try_parse_from(["rift", "server", "start", "--auth", "skip", "--foreground"])
+                .expect("--auth skip beside --foreground must parse");
+        let Some(CliCommand::Server {
+            command:
+                super::server::ServerCommand::Start {
+                    foreground: true,
+                    auth: super::server::AuthMode::Skip,
+                },
+        }) = parsed.command
+        else {
+            panic!("the flagged start must carry both values: {parsed:?}");
+        };
     }
 
     #[test]
