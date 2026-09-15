@@ -2003,6 +2003,27 @@ mod tests {
                 "invalid process id must not prove exit"
             );
         }
+        for poll_again in [false, true] {
+            let mut process = ProcessExit::open(std::process::id());
+            let ProcessExit::Waiting { last_error, .. } = &mut process else {
+                panic!("the current process handle must open: {process:?}");
+            };
+            *last_error = Some(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "process wait interrupted",
+            ));
+            if poll_again {
+                assert!(!process.exited(), "the current process must remain alive");
+            }
+            let error = process.refused(ServerCommandFault::StopTimedOut {
+                holder: Box::new(holder()),
+            });
+            assert_eq!(
+                error.to_string().contains("process wait interrupted"),
+                !poll_again,
+                "a successful poll must clear the prior wait failure: {error}"
+            );
+        }
         Ok(())
     }
 

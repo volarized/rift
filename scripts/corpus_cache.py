@@ -52,6 +52,17 @@ class Pin:
 
     def verify(self, root: Path) -> Measurement:
         """Refuse a cache that moved, changed, or lost its measured objects."""
+        observed = self._verify_tree(root)
+        missing = missing_history_objects(root, self.commit)
+        if missing:
+            raise RuntimeError(
+                f"{self.name}: {len(missing)} history objects are missing, first {missing[0]}; "
+                "run just corpus-sync before testing"
+            )
+        return observed
+
+    def _verify_tree(self, root: Path) -> Measurement:
+        """Verify the pinned bytes before any repair fetch changes the object store."""
         head = git(root, "rev-parse", "HEAD").decode().strip()
         if head != self.commit:
             raise RuntimeError(
@@ -82,6 +93,19 @@ class Pin:
         """Publish a verified depth-50 checkout by renaming its temporary directory."""
         destination = self.cache
         if destination.exists():
+            self._verify_tree(destination)
+            if missing_history_objects(destination, self.commit):
+                git(
+                    destination,
+                    "fetch",
+                    "--quiet",
+                    "--depth=50",
+                    "--no-filter",
+                    "--refetch",
+                    "--no-tags",
+                    "origin",
+                    self.commit,
+                )
             self.verify(destination)
             return destination
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -103,7 +127,7 @@ class Pin:
                 "fetch",
                 "--quiet",
                 "--depth=50",
-                "--filter=blob:none",
+                "--no-tags",
                 "origin",
                 self.commit,
             )
@@ -113,10 +137,10 @@ class Pin:
         return destination
 
     def checkout(self, destination: Path, *, depth: int = 50) -> None:
-        """Copy a disposable tree while the verified partial-clone cache remains untouched.
+        """Copy a disposable tree while the verified cache remains untouched.
 
-        A local upload-pack cannot serve unfetched promisor objects. copytree
-        preserves Git's remote and shallow metadata along with every symlink.
+        copytree preserves Git's remote and shallow metadata with every symlink.
+        Verification requires all reachable history objects before serving.
         The separate depth-one case uses Git's fetch boundary directly.
         """
         self.verify(self.cache)
@@ -137,7 +161,7 @@ class Pin:
                 "fetch",
                 "--quiet",
                 "--depth=1",
-                "--filter=blob:none",
+                "--no-tags",
                 "origin",
                 self.commit,
             )
@@ -145,6 +169,17 @@ class Pin:
         else:
             raise ValueError("corpus depth must be 1 or 50")
         self.verify(destination)
+
+
+def missing_history_objects(root: Path, commit: str) -> list[str]:
+    """Read missing IDs without Git fetching them or printing every available object."""
+    missing = git(
+        root, "rev-list", "--quiet", "--objects", "--missing=print", commit
+    ).splitlines()
+    for row in missing:
+        if re.fullmatch(rb"\?[0-9a-f]{40}", row) is None:
+            raise ValueError(f"invalid missing history object: {row!r}")
+    return [row[1:].decode("ascii") for row in missing]
 
 
 def git(
