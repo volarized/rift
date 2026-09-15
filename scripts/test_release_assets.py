@@ -20,7 +20,9 @@ from release_assets import (
     ROOT,
     ReleaseAssets,
     object_document,
+    require_machine,
     require_release,
+    require_windows_machine,
     select_previous,
 )
 from release_fixture import (
@@ -29,9 +31,43 @@ from release_fixture import (
     LATEST_PATH,
     ReleaseFixture,
     metadata,
+    require_macos_trust,
     trusted_certificate,
 )
 from rift_release.release import package_release
+
+
+def windows_image(machine: int) -> bytes:
+    """Build the documented DOS offset, PE signature, and machine fields for validation."""
+    return (
+        b"MZ"
+        + bytes(58)
+        + (64).to_bytes(4, "little")
+        + b"PE\0\0"
+        + machine.to_bytes(2, "little")
+    )
+
+
+def macho_image(machine: int) -> bytes:
+    """Build a full Mach-O 64-bit header with the documented machine field."""
+    return b"\xcf\xfa\xed\xfe" + machine.to_bytes(4, "little") + bytes(24)
+
+
+def elf_image(machine: int) -> bytes:
+    """Build a full ELF64 header with little-endian machine and current version."""
+    return (
+        b"\x7fELF\x02\x01\x01" + bytes(11) + machine.to_bytes(2, "little") + bytes(44)
+    )
+
+
+IMAGES: dict[str, bytes] = {
+    "x86_64-pc-windows-msvc": windows_image(0x8664),
+    "aarch64-pc-windows-msvc": windows_image(0xAA64),
+    "x86_64-apple-darwin": macho_image(0x01000007),
+    "aarch64-apple-darwin": macho_image(0x0100000C),
+    "x86_64-unknown-linux-gnu": elf_image(62),
+    "aarch64-unknown-linux-gnu": elf_image(183),
+}
 
 
 class FixtureTests(unittest.TestCase):
@@ -127,8 +163,163 @@ class FixtureTests(unittest.TestCase):
         ):
             self.fail("local trust must refuse")
 
+    def test_macos_cleanup_clears_only_owned_trust_and_requires_native_rejection(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ReleaseFixture(Path(directory), {})
+            fixture.server_close()
+            rejected = RuntimeError(
+                "security exited 1: Cert Verify Result: CSSMERR_TP_NOT_TRUSTED\n"
+            )
+            with (
+                patch("release_fixture.sys.platform", "darwin"),
+                patch.dict(
+                    os.environ,
+                    {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted"},
+                ),
+                patch(
+                    "release_process.run", side_effect=["", "", "", "", rejected]
+                ) as command,
+                self.assertRaisesRegex(ValueError, "gate failed"),
+                trusted_certificate(fixture.certificate),
+            ):
+                raise ValueError("gate failed")
+            calls = command.call_args_list
+            self.assertEqual(len(calls), 5)
+            self.assertEqual(calls[0].args[0][6], "trustRoot")
+            self.assertEqual(calls[2].args[0][6], "unspecified")
+            self.assertEqual(calls[0].args[0][-1], str(fixture.certificate))
+            self.assertEqual(calls[2].args[0][-1], str(fixture.certificate))
+            self.assertEqual(calls[3].args[0][3], "delete-certificate")
+            self.assertNotIn("-t", calls[3].args[0])
+            self.assertEqual(calls[1].args, calls[4].args)
+            self.assertTrue(all(call.kwargs["timeout"] <= 60 for call in calls))
+
+    def test_macos_cleanup_attempts_deletion_when_clearing_trust_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = ReleaseFixture(Path(directory), {})
+            fixture.server_close()
+            with (
+                patch("release_fixture.sys.platform", "darwin"),
+                patch.dict(
+                    os.environ,
+                    {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted"},
+                ),
+                patch(
+                    "release_process.run",
+                    side_effect=[
+                        "",
+                        "",
+                        RuntimeError("clear failed"),
+                        "",
+                        RuntimeError(
+                            "security exited 1: Cert Verify Result: CSSMERR_TP_NOT_TRUSTED"
+                        ),
+                    ],
+                ) as command,
+                self.assertRaisesRegex(RuntimeError, "clear failed"),
+                trusted_certificate(fixture.certificate),
+            ):
+                pass
+            self.assertEqual(command.call_args_list[3].args[0][3], "delete-certificate")
+
+    def test_macos_verification_cannot_accept_other_errors_or_remaining_trust(
+        self,
+    ) -> None:
+        for result in (
+            "",
+            RuntimeError("security exceeded 15s"),
+            RuntimeError("security exited 1: invalid certificate"),
+        ):
+            with (
+                self.subTest(result=result),
+                patch("release_process.run", side_effect=[result]),
+                self.assertRaises((RuntimeError, AssertionError)),
+            ):
+                require_macos_trust(Path("owned-ca.pem"), trusted=False)
+
 
 class AssetTests(unittest.TestCase):
+    def test_valid_checksum_cannot_accept_wrong_machine_for_any_target(self) -> None:
+        for source, data in IMAGES.items():
+            architecture, platform = source.split("-", 1)
+            other = "x86_64" if architecture == "aarch64" else "aarch64"
+            target = f"{other}-{platform}"
+            with (
+                self.subTest(source=source, target=target),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                binary = root / "rift"
+                binary.write_bytes(data)
+                binary.chmod(0o755)
+                archive = package_release(ROOT, "v0.0.34", target, binary, root)
+                digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+                (root / "rift-v0.0.34-checksums.sha256").write_text(
+                    f"{digest}  {archive.name}\n"
+                )
+                with self.assertRaisesRegex(ValueError, "machine does not match"):
+                    ReleaseAssets.read(root, "v0.0.34", target)
+
+    def test_unix_machine_rejects_universal_wrong_encoding_and_truncated_headers(
+        self,
+    ) -> None:
+        macho = macho_image(0x01000007)
+        elf = elf_image(62)
+        invalid = {
+            "x86_64-apple-darwin": (
+                macho[:31],
+                bytes.fromhex("cafebabe") + macho[4:],
+                bytes.fromhex("bebafeca") + macho[4:],
+                bytes.fromhex("cafebabf") + macho[4:],
+                bytes.fromhex("bfbafeca") + macho[4:],
+                bytes.fromhex("feedfacf") + macho[4:],
+                bytes.fromhex("cefaedfe") + macho[4:],
+            ),
+            "x86_64-unknown-linux-gnu": (
+                elf[:63],
+                b"invalid" + elf[7:],
+                elf[:4] + b"\x01" + elf[5:],
+                elf[:5] + b"\x02" + elf[6:],
+                elf[:6] + b"\x00" + elf[7:],
+            ),
+        }
+        for target, images in invalid.items():
+            for data in images:
+                with (
+                    self.subTest(target=target, data=data),
+                    self.assertRaisesRegex(ValueError, "header"),
+                ):
+                    require_machine(data, target)
+
+    def test_windows_machine_rejects_wrong_architecture_and_invalid_headers(
+        self,
+    ) -> None:
+        x64 = "x86_64-pc-windows-msvc"
+        arm64 = "aarch64-pc-windows-msvc"
+        require_windows_machine(windows_image(0x8664), x64)
+        require_windows_machine(windows_image(0xAA64), arm64)
+        for machine, target in ((0x8664, arm64), (0xAA64, x64), (0xA641, arm64)):
+            with (
+                self.subTest(machine=machine, target=target),
+                self.assertRaisesRegex(ValueError, "machine"),
+            ):
+                require_windows_machine(windows_image(machine), target)
+        for data in (
+            b"MZ",
+            b"invalid" + windows_image(0x8664)[7:],
+            windows_image(0x8664)[:64],
+            windows_image(0x8664)[:60]
+            + bytes.fromhex("ffffffff")
+            + windows_image(0x8664)[64:],
+        ):
+            with (
+                self.subTest(data=data),
+                self.assertRaisesRegex(ValueError, "header|signature"),
+            ):
+                require_windows_machine(data, x64)
+
     def test_previous_release_is_lower_even_when_candidate_is_already_latest(
         self,
     ) -> None:
@@ -144,14 +335,14 @@ class AssetTests(unittest.TestCase):
             select_previous("v0.0.35", releases * 26)
 
     def test_exact_packaged_bytes_are_served_and_corruption_refuses(self) -> None:
-        for target in ("x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"):
+        for target, data in IMAGES.items():
             with (
                 self.subTest(target=target),
                 tempfile.TemporaryDirectory() as directory,
             ):
                 root = Path(directory)
                 binary = root / "rift"
-                binary.write_bytes(b"real fixture executable bytes")
+                binary.write_bytes(data)
                 binary.chmod(0o755)
                 archive = package_release(ROOT, "v0.0.34", target, binary, root)
                 original = archive.read_bytes()

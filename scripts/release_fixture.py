@@ -179,12 +179,32 @@ def metadata(tag: str) -> bytes:
     return json.dumps({"tag_name": tag, "draft": False, "prerelease": False}).encode()
 
 
+def require_macos_trust(certificate: Path, *, trusted: bool) -> None:
+    """Require native evaluation to accept the CA, or reject it as untrusted."""
+    from release_process import run
+
+    command = ["security", "verify-cert", "-L", "-l", "-c", str(certificate)]
+    if trusted:
+        run(command, timeout=15)
+        return
+    try:
+        run(command, timeout=15)
+    except RuntimeError as error:
+        if str(error).strip() != (
+            "security exited 1: Cert Verify Result: CSSMERR_TP_NOT_TRUSTED"
+        ):
+            raise
+    else:
+        raise AssertionError("test CA remains trusted after cleanup")
+
+
 @contextmanager
 def trusted_certificate(certificate: Path) -> Iterator[None]:
     """Trust the test CA in native TLS, restricting OS store writes to hosted CI runners.
 
     Linux OpenSSL uses the child's SSL_CERT_FILE. macOS and Windows native TLS
-    use OS stores, so the gate adds and removes only this CA on disposable runners.
+    use OS stores on disposable runners. macOS clears this CA's trust result and
+    deletes its certificate, leaving an inert setting until the runner is destroyed.
     """
     from release_process import run
 
@@ -219,8 +239,12 @@ def trusted_certificate(certificate: Path) -> Iterator[None]:
             "sudo",
             "-n",
             "security",
-            "remove-trusted-cert",
+            "add-trusted-cert",
             "-d",
+            "-r",
+            "unspecified",
+            "-k",
+            keychain,
             str(certificate),
         ]
         delete = [
@@ -237,11 +261,19 @@ def trusted_certificate(certificate: Path) -> Iterator[None]:
         remove = ["certutil", "-user", "-delstore", "Root", thumbprint]
         delete = None
     try:
-        run(add)
+        run(add, timeout=60)
+        if sys.platform == "darwin":
+            require_macos_trust(certificate, trusted=True)
         yield
     finally:
         try:
-            run(remove)
+            # Removing the last macOS trust setting can request interactive
+            # authorization. An unspecified result grants no trust and keeps
+            # this root-only update on Apple's nonempty-settings path.
+            run(remove, timeout=60)
         finally:
             if delete is not None:
-                run(delete)
+                try:
+                    run(delete, timeout=30)
+                finally:
+                    require_macos_trust(certificate, trusted=False)
