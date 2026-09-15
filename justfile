@@ -57,6 +57,10 @@ clippy:
 docs:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 
+# Stable Rust exposes doctests through rustdoc; nextest runs the other Rust tests.
+doctest:
+    cargo test --doc --workspace --all-features --locked
+
 audit:
     cargo audit
     cargo deny check
@@ -79,21 +83,17 @@ clean:
 # cached per machine, so only the first run pays for the download. Coverage is
 # this run's artifact, not a second run.
 test:
-    RIFT_ENGINE_LIVE=1 RIFT_SEARCH_LIVE=1 cargo llvm-cov nextest --workspace --all-targets --all-features --locked --profile ci --lcov --output-path lcov.info --fail-under-lines 86
+    RIFT_ENGINE_LIVE=1 RIFT_SEARCH_LIVE=1 cargo llvm-cov nextest --workspace --all-targets --all-features --locked --profile ci --no-tests fail --lcov --output-path lcov.info --fail-under-lines 86
 
 # The live-engine suites alone, for iterating on them without paying for
 # the instrumented workspace run.
 engine-test:
-    RIFT_ENGINE_LIVE=1 cargo test -p rift-lsp --test live_rust_analyzer
-    RIFT_ENGINE_LIVE=1 cargo test -p rift-mcp --test live_rust_analyzer
-    RIFT_ENGINE_LIVE=1 cargo test -p rift-lsp --test live_typescript
-    RIFT_ENGINE_LIVE=1 cargo test -p rift-mcp --test live_typescript
-    RIFT_ENGINE_LIVE=1 cargo test -p rift-mcp --test live_toml
+    RIFT_ENGINE_LIVE=1 cargo nextest run --locked --no-tests fail -p rift-lsp -p rift-mcp --test live_rust_analyzer --test live_typescript --test live_toml
 
 # The live semantic-search suite alone, for iterating on it without paying for
 # the instrumented workspace run. Reaches the real model hub.
 search-test:
-    RIFT_SEARCH_LIVE=1 cargo test -p rift-mcp --test live_semantic_search
+    RIFT_SEARCH_LIVE=1 cargo nextest run --locked --no-tests fail -p rift-mcp --test live_semantic_search
 
 release-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_release.py
@@ -106,7 +106,7 @@ testing-check:
     uv run --locked --python 3.12 --project scripts ty check --extra-search-path scripts --extra-search-path tools/rift-release/src scripts
     uv run --locked --python 3.12 --project scripts pytest scripts
 
-rust-gate: format dashes generate-check conformance check clippy docs audit test release-test installer-test testing-check
+rust-gate: format dashes generate-check conformance check clippy docs doctest audit test release-test installer-test testing-check
 
 # One signed tag on the commit `origin/main` names right now. The recipe reads
 # that commit from the remote, so the local checkout's branch and its uncommitted
