@@ -237,10 +237,18 @@ def main() -> int:
     """Serve one throwaway workspace and score it against the baseline."""
     install_runner()
     binary = build_server_binary()
-    with tempfile.TemporaryDirectory(prefix="rift-conformance-") as directory:
+    with (
+        tempfile.TemporaryDirectory(prefix="rift-conformance-") as directory,
+        tempfile.TemporaryDirectory(prefix="rift-conformance-log-") as log_directory,
+    ):
         root = Path(directory)
         lay_out_workspace(root)
-        log_path = root / "server.log"
+        # The server watches the tree it serves, so its own output stays
+        # outside that tree. A log written beside `src` moves the workspace
+        # fingerprint on every line, and the startup capture never settles:
+        # the server refuses to start, naming `server.log` as the file that
+        # moved between two scans.
+        log_path = Path(log_directory) / "server.log"
         server = start_server(binary, root, log_path)
         try:
             port = await_published_port(server, root, log_path)
