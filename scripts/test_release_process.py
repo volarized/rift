@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import selectors
 import signal
 import subprocess
 import sys
@@ -29,6 +30,7 @@ from release_process import (
     run,
     run_bytes,
     signal_group,
+    termination_handler,
 )
 from release_process_unix import OWNER_ENV
 
@@ -224,7 +226,7 @@ class ProcessTests(unittest.TestCase):
                 "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
                 "os.kill(os.getppid(),signal.SIGTERM); time.sleep(30)"
             )
-            with self.assertRaisesRegex(InterruptedError, "SIGTERM"):
+            with self.assertRaisesRegex(RuntimeError, "SIGTERM"):
                 run([sys.executable, "-c", program, str(path)], timeout=5)
             pid = int(path.read_text())
             try:
@@ -232,6 +234,21 @@ class ProcessTests(unittest.TestCase):
                 self.assertEqual(child.status(), psutil.STATUS_ZOMBIE)
             except psutil.NoSuchProcess:
                 pass
+
+    @unittest.skipIf(sys.platform == "win32", "Unix SIGTERM during a selector wait")
+    def test_sigterm_interrupts_a_selector_wait(self) -> None:
+        program = (
+            "import os,signal,time; time.sleep(0.05); "
+            "os.kill(os.getppid(),signal.SIGTERM)"
+        )
+        with (
+            termination_handler(),
+            selectors.DefaultSelector() as selector,
+            subprocess.Popen([sys.executable, "-c", program]) as child,
+            self.assertRaisesRegex(RuntimeError, "SIGTERM"),
+        ):
+            selector.select(timeout=2)
+        self.assertEqual(child.returncode, 0)
 
     def test_child_environment_is_inherited_or_replaced_explicitly(self) -> None:
         # subprocess requires SystemRoot for Windows side-by-side assemblies.

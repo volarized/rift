@@ -87,7 +87,7 @@ fn proxied_engine_bound_covers_two_retry_sequences_and_election() {
 }
 
 fn rift_binary_identity() -> TestResult<ProductIdentity> {
-    let executable = fs::read(env!("CARGO_BIN_EXE_rift"))?;
+    let executable = fs::read(harness::rift_binary())?;
     Ok(ProductIdentity {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         executable_digest: format!("{:x}", Sha256::digest(executable)),

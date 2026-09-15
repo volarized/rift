@@ -283,7 +283,7 @@ async fn a_followed_read_prints_a_record_the_server_writes_later() -> TestResult
     recorded(&client, LOGS_URI).await?;
     let output = tempfile::tempdir()?;
     let transcript = output.path().join("followed.txt");
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rift"))
+    let mut child = std::process::Command::new(harness::rift_binary())
         .args(["server", "logs", "--follow"])
         .current_dir(directory.path())
         .stdin(std::process::Stdio::null())
