@@ -68,6 +68,10 @@ jobs:
             case: workspace
             test: test_nextjs_corpus
             minutes: 13
+          - repository: nextjs
+            case: churn
+            test: test_nextjs_churn
+            minutes: 13
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
