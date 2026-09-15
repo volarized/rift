@@ -2776,7 +2776,9 @@ pub(crate) fn publish_rebuild_after(
 /// one made while `rift.toml` moved, supersedes the candidate.
 ///
 /// Work is one digest per observed path, bounded by how many paths one observation
-/// retains, and it runs under the publication lane alone.
+/// retains, and it runs under the publication lane alone. A bounded read that left a file
+/// out answers only a candidate with no digest and the same recorded warning; another
+/// omission or an I/O error still supersedes it.
 fn answered_candidate(
     root: &Path,
     candidate: &Arc<PublishedWorkspace>,
@@ -2791,7 +2793,28 @@ fn answered_candidate(
     {
         return None;
     }
-    let observed = observed_digests(root, &pending.paths, &candidate.source_policy)?;
+    let mut observed = Vec::with_capacity(pending.paths.len());
+    for path in &pending.paths {
+        let digest = match candidate
+            .source_policy
+            .visible_digest(&root.join(path.as_str()))
+        {
+            Ok(digest) => digest,
+            Err(error)
+                if candidate.reads.file_digest(path).is_none()
+                    && error
+                        .fault()
+                        .left_out_file(path.clone())
+                        .is_some_and(|warning| {
+                            candidate.reads.file_warning(path) == Some(&warning)
+                        }) =>
+            {
+                None
+            }
+            Err(_) => return None,
+        };
+        observed.push((path.clone(), digest));
+    }
     let changes = PathChanges::resolve(observed, |path| candidate.reads.file_digest(path));
     if !changes.is_empty() {
         return None;
@@ -3044,9 +3067,17 @@ mod tests {
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
     fn stable_candidate(root: &std::path::Path, epoch: u64) -> TestResult<Arc<PublishedWorkspace>> {
+        candidate_with_limits(root, epoch, WorkspaceIndexLimits::default())
+    }
+
+    fn candidate_with_limits(
+        root: &std::path::Path,
+        epoch: u64,
+        limits: WorkspaceIndexLimits,
+    ) -> TestResult<Arc<PublishedWorkspace>> {
         match build_workspace_candidate(
             root,
-            WorkspaceIndexLimits::default(),
+            limits,
             &RebuildRequest::initial(epoch),
             &empty_dependency_store(),
         )? {
@@ -3539,6 +3570,93 @@ mod tests {
             ReadFault::unavailable("test rebuild", "superseded failure")
         ));
         assert!(state.blocking_read().failure.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_candidate_acknowledges_its_late_file_event() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = rift_core::ProjectPath::new("lib.rs")?;
+        let absolute = directory.path().join(path.as_str());
+        let limits = WorkspaceIndexLimits::new(4, 60, 60, 4, 100)?;
+        fs::write(&absolute, "pub fn beacon() {}\n")?;
+        let before = candidate_with_limits(directory.path(), 0, limits)?;
+        let (validation, _invalidations) = IndexValidation::new(limits.files_max());
+        validation.install_publication(&before);
+        fs::write(&absolute, "// oversized source\n".repeat(8))?;
+        let epoch = validation.observe_paths([path.clone()])?;
+        let _work = validation.take_pending();
+        let candidate = candidate_with_limits(directory.path(), epoch, limits)?;
+        assert!(candidate.reads.file_digest(&path).is_none());
+        assert!(candidate.source_policy.visible_digest(&absolute).is_err());
+        let state = RwLock::new(IndexState {
+            current: before,
+            failure: None,
+        });
+        let late_epoch = validation.observe_paths([path.clone()])?;
+        assert_eq!(
+            publish_rebuild(directory.path(), &state, &validation, &candidate),
+            RebuildOutcome::Published,
+            "a late observation of the same oversized file must not reject its captured omission"
+        );
+        let (published, _) = state.blocking_read().snapshot();
+        assert_eq!(published.epoch, late_epoch);
+        let params = serde_json::from_value(serde_json::json!({"name": "beacon"}))?;
+        let answer = published.reads.get_symbol(&params)?;
+        assert!(answer.hits.is_empty());
+        assert!(answer.warnings.iter().any(|warning| matches!(
+            warning,
+            rift_protocol::read::ReadWarning::SourceUnavailable { detail, .. }
+                if detail.contains("file byte limit")
+        )));
+
+        fs::write(&absolute, "pub fn changed() {}\n")?;
+        validation.observe_paths([path])?;
+        assert_eq!(
+            publish_rebuild(directory.path(), &state, &validation, &published),
+            RebuildOutcome::Superseded,
+            "new bounded source must supersede the old omission"
+        );
+        fs::remove_file(&absolute)?;
+        fs::create_dir(&absolute)?;
+        assert!(published.source_policy.visible_digest(&absolute).is_err());
+        assert_eq!(
+            publish_rebuild(directory.path(), &state, &validation, &published),
+            RebuildOutcome::Superseded,
+            "an I/O failure must not be accepted as the earlier file bound"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_observation_requires_the_same_recorded_omission() -> TestResult {
+        for original in [
+            None,
+            Some(b"source\0bytes".as_slice()),
+            Some(b"pub fn beacon() {}\n".as_slice()),
+        ] {
+            let directory = tempfile::tempdir()?;
+            let path = rift_core::ProjectPath::new("lib.rs")?;
+            let absolute = directory.path().join(path.as_str());
+            if let Some(bytes) = original {
+                fs::write(&absolute, bytes)?;
+            }
+            let limits = WorkspaceIndexLimits::new(4, 60, 60, 4, 100)?;
+            let candidate = candidate_with_limits(directory.path(), 0, limits)?;
+            let (validation, _invalidations) = IndexValidation::new(limits.files_max());
+            validation.install_publication(&candidate);
+            let state = RwLock::new(IndexState {
+                current: Arc::clone(&candidate),
+                failure: None,
+            });
+            fs::write(&absolute, "// oversized source\n".repeat(8))?;
+            validation.observe_paths([path])?;
+            assert_eq!(
+                publish_rebuild(directory.path(), &state, &validation, &candidate),
+                RebuildOutcome::Superseded,
+                "the candidate must carry the same file omission it acknowledges"
+            );
+        }
         Ok(())
     }
 
