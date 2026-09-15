@@ -704,12 +704,17 @@ class Corpus:
         await self.stop_during("history")
 
     async def stop_during(self, operation: str) -> None:
-        """Require recorded start without matching completion before issuing CLI stop."""
+        """Observe through a second proxy while the operation occupies its HTTP connection."""
         started_ms = time.time_ns() // 1_000_000
         with self.server() as server:
-            async with server.connect() as client:
+            async with (
+                server.connect() as client,
+                server.connect(
+                    log_path=server.log_path.with_suffix(".observer.mcp.log")
+                ) as observer,
+            ):
                 found = await observed(
-                    client,
+                    observer,
                     "rift://logs/component/index",
                     lambda rows: any(
                         row.get("operation") == "index.publish"
@@ -740,7 +745,7 @@ class Corpus:
                     wanted = "get_symbol"
                 try:
                     found = await observed(
-                        client,
+                        observer,
                         "rift://logs/component/index",
                         lambda rows: any(
                             row.get("operation") == wanted
