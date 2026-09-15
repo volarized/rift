@@ -106,6 +106,15 @@ testing-check:
     uv run --locked --python 3.12 --project scripts ty check --extra-search-path scripts --extra-search-path tools/rift-release/src scripts
     uv run --locked --python 3.12 --project scripts pytest scripts
 
+artifact-test *args:
+    uv run --locked --python 3.12 --project scripts python scripts/check_artifact.py {{ args }}
+
+agent-test *args:
+    uv run --locked --python 3.12 --project scripts python scripts/check_agent.py {{ args }}
+
+coldstart-test *args:
+    uv run --locked --python 3.12 --project scripts python scripts/check_coldstart.py {{ args }}
+
 rust-gate: format dashes generate-check conformance check clippy docs audit test release-test installer-test testing-check
 
 # One signed tag on the commit `origin/main` names right now. The recipe reads
