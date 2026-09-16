@@ -39,7 +39,7 @@ pub(crate) async fn served_workspace(
 ///
 /// This is the spelling the CLI hands the server: `rift mcp` and
 /// `rift server start` both serve the working directory, which they name
-/// `.`. Reads and writes below the root resolve against that directory
+/// `.`. Every read below the root resolves against that directory
 /// either way, so only the engine tier can tell the two spellings apart -
 /// it is addressed in `file://` URIs, which carry no working directory.
 /// A test cannot change the process directory without disturbing the
@@ -127,8 +127,9 @@ pub(crate) fn tool_request(name: &'static str, arguments: &Value) -> CallToolReq
 const ACCEPTANCE_ATTEMPTS_MAX: usize = 8;
 
 /// Calls the tool, retrying the refusal the server advertises as
-/// `retry: same_request`: a change the engine itself wrote to the tree can
-/// move the index between one request's snapshot and its acceptance.
+/// `retry: same_request`: a suite's own write to the served workspace -
+/// `dependency_index` rewrites `rift.toml` while the server runs - can move
+/// the index between one request's snapshot and its acceptance.
 pub(crate) async fn call_retrying_acceptance(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     params: CallToolRequestParams,
