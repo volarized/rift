@@ -554,7 +554,7 @@ async fn served_fixture() -> TestResult<(
     // caller from the callee.
     fs::write(
         directory.path().join("change_witness.rs"),
-        "pub fn change_witness() {}\n         pub fn calls_change_witness() {\n    change_witness();\n}\n",
+        "pub fn change_witness() {}\npub fn calls_change_witness() {\n    change_witness();\n}\n",
     )?;
     rift_history::fixture::commit_all(directory.path(), "introduce the change witness");
     let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
