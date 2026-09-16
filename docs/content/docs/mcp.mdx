@@ -388,9 +388,11 @@ Each caller's `traversal_path` carries a relationship from the caller to `serve`
 values such as `calls`, `references`, and `imports`; an empty or omitted list follows every
 facet. `target: "file"` never carries a walked hit, since a traversal only reaches symbols.
 
-A workspace with the binding provider disabled, no engine-resolved references, and no relationship
-data left from an earlier build refuses `capability_unavailable` naming `relationship traversal (providers.binding
-disabled)`: the graph this walk needs was never built. `traversal` never combines with `rev` -
+A workspace with the binding provider disabled, no successful engine reference answer, and no
+relationship data left from an earlier build refuses `capability_unavailable` naming
+`relationship traversal (providers.binding disabled)`: the graph this walk needs was never built.
+With no indexed relationships, a successful engine answer with no callers returns an empty result set.
+`traversal` never combines with `rev` -
 the relationship graph serves the current tree alone - and refuses `capability_unavailable`
 the same way. A `seed` that resolves to neither a graph node nor a lexical declaration refuses
 `resource_not_found`; one that resolves but carries no edges answers an empty result set, since
@@ -415,9 +417,14 @@ engine is configured, or the engine lacks reference support, the indexed relatio
 A configured engine that fails to start returns its failure through
 [`ErrorData`](/docs/developer/protocol/reference#ErrorData).
 
-The server captures source and configuration before and after the engine request. A changed
-capture discards the engine references, so the traversal uses the captured index alone.
-The request uses the configured engine retry and restart bounds.
+The server captures source and configuration before and after the engine request. If either
+changes, the server captures the current publication, refreshes the search ranking, and repeats
+the reference request, with at most three attempts. Reference resolution and these retries share
+one `[server] readiness_timeout` deadline. Exhausted attempts or an expired deadline return
+`temporarily_unavailable` with `retry: "same_request"`.
+
+A stale publication uses indexed relationships and carries `stale_index`. Each engine request
+also uses the configured engine retry and restart bounds.
 
 ### Dependency scope [#search-scope]
 
