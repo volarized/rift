@@ -11,8 +11,7 @@ use serde::{Deserialize, Serialize};
 use strum::VariantArray;
 
 /// Stable failure class for one request. `ErrorData.retry` carries the
-/// instance-specific retry decision; edit refusal uses typed domain
-/// results instead.
+/// instance-specific retry decision.
 #[derive(
     Clone,
     Copy,
@@ -79,9 +78,7 @@ pub enum RetryDirective {
     OperatorAction,
 }
 
-/// How far the request got before it failed. The same code means different things at
-/// different phases: `limit_exceeded` while reading is a response too big, and while
-/// checking a change it is a change set too large.
+/// The operation that failed while serving the request.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
@@ -89,12 +86,6 @@ pub enum RetryDirective {
 pub enum ErrorPhase {
     /// Reading workspace or provider data.
     Read,
-    /// Turning an address into the concrete thing it names at a state.
-    Resolve,
-    /// Checking a proposed change against the state it was pinned to.
-    Check,
-    /// Resolving the operation and writing the result into the targeted tree.
-    Change,
 }
 
 /// One cause in a failure chain. Entries appear from the outer operation to the concrete

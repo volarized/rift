@@ -24,22 +24,8 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 /// Bounds every shutdown wait so a hung server fails the test, not CI.
 const STOP_DEADLINE: Duration = Duration::from_secs(10);
 
-/// A `[[hooks]]` block whose `timeout` breaks its documented bound.
-const INVALID_CONFIGURATION: &str = r#"
-[[hooks]]
-id = "tests"
-kind = "test"
-command = ["cargo", "test"]
-changed_paths = "none"
-writes = "none"
-working_directory = ""
-environment = {}
-timeout = "0ms"
-output_limit = "4kb"
-failure_severity = "error"
-guarantees = []
-determinism = "deterministic"
-"#;
+/// A server table whose worker count breaks its documented bound.
+const INVALID_CONFIGURATION: &str = "[server]\nnum_workers = 0\n";
 
 /// A `[server]` table at the shortest accepted idle span.
 const SHORT_IDLE_CONFIGURATION: &str = r#"
@@ -154,15 +140,7 @@ async fn serves_tools_and_stops_on_external_cancel() -> TestResult {
         .iter()
         .map(|tool| tool.name.as_ref())
         .collect();
-    for expected in [
-        "get_symbol",
-        "search",
-        "nodes",
-        "replace_symbol",
-        "insert_symbol",
-        "replace_node",
-        "patch",
-    ] {
+    for expected in ["get_symbol", "search", "nodes"] {
         assert!(
             names.contains(&expected),
             "{expected} missing from {names:?}"
@@ -172,18 +150,10 @@ async fn serves_tools_and_stops_on_external_cancel() -> TestResult {
     let lookup = beacon_lookup(&client).await?;
     assert_eq!(lookup["hits"][0]["symbol"]["name"], json!("beacon"));
 
-    let inserted = client
-        .call_tool(
-            CallToolRequestParams::new("insert_symbol").with_arguments(arguments(&json!({
-                "anchor": "rift://symbol/rust/lib.rs/beacon",
-                "position": "after",
-                "body": "pub fn lantern() {}"
-            }))?),
-        )
-        .await?
-        .structured_content
-        .ok_or("insert_symbol must return structured content")?;
-    assert_eq!(inserted["status"], json!("applied"), "{inserted:#}");
+    fs::write(
+        directory.path().join("lib.rs"),
+        "pub fn beacon() {}\npub fn lantern() {}\n",
+    )?;
 
     let lantern = client
         .call_tool(

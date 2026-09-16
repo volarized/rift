@@ -356,6 +356,12 @@ impl EcmaScriptRules {
 }
 
 impl GrammarRules for EcmaScriptRules {
+    fn name_range(&self, node: Node<'_>) -> Result<Option<crate::ByteRange>, SyntaxError> {
+        node.child_by_field_id(self.kinds.field(EcmaScriptGrammarField::Name).get())
+            .map(extract::byte_range)
+            .transpose()
+    }
+
     fn declaration(&self, node: Node<'_>, text: &str) -> Result<Option<Declaration>, SyntaxError> {
         let Some(kind) = self.kinds.symbol_kind(node) else {
             return Ok(None);

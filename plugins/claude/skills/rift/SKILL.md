@@ -1,11 +1,11 @@
 ---
 name: rift
-description: Use when finding, reading, or editing code in a workspace Rift serves: structured search across declarations and source text, symbol reads by exact name, syntax inspection, and witnessed edits that recompute their address before writing and run the workspace's configured hooks.
+description: Use when finding or reading code in a workspace Rift serves: structured search across declarations and source text, symbol reads by exact name, and syntax inspection.
 ---
 
 # Rift
 
-Rift indexes this workspace's source and serves it over MCP: structured search, symbol reads by exact name, syntax inspection, and edits that carry their own address so a stale one refuses instead of splicing into moved code.
+Rift indexes this workspace's source and serves it over MCP: structured search, symbol reads by exact name, and syntax inspection.
 
 Start an unfamiliar repository at `rift://map`; it names the served languages and the workspace's own layout before any tool call.
 
@@ -18,9 +18,6 @@ Start an unfamiliar repository at `rift://map`; it names the served languages an
 | A dependency's public declaration is needed. | `get_symbol`, `search` (with `scope: "dependencies"`, or `"all"` to answer the project's own too) |
 | The syntax structure at one position is needed. | `nodes` |
 | A symbol's neighbors, its impact (who breaks when it changes), or a path between two symbols is needed. | `search` (with a `traversal` block) |
-| Code needs to change. | `patch`, `replace_node`, `insert_node`, `insert_symbol`, `replace_symbol`, `rename_symbol`, `remove_node`, `remove_symbol`, `move_file` (over raw file writes: the server recomputes witnesses and runs the workspace's configured hooks) |
-
-The edit tools apply through the server, which recomputes each address's witness before writing and refuses when the source moved since the address was read. Prefer them over writing files directly: a raw write bypasses that check and the workspace's configured hooks.
 
 ## When a call refuses
 

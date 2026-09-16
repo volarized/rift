@@ -48,32 +48,6 @@ async fn served_wire_errors_validate_against_the_error_data_schema() -> TestResu
         ("get_symbol", json!({ "name": "beacon", "limit": 0 })),
         ("nodes", json!({ "path": "missing.rs", "position": 0 })),
         (
-            "replace_symbol",
-            json!({ "symbol": "not-an-address", "body": "x" }),
-        ),
-        ("patch", json!({ "patch": "not a diff" })),
-        (
-            "replace_node",
-            json!({ "node": "not-an-address", "body": "x" }),
-        ),
-        (
-            "insert_symbol",
-            json!({ "anchor": "not-an-address", "position": "after", "body": "x" }),
-        ),
-        // Both node writers resolve their address through `resolve_node_range`, so a range
-        // in bounds but landing on no indexed node refuses identically on each. The witness
-        // is the digest of the bytes the range holds, `pub f`, so only the range can explain
-        // the refusal; a range the file no longer holds is a typed `source_unchanged`
-        // refusal the validation corpus covers.
-        (
-            "replace_node",
-            json!({ "node": "rift://node/rust/lib.rs@0-5#8cd07f40", "body": "x" }),
-        ),
-        (
-            "remove_node",
-            json!({ "node": "rift://node/rust/lib.rs@0-5#8cd07f40", "force": false }),
-        ),
-        (
             "get_symbol",
             json!({ "name": "beacon", "include": ["history"] }),
         ),
@@ -148,56 +122,6 @@ async fn failing_wire_error(
         panic!("expected protocol-level McpError, got {error:?}");
     };
     Ok(data.data.ok_or("wire error data must be present")?)
-}
-
-#[tokio::test]
-async fn raw_patch_without_headers_names_the_minimal_envelope() -> TestResult {
-    let directory = tempfile::tempdir()?;
-    fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-    fs::write(
-        directory.path().join("rift.toml"),
-        hermetic_search::SEMANTIC_DISABLED,
-    )?;
-
-    let wire =
-        failing_wire_error(directory.path(), "patch", json!({ "patch": "not a diff" })).await?;
-    let parsed: ErrorData = serde_json::from_value(wire)?;
-    assert!(
-        parsed.message.contains("--- a/src/lib.rs"),
-        "patch error must show the minimal original header: {}",
-        parsed.message
-    );
-    assert!(
-        parsed.message.contains("+++ b/src/lib.rs"),
-        "patch error must show the minimal replacement header: {}",
-        parsed.message
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn apply_patch_envelope_is_refused_naming_the_unified_diff_form() -> TestResult {
-    let directory = tempfile::tempdir()?;
-    fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-    fs::write(
-        directory.path().join("rift.toml"),
-        hermetic_search::SEMANTIC_DISABLED,
-    )?;
-
-    let envelope = "*** Begin Patch\n*** Update File: lib.rs\n@@\n-pub fn beacon() {}\n+pub fn beacon() { }\n*** End Patch\n";
-    let wire = failing_wire_error(directory.path(), "patch", json!({ "patch": envelope })).await?;
-    let parsed: ErrorData = serde_json::from_value(wire)?;
-    assert!(
-        parsed.message.contains("*** Begin Patch"),
-        "patch error must name the envelope that arrived: {}",
-        parsed.message
-    );
-    assert!(
-        parsed.message.contains("--- a/"),
-        "patch error must name the unified-diff form to send: {}",
-        parsed.message
-    );
-    Ok(())
 }
 
 #[tokio::test]

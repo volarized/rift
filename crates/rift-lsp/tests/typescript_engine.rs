@@ -3,10 +3,8 @@
 //! The engine refuses to initialize without a `typescript` package it can
 //! resolve from the workspace root (`-32603 Could not find a valid
 //! TypeScript installation`), so the session fixture carries the manifest
-//! and the committed lockfile of rift-mcp's fixture project and installs
-//! from that lockfile into its tempdir. One project, one lockfile, two
-//! suites: the tool-level suite reads the sources beside them, and this
-//! one needs only the resolvable package.
+//! and the committed lockfile from its fixture project, then installs
+//! from that lockfile into its tempdir.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -23,17 +21,14 @@ pub(crate) const BUN_PROGRAM: &str = "bun";
 pub(crate) const LANGUAGE_SERVER_PROGRAM: &str = "node_modules/.bin/typescript-language-server";
 
 /// The manifest and lockfile the install reads, from the one fixture
-/// project both live suites share.
+/// project the live suite reads.
 pub(crate) fn typescript_package_files() -> [(&'static str, &'static str); 2] {
     [
         (
             "package.json",
-            include_str!("../../rift-mcp/tests/fixtures/typescript/package.json"),
+            include_str!("fixtures/typescript/package.json"),
         ),
-        (
-            "bun.lock",
-            include_str!("../../rift-mcp/tests/fixtures/typescript/bun.lock"),
-        ),
+        ("bun.lock", include_str!("fixtures/typescript/bun.lock")),
     ]
 }
 

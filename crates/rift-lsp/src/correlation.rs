@@ -215,11 +215,13 @@ mod tests {
     fn begin_allocates_increasing_ids_and_conclude_returns_the_method() {
         let mut correlation = Correlation::new();
         let first = correlation.begin("initialize").expect("first id");
-        let second = correlation.begin("textDocument/rename").expect("second id");
+        let second = correlation
+            .begin("textDocument/references")
+            .expect("second id");
         assert_ne!(first, second);
         assert_eq!(
             correlation.conclude(&serde_json::json!(1)).expect("method"),
-            "textDocument/rename"
+            "textDocument/references"
         );
         assert_eq!(
             correlation.conclude(&serde_json::json!(0)).expect("method"),

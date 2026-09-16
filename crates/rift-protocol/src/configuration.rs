@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use crate::dependencies::DependenciesConfiguration;
 use crate::lock::{SERVER_PORT_FLOOR, SERVER_PORT_MAX, SERVER_PORT_MIN};
-use crate::read::{CoverageScope, Language, PathPattern, ProjectPath};
+use crate::read::{Language, PathPattern};
 use crate::retry::{
     RESTART_ATTEMPTS_MAX, RESTART_ATTEMPTS_MIN, RESTART_WINDOW_MS_MAX, RESTART_WINDOW_MS_MIN,
     RETRY_ATTEMPTS_MAX, RETRY_ATTEMPTS_MIN, RETRY_DELAY_LIMIT_MS_MAX, RETRY_DELAY_LIMIT_MS_MIN,
@@ -89,28 +89,14 @@ pub const BINDING_REFERENCE_TARGETS_MAX: u64 = 256;
 pub const BINDING_PUBLICATION_WORK_MAX: u64 = 5_000_000_000;
 /// Bytes `search.semantic.model` may hold, at most.
 pub const SEMANTIC_MODEL_BYTES_MAX: usize = 128;
-/// Configured hooks one workspace may declare, at most.
-pub const HOOKS_MAX: usize = 32;
-/// Bytes one hook's `id` may hold, at most.
-pub const HOOK_ID_BYTES_MAX: usize = 64;
+
 /// Literal arguments one configured command may hold, at most.
 pub const COMMAND_ARGUMENTS_MAX: usize = 64;
 /// Bytes one configured command argument may hold, at most.
 pub const COMMAND_ARGUMENT_BYTES_MAX: usize = 4_096;
-/// Path patterns one language, hook, or text-search table may hold, at most.
+/// Path patterns one language or text-search table may hold, at most.
 pub const CONFIGURATION_PATTERNS_MAX: usize = 64;
-/// Entries one hook's `environment` may hold, at most.
-pub const HOOK_ENVIRONMENT_ENTRIES_MAX: usize = 64;
-/// Milliseconds one hook may run before Rift kills it, at most: one hour.
-pub const HOOK_TIMEOUT_MS_MAX: u64 = 3_600_000;
-/// Bytes of each hook stream Rift keeps, at least.
-pub const HOOK_OUTPUT_BYTES_MIN: u64 = 256;
-/// Bytes of each hook stream Rift keeps, at most.
-pub const HOOK_OUTPUT_BYTES_MAX: u64 = 4_096;
-/// Guarantees one hook may declare, at most.
-pub const HOOK_GUARANTEES_MAX: usize = 16;
-/// Bytes one guarantee's `detail` may hold, at most.
-pub const HOOK_GUARANTEE_DETAIL_BYTES_MAX: usize = 1_024;
+
 /// The pattern `[search.text].include` carries when the key is absent: every
 /// visible path no language entry claimed joins the text index.
 pub const TEXT_INCLUDE_PATTERN_DEFAULT: &str = "**";
@@ -404,10 +390,7 @@ pub struct WorkspaceConfiguration {
     /// The server's own log records: how many the workspace database keeps,
     /// how many one read returns, and which targets are captured.
     pub logs: LogsConfiguration,
-    /// Hooks run in the changed tree, in list order, each time a change
-    /// applies.
-    #[schemars(length(max = 32))]
-    pub hooks: Vec<CommandHook>,
+
     /// Exact language entries keyed by their `name` or `name:dialect` identity segment.
     pub languages: BTreeMap<String, LanguageConfiguration>,
     /// Shared LSP processes keyed by name. Language entries select them explicitly.
@@ -458,7 +441,6 @@ impl WorkspaceConfiguration {
             .or_else(|| self.source.violation())
             .or_else(|| self.dependencies.violation())
             .or_else(|| self.logs.violation())
-            .or_else(|| hooks_violation(&self.hooks))
             .or_else(|| languages_violation(&self.languages, &self.lsp))
             .or_else(|| lsp_configurations_violation(&self.lsp))
     }
@@ -1582,180 +1564,6 @@ impl CommandInput {
     }
 }
 
-/// One `[[hooks]]` command the server runs inside the changed tree.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-#[schemars(transform = crate::schema::declare_hook_contract)]
-pub struct CommandHook {
-    /// Label for this hook's results, unique within the list.
-    #[schemars(length(min = 1, max = 64))]
-    pub id: String,
-    /// What the hook is: a formatter, test suite, linter, build, or another command.
-    pub kind: HookKind,
-    /// Executable and literal arguments. Rift starts it directly without a shell.
-    pub command: CommandInput,
-    /// Whether the server appends changed project paths after the configured command, in byte order.
-    #[serde(default)]
-    pub changed_paths: ChangedPaths,
-    /// Source files the server permits the hook to change.
-    #[serde(default)]
-    pub writes: HookWrites,
-    /// Directory the process starts in, relative to the changed tree's root. Empty selects the
-    /// root. Absolute paths and `.` or `..` segments are refused.
-    #[serde(default)]
-    pub working_directory: ProjectPath,
-    /// Environment values added to the environment the server inherited.
-    #[serde(default)]
-    pub environment: BTreeMap<String, String>,
-    /// Wall-clock bound before the server kills the process, 1ms to 1h.
-    #[serde(default = "default_hook_timeout")]
-    pub timeout: Duration,
-    /// Bytes of each output stream the server keeps, 256b to 4kb. The full size is still reported.
-    #[serde(default = "default_hook_output_limit")]
-    pub output_limit: ByteSize,
-    /// Severity the server reports when the hook does not pass.
-    #[serde(default)]
-    pub failure_severity: HookFailureSeverity,
-    /// What a passing validation establishes. Transform hooks cannot declare guarantees.
-    #[serde(default)]
-    #[schemars(length(max = 16))]
-    pub guarantees: Vec<HookGuarantee>,
-    /// Whether an identical tree and environment are expected to reproduce the result.
-    pub determinism: Determinism,
-    /// Project-relative path patterns that select this hook. Empty selects every change.
-    #[serde(default)]
-    #[schemars(length(max = 64))]
-    pub include: Vec<PathPattern>,
-    /// Project-relative path patterns removed from hook selection.
-    #[serde(default)]
-    #[schemars(length(max = 64))]
-    pub exclude: Vec<PathPattern>,
-}
-
-fn default_hook_timeout() -> Duration {
-    Duration::from_millis(120_000)
-}
-
-fn default_hook_output_limit() -> ByteSize {
-    ByteSize::from_bytes(4_096)
-}
-
-/// What a hook is, as workspace configuration presents it.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum HookKind {
-    /// A source formatter.
-    Format,
-    /// A test suite.
-    Test,
-    /// A linter.
-    Lint,
-    /// A build.
-    Build,
-    /// A hook none of the other kinds describe.
-    Other,
-}
-
-/// Whether the changed project paths ride the hook's command line.
-#[derive(
-    Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum ChangedPaths {
-    /// The command runs exactly as configured.
-    #[default]
-    None,
-    /// The changed project paths follow the configured command, in byte
-    /// order, for a tool that takes files.
-    Append,
-}
-
-/// Source writes the server may retain from one hook.
-#[derive(
-    Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum HookWrites {
-    /// A validation hook that may not change source files.
-    #[default]
-    None,
-    /// A transform hook that may change only paths changed before hooks ran.
-    ChangedPaths,
-    /// A transform hook that may change any source file in the workspace.
-    Workspace,
-}
-
-impl HookWrites {
-    /// Returns whether hook changes source files.
-    #[must_use]
-    pub const fn is_transform(self) -> bool {
-        !matches!(self, Self::None)
-    }
-
-    /// Returns whether hook only validates source files.
-    #[must_use]
-    pub const fn is_validation(self) -> bool {
-        matches!(self, Self::None)
-    }
-}
-
-/// Severity the server reports when a hook does not pass.
-#[derive(
-    Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum HookFailureSeverity {
-    /// The hook result reports a warning.
-    Warning,
-    /// The hook result reports an error.
-    #[default]
-    Error,
-}
-
-/// Whether an identical tree and environment are expected to reproduce a
-/// hook's result.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum Determinism {
-    /// The same tree and environment give the same answer.
-    Deterministic,
-    /// The result may vary between identical runs.
-    BestEffort,
-}
-
-/// What a passing run of one hook establishes about the change it checked.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HookGuarantee {
-    /// Which property a pass establishes.
-    pub kind: GuaranteeKind,
-    /// What the check covers.
-    pub scope: CoverageScope,
-    /// The exact property the hook checks, and the limits on reading a pass.
-    #[schemars(length(min = 1, max = 1_024))]
-    pub detail: String,
-}
-
-/// A property a verifier can establish about an applied change.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum GuaranteeKind {
-    /// The changed source parses.
-    SyntaxValidated,
-    /// Names still resolve to what they resolved to before the change.
-    BindingsPreserved,
-    /// References to the changed declarations were updated with them.
-    ReferencesUpdated,
-    /// The change's behavior was exercised, such as by a test suite.
-    BehaviorChecked,
-}
-
 /// One external LSP process Rift may start.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1917,29 +1725,7 @@ pub enum ConfigurationViolation {
         /// The configured semantic weight.
         semantic: f64,
     },
-    /// Transform hook follows validation hook.
-    HookTransformAfterValidation {
-        /// Transform hook appearing too late.
-        transform: String,
-        /// Earlier validation hook.
-        validation: String,
-    },
-    /// Transform hook declares guarantees reserved for validation hooks.
-    HookTransformGuarantees {
-        /// Transform hook declaring guarantees.
-        id: String,
-    },
-    /// Two hooks share one id, so their results could not be told apart.
-    HookIdDuplicate {
-        /// The id both hooks claim.
-        id: String,
-    },
-    /// A hook id is empty, too long, or uses characters outside
-    /// `A-Z a-z 0-9 . _ -`.
-    HookIdInvalid {
-        /// The rejected id.
-        id: String,
-    },
+
     /// A command carries no executable.
     CommandProgramEmpty {
         /// Configuration key carrying the command.
@@ -1980,21 +1766,7 @@ pub enum ConfigurationViolation {
         /// Rejected executable size.
         bytes: u64,
     },
-    /// A hook's `working_directory` is not a project-relative path: it is
-    /// absolute, or carries a `.` or `..` segment.
-    HookWorkingDirectoryInvalid {
-        /// The hook declaring the directory.
-        id: String,
-        /// The rejected directory.
-        working_directory: String,
-    },
-    /// A hook environment key is empty, or carries `=` or a NUL byte.
-    HookEnvironmentKeyInvalid {
-        /// The hook declaring the entry.
-        id: String,
-        /// The rejected key.
-        key: String,
-    },
+
     /// An `[lsp.<name>]` key is not a lowercase word.
     LspNameInvalid {
         /// The rejected LSP process name.
@@ -2073,10 +1845,6 @@ impl ConfigurationViolation {
     /// The violation's evidence as stable key-value pairs, for error
     /// context.
     #[must_use]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one arm per catalog violation; the match grows with the catalog"
-    )]
     pub fn evidence(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::LimitOutOfRange {
@@ -2111,23 +1879,7 @@ impl ConfigurationViolation {
                 ("lexical_weight", lexical.to_string()),
                 ("semantic_weight", semantic.to_string()),
             ],
-            Self::HookTransformAfterValidation {
-                transform,
-                validation,
-            } => vec![
-                ("transform", transform.clone()),
-                ("validation", validation.clone()),
-            ],
-            Self::HookTransformGuarantees { id } => vec![
-                ("id", id.clone()),
-                (
-                    "rule",
-                    "guarantees belong only to validation hooks".to_owned(),
-                ),
-            ],
-            Self::HookIdDuplicate { id } | Self::HookIdInvalid { id } => {
-                vec![("id", id.clone())]
-            }
+
             Self::CommandProgramEmpty { field } => vec![("field", (*field).to_owned())],
             Self::CommandProgramWhitespace { field, program }
             | Self::CommandProgramAbsolute { field, program }
@@ -2140,16 +1892,7 @@ impl ConfigurationViolation {
                 ("bytes", bytes.to_string()),
                 ("bytes_max", COMMAND_ARGUMENT_BYTES_MAX.to_string()),
             ],
-            Self::HookWorkingDirectoryInvalid {
-                id,
-                working_directory,
-            } => vec![
-                ("id", id.clone()),
-                ("working_directory", working_directory.clone()),
-            ],
-            Self::HookEnvironmentKeyInvalid { id, key } => {
-                vec![("id", id.clone()), ("key", key.clone())]
-            }
+
             Self::LspNameInvalid { name } => vec![("name", name.clone())],
             Self::LspEnvironmentKeyInvalid { lsp, key } => {
                 vec![("lsp", lsp.clone()), ("key", key.clone())]
@@ -2210,166 +1953,10 @@ pub(crate) fn first_out_of_range<const ROWS: usize>(
         .find_map(|(field, value, min, max)| out_of_range(field, value, min, max))
 }
 
-/// Returns first hook violation in list order.
-fn hooks_violation(hooks: &[CommandHook]) -> Option<ConfigurationViolation> {
-    if hooks.len() > HOOKS_MAX {
-        return out_of_range("hooks", hooks.len() as u64, 0, HOOKS_MAX as u64);
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    let mut first_validation = None;
-    for hook in hooks {
-        if let Some(violation) = hook_violation(hook) {
-            return Some(violation);
-        }
-        if !seen.insert(hook.id.as_str()) {
-            return Some(ConfigurationViolation::HookIdDuplicate {
-                id: hook.id.clone(),
-            });
-        }
-        if hook.writes.is_validation() {
-            first_validation.get_or_insert(hook.id.as_str());
-        } else if let Some(validation) = first_validation {
-            return Some(ConfigurationViolation::HookTransformAfterValidation {
-                transform: hook.id.clone(),
-                validation: validation.to_owned(),
-            });
-        }
-    }
-    None
-}
-
-/// Returns first violation one hook carries.
-fn hook_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
-    identity_violation(hook)
-        .or_else(|| command_violation(hook))
-        .or_else(|| working_directory_violation(hook))
-        .or_else(|| environment_violation(hook))
-        .or_else(|| {
-            (hook.writes.is_transform() && !hook.guarantees.is_empty()).then(|| {
-                ConfigurationViolation::HookTransformGuarantees {
-                    id: hook.id.clone(),
-                }
-            })
-        })
-        .or_else(|| guarantee_violation(hook))
-        .or_else(|| hook_bounds_violation(hook))
-}
-
-/// The `id` rule: the label every result of this hook carries.
-fn identity_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
-    (!is_hook_id(&hook.id)).then(|| ConfigurationViolation::HookIdInvalid {
-        id: hook.id.clone(),
-    })
-}
-
-/// The rules on what the hook runs: a present, non-absolute,
-/// dot-segment-free program.
-fn command_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
-    hook.command.violation("hooks.command")
-}
-
-/// The rule on `working_directory`: empty selects the workspace root;
-/// otherwise it must be relative, with no `.` or `..` segment.
-fn working_directory_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
-    (!is_project_relative_path(&hook.working_directory.0)).then(|| {
-        ConfigurationViolation::HookWorkingDirectoryInvalid {
-            id: hook.id.clone(),
-            working_directory: hook.working_directory.0.clone(),
-        }
-    })
-}
-
-/// Whether `value` is a valid project-relative path: empty names the
-/// workspace root; a non-empty value must not be absolute (by
-/// [`is_absolute_program`]'s rule, which also refuses any backslash) and
-/// must carry no `.` or `..` segment.
-fn is_project_relative_path(value: &str) -> bool {
-    value.is_empty() || (!is_absolute_program(value) && !value.split('/').any(is_dot_path_segment))
-}
-
 /// Whether `segment` is `.` or `..`: a path segment that resolves outside
 /// the location it names.
 fn is_dot_path_segment(segment: &str) -> bool {
     matches!(segment, "." | "..")
-}
-
-/// The rule on every `environment` entry's key.
-fn environment_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
-    let key = hook
-        .environment
-        .keys()
-        .find(|key| !is_environment_key(key))?;
-    Some(ConfigurationViolation::HookEnvironmentKeyInvalid {
-        id: hook.id.clone(),
-        key: key.clone(),
-    })
-}
-
-/// The `detail` length rule on every declared guarantee.
-fn guarantee_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
-    hook.guarantees.iter().find_map(|guarantee| {
-        out_of_range(
-            "hooks.guarantees.detail",
-            guarantee.detail.len() as u64,
-            1,
-            HOOK_GUARANTEE_DETAIL_BYTES_MAX as u64,
-        )
-    })
-}
-
-/// The numeric bounds one hook carries, as a table in key order.
-fn hook_bounds_violation(hook: &CommandHook) -> Option<ConfigurationViolation> {
-    let limits = [
-        (
-            "hooks.environment",
-            hook.environment.len() as u64,
-            0,
-            HOOK_ENVIRONMENT_ENTRIES_MAX as u64,
-        ),
-        (
-            "hooks.timeout",
-            hook.timeout.milliseconds(),
-            1,
-            HOOK_TIMEOUT_MS_MAX,
-        ),
-        (
-            "hooks.output_limit",
-            hook.output_limit.bytes(),
-            HOOK_OUTPUT_BYTES_MIN,
-            HOOK_OUTPUT_BYTES_MAX,
-        ),
-        (
-            "hooks.guarantees",
-            hook.guarantees.len() as u64,
-            0,
-            HOOK_GUARANTEES_MAX as u64,
-        ),
-        (
-            "hooks.include",
-            hook.include.len() as u64,
-            0,
-            CONFIGURATION_PATTERNS_MAX as u64,
-        ),
-        (
-            "hooks.exclude",
-            hook.exclude.len() as u64,
-            0,
-            CONFIGURATION_PATTERNS_MAX as u64,
-        ),
-    ];
-    first_out_of_range(limits)
-        .or_else(|| path_patterns_violation("hooks.include", &hook.include))
-        .or_else(|| path_patterns_violation("hooks.exclude", &hook.exclude))
-}
-
-/// Whether `id` labels a hook: nonempty, at most
-/// [`HOOK_ID_BYTES_MAX`] bytes, characters from `A-Z a-z 0-9 . _ -`.
-fn is_hook_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= HOOK_ID_BYTES_MAX
-        && id.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
-        })
 }
 
 /// Whether `key` can name an environment entry: nonempty, without `=` or a
@@ -2653,25 +2240,6 @@ mod tests {
     use crate::source::SOURCE_PATTERNS_MAX;
     use serde_json::json;
 
-    fn hook() -> CommandHook {
-        CommandHook {
-            id: "tests".to_owned(),
-            kind: HookKind::Test,
-            command: CommandInput::ProgramAndArguments(vec!["cargo".to_owned(), "test".to_owned()]),
-            changed_paths: ChangedPaths::None,
-            writes: HookWrites::None,
-            working_directory: ProjectPath(String::new()),
-            environment: BTreeMap::new(),
-            timeout: Duration::from_millis(120_000),
-            output_limit: ByteSize::from_bytes(4_096),
-            failure_severity: HookFailureSeverity::Error,
-            guarantees: Vec::new(),
-            determinism: Determinism::Deterministic,
-            include: Vec::new(),
-            exclude: Vec::new(),
-        }
-    }
-
     fn lsp() -> LspConfiguration {
         LspConfiguration {
             command: Some(CommandInput::ProgramAndArguments(vec![
@@ -2876,7 +2444,7 @@ mod tests {
         assert!(configuration.source.respect_gitignore);
         assert!(configuration.dependencies.enabled);
         assert_eq!(configuration.dependencies.package_files, 2_000);
-        assert!(configuration.hooks.is_empty());
+
         assert!(configuration.languages.is_empty());
         assert!(configuration.lsp.is_empty());
         assert_eq!(
@@ -2908,20 +2476,6 @@ mod tests {
             assert!(
                 serde_json::from_value::<WorkspaceConfiguration>(case.clone()).is_err(),
                 "{case} must be refused"
-            );
-        }
-    }
-
-    #[test]
-    fn test_hook_block_requires_non_defaulted_keys() {
-        let complete = serde_json::to_value(hook()).expect("serialize");
-        let object = complete.as_object().expect("hook serializes to an object");
-        for missing in ["id", "kind", "command", "determinism"] {
-            let mut trimmed = object.clone();
-            trimmed.remove(missing);
-            assert!(
-                serde_json::from_value::<CommandHook>(serde_json::Value::Object(trimmed)).is_err(),
-                "a hook without {missing} must be refused"
             );
         }
     }
@@ -3738,27 +3292,6 @@ mod tests {
     }
 
     #[test]
-    fn test_hook_round_trips_through_json_with_exact_wire_names() {
-        let value = serde_json::to_value(hook()).expect("serialize");
-        assert_eq!(value["command"], json!(["cargo", "test"]));
-        assert_eq!(value["changed_paths"], json!("none"));
-        assert_eq!(value["writes"], json!("none"));
-        assert_eq!(value["failure_severity"], json!("error"));
-        assert_eq!(value["determinism"], json!("deterministic"));
-        let round_tripped: CommandHook = serde_json::from_value(value).expect("deserialize");
-        assert_eq!(round_tripped, hook());
-
-        let format: HookKind = serde_json::from_value(json!("format")).expect("format kind");
-        assert_eq!(format, HookKind::Format);
-        let workspace: HookWrites =
-            serde_json::from_value(json!("workspace")).expect("workspace writes");
-        assert_eq!(workspace, HookWrites::Workspace);
-        let warning: HookFailureSeverity =
-            serde_json::from_value(json!("warning")).expect("warning severity");
-        assert_eq!(warning, HookFailureSeverity::Warning);
-    }
-
-    #[test]
     fn test_size_and_duration_schemas_are_pattern_bound_strings() {
         let byte_size = serde_json::to_value(schemars::schema_for!(ByteSize)).expect("schema");
         assert_eq!(byte_size["type"], json!("string"));
@@ -3946,11 +3479,6 @@ mod tests {
         let source = &definitions["SourceConfiguration"]["properties"];
         let cases = [
             (
-                "hooks max",
-                &schema["properties"]["hooks"]["maxItems"],
-                json!(HOOKS_MAX),
-            ),
-            (
                 "num workers min",
                 &server["num_workers"]["minimum"],
                 json!(1),
@@ -4009,38 +3537,6 @@ mod tests {
                 "source exclude max",
                 &source["exclude"]["maxItems"],
                 json!(SOURCE_PATTERNS_MAX),
-            ),
-        ];
-        assert_schema_bounds(&cases);
-    }
-
-    #[test]
-    fn test_hook_schema_bounds_equal_the_enforced_constants() {
-        let schema =
-            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
-        let definitions = &schema["$defs"];
-        let hook = &definitions["CommandHook"]["properties"];
-        let guarantee = &definitions["HookGuarantee"]["properties"];
-        let command = &definitions["CommandInput"]["oneOf"];
-        let cases = [
-            ("id min", &hook["id"]["minLength"], json!(1)),
-            ("id max", &hook["id"]["maxLength"], json!(HOOK_ID_BYTES_MAX)),
-            ("program min", &command[0]["minLength"], json!(1)),
-            (
-                "command max",
-                &command[1]["maxItems"],
-                json!(COMMAND_ARGUMENTS_MAX + 1),
-            ),
-            (
-                "guarantees max",
-                &hook["guarantees"]["maxItems"],
-                json!(HOOK_GUARANTEES_MAX),
-            ),
-            ("detail min", &guarantee["detail"]["minLength"], json!(1)),
-            (
-                "detail max",
-                &guarantee["detail"]["maxLength"],
-                json!(HOOK_GUARANTEE_DETAIL_BYTES_MAX),
             ),
         ];
         assert_schema_bounds(&cases);
@@ -4284,36 +3780,13 @@ mod tests {
     }
 
     #[test]
-    fn test_language_and_hook_defaults_and_legacy_keys() {
+    fn test_language_defaults() {
         let language: LanguageConfiguration = serde_json::from_value(json!({})).expect("language");
         assert!(language.enabled);
         assert!(language.include.is_none());
         assert!(language.exclude.is_empty());
         assert!(!language.execution);
         assert!(language.lsp.is_none());
-
-        let value = json!({
-            "id": "tests",
-            "kind": "test",
-            "command": ["cargo", "test"],
-            "determinism": "deterministic"
-        });
-        let hook: CommandHook = serde_json::from_value(value).expect("hook defaults");
-        assert_eq!(hook.changed_paths, ChangedPaths::None);
-        assert_eq!(hook.writes, HookWrites::None);
-        assert_eq!(hook.working_directory, ProjectPath::default());
-        assert!(hook.environment.is_empty());
-        assert_eq!(hook.timeout, Duration::from_millis(120_000));
-        assert_eq!(hook.output_limit, ByteSize::from_bytes(4_096));
-        assert_eq!(hook.failure_severity, HookFailureSeverity::Error);
-        assert!(hook.guarantees.is_empty());
-
-        for legacy in [
-            json!({"type": "command", "id": "x", "kind": "test", "command": "cargo", "writes": "none", "failure_severity": "error", "determinism": "deterministic"}),
-            json!({"id": "x", "kind": "test", "program": "cargo", "arguments": [], "writes": "none", "failure_severity": "error", "determinism": "deterministic"}),
-        ] {
-            assert!(serde_json::from_value::<CommandHook>(legacy).is_err());
-        }
     }
 
     #[test]
@@ -4399,20 +3872,6 @@ mod tests {
                 ..
             })
         ));
-
-        let mut hook = hook();
-        hook.include = vec![PathPattern("../outside".to_owned())];
-        configuration = WorkspaceConfiguration {
-            hooks: vec![hook],
-            ..WorkspaceConfiguration::default()
-        };
-        assert!(matches!(
-            configuration.validate(),
-            Err(ConfigurationViolation::PathPatternInvalid {
-                field: "hooks.include",
-                ..
-            })
-        ));
     }
 
     #[test]
@@ -4470,7 +3929,7 @@ mod tests {
             command[1]["prefixItems"][0]["maxLength"],
             json!(COMMAND_ARGUMENT_BYTES_MAX)
         );
-        assert_eq!(schema["properties"]["hooks"]["maxItems"], json!(HOOKS_MAX));
+
         assert_eq!(
             schema["properties"]["languages"]["maxProperties"],
             json!(LANGUAGES_MAX)
@@ -4479,10 +3938,7 @@ mod tests {
             schema["properties"]["lsp"]["maxProperties"],
             json!(LSP_CONFIGURATIONS_MAX)
         );
-        assert_eq!(
-            schema["$defs"]["CommandHook"]["properties"]["environment"]["maxProperties"],
-            json!(HOOK_ENVIRONMENT_ENTRIES_MAX)
-        );
+
         assert_eq!(
             schema["$defs"]["LspConfiguration"]["properties"]["environment"]["maxProperties"],
             json!(LSP_ENVIRONMENT_ENTRIES_MAX)
@@ -4495,71 +3951,11 @@ mod tests {
             schema["$defs"]["LanguageConfiguration"]["properties"]["include"]["maxItems"],
             json!(CONFIGURATION_PATTERNS_MAX)
         );
-        assert_eq!(
-            schema["$defs"]["CommandHook"]["properties"]["include"]["maxItems"],
-            json!(CONFIGURATION_PATTERNS_MAX)
-        );
+
         assert_eq!(
             schema["$defs"]["TextSearchConfiguration"]["properties"]["include"]["maxItems"],
             json!(CONFIGURATION_PATTERNS_MAX)
         );
-    }
-
-    #[test]
-    fn test_hook_contract_validation_covers_command_order_and_bounds() {
-        let mut invalid = hook();
-        invalid.command = CommandInput::Program(String::new());
-        let configuration = WorkspaceConfiguration {
-            hooks: vec![invalid],
-            ..WorkspaceConfiguration::default()
-        };
-        assert!(matches!(
-            configuration.validate(),
-            Err(ConfigurationViolation::CommandProgramEmpty { .. })
-        ));
-
-        let mut invalid = hook();
-        invalid.working_directory = ProjectPath("../outside".to_owned());
-        let configuration = WorkspaceConfiguration {
-            hooks: vec![invalid],
-            ..WorkspaceConfiguration::default()
-        };
-        assert!(matches!(
-            configuration.validate(),
-            Err(ConfigurationViolation::HookWorkingDirectoryInvalid { .. })
-        ));
-
-        let mut transform = hook();
-        transform.id = "format".to_owned();
-        transform.writes = HookWrites::ChangedPaths;
-        let validation = hook();
-        let accepted = WorkspaceConfiguration {
-            hooks: vec![transform.clone(), validation.clone()],
-            ..WorkspaceConfiguration::default()
-        };
-        assert_eq!(accepted.validate(), Ok(()));
-        let refused = WorkspaceConfiguration {
-            hooks: vec![validation, transform],
-            ..WorkspaceConfiguration::default()
-        };
-        assert!(matches!(
-            refused.validate(),
-            Err(ConfigurationViolation::HookTransformAfterValidation { .. })
-        ));
-
-        let mut invalid = hook();
-        invalid.output_limit = ByteSize::from_bytes(HOOK_OUTPUT_BYTES_MIN - 1);
-        let configuration = WorkspaceConfiguration {
-            hooks: vec![invalid],
-            ..WorkspaceConfiguration::default()
-        };
-        assert!(matches!(
-            configuration.validate(),
-            Err(ConfigurationViolation::LimitOutOfRange {
-                field: "hooks.output_limit",
-                ..
-            })
-        ));
     }
 
     #[test]
@@ -4590,13 +3986,6 @@ mod tests {
                 lexical: 0.2,
                 semantic: 0.2,
             },
-            ConfigurationViolation::HookTransformAfterValidation {
-                transform: text(),
-                validation: text(),
-            },
-            ConfigurationViolation::HookTransformGuarantees { id: text() },
-            ConfigurationViolation::HookIdDuplicate { id: text() },
-            ConfigurationViolation::HookIdInvalid { id: text() },
             ConfigurationViolation::CommandProgramEmpty { field: "x" },
             ConfigurationViolation::CommandProgramWhitespace {
                 field: "x",
@@ -4617,14 +4006,6 @@ mod tests {
             ConfigurationViolation::CommandProgramOversized {
                 field: "x",
                 bytes: 4_097,
-            },
-            ConfigurationViolation::HookWorkingDirectoryInvalid {
-                id: text(),
-                working_directory: text(),
-            },
-            ConfigurationViolation::HookEnvironmentKeyInvalid {
-                id: text(),
-                key: text(),
             },
             ConfigurationViolation::LspNameInvalid { name: text() },
             ConfigurationViolation::LspEnvironmentKeyInvalid {

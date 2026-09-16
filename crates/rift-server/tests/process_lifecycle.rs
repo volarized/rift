@@ -21,18 +21,19 @@ use rift_protocol::retry::{RestartPolicy, RetryPolicy};
 const SHELL_PROGRAM: &str = "sh";
 
 /// The `initialize` response body every fixture answers with, advertising
-/// rename and prepared rename.
-const INITIALIZE_BODY: &str = r#"{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"renameProvider":{"prepareProvider":true}}}}"#;
+/// reference requests.
+const INITIALIZE_BODY: &str =
+    r#"{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"referencesProvider":true}}}"#;
 
 /// One framed JSON-RPC message.
 fn framed(body: &str) -> String {
     format!("Content-Length: {}\r\n\r\n{body}", body.len())
 }
 
-/// A success answer to request `id`, carrying one text edit.
+/// A success answer to request `id`, carrying one location.
 pub(crate) fn ok_response(id: u64) -> String {
     framed(&format!(
-        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"changes":{{"file:///src/lib.rs":[{{"range":{{"start":{{"line":0,"character":3}},"end":{{"line":0,"character":9}}}},"newText":"renamed"}}]}}}}}}"#
+        r#"{{"jsonrpc":"2.0","id":{id},"result":[{{"uri":"file:///src/lib.rs","range":{{"start":{{"line":0,"character":3}},"end":{{"line":0,"character":9}}}}}}]}}"#
     ))
 }
 

@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn test_configuration_violation_renders_through_the_registry() {
         let violation = ConfigurationViolation::CommandProgramAbsolute {
-            field: "hooks.command",
+            field: "languages.rust.lsp.command",
             program: "/bin/cargo".to_owned(),
         };
         let error = Error::from(violation);
@@ -309,7 +309,7 @@ mod tests {
         let message = error.to_string();
         assert!(
             message.contains("violation command_program_absolute")
-                && message.contains("field hooks.command")
+                && message.contains("field languages.rust.lsp.command")
                 && message.contains("program /bin/cargo")
                 && message.contains("correct the reported configuration field"),
             "the render must carry the serde label, the evidence, and the action: {message}"

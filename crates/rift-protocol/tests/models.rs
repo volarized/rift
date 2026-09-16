@@ -3,7 +3,6 @@
 //! constraints. Serialization of the derived shapes is exercised by the MCP
 //! server tests, not re-proven here.
 
-use rift_protocol::change::ChangeResult;
 use rift_protocol::error::ErrorData;
 use rift_protocol::read::{
     Diagnostic, DiagnosticReliability, GetSymbolInclude, GetSymbolParams, GetSymbolResult,
@@ -71,10 +70,6 @@ fn response_model_examples_carry_no_null_or_empty_collection() {
     let search_result =
         serde_json::to_value(schema_for!(SearchResult)).expect("search_result schema");
     assert_examples_carry_no_null_or_empty(&search_result, "SearchResult");
-
-    let change_result =
-        serde_json::to_value(schema_for!(ChangeResult)).expect("change_result schema");
-    assert_examples_carry_no_null_or_empty(&change_result, "ChangeResult");
 }
 
 /// A `GetSymbolResult`, `NodesResult`, and `SearchResult` each deserialize from a minimal
@@ -99,31 +94,6 @@ fn paginated_read_results_deserialize_with_warnings_absent() -> TestResult {
         "pagination": { "page_index": 0, "total_pages": 0 }
     }))?;
     assert!(search.warnings.is_empty());
-    Ok(())
-}
-
-/// A `refused` `ChangeResult` deserializes with `diagnostics` absent, filling it with the
-/// empty default; a re-serialized empty-diagnostics refusal omits the member.
-#[test]
-fn change_result_refused_deserializes_with_diagnostics_absent() -> TestResult {
-    let refused: ChangeResult = serde_json::from_value(json!({
-        "status": "refused",
-        "reason": "unsupported",
-        "preconditions": []
-    }))?;
-    let ChangeResult::Refused { diagnostics, .. } = &refused else {
-        panic!("expected a refused ChangeResult, got {refused:?}");
-    };
-    assert!(diagnostics.is_empty());
-    assert_eq!(
-        serde_json::to_value(&refused)?,
-        json!({
-            "status": "refused",
-            "reason": "unsupported",
-            "preconditions": []
-        }),
-        "empty diagnostics must stay off the wire"
-    );
     Ok(())
 }
 

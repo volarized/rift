@@ -20,21 +20,19 @@ use lsp_types::notification::{
     Notification, Progress, PublishDiagnostics,
 };
 use lsp_types::request::{
-    DocumentDiagnosticRequest, Initialize, PrepareRenameRequest, References, RegisterCapability,
-    Rename, Request, Shutdown, WillRenameFiles, WorkDoneProgressCreate, WorkspaceConfiguration,
-    WorkspaceDiagnosticRefresh,
+    DocumentDiagnosticRequest, Initialize, References, RegisterCapability, Request, Shutdown,
+    WorkDoneProgressCreate, WorkspaceConfiguration, WorkspaceDiagnosticRefresh,
 };
 use lsp_types::{
     ConfigurationParams, Diagnostic, DidChangeWatchedFilesParams,
     DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentChangeOperation, DocumentChanges, DocumentDiagnosticParams,
-    DocumentDiagnosticReport, DocumentDiagnosticReportResult, FileChangeType, FileEvent,
-    FileRename, FileSystemWatcher, GlobPattern, InitializeParams, InitializedParams, Location,
-    PartialResultParams, Position, PrepareRenameResponse, ProgressParams, ProgressParamsValue,
-    ProgressToken, PublishDiagnosticsParams, ReferenceContext, ReferenceParams, RegistrationParams,
-    RenameFilesParams, RenameParams, TextDocumentIdentifier, TextDocumentItem,
+    DidOpenTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReport,
+    DocumentDiagnosticReportResult, FileChangeType, FileEvent, FileSystemWatcher, GlobPattern,
+    InitializeParams, InitializedParams, Location, PartialResultParams, Position, ProgressParams,
+    ProgressParamsValue, ProgressToken, PublishDiagnosticsParams, ReferenceContext,
+    ReferenceParams, RegistrationParams, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, WatchKind, WorkDoneProgress, WorkDoneProgressCreateParams,
-    WorkDoneProgressParams, WorkspaceEdit, WorkspaceFolder,
+    WorkDoneProgressParams, WorkspaceFolder,
 };
 use rift_core::{
     CapturedStream, Error, ErrorCode, ErrorContext, ErrorName, Fault, ProjectPath,
@@ -94,7 +92,7 @@ const RETRYABLE_REFUSAL_CODES: [i64; 2] = [SERVER_CANCELLED, CONTENT_MODIFIED];
 /// How to start one engine child: the executable and the bounds it runs
 /// under.
 ///
-/// The program is resolved like a hook's: never empty, never an absolute
+/// The program is never empty, never an absolute
 /// path, looked up through the child's `PATH`.
 #[derive(Clone, Debug)]
 pub struct EngineLaunch {
@@ -467,42 +465,29 @@ impl WorkProgress {
     }
 }
 
-/// One request whose empty answer says nothing a real answer would not.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum EmptyAnswer {
-    /// textDocument/prepareRename reported no range.
-    PrepareRename,
-    /// textDocument/rename proposed no edit.
-    Rename,
-    /// workspace/willRenameFiles proposed no edit.
-    WillRenameFiles,
-    /// textDocument/references reported no location.
-    References,
-}
-
 /// What the session's most recent answer said.
 ///
 /// Every request clears `latest` before it is sent, so a verdict cannot
-/// outlive the answer that set it. Only two bounded operations set one.
+/// outlive the answer that set it. Reference requests set the verdict.
 #[derive(Debug, Default)]
 struct EmptyAnswers {
-    latest: Option<EmptyAnswer>,
+    latest: bool,
 }
 
 impl EmptyAnswers {
     /// Forgets the previous answer's verdict; every request starts here.
     fn forget(&mut self) {
-        self.latest = None;
+        self.latest = false;
     }
 
-    /// Records whether one answer to `operation` said nothing.
-    fn record(&mut self, operation: EmptyAnswer, empty: bool) {
-        self.latest = empty.then_some(operation);
+    /// Records whether the reference request returned no locations.
+    fn record(&mut self, empty: bool) {
+        self.latest = empty;
     }
 
     /// Whether latest operation answered nothing.
     fn is_empty(&self) -> bool {
-        self.latest.is_some()
+        self.latest
     }
 }
 
@@ -711,9 +696,8 @@ impl EngineSession {
         &self.root
     }
 
-    /// The version the most recent `didOpen` carried. An engine echoes it
-    /// on a versioned edit, and a compiler of that edit compares against
-    /// this value.
+    /// The version the most recent `didOpen` carried. Published diagnostics
+    /// name this version when the engine reports it.
     #[must_use]
     pub fn document_version(&self) -> i32 {
         self.document_version
@@ -826,99 +810,6 @@ impl EngineSession {
         self.notify::<DidCloseTextDocument>(&params).await
     }
 
-    /// The engine's workspace edit renaming the symbol at one position.
-    ///
-    /// An engine answering `null` proposes no edit; the empty edit comes
-    /// back so every answer has the same shape.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError`] when rename is not advertised, the engine
-    /// refuses the name, or the exchange breaks.
-    ///
-    /// # Cancel safety
-    ///
-    /// Dropping the future leaves the request pending; a later call
-    /// discards the engine's stale response.
-    pub async fn rename(
-        &mut self,
-        path: &ProjectPath,
-        position: Position,
-        new_name: &str,
-    ) -> Result<WorkspaceEdit, EngineError> {
-        require(self.capabilities.rename, Rename::METHOD)?;
-        let params = RenameParams {
-            text_document_position: self.position_params(path, position)?,
-            new_name: new_name.to_owned(),
-            work_done_progress_params: WorkDoneProgressParams::default(),
-        };
-        let edit = self.request::<Rename>(params).await?;
-        self.empty_answers
-            .record(EmptyAnswer::Rename, proposes_no_edit(edit.as_ref()));
-        Ok(edit.unwrap_or_default())
-    }
-
-    /// The engine's verdict on renaming at one position.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError`] when prepared renames are not advertised or
-    /// the exchange breaks.
-    ///
-    /// # Cancel safety
-    ///
-    /// Dropping the future leaves the request pending; a later call
-    /// discards the engine's stale response.
-    pub async fn prepare_rename(
-        &mut self,
-        path: &ProjectPath,
-        position: Position,
-    ) -> Result<Option<PrepareRenameResponse>, EngineError> {
-        require(
-            self.capabilities.prepare_rename,
-            PrepareRenameRequest::METHOD,
-        )?;
-        let params = self.position_params(path, position)?;
-        let answer = self.request::<PrepareRenameRequest>(params).await?;
-        self.empty_answers
-            .record(EmptyAnswer::PrepareRename, answer.is_none());
-        Ok(answer)
-    }
-
-    /// The engine's workspace edit for moving one file, if it proposes one.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError`] when will-rename requests are not advertised
-    /// or the exchange breaks.
-    ///
-    /// # Cancel safety
-    ///
-    /// Dropping the future leaves the request pending; a later call
-    /// discards the engine's stale response.
-    pub async fn will_rename_files(
-        &mut self,
-        from: &ProjectPath,
-        to: &ProjectPath,
-    ) -> Result<Option<WorkspaceEdit>, EngineError> {
-        require(
-            self.capabilities.will_rename_files(),
-            WillRenameFiles::METHOD,
-        )?;
-        let params = RenameFilesParams {
-            files: vec![FileRename {
-                old_uri: self.document_uri(from)?.as_str().to_owned(),
-                new_uri: self.document_uri(to)?.as_str().to_owned(),
-            }],
-        };
-        let edit = self.request::<WillRenameFiles>(params).await?;
-        self.empty_answers.record(
-            EmptyAnswer::WillRenameFiles,
-            proposes_no_edit(edit.as_ref()),
-        );
-        Ok(edit)
-    }
-
     /// The locations the engine names for the declaration at one position, its own
     /// occurrence included.
     ///
@@ -952,8 +843,7 @@ impl EngineSession {
         };
         let locations = self.request::<References>(params).await?;
         let locations = locations.unwrap_or_default();
-        self.empty_answers
-            .record(EmptyAnswer::References, locations.is_empty());
+        self.empty_answers.record(locations.is_empty());
         Ok(locations)
     }
 
@@ -1513,39 +1403,6 @@ fn retain_published(
     );
 }
 
-/// Whether one will-rename answer proposes no edit at all.
-///
-/// An engine that has not indexed the moved file's references answers
-/// `null`, and one that answers an edit set holding no edit says exactly
-/// the same thing. Versioned document changes take precedence over the
-/// plain `changes` map, as the compile of the proposal does, and a
-/// create, rename, or delete operation counts as an edit even though it
-/// carries no text.
-#[must_use]
-pub fn proposes_no_edit(edit: Option<&WorkspaceEdit>) -> bool {
-    let Some(edit) = edit else {
-        return true;
-    };
-    match (&edit.document_changes, &edit.changes) {
-        (Some(DocumentChanges::Edits(documents)), _) => {
-            documents.iter().all(|document| document.edits.is_empty())
-        }
-        (Some(DocumentChanges::Operations(operations)), _) => {
-            operations.iter().all(operation_edits_nothing)
-        }
-        (None, Some(changes)) => changes.values().all(Vec::is_empty),
-        (None, None) => true,
-    }
-}
-
-/// Whether one mixed document-change operation changes nothing.
-fn operation_edits_nothing(operation: &DocumentChangeOperation) -> bool {
-    match operation {
-        DocumentChangeOperation::Op(_) => false,
-        DocumentChangeOperation::Edit(document) => document.edits.is_empty(),
-    }
-}
-
 /// Whether one registered glob pattern matches a slash-separated relative
 /// path.
 ///
@@ -1572,7 +1429,7 @@ fn require(served: bool, capability: &str) -> Result<(), EngineError> {
     }
 }
 
-/// Refuses an empty program and an absolute executable path, as hooks do.
+/// Refuses an empty program and an absolute executable path.
 fn refuse_program(program: &str) -> Result<(), EngineError> {
     if program.is_empty() {
         return Err(Error::new(EngineFault::ProgramEmpty));
@@ -1607,7 +1464,7 @@ fn answer_server_request(method: &str, id: &Value, params: Option<Value>) -> Vec
     }
 }
 
-/// Drains one stream under the capture policy hook drains follow.
+/// Drains one stream under the capture policy.
 ///
 /// The first `capture_bytes` are kept and the rest counted. Each read
 /// returns at least one byte, so the loop iterates at most
@@ -1658,7 +1515,7 @@ mod tests {
     }
 
     #[test]
-    fn program_refusals_match_the_hook_rules() {
+    fn program_refusals_name_invalid_executables() {
         let empty = refuse_program("").expect_err("empty program");
         assert!(matches!(empty.fault(), EngineFault::ProgramEmpty));
         assert_eq!(
@@ -1728,11 +1585,11 @@ mod tests {
             ),
             (
                 EngineFault::ConnectionClosed {
-                    method: "textDocument/rename".to_owned(),
+                    method: "textDocument/references".to_owned(),
                 },
                 ErrorCode::TemporarilyUnavailable,
                 true,
-                "textDocument/rename",
+                "textDocument/references",
             ),
             (
                 EngineFault::TimedOut {
@@ -1785,7 +1642,7 @@ mod tests {
             ),
             (
                 EngineFault::Refused {
-                    method: "textDocument/rename".to_owned(),
+                    method: "textDocument/references".to_owned(),
                     code: -32602,
                     message: "not an identifier".to_owned(),
                 },
@@ -1914,7 +1771,7 @@ mod tests {
         );
         assert!(
             EngineFault::Refused {
-                method: "textDocument/rename".to_owned(),
+                method: "textDocument/references".to_owned(),
                 code: -32602,
                 message: "No references found at position".to_owned(),
             }
@@ -2013,95 +1870,15 @@ mod tests {
     fn empty_answers_record_latest_operation_and_forget_between_requests() {
         let mut record = EmptyAnswers::default();
         assert!(!record.is_empty(), "session has no empty answer yet");
-        record.record(EmptyAnswer::WillRenameFiles, true);
-        assert!(record.is_empty(), "empty edit is recorded");
-        record.record(EmptyAnswer::References, true);
+        record.record(true);
         assert!(record.is_empty(), "empty references are recorded");
-        record.record(EmptyAnswer::References, false);
+        record.record(true);
+        assert!(record.is_empty(), "empty references are recorded");
+        record.record(false);
         assert!(!record.is_empty(), "nonempty answer clears verdict");
-        record.record(EmptyAnswer::WillRenameFiles, true);
+        record.record(true);
         record.forget();
         assert!(!record.is_empty(), "next request forgets old verdict");
-    }
-
-    /// One will-rename answer per proposal shape, and whether it proposes
-    /// an edit: `null`, both empty carriers, and each carrier holding one.
-    fn will_rename_answers() -> Vec<(Option<WorkspaceEdit>, bool, &'static str)> {
-        use lsp_types::{
-            CreateFile, OneOf, OptionalVersionedTextDocumentIdentifier, ResourceOp,
-            TextDocumentEdit, TextEdit,
-        };
-        let uri: lsp_types::Uri = "file:///workspace/lib.rs".parse().expect("fixture uri");
-        let created: lsp_types::Uri = "file:///workspace/new.rs".parse().expect("fixture uri");
-        let edit = TextEdit {
-            range: lsp_types::Range::default(),
-            new_text: "renamed".to_owned(),
-        };
-        let document =
-            |edits: Vec<OneOf<TextEdit, lsp_types::AnnotatedTextEdit>>| TextDocumentEdit {
-                text_document: OptionalVersionedTextDocumentIdentifier {
-                    uri: uri.clone(),
-                    version: None,
-                },
-                edits,
-            };
-        let changed = |edits: Vec<TextEdit>| WorkspaceEdit {
-            changes: Some([(uri.clone(), edits)].into_iter().collect()),
-            ..WorkspaceEdit::default()
-        };
-        let versioned = |changes: DocumentChanges| WorkspaceEdit {
-            document_changes: Some(changes),
-            ..WorkspaceEdit::default()
-        };
-        vec![
-            (None, true, "a null answer proposes nothing"),
-            (Some(WorkspaceEdit::default()), true, "no carrier at all"),
-            (Some(changed(Vec::new())), true, "a document with no edit"),
-            (
-                Some(versioned(DocumentChanges::Edits(vec![
-                    document(Vec::new()),
-                ]))),
-                true,
-                "a versioned document with no edit",
-            ),
-            (
-                Some(versioned(DocumentChanges::Operations(vec![
-                    DocumentChangeOperation::Edit(document(Vec::new())),
-                ]))),
-                true,
-                "a mixed operation list with no edit",
-            ),
-            (
-                Some(changed(vec![edit.clone()])),
-                false,
-                "one edit in the changes map",
-            ),
-            (
-                Some(versioned(DocumentChanges::Edits(vec![document(vec![
-                    OneOf::Left(edit),
-                ])]))),
-                false,
-                "one versioned edit",
-            ),
-            (
-                Some(versioned(DocumentChanges::Operations(vec![
-                    DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
-                        uri: created,
-                        options: None,
-                        annotation_id: None,
-                    })),
-                ]))),
-                false,
-                "a file operation is an edit even with no text of its own",
-            ),
-        ]
-    }
-
-    #[test]
-    fn a_proposal_without_an_edit_says_what_no_answer_says() {
-        for (answer, empty, evidence) in will_rename_answers() {
-            assert_eq!(proposes_no_edit(answer.as_ref()), empty, "{evidence}");
-        }
     }
 
     #[test]

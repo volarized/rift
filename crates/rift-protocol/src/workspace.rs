@@ -3,7 +3,6 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::configuration::HookKind;
 use crate::read::{Digest, Language, Pagination, ProjectPath};
 use crate::schema;
 use crate::search::PathPattern;
@@ -23,9 +22,7 @@ const _: () = assert!(
     WORKSPACE_LANGUAGE_SUMMARIES_MAX > crate::configuration::LANGUAGES_MAX,
     "a workspace page reports every configured language entry and every shipped one"
 );
-/// Hook summaries one workspace resource page may carry, at most: one per
-/// configured hook.
-pub const WORKSPACE_HOOK_SUMMARIES_MAX: usize = crate::configuration::HOOKS_MAX;
+
 /// Bytes one workspace LSP process key may hold, at most.
 pub const WORKSPACE_LSP_PROCESS_KEY_BYTES_MAX: usize = 129;
 
@@ -38,9 +35,7 @@ pub struct WorkspaceResourcePage {
     /// Effective exact-language entries, sorted by language identity.
     #[schemars(length(max = 128))]
     pub languages: Vec<WorkspaceLanguageSummary>,
-    /// Configured hooks in execution order.
-    #[schemars(length(max = 32))]
-    pub hooks: Vec<WorkspaceHookSummary>,
+
     /// Source units on this page, sorted by project path.
     #[schemars(length(max = 1_000))]
     pub source: Vec<WorkspaceSourceUnit>,
@@ -104,26 +99,6 @@ pub enum LspState {
     Failed,
 }
 
-/// Effective path selection for one configured hook.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-#[schemars(transform = schema::declare_workspace_hook_summary_empty_defaults)]
-pub struct WorkspaceHookSummary {
-    /// Hook identity from workspace configuration.
-    #[schemars(length(min = 1, max = 64))]
-    pub id: String,
-    /// What the hook checks or changes.
-    pub kind: HookKind,
-    /// Path patterns selecting initially changed files for this hook. Absent when empty.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 64))]
-    pub include: Vec<PathPattern>,
-    /// Path patterns removed from hook selection. Absent when empty.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 64))]
-    pub exclude: Vec<PathPattern>,
-}
-
 /// One source unit in the captured workspace catalog.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -139,11 +114,63 @@ pub struct WorkspaceSourceUnit {
 
 #[cfg(test)]
 mod tests {
+    use crate::configuration::CONFIGURATION_PATTERNS_MAX;
     use schemars::schema_for;
+    #[test]
+    fn schema_carries_collection_and_identity_bounds() {
+        let schema = serde_json::to_value(schema_for!(WorkspaceResourcePage))
+            .expect("workspace schema serializes");
+        let page = &schema["properties"];
+        assert_eq!(
+            page["languages"]["maxItems"],
+            json!(WORKSPACE_LANGUAGE_SUMMARIES_MAX)
+        );
+        assert_eq!(
+            page["source"]["maxItems"],
+            json!(WORKSPACE_SOURCE_UNITS_MAX)
+        );
+
+        let definitions = &schema["$defs"];
+        let language = &definitions["WorkspaceLanguageSummary"]["properties"];
+        assert_eq!(
+            language["include"]["maxItems"],
+            json!(CONFIGURATION_PATTERNS_MAX)
+        );
+        assert_eq!(
+            language["exclude"]["maxItems"],
+            json!(CONFIGURATION_PATTERNS_MAX)
+        );
+        let lsp = &definitions["WorkspaceLspSummary"]["properties"]["process"];
+        assert_eq!(lsp["minLength"], json!(1));
+        assert_eq!(lsp["maxLength"], json!(WORKSPACE_LSP_PROCESS_KEY_BYTES_MAX));
+        assert_eq!(
+            lsp["pattern"],
+            json!(r"^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$")
+        );
+    }
+
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::configuration::{CONFIGURATION_PATTERNS_MAX, HOOK_ID_BYTES_MAX};
+
+    fn page() -> WorkspaceResourcePage {
+        WorkspaceResourcePage {
+            configuration_revision: Digest("3f9a1c2e".to_owned()),
+            languages: vec![language()],
+            source: vec![WorkspaceSourceUnit {
+                path: ProjectPath("src/view.tsx".to_owned()),
+                digest: Digest("8a4d20bc".to_owned()),
+                language: Some(Language {
+                    name: "typescript".to_owned(),
+                    dialect: Some("tsx".to_owned()),
+                }),
+            }],
+            pagination: Pagination {
+                page_index: 0,
+                total_pages: 1,
+            },
+        }
+    }
 
     fn language() -> WorkspaceLanguageSummary {
         WorkspaceLanguageSummary {
@@ -163,31 +190,6 @@ mod tests {
         }
     }
 
-    fn page() -> WorkspaceResourcePage {
-        WorkspaceResourcePage {
-            configuration_revision: Digest("3f9a1c2e".to_owned()),
-            languages: vec![language()],
-            hooks: vec![WorkspaceHookSummary {
-                id: "check".to_owned(),
-                kind: HookKind::Build,
-                include: vec![PathPattern("src/**".to_owned())],
-                exclude: Vec::new(),
-            }],
-            source: vec![WorkspaceSourceUnit {
-                path: ProjectPath("src/view.tsx".to_owned()),
-                digest: Digest("8a4d20bc".to_owned()),
-                language: Some(Language {
-                    name: "typescript".to_owned(),
-                    dialect: Some("tsx".to_owned()),
-                }),
-            }],
-            pagination: Pagination {
-                page_index: 0,
-                total_pages: 1,
-            },
-        }
-    }
-
     #[test]
     fn workspace_resource_page_serializes_its_effective_state() {
         let value = serde_json::to_value(page()).expect("workspace page serializes");
@@ -199,7 +201,6 @@ mod tests {
             json!("typescript:tsx")
         );
         assert_eq!(value["languages"][0]["lsp"]["state"], json!("ready"));
-        assert_eq!(value["hooks"][0]["kind"], json!("build"));
         assert_eq!(value["source"][0]["path"], json!("src/view.tsx"));
         assert_eq!(value["pagination"]["total_pages"], json!(1));
     }
@@ -237,45 +238,6 @@ mod tests {
                 serde_json::from_value(json!(spelling)).expect("LSP state deserializes");
             assert_eq!(deserialized, state);
         }
-    }
-
-    #[test]
-    fn schema_carries_collection_and_identity_bounds() {
-        let schema = serde_json::to_value(schema_for!(WorkspaceResourcePage))
-            .expect("workspace schema serializes");
-        let page = &schema["properties"];
-        assert_eq!(
-            page["languages"]["maxItems"],
-            json!(WORKSPACE_LANGUAGE_SUMMARIES_MAX)
-        );
-        assert_eq!(
-            page["hooks"]["maxItems"],
-            json!(WORKSPACE_HOOK_SUMMARIES_MAX)
-        );
-        assert_eq!(
-            page["source"]["maxItems"],
-            json!(WORKSPACE_SOURCE_UNITS_MAX)
-        );
-
-        let definitions = &schema["$defs"];
-        let language = &definitions["WorkspaceLanguageSummary"]["properties"];
-        assert_eq!(
-            language["include"]["maxItems"],
-            json!(CONFIGURATION_PATTERNS_MAX)
-        );
-        assert_eq!(
-            language["exclude"]["maxItems"],
-            json!(CONFIGURATION_PATTERNS_MAX)
-        );
-        let hook = &definitions["WorkspaceHookSummary"]["properties"];
-        assert_eq!(hook["id"]["maxLength"], json!(HOOK_ID_BYTES_MAX));
-        let lsp = &definitions["WorkspaceLspSummary"]["properties"]["process"];
-        assert_eq!(lsp["minLength"], json!(1));
-        assert_eq!(lsp["maxLength"], json!(WORKSPACE_LSP_PROCESS_KEY_BYTES_MAX));
-        assert_eq!(
-            lsp["pattern"],
-            json!(r"^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$")
-        );
     }
 
     #[test]

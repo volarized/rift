@@ -259,6 +259,12 @@ impl PythonRules {
 }
 
 impl GrammarRules for PythonRules {
+    fn name_range(&self, node: Node<'_>) -> Result<Option<crate::ByteRange>, SyntaxError> {
+        node.child_by_field_id(self.kinds.name.get())
+            .map(extract::byte_range)
+            .transpose()
+    }
+
     fn declaration(&self, node: Node<'_>, text: &str) -> Result<Option<Declaration>, SyntaxError> {
         if node.kind_id() == self.kinds.function {
             return self.definition_declaration(

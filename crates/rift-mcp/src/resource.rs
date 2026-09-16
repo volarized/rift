@@ -48,7 +48,7 @@ pub(crate) fn declared_resources() -> Vec<Resource> {
         Resource::new(WORKSPACE_URI, "workspace")
             .with_title("Workspace")
             .with_description(
-                "The server's effective language and hook configuration, with one page of the \
+                "The server's effective language configuration, with one page of the \
                  captured source catalog.",
             )
             .with_mime_type(RESOURCE_MEDIA_TYPE),
@@ -254,7 +254,6 @@ mod tests {
         WorkspaceResourcePage {
             configuration_revision: Digest("3f9a1c2e".to_owned()),
             languages: Vec::new(),
-            hooks: Vec::new(),
             source: Vec::new(),
             pagination: Pagination {
                 page_index: 0,
@@ -417,7 +416,6 @@ mod tests {
 
         assert_eq!(body["configuration_revision"], "3f9a1c2e");
         assert_eq!(body["languages"], serde_json::json!([]));
-        assert_eq!(body["hooks"], serde_json::json!([]));
         assert_eq!(body["source"], serde_json::json!([]));
         match rendered.contents.first() {
             Some(ResourceContents::TextResourceContents { uri, mime_type, .. }) => {

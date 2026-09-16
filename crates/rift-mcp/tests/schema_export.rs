@@ -77,30 +77,11 @@ fn check_fails_when_configuration_schema_is_stale() -> TestResult {
 }
 
 #[test]
-fn configuration_schema_document_is_deterministic_and_validates_hooks() -> TestResult {
+fn configuration_schema_document_is_deterministic() -> TestResult {
     let first = schema::configuration_schema_document();
     assert_eq!(first, schema::configuration_schema_document());
     let document: Value = serde_json::from_str(&first)?;
     assert_eq!(document["title"], "WorkspaceConfiguration");
-    let hook = &document["$defs"]["CommandHook"];
-    assert_eq!(hook["additionalProperties"], Value::Bool(false));
-    let required: Vec<&str> = hook["required"]
-        .as_array()
-        .ok_or("hook required must be an array")?
-        .iter()
-        .map(|field| {
-            field
-                .as_str()
-                .ok_or("hook required entries must be strings")
-        })
-        .collect::<Result<_, _>>()?;
-    assert_eq!(
-        required,
-        ["id", "kind", "command", "determinism"],
-        "only hook identity, kind, command, and determinism are required"
-    );
-    assert_eq!(hook["properties"]["writes"]["default"], "none");
-    assert_eq!(hook["properties"]["failure_severity"]["default"], "error");
     Ok(())
 }
 

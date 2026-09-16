@@ -1,13 +1,4 @@
-//! Validates and verifies the behaviour of every advertised tool on the MCP
-//! surface: each corpus request against the tool's advertised input schema,
-//! each structured result against its advertised output schema, and every
-//! sub-variant a result can take. The walk follows a paginated result page
-//! by page - `page_index` climbing under the result's own `total_pages` -
-//! so a live multi-page answer and the empty page past the end are both
-//! proven against the schema. Every `ChangeResult` arm is proven the same
-//! way: applied (with and without parser findings), and refused for a failed
-//! precondition and an unsupported file-level change - plus a live witnessed
-//! `replace_node` that lands after the walk.
+//! Served read requests and responses validate against their advertised schemas.
 
 mod hermetic_search;
 
@@ -83,56 +74,11 @@ fn corpus() -> Vec<(&'static str, Value)> {
         ),
         ("nodes", json!({ "path": "lib.rs", "position": 0 })),
         ("nodes", json!({ "path": "lib.rs", "position": 8 })),
-        (
-            "replace_symbol",
-            json!({
-                "symbol": "rift://symbol/rust/lib.rs/beacon_two",
-                "body": "pub fn beacon_two() -> u8 {\n    2\n}"
-            }),
-        ),
-        (
-            "replace_symbol",
-            json!({
-                "symbol": "rift://symbol/rust/lib.rs/vanished",
-                "body": "pub fn vanished() {}"
-            }),
-        ),
-        (
-            "insert_symbol",
-            json!({
-                "anchor": "rift://symbol/rust/lib.rs/beacon_three",
-                "position": "after",
-                "body": "pub fn beacon_four() {}"
-            }),
-        ),
-        (
-            "replace_symbol",
-            json!({
-                "symbol": "rift://symbol/rust/lib.rs/beacon_three",
-                "body": "pub fn beacon_three( {"
-            }),
-        ),
-        // The shared fixture configures no language LSP binding, so the
-        // rename refuses `unsupported` with the no-engine capability text.
-        (
-            "rename_symbol",
-            json!({
-                "symbol": "rift://symbol/rust/lib.rs/beacon_two",
-                "new_name": "beacon_renamed"
-            }),
-        ),
     ];
     requests.extend(dependency_scope_search_corpus());
-    requests.extend(node_write_corpus());
-    requests.extend(patch_corpus());
-    requests.extend(move_file_corpus());
     requests.extend(revision_read_corpus());
-    requests.extend(insert_symbol_file_target_corpus());
     requests.extend(lexical_search_corpus());
-    // Ahead of `remove_corpus()`: that corpus removes `remove_watched.rs`'s `beacon_watched`,
-    // the declaration this corpus's seed and `to` both name.
     requests.extend(traversal_search_corpus());
-    requests.extend(remove_corpus());
     requests
 }
 
@@ -201,190 +147,6 @@ fn traversal_search_corpus() -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// `remove_symbol` requests with no language LSP binding: this fixture proves the
-/// schema and pagination arms the corpus walk needs, not the engine-checked reference arm -
-/// `live_rust_analyzer.rs`'s `remove_symbol_with_a_standing_reference_refuses_and_names_the_caller`
-/// is what proves a real engine's `no_references` precondition, gated behind
-/// `RIFT_ENGINE_LIVE` since this hermetic corpus runs in plain `cargo test`.
-fn remove_corpus() -> Vec<(&'static str, Value)> {
-    vec![
-        (
-            "remove_symbol",
-            json!({
-                "symbol": "rift://symbol/rust/remove_lonely.rs/beacon_lonely",
-                "force": false
-            }),
-        ),
-        (
-            "remove_symbol",
-            json!({
-                "symbol": "rift://symbol/rust/remove_watched.rs/beacon_watched",
-                "force": false
-            }),
-        ),
-        // A stale witness on a range that does name a real node, proving `remove_node`
-        // reaches the same witness verification `replace_node` shares through
-        // `resolve_node_range`. The address names `remove_caller.rs`, which no other
-        // corpus entry writes to, so the range still lands however far the corpus has
-        // rewritten `lib.rs` by the time this entry runs. The live-fetched witness case
-        // runs in `live_witnessed_remove_node_checks_references_and_validates`, and a
-        // range naming no node at all is an `invalid_request` the error corpus covers.
-        (
-            "remove_node",
-            json!({
-                "node": "rift://node/rust/remove_caller.rs@0-48#00000000",
-                "force": false
-            }),
-        ),
-        // A range past the end of `remove_caller.rs`: the address of a node the file no
-        // longer holds refuses `source_unchanged` with the file's length as the observed
-        // value, the same typed refusal a stale witness gets.
-        (
-            "remove_node",
-            json!({
-                "node": "rift://node/rust/remove_caller.rs@0-999#00000000",
-                "force": false
-            }),
-        ),
-    ]
-}
-
-/// The node writers, each addressing a witnessed range: `replace_node` over a stale
-/// witness and over a range past the file's end, `insert_node` over a fresh witness, a
-/// stale one, and a range past the file's end.
-///
-/// The applied insertion addresses `remove_watched.rs`, whose declaration only
-/// `remove_symbol` reaches later and only by symbol name, so the insertion cannot move a
-/// byte range a later entry depends on. The body carries its own trailing newline: the
-/// tool adds no separator of its own.
-fn node_write_corpus() -> Vec<(&'static str, Value)> {
-    vec![
-        (
-            "replace_node",
-            json!({
-                "node": "rift://node/rust/lib.rs@0-22#00000000",
-                "body": "pub fn beacon_one() {}"
-            }),
-        ),
-        (
-            "replace_node",
-            json!({
-                "node": "rift://node/rust/lib.rs@0-999#00000000",
-                "body": "pub fn never_lands() {}"
-            }),
-        ),
-        (
-            "insert_node",
-            json!({
-                "anchor": "rift://node/rust/lib.rs@0-999#00000000",
-                "position": "after",
-                "body": "pub fn never_lands() {}"
-            }),
-        ),
-        (
-            "insert_node",
-            json!({
-                "anchor": "rift://node/rust/remove_watched.rs@0-26#d662e01c",
-                "position": "before",
-                "body": "pub fn beacon_inserted() {}\n"
-            }),
-        ),
-        (
-            "insert_node",
-            json!({
-                "anchor": "rift://node/rust/lib.rs@0-22#00000000",
-                "position": "after",
-                "body": "pub fn never_lands() {}"
-            }),
-        ),
-    ]
-}
-
-/// `patch` requests: modifying, creating, and renaming a file, each proving one
-/// unified-diff arm the tool advertises.
-fn patch_corpus() -> Vec<(&'static str, Value)> {
-    vec![
-        (
-            "patch",
-            json!({
-                "patch": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-pub fn beacon_one() {}\n+pub fn beacon_one() -> u8 { 1 }\n"
-            }),
-        ),
-        (
-            "patch",
-            json!({
-                "patch": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-pub fn never_there() {}\n+pub fn never_there() -> u8 { 0 }\n"
-            }),
-        ),
-        (
-            "patch",
-            json!({
-                "patch": "--- /dev/null\n+++ b/fresh.rs\n@@ -0,0 +1 @@\n+pub fn fresh() {}\n"
-            }),
-        ),
-        (
-            "patch",
-            json!({
-                // The header claims line 1; the unique match actually sits
-                // at line 5, proving header line numbers are hints only.
-                "patch": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-pub fn beacon_three() {}\n+pub fn beacon_three() -> u8 { 3 }\n"
-            }),
-        ),
-        (
-            "patch",
-            json!({
-                // The header counts 9 old and 4 new lines over a body
-                // carrying one of each, proving the counts are read from
-                // the body the way `git apply` reads them.
-                "patch": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1,9 +1,4 @@\n-pub fn beacon_two() {}\n+pub fn beacon_two() -> u8 { 2 }\n"
-            }),
-        ),
-        (
-            "patch",
-            json!({
-                "patch": "--- a/lib.rs\n+++ b/renamed.rs\n@@ -1 +1 @@\n-pub fn beacon_one() -> u8 { 1 }\n+pub fn beacon_one() -> u8 { 1 }\n"
-            }),
-        ),
-        // `justfile` carries no extension and no syntax provider; `patch` still
-        // reaches it through the `[source]` policy.
-        (
-            "patch",
-            json!({
-                "patch": "--- a/justfile\n+++ b/justfile\n@@ -1,2 +1,2 @@\n default:\n-    echo hi\n+    echo hello\n"
-            }),
-        ),
-    ]
-}
-
-/// `move_file` requests: an applied move into a created directory - the
-/// fixture configures no language LSP binding, so its summary carries the
-/// references-not-updated warning - a missing source, and an occupied
-/// destination. `fresh.rs` exists because the patch corpus created it.
-fn move_file_corpus() -> Vec<(&'static str, Value)> {
-    vec![
-        (
-            "move_file",
-            json!({ "from": "fresh.rs", "to": "moved/fresh.rs" }),
-        ),
-        (
-            "move_file",
-            json!({ "from": "ghost.rs", "to": "ghost_two.rs" }),
-        ),
-        ("move_file", json!({ "from": "lib.rs", "to": "notes.txt" })),
-    ]
-}
-
-/// `move_file` requests that must fail the advertised input schema before
-/// any tool resolves them: a state path, an escaping path, and an unknown
-/// field.
-fn invalid_move_file_corpus() -> Vec<Value> {
-    vec![
-        json!({ "from": "lib.rs", "to": ".rift/x.rs" }),
-        json!({ "from": "../escape.rs", "to": "lib2.rs" }),
-        json!({ "from": "lib.rs", "to": "lib2.rs", "overwrite": true }),
-    ]
-}
-
 /// Search requests only the lexical search-index tier can fully answer: a multi-word
 /// prose query merging in hits identifier search alone would not surface, and a query
 /// that only `notes.txt` answers, since identifier search never reaches its content.
@@ -405,90 +167,6 @@ fn revision_read_corpus() -> Vec<(&'static str, Value)> {
             "nodes",
             json!({ "path": "lib.rs", "position": 0, "rev": "main" }),
         ),
-    ]
-}
-
-/// `insert_symbol` file-target requests: an append to an existing file, a
-/// created file with nested parent directories, and a missing-target refusal.
-fn insert_symbol_file_target_corpus() -> Vec<(&'static str, Value)> {
-    vec![
-        (
-            "insert_symbol",
-            json!({
-                "file": "lib.rs",
-                "position": "after",
-                "body": "pub fn beacon_extra() {}"
-            }),
-        ),
-        (
-            "insert_symbol",
-            json!({
-                "file": "docs/notes.md",
-                "position": "before",
-                "create_missing": true,
-                "body": "# Notes"
-            }),
-        ),
-        (
-            "insert_symbol",
-            json!({
-                "file": "docs/missing.md",
-                "position": "after",
-                "body": "# Missing"
-            }),
-        ),
-    ]
-}
-
-/// `insert_symbol` requests that must fail the advertised input schema before
-/// any tool ever resolves them: each proves one refused target-shape rule.
-fn invalid_insert_symbol_corpus() -> Vec<Value> {
-    vec![
-        json!({
-            "anchor": "rift://symbol/rust/lib.rs/beacon_one",
-            "file": "notes/extra.md",
-            "position": "after",
-            "body": "x"
-        }),
-        json!({
-            "position": "after",
-            "body": "x"
-        }),
-        json!({
-            "anchor": "rift://symbol/rust/lib.rs/beacon_one",
-            "position": "after",
-            "body": "x",
-            "create_missing": true
-        }),
-        json!({
-            "file": ".rift/x.rs",
-            "position": "after",
-            "body": "x"
-        }),
-        json!({
-            "file": "../escape.rs",
-            "position": "after",
-            "body": "x"
-        }),
-    ]
-}
-
-/// `rename_symbol` requests that must fail the advertised input schema
-/// before any tool resolves them: a malformed address, an empty name, an
-/// oversized name, and an unknown field.
-fn invalid_rename_symbol_corpus() -> Vec<Value> {
-    vec![
-        json!({ "symbol": "not-an-address", "new_name": "beacon_renamed" }),
-        json!({ "symbol": "rift://symbol/rust/lib.rs/beacon_one", "new_name": "" }),
-        json!({
-            "symbol": "rift://symbol/rust/lib.rs/beacon_one",
-            "new_name": "n".repeat(257)
-        }),
-        json!({
-            "symbol": "rift://symbol/rust/lib.rs/beacon_one",
-            "new_name": "beacon_renamed",
-            "dry_run": true
-        }),
     ]
 }
 
@@ -597,7 +275,7 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
                 expects_source,
                 "a hit carries source exactly when the request includes it: {request:#} {hit:#}"
             );
-            // A dependency hit is never an edit target, so it carries no node address.
+            // A dependency hit carries its package source location.
             let addressable = hit.get("unit").is_none();
             assert_eq!(
                 hit.get("node").is_some(),
@@ -733,7 +411,7 @@ fn assert_source_unit_ids_use_served_resolvers(
 /// The fixture's directories: the served workspace and, beside it, the helper crate its
 /// manifest depends on by path.
 struct FixtureDirectories {
-    workspace: tempfile::TempDir,
+    _workspace: tempfile::TempDir,
     /// Held for the life of the server: the catalog roots the helper here.
     _helper: tempfile::TempDir,
 }
@@ -805,10 +483,7 @@ async fn served_fixture() -> TestResult<(
         directory.path().join("notes.txt"),
         "Beacon telemetry guidance covers rotating every legacy sensor unit safely.\n",
     )?;
-    // No language LSP binding exists in this fixture, so both files remove unchecked; a real
-    // engine's own standing-reference refusal is proven in `live_rust_analyzer.rs` instead.
-    // `remove_caller.rs` still calls `beacon_watched`, so a future engine-backed suite that
-    // reuses this shape finds the reference this fixture cannot check.
+    // The declaration and caller also serve traversal requests.
     fs::write(
         directory.path().join("remove_lonely.rs"),
         "pub fn beacon_lonely() {}\n",
@@ -821,17 +496,12 @@ async fn served_fixture() -> TestResult<(
         directory.path().join("remove_caller.rs"),
         "pub fn calls_watched() {\n    beacon_watched();\n}\n",
     )?;
-    // No syntax provider claims it. Baseline content still makes it visible to `patch`,
-    // while `nodes` refuses `capability_unavailable` naming missing extension.
+    // No syntax provider claims it; `nodes` names the missing extension.
     fs::write(directory.path().join("justfile"), "default:\n    echo hi\n")?;
     // A committed baseline, so the corpus can prove revision-addressed reads:
     // `hidden.rs` stays gitignored and uncommitted, everything else lands in
     // the fixture's one commit on `main`.
     //
-    // No language LSP binding: this fixture proves schema and pagination, not engine-checked
-    // behavior, so `rename_symbol`, `move_file`, and `remove_symbol` all take their
-    // no-engine-configured arm. `live_rust_analyzer.rs` and `live_typescript.rs` prove the
-    // engine-covered arms of every one of those tools against a real engine.
     let configuration = hermetic_search::SEMANTIC_DISABLED.to_owned();
     fs::write(directory.path().join("rift.toml"), configuration)?;
     rift_history::fixture::init(directory.path());
@@ -848,7 +518,7 @@ async fn served_fixture() -> TestResult<(
     let client = ().serve(client_transport).await?;
     Ok((
         FixtureDirectories {
-            workspace: directory,
+            _workspace: directory,
             _helper: helper,
         },
         client,
@@ -863,42 +533,17 @@ async fn served_fixture() -> TestResult<(
 struct CorpusArms {
     multi_page_results: usize,
     past_end_pages: usize,
-    applied_changes: usize,
-    applied_with_findings: usize,
-    refusal_reasons: BTreeSet<String>,
-    precondition_kinds: BTreeSet<String>,
+
     dependency_units: usize,
     search_dependency_units: usize,
 }
 
 impl CorpusArms {
-    /// Records which change-status arms one structured result proves, and how many hits
+    /// Records how many hits
     /// answered from the dependency index, on a `get_symbol` and a `search` answer alike.
     fn observe(&mut self, structured: &Value) {
         self.dependency_units += dependency_unit_count(&structured["hits"]);
         self.search_dependency_units += dependency_unit_count(&structured["results"]);
-        match structured["status"].as_str() {
-            Some("applied") => {
-                self.applied_changes += 1;
-                if structured["summary"]["diagnostics"]
-                    .as_array()
-                    .is_some_and(|findings| !findings.is_empty())
-                {
-                    self.applied_with_findings += 1;
-                }
-            }
-            Some("refused") => {
-                if let Some(reason) = structured["reason"].as_str() {
-                    self.refusal_reasons.insert(reason.to_owned());
-                }
-                for precondition in structured["preconditions"].as_array().into_iter().flatten() {
-                    if let Some(kind) = precondition["kind"].as_str() {
-                        self.precondition_kinds.insert(kind.to_owned());
-                    }
-                }
-            }
-            _ => {}
-        }
     }
 
     /// Fails the walk unless every tracked arm was produced live.
@@ -910,27 +555,6 @@ impl CorpusArms {
             self.multi_page_results,
             self.past_end_pages
         );
-        assert!(
-            self.applied_changes >= 3 && self.applied_with_findings >= 1,
-            "the corpus must prove the applied arm with and without parser findings: \
-             applied={}, with_findings={}",
-            self.applied_changes,
-            self.applied_with_findings
-        );
-        for reason in ["unmet_precondition", "unsupported"] {
-            assert!(
-                self.refusal_reasons.contains(reason),
-                "the corpus must prove the {reason} refusal arm; proven: {:?}",
-                self.refusal_reasons
-            );
-        }
-        for kind in ["target_exists", "source_unchanged"] {
-            assert!(
-                self.precondition_kinds.contains(kind),
-                "the corpus must prove the {kind} precondition; proven: {:?}",
-                self.precondition_kinds
-            );
-        }
         assert!(
             self.dependency_units > 0,
             "the corpus must prove a get_symbol hit answered from the dependency index, \
@@ -1157,122 +781,6 @@ fn every_tool_example_validates_against_its_advertised_schemas() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
-async fn tools_list_distinguishes_lookup_names_from_write_addresses() -> TestResult {
-    let (_directory, client, server_task) = served_fixture().await?;
-    let tools = client.list_all_tools().await?;
-
-    let schema = |name: &str| -> TestResult<Value> {
-        let tool = tools
-            .iter()
-            .find(|tool| tool.name.as_ref() == name)
-            .ok_or_else(|| format!("{name} must be advertised"))?;
-        Ok(Value::Object(tool.input_schema.as_ref().clone()))
-    };
-
-    let get_symbol = schema("get_symbol")?;
-    let name = &get_symbol["properties"]["name"];
-    assert_eq!(name["type"], "string");
-
-    let insert_symbol = schema("insert_symbol")?;
-    assert!(
-        insert_symbol["properties"]["anchor"]["anyOf"]
-            .as_array()
-            .is_some_and(|arms| arms.iter().any(|arm| arm["$ref"] == "#/$defs/SymbolId")),
-        "insert_symbol.anchor must carry the SymbolId schema: {insert_symbol:#}"
-    );
-    let replace_symbol = schema("replace_symbol")?;
-    assert_eq!(
-        replace_symbol["properties"]["symbol"]["$ref"],
-        "#/$defs/SymbolId"
-    );
-
-    let replace_node = schema("replace_node")?;
-    assert_eq!(replace_node["properties"]["node"]["$ref"], "#/$defs/NodeId");
-
-    let mut missing = Vec::new();
-    if !name["description"]
-        .as_str()
-        .is_some_and(|description| description.contains("not a full `SymbolId`"))
-    {
-        missing.push("get_symbol.name must distinguish a declaration name from a full SymbolId");
-    }
-    if !replace_symbol["properties"]["symbol"]["description"]
-        .as_str()
-        .is_some_and(|description| description.contains("returned by `get_symbol`"))
-    {
-        missing.push("replace_symbol.symbol must name where its full SymbolId comes from");
-    }
-    if !replace_node["properties"]["node"]["description"]
-        .as_str()
-        .is_some_and(|description| description.contains("returned by `nodes`"))
-    {
-        missing.push("replace_node.node must name where its full NodeId comes from");
-    }
-    assert!(
-        missing.is_empty(),
-        "tools/list leaves write address contract unclear: {missing:#?}"
-    );
-
-    client.cancel().await?;
-    server_task.await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn insert_symbol_schema_rejects_invalid_target_combinations() -> TestResult {
-    let (_directory, client, server_task) = served_fixture().await?;
-    let tools = client.list_all_tools().await?;
-    let validators = tool_validators(&tools)?;
-    let (input_validator, _) = &validators["insert_symbol"];
-    for request in invalid_insert_symbol_corpus() {
-        assert!(
-            input_validator.iter_errors(&request).next().is_some(),
-            "insert_symbol request must fail its advertised schema: {request:#}"
-        );
-    }
-
-    client.cancel().await?;
-    server_task.await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn move_file_schema_rejects_invalid_requests() -> TestResult {
-    let (_directory, client, server_task) = served_fixture().await?;
-    let tools = client.list_all_tools().await?;
-    let validators = tool_validators(&tools)?;
-    let (input_validator, _) = &validators["move_file"];
-    for request in invalid_move_file_corpus() {
-        assert!(
-            input_validator.iter_errors(&request).next().is_some(),
-            "move_file request must fail its advertised schema: {request:#}"
-        );
-    }
-
-    client.cancel().await?;
-    server_task.await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn rename_symbol_schema_rejects_invalid_requests() -> TestResult {
-    let (_directory, client, server_task) = served_fixture().await?;
-    let tools = client.list_all_tools().await?;
-    let validators = tool_validators(&tools)?;
-    let (input_validator, _) = &validators["rename_symbol"];
-    for request in invalid_rename_symbol_corpus() {
-        assert!(
-            input_validator.iter_errors(&request).next().is_some(),
-            "rename_symbol request must fail its advertised schema: {request:#}"
-        );
-    }
-
-    client.cancel().await?;
-    server_task.await?;
-    Ok(())
-}
-
 /// `traversal` combined with `rev` is a schema-valid, runtime-refused request: the edge lane
 /// serves the current tree alone, so the server refuses `capability_unavailable` rather than
 /// answering. This is the one traversal case the schema-validating corpus above cannot carry,
@@ -1311,50 +819,6 @@ fn tools_call_request(name: &'static str, value: &Value) -> TestResult<CallToolR
     Ok(CallToolRequestParams::new(name).with_arguments(arguments(value)?))
 }
 
-/// A hunk whose header counts disagree with its body applies, and the
-/// applied summary reports the file it wrote and the lines it counted.
-#[tokio::test]
-async fn miscounted_hunk_header_applies_and_reports_the_file_it_wrote() -> TestResult {
-    let (_directory, client, server_task) = served_fixture().await?;
-
-    // The body carries one old and one new line under a header claiming 9
-    // and 4. `git apply` reads the counts from the body; so does the server.
-    let miscounted = json!({
-        "patch": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1,9 +1,4 @@\n-pub fn beacon_two() {}\n+pub fn beacon_two() -> u8 { 2 }\n"
-    });
-    let arguments = arguments(&miscounted)?;
-    let request = CallToolRequestParams::new("patch").with_arguments(arguments);
-    let applied = client.call_tool(request).await?;
-    let applied = applied
-        .structured_content
-        .ok_or("patch must return structured content")?;
-    assert_eq!(
-        applied["status"],
-        json!("applied"),
-        "a miscounted header must apply on its context alone: {applied:#}"
-    );
-
-    let files = applied["summary"]["files"]
-        .as_array()
-        .ok_or("an applied patch must carry its files")?;
-    assert_eq!(files.len(), 1, "one hunk writes one file: {applied:#}");
-    assert_eq!(files[0]["path"], json!("lib.rs"));
-    assert_eq!(files[0]["kind"], json!("modified"));
-    assert_eq!(
-        (
-            files[0]["lines_added"].as_u64(),
-            files[0]["lines_removed"].as_u64()
-        ),
-        (Some(1), Some(1)),
-        "the body's one old and one new line are what the change counted, whatever the \
-         header claimed: {applied:#}"
-    );
-
-    client.cancel().await?;
-    server_task.await?;
-    Ok(())
-}
-
 /// A visible path no syntax provider parses refuses `capability_unavailable`, naming
 /// the extension - `nodes` can never serve it whatever tree it is pointed at.
 #[tokio::test]
@@ -1377,316 +841,6 @@ async fn nodes_on_an_unparsed_visible_path_names_the_extension() -> TestResult {
     assert!(
         message.contains("files with no extension"),
         "the refusal must name what governs the missing provider: {message}"
-    );
-
-    client.cancel().await?;
-    server_task.await?;
-    Ok(())
-}
-
-/// A file `insert_symbol` creates lands in the rebuilt snapshot, so a later
-/// read sees the symbol it declares.
-#[tokio::test]
-async fn insert_symbol_file_target_creation_is_visible_to_a_later_read() -> TestResult {
-    let (_directory, client, server_task) = served_fixture().await?;
-
-    let created = client
-        .call_tool(
-            CallToolRequestParams::new("insert_symbol").with_arguments(arguments(&json!({
-                "file": "extra.rs",
-                "position": "after",
-                "create_missing": true,
-                "body": "pub fn beacon_extra_read() {}"
-            }))?),
-        )
-        .await?;
-    let created = created
-        .structured_content
-        .ok_or("insert_symbol must return structured content")?;
-    assert_eq!(
-        created["status"],
-        json!("applied"),
-        "a missing file target with create_missing must land: {created:#}"
-    );
-
-    let found = client
-        .call_tool(
-            CallToolRequestParams::new("get_symbol")
-                .with_arguments(arguments(&json!({ "name": "beacon_extra_read" }))?),
-        )
-        .await?;
-    let found = found
-        .structured_content
-        .ok_or("get_symbol must return structured content")?;
-    let hits = found["hits"]
-        .as_array()
-        .ok_or("get_symbol must return hits")?;
-    assert!(
-        !hits.is_empty(),
-        "a file insert_symbol just created must be visible to a later read: {found:#}"
-    );
-
-    client.cancel().await?;
-    server_task.await?;
-    Ok(())
-}
-
-/// `get_symbol`'s `node` field is the same witnessed [`NodeId`](rift_protocol::read::NodeId)
-/// string `nodes` returns - the flattened edit address `replace_node` accepts directly, with
-/// no field to unwrap first. This proves the round trip through `get_symbol` the way
-/// [`live_witnessed_replace_node_lands_and_validates`] proves it through `nodes`.
-#[tokio::test]
-async fn live_get_symbol_node_address_round_trips_through_replace_node() -> TestResult {
-    let (_directory, client, server_task) = served_fixture().await?;
-    let tools = client.list_all_tools().await?;
-    let validators = tool_validators(&tools)?;
-
-    let found = client
-        .call_tool(
-            CallToolRequestParams::new("get_symbol")
-                .with_arguments(arguments(&json!({ "name": "beacon_two" }))?),
-        )
-        .await?;
-    let found = found
-        .structured_content
-        .ok_or("get_symbol must return structured content")?;
-    let witnessed = found["hits"][0]["node"]
-        .as_str()
-        .ok_or("a get_symbol hit must carry the bare witnessed node address")?
-        .to_owned();
-    assert!(
-        witnessed.starts_with("rift://node/"),
-        "get_symbol's node field is the address form itself, not a wrapper: {witnessed}"
-    );
-
-    let replaced = client
-        .call_tool(
-            CallToolRequestParams::new("replace_node").with_arguments(arguments(
-                &json!({ "node": witnessed, "body": "pub fn beacon_two() { /* replaced */ }" }),
-            )?),
-        )
-        .await?;
-    let replaced = replaced
-        .structured_content
-        .ok_or("replace_node must return structured content")?;
-    let (_, output_validator) = &validators["replace_node"];
-    assert_validates(
-        output_validator,
-        &replaced,
-        "get_symbol-addressed replace_node result",
-    );
-    assert_eq!(
-        replaced["status"],
-        json!("applied"),
-        "an address taken straight from get_symbol's node field must land: {replaced:#}"
-    );
-
-    client.cancel().await?;
-    server_task.await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn live_witnessed_replace_node_lands_and_validates() -> TestResult {
-    let (_directory, client, server_task) = served_fixture().await?;
-    let tools = client.list_all_tools().await?;
-    let validators = tool_validators(&tools)?;
-
-    let listing = client
-        .call_tool(
-            CallToolRequestParams::new("nodes")
-                .with_arguments(arguments(&json!({ "path": "lib.rs", "position": 3 }))?),
-        )
-        .await?;
-    let listing = listing
-        .structured_content
-        .ok_or("nodes must return structured content")?;
-    let witnessed = listing["nodes"][0]["id"]
-        .as_str()
-        .ok_or("listing must carry a node id")?
-        .to_owned();
-    let replaced = client
-        .call_tool(
-            CallToolRequestParams::new("replace_node").with_arguments(arguments(
-                &json!({ "node": witnessed, "body": "pub fn beacon_one() {}" }),
-            )?),
-        )
-        .await?;
-    let replaced = replaced
-        .structured_content
-        .ok_or("replace_node must return structured content")?;
-    let (_, output_validator) = &validators["replace_node"];
-    assert_validates(
-        output_validator,
-        &replaced,
-        "live witnessed replace_node result",
-    );
-    assert_eq!(
-        replaced["status"],
-        json!("applied"),
-        "a fresh witnessed address must land: {replaced:#}"
-    );
-
-    client.cancel().await?;
-    server_task.await?;
-    Ok(())
-}
-
-/// A fresh witnessed node address round-trips through `remove_node` the way
-/// [`live_witnessed_replace_node_lands_and_validates`] proves it for `replace_node`: no
-/// language LSP binding exists in this fixture, so the removal applies unchecked and the
-/// listed node's own declaration is what disappears.
-#[tokio::test]
-async fn live_witnessed_remove_node_round_trips_and_validates() -> TestResult {
-    let (directory, client, server_task) = served_fixture().await?;
-    let tools = client.list_all_tools().await?;
-    let validators = tool_validators(&tools)?;
-
-    let listing = client
-        .call_tool(
-            CallToolRequestParams::new("nodes").with_arguments(arguments(
-                &json!({ "path": "remove_lonely.rs", "position": 3 }),
-            )?),
-        )
-        .await?;
-    let listing = listing
-        .structured_content
-        .ok_or("nodes must return structured content")?;
-    let witnessed = listing["nodes"][0]["id"]
-        .as_str()
-        .ok_or("listing must carry a node id")?
-        .to_owned();
-    let removed = client
-        .call_tool(
-            CallToolRequestParams::new("remove_node")
-                .with_arguments(arguments(&json!({ "node": witnessed, "force": false }))?),
-        )
-        .await?;
-    let removed = removed
-        .structured_content
-        .ok_or("remove_node must return structured content")?;
-    let (_, output_validator) = &validators["remove_node"];
-    assert_validates(
-        output_validator,
-        &removed,
-        "live witnessed remove_node result",
-    );
-    assert_eq!(
-        removed["status"],
-        json!("applied"),
-        "an unreferenced declaration removes cleanly: {removed:#}"
-    );
-    assert_eq!(
-        fs::read_to_string(directory.workspace.path().join("remove_lonely.rs"))?,
-        "",
-        "the sole declaration leaves the file empty: {removed:#}"
-    );
-
-    client.cancel().await?;
-    server_task.await?;
-    Ok(())
-}
-
-/// A configured hook's verdicts ride the applied change: a passing hook's
-/// guarantees become validated evidence, a failing hook an error finding.
-#[cfg(unix)]
-#[tokio::test]
-async fn hooked_change_carries_validated_guarantees_and_findings() -> TestResult {
-    let directory = tempfile::tempdir()?;
-    fs::write(directory.path().join("lib.rs"), "pub fn beacon_one() {}\n")?;
-    fs::write(
-        directory.path().join("rift.toml"),
-        hermetic_search::SEMANTIC_DISABLED.to_owned()
-            + r#"
-[[hooks]]
-id = "echoes"
-kind = "other"
-command = ["echo", "checked"]
-changed_paths = "append"
-writes = "none"
-working_directory = ""
-environment = {}
-timeout = "30s"
-output_limit = "4kb"
-failure_severity = "error"
-guarantees = [
-    { kind = "behavior_checked", scope = { kind = "reach", reach = "project" }, detail = "echo ran over the changed paths" },
-]
-determinism = "deterministic"
-
-[[hooks]]
-id = "refuses"
-kind = "other"
-command = "false"
-changed_paths = "none"
-writes = "none"
-working_directory = ""
-environment = {}
-timeout = "30s"
-output_limit = "4kb"
-failure_severity = "error"
-guarantees = []
-determinism = "deterministic"
-"#,
-    )?;
-    let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
-    let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
-    let server_task = tokio::spawn(async move {
-        let service = server
-            .serve(server_transport)
-            .await
-            .expect("server must initialize");
-        service.waiting().await.expect("server must stop cleanly");
-    });
-    let client = ().serve(client_transport).await?;
-    let tools = client.list_all_tools().await?;
-    let validators = tool_validators(&tools)?;
-
-    let changed = client
-        .call_tool(
-            CallToolRequestParams::new("replace_symbol").with_arguments(arguments(&json!({
-                "symbol": "rift://symbol/rust/lib.rs/beacon_one",
-                "body": "pub fn beacon_one() -> u8 { 1 }"
-            }))?),
-        )
-        .await?;
-    let structured = changed
-        .structured_content
-        .ok_or("replace_symbol must return structured content")?;
-    let (_, output_validator) = &validators["replace_symbol"];
-    assert_validates(
-        output_validator,
-        &structured,
-        "hooked replace_symbol result",
-    );
-    assert_eq!(structured["status"], json!("applied"));
-
-    let guarantees = structured["summary"]["guarantees"]
-        .as_array()
-        .ok_or("summary must carry guarantees")?;
-    assert_eq!(
-        guarantees,
-        &vec![json!({
-            "kind": "behavior_checked",
-            "scope": { "kind": "reach", "reach": "project" },
-            "hook": "echoes",
-            "detail": "echo ran over the changed paths"
-        })],
-        "the passing hook's configured guarantee must ride the change"
-    );
-
-    let findings = structured["summary"]["diagnostics"]
-        .as_array()
-        .ok_or("summary must carry diagnostics")?;
-    let failure = findings
-        .iter()
-        .find(|finding| finding["code"] == json!("rift.hook.failed"))
-        .ok_or("the failing hook must contribute a rift.hook.failed finding")?;
-    assert_eq!(failure["severity"], json!("error"));
-    let message = failure["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("refuses") && message.contains("exited 1"),
-        "the finding must name the hook and what ended it: {message}"
     );
 
     client.cancel().await?;

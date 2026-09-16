@@ -4,16 +4,11 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use rift_core::{ProjectPath as CoreProjectPath, SourceVisibility};
+use rift_core::SourceVisibility;
 use rift_dependency::DependencyCatalog;
 use rift_index::{
     DependencyIndex, DependencyIndexLimits, LexicalIndexLimits, LogStore, PackageSelection,
     PathChanges, WorkspaceDigests, WorkspaceIndexLimits, capture_digests_with_languages,
-};
-use rift_protocol::change::{
-    ChangeResult, ChangeSummary, GuaranteeEvidence, InsertNodeParams, InsertSymbolParams,
-    MoveFileParams, PatchParams, RemoveNodeParams, RemoveSymbolParams, RenameSymbolParams,
-    ReplaceNodeParams, ReplaceSymbolParams,
 };
 use rift_protocol::configuration::{
     Duration as WireDuration, LspConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX, SEARCH_POOL_SLOTS_MAX,
@@ -27,17 +22,16 @@ use rift_protocol::read::{
     ProjectPath, ReadWarning, SearchParams, SearchResult, SearchScope,
 };
 use rift_protocol::workspace::{
-    WORKSPACE_SOURCE_UNITS_MAX, WorkspaceHookSummary, WorkspaceLanguageSummary,
-    WorkspaceLspSummary, WorkspaceResourcePage, WorkspaceSourceUnit,
+    WORKSPACE_SOURCE_UNITS_MAX, WorkspaceLanguageSummary, WorkspaceLspSummary,
+    WorkspaceResourcePage, WorkspaceSourceUnit,
 };
 use rift_search::{
     AcquisitionLimits, FusedRanking, ModelSource, RankedUnit, RevisionScoped, SearchError,
     SearchIndex, SearchIndexLimits, SemanticReadiness,
 };
 use rift_server::{
-    ChangeService, DependencyStore, EnginePool, HookSnapshot, HookStatus, LspProcessKey,
-    MoveResolution, ReadError, ReadFault, ReadService, RemoveResolution, RenameResolution,
-    plan_move, plan_remove_node, plan_remove_symbol, plan_rename, wire_digest,
+    DependencyStore, EnginePool, EngineReferences, LspProcessKey, ReadError, ReadFault,
+    ReadService, resolve_engine_references, wire_digest,
 };
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{
@@ -52,15 +46,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use crate::dependency::{DependencyLane, DependencyRequest};
-use crate::failure::{WireFailure, hook_failure_diagnostic, stale_snapshot_diagnostic};
+use crate::failure::WireFailure;
 use crate::resource;
 use crate::storage::WorkspaceStorage;
 use crate::validation::{
     ConfigurationFingerprint, ConfigurationState, INDEX_CAPTURE_ATTEMPTS_MAX, IndexState,
-    IndexSupervisor, IndexSupervisorContext, IndexValidation, LexicalCommitState, LexicalHandoff,
-    LexicalLane, LexicalWrite, PendingWork, PopulationLane, PublishedWorkspace, RebuildOutcome,
-    WorkspaceCandidate, build_workspace_candidate, configuration_fingerprint, finish_rebuild,
-    initial_workspace, lexical_write, run_index_supervisor, workspace_watcher,
+    IndexSupervisor, IndexSupervisorContext, IndexValidation, LexicalCommitState, LexicalLane,
+    LexicalWrite, PopulationLane, PublishedWorkspace, configuration_fingerprint, initial_workspace,
+    run_index_supervisor, workspace_watcher,
 };
 
 /// Semantic candidates one file may contribute to a fused ranking.
@@ -156,102 +149,6 @@ impl BlockingExecutor {
         })
         .await
         .map_err(|error| ReadFault::task(operation, error.to_string()))?
-    }
-}
-
-/// The engine pool held across requests, replaced when accepted LSP configuration changes.
-///
-/// Rebuilds recreate the published `ConfigurationState` but never the
-/// long-lived services, so the hold compares the published tables against
-/// the pool it keeps: unchanged tables reuse the running sessions, and
-/// changed tables swap in a fresh pool and shut the replaced one down.
-#[derive(Debug)]
-pub(crate) struct EngineHold {
-    root: PathBuf,
-    pool: AsyncMutex<Arc<EnginePool>>,
-}
-
-impl EngineHold {
-    /// Builds the hold with a pool for startup LSP configuration.
-    pub(crate) fn new(
-        root: PathBuf,
-        definitions: BTreeMap<LspProcessKey, LspConfiguration>,
-        bindings: BTreeMap<String, LspProcessKey>,
-    ) -> Self {
-        let pool = Arc::new(EnginePool::new(&root, definitions, bindings));
-        Self {
-            root,
-            pool: AsyncMutex::new(pool),
-        }
-    }
-
-    /// The pool serving `engines`: the held pool while its tables are
-    /// unchanged, or a replacement built for the new tables.
-    ///
-    /// A replaced pool's sessions are shut down after the hold's lock is
-    /// released, so concurrent callers proceed against the replacement
-    /// while the old engines end; a request still holding the replaced
-    /// pool finishes its exchange first, because shutdown takes each slot's
-    /// own lock.
-    ///
-    /// # Cancel safety
-    ///
-    /// Dropping the future after the swap skips the replaced pool's
-    /// graceful shutdown; its children are then killed through the
-    /// session's kill-on-drop arming once the last holder drops the pool.
-    pub(crate) async fn pool_for(
-        &self,
-        definitions: BTreeMap<LspProcessKey, LspConfiguration>,
-        bindings: BTreeMap<String, LspProcessKey>,
-    ) -> Arc<EnginePool> {
-        let mut held = self.pool.lock().await;
-        if held.built_from(&definitions, &bindings) {
-            return Arc::clone(&held);
-        }
-        let rebuilt = Arc::new(held.reconfigure(&self.root, definitions, bindings));
-        let replaced = std::mem::replace(&mut *held, Arc::clone(&rebuilt));
-        drop(held);
-        replaced.shutdown_replaced_by(&rebuilt).await;
-        rebuilt
-    }
-
-    /// Ends the held pool's running engines; the pool stays usable and a
-    /// later request respawns what it needs.
-    pub(crate) async fn shutdown(&self) {
-        let held = Arc::clone(&*self.pool.lock().await);
-        held.shutdown().await;
-    }
-}
-
-/// Serializes workspace mutations and snapshot publication.
-#[derive(Debug, Default)]
-pub(crate) struct ChangeLane {
-    entry: AsyncMutex<()>,
-}
-
-impl ChangeLane {
-    /// Runs one operation after FIFO entry to the workspace lane.
-    pub(crate) fn run<Output>(&self, operation: impl FnOnce() -> Output) -> Output {
-        let guard = self.entry.blocking_lock();
-        let output = operation();
-        // Filesystem mutation and snapshot publication finish before release.
-        drop(guard);
-        output
-    }
-
-    /// Verifies occupied entry, reports it, then uses the production lane.
-    #[cfg(test)]
-    fn run_after_contention<Output>(
-        &self,
-        on_contention: impl FnOnce(),
-        operation: impl FnOnce() -> Output,
-    ) -> Output {
-        assert!(
-            self.entry.try_lock().is_err(),
-            "contention witness requires an occupied change lane"
-        );
-        on_contention();
-        self.run(operation)
     }
 }
 
@@ -789,33 +686,7 @@ struct RecordedRebuildFailure {
     error: Arc<ReadError>,
 }
 
-/// What one request does about a recorded rebuild failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FailureVerdict {
-    /// Answer from the published snapshot, carrying the failure as `stale_index`.
-    AnswerStale,
-    /// Refuse with the recorded failure.
-    Refuse,
-    /// Wait for the rebuild the newer observation asked for.
-    Wait,
-}
-
 impl RecordedRebuildFailure {
-    /// A read answers from the snapshot it has; a change refuses at the epoch that
-    /// failed, and waits for the retry when a newer observation has already landed.
-    const fn verdict(&self, phase: wire::ErrorPhase) -> FailureVerdict {
-        match phase {
-            wire::ErrorPhase::Read => FailureVerdict::AnswerStale,
-            wire::ErrorPhase::Resolve | wire::ErrorPhase::Check | wire::ErrorPhase::Change => {
-                if self.epoch == self.observed_epoch {
-                    FailureVerdict::Refuse
-                } else {
-                    FailureVerdict::Wait
-                }
-            }
-        }
-    }
-
     /// The `stale_index` warning an answer served from `published` carries after this
     /// failure, naming the tree revision `captured` folds to and, when that is the
     /// published one, what `moved` instead.
@@ -894,49 +765,6 @@ impl SearchRanking {
             }],
         }
     }
-}
-
-/// The paths one applied change asks the next snapshot to reparse, or nothing when that
-/// snapshot has to read every visible file.
-///
-/// A change names what it wrote, and a workspace that runs hooks names what they wrote
-/// beside it: [`ChangeService::finalize_hook_result`] rebuilds the summary from the
-/// captures taken around the run, so a hook declaring `writes = "workspace"` lands in the
-/// summary as the files whose bytes it moved, and a run that moved none adds nothing.
-/// Three cases read everything instead: more written paths than `paths_max`, the
-/// workspace's own file bound, which one observation cannot retain anyway; a written path
-/// that decides what the workspace includes, because `rift.toml` and every `.gitignore`
-/// reshape the whole file set; and a wire path the index cannot key, which is covered
-/// rather than narrowed away.
-fn changed_paths_to_reparse(
-    root: &Path,
-    current: &PublishedWorkspace,
-    paths_max: usize,
-    summary: &ChangeSummary,
-) -> Option<Vec<CoreProjectPath>> {
-    if summary.files.len() > paths_max {
-        tracing::info!(
-            component = "index",
-            operation = "index.build",
-            trigger = "rift_change",
-            changed_count = summary.files.len(),
-            paths_max,
-            "change wrote past the workspace file bound; the next snapshot reads every visible file"
-        );
-        return None;
-    }
-    let mut paths = Vec::with_capacity(summary.files.len());
-    for file in &summary.files {
-        let path = CoreProjectPath::new(&file.path.0).ok()?;
-        if current
-            .source_policy
-            .decides_inclusion(&root.join(path.as_str()))
-        {
-            return None;
-        }
-        paths.push(path);
-    }
-    Some(paths)
 }
 
 /// What one revision-qualified store answer means for the request that captured
@@ -1134,8 +962,7 @@ pub(crate) fn hermetic_workspace(root: &Path, configuration: &str) -> std::io::R
     std::fs::write(root.join("rift.toml"), contents)
 }
 
-/// Workspace MCP server: reads serve an immutable snapshot, changes
-/// write the workspace and swap in a fresh snapshot.
+/// Workspace MCP server: reads serve an immutable snapshot rebuilt after source changes.
 ///
 /// Clones share every piece of server state. The HTTP transport clones one
 /// server per request, so index-supervisor cancellation keys off the last
@@ -1152,26 +979,18 @@ pub struct RiftMcp {
     /// never this guard, so the guard's drop is what ends them.
     #[expect(dead_code, reason = "held for its cancel-on-last-drop effect")]
     supervisor_cancellation: Arc<tokio_util::sync::DropGuard>,
-    changes: Arc<ChangeService>,
-    change_lane: Arc<ChangeLane>,
     blocking: BlockingExecutor,
     /// The workspace's search index, absent when it could not be opened at
     /// startup; `search` then serves identifier matching alone and says so in
     /// every answer's warnings.
     search_index: Option<Arc<SearchIndex>>,
-    /// The population lane, absent exactly when [`Self::search_index`] is: with
-    /// no index open there is no store to populate. A landed change hands its
-    /// publication here and returns, rather than awaiting the pass itself.
-    population: Option<PopulationLane>,
     /// The lexical lane, absent exactly when [`Self::search_index`] is. A rebuild commits
     /// through it before its snapshot becomes current.
     lexical: Option<LexicalLane>,
     /// The dependency index every published snapshot answers a dependency-scoped
     /// lookup from. The lane fills it behind the answers.
+    #[cfg(test)]
     dependencies: Arc<DependencyStore>,
-    /// The dependency lane. A publication hands its catalog here and returns, rather
-    /// than awaiting the package builds itself.
-    dependency_lane: DependencyLane,
     /// The workspace's recorded diagnostics, absent when the store could not be
     /// opened at startup; `rift://logs` then answers with that reason rather
     /// than refusing. The handle is the read side alone: the drain task that
@@ -1183,24 +1002,6 @@ pub struct RiftMcp {
     #[cfg(test)]
     forced_capture: ForcedCapture,
     tool_router: ToolRouter<Self>,
-}
-
-/// One already-serialized change's outcome, threaded out of the blocking executor so the
-/// async `change` method hands on exactly the publication this change landed, without a
-/// second, possibly-superseded read of shared state.
-struct SerializedChange {
-    result: Result<Json<ChangeResult>, ErrorData>,
-    publication: Option<AppliedPublication>,
-}
-
-impl SerializedChange {
-    /// A refusal or a diagnostic-only outcome: nothing published.
-    const fn wire(result: Result<Json<ChangeResult>, ErrorData>) -> Self {
-        Self {
-            result,
-            publication: None,
-        }
-    }
 }
 
 /// The search tier one server opens at startup: the index, the lanes over it, and the
@@ -1236,31 +1037,6 @@ impl AssembledServer {
         drop(held);
         self.server
     }
-}
-
-/// Candidate one landed change built for publication and diagnostics.
-struct AppliedCandidate {
-    previous: Arc<PublishedWorkspace>,
-    published: Arc<PublishedWorkspace>,
-    change_set: rift_index::ChangeSet,
-    write: LexicalWrite,
-    work: PendingWork,
-    epoch: u64,
-}
-
-/// What one landed change published, and the snapshot its diagnostics pull against.
-struct AppliedPublication {
-    previous: Arc<PublishedWorkspace>,
-    /// The change's own snapshot: the tree the change lane built over the applied
-    /// write. Engine diagnostics pull against it whether or not it became the current
-    /// publication: a concurrent rebuild that superseded it may have scanned the tree
-    /// before the write landed, so the current publication can predate the change.
-    snapshot: Arc<PublishedWorkspace>,
-    /// Whether `snapshot` became the current publication. Only a published snapshot is
-    /// handed to the population lane; a superseded one is embedded by the rebuild that
-    /// superseded it.
-    published: bool,
-    change_set: rift_index::ChangeSet,
 }
 
 #[tool_router(router = tool_router, vis = "pub(crate)")]
@@ -1375,12 +1151,10 @@ impl RiftMcp {
             current: published,
             failure: None,
         }));
-        let change_lane = Arc::new(ChangeLane::default());
         let context = IndexSupervisorContext {
             root: root.clone(),
             limits,
             published: Arc::clone(&published),
-            change_lane: Arc::clone(&change_lane),
             validation: Arc::clone(&validation),
             blocking: blocking.clone(),
             population: population.clone(),
@@ -1409,14 +1183,11 @@ impl RiftMcp {
             published,
             validation,
             supervisor_cancellation,
-            changes: Arc::new(ChangeService::new(&root)),
-            change_lane,
             blocking,
             search_index,
-            population,
             lexical,
+            #[cfg(test)]
             dependencies,
-            dependency_lane,
             logs,
             engines,
             #[cfg(test)]
@@ -1526,27 +1297,6 @@ impl RiftMcp {
         &self.identity
     }
 
-    /// The engine pool serving the currently published LSP configuration.
-    ///
-    /// The hold outlives rebuilds: a publication whose engine tables are
-    /// unchanged reuses the running sessions, and one whose tables differ
-    /// replaces the pool and shuts the old engines down.
-    pub async fn engine_pool(&self) -> Arc<EnginePool> {
-        let published = Arc::clone(&self.published.read().await.current);
-        self.engine_pool_for(&published).await
-    }
-
-    /// The engine pool serving one captured publication's LSP configuration.
-    async fn engine_pool_for(&self, published: &PublishedWorkspace) -> Arc<EnginePool> {
-        let (definitions, bindings) = published.configuration.lsp_runtime_configuration();
-        self.engines.pool_for(definitions, bindings).await
-    }
-
-    /// Returns the shared engine hold for transport shutdown paths.
-    pub(crate) fn engine_hold(&self) -> Arc<EngineHold> {
-        Arc::clone(&self.engines)
-    }
-
     /// Returns owned supervisor shutdown access for transport adapters.
     pub(crate) fn index_supervisor(&self) -> IndexSupervisor {
         IndexSupervisor {
@@ -1651,12 +1401,59 @@ impl RiftMcp {
                  the request once the rebuilds settle",
             )
         });
+        let references = self.engine_references(&resolved, &params, budget).await?;
         let executed = params;
         let mut answer = self
-            .current_tree_read(&resolved, move |reads| reads.search(&executed, &units))
+            .current_tree_read(&resolved, move |reads| {
+                reads.search_with_references(&executed, &units, &references)
+            })
             .await?;
         answer.0.warnings.extend(warnings);
         Ok(answer)
+    }
+
+    /// Resolves references against one unchanged current-tree publication.
+    ///
+    /// Filesystem movement before or during the engine request discards its references;
+    /// the request still reads its captured index. A stale publication uses its index alone.
+    async fn engine_references(
+        &self,
+        resolved: &ResolvedWorkspace,
+        params: &SearchParams,
+        budget: Duration,
+    ) -> Result<EngineReferences, ErrorData> {
+        if params.traversal.is_none() || resolved.stale.is_some() {
+            return Ok(EngineReferences::default());
+        }
+        if !self.engine_tree_matches(&resolved.published).await? {
+            return Ok(EngineReferences::default());
+        }
+        let engines = self.engine_pool_for(&resolved.published).await;
+        let references = tokio::time::timeout(
+            budget,
+            resolve_engine_references(&resolved.published.reads, &engines, params),
+        )
+        .await
+        .map_err(|_| {
+            ReadFault::unavailable("engine references", "request deadline exceeded")
+                .tool_error(wire::ErrorPhase::Read)
+        })?
+        .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        if self.engine_tree_matches(&resolved.published).await? {
+            Ok(references)
+        } else {
+            Ok(EngineReferences::default())
+        }
+    }
+
+    /// Whether the captured source and configuration still match the publication.
+    async fn engine_tree_matches(&self, published: &PublishedWorkspace) -> Result<bool, ErrorData> {
+        let (digests, configuration) = self
+            .capture_tree(published)
+            .await
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        Ok(digests.fingerprint() == published.fingerprint
+            && configuration == published.configuration.fingerprint)
     }
 
     /// Runs the search index for one request against `published` - the exact snapshot the
@@ -1773,207 +1570,6 @@ impl RiftMcp {
     ) -> Result<Json<NodesResult>, ErrorData> {
         let rev = params.rev.clone();
         self.read_at(rev, move |reads| reads.nodes(params)).await
-    }
-
-    /// Replaces one declaration addressed by symbol. The whole declaration
-    /// includes its attached outer attributes and doc comments. The parser
-    /// derives the span, so the caller supplies no offsets; a refusal
-    /// names the failed precondition and leaves the workspace untouched.
-    /// The body is spliced in verbatim at the declaration's own start byte:
-    /// its first line inherits the declaration's column, and every later
-    /// line carries whatever indentation it is written with.
-    #[tool]
-    async fn replace_symbol(
-        &self,
-        Parameters(params): Parameters<ReplaceSymbolParams>,
-    ) -> Result<Json<ChangeResult>, ErrorData> {
-        self.change(move |reads, changes| changes.replace_symbol(reads, &params))
-            .await
-    }
-
-    /// Inserts a new declaration beside an anchor symbol, or content at a file
-    /// target. Anchored insertions land beside the anchor's whole declaration,
-    /// its attached outer attributes and doc comments included. A file target
-    /// lands the body verbatim at the file's start or end, creating it first
-    /// when `create_missing` is set and it is missing. A refusal names the
-    /// failed precondition and leaves the workspace untouched. A body
-    /// inserted `before` its anchor is spliced in at the anchor's start byte
-    /// and its first line inherits the anchor's column; a body inserted
-    /// `after` its anchor, or at a file target either side, always starts a
-    /// fresh line at column zero.
-    #[tool]
-    async fn insert_symbol(
-        &self,
-        Parameters(params): Parameters<InsertSymbolParams>,
-    ) -> Result<Json<ChangeResult>, ErrorData> {
-        self.change(move |reads, changes| changes.insert_symbol(reads, &params))
-            .await
-    }
-
-    /// Replaces one syntax node through a witnessed address from `nodes`.
-    /// The server recomputes the witness before writing and refuses when the
-    /// bytes drifted, so a stale address never splices into moved code.
-    #[tool]
-    async fn replace_node(
-        &self,
-        Parameters(params): Parameters<ReplaceNodeParams>,
-    ) -> Result<Json<ChangeResult>, ErrorData> {
-        self.change(move |reads, changes| changes.replace_node(reads, &params))
-            .await
-    }
-
-    /// Inserts new content beside a syntax node addressed through a witnessed address
-    /// from `nodes`. The server recomputes the witness before writing and refuses when
-    /// the bytes drifted, the same check `replace_node` runs. Unlike `insert_symbol`,
-    /// which separates a new declaration from its anchor with a blank line and preserves
-    /// the anchor's indentation, `body` lands verbatim at the node's own boundary with no
-    /// separator of its own: a node is not a declaration, so the caller supplies whatever
-    /// spacing and indentation the inserted bytes need.
-    #[tool]
-    async fn insert_node(
-        &self,
-        Parameters(params): Parameters<InsertNodeParams>,
-    ) -> Result<Json<ChangeResult>, ErrorData> {
-        self.change(move |reads, changes| changes.insert_node(reads, &params))
-            .await
-    }
-
-    /// Renames one declaration addressed by symbol through the configured
-    /// language engine. The engine proposes the edits; the server verifies
-    /// each one against the tree and writes them atomically, then reports
-    /// surviving occurrences of the old name as warning findings. Refused
-    /// as `unsupported` when no engine serves the declaration's language;
-    /// a refusal leaves the workspace untouched.
-    #[tool]
-    async fn rename_symbol(
-        &self,
-        Parameters(params): Parameters<RenameSymbolParams>,
-    ) -> Result<Json<ChangeResult>, ErrorData> {
-        let published = self
-            .published_workspace(wire::ErrorPhase::Change)
-            .await?
-            .published;
-        published.configuration.accepted(wire::ErrorPhase::Change)?;
-        let pool = self.engine_pool_for(&published).await;
-        let resolution = plan_rename(&published.reads, &pool, &self.root, &params)
-            .await
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
-        match resolution {
-            RenameResolution::Refused(result) => Ok(Json(result)),
-            RenameResolution::Planned(plan) => {
-                self.change(move |reads, changes| changes.apply_rename(reads, &plan))
-                    .await
-            }
-        }
-    }
-
-    /// Moves one visible file to a new project path. When the configured
-    /// language engine advertises will-rename requests for the file, its
-    /// reference updates land in the same atomic change; without an engine
-    /// or the capability the move still lands and the result carries a
-    /// warning that references were not updated. A refusal names the
-    /// failed precondition and leaves the workspace untouched.
-    #[tool]
-    async fn move_file(
-        &self,
-        Parameters(params): Parameters<MoveFileParams>,
-    ) -> Result<Json<ChangeResult>, ErrorData> {
-        let published = self
-            .published_workspace(wire::ErrorPhase::Change)
-            .await?
-            .published;
-        published.configuration.accepted(wire::ErrorPhase::Change)?;
-        let pool = self.engine_pool_for(&published).await;
-        let resolution = plan_move(&published.reads, &pool, &self.root, &params)
-            .await
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
-        match resolution {
-            MoveResolution::Refused(result) => Ok(Json(result)),
-            MoveResolution::Planned(plan) => {
-                self.change(move |reads, changes| changes.apply_move(reads, &plan))
-                    .await
-            }
-        }
-    }
-
-    /// Removes one declaration addressed by symbol. The whole declaration,
-    /// its attached outer attributes and doc comments included, is removed
-    /// together with the separator that followed it, so no blank-line run
-    /// stands where it stood. When the configured language engine
-    /// advertises `textDocument/references`, a standing reference refuses
-    /// `unmet_precondition` naming `no_references`, unless `force` applies
-    /// the removal anyway and carries the references as a warning. When the
-    /// check does not run - no such engine, an engine that has not confirmed
-    /// its readiness, or an engine that does not hold the file - the removal
-    /// applies and carries a warning naming why it was not checked.
-    #[tool]
-    async fn remove_symbol(
-        &self,
-        Parameters(params): Parameters<RemoveSymbolParams>,
-    ) -> Result<Json<ChangeResult>, ErrorData> {
-        let published = self
-            .published_workspace(wire::ErrorPhase::Change)
-            .await?
-            .published;
-        published.configuration.accepted(wire::ErrorPhase::Change)?;
-        let pool = self.engine_pool_for(&published).await;
-        let resolution = plan_remove_symbol(&published.reads, &pool, &self.root, &params)
-            .await
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
-        match resolution {
-            RemoveResolution::Refused(result) => Ok(Json(result)),
-            RemoveResolution::Planned(plan) => {
-                self.change(move |reads, changes| changes.apply_remove(reads, &plan))
-                    .await
-            }
-        }
-    }
-
-    /// Removes one syntax node through a witnessed address from `nodes`.
-    /// The server recomputes the witness before writing and refuses when
-    /// the bytes drifted, so a stale address never removes moved code. When
-    /// the node names a declaration, the removal is checked against the
-    /// configured language engine's references the same way `remove_symbol`
-    /// checks them; a node naming no declaration applies unchecked, with a
-    /// warning saying so.
-    #[tool]
-    async fn remove_node(
-        &self,
-        Parameters(params): Parameters<RemoveNodeParams>,
-    ) -> Result<Json<ChangeResult>, ErrorData> {
-        let published = self
-            .published_workspace(wire::ErrorPhase::Change)
-            .await?
-            .published;
-        published.configuration.accepted(wire::ErrorPhase::Change)?;
-        let pool = self.engine_pool_for(&published).await;
-        let resolution = plan_remove_node(&published.reads, &pool, &self.root, &params)
-            .await
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
-        match resolution {
-            RemoveResolution::Refused(result) => Ok(Json(result)),
-            RemoveResolution::Planned(plan) => {
-                self.change(move |reads, changes| changes.apply_remove(reads, &plan))
-                    .await
-            }
-        }
-    }
-
-    /// Applies unified-diff hunks to workspace files atomically. The target is any
-    /// file the workspace's `[source]` policy makes visible, parsed or not. Hunk
-    /// context guards the change: a header's line numbers are hints and
-    /// its line counts are read from the hunk's own body, as with
-    /// `git apply`. A `/dev/null` header creates or deletes the file. A body
-    /// that is not a unified diff, such as an `*** Begin Patch` envelope, is
-    /// refused naming the form to send. The result names each file the change
-    /// wrote with its size and line counts.
-    #[tool]
-    async fn patch(
-        &self,
-        Parameters(params): Parameters<PatchParams>,
-    ) -> Result<Json<ChangeResult>, ErrorData> {
-        self.change(move |reads, changes| changes.patch(reads, &params))
-            .await
     }
 
     /// Runs one read against the tree the request names - the current
@@ -2143,18 +1739,13 @@ impl RiftMcp {
     /// failed waits for nothing: it answers from that publication and says so, and the
     /// next filesystem event retries the rebuild.
     ///
-    /// Two relaxations serve a read alone. A change phase keeps refusing under both,
-    /// because a write resolves its address against the tree it is about to modify, and
-    /// only `Read` and `Change` reach here: every `published_workspace` call names one of
-    /// the two.
-    ///
     /// The first is the filesystem epoch, which counts observations rather than content.
     /// [`IndexValidation::observe_locked`] increments it for every classified event, and
     /// [`watch_path_impact`] classifies from the path and the event kind without reading a
     /// byte, so a write that lands the bytes a file already held moves the epoch while
     /// every digest stays equal. The capture is the content comparison: a read accepts the
     /// publication whenever the capture folds to its fingerprint under its configuration,
-    /// whatever the epoch counter reads, while a change still waits for the two to agree.
+    /// whatever the epoch counter reads.
     ///
     /// The second is the attempt budget. A successful superseded capture already proves
     /// movement: a read checks the tree once and answers stale with that recorded epoch.
@@ -2168,7 +1759,6 @@ impl RiftMcp {
         &self,
         phase: wire::ErrorPhase,
     ) -> Result<ResolvedWorkspace, ErrorData> {
-        let answers_stale = matches!(phase, wire::ErrorPhase::Read);
         let mut spent = None;
         let mut wait = ReadWait::Capture;
         for _attempt in 0..INDEX_CAPTURE_ATTEMPTS_MAX {
@@ -2185,8 +1775,7 @@ impl RiftMcp {
                 current.configuration.fingerprint == configuration_fingerprint;
             let tree_matches =
                 digests.fingerprint() == current.fingerprint && configuration_matches;
-            let epoch_matches = current.epoch == self.validation.observed_epoch();
-            if tree_matches && (epoch_matches || answers_stale) {
+            if tree_matches {
                 current.configuration.accepted(phase)?;
                 return Ok(ResolvedWorkspace::current(current));
             }
@@ -2207,8 +1796,7 @@ impl RiftMcp {
                 self.validation.observe_whole_workspace()
             };
             observed.map_err(|error| error.tool_error(phase))?;
-            if answers_stale
-                && configuration_matches
+            if configuration_matches
                 && let Some(epoch) = self.validation.superseded_after(current.epoch)
             {
                 current.configuration.accepted(phase)?;
@@ -2235,8 +1823,7 @@ impl RiftMcp {
             };
             spent = Some((current, digests, changes, moved));
         }
-        if answers_stale
-            && matches!(wait, ReadWait::Rebuild)
+        if matches!(wait, ReadWait::Rebuild)
             && let Some((current, digests, changes, moved)) = spent
         {
             current.configuration.accepted(phase)?;
@@ -2298,15 +1885,14 @@ impl RiftMcp {
 
     /// Waits until published and observed epochs agree, or resolves what a recorded
     /// rebuild failure means for this request: a read answers from the publication and
-    /// carries the failure, a change refuses with it at the observed epoch and waits for
-    /// the retry at an older one.
+    /// carries the failure.
     ///
     /// A read's first capture compares content even when observations are ahead. Changed
     /// source then waits for publication, unless a successful capture after the current
     /// publication was superseded. That completed work proves continued movement, so the
     /// read reaches its bounded captures and stale answer without waiting for a publication
     /// the moving tree keeps superseding. A later publication makes that exception
-    /// obsolete. Configuration movement and changes keep waiting for the epochs to agree.
+    /// obsolete. Configuration movement keeps waiting for the epochs to agree.
     ///
     /// Every other job of this loop stands for a read: a watcher the backend reported
     /// broken refuses, a supervisor that stopped refuses while the epochs disagree, and a
@@ -2360,382 +1946,18 @@ impl RiftMcp {
                     observed_epoch,
                     error,
                 };
-                match recorded.verdict(phase) {
-                    FailureVerdict::AnswerStale => return Ok((current, Some(recorded))),
-                    FailureVerdict::Refuse => return Err(recorded.error.tool_error(phase)),
-                    FailureVerdict::Wait => {}
-                }
+                return Ok((current, Some(recorded)));
             }
             let capture = match wait {
                 ReadWait::Capture => true,
                 ReadWait::Rebuild => self.validation.superseded_after(current.epoch).is_some(),
                 ReadWait::Configuration => false,
             };
-            if matches!(phase, wire::ErrorPhase::Read) && capture {
+            if capture {
                 return Ok((current, None));
             }
             changed.as_mut().await;
         }
-    }
-
-    /// Runs one change under the change lane, then hands its publication to the
-    /// dependency and population lanes and pulls engine diagnostics.
-    async fn change(
-        &self,
-        operation: impl FnOnce(&ReadService, &ChangeService) -> Result<ChangeResult, ReadError>
-        + Send
-        + 'static,
-    ) -> Result<Json<ChangeResult>, ErrorData> {
-        self.published_workspace(wire::ErrorPhase::Change).await?;
-        let root = self.root.clone();
-        let limits = self.limits;
-        let published = Arc::clone(&self.published);
-        let validation = Arc::clone(&self.validation);
-        let changes = Arc::clone(&self.changes);
-        let change_lane = Arc::clone(&self.change_lane);
-        let dependencies = Arc::clone(&self.dependencies);
-        let lexical = self.lexical.clone();
-        let outcome = self
-            .blocking
-            .run("workspace change", move || {
-                change_lane.run(|| {
-                    Self::change_serialized(
-                        &root,
-                        limits,
-                        &published,
-                        &validation,
-                        &changes,
-                        &dependencies,
-                        lexical.as_ref(),
-                        operation,
-                    )
-                })
-            })
-            .await
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Change))?;
-        let mut result = outcome.result?;
-        let publication = outcome.publication;
-        let published_next = publication
-            .as_ref()
-            .filter(|publication| publication.published)
-            .map(|publication| &publication.snapshot);
-        if let Some(next) = published_next {
-            self.dependency_lane.request_for(next);
-            if let Some(lane) = self.population.as_ref() {
-                lane.request(Arc::clone(next));
-            }
-        }
-        if let Json(ChangeResult::Applied { summary }) = &mut result
-            && let Some(publication) = publication.as_ref()
-        {
-            if publication.previous.configuration.has_validation_hooks() {
-                self.engines.shutdown().await;
-            }
-            let engines = self.engine_pool_for(&publication.snapshot).await;
-            summary.diagnostics.extend(
-                rift_server::engine_change_set_diagnostics(
-                    &engines,
-                    &publication.previous.reads,
-                    &publication.snapshot.reads,
-                    &publication.change_set,
-                )
-                .await,
-            );
-        }
-        Ok(result)
-    }
-
-    /// Publishes one landed change under the lane the caller holds, handing the lexical
-    /// lane its write, and returns what it published.
-    ///
-    /// The publication takes the same linearization point filesystem observation takes,
-    /// so a candidate superseded while it was built cannot become current. The events
-    /// the change's own write raised are not such a supersession: they name paths the
-    /// snapshot already holds, and the publication answers their epoch instead. A
-    /// publication the supervisor's cancellation refused answers like a superseded one:
-    /// the snapshot did not become current, and the process is leaving.
-    fn publish_applied_change(
-        root: &Path,
-        published: &RwLock<IndexState>,
-        validation: &IndexValidation,
-        lexical: Option<&LexicalLane>,
-        candidate: AppliedCandidate,
-    ) -> AppliedPublication {
-        let AppliedCandidate {
-            previous,
-            published: snapshot,
-            change_set,
-            write,
-            work,
-            epoch,
-        } = candidate;
-        let handoff = lexical
-            .cloned()
-            .map(|lane| LexicalHandoff::new(lane, write));
-        let outcome = finish_rebuild(root, published, validation, &snapshot, work, handoff);
-        let became_current = outcome == RebuildOutcome::Published;
-        if became_current {
-            tracing::info!(
-                component = "index",
-                operation = "index.publish",
-                trigger = "rift_change",
-                epoch,
-                "index snapshot published"
-            );
-        }
-        AppliedPublication {
-            previous,
-            snapshot,
-            published: became_current,
-            change_set,
-        }
-    }
-
-    /// One serialized change result and the publication it landed.
-    ///
-    /// Everything here runs under the change lane the caller holds: the write, the
-    /// hooks, the rebuild, and the publication with its lexical hand-off. A watcher
-    /// batch raised by the write's own filesystem events enters the lane after this
-    /// returns, so it resolves its observations against the published edit, finds every
-    /// digest equal, and builds nothing. The hand-offs to the dependency and population
-    /// lanes and the engine diagnostics run after the lane, in [`Self::change`]: none of
-    /// them changes the tree or the publication a later batch resolves against.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one argument per piece of server state the change lane reads and publishes through"
-    )]
-    fn change_serialized(
-        root: &Path,
-        limits: WorkspaceIndexLimits,
-        published: &RwLock<IndexState>,
-        validation: &IndexValidation,
-        changes: &ChangeService,
-        dependencies: &Arc<DependencyStore>,
-        lexical: Option<&LexicalLane>,
-        operation: impl FnOnce(&ReadService, &ChangeService) -> Result<ChangeResult, ReadError>,
-    ) -> Result<SerializedChange, ReadError> {
-        let state = published.blocking_read();
-        let (current, _) = state.snapshot();
-        drop(state);
-        if current.epoch != validation.observed_epoch() {
-            return Ok(SerializedChange::wire(Err(ReadFault::unavailable(
-                "workspace change",
-                "index changed before operation acceptance",
-            )
-            .tool_error(wire::ErrorPhase::Change))));
-        }
-        let configuration = match current.configuration.accepted(wire::ErrorPhase::Change) {
-            Ok(configuration) => configuration,
-            Err(error) => return Ok(SerializedChange::wire(Err(error))),
-        };
-        let original = if configuration.hooks.is_empty() {
-            None
-        } else {
-            let snapshot = changes.capture_hook_snapshot(&current.reads)?;
-            snapshot.require_source_text()?;
-            Some(snapshot)
-        };
-        let result = operation(&current.reads, changes)?;
-        let mut result = match original {
-            Some(original) => Self::apply_hook_pipeline(
-                root,
-                &configuration,
-                changes,
-                &current,
-                &original,
-                result,
-            )?,
-            None => result,
-        };
-        let publication = if let ChangeResult::Applied { summary } = &mut result {
-            Self::rebuild_after_applied_change(
-                root,
-                limits,
-                validation,
-                &current,
-                summary,
-                dependencies,
-            )
-            .map(|candidate| {
-                Self::publish_applied_change(root, published, validation, lexical, candidate)
-            })
-        } else {
-            None
-        };
-        Ok(SerializedChange {
-            result: Ok(Json(result)),
-            publication,
-        })
-    }
-
-    /// Rebuilds snapshot after one landed change and returns publication candidate.
-    fn rebuild_after_applied_change(
-        root: &Path,
-        limits: WorkspaceIndexLimits,
-        validation: &IndexValidation,
-        current: &Arc<PublishedWorkspace>,
-        summary: &mut ChangeSummary,
-        dependencies: &Arc<DependencyStore>,
-    ) -> Option<AppliedCandidate> {
-        let observed =
-            match changed_paths_to_reparse(root, current, validation.paths_max(), summary) {
-                Some(paths) => validation.observe_paths(paths),
-                None => validation.observe_whole_workspace(),
-            };
-        if let Err(error) = observed {
-            summary.diagnostics.push(stale_snapshot_diagnostic(&error));
-            return None;
-        }
-        if current.configuration.fingerprint != configuration_fingerprint(root) {
-            let error = ReadFault::unavailable(
-                "workspace change",
-                "configuration changed during snapshot rebuild",
-            );
-            let _ = validation.observe_whole_workspace();
-            summary.diagnostics.push(stale_snapshot_diagnostic(&error));
-            return None;
-        }
-        let mut request = validation.take_pending();
-        request.previous = Some(Arc::clone(current));
-        let epoch = request.epoch;
-        let candidate = match build_workspace_candidate(root, limits, &request, dependencies) {
-            Ok(WorkspaceCandidate::Stable {
-                published,
-                change_set,
-            }) => {
-                let write = lexical_write(&published, &change_set);
-                AppliedCandidate {
-                    previous: Arc::clone(current),
-                    published,
-                    change_set,
-                    write,
-                    work: request.work,
-                    epoch,
-                }
-            }
-            Ok(WorkspaceCandidate::ConfigurationChanged) => {
-                let error = ReadFault::unavailable(
-                    "workspace change",
-                    "configuration changed during snapshot rebuild",
-                );
-                let _ = validation.observe_whole_workspace();
-                summary.diagnostics.push(stale_snapshot_diagnostic(&error));
-                return None;
-            }
-            Err(error) => {
-                validation.restore_pending(request.work);
-                summary.diagnostics.push(stale_snapshot_diagnostic(&error));
-                return None;
-            }
-        };
-        Some(candidate)
-    }
-
-    /// Runs transforms, restores rejected writes, then runs validations.
-    fn apply_hook_pipeline(
-        root: &Path,
-        configuration: &WorkspaceConfiguration,
-        changes: &ChangeService,
-        current: &PublishedWorkspace,
-        original: &HookSnapshot,
-        result: ChangeResult,
-    ) -> Result<ChangeResult, ReadError> {
-        let ChangeResult::Applied { mut summary } = result else {
-            return Ok(result);
-        };
-        let changed_paths = summary.paths();
-        let selected_hooks =
-            rift_server::selected_hooks(&configuration.hooks, root, &changed_paths)
-                .map_err(ReadFault::index)?;
-        if selected_hooks.is_empty() {
-            return Ok(ChangeResult::Applied { summary });
-        }
-        let direct_paths: std::collections::BTreeSet<&str> =
-            changed_paths.iter().map(|path| path.0.as_str()).collect();
-
-        for hook in selected_hooks
-            .iter()
-            .copied()
-            .filter(|hook| hook.writes.is_transform())
-        {
-            let before = changes.capture_hook_snapshot(&current.reads)?;
-            before.require_source_text()?;
-            let run = rift_server::run_hook(hook, root, &changed_paths);
-            let after = changes.capture_hook_snapshot(&current.reads)?;
-            let hook_paths = before.changed_paths(&after);
-            let in_scope = hook.writes == rift_protocol::configuration::HookWrites::Workspace
-                || hook_paths
-                    .iter()
-                    .all(|path| direct_paths.contains(path.0.as_str()));
-            let permissions_changed = before.permissions_changed(&after);
-            let unavailable_path = after.unavailable_path();
-            if run.status == HookStatus::Passed
-                && in_scope
-                && !permissions_changed
-                && unavailable_path.is_none()
-            {
-                continue;
-            }
-            changes.restore_hook_snapshot(&current.reads, &before, &after)?;
-            let mut reported = run;
-            if reported.status == HookStatus::Passed {
-                let detail = if let Some(path) = unavailable_path {
-                    format!("hook source unavailable: {path}")
-                } else if permissions_changed {
-                    "hook changed source permissions".to_owned()
-                } else {
-                    "hook changed source outside declared write scope".to_owned()
-                };
-                reported.status = HookStatus::Error(detail);
-            }
-            summary
-                .diagnostics
-                .push(hook_failure_diagnostic(hook, &reported));
-        }
-
-        let final_snapshot = changes.capture_hook_snapshot(&current.reads)?;
-        final_snapshot.require_source_text()?;
-        let ChangeResult::Applied { mut summary } =
-            changes.finalize_hook_result(original, &final_snapshot, summary)?
-        else {
-            return Ok(ChangeResult::Unchanged);
-        };
-        let validated_paths = summary.paths();
-
-        for hook in selected_hooks
-            .iter()
-            .copied()
-            .filter(|hook| hook.writes.is_validation())
-        {
-            let before = changes.capture_hook_snapshot(&current.reads)?;
-            before.require_source_text()?;
-            let run = rift_server::run_hook(hook, root, &validated_paths);
-            let after = changes.capture_hook_snapshot(&current.reads)?;
-            if !before.is_unchanged(&after) {
-                changes.restore_hook_snapshot(&current.reads, &before, &after)?;
-                let mut reported = run;
-                reported.status =
-                    HookStatus::Error("validation hook changed source files".to_owned());
-                summary
-                    .diagnostics
-                    .push(hook_failure_diagnostic(hook, &reported));
-            } else if run.status == HookStatus::Passed {
-                summary
-                    .guarantees
-                    .extend(hook.guarantees.iter().map(|guarantee| GuaranteeEvidence {
-                        kind: guarantee.kind,
-                        scope: guarantee.scope.clone(),
-                        hook: hook.id.clone(),
-                        detail: guarantee.detail.clone(),
-                    }));
-            } else {
-                summary
-                    .diagnostics
-                    .push(hook_failure_diagnostic(hook, &run));
-            }
-        }
-
-        Ok(ChangeResult::Applied { summary })
     }
 }
 
@@ -2773,24 +1995,14 @@ impl RiftMcp {
     async fn read_workspace(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
         let page_index = resource::workspace_page_index(uri)?;
         let current = Arc::clone(&self.published.read().await.current);
-        let pool = self.engine_pool_for(&current).await;
         let configuration = current
             .configuration
             .accepted
             .as_ref()
             .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?
             .clone();
+        let pool = self.engine_pool_for(&current).await;
         let languages = workspace_languages(&current, &configuration, &pool)?;
-        let hooks = configuration
-            .hooks
-            .iter()
-            .map(|hook| WorkspaceHookSummary {
-                id: hook.id.clone(),
-                kind: hook.kind,
-                include: hook.include.clone(),
-                exclude: hook.exclude.clone(),
-            })
-            .collect();
         let source_digests = current
             .reads
             .visible_workspace_digests()
@@ -2823,7 +2035,6 @@ impl RiftMcp {
         let page = WorkspaceResourcePage {
             configuration_revision: Digest(current.configuration.fingerprint.wire_revision()),
             languages,
-            hooks,
             source: page_source,
             pagination: Pagination {
                 page_index,
@@ -2840,61 +2051,6 @@ impl RiftMcp {
         let current = Arc::clone(&self.published.read().await.current);
         Ok(resource::rendered_map(uri, &current.map))
     }
-}
-
-fn workspace_languages(
-    current: &PublishedWorkspace,
-    configuration: &WorkspaceConfiguration,
-    pool: &EnginePool,
-) -> Result<Vec<WorkspaceLanguageSummary>, ErrorData> {
-    let policy = current.source_policy.language_policy();
-    policy
-        .languages()
-        .iter()
-        .map(|effective| {
-            let language = Language::from_identity_segment(effective.identity())
-                .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
-            let input = configuration.languages.get(effective.identity());
-            let enabled = effective.enabled();
-            let lsp = input
-                .filter(|_input| enabled)
-                .and_then(|input| input.lsp.as_ref())
-                .map(|lsp| match lsp {
-                    rift_protocol::configuration::LanguageLspConfiguration::Named(name) => {
-                        (LspProcessKey::Named(name.clone()), name.clone())
-                    }
-                    rift_protocol::configuration::LanguageLspConfiguration::Inline(_) => (
-                        LspProcessKey::Inline(effective.identity().to_owned()),
-                        effective.identity().to_owned(),
-                    ),
-                })
-                .map(|(key, process)| WorkspaceLspSummary {
-                    process,
-                    state: pool
-                        .state_for_key(&key)
-                        .unwrap_or(rift_protocol::workspace::LspState::Stopped),
-                });
-            Ok(WorkspaceLanguageSummary {
-                language,
-                enabled,
-                include: effective
-                    .include()
-                    .iter()
-                    .cloned()
-                    .map(rift_protocol::read::PathPattern)
-                    .collect(),
-                exclude: effective
-                    .exclude()
-                    .iter()
-                    .cloned()
-                    .map(rift_protocol::read::PathPattern)
-                    .collect(),
-                execution: enabled && input.is_some_and(|input| input.execution),
-                syntax: effective.has_syntax(),
-                lsp,
-            })
-        })
-        .collect()
 }
 
 fn file_digest_revision(digest: rift_index::FileDigest) -> String {
@@ -2971,11 +2127,9 @@ impl ServerHandler for RiftMcp {
         )
         .with_server_info(Implementation::new("rift", env!("CARGO_PKG_VERSION")))
         .with_instructions(
-            "Read and edit the current workspace: get_symbol and search find \
-             declarations, nodes lists witnessed syntax nodes at a byte position, \
-             and replace_symbol, insert_symbol, replace_node, rename_symbol, \
-             move_file, and patch change code atomically behind verified \
-             preconditions. The rift://workspace resource reads effective configuration \
+            "Read the current workspace: get_symbol and search find \
+             declarations, nodes lists syntax nodes at a byte position. \
+             The rift://workspace resource reads effective configuration \
              and source files. The rift://logs resource reads the server's own diagnostics, \
              including while a tool refuses.",
         );
@@ -2984,92 +2138,172 @@ impl ServerHandler for RiftMcp {
     }
 }
 
+/// The engine pool held across requests, replaced when accepted LSP configuration changes.
+///
+/// Rebuilds recreate the published `ConfigurationState` but never the
+/// long-lived services, so the hold compares the published tables against
+/// the pool it keeps: unchanged tables reuse the running sessions, and
+/// changed tables swap in a fresh pool and shut the replaced one down.
+#[derive(Debug)]
+pub(crate) struct EngineHold {
+    root: PathBuf,
+    pool: AsyncMutex<Arc<EnginePool>>,
+}
+
+impl EngineHold {
+    /// Builds the hold with a pool for startup LSP configuration.
+    pub(crate) fn new(
+        root: PathBuf,
+        definitions: BTreeMap<LspProcessKey, LspConfiguration>,
+        bindings: BTreeMap<String, LspProcessKey>,
+    ) -> Self {
+        let pool = Arc::new(EnginePool::new(&root, definitions, bindings));
+        Self {
+            root,
+            pool: AsyncMutex::new(pool),
+        }
+    }
+
+    /// The pool serving `engines`: the held pool while its tables are
+    /// unchanged, or a replacement built for the new tables.
+    ///
+    /// A replaced pool's sessions are shut down after the hold's lock is
+    /// released, so concurrent callers proceed against the replacement
+    /// while the old engines end; a request still holding the replaced
+    /// pool finishes its exchange first, because shutdown takes each slot's
+    /// own lock.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future after the swap skips the replaced pool's
+    /// graceful shutdown; its children are then killed through the
+    /// session's kill-on-drop arming once the last holder drops the pool.
+    pub(crate) async fn pool_for(
+        &self,
+        definitions: BTreeMap<LspProcessKey, LspConfiguration>,
+        bindings: BTreeMap<String, LspProcessKey>,
+    ) -> Arc<EnginePool> {
+        let mut held = self.pool.lock().await;
+        if held.built_from(&definitions, &bindings) {
+            return Arc::clone(&held);
+        }
+        let rebuilt = Arc::new(held.reconfigure(&self.root, definitions, bindings));
+        let replaced = std::mem::replace(&mut *held, Arc::clone(&rebuilt));
+        drop(held);
+        replaced.shutdown_replaced_by(&rebuilt).await;
+        rebuilt
+    }
+
+    /// Ends the held pool's running engines; the pool stays usable and a
+    /// later request respawns what it needs.
+    pub(crate) async fn shutdown(&self) {
+        let held = Arc::clone(&*self.pool.lock().await);
+        held.shutdown().await;
+    }
+}
+
+impl RiftMcp {
+    /// The engine pool serving the currently published LSP configuration.
+    ///
+    /// The hold outlives rebuilds: a publication whose engine tables are
+    /// unchanged reuses the running sessions, and one whose tables differ
+    /// replaces the pool and shuts the old engines down.
+    pub async fn engine_pool(&self) -> Arc<EnginePool> {
+        let published = Arc::clone(&self.published.read().await.current);
+        self.engine_pool_for(&published).await
+    }
+
+    /// The engine pool serving one captured publication's LSP configuration.
+    async fn engine_pool_for(&self, published: &PublishedWorkspace) -> Arc<EnginePool> {
+        let (definitions, bindings) = published.configuration.lsp_runtime_configuration();
+        self.engines.pool_for(definitions, bindings).await
+    }
+
+    /// Returns the shared engine hold for transport shutdown paths.
+    pub(crate) fn engine_hold(&self) -> Arc<EngineHold> {
+        Arc::clone(&self.engines)
+    }
+}
+
+fn workspace_languages(
+    current: &PublishedWorkspace,
+    configuration: &WorkspaceConfiguration,
+    pool: &EnginePool,
+) -> Result<Vec<WorkspaceLanguageSummary>, ErrorData> {
+    let policy = current.source_policy.language_policy();
+    policy
+        .languages()
+        .iter()
+        .map(|effective| {
+            let language = Language::from_identity_segment(effective.identity())
+                .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+            let input = configuration.languages.get(effective.identity());
+            let enabled = effective.enabled();
+            let lsp = input
+                .filter(|_input| enabled)
+                .and_then(|input| input.lsp.as_ref())
+                .map(|lsp| match lsp {
+                    rift_protocol::configuration::LanguageLspConfiguration::Named(name) => {
+                        (LspProcessKey::Named(name.clone()), name.clone())
+                    }
+                    rift_protocol::configuration::LanguageLspConfiguration::Inline(_) => (
+                        LspProcessKey::Inline(effective.identity().to_owned()),
+                        effective.identity().to_owned(),
+                    ),
+                })
+                .map(|(key, process)| WorkspaceLspSummary {
+                    process,
+                    state: pool
+                        .state_for_key(&key)
+                        .unwrap_or(rift_protocol::workspace::LspState::Stopped),
+                });
+            Ok(WorkspaceLanguageSummary {
+                language,
+                enabled,
+                include: effective
+                    .include()
+                    .iter()
+                    .cloned()
+                    .map(rift_protocol::read::PathPattern)
+                    .collect(),
+                exclude: effective
+                    .exclude()
+                    .iter()
+                    .cloned()
+                    .map(rift_protocol::read::PathPattern)
+                    .collect(),
+                execution: enabled && input.is_some_and(|input| input.execution),
+                syntax: effective.has_syntax(),
+                lsp,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
-    use std::fs;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::time::Duration;
+    #[tokio::test]
+    async fn external_create_of_a_text_file_populates_lexical_search() -> TestResult {
+        let (directory, server) = fixture().await?;
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            let service = server
+                .serve(server_transport)
+                .await
+                .expect("server must initialize");
+            service.waiting().await.expect("server must stop cleanly");
+        });
+        let client = ().serve(client_transport).await?;
 
-    use rift_index::WorkspaceIndexLimits;
+        fs::write(
+            directory.path().join("notes.txt"),
+            "the migration guide covers replacing every legacy unit\n",
+        )?;
+        search_until_hit(client.peer(), "replacing legacy unit", "notes.txt").await?;
 
-    use rift_protocol::configuration::{
-        Duration as WireDuration, LspConfiguration, SearchConfiguration,
-        SemanticSearchConfiguration, SemanticSource,
-    };
-    use rift_protocol::lock::ProductIdentity;
-    use rift_protocol::read::{GetSymbolResult, ReadWarning, SearchParams, SearchResult};
-    use rift_search::{FusedRanking, ModelSource, RevisionScoped, SemanticReadiness};
-    use rift_server::{ChangeService, ConfigurationFault, LspProcessKey, ReadError, ReadFault};
-
-    use rmcp::ServiceError;
-    use rmcp::ServiceExt as _;
-    use rmcp::model::{CallToolRequestParams, ErrorCode};
-    use serde_json::json;
-    use sha2::{Digest as _, Sha256};
-
-    use crate::dependency::{DependencyPlan, empty_dependency_store};
-    use crate::validation::RebuildRequest;
-
-    use super::{BlockingExecutor, ChangeLane, CoreProjectPath, Parameters, RiftMcp};
-    use crate::validation::lexical_double::StoreDouble;
-    use crate::validation::{
-        ConfigurationState, IndexState, IndexValidation, LEXICAL_COMMIT_TIMEOUT,
-        LexicalCommitState, LexicalLane, PublishedWorkspace, RebuildOutcome, WorkspaceCandidate,
-        build_workspace_candidate, configuration_fingerprint, rebuild_workspace,
-        record_rebuild_failure, workspace_capture,
-    };
-
-    type TestResult<T = ()> = Result<T, Box<dyn Error>>;
-
-    async fn fixture() -> TestResult<(tempfile::TempDir, RiftMcp)> {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        super::hermetic_workspace(directory.path(), "")?;
-        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
-        Ok((directory, server))
-    }
-
-    async fn get_symbol(server: &RiftMcp, name: &str) -> Result<GetSymbolResult, rmcp::ErrorData> {
-        let params = serde_json::from_value(json!({"name": name}))
-            .expect("test symbol parameters must deserialize");
-        server
-            .get_symbol(Parameters(params))
-            .await
-            .map(|result| result.0)
-    }
-
-    async fn run_search(server: &RiftMcp, query: &str) -> Result<SearchResult, rmcp::ErrorData> {
-        let params: SearchParams = serde_json::from_value(json!({"query": query}))
-            .expect("test search parameters must deserialize");
-        server
-            .search(Parameters(params))
-            .await
-            .map(|result| result.0)
-    }
-
-    fn arguments(
-        value: &serde_json::Value,
-    ) -> TestResult<serde_json::Map<String, serde_json::Value>> {
-        value
-            .as_object()
-            .cloned()
-            .ok_or_else(|| "tool arguments must be an object".into())
-    }
-
-    fn stable_candidate(root: &std::path::Path, epoch: u64) -> TestResult<Arc<PublishedWorkspace>> {
-        match build_workspace_candidate(
-            root,
-            WorkspaceIndexLimits::default(),
-            &RebuildRequest::initial(epoch),
-            &empty_dependency_store(),
-        )? {
-            WorkspaceCandidate::Stable { published, .. } => Ok(published),
-            WorkspaceCandidate::ConfigurationChanged => {
-                Err("fixture configuration must remain stable".into())
-            }
-        }
+        client.cancel().await?;
+        server_task.await?;
+        Ok(())
     }
 
     /// One named LSP definition and its exact language binding, built through
@@ -3228,6 +2462,153 @@ mod tests {
             "captured request keeps its own LSP selection after publication moves"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_resource_reports_named_inline_and_disabled_languages() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(directory.path().join("script.rb"), "puts 'beacon'\n")?;
+        super::hermetic_workspace(
+            directory.path(),
+            "[lsp.shared]\ncommand = \"language-server\"\n\
+             [languages.ruby]\ninclude = [\"**/*.rb\"]\nexecution = true\nlsp = \"shared\"\n\
+             [languages.rust.lsp]\ncommand = \"rust-analyzer\"\n\
+             [languages.toml]\nenabled = false\nexecution = true\nlsp = \"shared\"\n",
+        )?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+
+        let answer = server.read_workspace("rift://workspace").await?;
+        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = answer
+            .contents
+            .first()
+            .expect("a workspace read answers with one content")
+        else {
+            unreachable!("a workspace read answers with text");
+        };
+        let body: serde_json::Value = serde_json::from_str(text)?;
+        let languages = body["languages"]
+            .as_array()
+            .expect("workspace languages are an array");
+        let language = |name: &str| {
+            languages
+                .iter()
+                .find(|entry| entry["language"] == serde_json::json!(name))
+                .expect("configured language is reported")
+        };
+
+        let rust = language("rust");
+        assert_eq!(rust["lsp"]["process"], serde_json::json!("rust"));
+        assert_eq!(rust["lsp"]["state"], serde_json::json!("stopped"));
+        assert_eq!(
+            rust["execution"],
+            serde_json::json!(false),
+            "execution stays off until its own entry enables it"
+        );
+
+        let ruby = language("ruby");
+        assert_eq!(
+            ruby["execution"],
+            serde_json::json!(true),
+            "an enabled entry carries its own execution permission"
+        );
+        assert_eq!(ruby["syntax"], serde_json::json!(false));
+        assert_eq!(ruby["lsp"]["process"], serde_json::json!("shared"));
+        assert_eq!(ruby["lsp"]["state"], serde_json::json!("stopped"));
+
+        let toml = language("toml");
+        assert_eq!(toml["enabled"], serde_json::json!(false));
+        assert_eq!(toml["execution"], serde_json::json!(false));
+        assert!(
+            toml.get("lsp").is_none(),
+            "disabled language omits LSP state"
+        );
+        Ok(())
+    }
+    use std::error::Error;
+    use std::fs;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use rift_index::WorkspaceIndexLimits;
+
+    use rift_protocol::configuration::{
+        Duration as WireDuration, LspConfiguration, SearchConfiguration,
+        SemanticSearchConfiguration, SemanticSource,
+    };
+    use rift_protocol::lock::ProductIdentity;
+    use rift_protocol::read::{GetSymbolResult, ReadWarning, SearchParams, SearchResult};
+    use rift_search::{FusedRanking, ModelSource, RevisionScoped, SemanticReadiness};
+    use rift_server::{LspProcessKey, ReadError, ReadFault};
+
+    use rmcp::ServiceError;
+    use rmcp::ServiceExt as _;
+    use rmcp::model::{CallToolRequestParams, ErrorCode};
+    use serde_json::json;
+    use sha2::{Digest as _, Sha256};
+
+    use crate::dependency::empty_dependency_store;
+    use crate::validation::RebuildRequest;
+
+    use super::{BlockingExecutor, Parameters, RiftMcp};
+    use crate::validation::lexical_double::StoreDouble;
+    use crate::validation::{
+        LEXICAL_COMMIT_TIMEOUT, LexicalCommitState, LexicalLane, PublishedWorkspace,
+        RebuildOutcome, WorkspaceCandidate, build_workspace_candidate, rebuild_workspace,
+        record_rebuild_failure, workspace_capture,
+    };
+    use rift_core::ProjectPath as CoreProjectPath;
+
+    type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+    async fn fixture() -> TestResult<(tempfile::TempDir, RiftMcp)> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "")?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        Ok((directory, server))
+    }
+
+    async fn get_symbol(server: &RiftMcp, name: &str) -> Result<GetSymbolResult, rmcp::ErrorData> {
+        let params = serde_json::from_value(json!({"name": name}))
+            .expect("test symbol parameters must deserialize");
+        server
+            .get_symbol(Parameters(params))
+            .await
+            .map(|result| result.0)
+    }
+
+    async fn run_search(server: &RiftMcp, query: &str) -> Result<SearchResult, rmcp::ErrorData> {
+        let params: SearchParams = serde_json::from_value(json!({"query": query}))
+            .expect("test search parameters must deserialize");
+        server
+            .search(Parameters(params))
+            .await
+            .map(|result| result.0)
+    }
+
+    fn arguments(
+        value: &serde_json::Value,
+    ) -> TestResult<serde_json::Map<String, serde_json::Value>> {
+        value
+            .as_object()
+            .cloned()
+            .ok_or_else(|| "tool arguments must be an object".into())
+    }
+
+    fn stable_candidate(root: &std::path::Path, epoch: u64) -> TestResult<Arc<PublishedWorkspace>> {
+        match build_workspace_candidate(
+            root,
+            WorkspaceIndexLimits::default(),
+            &RebuildRequest::initial(epoch),
+            &empty_dependency_store(),
+        )? {
+            WorkspaceCandidate::Stable { published, .. } => Ok(published),
+            WorkspaceCandidate::ConfigurationChanged => {
+                Err("fixture configuration must remain stable".into())
+            }
+        }
     }
 
     #[tokio::test]
@@ -3476,63 +2857,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn change_lane_waits_for_active_publication_before_entering() {
-        let lane = Arc::new(ChangeLane::default());
-        let (first_entered_sender, first_entered_receiver) = tokio::sync::oneshot::channel();
-        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
-        let first_lane = Arc::clone(&lane);
-        let first = tokio::task::spawn_blocking(move || {
-            first_lane.run(|| {
-                first_entered_sender
-                    .send(())
-                    .expect("first entry witness must still be listening");
-                release_receiver
-                    .recv()
-                    .expect("test must release first lane operation");
-                1_u8
-            })
-        });
-        first_entered_receiver
-            .await
-            .expect("first operation must enter change lane");
-
-        let second_entered = Arc::new(AtomicBool::new(false));
-        let second_flag = Arc::clone(&second_entered);
-        let (contended_sender, contended_receiver) = tokio::sync::oneshot::channel();
-        let second_lane = Arc::clone(&lane);
-        let second = tokio::task::spawn_blocking(move || {
-            second_lane.run_after_contention(
-                || {
-                    contended_sender
-                        .send(())
-                        .expect("contention witness must still be listening");
-                },
-                || {
-                    second_flag.store(true, Ordering::SeqCst);
-                    2_u8
-                },
-            )
-        });
-        contended_receiver
-            .await
-            .expect("second operation must reach occupied entry");
-        assert!(
-            !second_entered.load(Ordering::SeqCst),
-            "second operation must not enter before first publication releases"
-        );
-
-        release_sender
-            .send(())
-            .expect("first lane operation must accept release");
-        assert_eq!(first.await.expect("first lane task must join"), 1);
-        assert_eq!(second.await.expect("second lane task must join"), 2);
-        assert!(
-            second_entered.load(Ordering::SeqCst),
-            "second operation must proceed after publication releases"
-        );
-    }
-
-    #[tokio::test]
     async fn blocking_executor_queues_until_capacity_returns() {
         let executor = BlockingExecutor::isolated(1, 1_000);
         let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
@@ -3705,58 +3029,6 @@ mod tests {
         assert!(matches!(error.fault(), ReadFault::Task { .. }));
     }
 
-    #[test]
-    fn serialized_change_refuses_invalid_configuration_before_operation() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let candidate = stable_candidate(directory.path(), 0)?;
-        let configuration_error = rift_core::Error::new(ConfigurationFault::Malformed {
-            detail: "test invalid configuration".to_owned(),
-        });
-        let published = tokio::sync::RwLock::new(IndexState {
-            current: Arc::new(PublishedWorkspace {
-                reads: Arc::clone(&candidate.reads),
-                configuration: ConfigurationState {
-                    accepted: Err(Arc::new(configuration_error)),
-                    fingerprint: configuration_fingerprint(directory.path()),
-                },
-                fingerprint: candidate.fingerprint.clone(),
-                source_policy: Arc::clone(&candidate.source_policy),
-                map: Arc::clone(&candidate.map),
-                dependency_plan: DependencyPlan::default(),
-                epoch: 0,
-            }),
-            failure: None,
-        });
-        let (validation, _invalidations) =
-            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        let changes = ChangeService::new(directory.path());
-        let operation_called = AtomicBool::new(false);
-
-        let outcome = RiftMcp::change_serialized(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &published,
-            &validation,
-            &changes,
-            &empty_dependency_store(),
-            None,
-            |_, _| {
-                operation_called.store(true, Ordering::SeqCst);
-                panic!("invalid configuration must stop before operation")
-            },
-        )?;
-        assert!(outcome.publication.is_none());
-        let Err(error) = outcome.result else {
-            panic!("invalid configuration must refuse change");
-        };
-        let data = error.data.expect("Rift error must carry typed data");
-
-        assert_eq!(data["code"], json!("configuration_invalid"));
-        assert!(!operation_called.load(Ordering::SeqCst));
-        Ok(())
-    }
-
     #[tokio::test]
     async fn client_lists_and_calls_exact_read_only_surface() -> TestResult {
         let (_directory, server) = fixture().await?;
@@ -3776,20 +3048,7 @@ mod tests {
                 .iter()
                 .map(|tool| tool.name.as_ref())
                 .collect::<Vec<_>>(),
-            [
-                "get_symbol",
-                "insert_node",
-                "insert_symbol",
-                "move_file",
-                "nodes",
-                "patch",
-                "remove_node",
-                "remove_symbol",
-                "rename_symbol",
-                "replace_node",
-                "replace_symbol",
-                "search"
-            ]
+            ["get_symbol", "nodes", "search"]
         );
         assert!(tools.iter().all(|tool| tool.output_schema.is_some()));
 
@@ -3907,61 +3166,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn client_change_lands_and_reads_serve_the_new_snapshot() -> TestResult {
-        let (_directory, server) = fixture().await?;
-        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
-        let server_task = tokio::spawn(async move {
-            let service = server
-                .serve(server_transport)
-                .await
-                .expect("server must initialize");
-            service.waiting().await.expect("server must stop cleanly");
-        });
-        let client = ().serve(client_transport).await?;
-
-        let change = client
-            .call_tool(
-                CallToolRequestParams::new("replace_symbol").with_arguments(arguments(&json!({
-                    "symbol": "rift://symbol/rust/lib.rs/beacon",
-                    "body": "pub fn beacon() -> u8 {\n    7\n}"
-                }))?),
-            )
-            .await?;
-        let structured = change
-            .structured_content
-            .ok_or("replace_symbol must return structured content")?;
-        assert_eq!(structured["status"], json!("applied"));
-        assert_eq!(
-            structured["summary"]["files"][0]["path"],
-            json!("lib.rs"),
-            "the applied summary names the file it wrote"
-        );
-        assert_eq!(structured["summary"]["files"][0]["kind"], json!("modified"));
-        assert_eq!(structured["summary"]["files"][0]["lines_added"], json!(3));
-
-        let symbol = client
-            .call_tool(
-                CallToolRequestParams::new("get_symbol")
-                    .with_arguments(arguments(&json!({"name": "beacon"}))?),
-            )
-            .await?;
-        let structured = symbol
-            .structured_content
-            .ok_or("get_symbol must return structured content")?;
-        let excerpt = structured["hits"][0]["source"]
-            .as_str()
-            .ok_or("hit must carry source text")?;
-        assert!(
-            excerpt.contains("-> u8"),
-            "reads after an applied change must serve the new snapshot: {excerpt}"
-        );
-
-        client.cancel().await?;
-        server_task.await?;
-        Ok(())
-    }
-
     /// A multi-word prose query neither identifier search path can serve: no line contains
     /// the literal phrase, and no declaration name contains it either. `scale_value`'s doc
     /// comment supplies just the word "units" and `guide.txt` supplies "replace" and "all",
@@ -4049,45 +3253,6 @@ mod tests {
         Ok(())
     }
 
-    /// A text file created after startup is searchable only because the change's own
-    /// publication reached the population lane; the run's first pass never saw it.
-    #[tokio::test]
-    async fn client_change_creating_a_text_file_populates_lexical_search() -> TestResult {
-        let (_directory, server) = fixture().await?;
-        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
-        let server_task = tokio::spawn(async move {
-            let service = server
-                .serve(server_transport)
-                .await
-                .expect("server must initialize");
-            service.waiting().await.expect("server must stop cleanly");
-        });
-        let client = ().serve(client_transport).await?;
-
-        let diff = "--- /dev/null\n+++ b/notes.txt\n@@ -0,0 +1 @@\n+the migration guide covers replacing every legacy unit\n";
-        let change = client
-            .call_tool(
-                CallToolRequestParams::new("patch")
-                    .with_arguments(arguments(&json!({"patch": diff}))?),
-            )
-            .await?;
-        let structured = change
-            .structured_content
-            .ok_or("patch must return structured content")?;
-        assert_eq!(structured["status"], json!("applied"));
-
-        // The change hands its publication to the population lane and returns, and the
-        // change's own writes also wake the watcher, whose rebuild hands over a newer one.
-        // Until one of those passes lands, the revision guard serves identifier-only
-        // results. Poll within a bound instead of asserting the first answer, because that
-        // degraded window is advertised behavior.
-        search_until_hit(client.peer(), "replacing legacy unit", "notes.txt").await?;
-
-        client.cancel().await?;
-        server_task.await?;
-        Ok(())
-    }
-
     /// `build` returns before the lexical lane's first transaction ends and before the
     /// population lane runs the run's first pass.
     ///
@@ -4144,137 +3309,6 @@ mod tests {
             !ranked.results.is_empty(),
             "the committed unit set is searchable: {ranked:#?}"
         );
-        Ok(())
-    }
-
-    /// Calls one tool, retrying the refusals the server advertises as
-    /// `retry: same_request`: a concurrent write may move the index between
-    /// snapshot and acceptance, and the wire contract answers with a bounded
-    /// retry rather than a failure.
-    async fn call_until_accepted(
-        peer: &rmcp::service::Peer<rmcp::service::RoleClient>,
-        params: CallToolRequestParams,
-    ) -> TestResult<rmcp::model::CallToolResult> {
-        const ACCEPTANCE_ATTEMPTS_MAX: usize = 8;
-        for _attempt in 0..ACCEPTANCE_ATTEMPTS_MAX {
-            match peer.call_tool(params.clone()).await {
-                Ok(result) => return Ok(result),
-                Err(ServiceError::McpError(error))
-                    if error
-                        .data
-                        .as_ref()
-                        .is_some_and(|data| data.get("retry") == Some(&json!("same_request"))) => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err("the server kept refusing a retryable change".into())
-    }
-
-    #[tokio::test]
-    async fn concurrent_inserts_publish_from_serialized_fresh_snapshots() -> TestResult {
-        let (directory, server) = fixture().await?;
-        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
-        let server_task = tokio::spawn(async move {
-            let service = server
-                .serve(server_transport)
-                .await
-                .expect("server must initialize");
-            service.waiting().await.expect("server must stop cleanly");
-        });
-        let client = ().serve(client_transport).await?;
-        let first_client = client.peer().clone();
-        let second_client = client.peer().clone();
-        let first = call_until_accepted(
-            &first_client,
-            CallToolRequestParams::new("insert_symbol").with_arguments(arguments(&json!({
-                "anchor": "rift://symbol/rust/lib.rs/beacon",
-                "position": "after",
-                "body": "pub fn first_insert() {}"
-            }))?),
-        );
-        let second = call_until_accepted(
-            &second_client,
-            CallToolRequestParams::new("insert_symbol").with_arguments(arguments(&json!({
-                "anchor": "rift://symbol/rust/lib.rs/beacon",
-                "position": "after",
-                "body": "pub fn second_insert() {}"
-            }))?),
-        );
-        let (first, second) = tokio::join!(first, second);
-        for result in [first?, second?] {
-            let structured = result
-                .structured_content
-                .ok_or("insert_symbol must return structured content")?;
-            assert_eq!(structured["status"], json!("applied"));
-        }
-        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
-        assert!(
-            written.contains("first_insert"),
-            "first concurrent insert must survive: {written}"
-        );
-        assert!(
-            written.contains("second_insert"),
-            "second concurrent insert must survive: {written}"
-        );
-
-        client.cancel().await?;
-        server_task.await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn applied_change_skips_oversized_content_without_false_rebuild_failure() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        super::hermetic_workspace(directory.path(), "")?;
-        let tight = rift_index::WorkspaceIndexLimits::new(4, 60, 60, 4, 100)
-            .map_err(|error| error.to_string())?;
-        let server = RiftMcp::build(directory.path(), tight).await?;
-        let reads = server.clone();
-        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
-        let server_task = tokio::spawn(async move {
-            let service = server
-                .serve(server_transport)
-                .await
-                .expect("server must initialize");
-            service.waiting().await.expect("server must stop cleanly");
-        });
-        let client = ().serve(client_transport).await?;
-
-        let grown = "/// Grown far beyond the configured workspace byte bound.
-pub fn beacon() -> u64 {
-    7_000_000_000_000_000_000
-}";
-        let change = client
-            .call_tool(
-                CallToolRequestParams::new("replace_symbol").with_arguments(arguments(&json!({
-                    "symbol": "rift://symbol/rust/lib.rs/beacon",
-                    "body": grown
-                }))?),
-            )
-            .await?;
-        let structured = change
-            .structured_content
-            .ok_or("replace_symbol must return structured content")?;
-        assert_eq!(structured["status"], json!("applied"));
-        assert!(
-            structured["summary"].get("diagnostics").is_none(),
-            "an applied change with no findings must omit diagnostics"
-        );
-
-        let skipped = get_symbol(&reads, "beacon").await?;
-        assert!(
-            skipped.hits.is_empty(),
-            "oversized source must leave the symbol index: {skipped:#?}"
-        );
-        assert!(skipped.warnings.iter().any(|warning| matches!(
-            warning,
-            ReadWarning::SourceUnavailable { unit: Some(unit), detail }
-                if unit.0.ends_with("/lib.rs") && detail.contains("file byte limit")
-        )));
-
-        client.cancel().await?;
-        server_task.await?;
         Ok(())
     }
 
@@ -4363,385 +3397,6 @@ pub fn beacon() -> u64 {
         Ok(())
     }
 
-    #[test]
-    fn serialized_change_refuses_when_index_already_moved() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let candidate = stable_candidate(directory.path(), 0)?;
-        let (validation, _receiver) =
-            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        validation
-            .observe_whole_workspace()
-            .map_err(|error| format!("observation must land: {error:?}"))?;
-        let published = tokio::sync::RwLock::new(IndexState {
-            current: candidate,
-            failure: None,
-        });
-        let changes = ChangeService::new(directory.path());
-        let outcome = RiftMcp::change_serialized(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &published,
-            &validation,
-            &changes,
-            &empty_dependency_store(),
-            None,
-            |_, _| panic!("a moved index must refuse before the operation runs"),
-        )?;
-        assert!(outcome.publication.is_none());
-        let Err(error) = outcome.result else {
-            panic!("a moved index must refuse the change");
-        };
-        assert!(
-            error
-                .message
-                .contains("index changed before operation acceptance"),
-            "unexpected refusal: {error:?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn applied_change_reports_lost_observation_as_stale_snapshot() -> TestResult {
-        use rift_protocol::change::{ChangeId, ChangeResult, ChangeSummary};
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let candidate = stable_candidate(directory.path(), 0)?;
-        let (validation, receiver) =
-            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        drop(receiver);
-        let published = tokio::sync::RwLock::new(IndexState {
-            current: candidate,
-            failure: None,
-        });
-        let changes = ChangeService::new(directory.path());
-        let outcome = RiftMcp::change_serialized(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &published,
-            &validation,
-            &changes,
-            &empty_dependency_store(),
-            None,
-            |_, _| {
-                Ok(ChangeResult::Applied {
-                    summary: ChangeSummary {
-                        id: ChangeId("0123abcd".to_owned()),
-                        files: Vec::new(),
-                        diagnostics: Vec::new(),
-                        guarantees: Vec::new(),
-                    },
-                })
-            },
-        )?;
-        assert!(outcome.publication.is_none());
-        let Ok(rmcp::Json(ChangeResult::Applied { summary })) = outcome.result else {
-            panic!("the applied change must survive a lost observation");
-        };
-        assert_eq!(summary.diagnostics.len(), 1);
-        assert!(
-            summary.diagnostics[0].message.contains("could not refresh"),
-            "diagnostic must explain the stale snapshot: {:?}",
-            summary.diagnostics[0]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn applied_change_that_moves_configuration_reports_stale_snapshot() -> TestResult {
-        use rift_protocol::change::{ChangeId, ChangeResult, ChangeSummary};
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let candidate = stable_candidate(directory.path(), 0)?;
-        let (validation, _receiver) =
-            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        let published = tokio::sync::RwLock::new(IndexState {
-            current: candidate,
-            failure: None,
-        });
-        let changes = ChangeService::new(directory.path());
-        let root = directory.path().to_path_buf();
-        let outcome = RiftMcp::change_serialized(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &published,
-            &validation,
-            &changes,
-            &empty_dependency_store(),
-            None,
-            move |_, _| {
-                let moved = "[providers.history]\nenabled = false\n";
-                fs::write(root.join("rift.toml"), moved).map_err(|error| {
-                    ReadFault::task("test configuration write", error.to_string())
-                })?;
-                Ok(ChangeResult::Applied {
-                    summary: ChangeSummary {
-                        id: ChangeId("0123abcd".to_owned()),
-                        files: Vec::new(),
-                        diagnostics: Vec::new(),
-                        guarantees: Vec::new(),
-                    },
-                })
-            },
-        )?;
-        assert!(outcome.publication.is_none());
-        let Ok(rmcp::Json(ChangeResult::Applied { summary })) = outcome.result else {
-            panic!("the applied change must survive a moved configuration");
-        };
-        assert_eq!(summary.diagnostics.len(), 1);
-        assert!(
-            summary.diagnostics[0]
-                .message
-                .contains("configuration changed during snapshot rebuild"),
-            "diagnostic must name the moved configuration: {:?}",
-            summary.diagnostics[0]
-        );
-        Ok(())
-    }
-
-    /// The `rift.toml` a workspace-hook test serves: one transform hook that may rewrite
-    /// any source file, running `script` through `sh` from the tree root.
-    #[cfg(unix)]
-    fn workspace_hook_configuration(script: &str) -> String {
-        format!(
-            "[[hooks]]\n\
-             id = \"format\"\n\
-             kind = \"format\"\n\
-             command = [\"sh\", \"{script}\"]\n\
-             writes = \"workspace\"\n\
-             determinism = \"deterministic\"\n"
-        )
-    }
-
-    /// Runs one change that writes `source` to `lib.rs` under a workspace transform hook
-    /// running `script`, against a validation whose retention bound is `paths_max`.
-    #[cfg(unix)]
-    fn workspace_hook_change(
-        directory: &tempfile::TempDir,
-        script: &str,
-        paths_max: usize,
-        source: &'static str,
-    ) -> TestResult<super::SerializedChange> {
-        use rift_protocol::change::{
-            ChangeId, ChangeResult, ChangeSummary, FileChange, FileChangeKind,
-        };
-
-        fs::write(directory.path().join("format.sh"), script)?;
-        fs::write(
-            directory.path().join("rift.toml"),
-            workspace_hook_configuration("format.sh"),
-        )?;
-        let candidate = stable_candidate(directory.path(), 0)?;
-        let (validation, _receiver) = IndexValidation::new(paths_max);
-        let published = tokio::sync::RwLock::new(IndexState {
-            current: candidate,
-            failure: None,
-        });
-        let changes = ChangeService::new(directory.path());
-        let root = directory.path().to_path_buf();
-        let outcome = RiftMcp::change_serialized(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &published,
-            &validation,
-            &changes,
-            &empty_dependency_store(),
-            None,
-            move |_, _| {
-                fs::write(root.join("lib.rs"), source)
-                    .map_err(|error| ReadFault::task("test source write", error.to_string()))?;
-                Ok(ChangeResult::Applied {
-                    summary: ChangeSummary {
-                        id: ChangeId("0123abcd".to_owned()),
-                        files: vec![FileChange {
-                            path: rift_protocol::read::ProjectPath("lib.rs".to_owned()),
-                            kind: FileChangeKind::Modified,
-                            size_bytes: u64::try_from(source.len()).unwrap_or_default(),
-                            line_count: 1,
-                            lines_added: 1,
-                            lines_removed: 1,
-                        }],
-                        diagnostics: Vec::new(),
-                        guarantees: Vec::new(),
-                    },
-                })
-            },
-        )?;
-        Ok(outcome)
-    }
-
-    /// A hook declaring workspace-wide writes names what it rewrote through the summary
-    /// the hook pipeline finalizes, so the next snapshot reparses the change's own file
-    /// and the hook's instead of reading every visible file.
-    #[cfg(unix)]
-    #[test]
-    fn a_workspace_hook_that_rewrote_one_file_rebuilds_that_file_alone() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        fs::write(directory.path().join("notes.txt"), "original note\n")?;
-        let outcome = workspace_hook_change(
-            &directory,
-            "echo 'formatted note' > notes.txt\n",
-            WorkspaceIndexLimits::default().files_max(),
-            "pub fn beacon() -> u8 { 1 }\n",
-        )?;
-        let publication = outcome
-            .publication
-            .ok_or("the applied change must publish a snapshot")?;
-        let rift_index::ChangeSet::Incremental(changes) = publication.change_set else {
-            panic!("a workspace hook's writes must keep the rebuild incremental");
-        };
-        assert_eq!(
-            changes
-                .iter()
-                .map(|(path, _)| path.as_str().to_owned())
-                .collect::<Vec<_>>(),
-            ["lib.rs", "notes.txt"],
-            "the rebuild must name the change's own file and the hook's, and no other"
-        );
-        Ok(())
-    }
-
-    /// A hook that rewrote nothing leaves the tree the publication already holds, so the
-    /// change moves no byte and nothing publishes.
-    #[cfg(unix)]
-    #[test]
-    fn a_workspace_hook_that_rewrote_nothing_publishes_no_rebuild() -> TestResult {
-        use rift_protocol::change::ChangeResult;
-
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let outcome = workspace_hook_change(
-            &directory,
-            "exit 0\n",
-            WorkspaceIndexLimits::default().files_max(),
-            "pub fn beacon() {}\n",
-        )?;
-        assert!(
-            outcome.publication.is_none(),
-            "a run that moved no byte must publish no rebuild"
-        );
-        let Ok(rmcp::Json(ChangeResult::Unchanged)) = outcome.result else {
-            panic!("a run that moved no byte must answer unchanged");
-        };
-        Ok(())
-    }
-
-    /// The workspace's own file bound is what one observation may retain, so a change
-    /// whose hook rewrote past it asks for every visible file instead of a path list the
-    /// retention would escalate anyway.
-    #[cfg(unix)]
-    #[test]
-    fn hook_writes_past_the_workspace_file_bound_rebuild_the_whole_workspace() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        fs::write(directory.path().join("notes.txt"), "original note\n")?;
-        let outcome = workspace_hook_change(
-            &directory,
-            "echo 'formatted note' > notes.txt\n",
-            1,
-            "pub fn beacon() -> u8 { 1 }\n",
-        )?;
-        let publication = outcome
-            .publication
-            .ok_or("the applied change must publish a snapshot")?;
-        assert_eq!(
-            publication.change_set,
-            rift_index::ChangeSet::Full,
-            "two written paths past a one-path bound must read every visible file"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn applied_change_that_breaks_the_source_policy_rebuild_reports_stale_snapshot() -> TestResult {
-        use rift_protocol::change::{
-            ChangeId, ChangeResult, ChangeSummary, FileChange, FileChangeKind,
-        };
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let configuration = directory.path().join("rift.toml");
-        fs::write(configuration, "[source]\nfiles = 1000\n")?;
-        let candidate = stable_candidate(directory.path(), 0)?;
-        let (validation, _receiver) =
-            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        let published = tokio::sync::RwLock::new(IndexState {
-            current: candidate,
-            failure: None,
-        });
-        let changes = ChangeService::new(directory.path());
-        let root = directory.path().to_path_buf();
-        // `[source] files = 1000` accepts the workspace's single Rust source file: the
-        // source scan never counts `.gitignore` files. `ReadService::build` also compiles
-        // the `[source]` policy right after that scan, and its `GitignoreChain` walk counts
-        // each `.gitignore` file against that same bound, so the 1001 `.gitignore` files
-        // written by the change trip `TooManyFiles` there even though the source scan alone
-        // already succeeded.
-        let outcome = RiftMcp::change_serialized(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &published,
-            &validation,
-            &changes,
-            &empty_dependency_store(),
-            None,
-            move |_, _| {
-                let nested = root.join("nested");
-                let root_gitignore = root.join(".gitignore");
-                let nested_gitignore = root.join("nested/.gitignore");
-                fs::create_dir_all(&nested).expect("nested directory scaffold must write");
-                fs::write(&root_gitignore, "").expect("root gitignore scaffold must write");
-                fs::write(&nested_gitignore, "").expect("nested gitignore scaffold must write");
-                for index in 1..1_000 {
-                    let directory = root.join(format!("nested-{index:04}"));
-                    fs::create_dir_all(&directory).expect("nested directory scaffold must write");
-                    fs::write(directory.join(".gitignore"), "")
-                        .expect("gitignore scaffold must write");
-                }
-                Ok(ChangeResult::Applied {
-                    summary: ChangeSummary {
-                        id: ChangeId("0123abcd".to_owned()),
-                        // A written `.gitignore` decides what the workspace includes, so
-                        // this change asks for the whole workspace and its `[source]`
-                        // policy is compiled again.
-                        files: vec![
-                            FileChange {
-                                path: rift_protocol::read::ProjectPath(".gitignore".to_owned()),
-                                kind: FileChangeKind::Created,
-                                size_bytes: 0,
-                                line_count: 0,
-                                lines_added: 0,
-                                lines_removed: 0,
-                            },
-                            FileChange {
-                                path: rift_protocol::read::ProjectPath(
-                                    "nested/.gitignore".to_owned(),
-                                ),
-                                kind: FileChangeKind::Created,
-                                size_bytes: 0,
-                                line_count: 0,
-                                lines_added: 0,
-                                lines_removed: 0,
-                            },
-                        ],
-                        diagnostics: Vec::new(),
-                        guarantees: Vec::new(),
-                    },
-                })
-            },
-        )?;
-        let Ok(rmcp::Json(ChangeResult::Applied { summary })) = outcome.result else {
-            panic!("the applied change must survive a failed source-policy rebuild");
-        };
-        assert_eq!(summary.diagnostics.len(), 1);
-        let diagnostic = &summary.diagnostics[0];
-        assert!(
-            diagnostic.message.contains("too_many_files"),
-            "diagnostic must name the source-policy rebuild failure: {diagnostic:?}"
-        );
-        Ok(())
-    }
-
     #[tokio::test]
     async fn reads_fail_fast_after_watcher_failure() -> TestResult {
         let (_directory, server) = fixture().await?;
@@ -4797,6 +3452,21 @@ pub fn beacon() -> u64 {
             context,
             _invalidations: invalidations,
         })
+    }
+
+    #[tokio::test]
+    async fn engine_reference_capture_rejects_source_and_configuration_movement() -> TestResult {
+        let (directory, assembled) = unsupervised_fixture().await?;
+        let server = &assembled.server;
+        let published = Arc::clone(&server.published.read().await.current);
+        assert!(server.engine_tree_matches(&published).await?);
+        fs::write(directory.path().join("lib.rs"), "pub fn later() {}\n")?;
+        assert!(!server.engine_tree_matches(&published).await?);
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        assert!(server.engine_tree_matches(&published).await?);
+        super::hermetic_workspace(directory.path(), "[languages.rust]\nenabled = false\n")?;
+        assert!(!server.engine_tree_matches(&published).await?);
+        Ok(())
     }
 
     /// Writes a second declaration into the fixture's `lib.rs`, observes that path
@@ -5095,320 +3765,6 @@ pub fn beacon() -> u64 {
         Ok(())
     }
 
-    /// The production capture, counting every build it runs: a stable candidate whose
-    /// change set replaces at least one path. A candidate that shares the previous read
-    /// service built nothing and is not counted.
-    fn counting_capture(
-        dependencies: &Arc<rift_server::DependencyStore>,
-        builds: &Arc<AtomicUsize>,
-    ) -> impl crate::validation::CaptureWorkspace + Clone + Send + 'static {
-        let scan = workspace_capture(dependencies);
-        let builds = Arc::clone(builds);
-        move |root: &std::path::Path, limits: WorkspaceIndexLimits, request: &RebuildRequest| {
-            let candidate = scan(root, limits, request)?;
-            if let WorkspaceCandidate::Stable { change_set, .. } = &candidate
-                && !change_set.is_empty()
-            {
-                builds.fetch_add(1, Ordering::SeqCst);
-            }
-            Ok(candidate)
-        }
-    }
-
-    /// One landed change beside the watcher batch its own write raises: the batch is
-    /// coalesced while the change holds the lane, and enters the lane after it. The
-    /// change is the one capture and the one publication; a batch whose paths all match
-    /// the publication builds nothing and stamps that publication with its epoch.
-    #[tokio::test]
-    async fn a_landed_change_beside_a_pending_watcher_batch_is_captured_once() -> TestResult {
-        use rift_protocol::change::{ChangeResult, PatchParams};
-
-        let (directory, assembled) = unsupervised_fixture().await?;
-        let server = &assembled.server;
-        let batch = Arc::new(std::sync::Mutex::new(None));
-        let coalesced = Arc::clone(&batch);
-        let observing = Arc::clone(&server.validation);
-        let path = CoreProjectPath::new("lib.rs")?;
-        let params: PatchParams = serde_json::from_value(json!({
-            "patch": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1,2 @@\n pub fn beacon() {}\n+pub fn lantern() {}\n"
-        }))?;
-        let lane = Arc::clone(&server.change_lane);
-        let root = directory.path().to_path_buf();
-        let published = Arc::clone(&server.published);
-        let validation = Arc::clone(&server.validation);
-        let changes = Arc::clone(&server.changes);
-        let dependencies = Arc::clone(&server.dependencies);
-        let lexical = server.lexical.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
-            lane.run(|| {
-                RiftMcp::change_serialized(
-                    &root,
-                    WorkspaceIndexLimits::default(),
-                    &published,
-                    &validation,
-                    &changes,
-                    &dependencies,
-                    lexical.as_ref(),
-                    move |reads, changes: &ChangeService| {
-                        let result = changes.patch(reads, &params)?;
-                        // The watcher observes the write while the change still holds
-                        // the lane, and the supervisor coalesces that batch before the
-                        // change observes its own paths.
-                        observing.observe_paths([path])?;
-                        *coalesced
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(observing.take_pending());
-                        Ok(result)
-                    },
-                )
-            })
-        })
-        .await??;
-        let publication = outcome
-            .publication
-            .ok_or("the landed change must publish its snapshot")?;
-        assert!(
-            publication.published,
-            "the change's snapshot becomes current before the lane releases"
-        );
-        assert!(
-            !publication.change_set.is_empty(),
-            "the landed change is the one capture"
-        );
-        let Ok(rmcp::Json(ChangeResult::Applied { .. })) = outcome.result else {
-            return Err("the change must land".into());
-        };
-
-        let builds = Arc::new(AtomicUsize::new(0));
-        let capture = counting_capture(&assembled.context.dependencies, &builds);
-        let pending = batch
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-            .ok_or("the watcher batch must be pending")?;
-        let first = rebuild_workspace(&assembled.context, pending, capture.clone()).await?;
-        assert_eq!(
-            first,
-            RebuildOutcome::Superseded,
-            "the batch coalesced before the change observed its paths is superseded"
-        );
-        let second = server.validation.take_pending();
-        let second = rebuild_workspace(&assembled.context, second, capture).await?;
-        assert_eq!(
-            builds.load(Ordering::SeqCst),
-            0,
-            "a watcher batch whose paths the landed change already published builds nothing"
-        );
-        assert_eq!(
-            second,
-            RebuildOutcome::Unchanged,
-            "the batch stamps the published edit with its epoch and publishes nothing new"
-        );
-        let current = current_publication(server).await;
-        assert_eq!(
-            current.epoch,
-            server.validation.observed_epoch(),
-            "the current publication answers the batch's epoch"
-        );
-        assert!(
-            Arc::ptr_eq(&current.reads, &publication.snapshot.reads),
-            "the current publication shares the change's own read service"
-        );
-        Ok(())
-    }
-
-    /// The pieces of one server a change publishes through, owned so the change lane
-    /// can run them on a blocking thread.
-    struct ChangeLaneParts {
-        root: std::path::PathBuf,
-        published: Arc<tokio::sync::RwLock<IndexState>>,
-        validation: Arc<IndexValidation>,
-        changes: Arc<ChangeService>,
-        dependencies: Arc<rift_server::DependencyStore>,
-        lexical: Option<LexicalLane>,
-    }
-
-    impl ChangeLaneParts {
-        fn of(server: &RiftMcp, root: &std::path::Path) -> Self {
-            Self {
-                root: root.to_path_buf(),
-                published: Arc::clone(&server.published),
-                validation: Arc::clone(&server.validation),
-                changes: Arc::clone(&server.changes),
-                dependencies: Arc::clone(&server.dependencies),
-                lexical: server.lexical.clone(),
-            }
-        }
-    }
-
-    /// Observes `path` the way the watcher does once the filesystem delivers a write.
-    fn observe_written_path(validation: &IndexValidation, path: &str) -> Result<(), String> {
-        let path =
-            CoreProjectPath::new(path).map_err(|error| format!("path must parse: {error:?}"))?;
-        validation
-            .observe_paths([path])
-            .map_err(|error| format!("the write's events must be observed: {error:?}"))?;
-        Ok(())
-    }
-
-    /// Lands one patch and publishes its snapshot, running `between` in the window the
-    /// capture and the publication leave open.
-    ///
-    /// That window is where the watcher delivers what the write raised: the change has
-    /// already taken the pending work its capture answers, so an observation made there
-    /// arrives against a candidate one epoch behind.
-    fn landed_change_publication(
-        parts: &ChangeLaneParts,
-        params: &rift_protocol::change::PatchParams,
-        between: impl FnOnce() -> Result<(), String>,
-    ) -> Result<super::AppliedPublication, String> {
-        use rift_protocol::change::ChangeResult;
-
-        let current = parts.published.blocking_read().snapshot().0;
-        current
-            .configuration
-            .accepted(super::wire::ErrorPhase::Change)
-            .map_err(|error| format!("the fixture's configuration must accept: {error:?}"))?;
-        let applied = parts
-            .changes
-            .patch(&current.reads, params)
-            .map_err(|error| format!("the patch must apply: {error:?}"))?;
-        let ChangeResult::Applied { mut summary } = applied else {
-            return Err("the patch must land".to_owned());
-        };
-        let candidate = RiftMcp::rebuild_after_applied_change(
-            &parts.root,
-            WorkspaceIndexLimits::default(),
-            &parts.validation,
-            &current,
-            &mut summary,
-            &parts.dependencies,
-        )
-        .ok_or_else(|| "the landed change must build a candidate".to_owned())?;
-        between()?;
-        Ok(RiftMcp::publish_applied_change(
-            &parts.root,
-            &parts.published,
-            &parts.validation,
-            parts.lexical.as_ref(),
-            candidate,
-        ))
-    }
-
-    /// The patch both window tests land on the fixture's `lib.rs`.
-    fn lantern_patch() -> TestResult<rift_protocol::change::PatchParams> {
-        Ok(serde_json::from_value(json!({
-            "patch": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1,2 @@\n pub fn beacon() {}\n+pub fn lantern() {}\n"
-        }))?)
-    }
-
-    /// One landed change whose own write reaches the watcher after the capture: the
-    /// events name exactly the paths the change captured, so the candidate still
-    /// answers them and publishes once.
-    #[tokio::test]
-    async fn a_landed_change_publishes_past_the_events_its_own_write_raised() -> TestResult {
-        let (directory, assembled) = unsupervised_fixture().await?;
-        let server = &assembled.server;
-        let params = lantern_patch()?;
-        let parts = ChangeLaneParts::of(server, directory.path());
-        let lane = Arc::clone(&server.change_lane);
-        let publication = tokio::task::spawn_blocking(move || {
-            lane.run(|| {
-                landed_change_publication(&parts, &params, || {
-                    observe_written_path(&parts.validation, "lib.rs")
-                })
-            })
-        })
-        .await??;
-        assert!(
-            publication.published,
-            "a change's own filesystem events must not supersede the snapshot they describe"
-        );
-
-        let builds = Arc::new(AtomicUsize::new(0));
-        let capture = counting_capture(&assembled.context.dependencies, &builds);
-        let pending = server.validation.take_pending();
-        let outcome = rebuild_workspace(&assembled.context, pending, capture).await?;
-        assert_eq!(
-            builds.load(Ordering::SeqCst),
-            0,
-            "the landed change is the one capture; the events it raised build nothing"
-        );
-        assert_eq!(
-            outcome,
-            RebuildOutcome::Unchanged,
-            "the batch stamps the published edit with its epoch and publishes nothing new"
-        );
-        let current = current_publication(server).await;
-        assert!(
-            Arc::ptr_eq(&current.reads, &publication.snapshot.reads),
-            "the current publication shares the change's own read service"
-        );
-        Ok(())
-    }
-
-    /// The same window, entered by a write the change did not make: the observed path
-    /// no longer holds what the candidate captured, so the candidate is superseded and
-    /// the next batch reads the tree again.
-    #[tokio::test]
-    async fn a_write_the_change_did_not_make_supersedes_its_candidate() -> TestResult {
-        let (directory, assembled) = unsupervised_fixture().await?;
-        let server = &assembled.server;
-        let params = lantern_patch()?;
-        let parts = ChangeLaneParts::of(server, directory.path());
-        let lane = Arc::clone(&server.change_lane);
-        let intruded = directory.path().join("lib.rs");
-        let publication = tokio::task::spawn_blocking(move || {
-            lane.run(|| {
-                landed_change_publication(&parts, &params, || {
-                    fs::write(&intruded, "pub fn intruder() {}\n")
-                        .map_err(|error| format!("the second write must land: {error:?}"))?;
-                    observe_written_path(&parts.validation, "lib.rs")
-                })
-            })
-        })
-        .await??;
-        assert!(
-            !publication.published,
-            "bytes the candidate never read must supersede it"
-        );
-
-        let builds = Arc::new(AtomicUsize::new(0));
-        let capture = counting_capture(&assembled.context.dependencies, &builds);
-        let pending = server.validation.take_pending();
-        let outcome = rebuild_workspace(&assembled.context, pending, capture).await?;
-        assert_eq!(
-            outcome,
-            RebuildOutcome::Published,
-            "the batch publishes the bytes the superseding write left"
-        );
-        assert_eq!(
-            builds.load(Ordering::SeqCst),
-            1,
-            "the superseding write is read by the batch that answers it"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn a_change_under_a_rebuild_failure_at_the_observed_epoch_refuses() -> TestResult {
-        let (directory, assembled) = unsupervised_fixture().await?;
-        let server = &assembled.server;
-        fail_rebuild_after_events(directory.path(), server, 3).await?;
-
-        let error = server
-            .published_workspace(super::wire::ErrorPhase::Change)
-            .await
-            .err()
-            .ok_or("a change under the failure that stands at the observed epoch refuses")?;
-        assert!(
-            error.message.contains("injected failure"),
-            "the refusal carries the recorded failure: {error:?}"
-        );
-        Ok(())
-    }
-
     /// Most one test waits for a request the bounded loop answers on its own.
     const RECONCILED_READ_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -5570,31 +3926,6 @@ pub fn beacon() -> u64 {
 
         assert!(
             refusal.message.contains("injected capture failure"),
-            "{refusal:?}"
-        );
-        Ok(())
-    }
-
-    /// A change resolves its address against the tree it is about to modify, so the same
-    /// condition keeps refusing on the change path.
-    #[tokio::test]
-    async fn a_change_whose_tree_keeps_moving_refuses() -> TestResult {
-        let (directory, server) = fixture().await?;
-        capture_a_tree_that_keeps_moving(&server, directory.path());
-        let params = serde_json::from_value(json!({
-            "patch": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1,2 @@\n pub fn beacon() {}\n+pub fn lantern() {}\n"
-        }))?;
-
-        let refusal = tokio::time::timeout(RECONCILED_READ_MAX, server.patch(Parameters(params)))
-            .await
-            .map_err(|_| "a change whose tree keeps moving must refuse within the bound")?
-            .map(|_applied| ())
-            .expect_err("a change whose tree keeps moving must refuse");
-
-        assert!(
-            refusal
-                .message
-                .contains("workspace changed across bounded reconciliation attempts"),
             "{refusal:?}"
         );
         Ok(())
@@ -5867,39 +4198,6 @@ pub fn beacon() -> u64 {
         Ok(())
     }
 
-    /// The same condition on the change path: a write resolves its address against the
-    /// tree it is about to modify, so it keeps waiting for the two epochs and refuses
-    /// when its readiness budget is spent.
-    #[tokio::test]
-    async fn a_change_whose_epoch_runs_ahead_refuses_within_its_budget() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        super::hermetic_workspace(directory.path(), "[server]\nreadiness_timeout = \"1s\"\n")?;
-        let assembled = unsupervised_server(directory.path()).await?;
-        let server = &assembled.server;
-        observe_without_recording_a_failure(server, "lib.rs", 3)?;
-        let params = serde_json::from_value(json!({
-            "patch": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1,2 @@\n pub fn beacon() {}\n+pub fn lantern() {}\n"
-        }))?;
-
-        let refusal = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            server.patch(Parameters(params)),
-        )
-        .await
-        .map_err(|_| "a change whose epoch runs ahead must refuse inside its budget")?
-        .map(|_applied| ())
-        .expect_err("a change whose epoch runs ahead must refuse");
-
-        assert!(
-            refusal
-                .message
-                .contains("filesystem events behind the tree"),
-            "{refusal:?}"
-        );
-        Ok(())
-    }
-
     /// Observes `path` `events` times and records no rebuild failure, so the observed
     /// epoch runs ahead of the published one with nothing to resolve it.
     fn observe_without_recording_a_failure(
@@ -5915,29 +4213,6 @@ pub fn beacon() -> u64 {
                 .map_err(|error| format!("observation must land: {error:?}"))?;
         }
         Ok(epoch)
-    }
-
-    #[test]
-    fn a_failure_verdict_follows_the_phase_and_the_epochs() {
-        use super::FailureVerdict::{AnswerStale, Refuse, Wait};
-        use super::wire::ErrorPhase::{Change, Check, Read, Resolve};
-
-        let at_observed = super::RecordedRebuildFailure {
-            epoch: 3,
-            observed_epoch: 3,
-            error: Arc::new(ReadFault::unavailable("test rebuild", "injected failure")),
-        };
-        let behind_observed = super::RecordedRebuildFailure {
-            epoch: 3,
-            observed_epoch: 5,
-            error: Arc::clone(&at_observed.error),
-        };
-        assert_eq!(at_observed.verdict(Read), AnswerStale);
-        assert_eq!(behind_observed.verdict(Read), AnswerStale);
-        for phase in [Resolve, Check, Change] {
-            assert_eq!(at_observed.verdict(phase), Refuse);
-            assert_eq!(behind_observed.verdict(phase), Wait);
-        }
     }
 
     #[test]
@@ -6159,27 +4434,6 @@ pub fn beacon() -> u64 {
         Ok(())
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_stalled_change_names_the_epochs_it_waited_on() -> TestResult {
-        let (_directory, server) = fixture().await?;
-        server
-            .validation
-            .observed_epoch
-            .fetch_add(3, std::sync::atomic::Ordering::SeqCst);
-
-        let error = server
-            .published_workspace(super::wire::ErrorPhase::Change)
-            .await
-            .map(|_current| ())
-            .expect_err("a stalled publication must refuse a change");
-
-        assert!(error.message.contains("published epoch 0"), "{error:?}");
-        assert!(error.message.contains("observed epoch 3"), "{error:?}");
-        assert!(error.message.contains("rift://logs"), "{error:?}");
-        assert_eq!(error.data.ok_or("typed refusal")?["phase"], json!("change"));
-        Ok(())
-    }
-
     #[tokio::test]
     async fn a_stall_after_the_epoch_settled_names_unfinished_validation() -> TestResult {
         let (_directory, server) = fixture().await?;
@@ -6270,108 +4524,6 @@ pub fn beacon() -> u64 {
         assert_eq!(
             body["pagination"],
             serde_json::json!({ "page_index": 0, "total_pages": 1 })
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn workspace_resource_reports_named_inline_and_disabled_languages() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        fs::write(directory.path().join("script.rb"), "puts 'beacon'\n")?;
-        super::hermetic_workspace(
-            directory.path(),
-            "[lsp.shared]\ncommand = \"language-server\"\n\
-             [languages.ruby]\ninclude = [\"**/*.rb\"]\nexecution = true\nlsp = \"shared\"\n\
-             [languages.rust.lsp]\ncommand = \"rust-analyzer\"\n\
-             [languages.toml]\nenabled = false\nexecution = true\nlsp = \"shared\"\n",
-        )?;
-        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
-
-        let answer = server.read_workspace("rift://workspace").await?;
-        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = answer
-            .contents
-            .first()
-            .expect("a workspace read answers with one content")
-        else {
-            unreachable!("a workspace read answers with text");
-        };
-        let body: serde_json::Value = serde_json::from_str(text)?;
-        let languages = body["languages"]
-            .as_array()
-            .expect("workspace languages are an array");
-        let language = |name: &str| {
-            languages
-                .iter()
-                .find(|entry| entry["language"] == serde_json::json!(name))
-                .expect("configured language is reported")
-        };
-
-        let rust = language("rust");
-        assert_eq!(rust["lsp"]["process"], serde_json::json!("rust"));
-        assert_eq!(rust["lsp"]["state"], serde_json::json!("stopped"));
-        assert_eq!(
-            rust["execution"],
-            serde_json::json!(false),
-            "execution stays off until its own entry enables it"
-        );
-
-        let ruby = language("ruby");
-        assert_eq!(
-            ruby["execution"],
-            serde_json::json!(true),
-            "an enabled entry carries its own execution permission"
-        );
-        assert_eq!(ruby["syntax"], serde_json::json!(false));
-        assert_eq!(ruby["lsp"]["process"], serde_json::json!("shared"));
-        assert_eq!(ruby["lsp"]["state"], serde_json::json!("stopped"));
-
-        let toml = language("toml");
-        assert_eq!(toml["enabled"], serde_json::json!(false));
-        assert_eq!(toml["execution"], serde_json::json!(false));
-        assert!(
-            toml.get("lsp").is_none(),
-            "disabled language omits LSP state"
-        );
-        Ok(())
-    }
-
-    /// Each configured hook is reported with its own path selection, beside the
-    /// language entries rather than inside one.
-    #[tokio::test]
-    async fn workspace_resource_reports_each_hook_with_its_path_selection() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        super::hermetic_workspace(
-            directory.path(),
-            "[[hooks]]\nid = \"tests\"\nkind = \"test\"\ncommand = [\"true\"]\n\
-             determinism = \"deterministic\"\ninclude = [\"crates/**\"]\n\
-             exclude = [\"crates/generated/**\"]\n",
-        )?;
-        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
-
-        let answer = server.read_workspace("rift://workspace").await?;
-        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = answer
-            .contents
-            .first()
-            .expect("a workspace read answers with one content")
-        else {
-            unreachable!("a workspace read answers with text");
-        };
-        let body: serde_json::Value = serde_json::from_str(text)?;
-        let hooks = body["hooks"].as_array().expect("hooks are an array");
-        assert_eq!(hooks.len(), 1, "{text}");
-        assert_eq!(hooks[0]["id"], serde_json::json!("tests"));
-        assert_eq!(hooks[0]["kind"], serde_json::json!("test"));
-        assert_eq!(hooks[0]["include"], serde_json::json!(["crates/**"]));
-        assert_eq!(
-            hooks[0]["exclude"],
-            serde_json::json!(["crates/generated/**"])
-        );
-        assert_eq!(
-            body["pagination"]["total_pages"],
-            serde_json::json!(1),
-            "one page holds the whole catalog: {text}"
         );
         Ok(())
     }
@@ -7185,42 +5337,6 @@ pub fn beacon() -> u64 {
         })
     }
 
-    /// The units the store ranks for whatever tree it is stamped with right now.
-    ///
-    /// A store is read under one revision, so a poll that watches for a pass to land reads
-    /// the stamp first and asks that same tree for its rows. A pass that lands between the
-    /// two reads answers `OtherRevision`, so the read is made again, at most
-    /// [`SEARCH_TIER_ATTEMPTS_MAX`] times.
-    ///
-    /// # Errors
-    ///
-    /// Returns the last revision the store moved to once the bound runs out, and any other
-    /// unmatched answer at once.
-    async fn ranked_now(
-        index: &rift_search::SearchIndex,
-        query: &str,
-    ) -> TestResult<Vec<rift_search::RankedUnit>> {
-        let mut moved = None;
-        for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
-            let Some(stamped) = index.tree_revision().await? else {
-                return Ok(Vec::new());
-            };
-            match index.search(&stamped, query, 8).await? {
-                RevisionScoped::Matched(ranked) => return Ok(ranked.into_units()),
-                RevisionScoped::OtherRevision(revision) => moved = Some(revision),
-                other @ RevisionScoped::NoRevision => {
-                    return Err(
-                        format!("the store moved while it was being read: {other:?}").into(),
-                    );
-                }
-            }
-        }
-        Err(format!(
-            "the store kept moving across {SEARCH_TIER_ATTEMPTS_MAX} reads, last to {moved:?}"
-        )
-        .into())
-    }
-
     /// Polls one in-process search until the population lane's pass has landed, and answers
     /// with the first answer the store itself ranked.
     ///
@@ -7385,7 +5501,7 @@ pub fn beacon() -> u64 {
     }
 
     #[tokio::test]
-    async fn startup_populates_the_index_and_a_landed_change_repopulates_it() -> TestResult {
+    async fn startup_populates_the_index_at_the_published_revision() -> TestResult {
         let (_directory, server) = fixture().await?;
         let index = server
             .search_index
@@ -7413,74 +5529,6 @@ pub fn beacon() -> u64 {
             stamped.as_deref(),
             Some(published.as_str()),
             "the run's first pass must stamp the published tree revision"
-        );
-        assert!(
-            !ranked_now(&index, "beacon").await?.is_empty(),
-            "the run's first pass must leave the published unit set searchable"
-        );
-
-        let insert = json!({
-            "anchor": "rift://symbol/rust/lib.rs/beacon",
-            "position": "after",
-            "body": "pub fn lantern() {}"
-        });
-        let params = serde_json::from_value(insert)?;
-        let applied = server.insert_symbol(Parameters(params)).await?.0;
-        assert!(
-            matches!(applied, rift_protocol::change::ChangeResult::Applied { .. }),
-            "the fixture insert must land: {applied:#?}"
-        );
-        // The change hands its publication to the population lane; a filesystem rebuild that
-        // supersedes it hands the supervisor's instead. Poll under a bound rather than
-        // racing which of the two passes ran.
-        for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
-            if !ranked_now(&index, "lantern").await?.is_empty() {
-                return Ok(());
-            }
-            tokio::time::sleep(SEARCH_TIER_POLL).await;
-        }
-        Err("the pass after a landed change never ranked the inserted declaration".into())
-    }
-
-    /// `insert_symbol` `after`, then `remove_symbol` on exactly what landed, returns the
-    /// file's bytes to the original exactly - the same round trip
-    /// `insert_symbol_after_then_remove_symbol_round_trips_to_the_original_bytes` proves
-    /// against `ChangeService` directly, driven here through the tool methods the MCP
-    /// surface advertises.
-    #[tokio::test]
-    async fn insert_symbol_after_then_remove_symbol_round_trips_through_the_mcp_surface()
-    -> TestResult {
-        let (directory, server) = fixture().await?;
-        let original = fs::read_to_string(directory.path().join("lib.rs"))?;
-
-        let insert = serde_json::from_value(json!({
-            "anchor": "rift://symbol/rust/lib.rs/beacon",
-            "position": "after",
-            "body": "pub fn tail() {}"
-        }))?;
-        let inserted = server.insert_symbol(Parameters(insert)).await?.0;
-        assert!(
-            matches!(
-                inserted,
-                rift_protocol::change::ChangeResult::Applied { .. }
-            ),
-            "the insertion must land: {inserted:#?}"
-        );
-
-        let remove = serde_json::from_value(json!({
-            "symbol": "rift://symbol/rust/lib.rs/tail",
-            "force": false
-        }))?;
-        let removed = server.remove_symbol(Parameters(remove)).await?.0;
-        assert!(
-            matches!(removed, rift_protocol::change::ChangeResult::Applied { .. }),
-            "the removal must land: {removed:#?}"
-        );
-
-        let written = fs::read_to_string(directory.path().join("lib.rs"))?;
-        assert_eq!(
-            written, original,
-            "insert then remove through the MCP surface must return the original bytes"
         );
         Ok(())
     }

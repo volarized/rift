@@ -33,42 +33,9 @@ pub use crate::search::{
 // `diagnostic` so this module stays below its size bound; re-exporting them here keeps every
 // existing `rift_protocol::read::Diagnostic`-style path resolving.
 pub use crate::diagnostic::{
-    Diagnostic, DiagnosticCode, DiagnosticContext, DiagnosticContextSource, DiagnosticContinuation,
+    Diagnostic, DiagnosticContext, DiagnosticContextSource, DiagnosticContinuation,
     DiagnosticRelated, DiagnosticReliability, DiagnosticTag,
 };
-
-/// How far the claim reaches.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum CoverageReach {
-    /// Only what this request touched.
-    Request,
-    /// Every visible file of the workspace.
-    Project,
-    /// The workspace's resolved dependencies.
-    Dependencies,
-    /// The workspace, its dependencies, and the standard library together.
-    All,
-}
-
-/// What a completeness statement covers - everything the request asked for, one file, or a
-/// standing scope the answer holds over.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "kind", deny_unknown_fields, rename_all = "snake_case")]
-pub enum CoverageScope {
-    /// A standing scope identified by its name.
-    Reach {
-        /// How far the claim reaches.
-        reach: CoverageReach,
-    },
-    /// A single unit is just a file: the claim holds for that path and says nothing about any other.
-    Unit {
-        /// The file the claim is about.
-        unit: FileId,
-    },
-}
 
 /// The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`
 /// uses. The full digest is computed and compared internally; only this short form ever
@@ -186,7 +153,7 @@ pub struct GetSymbolHit {
     /// The 1-based source line where the declaration begins.
     #[schemars(range(min = 1_u64))]
     pub line: u64,
-    /// The declaration node's identity, the full edit address `replace_node` accepts.
+    /// The declaration node's identity, including its source range and witness.
     /// Absent unless `include` names `source`, or when source is unavailable or outside
     /// the project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -567,8 +534,7 @@ pub struct Node {
     pub facets: Vec<NodeFacet>,
     /// The bytes it spans, as offsets into the file.
     pub range: TextRange,
-    /// The node's named parts, so an operation can rewrite a function body without touching
-    /// the documentation above it. Absent when empty.
+    /// The node's named parts, including its function body and documentation. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub regions: Vec<NodeRegion>,
     /// The region this one is nested inside. Absent at the top level of a unit.
@@ -627,10 +593,8 @@ pub enum NodeFacet {
 
 /// Identity of one syntax-tree node. The byte range locates the node in the tree the request
 /// targets; the fragment after `#` is its witness - the first eight lowercase hex characters
-/// of the SHA-256 of the node's source bytes. Resolution refuses a range that does not land
-/// on an indexed node's own bytes, and otherwise recomputes the witness, refusing with a
-/// failed `source_unchanged` precondition when the bytes have drifted - so an address read
-/// from a stale listing, or one naming no real node, cannot splice into the wrong code.
+/// of the SHA-256 of the node's source bytes. The identity describes the node in the
+/// revision the response names.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 #[schemars(transparent)]
@@ -653,8 +617,8 @@ pub struct NodeRegion {
     pub range: TextRange,
 }
 
-/// Lists the syntax nodes covering one position, outermost first. It returns a witnessed
-/// address for an edit smaller than a declaration, such as one call expression.
+/// Lists the syntax nodes covering one position, outermost first. Each node carries its
+/// source range and kind, including expressions smaller than a declaration.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(extend("rift:since" = "v0.0.4"))]
@@ -681,8 +645,7 @@ pub struct NodesParams {
     pub rev: Option<RevisionId>,
 }
 
-/// The nodes covering one position. Each identity carries its witness, so an address taken
-/// from this listing refuses cleanly once the bytes drift.
+/// The nodes covering one position, with identities derived from their source bytes.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::declare_nodes_result_empty_defaults)]
@@ -1078,8 +1041,8 @@ pub struct Relationship {
 }
 
 /// How this edge was established. Every edge reaches Rift from a provider, and this field
-/// records how much the provider knew: `syntax` and `heuristic` need another check before
-/// rewriting.
+/// records whether the provider resolved the edge semantically, read it from syntax, or
+/// inferred it.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]

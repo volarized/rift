@@ -12,7 +12,7 @@ use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault};
 use rift_protocol::configuration::{ConfigurationViolation, WorkspaceConfiguration};
 
 /// Bytes a `rift.toml` may hold, at most. The file states bounded tables
-/// and hook lists; one this large is not configuration.
+/// and language entries; one this large is not configuration.
 pub const CONFIGURATION_FILE_BYTES_MAX: u64 = 256 << 10;
 
 /// One configuration failure: why the workspace's `rift.toml` cannot be
@@ -150,105 +150,6 @@ fn accept_configuration(raw: &str) -> Result<WorkspaceConfiguration, Configurati
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use rift_protocol::configuration::{
-        ByteSize, ChangedPaths, Determinism, HookFailureSeverity, HookKind, HookWrites,
-        SemanticSource,
-    };
-
-    /// The `[[hooks]]` example the configuration docs show, keys complete.
-    const DOCUMENTED_HOOK: &str = r#"
-[[hooks]]
-id = "tests"
-kind = "test"
-command = ["cargo", "test"]
-changed_paths = "none"
-writes = "none"
-working_directory = ""
-environment = {}
-timeout = "120s"
-output_limit = "4kb"
-failure_severity = "error"
-guarantees = []
-determinism = "deterministic"
-include = []
-exclude = []
-"#;
-
-    fn write_configuration(directory: &tempfile::TempDir, contents: &str) {
-        std::fs::write(
-            directory.path().join(WORKSPACE_CONFIGURATION_FILE),
-            contents,
-        )
-        .expect("test configuration must be writable");
-    }
-
-    #[test]
-    fn test_missing_file_is_the_default_configuration() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let configuration =
-            load_configuration(directory.path()).expect("a missing file must accept defaults");
-        assert_eq!(configuration, WorkspaceConfiguration::default());
-    }
-
-    #[test]
-    fn test_documented_example_file_is_accepted() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let contents = format!(
-            r#"
-[execution]
-max_code = "16kb"
-max_timeout = "30s"
-max_output = "8kb"
-max_concurrent = 2
-
-[providers.history]
-enabled = true
-max_revisions = 500
-
-[search.lexical]
-weight = 0.6
-
-[search.semantic]
-weight = 0.4
-source = "hf"
-model = "BAAI/bge-small-en-v1.5"
-download_timeout = "5m"
-{DOCUMENTED_HOOK}
-"#
-        );
-        write_configuration(&directory, &contents);
-        let configuration =
-            load_configuration(directory.path()).expect("the documented example must be accepted");
-        assert_eq!(
-            configuration.execution.max_code,
-            ByteSize::from_bytes(16 << 10)
-        );
-        assert!((configuration.search.lexical.weight - 0.6).abs() < f64::EPSILON);
-        assert!((configuration.search.semantic.weight - 0.4).abs() < f64::EPSILON);
-        assert_eq!(configuration.search.semantic.source, SemanticSource::Hf);
-        assert_eq!(
-            configuration.search.semantic.model,
-            "BAAI/bge-small-en-v1.5"
-        );
-        let hook = &configuration.hooks[0];
-        assert_eq!(hook.id, "tests");
-        assert_eq!(hook.kind, HookKind::Test);
-        assert_eq!(hook.command.program(), "cargo");
-        assert_eq!(hook.command.arguments(), ["test"]);
-        assert_eq!(hook.changed_paths, ChangedPaths::None);
-        assert_eq!(hook.determinism, Determinism::Deterministic);
-    }
-
-    #[test]
-    fn test_semantic_candidate_bounds_parse_from_toml() {
-        let configuration =
-            accept_configuration("[search.semantic]\ncandidates = 100\ncandidates_per_file = 8\n")
-                .expect("both candidate bounds must be accepted");
-        assert_eq!(configuration.search.semantic.candidates, 100);
-        assert_eq!(configuration.search.semantic.candidates_per_file, 8);
-    }
-
     /// The repository's own `rift.toml`, exercised so the committed file accepts cleanly
     /// under the exact model this module validates against.
     #[test]
@@ -273,25 +174,65 @@ download_timeout = "5m"
             ]
         );
         assert!(configuration.source.respect_gitignore);
-        assert_eq!(configuration.hooks.len(), 2);
-        assert_eq!(configuration.hooks[0].id, "format");
-        assert_eq!(configuration.hooks[0].kind, HookKind::Format);
-        assert_eq!(configuration.hooks[0].command.program(), "cargo");
-        assert_eq!(configuration.hooks[0].command.arguments(), ["fmt", "--all"]);
-        assert_eq!(configuration.hooks[0].writes, HookWrites::Workspace);
+    }
+
+    #[test]
+    fn test_documented_example_file_is_accepted() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let contents = r#"
+[execution]
+max_code = "16kb"
+max_timeout = "30s"
+max_output = "8kb"
+max_concurrent = 2
+
+[providers.history]
+enabled = true
+max_revisions = 500
+
+[search.lexical]
+weight = 0.6
+
+[search.semantic]
+weight = 0.4
+source = "hf"
+model = "BAAI/bge-small-en-v1.5"
+download_timeout = "5m"
+"#;
+        std::fs::write(directory.path().join("rift.toml"), contents).expect("configuration");
+        let configuration =
+            load_configuration(directory.path()).expect("the documented example must be accepted");
         assert_eq!(
-            configuration.hooks[0].failure_severity,
-            HookFailureSeverity::Warning
+            configuration.execution.max_code,
+            ByteSize::from_bytes(16 << 10)
         );
-        assert!(configuration.hooks[0].guarantees.is_empty());
-        assert_eq!(configuration.hooks[1].id, "check");
-        assert_eq!(configuration.hooks[1].command.program(), "just");
-        assert_eq!(configuration.hooks[1].command.arguments(), ["check"]);
-        assert_eq!(configuration.hooks[1].writes, HookWrites::None);
+        assert!((configuration.search.lexical.weight - 0.6).abs() < f64::EPSILON);
+        assert!((configuration.search.semantic.weight - 0.4).abs() < f64::EPSILON);
+        assert_eq!(configuration.search.semantic.source, SemanticSource::Hf);
         assert_eq!(
-            configuration.hooks[1].failure_severity,
-            HookFailureSeverity::Error
+            configuration.search.semantic.model,
+            "BAAI/bge-small-en-v1.5"
         );
+    }
+
+    use super::*;
+    use rift_protocol::configuration::{ByteSize, SemanticSource, WorkspaceConfiguration};
+
+    #[test]
+    fn test_missing_file_is_the_default_configuration() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let configuration =
+            load_configuration(directory.path()).expect("a missing file must accept defaults");
+        assert_eq!(configuration, WorkspaceConfiguration::default());
+    }
+
+    #[test]
+    fn test_semantic_candidate_bounds_parse_from_toml() {
+        let configuration =
+            accept_configuration("[search.semantic]\ncandidates = 100\ncandidates_per_file = 8\n")
+                .expect("both candidate bounds must be accepted");
+        assert_eq!(configuration.search.semantic.candidates, 100);
+        assert_eq!(configuration.search.semantic.candidates_per_file, 8);
     }
 
     #[test]
@@ -320,41 +261,6 @@ download_timeout = "5m"
             error.fault(),
             ConfigurationFault::Malformed { .. }
         ));
-    }
-
-    #[test]
-    fn test_hook_missing_environment_uses_default() {
-        let trimmed = DOCUMENTED_HOOK.replace("environment = {}\n", "");
-        let configuration =
-            accept_configuration(&trimmed).expect("a hook without environment must use default");
-        assert!(configuration.hooks[0].environment.is_empty());
-    }
-
-    #[test]
-    fn test_out_of_bounds_value_is_refused_with_field_evidence() {
-        let broken = DOCUMENTED_HOOK.replace(r#"timeout = "120s""#, r#"timeout = "0ms""#);
-        let error =
-            accept_configuration(&broken).expect_err("a zero hook timeout must refuse the file");
-        assert!(matches!(error.fault(), ConfigurationFault::Invalid(_)));
-        let message = error.to_string();
-        assert!(
-            message.contains("hooks.timeout") && message.contains("1..=3600000"),
-            "the refusal must name the field and its range: {message}"
-        );
-    }
-
-    #[test]
-    fn test_absolute_hook_executable_is_refused() {
-        let broken = DOCUMENTED_HOOK.replace(
-            "command = [\"cargo\", \"test\"]",
-            "command = [\"/bin/cargo\", \"test\"]",
-        );
-        let error = accept_configuration(&broken)
-            .expect_err("an absolute executable path must refuse the file");
-        assert!(
-            error.to_string().contains("/bin/cargo"),
-            "the refusal must name the refused program: {error}"
-        );
     }
 
     #[test]

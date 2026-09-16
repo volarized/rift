@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use crate::failure::WireFailure as _;
 
 /// Bytes one inbound frame may hold before the guard refuses it rather
-/// than keep buffering. Large enough for a substantial patch or diff
+/// than keep buffering. Large enough for a substantial source read
 /// carried as `tools/call` arguments, matching the scale
 /// [`rift_protocol::configuration::TEXT_CHUNK_BYTES_MAX`] already uses for
 /// "a big but bounded blob" elsewhere in the protocol.

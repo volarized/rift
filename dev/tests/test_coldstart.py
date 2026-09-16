@@ -160,3 +160,63 @@ def test_stop_rejects_status_after_original_deadline(
     monkeypatch.setattr(check_coldstart, "container_command", late_status)
     with pytest.raises(AssertionError, match="cold server stop exceeded"):
         check_coldstart.stop_container("fixture", 7)
+
+
+@pytest.mark.parametrize("failed_launch", [True, False])
+def test_missing_engine_requires_launch_failure_and_preserves_syntax_reads(
+    monkeypatch: pytest.MonkeyPatch, failed_launch: bool
+) -> None:
+    from contextlib import nullcontext
+    from typing import cast
+    from unittest.mock import AsyncMock
+
+    from mcp.shared.exceptions import McpError
+    from mcp.types import ErrorData
+    from rift_dev.rift_test_client import Client, JsonObject
+
+    client = AsyncMock(spec=Client)
+    reads = []
+
+    async def call(name: str, arguments: JsonObject) -> JsonObject:
+        if name == "search":
+            if failed_launch:
+                raise McpError(
+                    ErrorData(
+                        code=-32000,
+                        message="launch_failed",
+                        data={"code": "capability_unavailable"},
+                    )
+                )
+            return {"results": []}
+        assert name == "get_symbol"
+        reads.append(arguments)
+        return {
+            "hits": [
+                {
+                    "symbol": {
+                        "name": "beacon_cold",
+                        "id": "rift://symbol/rust/lib.rs/beacon_cold",
+                    },
+                    "source": check_coldstart.SOURCE.rstrip("\n"),
+                }
+            ]
+        }
+
+    client.call.side_effect = call
+    client.resource.return_value = {"records": [{"message": "launch failed"}]}
+    commands = []
+    monkeypatch.setattr(
+        check_coldstart,
+        "container_command",
+        lambda name, arguments: commands.append((name, arguments)),
+    )
+    with (
+        nullcontext()
+        if failed_launch
+        else pytest.raises(AssertionError, match="answered references")
+    ):
+        asyncio.run(
+            check_coldstart.check_missing_executable(cast(Client, client), "fixture")
+        )
+    assert len(reads) == (2 if failed_launch else 1)
+    assert commands[0][1][-1] == '[languages.rust.lsp]\ncommand = ["rust-analyzer"]\n'

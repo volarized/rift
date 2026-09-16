@@ -1,4 +1,4 @@
-//! Wire models for provider, hook, and apply findings (`Diagnostic` and its context).
+//! Wire models for provider findings (`Diagnostic` and its context).
 //! Extracted from [`crate::read`] so that module stays below its size bound; every type here is
 //! re-exported from `read` so existing `rift_protocol::read::Diagnostic`-style paths keep
 //! resolving.
@@ -48,72 +48,6 @@ pub struct Diagnostic {
     pub language: Option<Language>,
 }
 
-/// A code Rift stamps on a diagnostic it authors itself, as `Diagnostic.code`. Provider
-/// diagnostics keep their tools' own codes; these name the findings the server raises about a
-/// change it applied. The code strings are owned by serde, the same way error codes are.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
-pub enum DiagnosticCode {
-    /// A syntax provider marked source erroneous after an applied change.
-    #[serde(rename = "rift.syntax.error")]
-    SyntaxError,
-    /// A configured hook did not pass over an applied change.
-    #[serde(rename = "rift.hook.failed")]
-    HookFailed,
-    /// Snapshot rebuild failed after an applied change; current-tree reads refuse until the
-    /// server publishes a fresh snapshot.
-    #[serde(rename = "rift.snapshot.stale")]
-    SnapshotStale,
-    /// A word-boundary occurrence of a renamed declaration's old name survives in the
-    /// changed tree after the rename.
-    #[serde(rename = "rift.rename.survivor")]
-    RenameSurvivor,
-    /// A file move landed without engine reference updates: no engine serves the file's
-    /// language, or the configured engine does not cover the move.
-    #[serde(rename = "rift.move.references_not_updated")]
-    MoveReferencesNotUpdated,
-    /// An occurrence of a moved file's old path, in any spelling a reference carries,
-    /// survives in the changed tree after the move.
-    #[serde(rename = "rift.move.survivor")]
-    MoveSurvivor,
-    /// The language engine could not serve diagnostics over an applied change; the
-    /// change itself landed.
-    #[serde(rename = "rift.engine.failed")]
-    EngineFailed,
-    /// The language engine was still analyzing when it answered every attempt, so its
-    /// findings over an applied change may be incomplete; the change itself landed.
-    #[serde(rename = "rift.engine.analyzing")]
-    EngineAnalyzing,
-    /// The language engine's post-apply diagnostics for one or more changed paths could
-    /// not be proven settled: the engine has never confirmed its own readiness, so an
-    /// empty answer is not evidence the paths are clean. The change itself landed.
-    #[serde(rename = "rift.engine.unready")]
-    EngineUnready,
-    /// A removal applied under `force` while a reference to the removed declaration still
-    /// stood.
-    #[serde(rename = "rift.remove.reference")]
-    RemoveReference,
-    /// A removal applied without a reference check: no engine served the language, the
-    /// engine advertised no `textDocument/references`, the request failed, or the removed
-    /// node named no declaration.
-    #[serde(rename = "rift.remove.unchecked")]
-    RemoveUnchecked,
-}
-
-impl DiagnosticCode {
-    /// The stable code string, read back through serialization so it cannot drift from the
-    /// serde spelling.
-    #[must_use]
-    pub fn code(self) -> String {
-        match serde_json::to_value(self) {
-            Ok(serde_json::Value::String(code)) => code,
-            other => unreachable!(
-                "diagnostic codes are unit variants and must serialize to plain strings, \
-                 got {other:?}"
-            ),
-        }
-    }
-}
-
 /// One `Diagnostic` as an MCP answer carries it: the fact its emitter minted, plus what Rift
 /// can add on top - where it lands in a line and column, and the source around it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -136,8 +70,7 @@ pub struct DiagnosticContext {
     pub excerpt: Option<SourceExcerpt>,
 }
 
-/// Component that produced the diagnostic. Rift sets this after collecting provider, hook,
-/// or apply output.
+/// Component that produced the diagnostic.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
@@ -145,10 +78,6 @@ pub struct DiagnosticContext {
 pub enum DiagnosticContextSource {
     /// A language provider emitted the finding.
     Provider,
-    /// A configured hook emitted the finding.
-    Hook,
-    /// Applying a change request emitted the finding.
-    Apply,
 }
 
 /// Whether the finding is an artefact of source that stops mid-way, which is the normal
@@ -205,36 +134,4 @@ pub enum DiagnosticTag {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::DiagnosticCode;
-
-    #[test]
-    fn test_diagnostic_codes_serialize_to_their_documented_spellings() {
-        assert_eq!(DiagnosticCode::SyntaxError.code(), "rift.syntax.error");
-        assert_eq!(DiagnosticCode::HookFailed.code(), "rift.hook.failed");
-        assert_eq!(DiagnosticCode::SnapshotStale.code(), "rift.snapshot.stale");
-        assert_eq!(
-            DiagnosticCode::RenameSurvivor.code(),
-            "rift.rename.survivor"
-        );
-        assert_eq!(
-            DiagnosticCode::MoveReferencesNotUpdated.code(),
-            "rift.move.references_not_updated"
-        );
-        assert_eq!(DiagnosticCode::MoveSurvivor.code(), "rift.move.survivor");
-        assert_eq!(DiagnosticCode::EngineFailed.code(), "rift.engine.failed");
-        assert_eq!(
-            DiagnosticCode::EngineAnalyzing.code(),
-            "rift.engine.analyzing"
-        );
-        assert_eq!(DiagnosticCode::EngineUnready.code(), "rift.engine.unready");
-        assert_eq!(
-            DiagnosticCode::RemoveReference.code(),
-            "rift.remove.reference"
-        );
-        assert_eq!(
-            DiagnosticCode::RemoveUnchecked.code(),
-            "rift.remove.unchecked"
-        );
-    }
-}
+mod tests {}

@@ -1,6 +1,6 @@
 //! Bounded capture vocabulary for child-process output streams.
 //!
-//! Hook runs and language engine sessions drain a child's pipes under the
+//! Language engine sessions drain a child's pipes under the
 //! same policy: keep a configured prefix, count the rest up to a ceiling,
 //! and report both so a truncated log is distinguishable from a short one.
 

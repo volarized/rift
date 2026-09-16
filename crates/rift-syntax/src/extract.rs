@@ -32,6 +32,11 @@ pub(crate) trait GrammarRules {
     /// attributes and doc comments included.
     fn declaration_start(&self, node: Node<'_>, text: &str) -> usize;
 
+    /// The grammar's exact declaration name field, absent for providers without one.
+    fn name_range(&self, _node: Node<'_>) -> Result<Option<ByteRange>, SyntaxError> {
+        Ok(None)
+    }
+
     /// The separator qualified names join with, such as `::`.
     fn qualification_separator(&self) -> &'static str;
 }
@@ -176,6 +181,7 @@ fn qualified_symbol(
             end: item_range.end,
         },
         item_range,
+        name_range: rules.name_range(node)?,
         body_range: declaration.body_range,
         signatures,
         documentation: declaration.documentation,
