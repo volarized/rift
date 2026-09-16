@@ -43,7 +43,8 @@ use crate::search::{
 };
 use crate::traversal::{
     TRAVERSAL_NODES_MAX, TraversalRanking, TraversalSeeds, WalkMerge, merge_walk_hits,
-    traversal_truncation_warning, walk_traversal_with_references, walkable,
+    relationship_coverage_warning, traversal_truncation_warning, unproducible_facets,
+    walk_traversal_with_references, walkable,
 };
 
 /// Answers one `search` request that carries `change`: the declarations the two
@@ -100,17 +101,21 @@ pub fn search_change(
 }
 
 /// What one walk riding beside a comparison reports: the disclosure every such
-/// answer carries, and whether the shared walk budget stopped the walk.
+/// answer carries, the requested facets no provider populates, and whether the
+/// shared walk budget stopped the walk.
 struct ChangeTraversalReport {
     disclosure: ReadWarning,
+    coverage_missing: Option<ReadWarning>,
     truncated: bool,
 }
 
 impl ChangeTraversalReport {
-    /// The warnings this walk contributes: the disclosure, then the walk bound when
-    /// the shared budget stopped the walk before the reachable graph was exhausted.
+    /// The warnings this walk contributes: the disclosure, the coverage gap when
+    /// one was requested, then the walk bound when the shared budget stopped the
+    /// walk before the reachable graph was exhausted.
     fn warnings(self) -> Vec<ReadWarning> {
         let mut warnings = vec![self.disclosure];
+        warnings.extend(self.coverage_missing);
         if self.truncated {
             warnings.push(traversal_truncation_warning());
         }
@@ -163,6 +168,13 @@ fn collect_change_traversal_hits(
     merge_walk_hits(reads, walk.discovered, merge, results)?;
     Ok(ChangeTraversalReport {
         disclosure: change_traversal_disclosure(unplaced),
+        // A comparison seeds declarations in every language it found changed, so the
+        // language half of the coverage gap has no one subject to name; the facet half
+        // is the same for every seed, and that is what this answer can state.
+        coverage_missing: relationship_coverage_warning(
+            unproducible_facets(&traversal.facets),
+            None,
+        ),
         truncated: walk.truncated,
     })
 }
@@ -1609,11 +1621,13 @@ mod tests {
     fn change_traversal_report_warns_the_disclosure_and_the_walk_bound() {
         let ran = ChangeTraversalReport {
             disclosure: change_traversal_disclosure(0),
+            coverage_missing: None,
             truncated: false,
         };
         assert_eq!(ran.warnings(), [change_traversal_disclosure(0)]);
         let stopped = ChangeTraversalReport {
             disclosure: change_traversal_disclosure(2),
+            coverage_missing: None,
             truncated: true,
         };
         assert_eq!(
@@ -1623,6 +1637,38 @@ mod tests {
                 traversal_truncation_warning()
             ]
         );
+    }
+
+    /// A facet no provider populates leaves the walk nothing to follow, so the answer says
+    /// so rather than leaving an empty impact to read as an absent caller.
+    #[test]
+    fn change_traversal_over_an_unproduced_facet_names_the_coverage_gap() -> TestResult {
+        let fixture = Fixture::revisions(IMPACT_BASE, IMPACT_HEAD, &[])?;
+
+        let answer = fixture.search(&json!({
+            "change": {"base": "baseline"},
+            "traversal": {"direction": "incoming", "facets": ["implements"]}
+        }))?;
+
+        let names: Vec<String> = matched(&answer).into_iter().map(|hit| hit.0).collect();
+        assert_eq!(names, ["watched"], "{names:?}");
+        let gap = answer
+            .warnings
+            .iter()
+            .find(|warning| matches!(warning, ReadWarning::RelationshipCoverageMissing { .. }));
+        assert_eq!(
+            gap,
+            Some(&ReadWarning::RelationshipCoverageMissing {
+                facets: vec![rift_protocol::read::RelationshipFacet::Implements],
+                language: None,
+                detail: "no provider populates the requested facet implements, so the walk \
+                         followed no edge under it"
+                    .to_owned(),
+            }),
+            "{:?}",
+            answer.warnings
+        );
+        Ok(())
     }
 
     /// The disclosure names the tree whose edges the walk followed and counts the changed

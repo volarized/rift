@@ -619,6 +619,11 @@ declaration the head revision removed among them, since such a declaration start
 warning states which tree supplied the edges; it never states that the answer is incomplete for
 that tree.
 
+A `facets` list naming a facet no provider populates attaches a `relationship_coverage_missing`
+entry to `warnings`, as it does beside a `seed`. Its `facets` names the gap; its `language` stays
+absent, since a comparison seeds declarations in every language it found changed and no one
+language answers for them.
+
 One walk budget covers every starting declaration, so the symbols one comparison's walk
 discovers keep the same node bound a seeded walk keeps rather than that bound per changed
 declaration. A walk the server stops at it attaches one `traversal_truncated` entry to

@@ -191,7 +191,7 @@ fn relationship_coverage_missing(
 ///
 /// `validate_traversal` refuses a list longer than `SEARCH_TRAVERSAL_FACETS_MAX` before this
 /// runs, which bounds both the scan and the deduplication it carries.
-fn unproducible_facets(requested: &[RelationshipFacet]) -> Vec<RelationshipFacet> {
+pub(crate) fn unproducible_facets(requested: &[RelationshipFacet]) -> Vec<RelationshipFacet> {
     let produced = produced_relationship_facets();
     let mut missing: Vec<RelationshipFacet> = Vec::new();
     for facet in requested {
@@ -227,7 +227,7 @@ fn uncovered_language(
 
 /// The `relationship_coverage_missing` warning naming what has no provider, or `None` when
 /// neither `facets` nor `language` names a gap.
-fn relationship_coverage_warning(
+pub(crate) fn relationship_coverage_warning(
     facets: Vec<RelationshipFacet>,
     language: Option<Language>,
 ) -> Option<ReadWarning> {
