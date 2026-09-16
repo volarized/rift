@@ -384,3 +384,45 @@ def probe_units(root: Path) -> int:
         ).fetchone()
     require(row is not None, "lexical probe count returned no row")
     return number(row[0], "lexical probe units")
+
+
+def churn_answer(
+    tool: str, answer: JsonObject, sources: list[str], identity: str | None
+) -> str:
+    """Require one probe declaration with source from a complete authored revision."""
+    warnings(answer)
+    if tool == "nodes":
+        nodes = array_value(answer.get("nodes"), "probe nodes")
+        excerpts = array_value(answer.get("source"), "probe node sources")
+        require(len(nodes) == len(excerpts), "nodes lost matching source excerpts")
+        matches = [
+            (object_value(node, "probe node"), excerpt)
+            for node, excerpt in zip(nodes, excerpts, strict=True)
+            if object_value(node, "probe node").get("symbol") == identity
+        ]
+        require(len(matches) == 1, "nodes lost probe declaration")
+        hit, excerpt = matches[0]
+        found = string_value(hit.get("symbol"), "probe identity")
+    else:
+        rows = array_value(
+            answer.get("results" if tool == "search" else "hits"), "probe hits"
+        )
+        require(len(rows) == 1, f"{tool} lost probe declaration")
+        hit = object_value(rows[0], "probe hit")
+        owner = object_value(hit.get("hit"), "search hit") if tool == "search" else hit
+        symbol = object_value(owner.get("symbol"), "probe symbol")
+        found = string_value(symbol.get("id"), "probe identity")
+        require(hit.get("path") == PROBE_PATH, f"{tool} returned another probe path")
+        excerpt = hit.get("source")
+    require(identity is None or found == identity, f"{tool} changed probe identity")
+    source = string_value(excerpt, "probe source")
+    require(
+        source in sources,
+        f"{tool} returned source outside the expected revisions: {source}",
+    )
+    span = object_value(hit.get("range"), "probe range")
+    require(
+        span.get("start") == 0 and span.get("end") == len(source.encode()),
+        f"{tool} probe range disagrees with source",
+    )
+    return found
