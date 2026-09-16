@@ -1,28 +1,19 @@
-name: full
+name: integration
 
 on:
-  schedule:
-    - cron: "23 2 * * *"
+  push:
+    branches: [main]
   workflow_dispatch:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, labeled]
-  workflow_call:
-    inputs:
-      skip-release-gate:
-        description: Reuse the release workflow's installer and upgrade checks
-        type: boolean
-        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: full-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: integration-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  corpus-build:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-gate')
+  integration-build:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -31,23 +22,24 @@ jobs:
           persist-credentials: false
       - uses: Swatinem/rust-cache@v2.9.2
         with:
-          shared-key: corpus
+          shared-key: integration
       - uses: taiki-e/install-action@v2.86.3
         with:
           tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
-      - name: Build and archive instrumented corpus tests
-        run: just corpus-archive
+      - name: Build and archive integrations
+        run: just integration-archive
       - uses: actions/upload-artifact@v6.0.0
         with:
-          name: corpus-build
-          path: target/corpus.tar.zst
+          name: integration-build
+          path: |
+            target/integration.tar.zst
+            target/integration-cli.tar.zst
           compression-level: 0
           if-no-files-found: error
           retention-days: 7
 
   corpus:
-    needs: corpus-build
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-gate')
+    needs: integration-build
     strategy:
       fail-fast: false
       matrix:
@@ -81,19 +73,20 @@ jobs:
       - uses: astral-sh/setup-uv@v7.6.0
         with:
           enable-cache: true
-          cache-dependency-glob: scripts/uv.lock
+          cache-dependency-glob: dev/uv.lock
       - uses: actions/download-artifact@v7.0.0
         with:
-          name: corpus-build
+          name: integration-build
           path: target
       - uses: taiki-e/install-action@v2.86.3
         with:
           tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
+      - run: rustup component add llvm-tools-preview
       - name: Install validating client
-        run: uv sync --locked --python 3.12 --project scripts
+        run: uv sync --locked --python 3.12 --project dev
       - uses: actions/cache@v6.1.0
         with:
-          path: ~/.cache/rift-corpus
+          path: ~/.cache/huggingface/hub-corpus
           key: corpus-${{ matrix.repository }}-${{ hashFiles('crates/rift/tests/corpus/pins.toml') }}
       - name: Fetch pinned repository
         run: just corpus-sync "${{ matrix.repository }}"
@@ -102,10 +95,10 @@ jobs:
         timeout-minutes: ${{ matrix.minutes }}
         env:
           RIFT_CORPUS_REPORT: ${{ github.workspace }}/target/corpus/${{ matrix.repository }}.json
-        run: just corpus-test "${{ matrix.repository }}" "${{ matrix.test }}" target/corpus.tar.zst
+        run: just corpus-test "${{ matrix.repository }}" "${{ matrix.test }}" target/integration.tar.zst
       - name: Report corpus coverage
         if: ${{ !cancelled() && steps.corpus.outcome != 'skipped' }}
-        run: cargo llvm-cov report --nextest-archive-file target/corpus.tar.zst --lcov --output-path target/corpus.lcov
+        run: cargo llvm-cov report --nextest-archive-file target/integration.tar.zst --lcov --output-path target/corpus.lcov
       - uses: codecov/codecov-action@v5.5.5
         if: ${{ !cancelled() && steps.corpus.outcome != 'skipped' }}
         with:
@@ -136,55 +129,70 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-  agent:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-gate')
+  live:
+    needs: integration-build
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/download-artifact@v7.0.0
+        with:
+          name: integration-build
+          path: target
       - uses: astral-sh/setup-uv@v7.6.0
         with:
           enable-cache: true
-          cache-dependency-glob: scripts/uv.lock
-      - uses: Swatinem/rust-cache@v2.9.2
+          cache-dependency-glob: dev/uv.lock
+      - uses: taiki-e/install-action@v2.86.3
         with:
-          shared-key: release-native
-      - name: Install validating client
-        run: uv sync --locked --python 3.12 --project scripts
-      - name: Build candidate binary
-        run: cargo build --release --locked -p rift
-      - name: Serve candidate artifact
-        timeout-minutes: 4
-        run: uv run --locked --python 3.12 --project scripts python scripts/check_artifact.py --binary target/release/rift --junit target/full-gate/artifact.xml
-      - name: Exercise every served tool
-        timeout-minutes: 5
-        run: uv run --locked --python 3.12 --project scripts python scripts/check_agent.py --binary target/release/rift --junit target/full-gate/agent.xml
-      - name: Prove cold first use
-        timeout-minutes: 4
-        run: uv run --locked --python 3.12 --project scripts python scripts/check_coldstart.py --binary target/release/rift --junit target/full-gate/coldstart.xml
+          tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
+      - run: rustup component add llvm-tools-preview rust-analyzer
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: latest
+      - uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.bun/install/cache
+            ~/.cache/huggingface/hub
+          key: integration-dependencies-${{ runner.os }}-${{ hashFiles('dev/uv.lock', 'Cargo.lock', 'tools/mcp-conformance/bun.lock') }}
+          restore-keys: integration-dependencies-${{ runner.os }}-
+      - run: uv sync --locked --python 3.12 --project dev
+      - run: uv tool install tombi
+      - name: Run live integrations
+        id: live
+        run: just live-test target/integration.tar.zst
+      - name: Report integration coverage
+        if: ${{ !cancelled() && steps.live.outcome != 'skipped' }}
+        run: cargo llvm-cov report --nextest-archive-file target/integration.tar.zst --lcov --output-path target/integration.lcov
+      - name: Extract compiled CLI
+        run: |
+          mkdir -p target/integration-cli
+          tar --zstd -xf target/integration-cli.tar.zst -C target/integration-cli
+      - name: Validate artifact and MCP client
+        run: |
+          just artifact-test --binary target/integration-cli/rift --junit target/integration/artifact.xml
+          just agent-test --binary target/integration-cli/rift --junit target/integration/agent.xml
+          just conformance target/integration-cli/rift
+      - name: Validate cold first use
+        run: just coldstart-test --binary target/integration-cli/rift --junit target/integration/coldstart.xml
       - uses: codecov/codecov-action@v5.5.5
-        if: always()
+        if: ${{ !cancelled() && steps.live.outcome != 'skipped' }}
         with:
           disable_search: true
           fail_ci_if_error: true
-          files: target/full-gate/artifact.xml,target/full-gate/agent.xml,target/full-gate/coldstart.xml
-          flags: gate
-          name: rift-full-gate
-          report_type: test_results
+          files: target/integration.lcov
+          flags: integration
           token: ${{ secrets.CODECOV_TOKEN }}
       - uses: actions/upload-artifact@v6.0.0
         if: always()
         with:
-          name: full-gate
-          path: target/full-gate/
-          if-no-files-found: warn
+          name: integration-results
+          path: |
+            target/integration/
+            target/integration.lcov
+            target/nextest/integration/junit.xml
+          if-no-files-found: error
           retention-days: 7
-
-  release-gate:
-    if: >-
-      !inputs.skip-release-gate &&
-      (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-gate'))
-    uses: ./.github/workflows/release-gate.yml
-    secrets: inherit

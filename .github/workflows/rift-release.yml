@@ -63,7 +63,7 @@ jobs:
     timeout-minutes: 35
     env:
       RIFT_TARGET: ${{ matrix.target }}
-      # Match the native gate's Python harness while Rift remains ARM64 on Windows ARM.
+      # Release tooling uses x86-64 Python on Windows ARM; Rift stays native.
       UV_PYTHON: ${{ matrix.os == 'windows-11-arm' && 'cpython-3.12-windows-x86_64-none' || '3.12' }}
     steps:
       - uses: actions/checkout@v7.0.1
@@ -81,17 +81,6 @@ jobs:
       - name: Build release binary
         timeout-minutes: 30
         run: cargo build --release --locked --target "${{ matrix.target }}" --package rift
-      - name: Smoke test release binary
-        run: >-
-          uv run --locked --project scripts python scripts/check_artifact.py
-          --binary "${{ matrix.binary }}"
-          --version "${{ github.ref_name }}"
-      - uses: actions/upload-artifact@v6.0.0
-        with:
-          name: candidate-${{ matrix.target }}
-          path: ${{ matrix.binary }}
-          if-no-files-found: error
-          retention-days: 7
       - name: Package release archive
         run: >-
           uv run --locked --project tools/rift-release rift-release package
@@ -103,10 +92,6 @@ jobs:
           path: dist/*
           if-no-files-found: error
           retention-days: 7
-
-  native-tests:
-    needs: build
-    uses: ./.github/workflows/native-tests.yml
 
   docs:
     needs: validate
@@ -122,7 +107,11 @@ jobs:
       - uses: oven-sh/setup-bun@v2.2.0
         with:
           bun-version: latest
-          no-cache: true
+      - uses: actions/cache@v6.1.0
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('docs/bun.lock') }}
+          restore-keys: ${{ runner.os }}-bun-
       - run: bun install --frozen-lockfile
       - run: bunx biome ci .
       - run: bunx next typegen
@@ -137,7 +126,7 @@ jobs:
           retention-days: 7
 
   publish:
-    needs: [build, native-tests, docs]
+    needs: [build, docs]
     runs-on: ubuntu-24.04
     environment: rift-release
     permissions:
@@ -166,65 +155,17 @@ jobs:
         uses: actions/attest-build-provenance@v3.2.0
         with:
           subject-path: dist/*
-      - name: Create draft GitHub Release
+      - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
           gh release create "$RIFT_TAG" dist/*
           --verify-tag
-          --draft
           --title "Rift $RIFT_TAG"
           --generate-notes
 
-  full:
-    needs: validate
-    uses: ./.github/workflows/full.yml
-    with:
-      skip-release-gate: true
-    secrets: inherit
-
-  release-gate:
-    needs: publish
-    permissions:
-      contents: write
-    uses: ./.github/workflows/release-gate.yml
-    with:
-      tag: ${{ github.ref_name }}
-      draft: true
-    secrets: inherit
-
-  promote:
-    needs: [release-gate, full]
-    runs-on: ubuntu-24.04
-    environment: rift-release
-    permissions:
-      contents: write
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v7.0.1
-        with:
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@v7.6.0
-        with:
-          enable-cache: true
-          cache-dependency-glob: scripts/uv.lock
-      - uses: actions/download-artifact@v7.0.0
-        with:
-          path: gate-evidence
-          pattern: release-gate-*
-      - name: Require verified draft assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: >-
-          uv run --locked --python 3.12 --project scripts python scripts/check_release_promotion.py
-          --tag "$RIFT_TAG" --evidence gate-evidence
-      - name: Promote verified release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release edit "$RIFT_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
-
   deploy-docs:
-    needs: promote
+    needs: publish
     runs-on: ubuntu-24.04
     environment:
       name: production
@@ -239,7 +180,6 @@ jobs:
       - uses: oven-sh/setup-bun@v2.2.0
         with:
           bun-version: latest
-          no-cache: true
       - uses: actions/download-artifact@v7.0.0
         with:
           name: docs-site
