@@ -100,7 +100,9 @@ Python developer tooling lives in the locked `rift-dev` package under `dev/`:
 | `just corpus-test <name>` | Corpus suite for `bun`, `nextjs`, or `fastapi` |
 | `just artifact-test` | Build and serve the native release binary |
 | `just agent-test` | Validate three MCP tools and three resources |
-| `just integration-test` | Live models, corpus repositories, and served binary checks |
+| `just live-test` | Live language-engine and semantic model suites |
+| `just integration-archive` | Build one CLI and test archive for integration jobs |
+| `just integration-test` | Live language engines, models, corpus repositories, and served binary checks |
 
 Unit tests run on pull requests and pushes to `main`. Integration tests run on `main` after
 merge and on manual dispatch. CI reuses compiled test archives and caches dependencies.

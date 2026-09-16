@@ -268,6 +268,10 @@ one named or inline process for an exact language identity: rust-analyzer for `r
 `typescript-language-server` for `typescript` and `typescript:tsx`. Several identities may
 select the same named process.
 
+[`search`](/docs/mcp#search-engine-references) uses the engine for incoming reference traversal
+and combines the returned callers with indexed relationships. Source and configuration must
+match the captured index before and after the engine request.
+
 The embedded [ty](https://github.com/astral-sh/ty) engine serves Python over an in-memory
 transport through the same LSP session contract. Its version ships with the Rift binary.
 

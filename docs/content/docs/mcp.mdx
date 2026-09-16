@@ -364,60 +364,32 @@ from `seed` to the hit. Every `GraphHop` carries the
 [`Relationship`](/docs/developer/protocol/reference#Relationship) it followed and the direction it
 followed it in; `seed` itself is never a hit.
 
-This impact query asks what calls `resolve_traversal_seed`:
+For a Python workspace with the embedded engine configured, this request asks which declarations
+reference `serve` in `service.py`:
 
 **Request:**
 
 ```json
 {
   "traversal": {
-    "seed": "rift://symbol/rust/crates/rift-server/src/search.rs/resolve_traversal_seed",
-    "direction": "incoming"
-  }
-}
-```
-
-**Search hit:**
-
-```json
-{
-  "hit": {
-    "target": "symbol",
-    "symbol": {
-      "id": "rift://symbol/rust/crates/rift-server/src/search.rs/collect_traversal_hits",
-      "language": "rust",
-      "name": "collect_traversal_hits",
-      "kind": "function",
-      "facets": ["value", "callable"],
-      "visibility": "private"
-    }
+    "seed": "rift://symbol/python/service.py/serve",
+    "direction": "incoming",
+    "facets": ["references"],
+    "depth": 1
   },
-  "matched_by": ["relationship"],
-  "range": { "start": 29305, "end": 31111 },
-  "line": 779,
-  "path": "crates/rift-server/src/search.rs",
-  "traversal_path": [
-    {
-      "relationship": {
-        "from": "rift://symbol/rust/crates/rift-server/src/search.rs/collect_traversal_hits",
-        "kind": "calls",
-        "facets": ["calls"],
-        "to": "rift://symbol/rust/crates/rift-server/src/search.rs/resolve_traversal_seed",
-        "derivation": "resolution"
-      },
-      "direction": "incoming"
-    }
-  ],
-  "distance": 1
+  "target": "symbol"
 }
 ```
+
+Each caller's `traversal_path` carries a relationship from the caller to `serve`, with
+`facets: ["references"]` and `derivation: "resolution"`. The hop's direction is `incoming`.
 
 `facets` narrows the walk to [`RelationshipFacet`](/docs/developer/protocol/reference#RelationshipFacet)
 values such as `calls`, `references`, and `imports`; an empty or omitted list follows every
 facet. `target: "file"` never carries a walked hit, since a traversal only reaches symbols.
 
-A workspace with the binding provider disabled, and no relationship data left from an earlier
-build, refuses `capability_unavailable` naming `relationship traversal (providers.binding
+A workspace with the binding provider disabled, no engine-resolved references, and no relationship
+data left from an earlier build refuses `capability_unavailable` naming `relationship traversal (providers.binding
 disabled)`: the graph this walk needs was never built. `traversal` never combines with `rev` -
 the relationship graph serves the current tree alone - and refuses `capability_unavailable`
 the same way. A `seed` that resolves to neither a graph node nor a lexical declaration refuses
@@ -427,6 +399,25 @@ an isolated declaration is a legitimate answer.
 A walk the server stops at its node bound attaches a `traversal_truncated` entry to
 `warnings`, naming how many symbols it visited: hits reachable beyond the bound are missing,
 and a tighter `facets` list, a smaller `depth`, or a less-connected `seed` fits the walk under it.
+
+### Language-engine references [#search-engine-references]
+
+<VersionBadge version="v0.0.35" languages={["Rust", "TypeScript", "Python"]} />
+
+A current-tree symbol traversal consults the configured
+[language engine](/docs/developer/configuration#languages-and-lsp) when `direction` is `incoming`
+or `both` and `facets` contains `references` or is empty. The server adds engine-resolved
+references to the indexed relationships and applies the same traversal depth and result bounds.
+
+The server maps each reference location to the smallest indexed declaration containing it.
+Locations outside the workspace or without an indexed declaration contribute no hit. When no
+engine is configured, or the engine lacks reference support, the indexed relationships answer.
+A configured engine that fails to start returns its failure through
+[`ErrorData`](/docs/developer/protocol/reference#ErrorData).
+
+The server captures source and configuration before and after the engine request. A changed
+capture discards the engine references, so the traversal uses the captured index alone.
+The request uses the configured engine retry and restart bounds.
 
 ### Dependency scope [#search-scope]
 

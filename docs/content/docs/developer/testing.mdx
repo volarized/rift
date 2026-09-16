@@ -5,8 +5,7 @@ title: Testing
 <VersionBadge version="v0.0.35" />
 
 Unit tests run on pull requests and pushes to `main`. Integration tests run after a merge to
-`main` and on manual dispatch, with live semantic models and pinned Next.js, Bun, and FastAPI
-repositories.
+`main` and on manual dispatch, with live language engines and semantic models, and pinned Next.js, Bun, and FastAPI repositories.
 
 ## Unit tests
 
@@ -17,7 +16,7 @@ and `cargo-nextest`. Run the unit suite from the repository root:
 just test
 ```
 
-The unit suite runs without model downloads or corpus checkouts.
+The unit suite runs without external language servers, model downloads, or corpus checkouts.
 The test selection keeps those dependencies in the integration suite.
 `just doctest` runs Rust documentation examples through `cargo test --doc`, because nextest
 does not support doctests on stable Rust.
@@ -34,12 +33,18 @@ dependency caches avoid compiling unchanged dependencies on each run.
 
 ## Integration tests
 
-Live suites require network access for model weights and corpus source. Model and corpus
-caches are reused between runs. Run the integration suite from the repository root:
+Live suites require `rust-analyzer`, Bun, and tombi, plus network access for model weights and
+corpus source. Install the language tools with `rustup component add rust-analyzer` and
+`uv tool install tombi`; the TypeScript suite starts its language server through Bun.
+Model and package caches are reused between runs. Run the integration suite from the repository root:
 
 ```sh
 just integration-test
 ```
+
+`just live-test` selects the live language-engine and model suites. CI builds the CLI and an
+instrumented test archive once with `just integration-archive`, then passes the archive to
+`just live-test target/integration.tar.zst` and the corpus jobs.
 
 For one corpus repository, fetch its pinned source and run its suite:
 
@@ -66,7 +71,9 @@ A repin must update the recorded measurements.
 | Next.js | 31,115 | 157,964,029 | 32 | 15 |
 | FastAPI | 3,137 | 34,759,910 | 0 | 6 |
 
-Corpus checks cover search, symbol lookup, syntax reads, history, and shutdown. They serve the
+Corpus checks cover search, symbol lookup, syntax reads, history, and shutdown. They also create
+and remove source files outside Rift, compare later reads with those bytes, and verify that
+unrelated persisted lexical rows remain unchanged. They serve the
 same source and dependency configuration used by a workspace. Semantic model downloads stay
 disabled for corpus runs, so repository checks measure source and lexical indexing.
 
@@ -89,7 +96,23 @@ Both commands build the native release binary unless `--binary <path>` supplies 
 `--target <triple>` selects a Cargo target when building. A supplied binary is tested unchanged,
 so CI can reuse its build artifact.
 
-The integration suite also runs the upstream MCP conformance checks against the served binary.
+The artifact and agent checks require reads to observe external filesystem writes. The agent
+check also reads incoming references through the embedded Python engine and verifies the source
+stays unchanged. The integration suite runs upstream MCP conformance checks against the same binary.
+
+## Cold first use
+
+The cold check needs Docker and a Linux binary matching the container architecture:
+
+```sh
+just coldstart-test --binary target/release/rift
+```
+
+The container has no network, language servers, or existing Rift cache. It starts with an empty
+workspace, then reads a newly created source file. After configuration selects a missing language
+server, an incoming-reference request must report the launch failure while syntax reads remain
+available. CI runs this check with its compiled Linux artifact; a local macOS run needs a Linux binary.
+
 
 ## Developer tooling
 
