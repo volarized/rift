@@ -15,7 +15,7 @@ use rift_core::constants::{
     WORKSPACE_FILES_MAX_DEFAULT, WORKSPACE_IGNORED_DIRECTORIES,
 };
 use rift_core::{
-    CompositionId, ContributionError, Error, ErrorCode, ErrorContext, ErrorName, Fault,
+    CompositionId, ContributionError, Error, ErrorCode, ErrorContext, ErrorName, Fault, Language,
     LanguageFileSelections, LimitEvidence, PortableSymbolFacts, ProjectPath, ProviderId,
     SourceVisibility, SymbolId, TextFileInclusion, fault_label, symbol_identity,
 };
@@ -1604,6 +1604,22 @@ impl WorkspaceIndex {
     #[must_use]
     pub const fn binding_enabled(&self) -> bool {
         self.binding.is_enabled()
+    }
+
+    /// Whether any indexed file of `language` carries name-binding facts, the one input
+    /// [`RelationshipStore`]'s edges are built from.
+    ///
+    /// `false` means no provider in this build produced relationship facts for the
+    /// language over this workspace, so a declaration in it has no store edge whatever the
+    /// graph holds. One file whose extraction hit a bound cannot answer `false` on its
+    /// own: the scan asks every file of the language.
+    ///
+    /// The scan stops at the first file of `language` carrying facts, and is otherwise
+    /// bounded by the index's own file count.
+    #[must_use]
+    pub fn carries_binding_facts(&self, language: &Language) -> bool {
+        self.files()
+            .any(|file| file.syntax().language() == language && file.syntax().binding().is_some())
     }
 
     /// Assembles readable symbol through its normalized record.

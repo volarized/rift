@@ -418,7 +418,7 @@ pub enum EquivalenceEvidence {
 }
 
 /// Portable role of one semantic reference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::VariantArray)]
 pub enum ReferenceRole {
     /// Reference declares its target.
     Definition,
