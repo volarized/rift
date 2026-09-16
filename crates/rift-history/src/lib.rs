@@ -16,6 +16,6 @@ pub use contribution::{
     HistoryContributionAdapter, HistoryContributionError, HistoryContributionViolation,
 };
 pub use repository::{
-    HistoryError, HistoryFault, PathHistory, PathRevision, REVISION_TREE_ENTRIES_MAX, Repository,
-    ResolvedRevision, TreeFile,
+    ChangedFiles, HistoryError, HistoryFault, PathHistory, PathRevision, REVISION_TREE_ENTRIES_MAX,
+    Repository, ResolvedRevision, TreeFile,
 };
