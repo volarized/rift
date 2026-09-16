@@ -183,17 +183,31 @@ fn revision_read_corpus() -> Vec<(&'static str, Value)> {
 }
 
 /// A comparison of the fixture's two committed revisions: the `baseline` tag holds
-/// everything before `change_witness.rs` arrived, so this answer carries one
-/// `introduced` hit and validates the `change` arm of the served output schema
-/// against a real payload.
+/// everything before `change_witness.rs` arrived, so this answer carries the two
+/// `introduced` hits that file brought and validates the `change` arm of the served
+/// output schema against a real payload.
+///
+/// The second request rides a `traversal` beside the same comparison. The walk starts at
+/// both changed declarations, reaches the caller from the callee, and that caller is
+/// itself a changed declaration, so one payload carries `change` beside `traversal_path`
+/// and the answer carries the disclosure every walked comparison rides with.
 fn change_search_corpus() -> Vec<(&'static str, Value)> {
-    vec![(
-        "search",
-        json!({
-            "change": { "base": "baseline", "head": "HEAD" },
-            "include": ["source"]
-        }),
-    )]
+    vec![
+        (
+            "search",
+            json!({
+                "change": { "base": "baseline", "head": "HEAD" },
+                "include": ["source"]
+            }),
+        ),
+        (
+            "search",
+            json!({
+                "change": { "base": "baseline", "head": "HEAD" },
+                "traversal": { "direction": "incoming", "facets": ["calls"] }
+            }),
+        ),
+    ]
 }
 
 fn arguments(value: &Value) -> TestResult<serde_json::Map<String, Value>> {
@@ -535,9 +549,12 @@ async fn served_fixture() -> TestResult<(
     // A second commit, tagged apart from it, so a `change` request compares two
     // committed revisions that really differ.
     rift_history::fixture::git(directory.path(), &["tag", "baseline"]);
+    // Both the declaration and its caller arrive in this commit and live in one file, so
+    // the comparison answers two `introduced` hits and a walk beside it reaches the
+    // caller from the callee.
     fs::write(
         directory.path().join("change_witness.rs"),
-        "pub fn change_witness() {}\n",
+        "pub fn change_witness() {}\n         pub fn calls_change_witness() {\n    change_witness();\n}\n",
     )?;
     rift_history::fixture::commit_all(directory.path(), "introduce the change witness");
     let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;

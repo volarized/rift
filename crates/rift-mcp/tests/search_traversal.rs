@@ -252,6 +252,32 @@ async fn search_traversal_over_a_produced_facet_serves_no_coverage_warning() -> 
     Ok(())
 }
 
+/// A walk names its starting declaration: without a `change` beside it, `seed` is the only
+/// way to, so a request naming neither refuses.
+#[tokio::test]
+async fn search_traversal_without_a_seed_and_without_a_change_refuses() -> TestResult {
+    let (_directory, client, _server_task) = served_workspace(CALL_GRAPH_FILES, None).await?;
+
+    let error = client
+        .call_tool(tool_request(
+            "search",
+            &json!({"traversal": {"direction": "incoming"}}),
+        ))
+        .await
+        .expect_err("a walk with no starting declaration must refuse");
+    let rmcp::ServiceError::McpError(error) = error else {
+        panic!("the refusal must arrive as an MCP error: {error}");
+    };
+    assert_eq!(
+        error.data.as_ref().and_then(|data| data.get("code")),
+        Some(&json!("invalid_request")),
+        "{error:?}"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
 fn results(structured: &Value) -> Vec<Value> {
     structured["results"]
         .as_array()

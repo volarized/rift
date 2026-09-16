@@ -1,6 +1,7 @@
 //! Drives `search`'s `change` block through a live rmcp client over a committed fixture
-//! workspace: an introduced declaration, a removed one, a signature change, and the
-//! refusals a comparison of two committed revisions answers.
+//! workspace: an introduced declaration, a removed one, a signature change, the walk a
+//! `traversal` riding beside the comparison runs, and the refusals a comparison of two
+//! committed revisions answers.
 
 mod hermetic_search;
 // `served_relative_workspace` and its `relative_spelling` helper are part of
@@ -204,7 +205,7 @@ async fn search_change_refuses_the_requests_it_cannot_answer() -> TestResult {
                 "change": {"base": "baseline"},
                 "traversal": {"seed": "rift://symbol/rust/src/kept.rs/kept"}
             }),
-            "capability_unavailable",
+            "invalid_request",
         ),
         (
             json!({"change": {"base": "baseline"}, "scope": "all"}),
@@ -357,6 +358,79 @@ async fn search_change_pairs_a_declaration_moved_between_paths() -> TestResult {
         json!("rift://symbol/rust/src/to.rs/travelled"),
         "{structured}"
     );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// The base revision of the impact fixture: `watched`, and `calls_watched` calling it.
+const IMPACT_BASE: &str = "pub fn watched() {}\npub fn calls_watched() {\n    watched();\n}\n";
+
+/// The head revision: `watched` takes a parameter, and its caller's bytes are unchanged.
+const IMPACT_HEAD: &str =
+    "pub fn watched(flag: bool) {}\npub fn calls_watched() {\n    watched();\n}\n";
+
+/// A `traversal` riding beside a comparison starts at every changed declaration, reaches
+/// their callers through the current tree's relationship graph, and discloses that the
+/// edges are that tree's rather than either compared revision's.
+#[tokio::test]
+async fn search_change_with_a_traversal_reaches_the_callers_of_every_changed_declaration()
+-> TestResult {
+    let directory = tempfile::tempdir()?;
+    fs::write(
+        directory.path().join("rift.toml"),
+        hermetic_search::SEMANTIC_DISABLED,
+    )?;
+    write_all(directory.path(), &[("lib.rs", IMPACT_BASE)])?;
+    init(directory.path());
+    commit_all(directory.path(), "baseline");
+    git(directory.path(), &["tag", "baseline"]);
+    write_all(directory.path(), &[("lib.rs", IMPACT_HEAD)])?;
+    commit_all(directory.path(), "head");
+    let (client, _server_task) = served_root(directory.path()).await?;
+
+    let structured = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({
+                "change": {"base": "baseline"},
+                "traversal": {"direction": "incoming", "facets": ["calls"]}
+            }),
+        ),
+    )
+    .await?;
+
+    let names: Vec<String> = results(&structured)
+        .iter()
+        .filter_map(|hit| hit["hit"]["symbol"]["name"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(names, ["calls_watched", "watched"], "{structured}");
+    let caller = &results(&structured)[0];
+    assert_eq!(caller["matched_by"], json!(["relationship"]), "{caller}");
+    assert_eq!(caller["distance"], json!(1), "{caller}");
+    assert_eq!(
+        caller["traversal_path"][0]["relationship"]["to"],
+        json!("rift://symbol/rust/lib.rs/watched"),
+        "the first hop names the changed declaration the walk started at: {caller}"
+    );
+    assert!(caller["change"].is_null(), "{caller}");
+    let changed = &results(&structured)[1];
+    assert_eq!(changed["matched_by"], json!(["change"]), "{changed}");
+    assert_eq!(
+        changed["change"]["kind"],
+        json!("signature_changed"),
+        "{changed}"
+    );
+    let disclosure = structured["warnings"]
+        .as_array()
+        .and_then(|warnings| {
+            warnings
+                .iter()
+                .find(|warning| warning["code"] == json!("change_traversal_current_tree"))
+        })
+        .ok_or("every walked comparison discloses which tree supplied the edges")?;
+    assert_eq!(disclosure["unplaced"], json!(0), "{disclosure}");
 
     client.cancel().await?;
     Ok(())
