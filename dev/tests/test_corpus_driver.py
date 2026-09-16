@@ -210,20 +210,22 @@ def test_churn_write_failure_prevents_first_read(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("returned_identity", ["sample", "different"])
+@pytest.mark.parametrize(
+    "source", ["def sample(): pass\n", "#[derive(Default)]\npub struct Sample {}\n"]
+)
 def test_sampled_symbol_must_resolve_through_nodes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, returned_identity: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, returned_identity: str, source: str
 ) -> None:
     from rift_dev import check_corpus
 
     monkeypatch.setattr(check_corpus, "SYMBOL_COUNT", 1)
-    source = "def sample(): pass\n"
     (tmp_path / "source.py").write_text(source)
     corpus = Corpus(pins()["fastapi"], tmp_path / "rift", tmp_path / "report.json")
     corpus.root = tmp_path
     hit: JsonObject = {
         "hit": {"symbol": {"id": "sample", "language": "python"}},
         "path": "source.py",
-        "range": {"start": 0, "end": len(source.encode())},
+        "range": {"start": 0, "end": len(source.rstrip("\n").encode())},
     }
     client = AsyncMock(spec=Client)
     client.resource.return_value = {
@@ -241,7 +243,10 @@ def test_sampled_symbol_must_resolve_through_nodes(
         if name == "search":
             return {"results": [hit], "warnings": []}
         assert name == "nodes"
-        assert arguments == {"path": "source.py", "position": 0}
+        assert arguments == {
+            "path": "source.py",
+            "position": len(source.rstrip("\n").encode()) - 1,
+        }
         return {"nodes": [{"symbol": returned_identity}]}
 
     client.call.side_effect = call
