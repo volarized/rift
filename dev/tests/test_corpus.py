@@ -3,19 +3,25 @@
 from __future__ import annotations
 
 import dataclasses
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
 from rift_dev.corpus_assertions import (
+    PROBE_PATH,
+    PROBE_SOURCE,
     active_operation,
     active_stdout,
     exact_degradation,
     language_counts,
     lexical_breach,
+    lexical_content,
     map_paths,
     no_failed_builds,
+    probe_units,
     records,
     sample_symbols,
     warnings,
@@ -454,3 +460,88 @@ class Decisions(unittest.TestCase):
         ):
             with self.subTest(source=source), self.assertRaises(AssertionError):
                 warnings({"warnings": source})
+
+
+class PersistedContent(unittest.TestCase):
+    def test_reads_close_connections_on_success_and_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".rift").mkdir()
+            with closing(sqlite3.connect(root / ".rift/db")) as fixture:
+                fixture.execute(
+                    "CREATE TABLE lexical_units(identity TEXT, path TEXT, kind TEXT, name TEXT, byte_length INTEGER, content TEXT)"
+                )
+                fixture.execute(
+                    "INSERT INTO lexical_units VALUES ('id','source.rs','symbol','beacon',15,'fn beacon() {}')"
+                )
+                fixture.commit()
+            connect = sqlite3.connect
+            opened: list[sqlite3.Connection] = []
+
+            def tracked(
+                database: str, *, uri: bool, timeout: float
+            ) -> sqlite3.Connection:
+                connection = connect(database, uri=uri, timeout=timeout)
+                opened.append(connection)
+                return connection
+
+            with patch(
+                "rift_dev.corpus_assertions.sqlite3.connect", side_effect=tracked
+            ):
+                self.assertEqual(probe_units(root), 0)
+                self.assertEqual(lexical_content(root).units, 1)
+                with (
+                    patch("rift_dev.corpus_assertions.LEXICAL_UNITS_MAX", 0),
+                    self.assertRaises(AssertionError),
+                ):
+                    lexical_content(root)
+            self.assertEqual(len(opened), 3)
+            for connection in opened:
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connection.execute("SELECT 1")
+
+    def test_write_preserves_unrelated_rows_and_detects_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".rift").mkdir()
+            with sqlite3.connect(root / ".rift/db") as connection:
+                connection.execute(
+                    "CREATE TABLE lexical_units(identity TEXT, path TEXT, kind TEXT, name TEXT, byte_length INTEGER, content TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO lexical_units VALUES ('id','source.rs','symbol','beacon',15,'fn beacon() {}')"
+                )
+                connection.commit()
+                before = lexical_content(root)
+                connection.execute(
+                    "INSERT INTO lexical_units VALUES ('probe',?,'symbol','corpus_probe',24,?)",
+                    (PROBE_PATH, PROBE_SOURCE),
+                )
+                connection.commit()
+                self.assertEqual(lexical_content(root), before)
+                connection.execute(
+                    "UPDATE lexical_units SET content='changed' WHERE identity='id'"
+                )
+                connection.commit()
+                self.assertNotEqual(lexical_content(root), before)
+
+    def test_empty_or_over_budget_store_is_not_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".rift").mkdir()
+            with sqlite3.connect(root / ".rift/db") as connection:
+                connection.execute(
+                    "CREATE TABLE lexical_units(identity TEXT, path TEXT, kind TEXT, name TEXT, byte_length INTEGER, content TEXT)"
+                )
+                connection.commit()
+                with self.assertRaisesRegex(AssertionError, "empty"):
+                    lexical_content(root)
+                connection.execute(
+                    "INSERT INTO lexical_units VALUES ('id','source.rs','symbol','beacon',15,'fn beacon() {}')"
+                )
+                connection.commit()
+                with (
+                    patch("rift_dev.corpus_assertions.LEXICAL_UNITS_MAX", 0),
+                    self.assertRaisesRegex(AssertionError, "row count"),
+                ):
+                    lexical_content(root)

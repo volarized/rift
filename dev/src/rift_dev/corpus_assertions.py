@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
+import json
 import random
 import re
+import sqlite3
+from contextlib import closing
+from pathlib import Path
 from urllib.parse import unquote
 
 from rift_dev.rift_test_client import (
@@ -18,6 +24,8 @@ SYMBOL_COUNT = 200
 SYMBOL_POOL_MAX = 4000
 READ_COUNT = 50
 SOURCE_WARNINGS_MAX = 8
+LEXICAL_UNITS_MAX = 1_000_000
+LEXICAL_BYTES_MAX = 512 * 1024 * 1024
 PROBE_PATH = "rift_corpus_probe.rs"
 PROBE_SOURCE = "pub fn corpus_probe(){}\n"
 MAP_MODULES_MAX = 100_000
@@ -309,3 +317,70 @@ def active_stdout(output: str, operation: str, epoch: str | None) -> str:
             )
         require(not completed, f"{operation} completed before stop on stderr: {row}")
     return rows[start]
+
+
+@dataclasses.dataclass(frozen=True)
+class LexicalContent:
+    """Exact stored rows, excluding the probe path."""
+
+    units: int
+    bytes: int
+    digest: str
+
+
+def lexical_content(root: Path) -> LexicalContent:
+    """Hash ordered source rows through SQLite's read-only connection.
+
+    The schema is owned by rift-index/src/lexical.rs. Diagnostics and the
+    revision row change on each publication; unrelated source rows must not.
+    """
+    digest = hashlib.sha256()
+    count = size = 0
+    database = root / ".rift" / "db"
+    with closing(
+        sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True, timeout=5.0)
+    ) as connection:
+        cursor = connection.execute(
+            "SELECT identity,path,kind,name,byte_length,content FROM lexical_units "
+            "WHERE path != ? ORDER BY identity",
+            (PROBE_PATH,),
+        )
+        for row in cursor:
+            count += 1
+            encoded = json.dumps(
+                row, ensure_ascii=False, separators=(",", ":")
+            ).encode()
+            size += len(encoded)
+            require(
+                count <= LEXICAL_UNITS_MAX,
+                "lexical row count exceeded configured maximum",
+            )
+            require(
+                size <= LEXICAL_BYTES_MAX * 4,
+                "lexical row bytes exceeded bounded content and identities",
+            )
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+    require(count > 0, "lexical content is empty; the index did not publish")
+    return LexicalContent(count, size, digest.hexdigest())
+
+
+def database_bytes(root: Path) -> JsonObject:
+    return {
+        name: path.stat().st_size
+        for name in ("db", "db-wal", "db-shm")
+        if (path := root / ".rift" / name).is_file()
+    }
+
+
+def probe_units(root: Path) -> int:
+    """Count only the probe's persisted units after the lexical lane commits."""
+    database = root / ".rift" / "db"
+    with closing(
+        sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True, timeout=5.0)
+    ) as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM lexical_units WHERE path = ?", (PROBE_PATH,)
+        ).fetchone()
+    require(row is not None, "lexical probe count returned no row")
+    return number(row[0], "lexical probe units")

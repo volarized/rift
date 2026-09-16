@@ -56,6 +56,22 @@ async def check_reads(client: Client) -> None:
     )
 
 
+async def check_external_change(client: Client, root: Path) -> None:
+    """Require the next source read to observe an external filesystem write."""
+    expected = SOURCE.replace("{ 1 }", "{ 3 }")
+    path = root / "lib.rs"
+    path.write_bytes(expected.encode("utf-8"))
+    after = await symbol_hit(client, "beacon_one")
+    require(
+        after.get("source") == "pub fn beacon_one() -> u8 { 3 }",
+        f"filesystem change was absent from reads: {after}",
+    )
+    require(
+        path.read_bytes() == expected.encode("utf-8"),
+        "source read changed filesystem bytes",
+    )
+
+
 async def check_artifact(binary: Path, version: str) -> None:
     """Run the real executable without compiling or replacing its bytes."""
     async with gate_deadline("artifact", ARTIFACT_SECONDS):
@@ -69,6 +85,7 @@ async def check_artifact(binary: Path, version: str) -> None:
                 try:
                     async with server.connect() as client:
                         await check_reads(client)
+                        await check_external_change(client, root)
                     server.stop()
                 except BaseException as error:
                     error.add_note(server.read_log())

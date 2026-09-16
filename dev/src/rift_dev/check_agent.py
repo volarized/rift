@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 
 from rift_dev.check_artifact import (
+    check_external_change,
     check_reads,
     lay_out_workspace,
     symbol_hit,
@@ -91,6 +92,7 @@ async def check_agent(binary: Path, version: str | None = None) -> None:
                     async with server.connect() as client:
                         await check_resources(client)
                         await check_reads(client)
+                        await check_external_change(client, root)
                         await declaration_node(client, "beacon_one")
                         client.require_complete(READ_TOOLS)
                     server.stop()

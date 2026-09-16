@@ -19,13 +19,16 @@ from rift_dev.corpus_assertions import (
     READ_COUNT,
     SYMBOL_COUNT,
     active_stdout,
+    database_bytes,
     exact_degradation,
     fields,
     language_counts,
     lexical_breach,
+    lexical_content,
     map_paths,
     no_failed_builds,
     number,
+    probe_units,
     records,
     sample_symbols,
     warnings,
@@ -201,6 +204,7 @@ class Corpus:
                     )
                 await self.left_out(client)
                 await self.symbols(client, candidates)
+                await self.lexical_persistence(client)
                 if self.pin.name == "nextjs":
                     await self.symlinks(client)
                 no_failed_builds(
@@ -388,6 +392,51 @@ class Corpus:
             )
             require(path.read_bytes() == content, f"read changed {path}")
         self.record("identities", count=len(identities), seed=SEED)
+
+    async def lexical_persistence(self, client: Client) -> None:
+        """Preserve unrelated lexical rows after external source creation and removal."""
+        before = lexical_content(self.root)
+        sizes = database_bytes(self.root)
+        path = self.root / PROBE_PATH
+        path.write_bytes(PROBE_SOURCE.encode())
+        answer = await client.call("get_symbol", {"name": "corpus_probe"})
+        hits = objects(answer, "hits")
+        require(
+            len(hits) == 1 and hits[0].get("source") == PROBE_SOURCE.rstrip("\n"),
+            f"new source was absent from reads: {answer}",
+        )
+        await self.await_probe(True)
+        require(
+            lexical_content(self.root) == before,
+            "source creation changed unrelated persisted lexical rows",
+        )
+        require(
+            path.read_bytes() == PROBE_SOURCE.encode(),
+            "source read changed probe bytes",
+        )
+        self.record(
+            "lexical_persistence", before=sizes, after=database_bytes(self.root)
+        )
+        path.unlink()
+        answer = await client.call("get_symbol", {"name": "corpus_probe"})
+        require(
+            not objects(answer, "hits"), f"removed source remained indexed: {answer}"
+        )
+        await self.await_probe(False)
+        require(
+            lexical_content(self.root) == before,
+            "source removal changed unrelated persisted lexical rows",
+        )
+
+    async def await_probe(self, present: bool) -> None:
+        async with asyncio.timeout(OBSERVATION_SECONDS):
+            for _ in range(int(OBSERVATION_SECONDS / POLL_SECONDS)):
+                if (probe_units(self.root) > 0) == present:
+                    return
+                await asyncio.sleep(POLL_SECONDS)
+        raise AssertionError(
+            f"lexical probe publication never reached present={present}"
+        )
 
     async def symlinks(self, client: Client) -> None:
         workspace = map_paths(await client.resource("rift://map"))

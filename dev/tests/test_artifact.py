@@ -28,3 +28,33 @@ def test_workspace_preserves_lf_bytes_on_every_platform(tmp_path: Path) -> None:
     lay_out_workspace(tmp_path)
     assert (tmp_path / "lib.rs").read_bytes() == SOURCE.encode()
     assert (tmp_path / "rift.toml").read_bytes() == CONFIGURATION.encode()
+
+
+@pytest.mark.parametrize("published", [True, False])
+def test_external_change_requires_fresh_source(tmp_path: Path, published: bool) -> None:
+    import asyncio
+    from contextlib import nullcontext
+    from typing import cast
+
+    from rift_dev.check_artifact import check_external_change
+    from rift_dev.rift_test_client import Client
+
+    lay_out_workspace(tmp_path)
+    client = AsyncMock(spec=Client)
+    body = (
+        "pub fn beacon_one() -> u8 { 3 }"
+        if published
+        else "pub fn beacon_one() -> u8 { 1 }"
+    )
+    client.call.return_value = {
+        "hits": [{"symbol": {"name": "beacon_one"}, "source": body}]
+    }
+    with (
+        nullcontext()
+        if published
+        else pytest.raises(AssertionError, match="absent from reads")
+    ):
+        asyncio.run(check_external_change(cast(Client, client), tmp_path))
+    assert (tmp_path / "lib.rs").read_bytes() == SOURCE.replace(
+        "{ 1 }", "{ 3 }"
+    ).encode()
