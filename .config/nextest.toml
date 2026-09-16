@@ -14,7 +14,7 @@ leak-timeout = { period = "200ms", result = "fail" }
 live = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'binary(/^live_/)'
+filter = 'binary(/^live_/) or test(/^live_/)'
 test-group = 'live'
 
 [profile.ci]
