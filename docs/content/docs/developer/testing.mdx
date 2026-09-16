@@ -79,12 +79,14 @@ disabled for corpus runs, so repository checks measure source and lexical indexi
 
 The Next.js churn case writes a probe declaration every two seconds while `search`, `get_symbol`,
 and `nodes` read it. It runs at least 50 calls across those tools and requires at least two writes
-during pending reads. Each call must finish within 30 seconds, matching the configured readiness timeout, and
-return the same symbol identity, a complete written source revision, and its matching byte range.
+during pending reads. Each call must finish within 30 seconds, matching the configured readiness
+timeout, and return the same symbol identity, a complete written source revision, and its matching
+byte range. Source older than the revision present when the call started must carry `stale_index`.
 
-After writes stop, all three tools must return the final source. The report records each call's
-duration and overlapping writes, plus each tool's maximum duration. The case retains its
-720-second bound.
+After writes stop, all three tools must return the final source within one shared 30-second bound.
+The check repeats only reads that returned older source with `stale_index`; older source without
+that warning fails. The report records source revisions, warnings, each call's duration and
+overlapping writes, and each tool's maximum duration. The case retains its 720-second bound.
 
 Reports record the commit, seed, case, selected identities and languages, actions, elapsed time,
 and failure. `RIFT_CORPUS_REPORT` selects the JSON report location. Harness logs and reports
