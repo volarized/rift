@@ -396,14 +396,16 @@ class Corpus:
             )
             content = path.read_bytes()
             require(0 <= start < end <= len(content), "symbol range exceeds source")
+            # Declarations can start with attached comments or attributes. Extraction
+            # keeps their end equal to the item end, so its final byte is in the item.
             answer = await client.call(
-                "nodes", {"path": str(path.relative_to(self.root)), "position": start}
+                "nodes", {"path": str(path.relative_to(self.root)), "position": end - 1}
             )
+            nodes = objects(answer, "nodes")
             require(
-                any(
-                    node.get("symbol") == identity for node in objects(answer, "nodes")
-                ),
-                f"nodes omitted sampled declaration: {identity}",
+                any(node.get("symbol") == identity for node in nodes),
+                f"nodes omitted sampled declaration: {identity} at {end - 1}; "
+                f"returned {[(node.get('kind'), node.get('range'), node.get('symbol')) for node in nodes]}",
             )
             require(path.read_bytes() == content, f"read changed {path}")
         self.record("identities", count=len(identities), seed=SEED)
