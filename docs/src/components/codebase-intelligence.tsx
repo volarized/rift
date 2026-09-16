@@ -143,7 +143,7 @@ const LANGUAGES = [
     facts: ["Syntax"],
     description:
       "Syntax providers extract document structure and declarations, so documentation and configuration can participate in structured reads alongside program source.",
-    dependencies: "Project source: syntax nodes and byte ranges identify the text to read or edit.",
+    dependencies: "Project source: syntax nodes and byte ranges identify the text each read returns.",
   },
 ];
 
