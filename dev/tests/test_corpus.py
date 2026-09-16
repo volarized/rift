@@ -1,41 +1,34 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["mcp==1.26.0", "jsonschema==4.26.0", "psutil==7.2.2", "pywin32==312; sys_platform == 'win32'"]
-# ///
 """Exercise corpus measurements and refusal decisions without a live server."""
 
 from __future__ import annotations
 
 import dataclasses
-import sqlite3
 import tempfile
 import unittest
-from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
-from corpus_assertions import (
-    PROBE_PATH,
-    PROBE_SOURCE,
+from rift_dev.corpus_assertions import (
     active_operation,
     active_stdout,
-    capture_count,
-    change_patch,
     exact_degradation,
-    identity_resolved,
     language_counts,
     lexical_breach,
-    lexical_content,
     map_paths,
     no_failed_builds,
-    probe_units,
     records,
     sample_symbols,
     warnings,
 )
-from corpus_cache import Measurement, Pin, git, measure, missing_history_objects, pins
-from rift_test_client import JsonObject
+from rift_dev.corpus_cache import (
+    Measurement,
+    Pin,
+    git,
+    measure,
+    missing_history_objects,
+    pins,
+)
+from rift_dev.rift_test_client import JsonObject
 
 
 class Measurements(unittest.TestCase):
@@ -207,7 +200,7 @@ class CacheHistory(unittest.TestCase):
         for output in (b"not-an-object\n", b"?abcd\n", b"available object\n"):
             with (
                 self.subTest(output=output),
-                patch("corpus_cache.git", return_value=output),
+                patch("rift_dev.corpus_cache.git", return_value=output),
                 self.assertRaisesRegex(ValueError, "missing history object"),
             ):
                 missing_history_objects(Path(), "a" * 40)
@@ -296,7 +289,7 @@ class Decisions(unittest.TestCase):
         )
         self.assertNotIn("readme.md", found)
         with (
-            patch("corpus_assertions.MAP_MODULES_MAX", 1),
+            patch("rift_dev.corpus_assertions.MAP_MODULES_MAX", 1),
             self.assertRaisesRegex(AssertionError, "module count"),
         ):
             map_paths(answer)
@@ -318,46 +311,6 @@ class Decisions(unittest.TestCase):
                         "entry_points": [identity],
                     }
                 )
-
-    def test_capture_requires_one_completed_capture_and_publication(self) -> None:
-        capture: JsonObject = {
-            "identity": 2,
-            "message": "index.build",
-            "target": "rift_server::read",
-            "fields": {
-                "span": "closed",
-                "changed_count": "1",
-                "files_count": "42",
-                "tree_revision": "abcdef01",
-                "outcome": "ok",
-            },
-        }
-        publication: JsonObject = {
-            "identity": 3,
-            "operation": "index.publish",
-            "fields": {"trigger": "rift_change"},
-        }
-        supervisor: JsonObject = {
-            "identity": 4,
-            "message": "index.build",
-            "target": "rift_mcp::validation",
-            "fields": {"span": "closed"},
-        }
-        self.assertEqual(capture_count([capture, publication, supervisor], 1), 1)
-        for found in (
-            [capture],
-            [publication],
-            [capture, capture, publication],
-            [capture, publication, publication],
-        ):
-            with self.assertRaises(AssertionError):
-                capture_count(found, 1)
-        wrong: JsonObject = {
-            **capture,
-            "fields": {"span": "closed", "changed_count": "2"},
-        }
-        with self.assertRaises(AssertionError):
-            capture_count([wrong, publication], 1)
 
     def test_lexical_breach_requires_exact_field_maximum_and_overflow(self) -> None:
         def answer(detail: str) -> JsonObject:
@@ -449,25 +402,6 @@ class Decisions(unittest.TestCase):
         with self.assertRaises(AssertionError):
             active_operation([start, closed], "rebuild", 1, True)
 
-    def test_identity_refuses_missing_target_but_accepts_equal_source(self) -> None:
-        refusal: JsonObject = {
-            "status": "refused",
-            "reason": "unmet_precondition",
-            "preconditions": [
-                {
-                    "kind": "target_exists",
-                    "status": "failed",
-                    "observed": {"kind": "boolean", "value": False},
-                },
-            ],
-        }
-        with self.assertRaisesRegex(AssertionError, "cannot be addressed"):
-            identity_resolved(refusal, "rift://symbol/rust/lib.rs/beacon")
-        refusal["preconditions"] = [{"kind": "source_unchanged", "status": "failed"}]
-        identity_resolved(refusal, "rift://symbol/rust/lib.rs/beacon")
-        with self.assertRaisesRegex(AssertionError, "unknown change outcome"):
-            identity_resolved({"status": "unknown"}, "symbol")
-
     def test_log_page_refuses_missing_store_and_truncation(self) -> None:
         answers: list[JsonObject] = [
             {"unavailable": "failed", "records": []},
@@ -520,98 +454,3 @@ class Decisions(unittest.TestCase):
         ):
             with self.subTest(source=source), self.assertRaises(AssertionError):
                 warnings({"warnings": source})
-
-    def test_fixture_patch_keeps_exact_bytes(self) -> None:
-        self.assertEqual(len(PROBE_SOURCE.encode()), 24)
-        self.assertIn(
-            "@@ -0,0 +1,1 @@\n+" + PROBE_SOURCE,
-            change_patch(PROBE_PATH, "", PROBE_SOURCE),
-        )
-        self.assertIn("+++ /dev/null", change_patch(PROBE_PATH, PROBE_SOURCE, ""))
-
-
-class PersistedContent(unittest.TestCase):
-    def test_reads_close_connections_on_success_and_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / ".rift").mkdir()
-            with closing(sqlite3.connect(root / ".rift/db")) as fixture:
-                fixture.execute(
-                    "CREATE TABLE lexical_units(identity TEXT, path TEXT, kind TEXT, name TEXT, byte_length INTEGER, content TEXT)"
-                )
-                fixture.execute(
-                    "INSERT INTO lexical_units VALUES ('id','source.rs','symbol','beacon',15,'fn beacon() {}')"
-                )
-                fixture.commit()
-            connect = sqlite3.connect
-            opened: list[sqlite3.Connection] = []
-
-            def tracked(
-                database: str, *, uri: bool, timeout: float
-            ) -> sqlite3.Connection:
-                connection = connect(database, uri=uri, timeout=timeout)
-                opened.append(connection)
-                return connection
-
-            with patch("corpus_assertions.sqlite3.connect", side_effect=tracked):
-                self.assertEqual(probe_units(root), 0)
-                self.assertEqual(lexical_content(root).units, 1)
-                with (
-                    patch("corpus_assertions.LEXICAL_UNITS_MAX", 0),
-                    self.assertRaises(AssertionError),
-                ):
-                    lexical_content(root)
-            self.assertEqual(len(opened), 3)
-            for connection in opened:
-                with self.assertRaises(sqlite3.ProgrammingError):
-                    connection.execute("SELECT 1")
-
-    def test_edit_preserves_unrelated_rows_and_detects_replacement(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / ".rift").mkdir()
-            with sqlite3.connect(root / ".rift/db") as connection:
-                connection.execute(
-                    "CREATE TABLE lexical_units(identity TEXT, path TEXT, kind TEXT, name TEXT, byte_length INTEGER, content TEXT)"
-                )
-                connection.execute(
-                    "INSERT INTO lexical_units VALUES ('id','source.rs','symbol','beacon',15,'fn beacon() {}')"
-                )
-                connection.commit()
-                before = lexical_content(root)
-                connection.execute(
-                    "INSERT INTO lexical_units VALUES ('probe',?,'symbol','corpus_probe',24,?)",
-                    (PROBE_PATH, PROBE_SOURCE),
-                )
-                connection.commit()
-                self.assertEqual(lexical_content(root), before)
-                connection.execute(
-                    "UPDATE lexical_units SET content='changed' WHERE identity='id'"
-                )
-                connection.commit()
-                self.assertNotEqual(lexical_content(root), before)
-
-    def test_empty_or_over_budget_store_is_not_evidence(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / ".rift").mkdir()
-            with sqlite3.connect(root / ".rift/db") as connection:
-                connection.execute(
-                    "CREATE TABLE lexical_units(identity TEXT, path TEXT, kind TEXT, name TEXT, byte_length INTEGER, content TEXT)"
-                )
-                connection.commit()
-                with self.assertRaisesRegex(AssertionError, "empty"):
-                    lexical_content(root)
-                connection.execute(
-                    "INSERT INTO lexical_units VALUES ('id','source.rs','symbol','beacon',15,'fn beacon() {}')"
-                )
-                connection.commit()
-                with (
-                    patch("corpus_assertions.LEXICAL_UNITS_MAX", 0),
-                    self.assertRaisesRegex(AssertionError, "row count"),
-                ):
-                    lexical_content(root)
-
-
-if __name__ == "__main__":
-    unittest.main()

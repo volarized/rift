@@ -1,8 +1,3 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.10"
-# dependencies = []
-# ///
 """Verify Rift crate dependency direction and single binary ownership."""
 
 from __future__ import annotations
@@ -144,9 +139,13 @@ def fail_test_targets(packages: list[dict[str, Any]]) -> None:
     for package in packages:
         unlisted, testless = unlisted_test_suites(package)
         for path in unlisted:
-            complaints.append(f"{package['name']}: {path} declares a test and has no [[test]] entry")
+            complaints.append(
+                f"{package['name']}: {path} declares a test and has no [[test]] entry"
+            )
         for path in testless:
-            complaints.append(f"{package['name']}: {path} has a [[test]] entry and declares no test")
+            complaints.append(
+                f"{package['name']}: {path} has a [[test]] entry and declares no test"
+            )
     if complaints:
         raise RuntimeError("Rift test targets differ:\n" + "\n".join(complaints))
 
@@ -179,7 +178,3 @@ def main() -> int:
 
     fail_test_targets(packages)
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

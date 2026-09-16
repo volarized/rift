@@ -1,8 +1,3 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["psutil==7.2.2", "pywin32==312; sys_platform == 'win32'"]
-# ///
 """Prove command limits, byte streams, environment inheritance, and descendant cleanup."""
 
 from __future__ import annotations
@@ -22,7 +17,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import psutil
-from release_process import (
+from rift_dev.release_process import (
     OUTPUT_BYTES_MAX,
     Drain,
     owned_environment,
@@ -32,7 +27,7 @@ from release_process import (
     signal_group,
     termination_handler,
 )
-from release_process_unix import OWNER_ENV
+from rift_dev.release_process_unix import OWNER_ENV
 
 
 class ProcessTests(unittest.TestCase):
@@ -47,7 +42,7 @@ class ProcessTests(unittest.TestCase):
         try:
             with (
                 tempfile.TemporaryFile() as stdin,
-                patch("release_process_unix.PROCESS_COUNT_MAX", 0),
+                patch("rift_dev.release_process_unix.PROCESS_COUNT_MAX", 0),
                 self.assertRaisesRegex(RuntimeError, "observation exceeded"),
                 owned_process(
                     [sys.executable, "-c", program], None, None, stdin
@@ -75,8 +70,10 @@ class ProcessTests(unittest.TestCase):
         try:
             with (
                 self.assertRaisesRegex(RuntimeError, "observation exceeded"),
-                patch("release_process_unix.PROCESS_COUNT_MAX", 1),
-                patch("release_process_unix.psutil.process_iter") as process_iter,
+                patch("rift_dev.release_process_unix.PROCESS_COUNT_MAX", 1),
+                patch(
+                    "rift_dev.release_process_unix.psutil.process_iter"
+                ) as process_iter,
                 owned_environment({}) as environment,
             ):
                 process = subprocess.Popen(
@@ -121,8 +118,8 @@ class ProcessTests(unittest.TestCase):
     def test_nested_command_keeps_outer_owner_with_replaced_environment(self) -> None:
         previous = os.environ.get(OWNER_ENV)
         program = (
-            "import json,os,sys; from release_process import run; "
-            "from release_process_unix import OWNER_ENV; "
+            "import json,os,sys; from rift_dev.release_process import run; "
+            "from rift_dev.release_process_unix import OWNER_ENV; "
             "inner=run([sys.executable,'-c', 'import os,sys; print(os.environ[sys.argv[1]])',OWNER_ENV],environment={}); "
             "print(json.dumps({'outer':os.environ[OWNER_ENV].split(','),'inner':inner.strip().split(',')}))"
         )
@@ -177,7 +174,10 @@ class ProcessTests(unittest.TestCase):
             process.stdout.close()
             process.stderr.close()
         with (
-            patch("release_process.os.killpg", side_effect=PermissionError("denied")),
+            patch(
+                "rift_dev.release_process.os.killpg",
+                side_effect=PermissionError("denied"),
+            ),
             self.assertRaisesRegex(PermissionError, "denied"),
         ):
             signal_group(os.getpgrp(), signal.SIGTERM)
@@ -300,7 +300,7 @@ class ProcessTests(unittest.TestCase):
                 "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30)"
             )
             parent = (
-                "import sys; from release_process import run; "
+                "import sys; from rift_dev.release_process import run; "
                 "run([sys.executable, '-c', sys.argv[1], sys.argv[2]], timeout=30)"
             )
             started = time.monotonic()

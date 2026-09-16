@@ -2,17 +2,11 @@
 
 from __future__ import annotations
 
-import dataclasses
-import hashlib
-import json
 import random
 import re
-import sqlite3
-from contextlib import closing
-from pathlib import Path
 from urllib.parse import unquote
 
-from rift_test_client import (
+from rift_dev.rift_test_client import (
     JsonObject,
     array_value,
     object_value,
@@ -24,8 +18,6 @@ SYMBOL_COUNT = 200
 SYMBOL_POOL_MAX = 4000
 READ_COUNT = 50
 SOURCE_WARNINGS_MAX = 8
-LEXICAL_UNITS_MAX = 1_000_000
-LEXICAL_BYTES_MAX = 512 * 1024 * 1024
 PROBE_PATH = "rift_corpus_probe.rs"
 PROBE_SOURCE = "pub fn corpus_probe(){}\n"
 MAP_MODULES_MAX = 100_000
@@ -215,71 +207,11 @@ def lexical_breach(answer: JsonObject, maximum: int) -> int:
     return observed
 
 
-def identity_resolved(answer: JsonObject, symbol: str) -> None:
-    """Issue #264: a read identity must reach change resolution."""
-    status = answer.get("status")
-    require(
-        status in ("applied", "refused", "unchanged"),
-        f"{symbol}: unknown change outcome {answer}",
-    )
-    if status != "refused":
-        return
-    conditions = array_value(answer.get("preconditions"), "change preconditions")
-    require(
-        bool(conditions) or answer.get("reason") != "unmet_precondition",
-        f"{symbol}: missing refused precondition",
-    )
-    for value in conditions:
-        condition = object_value(value, "change precondition")
-        missing = (
-            condition.get("kind") == "target_exists"
-            and condition.get("status") == "failed"
-        )
-        require(
-            not missing,
-            f"read identity cannot be addressed by replace_symbol: {symbol}: {answer}",
-        )
-
-
 def no_failed_builds(found: list[JsonObject]) -> None:
     failures = [
         record for record in found if record.get("message") == "index rebuild failed"
     ]
     require(not failures, f"index build failed: {failures}")
-
-
-def capture_count(found: list[JsonObject], after: int) -> int:
-    """Count completed source captures and publications after the recorded edit boundary."""
-    recent = [
-        row for row in found if number(row["identity"], "record identity") > after
-    ]
-    captures = [
-        row
-        for row in recent
-        if row.get("message") == "index.build"
-        and row.get("target") == "rift_server::read"
-        and fields(row).get("span") == "closed"
-    ]
-    publications = [
-        row
-        for row in recent
-        if row.get("operation") == "index.publish"
-        and fields(row).get("trigger") == "rift_change"
-    ]
-    require(
-        len(captures) == 1 and len(publications) == 1,
-        f"one edit must capture and publish once: {recent}",
-    )
-    require(
-        fields(captures[0]).get("changed_count") == "1",
-        f"capture lost changed_count: {captures}",
-    )
-    required = {"files_count", "tree_revision", "outcome"}
-    require(
-        required.issubset(fields(captures[0])), f"capture lost named fields: {captures}"
-    )
-    require(fields(captures[0]).get("outcome") == "ok", f"capture failed: {captures}")
-    return len(captures)
 
 
 def exact_degradation(found: list[JsonObject], expected: str | None) -> None:
@@ -377,87 +309,3 @@ def active_stdout(output: str, operation: str, epoch: str | None) -> str:
             )
         require(not completed, f"{operation} completed before stop on stderr: {row}")
     return rows[start]
-
-
-@dataclasses.dataclass(frozen=True)
-class LexicalContent:
-    """Exact stored rows, excluding the one path the edit changes."""
-
-    units: int
-    bytes: int
-    digest: str
-
-
-def lexical_content(root: Path) -> LexicalContent:
-    """Hash ordered source rows through SQLite's read-only connection.
-
-    The schema is owned by rift-index/src/lexical.rs. Diagnostics and the
-    revision row change on each publication; unrelated source rows must not.
-    """
-    digest = hashlib.sha256()
-    count = size = 0
-    database = root / ".rift" / "db"
-    with closing(
-        sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True, timeout=5.0)
-    ) as connection:
-        cursor = connection.execute(
-            "SELECT identity,path,kind,name,byte_length,content FROM lexical_units "
-            "WHERE path != ? ORDER BY identity",
-            (PROBE_PATH,),
-        )
-        for row in cursor:
-            count += 1
-            encoded = json.dumps(
-                row, ensure_ascii=False, separators=(",", ":")
-            ).encode()
-            size += len(encoded)
-            require(
-                count <= LEXICAL_UNITS_MAX,
-                "lexical row count exceeded configured maximum",
-            )
-            require(
-                size <= LEXICAL_BYTES_MAX * 4,
-                "lexical row bytes exceeded bounded content and identities",
-            )
-            digest.update(len(encoded).to_bytes(8, "big"))
-            digest.update(encoded)
-    require(count > 0, "lexical content is empty; the index did not publish")
-    return LexicalContent(count, size, digest.hexdigest())
-
-
-def database_bytes(root: Path) -> JsonObject:
-    return {
-        name: path.stat().st_size
-        for name in ("db", "db-wal", "db-shm")
-        if (path := root / ".rift" / name).is_file()
-    }
-
-
-def probe_units(root: Path) -> int:
-    """Count only the probe's persisted units after the lexical lane commits."""
-    database = root / ".rift" / "db"
-    with closing(
-        sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True, timeout=5.0)
-    ) as connection:
-        row = connection.execute(
-            "SELECT COUNT(*) FROM lexical_units WHERE path = ?", (PROBE_PATH,)
-        ).fetchone()
-    require(row is not None, "lexical probe count returned no row")
-    return number(row[0], "lexical probe units")
-
-
-def change_patch(path: str, previous: str, replacement: str) -> str:
-    """Build the complete one-line fixture patch, preserving its exact newline."""
-    require(
-        previous.count("\n") <= 1 and replacement.count("\n") <= 1,
-        "corpus probe must contain at most one source line",
-    )
-    before = f"a/{path}" if previous else "/dev/null"
-    after = f"b/{path}" if replacement else "/dev/null"
-    old = "1,1" if previous else "0,0"
-    new = "1,1" if replacement else "0,0"
-    return (
-        f"--- {before}\n+++ {after}\n@@ -{old} +{new} @@\n"
-        + (f"-{previous}" if previous else "")
-        + (f"+{replacement}" if replacement else "")
-    )

@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import IO, BinaryIO, Final
 
 import psutil
-from release_process_unix import UnixOwner
+
+from rift_dev.release_process_unix import UnixOwner
 
 OUTPUT_BYTES_MAX: Final = 4 * 1024 * 1024
 COMMAND_SECONDS_MAX: Final = 300.0
@@ -181,7 +182,7 @@ def owned_process(
     owner = None
     flags = 0
     if sys.platform == "win32":
-        from release_process_windows import WindowsJob
+        from rift_dev.release_process_windows import WindowsJob
 
         job = WindowsJob()
         flags = job.creation_flags

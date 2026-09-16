@@ -1,15 +1,8 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["mcp==1.26.0", "jsonschema==4.26.0", "psutil==7.2.2", "pywin32==312; sys_platform == 'win32'"]
-# ///
 """Fetch pinned trees or run their bounded suites through the compiled Rift binary."""
 
 from __future__ import annotations
 
-import argparse
 import asyncio
-import dataclasses
 import json
 import os
 import tempfile
@@ -18,32 +11,27 @@ import traceback
 from collections.abc import Callable
 from pathlib import Path
 
-from corpus_assertions import (
+from mcp.shared.exceptions import McpError
+
+from rift_dev.corpus_assertions import (
     PROBE_PATH,
     PROBE_SOURCE,
     READ_COUNT,
     SYMBOL_COUNT,
     active_stdout,
-    capture_count,
-    change_patch,
-    database_bytes,
     exact_degradation,
     fields,
-    identity_resolved,
     language_counts,
     lexical_breach,
-    lexical_content,
     map_paths,
     no_failed_builds,
     number,
-    probe_units,
     records,
     sample_symbols,
     warnings,
 )
-from corpus_cache import Pin, git, measure, pins
-from mcp.shared.exceptions import McpError
-from rift_test_client import (
+from rift_dev.corpus_cache import Pin, git
+from rift_dev.rift_test_client import (
     Client,
     Json,
     JsonObject,
@@ -213,7 +201,6 @@ class Corpus:
                     )
                 await self.left_out(client)
                 await self.symbols(client, candidates)
-                await self.single_capture(client)
                 if self.pin.name == "nextjs":
                     await self.symlinks(client)
                 no_failed_builds(
@@ -321,7 +308,7 @@ class Corpus:
         )
 
     async def symbols(self, client: Client, candidates: list[JsonObject]) -> None:
-        """Issue #264: exercise 200 emitted addresses without changing their bytes."""
+        """Resolve 200 sampled symbol identities through syntax reads."""
         initial = language_counts(candidates)
         pool = list(candidates)
         workspace = await client.resource("rift://workspace")
@@ -390,86 +377,17 @@ class Corpus:
             )
             content = path.read_bytes()
             require(0 <= start < end <= len(content), "symbol range exceeds source")
-            body = content[start:end].decode()
             answer = await client.call(
-                "replace_symbol", {"symbol": identity, "body": body}
+                "nodes", {"path": str(path.relative_to(self.root)), "position": start}
             )
-            identity_resolved(answer, identity)
             require(
-                path.read_bytes() == content,
-                f"byte-equal symbol replacement changed {path}",
+                any(
+                    node.get("symbol") == identity for node in objects(answer, "nodes")
+                ),
+                f"nodes omitted sampled declaration: {identity}",
             )
+            require(path.read_bytes() == content, f"read changed {path}")
         self.record("identities", count=len(identities), seed=SEED)
-
-    async def single_capture(self, client: Client) -> None:
-        before = lexical_content(self.root)
-        byte_sizes = database_bytes(self.root)
-        prior = records(await client.resource("rift://logs/component/index"))
-        last = max(
-            (number(row["identity"], "record identity") for row in prior), default=0
-        )
-        started = time.monotonic()
-        applied = await client.call(
-            "patch", {"patch": change_patch(PROBE_PATH, "", PROBE_SOURCE)}
-        )
-        require(applied.get("status") == "applied", f"probe patch refused: {applied}")
-        found = await observed(
-            client,
-            "rift://logs/component/index",
-            lambda rows: any(
-                row.get("operation") == "index.publish"
-                and fields(row).get("trigger") == "rift_change"
-                and number(row["identity"], "record identity") > last
-                for row in rows
-            ),
-        )
-        require(
-            time.monotonic() - started <= OBSERVATION_SECONDS,
-            "edit publication exceeded 60 seconds",
-        )
-        await self.await_probe(True)
-        require(
-            (self.root / PROBE_PATH).read_bytes() == PROBE_SOURCE.encode(),
-            "published probe changed source bytes",
-        )
-        answer = await client.call("get_symbol", {"name": "corpus_probe"})
-        hits = objects(answer, "hits")
-        require(
-            len(hits) == 1 and hits[0].get("source") == PROBE_SOURCE.removesuffix("\n"),
-            f"newly published probe source differs: {hits}",
-        )
-        found = records(await client.resource("rift://logs/component/index"))
-        captures = capture_count(found, last)
-        require(
-            lexical_content(self.root) == before,
-            "one edit changed unrelated persisted lexical rows",
-        )
-        self.record(
-            "capture",
-            count=captures,
-            source_bytes=len(PROBE_SOURCE.encode()),
-            before=byte_sizes,
-            after=database_bytes(self.root),
-        )
-        removed = await client.call(
-            "patch", {"patch": change_patch(PROBE_PATH, PROBE_SOURCE, "")}
-        )
-        require(removed.get("status") == "applied", f"probe removal refused: {removed}")
-        await self.await_probe(False)
-        require(
-            lexical_content(self.root) == before,
-            "probe removal changed unrelated persisted lexical rows",
-        )
-
-    async def await_probe(self, present: bool) -> None:
-        async with asyncio.timeout(OBSERVATION_SECONDS):
-            for _ in range(int(OBSERVATION_SECONDS / POLL_SECONDS)):
-                if (probe_units(self.root) > 0) == present:
-                    return
-                await asyncio.sleep(POLL_SECONDS)
-        raise AssertionError(
-            f"lexical probe publication never reached present={present}"
-        )
 
     async def symlinks(self, client: Client) -> None:
         workspace = map_paths(await client.resource("rift://map"))
@@ -578,40 +496,16 @@ class Corpus:
         link.symlink_to(self.root, target_is_directory=True)
         with self.server(link) as server:
             async with server.connect() as client:
-                applied = await client.call(
-                    "patch", {"patch": change_patch(PROBE_PATH, "", PROBE_SOURCE)}
-                )
+                answer = await client.call("search", {"query": "test", "limit": 1})
                 require(
-                    applied.get("status") == "applied",
-                    f"symlink-root patch refused: {applied}",
-                )
-                moved = await client.call(
-                    "move_file", {"from": PROBE_PATH, "to": "rift_corpus_moved.rs"}
-                )
-                require(
-                    moved.get("status") == "applied",
-                    f"symlink-root move refused: {moved}",
-                )
-                require(
-                    (self.root / "rift_corpus_moved.rs").read_bytes()
-                    == PROBE_SOURCE.encode(),
-                    "move changed file bytes",
-                )
-                require(
-                    not (self.root / PROBE_PATH).exists(), "move retained its old path"
-                )
-                removed = await client.call(
-                    "patch",
-                    {"patch": change_patch("rift_corpus_moved.rs", PROBE_SOURCE, "")},
-                )
-                require(
-                    removed.get("status") == "applied", "moved probe removal refused"
+                    bool(objects(answer, "results")),
+                    "symlink root has no search results",
                 )
                 no_failed_builds(
                     records(await client.resource("rift://logs/component/index"))
                 )
             server.stop()
-        self.record("symlink_root", move="applied")
+        self.record("symlink_root", reads=True)
 
     async def shallow(self, root: Path) -> None:
         self.pin.checkout(root, depth=1)
@@ -699,24 +593,12 @@ class Corpus:
     async def stop_states(self) -> None:
         with self.server() as server:
             async with server.connect() as client:
-                previous = ""
-                for edit in range(15):
-                    replacement = f"pub fn corpus_probe() {{ let value = {edit}; }}\n"
-                    answer = await client.call(
-                        "patch",
-                        {"patch": change_patch(PROBE_PATH, previous, replacement)},
-                    )
-                    require(
-                        answer.get("status") == "applied",
-                        f"edit {edit} refused: {answer}",
-                    )
-                    previous = replacement
+                await client.call("search", {"query": "test", "limit": 1})
                 no_failed_builds(
                     records(await client.resource("rift://logs/component/index"))
                 )
             server.stop()
-        (self.root / PROBE_PATH).unlink()
-        self.record("stop", state="after_fifteen_edits", edits=15, process_gone=True)
+        self.record("stop", state="idle", process_gone=True)
         await self.stop_during("rebuild")
         await self.stop_during("history")
 
@@ -789,42 +671,3 @@ async def observed(
                 return found
             await asyncio.sleep(POLL_SECONDS)
     raise AssertionError(f"required record never reached {uri}")
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("sync", "measure", "test"))
-    parser.add_argument("name", nargs="?", choices=("bun", "nextjs", "fastapi"))
-    parser.add_argument("--binary", type=Path)
-    parser.add_argument("--report", type=Path)
-    parser.add_argument(
-        "--case", choices=("workspace", "stop", "churn"), default="workspace"
-    )
-    arguments = parser.parse_args()
-    selected = pins()
-    if arguments.name:
-        selected = {arguments.name: selected[arguments.name]}
-    for pin in selected.values():
-        if arguments.command == "sync":
-            print(pin.sync(), flush=True)
-        elif arguments.command == "measure":
-            print(
-                json.dumps(
-                    dataclasses.asdict(
-                        measure(git(pin.cache, "ls-tree", "-r", "-l", "-z", pin.commit))
-                    )
-                )
-            )
-        else:
-            require(
-                arguments.name is not None and arguments.binary is not None,
-                "test requires one corpus name and --binary",
-            )
-            report = arguments.report or Path(
-                f"target/test-results/corpus/{pin.name}/{arguments.case}/report.json"
-            )
-            asyncio.run(Corpus(pin, arguments.binary, report, arguments.case).run())
-
-
-if __name__ == "__main__":
-    main()

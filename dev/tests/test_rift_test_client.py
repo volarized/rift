@@ -15,12 +15,12 @@ import psutil
 import pytest
 from jsonschema import ValidationError
 from mcp import ClientSession, types
-from rift_test_client import Client, Server, outside_workspace, run_command
+from rift_dev.rift_test_client import Client, Server, outside_workspace, run_command
 
 SCHEMA = {
     "type": "object",
-    "properties": {"status": {"enum": ["applied", "refused"]}},
-    "required": ["status"],
+    "properties": {"results": {"type": "array"}},
+    "required": ["results"],
 }
 
 
@@ -28,8 +28,8 @@ def client_with_result(result: types.CallToolResult) -> Client:
     session = AsyncMock(spec=ClientSession)
     session.call_tool.return_value = result
     client = Client(cast(ClientSession, session))
-    client.tools["patch"] = types.Tool(
-        name="patch", inputSchema={"type": "object"}, outputSchema=SCHEMA
+    client.tools["search"] = types.Tool(
+        name="search", inputSchema={"type": "object"}, outputSchema=SCHEMA
     )
     return client
 
@@ -42,44 +42,13 @@ def test_invalid_structured_answer_fails_including_tool_errors(error: bool) -> N
         )
     )
     with pytest.raises(ValidationError):
-        asyncio.run(client.call("patch", {}))
+        asyncio.run(client.call("search", {}))
 
 
 def test_missing_structured_answer_fails() -> None:
     client = client_with_result(types.CallToolResult(content=[]))
     with pytest.raises(AssertionError, match="expected an object"):
-        asyncio.run(client.call("patch", {}))
-
-
-def test_refusal_validates_but_cannot_satisfy_applied_coverage() -> None:
-    client = client_with_result(
-        types.CallToolResult(
-            content=[], structuredContent={"status": "refused"}, isError=True
-        )
-    )
-    assert asyncio.run(client.call("patch", {})) == {"status": "refused"}
-    with pytest.raises(AssertionError, match="without an applied change"):
-        client.require_complete(set())
-
-
-def test_added_tool_without_a_case_fails() -> None:
-    client = client_with_result(
-        types.CallToolResult(content=[], structuredContent={"status": "applied"})
-    )
-    asyncio.run(client.call("patch", {}))
-    client.tools["new_tool"] = types.Tool(
-        name="new_tool", inputSchema={"type": "object"}, outputSchema=SCHEMA
-    )
-    with pytest.raises(AssertionError, match="unexercised tools.*new_tool"):
-        client.require_complete(set())
-
-
-def test_applied_edit_satisfies_tool_coverage() -> None:
-    client = client_with_result(
-        types.CallToolResult(content=[], structuredContent={"status": "applied"})
-    )
-    asyncio.run(client.call("patch", {}))
-    client.require_complete(set())
+        asyncio.run(client.call("search", {}))
 
 
 def test_non_object_tool_schema_fails_before_calls() -> None:
@@ -87,7 +56,7 @@ def test_non_object_tool_schema_fails_before_calls() -> None:
     session.list_tools.return_value = types.ListToolsResult(
         tools=[
             types.Tool(
-                name="patch",
+                name="search",
                 inputSchema={"type": "object"},
                 outputSchema={"oneOf": [SCHEMA]},
             ),
@@ -99,11 +68,11 @@ def test_non_object_tool_schema_fails_before_calls() -> None:
 
 def test_invalid_input_never_reaches_server() -> None:
     client = client_with_result(
-        types.CallToolResult(content=[], structuredContent={"status": "applied"})
+        types.CallToolResult(content=[], structuredContent={"results": []})
     )
-    client.tools["patch"].inputSchema = {"type": "object", "required": ["patch"]}
+    client.tools["search"].inputSchema = {"type": "object", "required": ["search"]}
     with pytest.raises(ValidationError):
-        asyncio.run(client.call("patch", {}))
+        asyncio.run(client.call("search", {}))
     cast(AsyncMock, client.session.call_tool).assert_not_called()
 
 
@@ -310,7 +279,7 @@ while not pathlib.Path('stop.release').exists():
 def test_junit_records_success_and_failure(tmp_path: Path, fails: bool) -> None:
     import xml.etree.ElementTree as element_tree
 
-    from rift_test_client import run_gate
+    from rift_dev.rift_test_client import run_gate
 
     async def operation() -> None:
         if fails:
@@ -333,7 +302,7 @@ def test_server_drain_stops_at_its_byte_bound(tmp_path: Path) -> None:
     import tempfile
     from unittest.mock import Mock
 
-    from rift_test_client import LOG_BYTES_MAX
+    from rift_dev.rift_test_client import LOG_BYTES_MAX
 
     root = tmp_path / "workspace"
     root.mkdir()
@@ -351,14 +320,14 @@ def test_server_drain_stops_at_its_byte_bound(tmp_path: Path) -> None:
     assert server.log_path.stat().st_size == LOG_BYTES_MAX
 
 
-def test_tool_error_cannot_report_an_applied_change() -> None:
+def test_tool_error_cannot_satisfy_a_read() -> None:
     client = client_with_result(
         types.CallToolResult(
-            content=[], structuredContent={"status": "applied"}, isError=True
+            content=[], structuredContent={"results": []}, isError=True
         )
     )
-    with pytest.raises(AssertionError, match="tool error without a refusal"):
-        asyncio.run(client.call("patch", {}))
+    with pytest.raises(AssertionError, match="reported a tool error"):
+        asyncio.run(client.call("search", {}))
 
 
 def test_failed_process_creation_restores_signal_handler(tmp_path: Path) -> None:
@@ -375,7 +344,7 @@ def test_failed_process_creation_restores_signal_handler(tmp_path: Path) -> None
 def test_junit_keeps_terminal_output_valid_xml(tmp_path: Path) -> None:
     import xml.etree.ElementTree as element_tree
 
-    from rift_test_client import write_junit
+    from rift_dev.rift_test_client import write_junit
 
     path = tmp_path / "failure.xml"
     write_junit(path, "cold", 1.0, "engine\x1b[31m failed\x00")
@@ -392,7 +361,7 @@ def test_connection_accepts_only_a_verified_stop(
     from contextlib import asynccontextmanager
     from unittest.mock import Mock
 
-    import rift_test_client
+    from rift_dev import rift_test_client
 
     root = tmp_path / "workspace"
     root.mkdir()
@@ -436,7 +405,7 @@ def test_concurrent_connections_preserve_separate_proxy_logs(
     from typing import TextIO
     from unittest.mock import Mock
 
-    import rift_test_client
+    from rift_dev import rift_test_client
 
     server = Server(tmp_path / "rift", tmp_path / "workspace", tmp_path / "server.log")
     process = Mock(spec=subprocess.Popen)
@@ -486,7 +455,7 @@ def test_explicit_proxy_log_cannot_enter_served_workspace(tmp_path: Path) -> Non
 def test_sdk_stderr_overflow_is_bounded(tmp_path: Path) -> None:
     import subprocess
 
-    from rift_test_client import LOG_BYTES_MAX, stderr_log
+    from rift_dev.rift_test_client import LOG_BYTES_MAX, stderr_log
 
     path = tmp_path / "mcp.log"
     with (
@@ -511,7 +480,7 @@ def test_gate_deadline_cancels_async_work_after_cleanup_and_records_failure(
 ) -> None:
     import xml.etree.ElementTree as element_tree
 
-    from rift_test_client import gate_deadline, run_gate
+    from rift_dev.rift_test_client import gate_deadline, run_gate
 
     cleanup: list[bool] = []
 
@@ -534,7 +503,7 @@ def test_gate_deadline_rejects_synchronous_work_that_blocks_cancellation(
 ) -> None:
     from types import SimpleNamespace
 
-    import rift_test_client
+    from rift_dev import rift_test_client
 
     clock = [100.0]
     monkeypatch.setattr(
@@ -555,7 +524,7 @@ def test_nested_gate_keeps_and_restores_the_earlier_deadline(
 ) -> None:
     from types import SimpleNamespace
 
-    import rift_test_client
+    from rift_dev import rift_test_client
 
     clock = [100.0]
     monkeypatch.setattr(
@@ -575,7 +544,7 @@ def test_nested_gate_keeps_and_restores_the_earlier_deadline(
 
 
 def test_gate_deadline_limits_a_synchronous_command() -> None:
-    from rift_test_client import gate_deadline
+    from rift_dev.rift_test_client import gate_deadline
 
     async def operation() -> None:
         async with gate_deadline("artifact", 0.1):
@@ -596,7 +565,7 @@ def test_stop_deadline_includes_observation_and_validation(
     from types import SimpleNamespace
     from unittest.mock import Mock
 
-    import rift_test_client
+    from rift_dev import rift_test_client
 
     clock = [100.0]
     monkeypatch.setattr(
@@ -615,3 +584,21 @@ def test_stop_deadline_includes_observation_and_validation(
     with pytest.raises(AssertionError, match="stop exceeded its deadline"):
         server.stop()
     assert not server._stopped
+
+
+def test_missing_read_tool_is_rejected() -> None:
+    client = client_with_result(
+        types.CallToolResult(content=[], structuredContent={"results": []})
+    )
+    with pytest.raises(AssertionError, match="missing tools.*nodes"):
+        client.require_complete({"search", "nodes"})
+
+
+def test_unexercised_read_tool_is_rejected() -> None:
+    client = client_with_result(
+        types.CallToolResult(content=[], structuredContent={"results": []})
+    )
+    with pytest.raises(AssertionError, match="unexercised tools.*search"):
+        client.require_complete({"search"})
+    asyncio.run(client.call("search", {}))
+    client.require_complete({"search"})

@@ -7,10 +7,10 @@ from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
-from check_corpus import Corpus
-from corpus_assertions import PROBE_PATH, READ_COUNT
-from corpus_cache import pins
-from rift_test_client import Client, JsonObject, object_value
+from rift_dev.check_corpus import Corpus
+from rift_dev.corpus_assertions import PROBE_PATH, READ_COUNT
+from rift_dev.corpus_cache import pins
+from rift_dev.rift_test_client import Client, JsonObject, object_value
 
 
 def test_bun_cases_preserve_each_server_log(tmp_path: Path) -> None:
