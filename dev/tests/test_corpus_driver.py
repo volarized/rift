@@ -45,35 +45,60 @@ def test_corpus_logs_disable_ansi_even_when_parent_allows_color(
     assert corpus.server().env["NO_COLOR"] == "1"
 
 
-@pytest.mark.parametrize("failing_read", [None, 3])
-def test_churn_writes_before_reads_and_keeps_writer_cadence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_read: int | None
+def probe_answer(name: str, source: str, identity: str = "probe") -> JsonObject:
+    span: JsonObject = {"start": 0, "end": len(source.encode())}
+    symbol: JsonObject = {"id": identity}
+    if name == "nodes":
+        return {"nodes": [{"symbol": identity, "range": span}], "source": [source]}
+    hit: JsonObject = {"path": PROBE_PATH, "range": span, "source": source}
+    if name == "search":
+        hit["hit"] = {"symbol": symbol}
+        return {"results": [hit]}
+    hit["symbol"] = symbol
+    return {"hits": [hit]}
+
+
+@pytest.mark.parametrize("failure", [None, "read", "final_source", "identity"])
+def test_churn_validates_all_tools_overlap_and_final_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str | None
 ) -> None:
+    from rift_dev import check_corpus
+
     corpus = Corpus(pins()["nextjs"], tmp_path / "rift", tmp_path / "report.json")
     corpus.root = tmp_path
     path = tmp_path / PROBE_PATH
-    sleeps: list[float] = []
-    read_sources: list[str] = []
     real_sleep = asyncio.sleep
+    calls: list[str] = []
+    sleeps: list[float] = []
     client = AsyncMock(spec=Client)
+    initial = "pub fn corpus_probe() { let value = 0; }"
 
     async def sleep(seconds: float) -> None:
         sleeps.append(seconds)
+        # A fast server can finish the minimum reads before two writes occur.
+        while len(calls) <= READ_COUNT * 3:
+            await real_sleep(0)
         await real_sleep(0)
 
     async def call(name: str, arguments: JsonObject) -> JsonObject:
-        assert name == "search"
-        assert arguments == {"query": "test", "limit": 1}
-        read_sources.append(path.read_text(encoding="utf-8"))
-        if len(read_sources) == failing_read:
+        assert arguments == check_corpus.CHURN_REQUESTS[name]
+        calls.append(name)
+        if failure == "read" and len(calls) == 3:
             raise OSError("search failed")
         await real_sleep(0)
-        return {"warnings": []}
+        source = initial if failure == "final_source" else path.read_text().rstrip("\n")
+        identity = "wrong" if failure == "identity" and len(calls) > 1 else "probe"
+        return probe_answer(name, source, identity)
 
     async def exercise() -> None:
+        expected = {
+            "read": (OSError, "search failed"),
+            "final_source": (AssertionError, "expected revisions"),
+            "identity": (AssertionError, "changed probe identity"),
+        }
         with (
-            pytest.raises(OSError, match="search failed")
-            if failing_read
+            pytest.raises(*expected[failure][:1], match=expected[failure][1])
+            if failure
             else nullcontext()
         ):
             await corpus.churn(cast(Client, client))
@@ -84,15 +109,61 @@ def test_churn_writes_before_reads_and_keeps_writer_cadence(
     client.call.side_effect = call
     monkeypatch.setattr(asyncio, "sleep", sleep)
     asyncio.run(exercise())
-    assert read_sources[0] == "pub fn corpus_probe() { let value = 0; }\n"
-    assert len(read_sources) == (failing_read or READ_COUNT)
-    assert sleeps and set(sleeps) == {2.0}
     assert not path.exists()
-    if failing_read is None:
-        assert len(set(read_sources)) > 1
-        assert object_value(corpus.actions[-1], "churn action")["reads"] == READ_COUNT
-    else:
-        assert not corpus.actions
+    assert sleeps and set(sleeps) == {2.0}
+    if failure is None:
+        summary = object_value(corpus.actions[-1], "churn action")
+        assert cast(int, summary["rounds"]) > READ_COUNT
+        assert cast(int, summary["overlapping_writes"]) >= 2
+        assert summary["read_seconds_max"] == 30.0
+        assert set(object_value(summary["latency"], "latency")) == {
+            "search",
+            "get_symbol",
+            "nodes",
+        }
+        assert calls[-3:] == ["search", "get_symbol", "nodes"]
+
+
+def test_churn_enforces_read_deadline_and_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rift_dev import check_corpus
+
+    corpus = Corpus(pins()["nextjs"], tmp_path / "rift", tmp_path / "report.json")
+    corpus.root = tmp_path
+    client = AsyncMock(spec=Client)
+
+    async def slow_call(*_args: object) -> JsonObject:
+        await asyncio.sleep(0.02)
+        return {}
+
+    monkeypatch.setattr(check_corpus, "READ_SECONDS", 0.001)
+    client.call.side_effect = slow_call
+    with pytest.raises(TimeoutError):
+        asyncio.run(corpus.churn(cast(Client, client)))
+    assert not (tmp_path / PROBE_PATH).exists()
+
+
+@pytest.mark.parametrize("tool", ["search", "get_symbol", "nodes"])
+def test_churn_rejects_wrong_ranges_and_partial_source(tool: str) -> None:
+    from rift_dev.corpus_assertions import churn_answer
+
+    source = "pub fn corpus_probe() {}"
+    assert churn_answer(tool, probe_answer(tool, source), [source], "probe") == "probe"
+    with pytest.raises(AssertionError, match="expected revisions"):
+        churn_answer(
+            tool, probe_answer(tool, "pub fn corpus_probe() {"), [source], "probe"
+        )
+    answer = probe_answer(tool, source)
+    rows = cast(
+        list[JsonObject],
+        answer[
+            "nodes" if tool == "nodes" else "results" if tool == "search" else "hits"
+        ],
+    )
+    object_value(rows[0]["range"], "range")["end"] = 1
+    with pytest.raises(AssertionError, match="range disagrees"):
+        churn_answer(tool, answer, [source], "probe")
 
 
 def test_churn_write_failure_prevents_first_read(tmp_path: Path) -> None:
