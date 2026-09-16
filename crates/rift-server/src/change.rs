@@ -1392,47 +1392,55 @@ mod tests {
         })
     }
 
-    /// Every hit's declaration name and the fields it was matched by, in answer order.
-    fn matched(answer: &SearchResult) -> Vec<(String, Vec<MatchedField>)> {
-        answer
-            .results
+    /// Every hit's declaration name and the fields it was matched by, in answer order,
+    /// read from the serialized answer the way `changes` reads a comparison's own rows.
+    fn matched(answer: &SearchResult) -> Vec<(String, Vec<String>)> {
+        let wire = serde_json::to_value(answer).expect("a result serializes");
+        wire["results"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
             .iter()
             .map(|hit| {
-                let name = match &hit.hit {
-                    rift_protocol::read::SearchHitTarget::Symbol { symbol } => symbol.name.clone(),
-                    _ => String::new(),
-                };
-                (name, hit.matched_by.clone())
+                let fields = hit["matched_by"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(text)
+                    .collect();
+                (text(&hit["hit"]["symbol"]["name"]), fields)
             })
             .collect()
     }
 
     /// The hit `name` names, which every walked answer holds exactly once.
-    fn hit<'answer>(answer: &'answer SearchResult, name: &str) -> &'answer SearchHit {
-        let found: Vec<&SearchHit> = answer
-            .results
+    fn hit(answer: &SearchResult, name: &str) -> Value {
+        let wire = serde_json::to_value(answer).expect("a result serializes");
+        let found: Vec<Value> = wire["results"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
             .iter()
-            .filter(|hit| match &hit.hit {
-                rift_protocol::read::SearchHitTarget::Symbol { symbol } => symbol.name == name,
-                _ => false,
-            })
+            .filter(|hit| hit["hit"]["symbol"]["name"] == json!(name))
+            .cloned()
             .collect();
-        assert_eq!(
-            found.len(),
-            1,
-            "{name} must be answered once: {:?}",
-            matched(answer)
-        );
-        found[0]
+        let rows = matched(answer);
+        assert_eq!(found.len(), 1, "{name} must be answered once: {rows:?}");
+        found[0].clone()
     }
 
     /// The changed declarations the current tree could not place, as the disclosure every
     /// walked comparison carries reports them.
-    fn unplaced(answer: &SearchResult) -> Option<u64> {
-        answer.warnings.iter().find_map(|warning| match warning {
-            ReadWarning::ChangeTraversalCurrentTree { unplaced, .. } => Some(*unplaced),
-            _ => None,
-        })
+    fn unplaced(answer: &SearchResult) -> Value {
+        let wire = serde_json::to_value(answer).expect("a result serializes");
+        wire["warnings"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .find(|warning| warning["code"] == json!("change_traversal_current_tree"))
+            .map_or(Value::Null, |warning| warning["unplaced"].clone())
     }
 
     /// A walk beside a comparison starts at the changed declaration and reaches the caller
@@ -1444,18 +1452,15 @@ mod tests {
         let answer = fixture.search(&impact_request())?;
 
         let caller = hit(&answer, "calls_watched");
-        assert_eq!(caller.matched_by, [MatchedField::Relationship]);
-        assert_eq!(caller.distance, Some(1));
-        let path = caller
-            .traversal_path
-            .as_ref()
-            .expect("a walked hit carries its path");
+        assert_eq!(caller["matched_by"], json!(["relationship"]), "{caller}");
+        assert_eq!(caller["distance"], json!(1), "{caller}");
         assert_eq!(
-            path[0].relationship.to.0, "rift://symbol/rust/lib.rs/watched",
-            "the first hop names the changed declaration the walk started at: {path:?}"
+            caller["traversal_path"][0]["relationship"]["to"],
+            json!("rift://symbol/rust/lib.rs/watched"),
+            "the first hop names the changed declaration the walk started at: {caller}"
         );
-        assert!(caller.change.is_none(), "{caller:?}");
-        assert_eq!(unplaced(&answer), Some(0), "{:?}", answer.warnings);
+        assert!(caller["change"].is_null(), "{caller}");
+        assert_eq!(unplaced(&answer), json!(0), "{:?}", answer.warnings);
         Ok(())
     }
 
@@ -1494,16 +1499,13 @@ mod tests {
 
         let caller = hit(&answer, "calls_watched");
         assert_eq!(
-            caller.matched_by,
-            [MatchedField::Change, MatchedField::Relationship]
+            caller["matched_by"],
+            json!(["change", "relationship"]),
+            "{caller}"
         );
-        assert_eq!(
-            caller.change.as_ref().map(|change| change.kind),
-            Some(SymbolVersionKind::BodyChanged),
-            "{caller:?}"
-        );
-        assert!(caller.traversal_path.is_some(), "{caller:?}");
-        assert_eq!(caller.distance, Some(1));
+        assert_eq!(caller["change"]["kind"], json!("body_changed"), "{caller}");
+        assert!(!caller["traversal_path"].is_null(), "{caller}");
+        assert_eq!(caller["distance"], json!(1), "{caller}");
         Ok(())
     }
 
@@ -1520,7 +1522,7 @@ mod tests {
 
         let answer = fixture.search(&impact_request())?;
 
-        assert_eq!(unplaced(&answer), Some(1), "{:?}", answer.warnings);
+        assert_eq!(unplaced(&answer), json!(1), "{:?}", answer.warnings);
         Ok(())
     }
 
@@ -1536,9 +1538,9 @@ mod tests {
 
         assert_eq!(
             matched(&answer),
-            [("watched".to_owned(), vec![MatchedField::Change])]
+            [("watched".to_owned(), vec!["change".to_owned()])]
         );
-        assert_eq!(unplaced(&answer), Some(0), "{:?}", answer.warnings);
+        assert_eq!(unplaced(&answer), json!(0), "{:?}", answer.warnings);
         Ok(())
     }
 
@@ -1589,7 +1591,7 @@ mod tests {
             enabled: false,
             ..rift_protocol::configuration::BindingConfiguration::default()
         };
-        let reads = ReadService::build_with_languages(
+        let built = ReadService::build_with_languages(
             fixture.directory.path(),
             fixture.limits,
             &SourceVisibility::default(),
@@ -1598,7 +1600,8 @@ mod tests {
             rift_index::BindingPolicy::from(&configuration),
             HistoryConfiguration::default(),
             rift_protocol::dependencies::DependenciesConfiguration::default(),
-        )?;
+        );
+        let reads = built?;
 
         let error = fixture
             .search_against(&impact_request(), &reads)
@@ -1675,20 +1678,24 @@ mod tests {
     /// declarations that tree holds no node for.
     #[test]
     fn change_traversal_disclosure_names_the_tree_and_counts_the_unplaced() {
-        let warning = change_traversal_disclosure(3);
-        let ReadWarning::ChangeTraversalCurrentTree { unplaced, detail } = warning else {
-            panic!("expected the walked-comparison disclosure: {warning:?}");
-        };
-        assert_eq!(unplaced, 3);
-        assert!(
-            detail.contains("current tree's relationship graph"),
-            "{detail}"
+        let several = "the walk followed the current tree's relationship graph, the only \
+                       graph this server holds, so its edges are neither compared \
+                       revision's; 3 changed declarations have no node in that tree and \
+                       seeded no walk";
+        assert_eq!(
+            change_traversal_disclosure(3),
+            ReadWarning::ChangeTraversalCurrentTree {
+                unplaced: 3,
+                detail: several.to_owned(),
+            }
         );
-        assert!(detail.contains("3 changed declarations have"), "{detail}");
-        let ReadWarning::ChangeTraversalCurrentTree { detail, .. } = change_traversal_disclosure(1)
-        else {
-            panic!("expected the walked-comparison disclosure");
-        };
-        assert!(detail.contains("1 changed declaration has"), "{detail}");
+        let one = several.replace("3 changed declarations have", "1 changed declaration has");
+        assert_eq!(
+            change_traversal_disclosure(1),
+            ReadWarning::ChangeTraversalCurrentTree {
+                unplaced: 1,
+                detail: one,
+            }
+        );
     }
 }

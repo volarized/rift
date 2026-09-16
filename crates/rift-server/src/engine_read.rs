@@ -1102,11 +1102,12 @@ mod tests {
         files.target = rift_protocol::read::SearchParamsTarget::File;
         // A walk riding beside a comparison names no seed, so no engine answers it: both
         // compared sides are committed revisions, which no engine session serves.
-        let compared: SearchParams = serde_json::from_value(json!({
+        let arguments = json!({
             "target": "symbol",
             "change": {"base": "baseline"},
             "traversal": {"direction": "incoming", "facets": ["references"]}
-        }))?;
+        });
+        let compared: SearchParams = serde_json::from_value(arguments)?;
         for params in [outgoing, calls, files, compared] {
             assert!(!super::uses_engine_references(&reads, &engines, &params)?);
         }

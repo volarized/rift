@@ -3865,9 +3865,8 @@ pub fn compute() -> i32 {
         for arguments in cases {
             let params: SearchParams =
                 serde_json::from_value(arguments.clone()).expect("the request parses");
-            super::validate_search(&params).unwrap_or_else(|error| {
-                panic!("{arguments} must pass the seed rule: {error}");
-            });
+            let accepted = super::validate_search(&params);
+            assert!(accepted.is_ok(), "{arguments} must pass the seed rule");
         }
     }
 
