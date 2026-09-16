@@ -78,8 +78,8 @@ same source and dependency configuration used by a workspace. Semantic model dow
 disabled for corpus runs, so repository checks measure source and lexical indexing.
 
 The Next.js churn case writes a probe declaration every two seconds while `search`, `get_symbol`,
-and `nodes` read it. It runs at least 50 rounds and requires at least two writes during pending
-reads. Each call must finish within 30 seconds, matching the configured readiness timeout, and
+and `nodes` read it. It runs at least 50 calls across those tools and requires at least two writes
+during pending reads. Each call must finish within 30 seconds, matching the configured readiness timeout, and
 return the same symbol identity, a complete written source revision, and its matching byte range.
 
 After writes stop, all three tools must return the final source. The report records each call's
