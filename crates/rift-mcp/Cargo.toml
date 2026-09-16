@@ -98,3 +98,7 @@ path = "tests/surface_validation.rs"
 [[test]]
 name = "workspace_resource"
 path = "tests/workspace_resource.rs"
+
+[[test]]
+name = "embedded_python"
+path = "tests/embedded_python.rs"
