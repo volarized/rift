@@ -257,6 +257,20 @@ declarations also carry their syntax nodes and byte ranges.
 
 The server invalidates a changed path's syntax facts and search-index entries.
 
+### Language engines
+
+A **language engine** resolves facts the grammar alone cannot provide, such as references to a
+declaration in another file. Rift's LSP client requests references and diagnostics over
+[LSP](https://microsoft.github.io/language-server-protocol/).
+
+Each [`[languages.<identity>]`](/docs/developer/configuration#languages-and-lsp) table selects
+one named or inline process for an exact language identity: rust-analyzer for `rust`, or
+`typescript-language-server` for `typescript` and `typescript:tsx`. Several identities may
+select the same named process.
+
+The embedded [ty](https://github.com/astral-sh/ty) engine serves Python over an in-memory
+transport through the same LSP session contract. Its version ships with the Rift binary.
+
 ### Binding
 
 <VersionBadge version="v0.0.27" languages={["Rust"]} />
@@ -271,8 +285,8 @@ Resolution keeps the language's own precedence: a definition in the nearest scop
 outer one, an explicit import shadows a wildcard one, and equally ranked candidates all stay in
 the answer. A reference the syntax facts cannot place stays unresolved.
 
-The provider runs inside the server during the index build, and the [`[providers.binding]`](/docs/developer/configuration#providers) table bounds every phase of its
-work. A breached bound never fails the build - the revision publishes with the syntax facts
+The provider runs inside the server during the index build, and the
+[`[providers.binding]`](/docs/developer/configuration#providers) table bounds every phase of its work. A breached bound never fails the build - the revision publishes with the syntax facts
 alone.
 
 ### History

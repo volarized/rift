@@ -16,6 +16,9 @@ An editor that supports TOML schema directives can load the generated schema:
 #:schema https://volar.sh/rift/rift.schema.json
 ```
 
+Treat `rift.toml` as executable workspace configuration: a selected LSP process starts with
+the server's OS permissions on its first request. Inspect the file before running Rift in a cloned repository.
+
 Each section states its defaults below its example. Durations take `ms`, `s`, `m`, `h`, or `d`;
 byte sizes take `b`, `kb`, `mb`, `gb`, or `tb` - binary units, so `1kb` is 1024 bytes.
 
@@ -158,35 +161,169 @@ A change to `package_size`, `index_size`, `package_files`, `include`, or `exclud
 every package: each held build was read under the old bounds and selection, so the next
 publication plans the index again from the catalog.
 
-## Languages
+## Languages and LSP
 
-<VersionBadge version="v0.0.35" />
+<VersionBadge version="v0.0.25" />
 
-An exact language entry connects visible paths to shipped syntax. Its key is a language name,
-or `name:dialect` for an exact dialect:
+An exact language entry connects visible paths to shipped syntax and an optional LSP process. Its key is a language name, or `name:dialect` for an exact dialect:
 
 ```toml
 [languages.rust]
 enabled = true
 include = ["**/*.rs"]
 exclude = ["vendor/**"]
+lsp = "rust"
+
+[lsp.rust]
+command = ["rustup", "run", "1.98", "rust-analyzer"]
+environment = {}
+startup_timeout = "30s"
+request_timeout = "1m"
+output_limit = "4kb"
+
+[lsp.rust.retry]
+attempts = 8
+delay = "250ms"
+delay_limit = "2s"
+
+[lsp.rust.restart]
+attempts = 3
+window = "5m"
 ```
 
 Every shipped syntax provider contributes its file patterns. An absent `include` keeps those
 patterns; a present list replaces them, and an empty list matches no file. `exclude` removes
-matches from the effective list. `enabled` defaults to `true`, and `exclude` defaults empty.
-A bare language and each of its dialect entries are independent.
+matches from the effective list. `enabled` defaults to `true`, `exclude` defaults empty,
+and `lsp` is absent by default. A bare language and each of its dialect entries are independent.
+`enabled = false` turns off syntax and LSP service for paths the entry matches.
 
-A language no shipped syntax provider knows must carry a nonempty `include` list. One visible
-path may match one exact language; a path two entries claim refuses the workspace candidate,
-naming the path and both identities. The previously published revision keeps serving.
+A language no shipped syntax provider knows must carry a nonempty `include` list. It can still
+select an LSP process. One visible path may match one exact language; a current path two entries
+claim refuses the workspace candidate, naming the path and both identities. The previously
+published revision keeps serving.
+A visible file no language claims remains available to generic reads, and joins lexical search as
+plain text when `[search.text].include` selects it. So does a file whose entry is disabled, or
+whose language ships no grammar: what those entries drop is syntax analysis, not the file.
 
-A visible file no language claims joins lexical search as plain text when
-`[search.text].include` selects it. So does a file whose entry is disabled or whose language
-ships no grammar: those entries control syntax analysis.
+`lsp` accepts an inline process table or the name of one shared top-level process. The inline
+table collapses to one key when the program takes no arguments:
 
-The workspace holds at most 64 language entries. Each language's `include` and `exclude` list
-holds at most 64 patterns.
+```toml
+[languages.rust]
+lsp.command = "rust-analyzer"
+```
+
+A named process may serve several exact identities, including dialects:
+
+```toml
+[languages.typescript]
+lsp = "typescript"
+
+[languages."typescript:tsx"]
+lsp = "typescript"
+
+[lsp.typescript]
+command = ["node_modules/.bin/typescript-language-server", "--stdio"]
+
+[lsp.typescript.initialization_options.tsserver]
+useSyntaxServer = "never"
+```
+
+<VersionBadge version="v0.0.31" languages={["Python"]} />
+
+An entry may select the embedded engine instead of a spawned command. The build links the
+engine in, so nothing is installed or started beside the server:
+
+```toml
+[languages.python.lsp]
+embedded = "ty"
+```
+
+`embedded` names an engine this build carries; `ty` serves Python. Exactly one of `command`
+and `embedded` is present, and an embedded engine takes no `environment` and no
+`initialization_options`: both configure a spawned process, so a table naming them beside
+`embedded` is refused rather than silently ignored.
+
+`command` accepts a program string without whitespace or a nonempty list holding the program and
+its literal arguments. The list holds one program and at most 64 arguments; each argument holds
+at most 4096 bytes. Rift starts the command directly without a shell. Absolute programs are
+refused. A bare name resolves through the server's `PATH`, with `environment` applied on top.
+`initialization_options` is absent by default and must be a JSON object when present;
+`environment` defaults empty and holds at most 64 entries.
+
+`startup_timeout` defaults to `"30s"` and takes `"1s"` to `"10m"`. `request_timeout` defaults
+to `"1m"` and takes `"1s"` to `"10m"`. `output_limit` defaults to `"4kb"` and takes `"1kb"` to
+`"8mb"`; Rift still reports the full size, so you can tell a truncated log from a short one.
+
+`retry` bounds repeated requests while an answer stays unsettled. `attempts` includes the first
+request; waits start at `delay`, double, and stop at `delay_limit`. `restart` bounds replacement
+processes after a process ends or stops answering. A replacement older than `window` stops
+counting. The server starts a process on its first request and keeps it across later requests.
+Configuration reload reuses unchanged process definitions and ends replaced processes.
+
+`retry.attempts` defaults to `8` and takes `1` to `64`. `retry.delay` defaults to `"250ms"` and
+takes `"1ms"` to `"1m"`; `retry.delay_limit` defaults to `"2s"` and takes `"1ms"` to `"10m"`.
+`restart.attempts` defaults to `3` and takes `0` to `16`; `restart.window` defaults to `"5m"` and
+takes `"1s"` to `"1d"`.
+
+A named process that no language selects is accepted but never started. A language that names a
+missing process is refused during configuration validation. The top-level table holds at most 16
+processes. The workspace holds at most 64 language entries. Each language `include` and `exclude`
+list holds at most 64 patterns.
+
+A language server may decline a request it's already serving, report that the file moved under
+it, or answer before it has loaded the declaration. Every such refusal gets the configured retry
+schedule. If every attempt refuses, Rift returns the language server's latest words.
+
+A capability the server never advertised is not a refusal and returns at once.
+
+`restart` bounds what Rift does when the process itself fails. One that ended, that couldn't be
+started, or that stopped answering is replaced automatically, and the replacement serves the
+request. Each replacement spends one of `restart.attempts`, and a replacement older than
+`restart.window` stops counting, so a process that dies once a week never runs out.
+
+One that crash-loops does: once the budget is spent, requests for its languages fail
+`temporarily_unavailable` until the window passes, instead of starting a process that dies again.
+The first process a workspace starts is the start, not a replacement, and a refused `command`
+program, empty or an absolute path, is reported at once rather than started again.
+
+A symbol address spells its language as an identity segment, and a declaration in a `.tsx` file
+is addressed under the dialect: `rift://symbol/typescript:tsx/view.tsx/Banner`. The server looks
+the entry up by that exact identity, so the bare language and the dialect are two independent
+entries, each selecting its own process, and both may select the same named one. Each dialect needs its own entry.
+
+A minimal entry names its process inline. This one names
+[tombi](https://github.com/tombi-toml/tombi), a TOML formatter, linter, and language server:
+
+```toml
+[languages.toml.lsp]
+command = ["tombi", "lsp"]
+```
+
+`lsp` is the subcommand that starts tombi's language server over stdio.
+
+A language server that ships as a package runs from workspace-installed bytes. Pin both packages
+in `package.json`, install from its lockfile, and point `command` at the local executable, the way
+`[lsp.typescript]` above does. This avoids paying package runner resolution at startup.
+
+typescript-language-server refuses its initialize request unless a `typescript` package resolves
+from the workspace root, answering `Could not find a valid TypeScript installation`. Install that
+package in the workspace, or name an existing one with the `tsserver.path` initialization option;
+without either, language-server initialization fails with that message.
+
+The index still walks what `source` leaves visible, so the installed package directory needs an
+exclude:
+
+```toml
+[source]
+exclude = ["node_modules/**"]
+```
+
+Without it the walk reaches `typescript`'s own sources, including files past the index's per-file
+byte bound. Any workspace with an installed package directory needs the same entry.
+
+`tsserver.useSyntaxServer = "never"` keeps the process to one semantic server. The default
+`auto` also runs a syntax-only server.
 
 ## Providers
 

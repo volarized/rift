@@ -309,6 +309,19 @@ resolutions beside the syntax publication. An item definition carries the same d
 binding as its syntax Contribution, the equivalence evidence normalization uses to join the
 two records.
 
+## Language engines
+
+The `rift-lsp` crate owns LSP sessions. A session opens source documents, requests references,
+and pulls diagnostics when the language server advertises that capability. It also retains
+published diagnostics under per-document and document-count bounds.
+
+The reference request includes the declaration's own occurrence. An empty answer can therefore
+mean the engine has not loaded the file; it cannot prove the declaration has no references.
+
+Each process has configured startup and request timeouts. The
+[`[lsp]`](/docs/developer/configuration#languages-and-lsp) configuration also bounds retries
+and process replacements.
+
 ## Configuration
 
 `rift.toml` at the workspace root is accepted at startup and re-accepted on change. Its schema
