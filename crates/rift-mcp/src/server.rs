@@ -31,7 +31,7 @@ use rift_search::{
 };
 use rift_server::{
     DependencyStore, EnginePool, EngineReferences, LspProcessKey, ReadError, ReadFault,
-    ReadService, resolve_engine_references, wire_digest,
+    ReadService, resolve_engine_references, uses_engine_references, wire_digest,
 };
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{
@@ -1393,6 +1393,15 @@ impl RiftMcp {
             resolved = self.published_workspace(wire::ErrorPhase::Read).await?;
             ranking = self.ranking(&params, &resolved.published, budget).await?;
         }
+        let (resolved, ranking, references) = tokio::time::timeout(
+            budget,
+            Box::pin(self.current_tree_references(resolved, ranking, &params, budget)),
+        )
+        .await
+        .map_err(|_| {
+            ReadFault::unavailable("engine references", "request deadline exceeded")
+                .tool_error(wire::ErrorPhase::Read)
+        })??;
         let SearchRanking { units, warnings } = ranking.unwrap_or_else(|| {
             SearchRanking::unavailable(
                 "the lexical index is stamped for a publication newer than the one this \
@@ -1401,7 +1410,6 @@ impl RiftMcp {
                  the request once the rebuilds settle",
             )
         });
-        let references = self.engine_references(&resolved, &params, budget).await?;
         let executed = params;
         let mut answer = self
             .current_tree_read(&resolved, move |reads| {
@@ -1412,41 +1420,65 @@ impl RiftMcp {
         Ok(answer)
     }
 
+    /// Repeats engine reads against a fresh publication when their captured tree moves.
+    ///
+    /// The caller bounds this entire exchange, including publication and ranking waits,
+    /// by the same readiness deadline as the original engine request.
+    async fn current_tree_references(
+        &self,
+        mut resolved: ResolvedWorkspace,
+        mut ranking: Option<SearchRanking>,
+        params: &SearchParams,
+        budget: Duration,
+    ) -> Result<(ResolvedWorkspace, Option<SearchRanking>, EngineReferences), ErrorData> {
+        for attempt in 0..INDEX_CAPTURE_ATTEMPTS_MAX {
+            if let Some(references) = self.engine_references(&resolved, params).await? {
+                return Ok((resolved, ranking, references));
+            }
+            if attempt + 1 < INDEX_CAPTURE_ATTEMPTS_MAX {
+                resolved = self.published_workspace(wire::ErrorPhase::Read).await?;
+                ranking = self.ranking(params, &resolved.published, budget).await?;
+            }
+        }
+        Err(ReadFault::unavailable(
+            "engine references",
+            "source or configuration kept changing during the bounded reference reads",
+        )
+        .tool_error(wire::ErrorPhase::Read))
+    }
+
     /// Resolves references against one unchanged current-tree publication.
     ///
-    /// Filesystem movement before or during the engine request discards its references;
-    /// the request still reads its captured index. A stale publication uses its index alone.
+    /// `None` asks the caller to capture a fresh publication after source or configuration
+    /// movement. A stale publication uses its index and keeps its existing stale warning.
     async fn engine_references(
         &self,
         resolved: &ResolvedWorkspace,
         params: &SearchParams,
-        budget: Duration,
-    ) -> Result<EngineReferences, ErrorData> {
+    ) -> Result<Option<EngineReferences>, ErrorData> {
         if params.traversal.is_none() || resolved.stale.is_some() {
-            return Ok(EngineReferences::default());
-        }
-        if !self.engine_tree_matches(&resolved.published).await? {
-            return Ok(EngineReferences::default());
+            return Ok(Some(EngineReferences::default()));
         }
         let engines = self.engine_pool_for(&resolved.published).await;
-        let references = tokio::time::timeout(
-            budget,
-            Box::pin(resolve_engine_references(
-                &resolved.published.reads,
-                &engines,
-                params,
-            )),
-        )
+        if !uses_engine_references(&resolved.published.reads, &engines, params)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?
+        {
+            return Ok(Some(EngineReferences::default()));
+        }
+        if !self.engine_tree_matches(&resolved.published).await? {
+            return Ok(None);
+        }
+        let references = Box::pin(resolve_engine_references(
+            &resolved.published.reads,
+            &engines,
+            params,
+        ))
         .await
-        .map_err(|_| {
-            ReadFault::unavailable("engine references", "request deadline exceeded")
-                .tool_error(wire::ErrorPhase::Read)
-        })?
         .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
         if self.engine_tree_matches(&resolved.published).await? {
-            Ok(references)
+            Ok(Some(references))
         } else {
-            Ok(EngineReferences::default())
+            Ok(None)
         }
     }
 
@@ -3460,16 +3492,132 @@ mod tests {
 
     #[tokio::test]
     async fn engine_reference_capture_rejects_source_and_configuration_movement() -> TestResult {
-        let (directory, assembled) = unsupervised_fixture().await?;
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(
+            directory.path(),
+            "[languages.rust.lsp]\ncommand = 'missing-engine'\n",
+        )?;
+        let assembled = unsupervised_server(directory.path()).await?;
         let server = &assembled.server;
         let published = Arc::clone(&server.published.read().await.current);
         assert!(server.engine_tree_matches(&published).await?);
         fs::write(directory.path().join("lib.rs"), "pub fn later() {}\n")?;
         assert!(!server.engine_tree_matches(&published).await?);
+        let params = serde_json::from_value(json!({"traversal": {
+            "seed": "rift://symbol/rust/lib.rs/beacon",
+            "direction": "incoming", "facets": ["references"], "depth": 1
+        }}))?;
+        let resolved = super::ResolvedWorkspace::current(Arc::clone(&published));
+        assert!(
+            server
+                .engine_references(&resolved, &params)
+                .await?
+                .is_none(),
+            "moved source asks for a fresh publication, not an empty engine answer"
+        );
+        for override_fields in [
+            json!({"direction": "outgoing", "facets": ["references"]}),
+            json!({"direction": "incoming", "facets": ["calls"]}),
+        ] {
+            let mut request = json!({"traversal": {
+                "seed": "rift://symbol/rust/lib.rs/beacon", "depth": 1
+            }});
+            request["traversal"]["direction"] = override_fields["direction"].clone();
+            request["traversal"]["facets"] = override_fields["facets"].clone();
+            let indexed = serde_json::from_value(request)?;
+            assert!(
+                server
+                    .engine_references(&resolved, &indexed)
+                    .await?
+                    .is_some(),
+                "an indexed traversal must not recapture source for unused engine references"
+            );
+        }
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         assert!(server.engine_tree_matches(&published).await?);
         super::hermetic_workspace(directory.path(), "[languages.rust]\nenabled = false\n")?;
         assert!(!server.engine_tree_matches(&published).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incoming_traversal_without_an_engine_keeps_its_indexed_snapshot() -> TestResult {
+        let (directory, assembled) = unsupervised_fixture().await?;
+        let server = &assembled.server;
+        let published = Arc::clone(&server.published.read().await.current);
+        fs::write(directory.path().join("lib.rs"), "pub fn later() {}\n")?;
+        let params = serde_json::from_value(json!({"traversal": {
+            "seed": "rift://symbol/rust/lib.rs/beacon",
+            "direction": "incoming", "facets": ["references"], "depth": 1
+        }}))?;
+        let resolved = super::ResolvedWorkspace::current(published);
+        assert!(
+            server
+                .engine_references(&resolved, &params)
+                .await?
+                .is_some(),
+            "no selected engine leaves the indexed read unchanged"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn engine_reference_recapture_uses_the_changed_publication() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("service.py"),
+            "def serve(port: int) -> int:\n    return port\n",
+        )?;
+        fs::write(
+            directory.path().join("main.py"),
+            "def caller() -> int:\n    return 0\n",
+        )?;
+        super::hermetic_workspace(
+            directory.path(),
+            "[providers.binding]\nenabled = false\n[languages.python.lsp]\nembedded = 'ty'\nretry = { attempts = 2, delay = '1ms', delay_limit = '1ms' }\n",
+        )?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        let resolved = server
+            .published_workspace(rift_protocol::error::ErrorPhase::Read)
+            .await?;
+        let before = resolved.published.fingerprint.clone();
+        let params = serde_json::from_value(json!({"target": "symbol", "traversal": {
+            "seed": "rift://symbol/python/service.py/serve",
+            "direction": "incoming", "facets": ["references"], "depth": 1
+        }}))?;
+        fs::write(
+            directory.path().join("main.py"),
+            "from service import serve\n\ndef caller() -> int:\n    return serve(8080)\n",
+        )?;
+        assert!(
+            server
+                .engine_references(&resolved, &params)
+                .await?
+                .is_none(),
+            "the captured publication predates the new caller"
+        );
+        let budget = server.readiness_timeout().await;
+        let (current, _, references) = tokio::time::timeout(
+            budget,
+            server.current_tree_references(resolved, None, &params, budget),
+        )
+        .await
+        .map_err(|_| "reference recapture exceeded the request deadline")??;
+        assert_ne!(
+            current.published.fingerprint, before,
+            "the loop captures the changed publication"
+        );
+        let answer = current
+            .published
+            .reads
+            .search_with_references(&params, &[], &references)?;
+        let rendered = serde_json::to_value(answer)?;
+        assert_eq!(
+            rendered["results"][0]["hit"]["symbol"]["name"], "caller",
+            "{rendered:#}"
+        );
+        server.engine_pool().await.shutdown().await;
         Ok(())
     }
 
