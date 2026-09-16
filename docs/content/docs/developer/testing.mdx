@@ -1,0 +1,143 @@
+---
+title: Testing
+---
+
+<VersionBadge version="v0.0.35" />
+
+Unit tests run on pull requests and pushes to `main`. Integration tests run after a merge to
+`main` and on manual dispatch, with live language engines and semantic models, and pinned Next.js, Bun, and FastAPI repositories.
+
+## Unit tests
+
+Install the pinned Rust toolchain, `uv`, `just`, `cargo-audit`, `cargo-deny`, `cargo-llvm-cov`,
+and `cargo-nextest`. Run the unit suite from the repository root:
+
+```sh
+just test
+```
+
+The unit suite runs without external language servers, model downloads, or corpus checkouts.
+The test selection keeps those dependencies in the integration suite.
+`just doctest` runs Rust documentation examples through `cargo test --doc`, because nextest
+does not support doctests on stable Rust.
+
+The remaining local checks cover formatting, generated files, crate boundaries, Clippy, Rust
+documentation, dependency policy, and developer tooling:
+
+```sh
+just rust-gate
+```
+
+CI retains compiled test archives and the CLI as artifacts. Test jobs reuse those artifacts;
+dependency caches avoid compiling unchanged dependencies on each run.
+
+## Integration tests
+
+Live suites require `rust-analyzer`, Bun, and tombi, plus network access for model weights and
+corpus source. Install the language tools with `rustup component add rust-analyzer` and
+`uv tool install tombi`; the TypeScript suite starts its language server through Bun.
+Model and package caches are reused between runs. Run the integration suite from the repository root:
+
+```sh
+just integration-test
+```
+
+`just live-test` selects the live language-engine and model suites. CI builds the CLI and an
+instrumented test archive once with `just integration-archive`, then passes the archive to
+`just live-test target/integration.tar.zst` and the corpus jobs.
+
+For one corpus repository, fetch its pinned source and run its suite:
+
+```sh
+just corpus-sync
+just corpus-test fastapi
+just corpus-test bun
+just corpus-test nextjs
+```
+
+Corpus suites use the optimized Cargo `corpus` profile with debug assertions, overflow checks,
+and line tables. Nextest runs one corpus test at a time. CI reuses one compiled archive across
+the corpus jobs.
+
+The cache lives under `~/.cache/rift-corpus`. Each suite creates a disposable checkout at the
+commit in `crates/rift/tests/corpus/pins.toml`. Fetches retain 50 commits of history; a separate
+depth-one checkout tests the shallow-history response. Every run compares Git tree counts and
+sizes with the pin and requires reachable history objects before serving the tree.
+A repin must update the recorded measurements.
+
+| Repository | Tracked files | Tracked bytes | Symlinks | Maximum path depth |
+| --- | ---: | ---: | ---: | ---: |
+| Bun | 19,743 | 197,365,136 | 9 | 10 |
+| Next.js | 31,115 | 157,964,029 | 32 | 15 |
+| FastAPI | 3,137 | 34,759,910 | 0 | 6 |
+
+Corpus checks cover search, symbol lookup, syntax reads, history, and shutdown. They also create
+and remove source files outside Rift, compare later reads with those bytes, and verify that
+unrelated persisted lexical rows remain unchanged. They serve the
+same source and dependency configuration used by a workspace. Semantic model downloads stay
+disabled for corpus runs, so repository checks measure source and lexical indexing.
+
+The Next.js churn case writes a probe declaration every two seconds while `search`, `get_symbol`,
+and `nodes` read it. It runs at least 50 calls across those tools and requires at least two writes
+during pending reads. Each call must finish within 30 seconds, matching the configured readiness
+timeout, and return the same symbol identity, a complete written source revision, and its matching
+byte range. Source older than the revision present when the call started must carry `stale_index`.
+
+After writes stop, all three tools must return the final source within one shared 30-second bound.
+The check repeats only reads that returned older source with `stale_index`; older source without
+that warning fails. The report records source revisions, warnings, each call's duration and
+overlapping writes, and each tool's maximum duration. The case retains its 720-second bound.
+
+Reports record the commit, seed, case, selected identities and languages, actions, elapsed time,
+and failure. `RIFT_CORPUS_REPORT` selects the JSON report location. Harness logs and reports
+stay outside the served checkout.
+
+## Artifact and agent checks
+
+Artifact checks run the native release binary from a temporary workspace. Agent checks use the
+Python MCP SDK and JSON Schema validator over stdio, exercise `search`, `get_symbol`, and
+`nodes`, and read the workspace, map, and log resources:
+
+```sh
+just artifact-test
+just agent-test
+```
+
+Both commands build the native release binary unless `--binary <path>` supplies one.
+`--target <triple>` selects a Cargo target when building. A supplied binary is tested unchanged,
+so CI can reuse its build artifact.
+
+The artifact and agent checks require reads to observe external filesystem writes. The agent
+check also reads incoming references through the embedded Python engine and verifies the source
+stays unchanged. The integration suite runs upstream MCP conformance checks against the same binary.
+
+## Cold first use
+
+The cold check needs Docker and a Linux binary matching the container architecture:
+
+```sh
+just coldstart-test --binary target/release/rift
+```
+
+The container has no network, language servers, or existing Rift cache. It starts with an empty
+workspace, then reads a newly created source file. After configuration selects a missing language
+server, an incoming-reference request must report the launch failure while syntax reads remain
+available. CI runs this check with its compiled Linux artifact; a local macOS run needs a Linux binary.
+
+
+## Developer tooling
+
+The `rift-dev` Python package lives in `dev/`. `uv` installs its locked dependencies, Typer
+provides the CLI, and Pydantic validates configuration. Run a command through the package:
+
+```sh
+uv run --locked --project dev rift-dev --help
+uv run --locked --project dev rift-dev corpus sync
+uv run --locked --project dev rift-dev agent --binary target/release/rift
+```
+
+The justfile wraps the same commands for local work and CI. Package checks run with:
+
+```sh
+just testing-check
+```

@@ -10,22 +10,16 @@ title: MCP
 `rift mcp` serves MCP over stdio for harnesses that launch servers as subprocesses. Stdout carries
 MCP frames; the process writes tracing events to stderr.
 
-Requests do not open connection-scoped sessions. Each request carries every address and witness
-it uses; the server holds no per-caller state between calls.
+Requests do not open connection-scoped sessions. Each request carries its arguments; the server holds no per-caller state between calls.
 
 A tool result rides MCP
 [`structuredContent`](https://modelcontextprotocol.io/specification/draft/server/tools#structured-content),
 typed by the tool's declared output schema, with the
-same JSON mirrored as a `text` block for harnesses that ignore it. A refusal is such a result -
-[`ChangeResult`](/docs/protocol/reference#ChangeResult) saying refused, never `isError` -
-while [`ErrorData`](/docs/protocol/reference#ErrorData) travels as the
+same JSON mirrored as a `text` block for harnesses that ignore it.
+[`ErrorData`](/docs/developer/protocol/reference#ErrorData) travels as the
 [JSON-RPC error](https://www.jsonrpc.org/specification#error_object)
 object's `data`, under code `-32000`. The exported schema at
 [`mcp.json`](https://volar.sh/rift/mcp.json) is the authoritative served shape.
-
-The server serializes change application per targeted tree: two concurrent changes against one
-tree apply one after the other, and the later one meets its preconditions against the earlier
-one's result. Reads run concurrently.
 
 ## Reads
 
@@ -35,7 +29,7 @@ Callers read code through these tools:
 | --- | --- |
 | [`get_symbol`](#tool-get_symbol) | declarations and their source by known name |
 | [`search`](#tool-search) | ranked files and symbols across the workspace tree |
-| [`nodes`](#tool-nodes) | the syntax nodes covering one position, with witnessed addresses |
+| [`nodes`](#tool-nodes) | the syntax nodes covering one position, with byte ranges |
 
 The index never follows or indexes a symlink, so no read returns one; the file a link points
 at answers under its own path.
@@ -114,8 +108,8 @@ Every read carries an optional `rev`, and reads the workspace tree when it is ab
 Every read also accepts `rev` - a branch, tag, or commit id, spelled the way git spells it:
 `main`, `v0.0.6`, `dd0a482`. The server resolves the revision in place from the workspace's
 git objects, with no checkout, and indexes that commit's tree under the same
-[`[source]`](/docs/configuration#source) policy and bounds as the working-tree scan. A revision
-read answers from committed bytes, so uncommitted working-tree edits never appear in it.
+[`[source]`](/docs/developer/configuration#source) policy and bounds as the working-tree scan. A revision
+read answers from committed bytes, so uncommitted working-tree changes never appear in it.
 
 This `get_symbol` request reads a declaration as it stands on `main`, whatever the working tree
 currently holds:
@@ -141,7 +135,7 @@ A workspace with no git repository refuses a revision read and names the remedy:
 ```
 
 An unknown revision refuses with `resource_not_found`, and
-[`[providers.history]`](/docs/configuration#providers) owns the capability: `enabled = false`
+[`[providers.history]`](/docs/developer/configuration#providers) owns the capability: `enabled = false`
 refuses every revision read.
 
 <McpTool name="get_symbol" />
@@ -153,9 +147,9 @@ declaration excerpt - and `history` - the version-control timeline. An omitted `
 defaults to `["source"]`; an explicit empty list carries neither.
 
 `include: ["history"]` attaches the symbol's version-control timeline as a
-[`SymbolHistory`](/docs/protocol/reference#SymbolHistory). The server follows first parents
+[`SymbolHistory`](/docs/developer/protocol/reference#SymbolHistory). The server follows first parents
 from the served revision along the declaration's current path, bounded by the `max_revisions`
-key in [`[providers.history]`](/docs/configuration#providers) and by a shallow clone's
+key in [`[providers.history]`](/docs/developer/configuration#providers) and by a shallow clone's
 boundary, and classifies what each touching revision did: `introduced`, `body_changed`,
 `signature_changed`, `removed`, or `decorators_changed`. A revision whose source cannot be
 parsed, or where the symbol is absent, contributes no version. `complete` says whether the
@@ -168,19 +162,18 @@ so revisions older than the listed ones may have touched the symbol.
 
 `scope` selects which declarations the lookup searches. `project`, the default, searches the
 workspace tree. `dependencies` searches the public declarations of the packages the
-[dependency resolvers](/docs/architecture#source-discovery) cataloged with a source root, as
-the [dependency index](/docs/architecture#dependency-index) holds them. `all` searches both and
+[dependency resolvers](/docs/developer/architecture#source-discovery) cataloged with a source root, as
+the [dependency index](/docs/developer/architecture#dependency-index) holds them. `all` searches both and
 lists a project hit before a dependency hit of equal rank.
 
 A dependency hit carries `unit` in place of `path`: the
-[`SourceUnitId`](/docs/protocol/reference#SourceUnitId) of the package file, spelled
+[`SourceUnitId`](/docs/developer/protocol/reference#SourceUnitId) of the package file, spelled
 `rift://source/<manager>/<name>@<version>/<file>`. Its `symbol.origin` names the owning
-package. The hit carries no `node`, since a package is never an edit target, and no
-`history`.
+package. The hit carries neither `node` nor `history`.
 
 The server refuses `rev` together with a scope beyond `project` as `invalid_request`: the
 dependency index serves the current tree alone. While the workspace's
-[`[dependencies]`](/docs/configuration#dependencies) table sets `enabled = false`, the server
+[`[dependencies]`](/docs/developer/configuration#dependencies) table sets `enabled = false`, the server
 refuses a scope beyond `project` as `capability_unavailable`, naming the switch.
 
 This lookup reaches the `helper` crate a workspace's `Cargo.toml` names by path:
@@ -225,7 +218,7 @@ This lookup reaches the `helper` crate a workspace's `Cargo.toml` names by path:
 
 `search` takes a lexical `query`, narrowed or extended by a `paths` selector. `paths.include` and
 `paths.exclude` glob the project-relative path - the same glob engine backs the workspace's
-[`[source]`](/docs/configuration#source) policy - narrowing the indexed candidates before
+[`[source]`](/docs/developer/configuration#source) policy - narrowing the indexed candidates before
 scoring.
 
 `paths.force_include` reaches past both: a file `[source]` or `.gitignore` excluded from the
@@ -306,7 +299,7 @@ hit. The ranked lane placed it, so the hit is tagged `matched_by: ["ranked"]`, n
 <VersionBadge version="v0.0.25" />
 
 Every visible bounded UTF-8 file without a NUL byte joins the same index when its effective
-language entry or [`[search.text].include`](/docs/configuration#search) selects it. A hit on one
+language entry or [`[search.text].include`](/docs/developer/configuration#search) selects it. A hit on one
 of those files returns as a `file` hit, tagged
 `matched_by: ["ranked"]` the same way:
 
@@ -350,7 +343,7 @@ answer.
 
 `traversal` walks the relationship graph `[providers.binding]` builds: a bounded search from
 one `seed`, following `direction` and narrowed to `facets`, up to `depth` hops. `seed` and the
-optional `to` are declaration [`SymbolId`](/docs/protocol/reference#SymbolId) values, the same
+optional `to` are declaration [`SymbolId`](/docs/developer/protocol/reference#SymbolId) values, the same
 identity a `get_symbol` or `search` hit already carries.
 
 `traversal` stands alone as a pure graph walk or rides beside `query`; a symbol both lanes
@@ -366,66 +359,40 @@ Three shapes cover most questions:
 - **Path** - `to` set: whether, and by which shortest route, the walk reaches one named symbol.
 
 Each reached symbol becomes a hit tagged `matched_by: ["relationship"]`, carrying `distance` -
-the path length - and `traversal_path`, the [`GraphHop`](/docs/protocol/reference#GraphHop) list
+the path length - and `traversal_path`, the [`GraphHop`](/docs/developer/protocol/reference#GraphHop) list
 from `seed` to the hit. Every `GraphHop` carries the
-[`Relationship`](/docs/protocol/reference#Relationship) it followed and the direction it
+[`Relationship`](/docs/developer/protocol/reference#Relationship) it followed and the direction it
 followed it in; `seed` itself is never a hit.
 
-This impact query asks what calls `resolve_traversal_seed`:
+For a Python workspace with the embedded engine configured, this request asks which declarations
+reference `serve` in `service.py`:
 
 **Request:**
 
 ```json
 {
   "traversal": {
-    "seed": "rift://symbol/rust/crates/rift-server/src/search.rs/resolve_traversal_seed",
-    "direction": "incoming"
-  }
-}
-```
-
-**Search hit:**
-
-```json
-{
-  "hit": {
-    "target": "symbol",
-    "symbol": {
-      "id": "rift://symbol/rust/crates/rift-server/src/search.rs/collect_traversal_hits",
-      "language": "rust",
-      "name": "collect_traversal_hits",
-      "kind": "function",
-      "facets": ["value", "callable"],
-      "visibility": "private"
-    }
+    "seed": "rift://symbol/python/service.py/serve",
+    "direction": "incoming",
+    "facets": ["references"],
+    "depth": 1
   },
-  "matched_by": ["relationship"],
-  "range": { "start": 29305, "end": 31111 },
-  "line": 779,
-  "path": "crates/rift-server/src/search.rs",
-  "traversal_path": [
-    {
-      "relationship": {
-        "from": "rift://symbol/rust/crates/rift-server/src/search.rs/collect_traversal_hits",
-        "kind": "calls",
-        "facets": ["calls"],
-        "to": "rift://symbol/rust/crates/rift-server/src/search.rs/resolve_traversal_seed",
-        "derivation": "resolution"
-      },
-      "direction": "incoming"
-    }
-  ],
-  "distance": 1
+  "target": "symbol"
 }
 ```
 
-`facets` narrows the walk to [`RelationshipFacet`](/docs/protocol/reference#RelationshipFacet)
+Each caller's `traversal_path` carries a relationship from the caller to `serve`, with
+`facets: ["references"]` and `derivation: "resolution"`. The hop's direction is `incoming`.
+
+`facets` narrows the walk to [`RelationshipFacet`](/docs/developer/protocol/reference#RelationshipFacet)
 values such as `calls`, `references`, and `imports`; an empty or omitted list follows every
 facet. `target: "file"` never carries a walked hit, since a traversal only reaches symbols.
 
-A workspace with the binding provider disabled, and no relationship data left from an earlier
-build, refuses `capability_unavailable` naming `relationship traversal (providers.binding
-disabled)`: the graph this walk needs was never built. `traversal` never combines with `rev` -
+A workspace with the binding provider disabled, no successful engine reference answer, and no
+relationship data left from an earlier build refuses `capability_unavailable` naming
+`relationship traversal (providers.binding disabled)`: the graph this walk needs was never built.
+With no indexed relationships, a successful engine answer with no callers returns an empty result set.
+`traversal` never combines with `rev` -
 the relationship graph serves the current tree alone - and refuses `capability_unavailable`
 the same way. A `seed` that resolves to neither a graph node nor a lexical declaration refuses
 `resource_not_found`; one that resolves but carries no edges answers an empty result set, since
@@ -435,6 +402,30 @@ A walk the server stops at its node bound attaches a `traversal_truncated` entry
 `warnings`, naming how many symbols it visited: hits reachable beyond the bound are missing,
 and a tighter `facets` list, a smaller `depth`, or a less-connected `seed` fits the walk under it.
 
+### Language-engine references [#search-engine-references]
+
+<VersionBadge version="v0.0.35" languages={["Rust", "TypeScript", "Python"]} />
+
+A current-tree symbol traversal consults the configured
+[language engine](/docs/developer/configuration#languages-and-lsp) when `direction` is `incoming`
+or `both` and `facets` contains `references` or is empty. The server adds engine-resolved
+references to the indexed relationships and applies the same traversal depth and result bounds.
+
+The server maps each reference location to the smallest indexed declaration containing it.
+Locations outside the workspace or without an indexed declaration contribute no hit. When no
+engine is configured, or the engine lacks reference support, the indexed relationships answer.
+A configured engine that fails to start returns its failure through
+[`ErrorData`](/docs/developer/protocol/reference#ErrorData).
+
+The server captures source and configuration before and after the engine request. If either
+changes, the server captures the current publication, refreshes the search ranking, and repeats
+the reference request, with at most three attempts. Reference resolution and these retries share
+one `[server] readiness_timeout` deadline. Exhausted attempts or an expired deadline return
+`temporarily_unavailable` with `retry: "same_request"`.
+
+A stale publication uses indexed relationships and carries `stale_index`. Each engine request
+also uses the configured engine retry and restart bounds.
+
 ### Dependency scope [#search-scope]
 
 <VersionBadge version="v0.0.32" languages={["Rust", "Python", "TypeScript"]} />
@@ -443,13 +434,13 @@ and a tighter `facets` list, a smaller `depth`, or a less-connected `seed` fits 
 [`get_symbol`](#get_symbol-scope) takes. `project`, the default, runs the lanes above: the
 indexed declarations and lines, the `paths.force_include` files, the ranked tier, and
 `traversal`. `dependencies` runs none of them and answers from the public declarations of the
-packages the [dependency index](/docs/architecture#dependency-index) holds, ranked the way the
+packages the [dependency index](/docs/developer/architecture#dependency-index) holds, ranked the way the
 project index ranks a name. `all` runs both and orders the two sides together under `order`:
 by score under `relevance`; under `path`, every project path first, then the dependency hits
 in unit order.
 
 A dependency hit is a `symbol` hit tagged `matched_by: ["name"]`, addressed by `unit` in place
-of `path` - the [`SourceUnitId`](/docs/protocol/reference#SourceUnitId) of the package file -
+of `path` - the [`SourceUnitId`](/docs/developer/protocol/reference#SourceUnitId) of the package file -
 with `range` and `line` inside that unit, and `source` when `include` names it. A package
 contributes declarations alone, so `target: "file"` answers nothing from it.
 
@@ -507,9 +498,6 @@ This search reaches the `helper` crate the `get_symbol` lookup above reaches:
 
 <McpTool name="nodes" />
 
-Each identity carries the witness a later
-[`replace_node`](#tool-replace_node) verifies.
-
 A visible path no syntax provider parses - `justfile`, `.gitignore` - refuses
 `capability_unavailable`, naming the extension, or stating that the path carries none.
 
@@ -542,7 +530,7 @@ every workspace read is still refusing. A store that could not be opened answers
 set and an `unavailable` reason rather than a refusal.
 
 `[logs] page_records` bounds one read; `retention_records` bounds the store. Both are
-[workspace configuration](/docs/configuration#logs).
+[workspace configuration](/docs/developer/configuration#logs).
 
 ### Workspace [#resource-workspace]
 
@@ -553,13 +541,12 @@ The answer carries:
 
 - `configuration_revision` - an eight-character digest of the accepted `rift.toml` bytes
 - `languages` - effective identities in order, with enabled state, include and exclude patterns,
-  syntax availability, execution permission, and selected LSP process state
-- `hooks` - configured hook identities, kinds, and effective path selection
+  syntax availability, and selected LSP process state
 - `source` - captured project paths, content digests, and matched language identities
 - `pagination` - the zero-based page and total page count
 
 The bare URI selects page zero. `rift://workspace?page_index=1` selects another page. Each page
-holds at most 1000 source units; language and hook summaries repeat so every page can be read
+holds at most 1000 source units; language summaries repeat so every page can be read
 alone. A page past the end returns an empty `source` list with the true page count.
 
 ### Map [#resource-map]
@@ -570,7 +557,7 @@ alone. A page past the end returns an empty `source` list with the true page cou
 codebase, computed once when the index publishes and served from cache after that, so a read
 costs a lookup. The answer carries:
 
-- `revision` - an eight-character [`Digest`](/docs/protocol/reference#Digest) of the indexed
+- `revision` - an eight-character [`Digest`](/docs/developer/protocol/reference#Digest) of the indexed
   tree the map was computed from
 - `languages` - per-language file and symbol counts, sorted by language spelling
 - `modules` - the directory tree indexed files sit under, each entry's file and symbol counts
@@ -586,19 +573,19 @@ costs a lookup. The answer carries:
 <VersionBadge version="v0.0.29" languages={["Rust"]} />
 
 `hubs` and `entry_points` need facts only the Rust provider currently supplies. `hubs` ranks
-[`SymbolId`](/docs/protocol/reference#SymbolId)s by the reference counts the
-[binding provider](/docs/architecture#semantics) resolves; `entry_points` lists symbols
-carrying the `entrypoint` [`SymbolFacet`](/docs/protocol/reference#SymbolFacet) - a file-scope
+[`SymbolId`](/docs/developer/protocol/reference#SymbolId)s by the reference counts the
+[binding provider](/docs/developer/architecture#semantics) resolves; `entry_points` lists symbols
+carrying the `entrypoint` [`SymbolFacet`](/docs/developer/protocol/reference#SymbolFacet) - a file-scope
 `fn main`, not one nested in a module, an `impl` block, or another function. Both stay empty for
 a workspace with no such facts.
 
 <VersionBadge version="v0.0.32" languages={["Rust", "Python", "TypeScript"]} />
 
-`packages` lists what the [dependency resolvers](/docs/architecture#source-discovery) cataloged:
+`packages` lists what the [dependency resolvers](/docs/developer/architecture#source-discovery) cataloged:
 the Cargo resolver reads the resolved graph from `cargo metadata` and falls back to
 `Cargo.lock` when `cargo` is not on the server's `PATH`; the uv, npm, and Bun resolvers read
 `uv.lock`, `package-lock.json`, and `bun.lock`. Each entry is a
-[`PackageIdentity`](/docs/protocol/reference#PackageIdentity). The list follows the lockfile:
+[`PackageIdentity`](/docs/developer/protocol/reference#PackageIdentity). The list follows the lockfile:
 a lockfile rewritten while the server runs is re-cataloged on the next publication.
 
 A resolver reads at most 256 manifests per workspace, taken in path order, so `packages` over a
@@ -644,110 +631,10 @@ workspace holding more lists what the manifests it read declare.
 }
 ```
 
-### Planned resources
-
-<VersionBadge version="planned" />
-
-Resources expose workspace state to consumers such as a UI. They carry data shaped for paging:
-
-| Resource | Content |
-| --- | --- |
-| [`rift://projection/{id}`](#resource-projection) | one projection's path on disk and its state |
-| [`rift://changes{?projection,page_index}`](#resource-changes) | one changeset, each change with its evidence |
-| [`rift://fs{/path}{?start,length,page_index}`](#resource-fs) | a directory's entries, or a bounded range of file bytes |
-
-[`rift://fs`](#resource-fs) serves file bytes and directory listings to consumers without host
-filesystem tools.
-
-[`projection_create`](#tool-projection_create) materializes the complete pinned directory.
-Reading `rift://projection/{id}` returns its stable path and base revision. Before returning
-projection state or changes, the server reconciles direct filesystem writes against the
-projection manifest, so a shell write appears in the same changeset as a server-applied change.
-
-A paged resource answer carries `pagination` the same way the read tools do. A file-range read
-continues by byte offset; the payload's `digest` detects a file change and requires a restart
-from offset zero.
-
-## Projections
-
-<VersionBadge version="planned" />
-
-| Tool | What it does |
-| --- | --- |
-| [`projection_create`](#tool-projection_create) | materializes a pinned workspace snapshot |
-| [`projection_list`](#tool-projection_list) | lists projections and the state of each |
-| [`projection_remove`](#tool-projection_remove) | deletes one projection, unpublished changes included |
-| [`projection_restore`](#tool-projection_restore) | refreshes changed paths from the workspace |
-| [`publish`](#tool-publish) | writes one projection's changes into the workspace |
-
-`publish` takes the list of change ids whose confirmations the caller accepts, and writes
-nothing unless it can write everything:
-
-- a change carrying a confirmation the call didn't accept comes back in `unaccepted`
-- a path the projection changed that the workspace changed too comes back in `conflicts`
-- a file returned by a projection read that the workspace changed comes back in
-  `dependency_conflicts`
-
-Before those checks, the server compares the directory against its manifest. A process-written delta
-becomes one `filesystem` change with exact `paths`, current provider and hook evidence, and an
-`external` confirmation. If this scan discovers new writes, their ids return in `unaccepted`;
-the caller reads `rift://changes` and retries after reviewing them.
-
-Projection-scoped `get_symbol`, `search`, and `nodes` calls record exact returned files and their
-digests. `publish` checks those read dependencies even when the projection did not change them.
-This prevents a change to `src/app.py` from landing after the declaration it read from
-`src/config.py` moved in the workspace.
-
-`max_projection_dependencies` and `max_projection_dependency_bytes` bound this read set. A read
-that would cross either limit fails before returning its data.
-
-Each [`DependencyConflict`](/docs/protocol/reference#DependencyConflict) carries `path`,
-`observed`, and `current`. The caller can reread and revise its work, or pass that exact object in
-`accept_dependencies`. An acceptance with an older `current` digest does not match after another
-workspace edit and remains in `dependency_conflicts`.
-
-An empty search has no returned file to record. Reads performed directly against the projection
-directory also bypass the read set. A caller whose work depends on either result reads again
-before publishing.
-
-For every refusal, the server leaves both trees unchanged. Publication is serialized
-workspace-wide, so a `publish` that cannot take the workspace inside the call budget fails with
-`temporarily_unavailable` and is worth sending again once the holder finishes. On success the server
-writes every changed path, removes directories its deletions left empty - the workspace root
-excluded - rebuilds the pinned projection from the resulting workspace, advances its base
-revision, and clears its changeset and read dependencies.
-
-`projection_restore` goes the other way: it refreshes selected changed paths from the workspace
-and drops the changes that touched them. A change is dropped whole - naming one of its paths
-restores every path it touched, because restoring one path of a change without the others would
-leave a change record that no longer describes the tree. Restored paths take their new conflict
-baseline from the current workspace; other paths retain their earlier baselines.
-
-## Execution
-
-<VersionBadge version="planned" />
-
-[`execute`](#tool-execute) evaluates a block of code in the targeted tree's execution copy. The
-copy persists between calls - a dependency one evaluation installs is still there for the next -
-and the server refreshes its visible files to match the targeted tree before each evaluation, so
-the code always runs against the tree as it stands.
-
-Writes addressed inside the execution directory stay there and are not synchronized into the
-targeted tree. The execution directory is not a sandbox; the runtime uses the server's OS
-permissions, so an absolute path can reach outside it.
-
-A workspace already at the `max_concurrent` bound of the
-[`[execution]`](/docs/configuration#execution) section returns `temporarily_unavailable`. The
-caller may send the same request after an evaluation slot becomes free.
-
-`execute` needs `rift.toml` to allow the exact language and a runtime to serve it. A call without
-both refuses with `capability_unavailable`.
-
 ## Errors
 
-A refusal is a normal tool result: the server understood the operation and declined to change the
-tree. `ErrorData` reports request and infrastructure failures such as invalid input, a crossed
-limit, or a storage failure.
+[`ErrorData`](/docs/developer/protocol/reference#ErrorData) reports request and infrastructure failures
+such as invalid input, a crossed limit, or a storage failure.
 
 Every one carries a `retry` directive, which is the field to branch on - it rides each error
 instance rather than the code, because the same `storage_failure` can be transient once and

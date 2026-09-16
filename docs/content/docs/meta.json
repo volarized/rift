@@ -1,11 +1,3 @@
 {
-  "pages": [
-    "index",
-    "architecture",
-    "implementation",
-    "configuration",
-    "testing",
-    "claude-code",
-    "protocol"
-  ]
+  "pages": ["index", "installation", "mcp", "agentic-usage", "developer"]
 }
