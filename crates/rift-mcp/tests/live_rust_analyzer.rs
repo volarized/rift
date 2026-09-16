@@ -681,5 +681,8 @@ fn rust_engine_fixture_pins_1_98() {
     let fixture = rust_engine::fixture();
     assert_eq!(fixture.program, "rustup");
     assert_eq!(fixture.arguments, ["run", "1.98", "rust-analyzer"]);
-    assert_eq!(fixture.extra_toml, "\n[lsp.rust.retry]\nattempts = 16\n");
+    assert!(
+        fixture.extra_toml.is_empty(),
+        "the live Rust fixture must use the shipped retry policy"
+    );
 }

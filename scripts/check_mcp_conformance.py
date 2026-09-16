@@ -22,11 +22,12 @@ of this repository and leaves nothing behind.
 
 Usage:
 
-    uv run --script scripts/check_mcp_conformance.py
+    uv run --script scripts/check_mcp_conformance.py [--binary path/to/rift]
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import signal
@@ -34,6 +35,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parent.parent
@@ -77,21 +79,27 @@ def lay_out_workspace(root: Path) -> None:
     (root / "src" / "main.rs").write_text(FIXTURE_SOURCE, encoding="utf-8")
 
 
-def build_server_binary() -> Path:
+def build_server_binary(*, release: bool = False, target: str | None = None) -> Path:
     """Build `rift` and answer the executable Cargo wrote.
 
     The build runs in this repository, where `rust-toolchain.toml` selects
     the compiler; the server itself then runs with the served workspace as
     its working directory, which is the root `rift server` serves.
     """
+    command = [
+        "cargo",
+        "build",
+        "--locked",
+        "-p",
+        "rift",
+        "--message-format=json-render-diagnostics",
+    ]
+    if release:
+        command.append("--release")
+    if target is not None:
+        command.extend(["--target", target])
     completed = subprocess.run(
-        [
-            "cargo",
-            "build",
-            "-p",
-            "rift",
-            "--message-format=json-render-diagnostics",
-        ],
+        command,
         cwd=REPOSITORY,
         check=True,
         capture_output=True,
@@ -103,9 +111,12 @@ def build_server_binary() -> Path:
             message = json.loads(line)
         except ValueError:
             continue
-        if message.get("reason") == "compiler-artifact" and message.get("executable"):
-            if message.get("target", {}).get("name") == "rift":
-                return Path(message["executable"])
+        if (
+            message.get("reason") == "compiler-artifact"
+            and message.get("executable")
+            and message.get("target", {}).get("name") == "rift"
+        ):
+            return Path(message["executable"])
     raise RuntimeError("the build reported no rift executable")
 
 
@@ -233,10 +244,17 @@ def run_suite(port: int) -> int:
     return completed.returncode
 
 
-def main() -> int:
+def main(arguments: Sequence[str] | None = None) -> int:
     """Serve one throwaway workspace and score it against the baseline."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--binary", type=Path, help="Use this supplied binary without building"
+    )
+    supplied: Path | None = parser.parse_args(arguments).binary
+    binary = supplied.resolve() if supplied is not None else build_server_binary()
+    if not binary.is_file():
+        raise RuntimeError(f"conformance binary does not exist: {binary}")
     install_runner()
-    binary = build_server_binary()
     with (
         tempfile.TemporaryDirectory(prefix="rift-conformance-") as directory,
         tempfile.TemporaryDirectory(prefix="rift-conformance-log-") as log_directory,

@@ -1,0 +1,26 @@
+nextest-version = "0.9.140"
+
+[store]
+dir = "target/nextest"
+
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 1, grace-period = "10s" }
+retries = 0
+leak-timeout = { period = "200ms", result = "fail" }
+
+# These suites start language engines or share the model download cache.
+# Nextest runs each test in a process, so an in-process mutex cannot serialize them.
+[test-groups]
+live = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(/^live_/)'
+test-group = 'live'
+
+[profile.ci]
+global-timeout = "480s"
+fail-fast = false
+failure-output = "immediate-final"
+
+[profile.ci.junit]
+path = "junit.xml"
