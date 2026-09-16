@@ -58,7 +58,10 @@ def probe_answer(name: str, source: str, identity: str = "probe") -> JsonObject:
     return {"hits": [hit]}
 
 
-@pytest.mark.parametrize("failure", [None, "read", "final_source", "identity"])
+@pytest.mark.parametrize(
+    "failure",
+    [None, "read", "unmarked_stale", "identity", "marked_stale", "perpetual_stale"],
+)
 def test_churn_validates_all_tools_overlap_and_final_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str | None
 ) -> None:
@@ -69,16 +72,23 @@ def test_churn_validates_all_tools_overlap_and_final_source(
     path = tmp_path / PROBE_PATH
     real_sleep = asyncio.sleep
     calls: list[str] = []
+    writer_stopped = False
+    final_calls: dict[str, int] = {}
     sleeps: list[float] = []
     client = AsyncMock(spec=Client)
     initial = "pub fn corpus_probe() { let value = 0; }"
 
     async def sleep(seconds: float) -> None:
         sleeps.append(seconds)
-        # A fast server can finish the minimum reads before two writes occur.
-        while len(calls) <= READ_COUNT:
+        nonlocal writer_stopped
+        try:
+            # A fast server can finish the minimum reads before two writes occur.
+            while seconds == 2.0 and len(calls) <= READ_COUNT:
+                await real_sleep(0)
             await real_sleep(0)
-        await real_sleep(0)
+        except asyncio.CancelledError:
+            writer_stopped = True
+            raise
 
     async def call(name: str, arguments: JsonObject) -> JsonObject:
         assert arguments == check_corpus.CHURN_REQUESTS[name]
@@ -86,19 +96,31 @@ def test_churn_validates_all_tools_overlap_and_final_source(
         if failure == "read" and len(calls) == 3:
             raise OSError("search failed")
         await real_sleep(0)
-        source = initial if failure == "final_source" else path.read_text().rstrip("\n")
+        source = path.read_text().rstrip("\n")
         identity = "wrong" if failure == "identity" and len(calls) > 1 else "probe"
-        return probe_answer(name, source, identity)
+        marked = False
+        if writer_stopped:
+            final_calls[name] = final_calls.get(name, 0) + 1
+            if failure in ("unmarked_stale", "perpetual_stale") or (
+                failure == "marked_stale" and final_calls[name] == 1
+            ):
+                source = initial
+                marked = failure != "unmarked_stale"
+        answer = probe_answer(name, source, identity)
+        if marked:
+            answer["warnings"] = [{"code": "stale_index"}]
+        return answer
 
     async def exercise() -> None:
         expected = {
             "read": (OSError, "search failed"),
-            "final_source": (AssertionError, "expected revisions"),
+            "unmarked_stale": (AssertionError, "without stale_index"),
+            "perpetual_stale": (TimeoutError, None),
             "identity": (AssertionError, "changed probe identity"),
         }
         with (
             pytest.raises(*expected[failure][:1], match=expected[failure][1])
-            if failure
+            if failure in expected
             else nullcontext()
         ):
             await corpus.churn(cast(Client, client))
@@ -108,10 +130,12 @@ def test_churn_validates_all_tools_overlap_and_final_source(
 
     client.call.side_effect = call
     monkeypatch.setattr(asyncio, "sleep", sleep)
+    if failure == "perpetual_stale":
+        monkeypatch.setattr(check_corpus, "READ_SECONDS", 0.05)
     asyncio.run(exercise())
     assert not path.exists()
-    assert sleeps and set(sleeps) == {2.0}
-    if failure is None:
+    assert sleeps and set(sleeps) <= {2.0, check_corpus.POLL_SECONDS}
+    if failure in (None, "marked_stale"):
         summary = object_value(corpus.actions[-1], "churn action")
         assert cast(int, summary["reads"]) > READ_COUNT
         assert all(
@@ -127,7 +151,7 @@ def test_churn_validates_all_tools_overlap_and_final_source(
             "get_symbol",
             "nodes",
         }
-        assert calls[-3:] == ["search", "get_symbol", "nodes"]
+        assert set(final_calls) == {"search", "get_symbol", "nodes"}
 
 
 def test_churn_enforces_read_deadline_and_cleans_up(
@@ -155,7 +179,10 @@ def test_churn_rejects_wrong_ranges_and_partial_source(tool: str) -> None:
     from rift_dev.corpus_assertions import churn_answer
 
     source = "pub fn corpus_probe() {}"
-    assert churn_answer(tool, probe_answer(tool, source), [source], "probe") == "probe"
+    assert churn_answer(tool, probe_answer(tool, source), [source], "probe") == (
+        "probe",
+        source,
+    )
     with pytest.raises(AssertionError, match="expected revisions"):
         churn_answer(
             tool, probe_answer(tool, "pub fn corpus_probe() {"), [source], "probe"

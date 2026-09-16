@@ -538,25 +538,45 @@ class Corpus:
                 await asyncio.sleep(2.0)
                 write(edit)
 
-        async def read(name: str, expected: list[str], identity: str | None) -> str:
+        async def read(name: str, identity: str | None) -> tuple[str, int]:
             nonlocal overlaps
             before = len(sources)
             started = time.monotonic()
+            codes: list[str] = []
+            revision: int | None = None
             try:
                 async with gate_deadline(f"churn {name}", READ_SECONDS):
                     answer = await client.call(name, CHURN_REQUESTS[name])
+                codes = [
+                    string_value(warning.get("code"), "warning code")
+                    for warning in warnings(answer)
+                ]
+                found, source = churn_answer(name, answer, sources, identity)
+                revision = sources.index(source)
+                require(
+                    revision >= before - 1 or "stale_index" in codes,
+                    f"{name} returned old source without stale_index",
+                )
+                return found, revision
             finally:
                 elapsed = time.monotonic() - started
                 timings[name].append(elapsed)
                 changed = len(sources) - before
                 overlaps += changed
-                self.record("churn_read", tool=name, seconds=elapsed, writes=changed)
-            return churn_answer(name, answer, expected, identity)
+                self.record(
+                    "churn_read",
+                    tool=name,
+                    seconds=elapsed,
+                    writes=changed,
+                    source_revision=revision,
+                    source_revision_at_start=before - 1,
+                    warning_codes=codes,
+                )
 
         write(0)
         task: asyncio.Task[None] | None = None
         try:
-            identity = await read("get_symbol", sources, None)
+            identity, _revision = await read("get_symbol", None)
             task = asyncio.create_task(writer())
             reads = 0
             tools = tuple(CHURN_REQUESTS)
@@ -564,7 +584,7 @@ class Corpus:
             async with gate_deadline("corpus churn", self.pin.seconds):
                 while reads < READ_COUNT or overlaps < 2:
                     name = tools[reads % len(tools)]
-                    await read(name, sources, identity)
+                    await read(name, identity)
                     pressure_calls[name] += 1
                     reads += 1
                     if task.done():
@@ -573,8 +593,20 @@ class Corpus:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
             final = [sources[-1]]
-            for name in CHURN_REQUESTS:
-                await read(name, final, identity)
+            convergence = time.monotonic()
+            async with gate_deadline("churn final source", READ_SECONDS):
+                for name in CHURN_REQUESTS:
+                    while True:
+                        _identity, revision = await read(name, identity)
+                        if revision == len(sources) - 1:
+                            break
+                        # read already refused every older answer without stale_index.
+                        await asyncio.sleep(POLL_SECONDS)
+            self.record(
+                "churn_convergence",
+                seconds=time.monotonic() - convergence,
+                source_revision=len(sources) - 1,
+            )
             require(
                 path.read_text(encoding="utf-8").rstrip("\n") == final[0],
                 "reads changed probe source",
