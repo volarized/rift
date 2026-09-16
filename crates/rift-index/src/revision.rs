@@ -7,7 +7,7 @@
 //! answers. A future language joins revision reads the same way it joins
 //! the scan - by its provider's declared extensions and a syntax step.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rift_core::constants::WORKSPACE_IGNORED_DIRECTORIES;
 use rift_core::{CompositionId, ProjectPath, SourceVisibility};
@@ -71,6 +71,38 @@ impl WorkspaceIndex {
         text_inclusion: &rift_core::TextFileInclusion,
         languages: &rift_core::LanguageFileSelections,
     ) -> Result<Self, WorkspaceIndexError> {
+        Self::at_revision_with_selection(
+            repository,
+            revision,
+            limits,
+            visibility,
+            text_inclusion,
+            languages,
+            &|_| true,
+        )
+    }
+
+    /// Builds one committed-tree index over the paths `selection` keeps.
+    ///
+    /// The visible-path policy applies first, so a selection can only narrow
+    /// what the revision read would otherwise hold. A caller that already
+    /// knows which paths it will read - a comparison of two revisions, which
+    /// reads the changed ones alone - passes them here instead of paying for
+    /// the whole tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] for invalid paths, configuration,
+    /// bounds, history reads, or syntax.
+    pub fn at_revision_with_selection(
+        repository: &Repository,
+        revision: &ResolvedRevision,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+        text_inclusion: &rift_core::TextFileInclusion,
+        languages: &rift_core::LanguageFileSelections,
+        selection: &dyn Fn(&str) -> bool,
+    ) -> Result<Self, WorkspaceIndexError> {
         let root = repository.root().to_path_buf();
         let composition = revision_composition()?;
         let language = std::sync::Arc::new(crate::WorkspaceLanguagePolicy::build(
@@ -78,8 +110,8 @@ impl WorkspaceIndex {
             languages,
             text_inclusion,
         )?);
-        let matcher = PathMatcher::build(&root, visibility.include(), visibility.exclude())?;
-        let includes = |path: &str| hard_floor_includes(path) && matcher.includes(&root.join(path));
+        let visible = RevisionPaths::build(&root, visibility)?;
+        let includes = |path: &str| visible.includes(path) && selection(path);
         let listed = repository
             .tree_files(revision, &includes, REVISION_TREE_ENTRIES_MAX)
             .map_err(history_error)?;
@@ -158,11 +190,40 @@ fn history_error(error: rift_history::HistoryError) -> WorkspaceIndexError {
     index_error_caused_by(WorkspaceIndexViolation::History, None, error)
 }
 
-/// Whether a committed path's first segment stays outside the hard floor
-/// every workspace applies: `.git`, `.rift`, and `target` are never indexed.
-fn hard_floor_includes(path: &str) -> bool {
-    let first_segment = path.split('/').next().unwrap_or(path);
-    !WORKSPACE_IGNORED_DIRECTORIES.contains(&first_segment)
+/// The committed paths one revision read may hold: the hard floor every
+/// workspace applies, then the workspace's `[source]` policy.
+///
+/// One predicate owns both rules, so a caller that lists changed paths
+/// before the index is built screens them the way the build itself would.
+#[derive(Debug)]
+pub struct RevisionPaths {
+    root: PathBuf,
+    matcher: PathMatcher,
+}
+
+impl RevisionPaths {
+    /// Compiles the visible-path policy for the revision reads of one
+    /// workspace root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] for an invalid `[source]` pattern.
+    pub fn build(root: &Path, visibility: &SourceVisibility) -> Result<Self, WorkspaceIndexError> {
+        Ok(Self {
+            root: root.to_path_buf(),
+            matcher: PathMatcher::build(root, visibility.include(), visibility.exclude())?,
+        })
+    }
+
+    /// Whether one committed workspace-relative path is visible: its first
+    /// segment stays outside the hard floor - `.git`, `.rift`, and `target`
+    /// are never indexed - and the `[source]` policy keeps it.
+    #[must_use]
+    pub fn includes(&self, path: &str) -> bool {
+        let first_segment = path.split('/').next().unwrap_or(path);
+        !WORKSPACE_IGNORED_DIRECTORIES.contains(&first_segment)
+            && self.matcher.includes(&self.root.join(path))
+    }
 }
 
 /// The number of directories above a workspace-relative file path - the
