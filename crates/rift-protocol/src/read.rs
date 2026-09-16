@@ -949,6 +949,24 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
+    /// No provider populates part of the relationship coverage the traversal asked for, so
+    /// the walk had nothing to follow there whatever the graph holds. The warning states
+    /// that a provider is absent; it never states that the seed has no such neighbor. An
+    /// empty answer carrying it means the walk could not run; an empty answer without it
+    /// means the walk ran and the seed has no neighbor under the request.
+    RelationshipCoverageMissing {
+        /// The requested facets no provider populates, in the request's own order,
+        /// deduplicated. Absent when every requested facet has a provider.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        facets: Vec<RelationshipFacet>,
+        /// The seed declaration's language, when the gap is the language rather than the
+        /// facet. Absent when the language has a provider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<Language>,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
     /// Cataloged packages with a source root are still being indexed, so a `dependencies`
     /// or `all` answer holds their declarations only once the index reaches them. The
     /// answer is served from the packages indexed so far. Rides only an answer whose
@@ -1743,7 +1761,8 @@ mod tests {
     use super::{
         Digest, Duration, FileId, GetSymbolParams, LANGUAGE_IDENTITY_PATTERN, Language,
         PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX, PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning,
-        RevisionId, RevisionIdViolation, SearchScope, SourceUnitId, Symbol, SymbolId,
+        RelationshipFacet, RevisionId, RevisionIdViolation, SearchScope, SourceUnitId, Symbol,
+        SymbolId,
     };
     use schemars::schema_for;
     use serde_json::json;
@@ -2153,6 +2172,46 @@ mod tests {
         assert_eq!(parsed, warning);
     }
 
+    /// Both members are omitted when they carry no gap, so absence is the signal a caller
+    /// reads: a facet gap serializes without `language`, a language gap without `facets`.
+    #[test]
+    fn the_relationship_coverage_warning_omits_the_member_that_carries_no_gap() {
+        let cases = [
+            (
+                ReadWarning::RelationshipCoverageMissing {
+                    facets: vec![RelationshipFacet::Implements],
+                    language: None,
+                    detail: "no provider populates the requested facet implements".to_owned(),
+                },
+                json!({
+                    "code": "relationship_coverage_missing",
+                    "facets": ["implements"],
+                    "detail": "no provider populates the requested facet implements",
+                }),
+            ),
+            (
+                ReadWarning::RelationshipCoverageMissing {
+                    facets: Vec::new(),
+                    language: Some(Language {
+                        name: "toml".to_owned(),
+                        dialect: None,
+                    }),
+                    detail: "no provider populates outgoing relationships for toml".to_owned(),
+                },
+                json!({
+                    "code": "relationship_coverage_missing",
+                    "language": "toml",
+                    "detail": "no provider populates outgoing relationships for toml",
+                }),
+            ),
+        ];
+        for (warning, wire) in cases {
+            assert_eq!(serde_json::to_value(&warning).expect("serialize"), wire);
+            let parsed: ReadWarning = serde_json::from_value(wire).expect("deserialize");
+            assert_eq!(parsed, warning);
+        }
+    }
+
     #[test]
     fn the_results_truncation_warning_round_trips_under_its_code_tag() {
         let warning = ReadWarning::ResultsTruncated { results_max: 1_000 };
@@ -2182,6 +2241,7 @@ mod tests {
             "dependency_index_pending",
             "dependency_package_skipped",
             "dependency_resolver_degraded",
+            "relationship_coverage_missing",
         ] {
             assert!(
                 codes.contains(&json!({ "const": code, "type": "string" })),
