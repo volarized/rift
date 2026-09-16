@@ -1,0 +1,181 @@
+name: release-gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Candidate tag; empty uses the workspace version
+        type: string
+        default: ""
+      draft:
+        description: Download a GitHub draft instead of building the candidate
+        type: boolean
+        default: false
+      from-tag:
+        description: Previous release; empty selects the greatest stable version below the candidate
+        type: string
+        default: ""
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        default: ""
+      draft:
+        type: boolean
+        default: false
+      from-tag:
+        type: string
+        default: ""
+
+# Inherit the caller's token permissions: draft visibility requires push access.
+# The release caller supplies contents: write; the full caller supplies contents: read.
+
+jobs:
+  build:
+    if: ${{ !inputs.draft }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: target/x86_64-unknown-linux-gnu/release/rift
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: target/aarch64-unknown-linux-gnu/release/rift
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: target/x86_64-apple-darwin/release/rift
+          - os: macos-15
+            target: aarch64-apple-darwin
+            binary: target/aarch64-apple-darwin/release/rift
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: target/x86_64-pc-windows-msvc/release/rift.exe
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            binary: target/aarch64-pc-windows-msvc/release/rift.exe
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          shared-key: release-${{ matrix.target }}
+      - name: Build candidate binary
+        timeout-minutes: 30
+        run: |
+          rustup target add "${{ matrix.target }}"
+          cargo build --release --locked --target "${{ matrix.target }}" --package rift
+      - uses: actions/upload-artifact@v6.0.0
+        with:
+          name: candidate-${{ matrix.target }}
+          path: ${{ matrix.binary }}
+          if-no-files-found: error
+          retention-days: 7
+
+  native-tests:
+    needs: build
+    if: ${{ !inputs.draft }}
+    uses: ./.github/workflows/native-tests.yml
+
+  release-gate:
+    needs: [build, native-tests]
+    # Explicit status check permits the intentional build skip for draft assets.
+    # Candidate gates require every native build and unit test job to succeed.
+    if: ${{ !cancelled() && ((inputs.draft && needs.build.result == 'skipped' && needs.native-tests.result == 'skipped') || (!inputs.draft && needs.build.result == 'success' && needs.native-tests.result == 'success')) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: target/x86_64-unknown-linux-gnu/release/rift
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: target/aarch64-unknown-linux-gnu/release/rift
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: target/x86_64-apple-darwin/release/rift
+          - os: macos-15
+            target: aarch64-apple-darwin
+            binary: target/aarch64-apple-darwin/release/rift
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: target/x86_64-pc-windows-msvc/release/rift.exe
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            binary: target/aarch64-pc-windows-msvc/release/rift.exe
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      # cryptography has no Windows ARM wheel. Only the Python harness runs under
+      # x64 emulation; the installer and updater execute the verified ARM64 binary.
+      UV_PYTHON: ${{ matrix.os == 'windows-11-arm' && 'cpython-3.12-windows-x86_64-none' || '3.12' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v7.0.0
+        if: ${{ !inputs.draft }}
+        with:
+          name: candidate-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release
+      - name: Restore candidate execution permission
+        if: ${{ !inputs.draft && runner.os != 'Windows' }}
+        run: chmod +x "${{ matrix.binary }}"
+      - uses: astral-sh/setup-uv@v7.6.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: scripts/uv.lock
+      - name: Install gate dependencies
+        run: uv sync --locked --project scripts
+      - name: Verify command ownership
+        timeout-minutes: 1
+        run: uv run --locked --project scripts python scripts/test_release_process.py
+      - name: Install Linux shell
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          if ! command -v zsh; then
+            sudo apt-get update
+            sudo apt-get install -y zsh
+          fi
+      - name: Install and upgrade verified release bytes
+        timeout-minutes: 8
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RIFT_GATE_TAG: ${{ inputs.tag }}
+          RIFT_GATE_PREVIOUS: ${{ inputs.from-tag }}
+          RIFT_GATE_DRAFT: ${{ inputs.draft }}
+        run: |
+          args=(--target "${{ matrix.target }}")
+          if [[ -n "$RIFT_GATE_TAG" ]]; then args+=(--tag "$RIFT_GATE_TAG"); fi
+          if [[ -n "$RIFT_GATE_PREVIOUS" ]]; then args+=(--from-tag "$RIFT_GATE_PREVIOUS"); fi
+          if [[ "$RIFT_GATE_DRAFT" != true ]]; then args+=(--candidate-binary "${{ matrix.binary }}"); fi
+          if [[ "$RUNNER_OS" == Linux ]]; then args+=(--coldstart); fi
+          if [[ "${{ matrix.os }}" == ubuntu-24.04 ]]; then args+=(--agent); fi
+          uv run --locked --project scripts python scripts/check_release_gate.py "${args[@]}"
+      - uses: actions/upload-artifact@v6.0.0
+        if: always()
+        with:
+          name: release-gate-${{ matrix.target }}
+          path: target/release-gate/
+          if-no-files-found: error
+          retention-days: 7
+      - uses: codecov/codecov-action@v5.5.5
+        if: always()
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          disable_search: true
+          fail_ci_if_error: true
+          report_type: test_results
+          files: target/release-gate/junit.xml
+          flags: gate

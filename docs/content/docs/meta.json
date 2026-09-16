@@ -1,3 +1,11 @@
 {
-  "pages": ["index", "architecture", "implementation", "configuration", "claude-code", "protocol"]
+  "pages": [
+    "index",
+    "architecture",
+    "implementation",
+    "configuration",
+    "testing",
+    "claude-code",
+    "protocol"
+  ]
 }

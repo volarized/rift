@@ -145,6 +145,13 @@ it answers from the published index and carries `stale_index`, whose `detail` na
 the failed rebuild answered for, the counter the tree is at, and the failure's causes. A change
 meeting the same failure refuses, and the next observation retries the rebuild.
 
+<VersionBadge version="v0.0.34" />
+
+With debug capture enabled, `index.build` records its start and epoch before reading a candidate
+tree. A `get_symbol` history read records its start and retains a span until the history request
+ends. The corpus shutdown tests use these records to observe work in progress before issuing
+`rift server stop`; starting a client request alone does not prove that work has started.
+
 ## Rift FS
 
 <VersionBadge version="planned" />
