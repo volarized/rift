@@ -30,7 +30,6 @@ candle-transformers = { version = "0.11.0", default-features = false }
 clap = { version = "4.6.5", features = ["derive"] }
 data-encoding = "2.6.0"
 getrandom = { version = "0.4.3", features = ["std"] }
-diffy = "0.5.1"
 flate2 = "1.1.9"
 fs4 = "1.1.0"
 gix = { version = "0.86.0", default-features = false, features = ["revision", "sha1"] }

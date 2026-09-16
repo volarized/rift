@@ -34,11 +34,8 @@ async fn resource_body(
 }
 
 #[tokio::test]
-async fn the_workspace_resource_answers_effective_languages_hooks_and_source() -> TestResult {
-    let configuration = "[languages.rust.lsp]\ncommand = \"rust-analyzer\"\n\
-         [[hooks]]\nid = \"check\"\nkind = \"build\"\ncommand = [\"true\"]\n\
-         determinism = \"deterministic\"\ninclude = [\"**/*.rs\"]\n"
-        .to_owned();
+async fn the_workspace_resource_answers_effective_languages_and_source() -> TestResult {
+    let configuration = "[languages.rust.lsp]\ncommand = \"rust-analyzer\"\n".to_owned();
     let (_directory, client, server_task) = served_workspace(
         &[
             ("lib.rs", "pub fn beacon() {}\n"),
@@ -65,11 +62,6 @@ async fn the_workspace_resource_answers_effective_languages_hooks_and_source() -
     assert_eq!(rust["syntax"], Value::from(true), "{rust}");
     assert_eq!(rust["lsp"]["process"], Value::from("rust"), "{rust}");
     assert_eq!(rust["lsp"]["state"], Value::from("stopped"), "{rust}");
-
-    let hooks = body["hooks"].as_array().ok_or("hooks are an array")?;
-    assert_eq!(hooks.len(), 1, "{body:#}");
-    assert_eq!(hooks[0]["id"], Value::from("check"));
-    assert_eq!(hooks[0]["include"], serde_json::json!(["**/*.rs"]));
 
     let source = body["source"].as_array().ok_or("source is an array")?;
     let paths: Vec<&str> = source

@@ -69,6 +69,8 @@ pub struct SyntaxSymbol {
     /// The item node's own byte range, excluding any attached outer
     /// attributes and doc comments. Equal to `range` when nothing attaches.
     pub item_range: ByteRange,
+    /// The grammar field naming this declaration, when the provider exposes one.
+    pub name_range: Option<ByteRange>,
     /// The implementation part: the grammar's body or value field; `None`
     /// for a declaration without one.
     pub body_range: Option<ByteRange>,
@@ -311,6 +313,7 @@ mod tests {
             visibility: None,
             range,
             item_range: range,
+            name_range: None,
             body_range: None,
             signatures: Vec::new(),
             documentation: Vec::new(),

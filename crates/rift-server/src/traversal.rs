@@ -2,7 +2,7 @@
 //! across `RelationshipStore`'s edges, merged into `search`'s hit set. Extracted from `search`
 //! so that module stays below its size bound.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
 use rift_core::{LoopBudget, SymbolId as CoreSymbolId};
@@ -17,7 +17,8 @@ use rift_protocol::read::{
 };
 use rift_syntax::SyntaxSymbol;
 
-use crate::change::parse_symbol_address;
+use crate::engine_read::EngineReferences;
+use crate::read::parse_symbol_address;
 use crate::read::{ReadError, ReadFault, ReadService};
 use crate::search::{HitPayloads, build_symbol_hit, find_symbol_hit_mut, includes, resolve_symbol};
 
@@ -51,7 +52,7 @@ pub(crate) fn validate_traversal(traversal: &SearchTraversal) -> Result<(), Read
 /// Most distinct symbols one traversal may visit beyond `seed`. `RelationshipStore`'s
 /// adjacency lists are themselves sorted, so a walk that breaches this bound stops
 /// discovering new symbols and truncates the same way on every call over the same graph.
-const TRAVERSAL_NODES_MAX: usize = 10_000;
+pub(crate) const TRAVERSAL_NODES_MAX: usize = 10_000;
 
 /// Fourth hit-collection lane: a bounded relationship walk from `traversal.seed`, merged into
 /// `results` alongside whatever the lexical and ranked lanes already placed there. Runs after
@@ -67,17 +68,20 @@ pub(crate) fn collect_traversal_hits(
     matcher: Option<&PathMatcher>,
     root: &Path,
     traversal: &SearchTraversal,
+    references: &EngineReferences,
     payloads: HitPayloads,
     results: &mut Vec<SearchHit>,
 ) -> Result<bool, ReadError> {
     let store = reads.relationships();
-    if store.is_empty() && !reads.index().binding_enabled() {
+    if store.is_empty() && !reads.index().binding_enabled() && !references.resolved(&traversal.seed)
+    {
         return Err(ReadFault::unsupported(
             "relationship traversal (providers.binding disabled)",
         ));
     }
     let seed = resolve_traversal_seed(reads, &traversal.seed)?;
-    let walk = walk_traversal(store, &seed, traversal);
+    let walk =
+        walk_traversal_with_references(store, &seed, traversal, TRAVERSAL_NODES_MAX, references);
     for (identity, path) in walk.discovered {
         if traversal
             .to
@@ -119,7 +123,7 @@ fn resolve_traversal_seed(reads: &ReadService, seed: &SymbolId) -> Result<CoreSy
 /// Resolves one graph-walked identity back to its declaration, the way a ranked lexical unit
 /// resolves: parse the wire address the identity spells, then scan the addressed file for the
 /// matching declaration.
-fn resolve_graph_symbol<'a>(
+pub(crate) fn resolve_graph_symbol<'a>(
     index: &'a WorkspaceIndex,
     identity: &CoreSymbolId,
 ) -> Option<(&'a IndexedFile, &'a SyntaxSymbol)> {
@@ -129,8 +133,8 @@ fn resolve_graph_symbol<'a>(
 
 /// One traversal walk's outcome: each discovered symbol with its shortest path, and whether
 /// the node bound stopped the walk before the reachable graph was exhausted.
-struct TraversalWalk {
-    discovered: Vec<(CoreSymbolId, Vec<GraphHop>)>,
+pub(crate) struct TraversalWalk {
+    pub(crate) discovered: Vec<(CoreSymbolId, Vec<GraphHop>)>,
     truncated: bool,
 }
 
@@ -150,23 +154,30 @@ pub(crate) fn traversal_truncation_warning() -> ReadWarning {
 /// Walks `store` breadth-first from `seed`, honoring `traversal`'s direction, facet filter,
 /// and depth bound. BFS visits each symbol at its shortest path first and never requeues a
 /// visited symbol, so every returned path is the shortest one `store` has to it. Bounded by
-/// [`TRAVERSAL_NODES_MAX`].
-fn walk_traversal(
-    store: &RelationshipStore,
-    seed: &CoreSymbolId,
-    traversal: &SearchTraversal,
-) -> TraversalWalk {
-    walk_traversal_capped(store, seed, traversal, TRAVERSAL_NODES_MAX)
-}
-
-/// [`walk_traversal`] under an explicit node cap, so a test can force truncation without a
-/// graph sized past [`TRAVERSAL_NODES_MAX`] - the same split [`RelationshipStore::build`] and
-/// its own `build_capped` use.
+/// `TRAVERSAL_NODES_MAX`.
+/// Traversal under an explicit node cap for deterministic truncation tests.
+#[cfg(test)]
 fn walk_traversal_capped(
     store: &RelationshipStore,
     seed: &CoreSymbolId,
     traversal: &SearchTraversal,
     nodes_max: usize,
+) -> TraversalWalk {
+    walk_traversal_with_references(
+        store,
+        seed,
+        traversal,
+        nodes_max,
+        &EngineReferences::default(),
+    )
+}
+
+pub(crate) fn walk_traversal_with_references(
+    store: &RelationshipStore,
+    seed: &CoreSymbolId,
+    traversal: &SearchTraversal,
+    nodes_max: usize,
+    references: &EngineReferences,
 ) -> TraversalWalk {
     let mut visited: BTreeSet<CoreSymbolId> = BTreeSet::from([seed.clone()]);
     let mut budget = LoopBudget::new(nodes_max);
@@ -178,13 +189,12 @@ fn walk_traversal_capped(
         if path.len() as u64 >= traversal.depth {
             continue;
         }
-        for (edge, hop_direction) in traversal_edges(store, &current, traversal.direction) {
-            if !traversal.facets.is_empty() && !traversal.facets.contains(&edge.facet()) {
+        for edge in combined_edges(store, &current, traversal.direction, references) {
+            if !edge.eligible(&traversal.facets) {
                 continue;
             }
-            let next = match hop_direction {
-                HopDirection::Outgoing => edge.to().clone(),
-                HopDirection::Incoming => edge.from().clone(),
+            let Some(next) = edge.next() else {
+                continue;
             };
             if visited.contains(&next) {
                 continue;
@@ -195,7 +205,7 @@ fn walk_traversal_capped(
             }
             visited.insert(next.clone());
             let mut next_path = path.clone();
-            next_path.push(graph_hop(edge, hop_direction));
+            next_path.push(edge.hop());
             queue.push_back((next.clone(), next_path.clone()));
             discovered.push((next, next_path));
         }
@@ -204,6 +214,83 @@ fn walk_traversal_capped(
         discovered,
         truncated,
     }
+}
+
+enum TraversalEdge<'edge> {
+    Indexed(&'edge RelationshipEdge, HopDirection),
+    Confirmed(&'edge RelationshipEdge, &'edge GraphHop),
+    Resolved(&'edge GraphHop),
+}
+
+impl TraversalEdge<'_> {
+    fn eligible(&self, facets: &[rift_protocol::read::RelationshipFacet]) -> bool {
+        if facets.is_empty() {
+            return true;
+        }
+        match self {
+            Self::Indexed(edge, _) | Self::Confirmed(edge, _) => facets.contains(&edge.facet()),
+            Self::Resolved(hop) => hop
+                .relationship
+                .facets
+                .iter()
+                .any(|facet| facets.contains(facet)),
+        }
+    }
+
+    fn next(&self) -> Option<CoreSymbolId> {
+        match self {
+            Self::Indexed(edge, HopDirection::Outgoing) => Some(edge.to().clone()),
+            Self::Indexed(edge, HopDirection::Incoming) | Self::Confirmed(edge, _) => {
+                Some(edge.from().clone())
+            }
+            Self::Resolved(hop) => CoreSymbolId::new(hop.relationship.from.0.clone()).ok(),
+        }
+    }
+
+    fn hop(&self) -> GraphHop {
+        match self {
+            Self::Indexed(edge, direction) => graph_hop(edge, *direction),
+            Self::Confirmed(edge, resolved) => {
+                let mut hop = graph_hop(edge, HopDirection::Incoming);
+                hop.relationship.derivation = resolved.relationship.derivation;
+                hop
+            }
+            Self::Resolved(hop) => (*hop).clone(),
+        }
+    }
+}
+
+/// Borrows graph edges until the walk selects a new symbol, preserving indexed evidence.
+fn combined_edges<'edge>(
+    store: &'edge RelationshipStore,
+    current: &CoreSymbolId,
+    direction: TraversalDirection,
+    references: &'edge EngineReferences,
+) -> Vec<TraversalEdge<'edge>> {
+    let incoming = matches!(
+        direction,
+        TraversalDirection::Incoming | TraversalDirection::Both
+    );
+    let mut resolved: BTreeMap<_, _> = references
+        .incoming(current)
+        .iter()
+        .filter(|_| incoming)
+        .map(|hop| (hop.relationship.from.0.as_str(), hop))
+        .collect();
+    let mut edges = Vec::new();
+    for (edge, direction) in traversal_edges(store, current, direction) {
+        let confirms = direction == HopDirection::Incoming
+            && edge.facet() == rift_protocol::read::RelationshipFacet::References;
+        let confirmed = confirms
+            .then(|| resolved.remove(edge.from().as_str()))
+            .flatten();
+        edges.push(match confirmed {
+            Some(hop) => TraversalEdge::Confirmed(edge, hop),
+            None => TraversalEdge::Indexed(edge, direction),
+        });
+    }
+    edges.extend(resolved.into_values().map(TraversalEdge::Resolved));
+    edges
 }
 
 /// The edges a search traversal walks from `current`, tagged with the [`HopDirection`] each
@@ -423,7 +510,7 @@ mod tests {
     }
 
     /// One reference-only contribution: `occurrence` sits inside its enclosing definition's
-    /// range, so [`super::walk_traversal`]'s store carries the edge it produces.
+    /// range, so `walk_traversal_with_references`'s store carries the edge it produces.
     fn graph_reference(
         key_symbol: &str,
         occurrence: rift_core::DeclarationBinding,
@@ -995,5 +1082,47 @@ mod tests {
         let error = crate::search::validate_search(&over_facets)
             .expect_err("more facets than RelationshipFacet has variants must be refused");
         assert_eq!(error.descriptor().code(), "invalid_request");
+    }
+    #[test]
+    fn confirmed_reference_preserves_indexed_evidence_and_one_hit() {
+        let caller = graph_symbol_id("rift://symbol/rust/lib.rs/caller");
+        let target = graph_symbol_id("rift://symbol/rust/lib.rs/target");
+        let store = RelationshipStore::build(&graph_normalized(vec![
+            graph_definition("caller", caller.as_str(), (0, 40)),
+            graph_definition("target", target.as_str(), (40, 80)),
+            graph_reference(
+                "caller_reference",
+                graph_binding("lib.rs", 5, 10),
+                rift_core::ReferenceRole::Unknown,
+                "target",
+            ),
+        ]));
+        let edge = &store.incoming(&target)[0];
+        let prior = super::graph_hop(edge, rift_protocol::read::HopDirection::Incoming);
+        let mut confirmed = prior.clone();
+        confirmed.relationship.evidence.clear();
+        let references = crate::EngineReferences::from_incoming(std::collections::BTreeMap::from(
+            [(target.clone(), vec![confirmed])],
+        ));
+        let request = traversal_request(
+            &target,
+            TraversalDirection::Incoming,
+            1,
+            vec![RelationshipFacet::References],
+        );
+        let walk = super::walk_traversal_with_references(
+            &store,
+            &target,
+            &request,
+            TRAVERSAL_NODES_MAX,
+            &references,
+        );
+        assert_eq!(walk.discovered.len(), 1);
+        assert_eq!(walk.discovered[0].0, caller);
+        assert_eq!(walk.discovered[0].1[0], prior);
+        assert_eq!(
+            walk.discovered[0].1[0].relationship.derivation,
+            rift_protocol::read::RelationshipDerivation::Resolution
+        );
     }
 }

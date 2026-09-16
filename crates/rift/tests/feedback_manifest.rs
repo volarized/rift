@@ -1,4 +1,4 @@
-//! Checks every v0.0.23 feedback report has a v0.0.24 disposition.
+//! Checks retained v0.0.23 read and runtime feedback reports have dispositions.
 
 use std::collections::BTreeSet;
 
@@ -19,7 +19,7 @@ struct FeedbackReport {
 }
 
 #[test]
-fn feedback_manifest_maps_all_v0_0_23_reports() {
+fn feedback_manifest_maps_retained_v0_0_23_reports() {
     let manifest: FeedbackManifest =
         serde_json::from_str(include_str!("v0_0_23_feedback_manifest.json"))
             .expect("feedback manifest must be valid JSON");
@@ -28,9 +28,7 @@ fn feedback_manifest_maps_all_v0_0_23_reports() {
         [
             "request_frame",
             "pre_tree",
-            "post_tree",
             "result",
-            "hook_runs",
             "tree_revision",
             "engine_trace",
             "package_version",
@@ -38,7 +36,7 @@ fn feedback_manifest_maps_all_v0_0_23_reports() {
             "schema_digest",
         ]
     );
-    assert_eq!(manifest.reports.len(), 52);
+    assert_eq!(manifest.reports.len(), 29);
 
     let mut headings = BTreeSet::new();
     for report in manifest.reports {

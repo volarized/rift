@@ -22,7 +22,8 @@ use rift_protocol::read::{
 use rift_search::{Declaration, DescribedUnit, RankedUnit};
 use rift_syntax::{ByteRange, SyntaxSymbol};
 
-use crate::change::parse_symbol_address;
+use crate::engine_read::EngineReferences;
+use crate::read::parse_symbol_address;
 use crate::read::{
     ReadError, ReadFault, ReadService, accepted_limit, dependency_symbol, dependency_warnings,
     excerpt, page, project_path, results_truncation_warning, source_warnings, text_range,
@@ -49,6 +50,21 @@ impl ReadService {
         params: &SearchParams,
         ranked: &[RankedUnit],
     ) -> Result<SearchResult, ReadError> {
+        self.search_with_references(params, ranked, &EngineReferences::default())
+    }
+
+    /// Searches one publication with references resolved by its configured engines.
+    ///
+    /// # Errors
+    ///
+    /// Returns the search refusal, or rejects references from a different source revision.
+    pub fn search_with_references(
+        &self,
+        params: &SearchParams,
+        ranked: &[RankedUnit],
+        references: &EngineReferences,
+    ) -> Result<SearchResult, ReadError> {
+        references.validate_revision(self)?;
         validate_search(params)?;
         self.validate_dependency_scope(params.scope, params.rev.as_ref())?;
         if self.revision().is_some() && force_include_requested(params) {
@@ -95,6 +111,7 @@ impl ReadService {
                 selected.matcher.as_ref(),
                 self.index().root(),
                 traversal,
+                references,
                 payloads,
                 &mut results,
             )?;
@@ -118,6 +135,23 @@ impl ReadService {
                 results_max_reached,
             ),
         })
+    }
+
+    pub(crate) fn validate_engine_search(&self, params: &SearchParams) -> Result<(), ReadError> {
+        validate_search(params)?;
+        self.validate_dependency_scope(params.scope, params.rev.as_ref())?;
+        accepted_query(params)?;
+        accepted_limit(params.limit.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))?;
+        path_matcher(self.index().root(), params.paths.as_ref())?;
+        if let Some(selector) = params.paths.as_ref() {
+            PathMatcher::build(
+                self.index().root(),
+                &pattern_strings(&selector.force_include),
+                &[],
+            )
+            .map_err(ReadFault::index)?;
+        }
+        Ok(())
     }
 
     /// The warnings one search answer carries: those the collection gathered - the

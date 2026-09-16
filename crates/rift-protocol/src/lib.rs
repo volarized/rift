@@ -6,7 +6,6 @@
 //! into the docs, so the served surface and the documented surface cannot
 //! drift apart.
 
-pub mod change;
 pub mod configuration;
 pub mod dependencies;
 pub mod diagnostic;

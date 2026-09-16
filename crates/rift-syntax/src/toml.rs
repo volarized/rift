@@ -3,7 +3,7 @@
 //! A `pair` - one `key = value` line - declares one `member` symbol. A
 //! `table` (`[server]`) or `table_array_element` (`[[hooks]]`) declares one
 //! `table` symbol from its header key, so both are addressable and
-//! `replace_symbol` can rewrite a whole table. A pair nested inside a table,
+//! reads can return a whole table. A pair nested inside a table,
 //! an inline table, or an array of inline tables still declares, qualified
 //! through whichever pair or table holds it - the same rule an array of
 //! objects follows in JSON.

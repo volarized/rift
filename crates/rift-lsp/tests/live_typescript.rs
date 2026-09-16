@@ -5,12 +5,7 @@
 //! started from its fixture-local executable after a frozen install, so
 //! package resolution cannot read a shared runner cache. Spawn policy,
 //! framing, and encoding negotiation are checked against another engine
-//! typescript-language-server answer first, then pinned.
-//!
-//! rewrites, and the engine's silence on an applied change - lives in
-//! rift-mcp's `live_typescript` suite. This suite keeps the session
-//! contract pinned: the capability grid those tools stand on, and a clean
-//! shutdown.
+//! with cross-file references and a clean shutdown.
 
 #![cfg(unix)]
 
@@ -21,15 +16,14 @@ mod typescript_engine;
 use std::time::{Duration, Instant};
 
 use live_engine_gate::engine_live;
-use lsp_types::FileOperationPatternKind;
+use rift_core::ProjectPath;
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::session::{EngineLaunch, EngineSession};
 use typescript_engine::{install_typescript_engine, typescript_package_files};
 
 /// The live launch, built from the shared fixture's typescript-language-server
 /// data - `tsserver.useSyntaxServer = "never"` keeps the engine to one
-/// semantic server, the launch rift-mcp's tool suite pins its answers
-/// against.
+/// semantic server for cross-file references.
 fn launch() -> EngineLaunch {
     typescript_engine::fixture().launch()
 }
@@ -39,6 +33,17 @@ fn bun_project() -> tempfile::TempDir {
     let workspace = tempfile::tempdir().expect("tempdir");
     for (name, source) in typescript_package_files() {
         std::fs::write(workspace.path().join(name), source).expect("fixture writes");
+    }
+    for (name, source) in [
+        (
+            "tsconfig.json",
+            include_str!("fixtures/typescript/tsconfig.json"),
+        ),
+        ("hub.ts", include_str!("fixtures/typescript/hub.ts")),
+        ("caller.ts", include_str!("fixtures/typescript/caller.ts")),
+        ("view.tsx", include_str!("fixtures/typescript/view.tsx")),
+    ] {
+        std::fs::write(workspace.path().join(name), source).expect("source fixture writes");
     }
     install_typescript_engine(workspace.path());
     workspace
@@ -62,7 +67,7 @@ async fn typescript_language_server_falls_back_to_utf16_and_advertises_the_pinne
     }
     let workspace = bun_project();
     let started_at = Instant::now();
-    let session = EngineSession::start(launch(), workspace.path())
+    let mut session = EngineSession::start(launch(), workspace.path())
         .await
         .expect("typescript-language-server starts and negotiates");
     eprintln!("initialize answered in {:?}", started_at.elapsed());
@@ -74,47 +79,33 @@ async fn typescript_language_server_falls_back_to_utf16_and_advertises_the_pinne
          so the protocol default stands"
     );
     assert!(
-        record.rename && record.prepare_rename,
-        "the rename tool stands on the prepared rename: {record:#?}"
-    );
-    assert!(
         !record.pull_diagnostics,
         "this engine publishes diagnostics instead of serving pulls: {record:#?}"
     );
     assert_eq!(record.diagnostic_identifier, None);
-    assert!(
-        record.will_rename_files(),
-        "the move tool stands on workspace/willRenameFiles: {record:#?}"
-    );
-    let filters: Vec<(&str, &str, Option<&FileOperationPatternKind>)> = record
-        .will_rename_filters
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .map(|filter| {
-            (
-                filter.scheme.as_deref().unwrap_or_default(),
-                filter.pattern.glob.as_str(),
-                filter.pattern.matches.as_ref(),
-            )
-        })
-        .collect();
-    assert_eq!(
-        filters,
-        [
-            (
-                "file",
-                "**/*.{ts,js,jsx,tsx,mjs,mts,cjs,cts}",
-                Some(&FileOperationPatternKind::File)
-            ),
-            ("file", "**", Some(&FileOperationPatternKind::Folder)),
-        ],
-        "one alternation covers every ECMAScript extension the engine serves: {record:#?}"
-    );
-    assert!(
-        record.will_rename_matches("hub.ts") && record.will_rename_matches("view.tsx"),
-        "the advertised filters cover both dialects at the tree root: {record:#?}"
-    );
+    assert!(record.references, "the engine advertises references");
+    let document = ProjectPath::new("hub.ts").expect("fixture path");
+    session
+        .open(
+            &document,
+            "typescript",
+            include_str!("fixtures/typescript/hub.ts").to_owned(),
+        )
+        .await
+        .expect("didOpen is sent");
+    let locations = session
+        .references(&document, lsp_types::Position::new(0, 16))
+        .await
+        .expect("the function references resolve");
+    for (path, line, character) in [("hub.ts", 0, 16), ("caller.ts", 4, 9), ("view.tsx", 3, 16)] {
+        assert!(
+            locations
+                .iter()
+                .any(|location| location.uri.path().as_str().ends_with(path)
+                    && location.range.start == lsp_types::Position::new(line, character)),
+            "the reference in {path} must resolve: {locations:?}"
+        );
+    }
     let stopped_at = Instant::now();
     let stderr = session.shutdown().await;
     let elapsed = stopped_at.elapsed();

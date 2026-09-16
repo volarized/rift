@@ -20,8 +20,7 @@ use rift_core::{CapturedStream, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX};
 use tracing_subscriber::fmt::MakeWriter;
 
 /// Bytes of a detached server's startup stderr kept verbatim; the rest is
-/// only counted, the same split [`CapturedStream`] reports for a hook's
-/// captured streams.
+/// only counted, the same split [`CapturedStream`] reports for captured streams.
 const STARTUP_STDERR_CAPTURE_BYTES: usize = 8 << 10;
 
 /// The file under `.rift`, beside `server.json`, that holds the standard
@@ -282,14 +281,13 @@ pub(crate) fn spawn_detached_server_with_captured_stderr(
 /// A spawned server's captured standard error, read on a background
 /// thread for as long as the pipe stays open.
 ///
-/// Unlike a hook capture, the read loop never stops at the drain ceiling:
+/// The read loop never stops at the drain ceiling:
 /// this process holds the pipe's only reader, and a spawned server that
 /// starts successfully keeps running for the rest of the workspace's
 /// life, writing to this same pipe. Stopping the read would eventually
 /// fill the pipe and block the server's own writes; instead, bytes past
 /// [`STARTUP_STDERR_CAPTURE_BYTES`] are read and discarded, and the
-/// reported total caps at [`STREAM_TOTAL_BYTES_MAX`] the same way a hook
-/// capture's does. The loop ends only at end-of-file, which in practice
+/// reported total caps at [`STREAM_TOTAL_BYTES_MAX`] as other captured streams do. The loop ends only at end-of-file, which in practice
 /// means the child closed stderr because it exited.
 ///
 /// A caller whose poll finds the server serving drops this value without
@@ -335,7 +333,7 @@ impl StartupCapture {
 
 /// Reads `stream` to end-of-file, keeping the first `capture_bytes` and
 /// counting the rest up to [`STREAM_TOTAL_BYTES_MAX`]. The loop never
-/// stops early at that ceiling the way a hook capture's does: see
+/// stops early at that ceiling: see
 /// [`StartupCapture`]'s doc comment for why it must keep reading.
 fn drain_until_closed(mut stream: impl Read, capture_bytes: usize) -> CapturedStream {
     let mut kept: Vec<u8> = Vec::with_capacity(capture_bytes.min(STREAM_READ_BYTES));

@@ -2,8 +2,7 @@
 //!
 //! [`run_bounded`] starts the caller's command with its standard input closed
 //! and both output streams piped, drains each stream on its own thread keeping
-//! a caller-sized prefix, and kills the child at `timeout`. The hook runner and
-//! the dependency inspector both run their children through it.
+//! a caller-sized prefix, and kills the child at `timeout`. The dependency inspector runs its children through it.
 
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};

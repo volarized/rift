@@ -7,10 +7,8 @@
 //! engine beside the scripted one. Every asserted shape was observed on a
 //! live rust-analyzer answer first, then pinned.
 //!
-//! The tool-level proof - rename, move, and diagnostics through the real
-//! server - lives in rift-mcp's `live_rust_analyzer` suite. This suite
-//! keeps the session contract pinned: the capability grid those tools
-//! stand on, and a clean shutdown.
+//! The suite checks capabilities, project-load progress, cross-file references,
+//! and clean shutdown.
 
 #![cfg(unix)]
 
@@ -21,7 +19,6 @@ mod rust_engine;
 use std::time::{Duration, Instant};
 
 use live_engine_gate::engine_live;
-use lsp_types::FileOperationPatternKind;
 use rift_core::ProjectPath;
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::session::{EngineLaunch, EngineSession};
@@ -72,45 +69,12 @@ async fn rust_analyzer_negotiates_utf8_and_advertises_the_pinned_capability_grid
         "rust-analyzer accepts the preferred utf-8 offer"
     );
     assert!(
-        record.rename && record.prepare_rename,
-        "the rename tool stands on the prepared rename: {record:#?}"
-    );
-    assert!(
         record.pull_diagnostics,
         "the diagnostics walk stands on the pull: {record:#?}"
     );
     assert_eq!(
         record.diagnostic_identifier.as_deref(),
         Some("rust-analyzer")
-    );
-    assert!(
-        record.will_rename_files(),
-        "the move tool stands on workspace/willRenameFiles: {record:#?}"
-    );
-    let filters: Vec<(&str, &str, Option<&FileOperationPatternKind>)> = record
-        .will_rename_filters
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .map(|filter| {
-            (
-                filter.scheme.as_deref().unwrap_or_default(),
-                filter.pattern.glob.as_str(),
-                filter.pattern.matches.as_ref(),
-            )
-        })
-        .collect();
-    assert_eq!(
-        filters,
-        [
-            ("file", "**/*.rs", Some(&FileOperationPatternKind::File)),
-            ("file", "**", Some(&FileOperationPatternKind::Folder)),
-        ],
-        "rust-analyzer filters file renames to rust sources: {record:#?}"
-    );
-    assert!(
-        record.will_rename_matches("hub.rs"),
-        "the advertised filters cover a module file at the tree root: {record:#?}"
     );
     let stopped_at = Instant::now();
     let stderr = session.shutdown().await;
@@ -178,6 +142,24 @@ async fn work_done_progress_marks_the_project_load() {
     );
     let settled = settled.expect("the announced load must end inside the probe bound");
     eprintln!("rust-analyzer ended its load progress after {settled:?}");
+    let declaration = ProjectPath::new("hub.rs").expect("fixture declaration path");
+    session
+        .open(&declaration, "rust", HUB.to_owned())
+        .await
+        .expect("declaration opens");
+    let locations = session
+        .references(&declaration, lsp_types::Position::new(0, 7))
+        .await
+        .expect("the loaded function references resolve");
+    for (path, line, character) in [("hub.rs", 0, 7), ("caller.rs", 3, 4)] {
+        assert!(
+            locations
+                .iter()
+                .any(|location| location.uri.path().as_str().ends_with(path)
+                    && location.range.start == lsp_types::Position::new(line, character)),
+            "the reference in {path} must resolve: {locations:?}"
+        );
+    }
     session.shutdown().await;
 }
 

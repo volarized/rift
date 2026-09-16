@@ -439,6 +439,12 @@ impl SyntaxProvider for RustSyntaxProvider {
 struct RustGrammarRules;
 
 impl GrammarRules for RustGrammarRules {
+    fn name_range(&self, node: Node<'_>) -> Result<Option<crate::ByteRange>, SyntaxError> {
+        node.child_by_field_name(RustGrammarField::Name.as_str())
+            .map(extract::byte_range)
+            .transpose()
+    }
+
     fn declaration(&self, node: Node<'_>, text: &str) -> Result<Option<Declaration>, SyntaxError> {
         let Some(kind) =
             RustGrammarNodeKind::from_kind(node.kind()).and_then(RustGrammarNodeKind::symbol_kind)
@@ -483,7 +489,7 @@ impl GrammarRules for RustGrammarRules {
 
     /// A declaration's start, extended over its attached outer attributes
     /// and outer doc comments so the whole declaration - not just the item
-    /// node - is what `replace_symbol` and `insert_symbol` act on.
+    /// node - is what the symbol read returns.
     fn declaration_start(&self, node: Node<'_>, text: &str) -> usize {
         attachment::declaration_start(node, text)
     }

@@ -46,6 +46,7 @@ pub enum ReadFault {
     History(HistoryError),
     /// A language engine failed while serving the request.
     Engine(rift_lsp::session::EngineError),
+
     /// A cataloged package's index could not assemble the declaration a lookup matched.
     Dependency(Box<PackageIndexError>),
     /// A thread panicked while holding one of the service's locks, so what the lock
@@ -122,6 +123,7 @@ impl Fault for ReadFault {
             Self::Index(source) => source.descriptor().name(),
             Self::History(source) => source.descriptor().name(),
             Self::Engine(source) => source.name(),
+
             Self::Dependency(source) => source.name(),
             Self::Unsupported { .. } | Self::UnclaimedExtension { .. } => {
                 ErrorName::Wire(ErrorCode::CapabilityUnavailable)
@@ -144,6 +146,7 @@ impl Fault for ReadFault {
             Self::Index(source) => source.context(),
             Self::History(source) => source.context(),
             Self::Engine(source) => source.context(),
+
             Self::Dependency(source) => source.context(),
             Self::LockPoisoned { lock } => vec![
                 ErrorContext::new("lock", *lock),
@@ -190,6 +193,7 @@ impl Fault for ReadFault {
             Self::Index(source) => source.fault().limit_evidence(),
             Self::History(source) => source.fault().limit_evidence(),
             Self::Engine(source) => source.fault().limit_evidence(),
+
             Self::Dependency(source) => source.fault().limit_evidence(),
             Self::Unsupported { .. }
             | Self::UnclaimedExtension { .. }
@@ -209,6 +213,7 @@ impl Fault for ReadFault {
             Self::Index(source) => Some(source),
             Self::History(source) => Some(source),
             Self::Engine(source) => Some(source),
+
             Self::Dependency(source) => Some(source.as_ref()),
             Self::Unsupported { .. }
             | Self::UnclaimedExtension { .. }
@@ -284,14 +289,12 @@ impl ReadFault {
         Error::new(Self::Index(source))
     }
 
-    pub(crate) fn history(source: HistoryError) -> ReadError {
-        Error::new(Self::History(source))
-    }
-
-    /// Classifies a language engine failure, keeping the engine fault's own
-    /// wire classification.
     pub(crate) fn engine(source: rift_lsp::session::EngineError) -> ReadError {
         Error::new(Self::Engine(source))
+    }
+
+    pub(crate) fn history(source: HistoryError) -> ReadError {
+        Error::new(Self::History(source))
     }
 
     /// Classifies a package index failure, keeping the fault's own wire classification.
@@ -548,21 +551,6 @@ impl ReadService {
         self.source_policy
             .as_deref()
             .ok_or_else(|| ReadFault::task(operation, "a revision snapshot has no filesystem tree"))
-    }
-
-    /// Captures live visible regular-file paths for a workspace change hook.
-    ///
-    /// Bytes stay absent when configured file or workspace bounds stop content capture.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReadError`] when this is a revision snapshot or discovery fails.
-    pub fn capture_visible_workspace_entries(
-        &self,
-    ) -> Result<Vec<rift_index::VisibleWorkspaceEntry>, ReadError> {
-        self.filesystem_policy("capture visible workspace entries")?
-            .visible_entries()
-            .map_err(ReadFault::index)
     }
 
     /// Returns every visible regular file's content digest.
@@ -938,30 +926,6 @@ impl ReadService {
             ))),
             None => Some(UnservedSyntax::Unclaimed(extension_capability(path))),
         })
-    }
-
-    /// The exact language identity an engine is asked under for `path`: the
-    /// indexed file's own language, or the effective entry claiming the path when
-    /// no shipped provider parses it. An unshipped language reaches an engine this
-    /// way, because its entry selects a process without contributing syntax facts.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReadError`] when two language entries match `path`.
-    pub fn engine_language_segment(
-        &self,
-        path: &CoreProjectPath,
-    ) -> Result<Option<String>, ReadError> {
-        if let Some(file) = self.index.file(path) {
-            return Ok(Some(file.syntax().language().identity_segment()));
-        }
-        Ok(self
-            .index
-            .language_policy()
-            .language_for_path(Path::new(path.as_str()))
-            .map_err(ReadFault::index)?
-            .filter(|language| language.enabled())
-            .map(|language| language.identity().to_owned()))
     }
 
     /// Whether this snapshot can confirm `path` names a real visible file. On the
@@ -1771,72 +1735,6 @@ pub(crate) fn node_witness(source: &str, range: ByteRange) -> String {
     digest_hex8(bytes)
 }
 
-/// One witnessed node range, resolved and verified against an indexed file: whether the
-/// bytes it now hashes to still match the address's own witness.
-#[derive(Debug)]
-pub(crate) enum NodeRangeResolution {
-    /// The range lands on an indexed node and its bytes still hash to the given witness.
-    Verified,
-    /// The file's bytes no longer match the address: the range's bytes hash to a different
-    /// witness, or the file no longer holds the range at all.
-    WitnessChanged {
-        /// The witness recomputed from the file's current bytes, or, for a range the file
-        /// no longer holds, the file's current byte length: `outside the file's 120 bytes`.
-        observed: String,
-    },
-}
-
-/// Resolves one witnessed node range against `file`: every witnessed node read and write
-/// proves its range through this call, and nothing else compares or clamps a node witness.
-///
-/// A range is malformed on its own terms only when its start is beyond its end; that
-/// refuses. Every other mismatch between the address and the file is drift, because the
-/// address was minted from a file that held those bytes as a node: a range the file no
-/// longer holds - past its end, or off a UTF-8 character boundary - reports the file's
-/// current length as the observed value, and a range whose bytes hash to a different
-/// witness reports that witness, so the caller can build its own `source_unchanged`
-/// precondition either way. Nothing is clamped to whatever the file can still offer. A
-/// range whose bytes still hash to the witness must equal one of `file.syntax().nodes()`'s
-/// own ranges: no listing minted an address for any other range.
-///
-/// # Errors
-///
-/// Returns [`ReadError`] naming `start beyond end` for a malformed range, and `range names
-/// no syntax node` for an in-bounds range whose bytes match the witness while no indexed
-/// node has that range.
-pub(crate) fn resolve_node_range(
-    file: &IndexedFile,
-    range: ByteRange,
-    witness: &str,
-) -> Result<NodeRangeResolution, ReadError> {
-    if range.start > range.end {
-        return Err(ReadFault::invalid("span", "start beyond end"));
-    }
-    let source = file.source();
-    if !range_lands_in_source(source, range) {
-        return Ok(NodeRangeResolution::WitnessChanged {
-            observed: format!("outside the file's {} bytes", source.len()),
-        });
-    }
-    let observed = node_witness(source, range);
-    if observed != witness {
-        return Ok(NodeRangeResolution::WitnessChanged { observed });
-    }
-    if !file.syntax().nodes().iter().any(|node| node.range == range) {
-        return Err(ReadFault::invalid("span", "range names no syntax node"));
-    }
-    Ok(NodeRangeResolution::Verified)
-}
-
-/// Whether `source` holds `range`: both ends within its length and on a UTF-8 character
-/// boundary, so the range's bytes can be hashed.
-fn range_lands_in_source(source: &str, range: ByteRange) -> bool {
-    let (Ok(start), Ok(end)) = (usize::try_from(range.start), usize::try_from(range.end)) else {
-        return false;
-    };
-    end <= source.len() && source.is_char_boundary(start) && source.is_char_boundary(end)
-}
-
 /// First `DIGEST_WIRE_CHARS` lowercase hex characters of the SHA-256 of `source` - the sole
 /// wire constructor for a witness or a `Digest`. A 64-character digest reaching the wire is a
 /// defect this stays the single choke point against.
@@ -1876,6 +1774,58 @@ pub(crate) fn symbol_for_range(file: &IndexedFile, range: ByteRange) -> Option<&
         .find(|symbol| symbol.range == range || symbol.item_range == range)
 }
 
+/// A parsed symbol address: the language segment it files under, and its
+/// decoded path and qualified name.
+#[derive(Debug)]
+pub(crate) struct SymbolAddress {
+    pub(crate) language_segment: String,
+    pub(crate) path: CoreProjectPath,
+    pub(crate) qualified_name: String,
+}
+
+impl SymbolAddress {
+    /// The wire symbol identity this address spells, re-encoded.
+    pub(crate) fn wire_symbol(&self) -> rift_protocol::read::SymbolId {
+        rift_protocol::read::SymbolId(rift_core::symbol_identity(
+            &self.language_segment,
+            self.path.as_str(),
+            &self.qualified_name,
+        ))
+    }
+}
+
+/// Splits `rift://symbol/<language>/<path>/<qualified-name>` into its
+/// decoded parts. The language segment is taken as spelled; resolution
+/// verifies it against the addressed file's document.
+pub(crate) fn parse_symbol_address(address: &str) -> Result<SymbolAddress, ReadError> {
+    let malformed = || ReadFault::invalid("symbol", "not a rift symbol address");
+    let remainder = address
+        .strip_prefix("rift://symbol/")
+        .ok_or_else(malformed)?;
+    let (language_segment, remainder) = remainder.split_once('/').ok_or_else(malformed)?;
+    if language_segment.is_empty() {
+        return Err(malformed());
+    }
+    let (encoded_path, encoded_name) = remainder.rsplit_once('/').ok_or_else(malformed)?;
+    let path = decoded(encoded_path).ok_or_else(malformed)?;
+    let qualified_name = decoded(encoded_name).ok_or_else(malformed)?;
+    let path = CoreProjectPath::new(path).map_err(|error| {
+        ReadFault::invalid("symbol", rift_core::fault_label(&error.fault().violation()))
+    })?;
+    Ok(SymbolAddress {
+        language_segment: language_segment.to_owned(),
+        path,
+        qualified_name,
+    })
+}
+
+fn decoded(encoded: &str) -> Option<String> {
+    percent_encoding::percent_decode_str(encoded)
+        .decode_utf8()
+        .ok()
+        .map(std::borrow::Cow::into_owned)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::error::Error;
@@ -1894,7 +1844,7 @@ pub(crate) mod tests {
         ReadWarning, RevisionId, SOURCE_WARNINGS_MAX, SearchScope, SourceLocationKind,
         SourceUnitId,
     };
-    use rift_syntax::{ByteRange, ShippedLanguage};
+    use rift_syntax::ShippedLanguage;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -2328,137 +2278,6 @@ pub fn compute() -> i32 {
         assert!(
             unit.is_some(),
             "a dependency hit re-addresses through the source catalog"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_node_range_verifies_a_real_node_and_reports_a_changed_witness() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let path = rift_core::ProjectPath::new("src/lib.rs")?;
-        let file = service.index().file(&path).ok_or("fixture file indexed")?;
-        // A real address, read back through `nodes` the way a caller would, so its witness
-        // is the one production minting already computed rather than a second call here.
-        let listing = service.nodes(NodesParams {
-            path: ProjectPath("src/lib.rs".to_owned()),
-            position: 0,
-            rev: None,
-        })?;
-        let listed = &listing.nodes[0];
-        let witness = listed
-            .id
-            .0
-            .rsplit_once('#')
-            .map(|(_, witness)| witness.to_owned())
-            .ok_or("a listed node id must carry a witness")?;
-        let range = ByteRange {
-            start: listed.range.start,
-            end: listed.range.end,
-        };
-
-        let verified = super::resolve_node_range(file, range, &witness)?;
-        assert!(matches!(verified, super::NodeRangeResolution::Verified));
-
-        let changed = super::resolve_node_range(file, range, "00000000")?;
-        let super::NodeRangeResolution::WitnessChanged { observed } = changed else {
-            panic!("a wrong witness must report the change, not refuse the range");
-        };
-        assert_eq!(observed, witness);
-        Ok(())
-    }
-
-    /// A range past the file's end is what an address minted before the file shrank looks
-    /// like: drift, reported as a changed witness naming the file's current length rather
-    /// than a malformed request.
-    #[test]
-    fn resolve_node_range_reports_a_range_past_the_source_length_as_a_changed_witness() -> TestResult
-    {
-        let (_directory, service) = fixture()?;
-        let path = rift_core::ProjectPath::new("src/lib.rs")?;
-        let file = service.index().file(&path).ok_or("fixture file indexed")?;
-        let source_len = file.source().len();
-        let range = ByteRange {
-            start: 0,
-            end: source_len as u64 + 10,
-        };
-        let resolution = super::resolve_node_range(file, range, "00000000")?;
-        let super::NodeRangeResolution::WitnessChanged { observed } = resolution else {
-            panic!("a range past the source length must report drift, got {resolution:?}");
-        };
-        assert_eq!(observed, format!("outside the file's {source_len} bytes"));
-        Ok(())
-    }
-
-    /// A range that splits a multi-byte character cannot be hashed and names bytes the
-    /// file never held as a unit: it reports the same drift as a range past the end.
-    #[test]
-    fn resolve_node_range_reports_a_range_off_a_character_boundary_as_a_changed_witness()
-    -> TestResult {
-        let directory = TempDir::new()?;
-        fs::write(
-            directory.path().join("lib.rs"),
-            "pub fn beacon() { \"é\" }\n",
-        )?;
-        let service = ReadService::build(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::default(),
-            rift_protocol::configuration::HistoryConfiguration::default(),
-        )?;
-        let path = rift_core::ProjectPath::new("lib.rs")?;
-        let file = service.index().file(&path).ok_or("fixture file indexed")?;
-        let source = file.source();
-        let inside_character = source.find('é').ok_or("fixture holds é")? as u64 + 1;
-        let range = ByteRange {
-            start: 0,
-            end: inside_character,
-        };
-        let resolution = super::resolve_node_range(file, range, "00000000")?;
-        let super::NodeRangeResolution::WitnessChanged { observed } = resolution else {
-            panic!("a range off a character boundary must report drift, got {resolution:?}");
-        };
-        assert_eq!(
-            observed,
-            format!("outside the file's {} bytes", source.len())
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_node_range_refuses_a_range_whose_start_is_beyond_its_end() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let path = rift_core::ProjectPath::new("src/lib.rs")?;
-        let file = service.index().file(&path).ok_or("fixture file indexed")?;
-        let range = ByteRange { start: 5, end: 2 };
-        let error = super::resolve_node_range(file, range, "00000000")
-            .expect_err("a range whose start is beyond its end must refuse");
-        let ReadFault::Invalid { field, violation } = error.fault() else {
-            panic!("expected Invalid, got {:?}", error.fault());
-        };
-        assert_eq!(*field, "span");
-        assert!(violation.contains("start beyond end"), "{violation}");
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_node_range_refuses_an_in_bounds_range_naming_no_syntax_node() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let path = rift_core::ProjectPath::new("src/lib.rs")?;
-        let file = service.index().file(&path).ok_or("fixture file indexed")?;
-        // One byte into the file: inside the leading `pub` keyword, but not equal to any
-        // node's own range.
-        let range = ByteRange { start: 1, end: 2 };
-        let witness = super::digest_hex8(&file.source()[1..2]);
-        let error = super::resolve_node_range(file, range, &witness)
-            .expect_err("a range naming no syntax node must refuse");
-        let ReadFault::Invalid { field, violation } = error.fault() else {
-            panic!("expected Invalid, got {:?}", error.fault());
-        };
-        assert_eq!(*field, "span");
-        assert!(
-            violation.contains("names no syntax node"),
-            "the refusal must name the range, not a witness mismatch: {violation}"
         );
         Ok(())
     }
@@ -4456,21 +4275,10 @@ pub fn compute() -> i32 {
         let directory = committed_fixture()?;
         let service = revision_service(directory.path(), "main")?;
 
-        let entries = service
-            .capture_visible_workspace_entries()
-            .expect_err("a revision snapshot has no filesystem tree to walk");
         let digests = service
             .visible_workspace_digests()
             .expect_err("a revision snapshot has no filesystem tree to digest");
 
-        let entries_fault = entries.fault();
-        assert!(
-            matches!(
-                entries_fault,
-                ReadFault::Task { operation, .. } if *operation == "capture visible workspace entries"
-            ),
-            "unexpected fault {entries_fault:?}"
-        );
         let digests_fault = digests.fault();
         assert!(
             matches!(
