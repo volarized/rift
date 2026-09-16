@@ -1,3 +1,5 @@
+import type { ReactNode } from "react";
+
 import { DiagramFullscreen } from "@/components/diagram-fullscreen";
 import { buildScene, type IsoMetrics } from "@/lib/iso-scene";
 import { parseFlowchart } from "@/lib/mermaid-flowchart";
@@ -21,6 +23,10 @@ export type FlatDiagramProps = {
   alt: string;
   /** Overrides for the scene's proportions. See `IsoMetrics`. */
   metrics?: Partial<IsoMetrics>;
+  /** Muted, rounded node boxes, or the default background-filled outlines. */
+  variant?: "outline" | "soft";
+  /** Optional icons keyed by Mermaid node id. */
+  icons?: Readonly<Record<string, ReactNode>>;
   className?: string;
 };
 
@@ -37,18 +43,29 @@ const FLAT_METRICS: Partial<IsoMetrics> = {
 /** Clearance kept around the drawing inside the viewBox. */
 const FRAME_PADDING = 10;
 
-/** Ink opacities. Edges carry the drawing; the only fill is the page's own background. */
+/** Default ink opacities. Soft boxes use the docs' muted background. */
 const INK = { plate: 0.55, connector: 0.45, label: 0.9, note: 0.6, group: 0.3 };
 
-export async function FlatDiagram({ chart, alt, metrics, className }: FlatDiagramProps) {
+export async function FlatDiagram({
+  chart,
+  alt,
+  metrics,
+  variant = "outline",
+  icons = {},
+  className,
+}: FlatDiagramProps) {
   const flow = await parseFlowchart(chart);
-  const scene = buildScene(flow, () => null, { ...FLAT_METRICS, ...metrics });
+  const scene = buildScene(flow, (node) => (icons[node.id] ? node.id : null), {
+    ...FLAT_METRICS,
+    ...metrics,
+  });
 
   const x0 = scene.bounds.x0 - FRAME_PADDING;
   const y0 = scene.bounds.z0 - FRAME_PADDING;
   const width = scene.bounds.x1 - scene.bounds.x0 + FRAME_PADDING * 2;
   const height = scene.bounds.z1 - scene.bounds.z0 + FRAME_PADDING * 2;
-  const { label, note } = scene.metrics;
+  const { label, note, icon, gutter, margin } = scene.metrics;
+  const noteOpacity = variant === "soft" ? 0.8 : INK.note;
 
   return (
     <DiagramFullscreen className={className}>
@@ -76,7 +93,7 @@ export async function FlatDiagram({ chart, alt, metrics, className }: FlatDiagra
               y={group.z - group.depth / 2 + note * 1.3}
               fontSize={note}
               fill="currentColor"
-              fillOpacity={INK.note}
+              fillOpacity={noteOpacity}
             >
               {group.title.join(" ")}
             </text>
@@ -108,13 +125,22 @@ export async function FlatDiagram({ chart, alt, metrics, className }: FlatDiagra
               y={plate.z - plate.depth / 2}
               width={plate.width}
               height={plate.depth}
-              rx={5}
-              fill="var(--color-fd-background)"
+              rx={variant === "soft" ? 10 : 5}
+              fill={variant === "soft" ? "var(--color-fd-muted)" : "var(--color-fd-background)"}
               stroke="currentColor"
-              strokeOpacity={INK.plate}
+              strokeOpacity={variant === "soft" ? 0.18 : INK.plate}
             />
+            {plate.mark && (
+              <g
+                transform={`translate(${plate.x - plate.width / 2 + margin} ${plate.z - icon / 2})`}
+              >
+                <svg width={icon} height={icon} viewBox="0 0 24 24" aria-hidden="true">
+                  {icons[plate.mark]}
+                </svg>
+              </g>
+            )}
             <text
-              x={plate.x}
+              x={plate.x + (plate.mark ? (icon + gutter) / 2 : 0)}
               y={plate.z - ((plate.label.length - 1) * label * 1.45) / 2}
               textAnchor="middle"
               dominantBaseline="central"
@@ -123,7 +149,12 @@ export async function FlatDiagram({ chart, alt, metrics, className }: FlatDiagra
               fillOpacity={INK.label}
             >
               {plate.label.map((line, index) => (
-                <tspan key={line} x={plate.x} dy={index === 0 ? 0 : label * 1.45}>
+                <tspan
+                  key={line}
+                  x={plate.x + (plate.mark ? (icon + gutter) / 2 : 0)}
+                  dy={index === 0 ? 0 : label * 1.45}
+                  fillOpacity={variant === "soft" && index > 0 ? 0.8 : 1}
+                >
                   {line}
                 </tspan>
               ))}
@@ -140,7 +171,7 @@ export async function FlatDiagram({ chart, alt, metrics, className }: FlatDiagra
               dominantBaseline="central"
               fontSize={note}
               fill="currentColor"
-              fillOpacity={INK.note}
+              fillOpacity={noteOpacity}
               stroke="var(--color-fd-background)"
               strokeWidth={4}
               paintOrder="stroke"
