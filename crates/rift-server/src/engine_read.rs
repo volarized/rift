@@ -650,6 +650,214 @@ mod tests {
     }
 
     #[test]
+    fn reference_mapping_skips_unindexed_files_and_refuses_non_file_uris() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let reads = reads(directory.path())?;
+        let target = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;
+        let report = ReferenceReport {
+            locations: Ok(vec![
+                location(outside.path(), "lib.rs", 0, 0, 1),
+                location(directory.path(), "absent.rs", 0, 0, 1),
+            ]),
+            encoding: PositionEncoding::Utf16,
+            full: true,
+        };
+        assert!(map_references(&reads, &target, report, directory.path())?.is_empty());
+        let mut refused = location(directory.path(), "lib.rs", 0, 0, 1);
+        refused.uri = "https://example.com/lib.rs".parse()?;
+        let report = ReferenceReport {
+            locations: Ok(vec![refused]),
+            encoding: PositionEncoding::Utf16,
+            full: true,
+        };
+        let error =
+            map_references(&reads, &target, report, directory.path()).expect_err("scheme refused");
+        assert!(error.detail().contains("scheme_refused"), "{error}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reference_sources_require_indexed_declaration_name_ranges() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("settings.toml"), "beacon = 7\n")?;
+        let reads = reads(directory.path())?;
+        let configuration = serde_json::from_value(json!({"command":"/refused-engine"}))?;
+        let engines = pool(directory.path(), "toml", configuration);
+        let target = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;
+        let file = reads
+            .index()
+            .file(&ProjectPath::new("settings.toml")?)
+            .expect("indexed file");
+        assert!(
+            file.syntax()
+                .symbols()
+                .iter()
+                .all(|symbol| symbol.name_range.is_none())
+        );
+        assert!(
+            super::resolve_symbol_references(&reads, &engines, &target)
+                .await?
+                .is_none()
+        );
+        let absent = rift_core::SymbolId::new("rift://symbol/toml/absent.toml/beacon")?;
+        assert!(
+            super::resolve_symbol_references(&reads, &engines, &absent)
+                .await?
+                .is_none()
+        );
+        assert_eq!(
+            engines.state_for_key(&LspProcessKey::named("test")),
+            Some(rift_protocol::workspace::LspState::Stopped)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn embedded_references_resolve_two_incoming_depths() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("main.py"),
+            "def beacon() -> int:\n    return 7\n\ndef caller() -> int:\n    return beacon()\n\ndef outer() -> int:\n    return caller()\n",
+        )?;
+        let reads = reads(directory.path())?;
+        let configuration = serde_json::from_value(
+            json!({"embedded":"ty","retry":{"attempts":2,"delay":"1ms","delay_limit":"1ms"}}),
+        )?;
+        let engines = pool(directory.path(), "python", configuration);
+        let mut params = request(&symbol(&reads, "beacon"));
+        params.traversal.as_mut().expect("traversal").depth = 2;
+        let result = resolve_engine_references(&reads, &engines, &params).await;
+        engines.shutdown().await;
+        let references = result?;
+        let seed = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;
+        let caller = rift_core::SymbolId::new(symbol(&reads, "caller").0)?;
+        assert_eq!(
+            references.incoming(&seed)[0].relationship.from.0,
+            caller.as_str()
+        );
+        assert_eq!(
+            references.incoming(&caller)[0].relationship.from,
+            symbol(&reads, "outer")
+        );
+        let answer = reads.search_with_references(&params, &[], &references)?;
+        assert_eq!(answer.results.len(), 2);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn engine_reference_locations_are_bounded_before_deduplication() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let reads = reads(directory.path())?;
+        let count = super::TRAVERSAL_NODES_MAX + 1;
+        let locations = vec![location(directory.path(), "lib.rs", 0, 7, 13); count];
+        let responses = (1..=2)
+            .map(|id| {
+                let body =
+                    serde_json::to_string(&json!({"jsonrpc":"2.0","id":id,"result":locations}))?;
+                Ok(format!("Content-Length: {}\r\n\r\n{body}", body.len()))
+            })
+            .collect::<Result<Vec<_>, serde_json::Error>>()?;
+        let mut fixture = super::process_lifecycle::retrying(
+            super::process_lifecycle::answers(&responses, &["rust"]),
+            2,
+        );
+        let rift_protocol::configuration::CommandInput::ProgramAndArguments(command) = fixture
+            .configuration
+            .command
+            .as_mut()
+            .expect("process command")
+        else {
+            panic!("fixture uses arguments");
+        };
+        let gate = directory.path().join("finish.gate");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&gate)
+                .status()?
+                .success()
+        );
+        let mut release = fs::OpenOptions::new().read(true).write(true).open(&gate)?;
+        let script = directory.path().join("responses.sh");
+        let waiting = command[2].replace("sleep 0.2", &format!("read -r _ < '{}'", gate.display()));
+        fs::write(&script, waiting)?;
+        command.truncate(1);
+        command.push(script.to_string_lossy().into_owned());
+        let engines = pool(directory.path(), "rust", fixture.configuration);
+        let result =
+            resolve_engine_references(&reads, &engines, &request(&symbol(&reads, "beacon"))).await;
+        std::io::Write::write_all(&mut release, b"done\n")?;
+        engines.shutdown().await;
+        let error = result.expect_err("oversized engine answer");
+        assert!(
+            matches!(error.fault(), crate::ReadFault::Unavailable { .. }),
+            "{error:?}"
+        );
+        assert!(
+            error
+                .detail()
+                .contains(&format!("reference locations {count}")),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reference_edge_bound_applies_across_engine_requests() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("main.py"),
+            "def beacon() -> int:\n    return 7\n\ndef caller() -> int:\n    return beacon()\n",
+        )?;
+        let reads = reads(directory.path())?;
+        let target = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;
+        let prior = rift_core::SymbolId::new(symbol(&reads, "caller").0)?;
+        let report = ReferenceReport {
+            locations: Ok(vec![location(directory.path(), "main.py", 4, 11, 17)]),
+            encoding: PositionEncoding::Utf16,
+            full: true,
+        };
+        let edge = map_references(&reads, &target, report, directory.path())?.remove(0);
+        let prior_edges = (0..super::TRAVERSAL_NODES_MAX)
+            .map(|index| {
+                let mut edge = edge.clone();
+                edge.relationship.from =
+                    SymbolId(format!("rift://symbol/python/prior.py/caller_{index}"));
+                edge.relationship.to = SymbolId(prior.as_str().to_owned());
+                edge
+            })
+            .collect();
+        let mut references =
+            EngineReferences::from_incoming(BTreeMap::from([(prior.clone(), prior_edges)]));
+        let configuration = serde_json::from_value(
+            json!({"embedded":"ty","retry":{"attempts":2,"delay":"1ms","delay_limit":"1ms"}}),
+        )?;
+        let engines = pool(directory.path(), "python", configuration);
+        let mut requested = std::collections::BTreeSet::from([prior]);
+        let result = super::extend_references(
+            &reads,
+            &engines,
+            &mut references,
+            vec![target.clone()],
+            &mut requested,
+        )
+        .await;
+        engines.shutdown().await;
+        let error = result.expect_err("cumulative edge bound");
+        assert!(
+            error
+                .detail()
+                .contains("reference edges exceed the traversal node bound"),
+            "{error}"
+        );
+        assert!(references.incoming(&target).is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn references_reject_another_publication() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;

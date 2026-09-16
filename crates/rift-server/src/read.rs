@@ -1855,6 +1855,22 @@ pub(crate) mod tests {
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+    #[test]
+    fn symbol_address_refuses_empty_language_and_decoded_invalid_paths() {
+        for (address, expected) in [
+            ("rift://symbol//lib.rs/beacon", "not a rift symbol address"),
+            ("rift://symbol/rust/%2Flib.rs/beacon", "absolute"),
+            ("rift://symbol/rust/src%2F..%2Flib.rs/beacon", "dot_segment"),
+        ] {
+            let error = super::parse_symbol_address(address)
+                .map(|_| ())
+                .expect_err("invalid address");
+            assert!(
+                matches!(error.fault(), ReadFault::Invalid { field: "symbol", violation } if violation == expected)
+            );
+        }
+    }
+
     /// A read snapshot over `root` under `limits` and `languages`, built through the
     /// same entry point the server itself uses.
     fn reads_with(
