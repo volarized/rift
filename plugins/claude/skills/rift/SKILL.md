@@ -7,6 +7,8 @@ description: Use when finding or reading code in a workspace Rift serves: struct
 
 Rift indexes this workspace's source and serves it over MCP: structured search, symbol reads by exact name, and syntax inspection.
 
+Rift writes no source: apply a change with your own edit tools.
+
 Start an unfamiliar repository at `rift://map`; it names the served languages and the workspace's own layout before any tool call.
 
 ## Which tool
@@ -18,6 +20,7 @@ Start an unfamiliar repository at `rift://map`; it names the served languages an
 | A dependency's public declaration is needed. | `get_symbol`, `search` (with `scope: "dependencies"`, or `"all"` to answer the project's own too) |
 | The syntax structure at one position is needed. | `nodes` |
 | A symbol's neighbors, its impact (who breaks when it changes), or a path between two symbols is needed. | `search` (with a `traversal` block) |
+| What two committed revisions differ in, or what a change affects, is needed. | `search` (with a `change` block) |
 
 ## When a call refuses
 
