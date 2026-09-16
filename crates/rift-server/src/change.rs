@@ -127,6 +127,9 @@ impl ComparedRevisions {
         };
         let base_index = index_side(&base)?;
         let head_index = index_side(&head)?;
+        // Every selected path already passed the project-path contract: the index
+        // build over the same selection refuses a spelling that contract forbids
+        // before this list is taken.
         let paths = changed
             .paths()
             .iter()
