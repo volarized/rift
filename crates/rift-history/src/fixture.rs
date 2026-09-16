@@ -91,6 +91,24 @@ pub fn commit_all(root: &Path, message: &str) {
     git(root, &["commit", "-q", "-m", message]);
 }
 
+/// Commits a tree naming a subtree the object store does not hold, reachable
+/// as the ref `branch`.
+///
+/// Plumbing writes the tree entry without resolving it, so the commit is the
+/// shape a truncated or corrupted object store leaves behind: every read that
+/// descends into that subtree fails.
+///
+/// # Panics
+///
+/// Panics when git cannot run or exits nonzero.
+pub fn commit_missing_subtree(root: &Path, branch: &str) {
+    let absent = "0123456789abcdef0123456789abcdef01234567";
+    let entry = format!("040000 tree {absent}\tabsent\n");
+    let tree = plumb(root, &["mktree", "--missing"], entry.as_bytes());
+    let commit = plumb(root, &["commit-tree", &tree, "-m", "missing subtree"], b"");
+    git(root, &["update-ref", branch, &commit]);
+}
+
 /// Commits one blob at a raw byte path, reachable as the ref `branch`.
 ///
 /// The tree is built through git plumbing, so the path never touches the

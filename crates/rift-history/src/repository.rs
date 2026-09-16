@@ -957,6 +957,30 @@ mod tests {
         assert!(changed.paths().is_empty());
     }
 
+    /// A commit whose tree names a subtree the object store does not hold fails
+    /// the comparison rather than answering a partial listing.
+    #[test]
+    fn test_changed_files_refuses_a_tree_the_object_store_cannot_read() {
+        let directory = repository_fixture();
+        let root = directory.path();
+        crate::fixture::commit_missing_subtree(root, "refs/heads/broken");
+
+        let repository = Repository::open(root).expect("repository");
+        let base = repository.resolve("main").expect("base resolves");
+        let broken = repository.resolve("broken").expect("broken resolves");
+        let error = repository
+            .changed_files(&base, &broken, &include_all, 64)
+            .expect_err("an unreadable tree must refuse");
+
+        assert!(matches!(
+            error.fault(),
+            HistoryFault::Storage {
+                operation: "compare commit trees",
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn test_open_refuses_a_workspace_without_version_control() {
         let directory = tempfile::tempdir().expect("temp dir");

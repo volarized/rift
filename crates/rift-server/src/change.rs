@@ -160,9 +160,10 @@ impl ComparedRevisions {
         Ok(results)
     }
 
-    /// Compares one changed path's declarations. A declaration both sides hold
-    /// is classified against its base-side bytes; one only a side holds waits for
-    /// the cross-path pairing that decides whether it moved.
+    /// Compares one changed path. A path only one side indexes contributes every
+    /// declaration it holds to that side's unpaired list; a path neither side
+    /// indexes - a plain text file, or one whose bytes no provider could read -
+    /// contributes none.
     fn compare_path<'sides>(
         &'sides self,
         path: &ProjectPath,
@@ -170,16 +171,38 @@ impl ComparedRevisions {
         results: &mut Vec<SearchHit>,
         unpaired: &mut UnpairedDeclarations<'sides>,
     ) -> Result<(), ReadError> {
-        let base_file = self.base.file(path);
-        let head_file = self.head.file(path);
+        match (self.base.file(path), self.head.file(path)) {
+            (Some(base_file), Some(head_file)) => {
+                self.compare_files(path, (base_file, head_file), payloads, results, unpaired)
+            }
+            (None, Some(head_file)) => {
+                unpaired.added.extend(held(&self.head, head_file));
+                Ok(())
+            }
+            (Some(base_file), None) => {
+                unpaired.removed.extend(held(&self.base, base_file));
+                Ok(())
+            }
+            (None, None) => Ok(()),
+        }
+    }
+
+    /// Compares the declarations two indexed files hold. A declaration both files
+    /// hold is classified against its base-side bytes; one only a file holds waits
+    /// for the cross-path pairing that decides whether it moved.
+    fn compare_files<'sides>(
+        &'sides self,
+        path: &ProjectPath,
+        (base_file, head_file): (&'sides IndexedFile, &'sides IndexedFile),
+        payloads: HitPayloads,
+        results: &mut Vec<SearchHit>,
+        unpaired: &mut UnpairedDeclarations<'sides>,
+    ) -> Result<(), ReadError> {
         let base = declarations(base_file);
         let head = declarations(head_file);
         for (key, head_symbol) in &head {
-            let Some(head_file) = head_file else {
-                continue;
-            };
             let added = Declaration::new(&self.head, head_file, head_symbol);
-            let Some((base_file, base_symbol)) = base_file.zip(base.get(key).copied()) else {
+            let Some(base_symbol) = base.get(key).copied() else {
                 // The base side holds no such declaration, in this path or any
                 // other yet: whether it moved here is decided once every path is
                 // compared.
@@ -194,20 +217,14 @@ impl ComparedRevisions {
                 continue;
             };
             let wire_path = project_path(path);
-            results.push(changed_hit(
-                &added,
-                SymbolChange {
-                    kind,
-                    base_path: Some(wire_path.clone()),
-                    head_path: Some(wire_path),
-                },
-                payloads,
-            )?);
+            let change = SymbolChange {
+                kind,
+                base_path: Some(wire_path.clone()),
+                head_path: Some(wire_path),
+            };
+            results.push(changed_hit(&added, change, payloads)?);
         }
         for (key, base_symbol) in &base {
-            let Some(base_file) = base_file else {
-                continue;
-            };
             if head.contains_key(key) {
                 continue;
             }
@@ -267,17 +284,25 @@ type MoveGroup = (Vec<usize>, Vec<usize>);
 /// A provider names one declaration once per document, so the first entry under a
 /// key is the declaration - the same rule a symbol timeline's revision state
 /// applies when it looks one up by qualified name.
-fn declarations(file: Option<&IndexedFile>) -> BTreeMap<DeclarationKey<'_>, &SyntaxSymbol> {
+fn declarations(file: &IndexedFile) -> BTreeMap<DeclarationKey<'_>, &SyntaxSymbol> {
     let mut declarations = BTreeMap::new();
-    let Some(file) = file else {
-        return declarations;
-    };
     for symbol in file.syntax().symbols() {
         declarations
             .entry((symbol.qualified_name.as_str(), symbol.kind))
             .or_insert(symbol);
     }
     declarations
+}
+
+/// Every declaration one indexed file holds, as the side holding it sees them:
+/// one entry per declaration key, the way `declarations` keys them.
+fn held<'side>(
+    index: &'side WorkspaceIndex,
+    file: &'side IndexedFile,
+) -> impl Iterator<Item = Declaration<'side>> {
+    declarations(file)
+        .into_values()
+        .map(move |symbol| Declaration::new(index, file, symbol))
 }
 
 /// One declaration as one side of the comparison holds it.
@@ -347,48 +372,44 @@ impl UnpairedDeclarations<'_> {
             };
             let added = self.added[*addition];
             let removed = self.removed[*removal];
-            if added.file.path() == removed.file.path() {
-                continue;
-            }
+            let added_path = added.file.path();
+            let removed_path = removed.file.path();
+            assert_ne!(
+                added_path, removed_path,
+                "one pairing key cannot hold an addition and a removal in one path, since a \
+                 declaration both sides of that path hold is classified instead: \
+                 path={added_path:?}"
+            );
             moved_added[*addition] = true;
             moved_removed[*removal] = true;
-            results.push(changed_hit(
-                &added,
-                SymbolChange {
-                    kind: SymbolVersionKind::Moved,
-                    base_path: Some(project_path(removed.file.path())),
-                    head_path: Some(project_path(added.file.path())),
-                },
-                payloads,
-            )?);
+            let change = SymbolChange {
+                kind: SymbolVersionKind::Moved,
+                base_path: Some(project_path(removed_path)),
+                head_path: Some(project_path(added_path)),
+            };
+            results.push(changed_hit(&added, change, payloads)?);
         }
         for (position, added) in self.added.iter().enumerate() {
             if moved_added[position] {
                 continue;
             }
-            results.push(changed_hit(
-                added,
-                SymbolChange {
-                    kind: SymbolVersionKind::Introduced,
-                    base_path: None,
-                    head_path: Some(project_path(added.file.path())),
-                },
-                payloads,
-            )?);
+            let change = SymbolChange {
+                kind: SymbolVersionKind::Introduced,
+                base_path: None,
+                head_path: Some(project_path(added.file.path())),
+            };
+            results.push(changed_hit(added, change, payloads)?);
         }
         for (position, removed) in self.removed.iter().enumerate() {
             if moved_removed[position] {
                 continue;
             }
-            results.push(changed_hit(
-                removed,
-                SymbolChange {
-                    kind: SymbolVersionKind::Removed,
-                    base_path: Some(project_path(removed.file.path())),
-                    head_path: None,
-                },
-                payloads,
-            )?);
+            let change = SymbolChange {
+                kind: SymbolVersionKind::Removed,
+                base_path: Some(project_path(removed.file.path())),
+                head_path: None,
+            };
+            results.push(changed_hit(removed, change, payloads)?);
         }
         Ok(())
     }
@@ -409,13 +430,8 @@ fn changed_hit(
         // This lane reads no identifier rank: nothing here was matched by name.
         rank: SymbolMatchRank::Substring,
     };
-    let mut hit = build_symbol_hit(
-        declaration.index,
-        matched,
-        None,
-        vec![MatchedField::Change],
-        payloads,
-    )?;
+    let matched_by = vec![MatchedField::Change];
+    let mut hit = build_symbol_hit(declaration.index, matched, None, matched_by, payloads)?;
     hit.change = Some(change);
     Ok(hit)
 }
@@ -452,8 +468,8 @@ mod tests {
 
     use rift_core::{ErrorCode, ErrorName, Fault as _};
     use rift_history::fixture::{commit_all, git, init};
-    use rift_protocol::read::{ProjectPath as WireProjectPath, SearchHitTarget};
-    use serde_json::json;
+    use rift_protocol::read::ProjectPath as WireProjectPath;
+    use serde_json::{Value, json};
 
     use super::*;
 
@@ -468,6 +484,16 @@ mod tests {
     }
 
     impl Fixture {
+        /// Commits `base` as the tagged baseline, then writes `head` over it,
+        /// deleting whatever `removed` names first, and commits that.
+        fn revisions(
+            base: &[(&str, &str)],
+            head: &[(&str, &str)],
+            removed: &[&str],
+        ) -> TestResult<Self> {
+            Self::baseline(base)?.head(head, removed)
+        }
+
         /// Commits `base` as the tagged baseline.
         fn baseline(base: &[(&str, &str)]) -> TestResult<Self> {
             let directory = tempfile::tempdir()?;
@@ -522,40 +548,38 @@ mod tests {
     fn write_all(root: &std::path::Path, files: &[(&str, &str)]) -> TestResult {
         for (name, source) in files {
             let path = root.join(name);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
+            fs::create_dir_all(path.parent().unwrap_or(root))?;
             fs::write(path, source)?;
         }
         Ok(())
     }
 
+    /// One hit's declaration name, its change kind, and the two paths it names.
+    type ChangeRow = (String, String, Option<String>, Option<String>);
+
     /// Every hit's declaration name, its change kind, and the two paths it names,
     /// in the order the answer carries them.
-    fn changes(answer: &SearchResult) -> Vec<(String, String, Option<String>, Option<String>)> {
-        answer
-            .results
+    fn changes(answer: &SearchResult) -> Vec<ChangeRow> {
+        let wire = serde_json::to_value(answer).expect("a result serializes");
+        wire["results"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
             .iter()
             .map(|hit| {
-                let SearchHitTarget::Symbol { symbol } = &hit.hit else {
-                    panic!("a comparison answers symbol hits alone: {hit:?}");
-                };
-                let change = hit
-                    .change
-                    .as_ref()
-                    .expect("every change hit carries change");
                 (
-                    symbol.name.clone(),
-                    serde_json::to_value(change.kind)
-                        .expect("kind serializes")
-                        .as_str()
-                        .expect("kind is a string")
-                        .to_owned(),
-                    change.base_path.as_ref().map(|path| path.0.clone()),
-                    change.head_path.as_ref().map(|path| path.0.clone()),
+                    text(&hit["hit"]["symbol"]["name"]),
+                    text(&hit["change"]["kind"]),
+                    hit["change"]["base_path"].as_str().map(str::to_owned),
+                    hit["change"]["head_path"].as_str().map(str::to_owned),
                 )
             })
             .collect()
+    }
+
+    /// One wire string, read as the payload spells it.
+    fn text(value: &Value) -> String {
+        value.as_str().unwrap_or_default().to_owned()
     }
 
     fn wire_code(error: &ReadError) -> ErrorName {
@@ -564,8 +588,9 @@ mod tests {
 
     #[test]
     fn change_reports_an_added_declaration_as_introduced() -> TestResult {
-        let fixture = Fixture::baseline(&[("src/lib.rs", "pub fn kept() {}\n")])?
-            .head(&[("src/added.rs", "pub fn added() {}\n")], &[])?;
+        let base = [("src/lib.rs", "pub fn kept() {}\n")];
+        let head = [("src/added.rs", "pub fn added() {}\n")];
+        let fixture = Fixture::revisions(&base, &head, &[])?;
 
         let answer = fixture.baseline_to_head()?;
 
@@ -583,11 +608,11 @@ mod tests {
 
     #[test]
     fn change_reports_a_removed_declaration_from_its_base_side() -> TestResult {
-        let fixture = Fixture::baseline(&[
+        let base = [
             ("src/lib.rs", "pub fn kept() {}\n"),
             ("src/gone.rs", "pub fn gone() {}\n"),
-        ])?
-        .head(&[], &["src/gone.rs"])?;
+        ];
+        let fixture = Fixture::revisions(&base, &[], &["src/gone.rs"])?;
 
         let answer = fixture.search(&json!({
             "change": {"base": "baseline"},
@@ -612,25 +637,23 @@ mod tests {
 
     #[test]
     fn change_separates_signature_body_and_decorator_changes() -> TestResult {
-        let fixture = Fixture::baseline(&[
+        let base = [
             ("src/signature.rs", "pub fn shifted() {}\n"),
             ("src/body.rs", "pub fn worked() {\n    let x = 1;\n}\n"),
             (
                 "src/decorators.rs",
                 "/// One.\npub fn documented() {\n    let x = 1;\n}\n",
             ),
-        ])?
-        .head(
-            &[
-                ("src/signature.rs", "pub fn shifted(flag: bool) {}\n"),
-                ("src/body.rs", "pub fn worked() {\n    let x = 2;\n}\n"),
-                (
-                    "src/decorators.rs",
-                    "/// Two.\npub fn documented() {\n    let x = 1;\n}\n",
-                ),
-            ],
-            &[],
-        )?;
+        ];
+        let head = [
+            ("src/signature.rs", "pub fn shifted(flag: bool) {}\n"),
+            ("src/body.rs", "pub fn worked() {\n    let x = 2;\n}\n"),
+            (
+                "src/decorators.rs",
+                "/// Two.\npub fn documented() {\n    let x = 1;\n}\n",
+            ),
+        ];
+        let fixture = Fixture::revisions(&base, &head, &[])?;
 
         let answer = fixture.baseline_to_head()?;
 
@@ -660,14 +683,43 @@ mod tests {
         Ok(())
     }
 
+    /// A path both revisions index, where the head revision adds one declaration
+    /// and drops another, answers one `introduced` hit beside one `removed` hit.
+    #[test]
+    fn change_reports_a_declaration_added_and_one_dropped_inside_one_path() -> TestResult {
+        let base = [("src/lib.rs", "pub fn kept() {}\npub fn dropped() {}\n")];
+        let head = [("src/lib.rs", "pub fn kept() {}\npub fn arrived() {}\n")];
+        let fixture = Fixture::revisions(&base, &head, &[])?;
+
+        let answer = fixture.baseline_to_head()?;
+
+        assert_eq!(
+            changes(&answer),
+            [
+                (
+                    "arrived".to_owned(),
+                    "introduced".to_owned(),
+                    None,
+                    Some("src/lib.rs".to_owned())
+                ),
+                (
+                    "dropped".to_owned(),
+                    "removed".to_owned(),
+                    Some("src/lib.rs".to_owned()),
+                    None
+                ),
+            ]
+        );
+        Ok(())
+    }
+
     /// A file both revisions changed outside every declaration answers no hit,
     /// even though the comparison read and parsed it.
     #[test]
     fn change_reports_no_hit_for_a_file_whose_declarations_stand() -> TestResult {
-        let fixture = Fixture::baseline(&[("src/lib.rs", "pub fn kept() {}\n")])?.head(
-            &[("src/lib.rs", "// a leading comment\npub fn kept() {}\n")],
-            &[],
-        )?;
+        let base = [("src/lib.rs", "pub fn kept() {}\n")];
+        let head = [("src/lib.rs", "// a leading comment\npub fn kept() {}\n")];
+        let fixture = Fixture::revisions(&base, &head, &[])?;
 
         let answer = fixture.baseline_to_head()?;
 
@@ -678,10 +730,9 @@ mod tests {
 
     #[test]
     fn change_pairs_a_declaration_moved_between_paths() -> TestResult {
-        let fixture = Fixture::baseline(&[("src/from.rs", "pub fn travelled() {}\n")])?.head(
-            &[("src/to.rs", "pub fn travelled() {}\n")],
-            &["src/from.rs"],
-        )?;
+        let base = [("src/from.rs", "pub fn travelled() {}\n")];
+        let head = [("src/to.rs", "pub fn travelled() {}\n")];
+        let fixture = Fixture::revisions(&base, &head, &["src/from.rs"])?;
 
         let answer = fixture.baseline_to_head()?;
 
@@ -706,14 +757,13 @@ mod tests {
     /// nothing: the evidence cannot say which removal the addition answers.
     #[test]
     fn change_leaves_an_ambiguous_move_as_an_addition_beside_its_removals() -> TestResult {
-        let fixture = Fixture::baseline(&[
+        let base = [
             ("src/first.rs", "pub fn travelled() {}\n"),
             ("src/second.rs", "pub fn travelled() {}\n"),
-        ])?
-        .head(
-            &[("src/third.rs", "pub fn travelled() {}\n")],
-            &["src/first.rs", "src/second.rs"],
-        )?;
+        ];
+        let head = [("src/third.rs", "pub fn travelled() {}\n")];
+        let removed = ["src/first.rs", "src/second.rs"];
+        let fixture = Fixture::revisions(&base, &head, &removed)?;
 
         let answer = fixture.baseline_to_head()?;
 
@@ -747,10 +797,9 @@ mod tests {
     /// is its own declaration, not the removed one relocated.
     #[test]
     fn change_never_pairs_a_same_named_declaration_written_differently() -> TestResult {
-        let fixture = Fixture::baseline(&[("src/from.rs", "pub fn travelled() {}\n")])?.head(
-            &[("src/to.rs", "pub fn travelled(flag: bool) {}\n")],
-            &["src/from.rs"],
-        )?;
+        let base = [("src/from.rs", "pub fn travelled() {}\n")];
+        let head = [("src/to.rs", "pub fn travelled(flag: bool) {}\n")];
+        let fixture = Fixture::revisions(&base, &head, &["src/from.rs"])?;
 
         let answer = fixture.baseline_to_head()?;
 
@@ -778,13 +827,12 @@ mod tests {
     /// contributes no declaration while every other changed path answers.
     #[test]
     fn change_answers_the_rest_when_one_changed_blob_is_not_utf8() -> TestResult {
-        let fixture = Fixture::baseline(&[("src/lib.rs", "pub fn kept() {}\n")])?;
-        fs::write(fixture.directory.path().join("src/binary.rs"), [0xff, 0xfe])?;
-        fs::write(
-            fixture.directory.path().join("src/added.rs"),
-            "pub fn added() {}\n",
-        )?;
-        commit_all(fixture.directory.path(), "head");
+        let base = [("src/lib.rs", "pub fn kept() {}\n")];
+        let fixture = Fixture::baseline(&base)?;
+        let root = fixture.directory.path();
+        fs::write(root.join("src/binary.rs"), [0xff, 0xfe])?;
+        fs::write(root.join("src/added.rs"), "pub fn added() {}\n")?;
+        commit_all(root, "head");
 
         let answer = fixture.baseline_to_head()?;
 
@@ -804,13 +852,12 @@ mod tests {
     /// engine every other selector uses.
     #[test]
     fn change_compares_only_the_paths_the_selector_keeps() -> TestResult {
-        let fixture = Fixture::baseline(&[("src/lib.rs", "pub fn kept() {}\n")])?.head(
-            &[
-                ("src/added.rs", "pub fn added() {}\n"),
-                ("other/added.rs", "pub fn elsewhere() {}\n"),
-            ],
-            &[],
-        )?;
+        let base = [("src/lib.rs", "pub fn kept() {}\n")];
+        let head = [
+            ("src/added.rs", "pub fn added() {}\n"),
+            ("other/added.rs", "pub fn elsewhere() {}\n"),
+        ];
+        let fixture = Fixture::revisions(&base, &head, &[])?;
 
         let answer = fixture.search(&json!({
             "change": {"base": "baseline"},
@@ -861,15 +908,13 @@ mod tests {
     #[test]
     fn change_answers_the_rest_when_one_changed_blob_is_oversized() -> TestResult {
         let oversized = format!("pub fn oversized() {{\n    // {}\n}}\n", "x".repeat(2_048));
-        let fixture = Fixture::baseline(&[("src/lib.rs", "pub fn kept() {}\n")])?
-            .head(
-                &[
-                    ("src/added.rs", "pub fn added() {}\n"),
-                    ("src/oversized.rs", oversized.as_str()),
-                ],
-                &[],
-            )?
-            .under(WorkspaceIndexLimits::new(64, 512, 262_144, 8, 1_000)?);
+        let base = [("src/lib.rs", "pub fn kept() {}\n")];
+        let head = [
+            ("src/added.rs", "pub fn added() {}\n"),
+            ("src/oversized.rs", oversized.as_str()),
+        ];
+        let limits = WorkspaceIndexLimits::new(64, 512, 262_144, 8, 1_000)?;
+        let fixture = Fixture::revisions(&base, &head, &[])?.under(limits);
 
         let answer = fixture.baseline_to_head()?;
 
@@ -918,10 +963,6 @@ mod tests {
             vec![super::change_truncation_warning()],
             "{answer:?}"
         );
-        let ReadWarning::ChangeTruncated { paths_max, .. } = &answer.warnings[0] else {
-            panic!("the comparison must warn that it stopped: {answer:?}");
-        };
-        assert_eq!(*paths_max, SEARCH_CHANGE_PATHS_MAX);
         Ok(())
     }
 
@@ -929,12 +970,10 @@ mod tests {
     /// search answer, and the answer names the bound it reached.
     #[test]
     fn change_stops_at_the_result_bound_and_warns() -> TestResult {
-        let fixture = Fixture::baseline(&[("src/lib.rs", "pub fn kept() {}\n")])?
-            .head(
-                &[("src/added.rs", "pub fn first() {}\npub fn second() {}\n")],
-                &[],
-            )?
-            .under(WorkspaceIndexLimits::new(64, 1_000_000, 262_144, 8, 1)?);
+        let base = [("src/lib.rs", "pub fn kept() {}\n")];
+        let head = [("src/added.rs", "pub fn first() {}\npub fn second() {}\n")];
+        let limits = WorkspaceIndexLimits::new(64, 1_000_000, 262_144, 8, 1)?;
+        let fixture = Fixture::revisions(&base, &head, &[])?.under(limits);
 
         let answer = fixture.baseline_to_head()?;
 
@@ -957,13 +996,12 @@ mod tests {
             open = "(".repeat(600),
             close = ")".repeat(600),
         );
-        let fixture = Fixture::baseline(&[("src/lib.rs", "pub fn kept() {}\n")])?.head(
-            &[
-                ("src/added.rs", "pub fn added() {}\n"),
-                ("src/deep.rs", refused.as_str()),
-            ],
-            &[],
-        )?;
+        let base = [("src/lib.rs", "pub fn kept() {}\n")];
+        let head = [
+            ("src/added.rs", "pub fn added() {}\n"),
+            ("src/deep.rs", refused.as_str()),
+        ];
+        let fixture = Fixture::revisions(&base, &head, &[])?;
 
         let answer = fixture.baseline_to_head()?;
 
@@ -1082,13 +1120,12 @@ mod tests {
     /// `relevance` falls back to the path order a comparison can state.
     #[test]
     fn change_orders_every_requested_order_deterministically() -> TestResult {
-        let fixture = Fixture::baseline(&[("src/b.rs", "pub fn second() {}\n")])?.head(
-            &[
-                ("src/a.rs", "pub fn first() {}\n"),
-                ("src/b.rs", "pub fn second(flag: bool) {}\n"),
-            ],
-            &[],
-        )?;
+        let base = [("src/b.rs", "pub fn second() {}\n")];
+        let head = [
+            ("src/a.rs", "pub fn first() {}\n"),
+            ("src/b.rs", "pub fn second(flag: bool) {}\n"),
+        ];
+        let fixture = Fixture::revisions(&base, &head, &[])?;
 
         for order in ["relevance", "path", "identity"] {
             let answer =
