@@ -1431,7 +1431,11 @@ impl RiftMcp {
         let engines = self.engine_pool_for(&resolved.published).await;
         let references = tokio::time::timeout(
             budget,
-            resolve_engine_references(&resolved.published.reads, &engines, params),
+            Box::pin(resolve_engine_references(
+                &resolved.published.reads,
+                &engines,
+                params,
+            )),
         )
         .await
         .map_err(|_| {
