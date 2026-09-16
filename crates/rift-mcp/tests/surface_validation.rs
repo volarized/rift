@@ -144,6 +144,17 @@ fn traversal_search_corpus() -> Vec<(&'static str, Value)> {
                 }
             }),
         ),
+        // `implements` reaches no reference role, so this answer carries the
+        // `relationship_coverage_missing` warning and validates the schema arm serving it.
+        (
+            "search",
+            json!({
+                "traversal": {
+                    "seed": "rift://symbol/rust/remove_caller.rs/calls_watched",
+                    "facets": ["implements"]
+                }
+            }),
+        ),
     ]
 }
 
