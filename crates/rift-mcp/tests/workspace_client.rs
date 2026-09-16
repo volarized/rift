@@ -1,13 +1,7 @@
-//! Shared scaffolding for the engine integration suites.
+//! Shared scaffolding for served workspace integration suites.
 //!
-//! Every suite builds a workspace whose own `rift.toml` turns the semantic
-//! search tier off and, where the suite drives a real engine, carries an
-//! LSP process and language binding built from the shared fixture in
-//! `engine_fixture.rs`, and drives the tools through a live rmcp client.
-//! Engine-specific fixture data lives beside this module: `rust_engine.rs`,
-//! `typescript_engine.rs`, and `toml_engine.rs`; `live_engine_gate.rs`
-//! gates the live suites those fixtures drive, and `hermetic_search.rs`
-//! carries the table every fixture declares to keep the semantic tier off.
+//! Each workspace disables semantic search through `hermetic_search.rs`
+//! and drives the read tools through a live rmcp client.
 
 use std::error::Error;
 use std::fs;

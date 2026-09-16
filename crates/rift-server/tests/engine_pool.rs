@@ -79,32 +79,26 @@ fn start_position() -> Position {
     }
 }
 
-/// One rename conversation through the pool for `name`, discarding the
-/// edit.
-///
-/// The document is opened first, as the server's own rename does, so a
-/// restarted engine sees the target it renames.
-async fn rename_through(
+/// One reference request through the pool for `name`. Opening the document
+/// first gives a restarted engine the source the request addresses.
+async fn references_through(
     pool: &EnginePool,
     name: &str,
-    new_name: &str,
 ) -> Result<(), rift_lsp::session::EngineError> {
     let slot = pool
         .engine_for(&language(name))
         .expect("the language is served");
     let target = document();
-    let renamed = new_name.to_owned();
     slot.request(move |session: &mut EngineSession| {
         let target = target.clone();
-        let renamed = renamed.clone();
         Box::pin(async move {
             session
                 .open(&target, "rust", "fn beacon() {}\n".to_owned())
                 .await?;
             session
-                .rename(&target, start_position(), &renamed)
+                .references(&target, start_position())
                 .await
-                .map(|_edit| ())
+                .map(|_locations| ())
         })
     })
     .await
@@ -118,10 +112,10 @@ async fn first_request_spawns_and_later_requests_reuse_one_session() {
         workspace.path(),
         vec![("fake", answers(&responses, &["rust", "python"]))],
     );
-    rename_through(&pool, "rust", "renamed")
+    references_through(&pool, "rust")
         .await
         .expect("the first request serves");
-    rename_through(&pool, "python", "renamed")
+    references_through(&pool, "python")
         .await
         .expect("a second language served by the same engine reuses it");
     pool.shutdown().await;
@@ -136,7 +130,7 @@ async fn dead_engine_is_restarted_within_the_budget_and_a_death_past_it_surfaces
         ..RestartPolicy::default()
     };
     let pool = pool_of(workspace.path(), vec![("fake", dies)]);
-    let error = rename_through(&pool, "rust", "renamed")
+    let error = references_through(&pool, "rust")
         .await
         .expect_err("the engine dies on both attempts");
     assert!(matches!(
@@ -156,10 +150,10 @@ async fn restart_budget_spent_inside_the_window_refuses_the_next_start() {
         ..RestartPolicy::default()
     };
     let pool = pool_of(workspace.path(), vec![("fake", dies)]);
-    rename_through(&pool, "rust", "renamed")
+    references_through(&pool, "rust")
         .await
         .expect_err("the engine dies on both attempts");
-    let refused = rename_through(&pool, "rust", "renamed")
+    let refused = references_through(&pool, "rust")
         .await
         .expect_err("the spent budget refuses another start");
     assert!(
@@ -181,7 +175,7 @@ async fn engine_that_stopped_answering_is_restarted_within_the_budget() {
         ..RestartPolicy::default()
     };
     let pool = pool_of(workspace.path(), vec![("fake", deaf)]);
-    let error = rename_through(&pool, "rust", "renamed")
+    let error = references_through(&pool, "rust")
         .await
         .expect_err("neither engine answers");
     assert!(
@@ -202,7 +196,7 @@ async fn failed_starts_spend_the_restart_budget() {
         ..RestartPolicy::default()
     };
     let pool = pool_of(workspace.path(), vec![("fake", absent)]);
-    let error = rename_through(&pool, "rust", "renamed")
+    let error = references_through(&pool, "rust")
         .await
         .expect_err("the program cannot be started");
     assert!(
@@ -210,7 +204,7 @@ async fn failed_starts_spend_the_restart_budget() {
         "unexpected fault {:?}",
         error.fault()
     );
-    let refused = rename_through(&pool, "rust", "renamed")
+    let refused = references_through(&pool, "rust")
         .await
         .expect_err("the spent budget refuses another start");
     assert!(
@@ -230,11 +224,11 @@ async fn restart_budget_frees_once_its_window_passes() {
         window: Duration::from_millis(1_000),
     };
     let pool = pool_of(workspace.path(), vec![("fake", absent)]);
-    let failed = rename_through(&pool, "rust", "renamed")
+    let failed = references_through(&pool, "rust")
         .await
         .expect_err("the program cannot be started");
     assert!(matches!(failed.fault(), EngineFault::LaunchFailed { .. }));
-    let refused = rename_through(&pool, "rust", "renamed")
+    let refused = references_through(&pool, "rust")
         .await
         .expect_err("the spent budget refuses another start");
     assert!(
@@ -243,7 +237,7 @@ async fn restart_budget_frees_once_its_window_passes() {
         refused.fault()
     );
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    let freed = rename_through(&pool, "rust", "renamed")
+    let freed = references_through(&pool, "rust")
         .await
         .expect_err("the program still cannot be started");
     assert!(
@@ -264,7 +258,7 @@ async fn a_configuration_fault_surfaces_without_restarting() {
     };
     let pool = pool_of(workspace.path(), vec![("fake", absolute)]);
     for _ in 0..2 {
-        let error = rename_through(&pool, "rust", "renamed")
+        let error = references_through(&pool, "rust")
             .await
             .expect_err("the program is refused");
         assert!(
@@ -300,11 +294,11 @@ async fn a_request_held_in_one_slot_leaves_other_engines_serving() {
         let pool = Arc::clone(&pool);
         async move {
             issued_sender.send(()).await.expect("the test listens");
-            rename_through(&pool, "rust", "renamed").await
+            references_through(&pool, "rust").await
         }
     });
     issued.recv().await.expect("the held request was issued");
-    rename_through(&pool, "python", "renamed")
+    references_through(&pool, "python")
         .await
         .expect("the second engine serves while the first slot is held");
     tokio::task::spawn_blocking(move || std::fs::write(&gate, b"go\n"))
@@ -321,8 +315,8 @@ async fn a_request_held_in_one_slot_leaves_other_engines_serving() {
 async fn refusal_leaves_the_engine_serving_without_a_restart() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let responses = vec![
-        refused_response(1, -32602, "new name is not an identifier"),
-        refused_response(2, -32602, "new name is not an identifier"),
+        refused_response(1, -32602, "position is outside the document"),
+        refused_response(2, -32602, "position is outside the document"),
         null_response(3),
         null_response(4),
     ];
@@ -330,9 +324,9 @@ async fn refusal_leaves_the_engine_serving_without_a_restart() {
         workspace.path(),
         vec![("fake", retrying(answers(&responses, &["rust"]), 2))],
     );
-    let refusal = rename_through(&pool, "rust", "1nvalid")
+    let refusal = references_through(&pool, "rust")
         .await
-        .expect_err("the engine refuses the name");
+        .expect_err("the engine refuses the position");
     assert!(matches!(refusal.fault(), EngineFault::Refused { .. }));
     let slot = pool
         .engine_for(&language("rust"))
@@ -342,7 +336,7 @@ async fn refusal_leaves_the_engine_serving_without_a_restart() {
         let target = target.clone();
         Box::pin(async move {
             session
-                .prepare_rename(&target, start_position())
+                .references(&target, start_position())
                 .await
                 .map(|_verdict| ())
         })
@@ -362,10 +356,10 @@ async fn shutdown_walks_every_running_engine() {
             ("b", answers(&[ok_response(1)], &["python"])),
         ],
     );
-    rename_through(&pool, "rust", "renamed")
+    references_through(&pool, "rust")
         .await
         .expect("the first engine serves");
-    rename_through(&pool, "python", "renamed")
+    references_through(&pool, "python")
         .await
         .expect("the second engine serves");
     let started_at = std::time::Instant::now();
@@ -409,7 +403,7 @@ async fn concurrent_requests_on_an_empty_slot_spawn_one_engine() {
         let issued_sender = issued_sender.clone();
         racers.push(tokio::spawn(async move {
             issued_sender.send(()).await.expect("the test listens");
-            rename_through(&pool, "rust", "renamed").await
+            references_through(&pool, "rust").await
         }));
     }
     for _ in 0..2 {
@@ -443,7 +437,7 @@ async fn a_retryable_refusal_is_absorbed_and_the_resend_answers() {
         workspace.path(),
         vec![("fake", retrying(answers(&responses, &["rust"]), 3))],
     );
-    rename_through(&pool, "rust", "renamed")
+    references_through(&pool, "rust")
         .await
         .expect("the resend answers");
     pool.shutdown().await;
@@ -457,15 +451,15 @@ async fn a_verdict_refusal_retries_and_returns_the_latest_engine_words() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let responses = vec![
         refused_response(1, -32602, "engine is still loading"),
-        refused_response(2, -32602, "new name is not an identifier"),
+        refused_response(2, -32602, "position is outside the document"),
     ];
     let pool = pool_of(
         workspace.path(),
         vec![("fake", retrying(answers(&responses, &["rust"]), 2))],
     );
-    let error = rename_through(&pool, "rust", "1nvalid")
+    let error = references_through(&pool, "rust")
         .await
-        .expect_err("the engine refuses the name");
+        .expect_err("the engine refuses the position");
     assert!(
         matches!(
             error.fault(),
@@ -473,7 +467,7 @@ async fn a_verdict_refusal_retries_and_returns_the_latest_engine_words() {
                 code: -32602,
                 message,
                 ..
-            } if message == "new name is not an identifier"
+            } if message == "position is outside the document"
         ),
         "unexpected fault {:?}",
         error.fault()
@@ -494,7 +488,7 @@ async fn an_engine_that_dies_mid_request_is_replaced_before_the_caller_sees_it()
         ..RestartPolicy::default()
     };
     let pool = pool_of(workspace.path(), vec![("fake", dies_once)]);
-    rename_through(&pool, "rust", "renamed")
+    references_through(&pool, "rust")
         .await
         .expect("the replacement answers the same operation");
     pool.shutdown().await;
@@ -513,10 +507,10 @@ async fn shutdown_replaced_by_ends_only_the_engines_the_replacement_drops() {
         ("dropped", answers(&[ok_response(1)], &["python"])),
     ]);
     let pool = EnginePool::new(workspace.path(), definitions.clone(), bindings.clone());
-    rename_through(&pool, "rust", "renamed")
+    references_through(&pool, "rust")
         .await
         .expect("the reused engine serves");
-    rename_through(&pool, "python", "renamed")
+    references_through(&pool, "python")
         .await
         .expect("the dropped engine serves");
 
@@ -539,7 +533,7 @@ async fn shutdown_replaced_by_ends_only_the_engines_the_replacement_drops() {
         Some(LspState::Stopped),
         "a shared slot is one allocation, so ending it would end the replacement's engine too"
     );
-    rename_through(&replacement, "rust", "again")
+    references_through(&replacement, "rust")
         .await
         .expect("the shared engine keeps serving through the replacement pool");
     replacement.shutdown().await;

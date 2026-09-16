@@ -44,7 +44,7 @@ use tracing::Instrument as _;
 
 use crate::dependency::{DependencyLane, DependencyPlan};
 use crate::failure::WireFailure;
-use crate::server::{BlockingExecutor, ChangeLane};
+use crate::server::BlockingExecutor;
 
 /// Filesystem events coalesced while one rebuild is pending.
 pub(crate) const INDEX_INVALIDATIONS_MAX: usize = 1;
@@ -292,10 +292,8 @@ pub(crate) struct IndexValidation {
     /// Observation and publication both take it, so a path observed between a rebuild's
     /// capture and its publication cannot be lost.
     pub(crate) publication_lane: SyncMutex<PendingWork>,
-    /// How many paths one observation may retain before it escalates to the whole
-    /// workspace. The workspace's own file bound: retaining more paths than the workspace
-    /// may hold files is a whole rebuild by another name.
     paths_max: usize,
+
     /// The current publication as event classification sees it: the inclusion policy
     /// the index was built under, and the index itself for what it holds. Absent before
     /// the first publication, when every event asks for the whole workspace anyway.
@@ -324,7 +322,6 @@ pub(crate) struct IndexSupervisorContext {
     pub(crate) root: PathBuf,
     pub(crate) limits: WorkspaceIndexLimits,
     pub(crate) published: Arc<RwLock<IndexState>>,
-    pub(crate) change_lane: Arc<ChangeLane>,
     pub(crate) validation: Arc<IndexValidation>,
     pub(crate) blocking: BlockingExecutor,
     /// The workspace's population lane, absent when the search index could not be opened
@@ -499,57 +496,6 @@ impl ConfigurationState {
             .map(|configuration| configuration.logs.clone())
             .unwrap_or_default()
     }
-
-    /// LSP process definitions and exact language bindings from the last acceptance.
-    ///
-    /// A named `[lsp.<name>]` entry becomes a definition whether or not a language
-    /// selects it, so the pool can start it the moment one does. An inline table
-    /// belongs to its own language entry alone, so a disabled entry contributes
-    /// neither the definition nor the binding.
-    pub(crate) fn lsp_runtime_configuration(
-        &self,
-    ) -> (
-        BTreeMap<LspProcessKey, LspConfiguration>,
-        BTreeMap<String, LspProcessKey>,
-    ) {
-        let Ok(configuration) = &self.accepted else {
-            return (BTreeMap::new(), BTreeMap::new());
-        };
-        let mut definitions = configuration
-            .lsp
-            .iter()
-            .map(|(name, lsp)| (LspProcessKey::Named(name.clone()), lsp.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let mut bindings = BTreeMap::new();
-        for (identity, language) in &configuration.languages {
-            let Some(lsp) = &language.lsp else {
-                continue;
-            };
-            if !language.enabled {
-                continue;
-            }
-            let key = match lsp {
-                LanguageLspConfiguration::Named(name) => LspProcessKey::Named(name.clone()),
-                LanguageLspConfiguration::Inline(lsp) => {
-                    let key = LspProcessKey::Inline(identity.clone());
-                    definitions.insert(key.clone(), lsp.clone());
-                    key
-                }
-            };
-            bindings.insert(identity.clone(), key);
-        }
-        (definitions, bindings)
-    }
-
-    /// Whether accepted configuration runs any source-read-only hook.
-    pub(crate) fn has_validation_hooks(&self) -> bool {
-        self.accepted.as_ref().is_ok_and(|configuration| {
-            configuration
-                .hooks
-                .iter()
-                .any(|hook| hook.writes.is_validation())
-        })
-    }
 }
 
 /// Exact bounded identity of the configuration policy source.
@@ -649,14 +595,6 @@ impl IndexValidation {
         let result = self.observe_locked(&mut publication);
         drop(publication);
         result
-    }
-
-    /// How many paths one observation may retain before it escalates to the whole
-    /// workspace. A caller that already knows how many paths it is about to name reads
-    /// this bound and asks for the whole workspace itself, so the escalation is stated
-    /// where it is decided rather than discovered inside the retention.
-    pub(crate) const fn paths_max(&self) -> usize {
-        self.paths_max
     }
 
     /// Marks watcher unhealthy and records invalidation in one critical section.
@@ -1105,8 +1043,8 @@ pub(crate) fn hard_floor_includes_watch_path(roots: &WatchRoots, path: &Path) ->
 ///
 /// A name event on an extensionless path asks for the whole workspace only when the
 /// path names a directory the index can hold files under: one on disk right now, or one
-/// the publication holds files below, as a directory renamed away is. The server's own
-/// writes stage each file as an extensionless temporary file beside its target and
+/// the publication holds files below, as a directory renamed away is. External writes can
+/// stage each file as an extensionless temporary file beside its target and
 /// rename it over the target; the publication holds nothing under that staging name, so
 /// its name event takes the per-path route a file event takes.
 pub(crate) fn watch_path_impact(
@@ -2482,15 +2420,13 @@ pub(crate) async fn rebuild_workspace(
     let limits = context.limits;
     let captured_state = Arc::clone(&context.published);
     let captured_validation = Arc::clone(&context.validation);
-    let change_lane = Arc::clone(&context.change_lane);
     let captured = tokio::select! {
         () = context.validation.cancellation.cancelled() => return Ok(RebuildOutcome::Cancelled),
         captured = context.blocking.run("filesystem index rebuild", move || {
-            capture_rebuild(
+            capture_rebuild_with(
                 &root,
                 limits,
                 &captured_state,
-                &change_lane,
                 &captured_validation,
                 request,
                 capture,
@@ -2588,19 +2524,6 @@ pub(crate) enum CapturedRebuild {
     /// The supervisor was cancelled before the capture ran, or before its candidate was
     /// handed on; the observation's work is returned and nothing publishes.
     Cancelled,
-}
-
-/// Captures one candidate while the mutation lane is held.
-pub(crate) fn capture_rebuild(
-    root: &Path,
-    limits: WorkspaceIndexLimits,
-    published: &RwLock<IndexState>,
-    change_lane: &ChangeLane,
-    validation: &IndexValidation,
-    request: RebuildRequest,
-    capture: impl CaptureWorkspace,
-) -> Result<CapturedRebuild, ReadError> {
-    change_lane.run(|| capture_rebuild_with(root, limits, published, validation, request, capture))
 }
 
 /// Runs one serialized capture over an injectable candidate builder, so tests can force
@@ -3047,8 +2970,109 @@ pub(crate) mod lexical_double {
     }
 }
 
+impl ConfigurationState {
+    /// LSP process definitions and exact language bindings from the last acceptance.
+    ///
+    /// A named `[lsp.<name>]` entry becomes a definition whether or not a language
+    /// selects it, so the pool can start it the moment one does. An inline table
+    /// belongs to its own language entry alone, so a disabled entry contributes
+    /// neither the definition nor the binding.
+    pub(crate) fn lsp_runtime_configuration(
+        &self,
+    ) -> (
+        BTreeMap<LspProcessKey, LspConfiguration>,
+        BTreeMap<String, LspProcessKey>,
+    ) {
+        let Ok(configuration) = &self.accepted else {
+            return (BTreeMap::new(), BTreeMap::new());
+        };
+        let mut definitions = configuration
+            .lsp
+            .iter()
+            .map(|(name, lsp)| (LspProcessKey::Named(name.clone()), lsp.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut bindings = BTreeMap::new();
+        for (identity, language) in &configuration.languages {
+            let Some(lsp) = &language.lsp else {
+                continue;
+            };
+            if !language.enabled {
+                continue;
+            }
+            let key = match lsp {
+                LanguageLspConfiguration::Named(name) => LspProcessKey::Named(name.clone()),
+                LanguageLspConfiguration::Inline(lsp) => {
+                    let key = LspProcessKey::Inline(identity.clone());
+                    definitions.insert(key.clone(), lsp.clone());
+                    key
+                }
+            };
+            bindings.insert(identity.clone(), key);
+        }
+        (definitions, bindings)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::ConfigurationState;
+    use rift_core::SourceVisibility;
+    use rift_server::LspProcessKey;
+    #[test]
+    fn configuration_capture_covers_content_invalid_policy_and_oversize() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[source]\nrespect_gitignore = false\n",
+        )?;
+        assert!(matches!(
+            super::configuration_fingerprint(directory.path()),
+            ConfigurationFingerprint::Content(_)
+        ));
+
+        fs::write(directory.path().join("rift.toml"), "invalid = true\n")?;
+        let invalid = ConfigurationState::accept(directory.path());
+        assert!(invalid.accepted.is_err());
+        assert_eq!(invalid.source_visibility(), SourceVisibility::default());
+        let (definitions, bindings) = invalid.lsp_runtime_configuration();
+        assert!(
+            definitions.is_empty() && bindings.is_empty(),
+            "an invalid file serves no LSP configuration"
+        );
+
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[lsp.ty]\ncommand = \"uvx\"\n[languages.python]\ninclude = [\"**/*.py\"]\nlsp = \"ty\"\n",
+        )?;
+        let with_lsp = ConfigurationState::accept(directory.path());
+        let (definitions, bindings) = with_lsp.lsp_runtime_configuration();
+        let key = LspProcessKey::named("ty");
+        assert_eq!(
+            definitions
+                .get(&key)
+                .and_then(|configuration| configuration.command.as_ref())
+                .map(rift_protocol::configuration::CommandInput::program),
+            Some("uvx"),
+            "an accepted LSP definition is served"
+        );
+        assert_eq!(bindings.get("python"), Some(&key));
+
+        fs::write(
+            directory.path().join("rift.toml"),
+            vec![
+                b'x';
+                usize::try_from(rift_server::CONFIGURATION_FILE_BYTES_MAX)
+                    .expect("configuration bound must fit usize")
+                    + 1
+            ],
+        )?;
+        assert!(matches!(
+            super::configuration_fingerprint(directory.path()),
+            ConfigurationFingerprint::Oversized(_)
+        ));
+        Ok(())
+    }
+
     use std::error::Error;
     use std::fs;
     use std::sync::Arc;
@@ -3058,20 +3082,18 @@ mod tests {
 
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
     use notify::{Event, EventKind};
-    use rift_core::SourceVisibility;
     use rift_index::{LexicalChange, LexicalIndexLimits, WorkspaceIndexLimits};
-    use rift_protocol::change::{ChangeResult, PatchParams};
     use rift_protocol::configuration::ServerConfiguration;
     use rift_search::{RevisionScoped, SearchIndex, SearchIndexLimits, SemanticReadiness};
-    use rift_server::{ChangeService, LspProcessKey, ReadFault};
+    use rift_server::ReadFault;
     use tokio::sync::{Barrier as AsyncBarrier, RwLock};
     use tokio_util::sync::CancellationToken;
     use tracing_subscriber::layer::SubscriberExt as _;
 
     use super::lexical_double::{LANE_ATTEMPTS_MAX, LANE_POLL, StoreDouble};
     use super::{
-        BlockingExecutor, ChangeSet, ConfigurationFingerprint, ConfigurationState, IndexState,
-        IndexValidation, LEXICAL_COMMIT_TIMEOUT, LEXICAL_COMMIT_TIMEOUT_MAX, LEXICAL_COMMITS_MAX,
+        BlockingExecutor, ChangeSet, ConfigurationFingerprint, IndexState, IndexValidation,
+        LEXICAL_COMMIT_TIMEOUT, LEXICAL_COMMIT_TIMEOUT_MAX, LEXICAL_COMMITS_MAX,
         LEXICAL_UNIT_COMMIT_BUDGET, LexicalCommitState, LexicalLane, LexicalWrite, PathChanges,
         PopulationLane, PublishedWorkspace, RebuildOutcome, RebuildRequest, WorkspaceCandidate,
         build_workspace_candidate, commit_deadline, publish_rebuild, publish_rebuild_after,
@@ -3101,71 +3123,6 @@ mod tests {
                 Err("fixture configuration must remain stable".into())
             }
         }
-    }
-
-    #[test]
-    fn configuration_capture_covers_content_invalid_policy_and_oversize() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(
-            directory.path().join("rift.toml"),
-            "[source]\nrespect_gitignore = false\n",
-        )?;
-        assert!(matches!(
-            super::configuration_fingerprint(directory.path()),
-            ConfigurationFingerprint::Content(_)
-        ));
-
-        fs::write(directory.path().join("rift.toml"), "invalid = true\n")?;
-        let invalid = ConfigurationState::accept(directory.path());
-        assert!(invalid.accepted.is_err());
-        assert_eq!(invalid.source_visibility(), SourceVisibility::default());
-        let (definitions, bindings) = invalid.lsp_runtime_configuration();
-        assert!(
-            definitions.is_empty() && bindings.is_empty(),
-            "an invalid file serves no LSP configuration"
-        );
-
-        fs::write(
-            directory.path().join("rift.toml"),
-            "[lsp.ty]\ncommand = \"uvx\"\n[languages.python]\ninclude = [\"**/*.py\"]\nlsp = \"ty\"\n",
-        )?;
-        let with_lsp = ConfigurationState::accept(directory.path());
-        assert!(!with_lsp.has_validation_hooks());
-        let (definitions, bindings) = with_lsp.lsp_runtime_configuration();
-        let key = LspProcessKey::named("ty");
-        assert_eq!(
-            definitions
-                .get(&key)
-                .and_then(|configuration| configuration.command.as_ref())
-                .map(rift_protocol::configuration::CommandInput::program),
-            Some("uvx"),
-            "an accepted LSP definition is served"
-        );
-        assert_eq!(bindings.get("python"), Some(&key));
-
-        fs::write(
-            directory.path().join("rift.toml"),
-            "[[hooks]]\nid = \"check\"\nkind = \"build\"\ncommand = [\"cargo\", \"check\"]\nchanged_paths = \"none\"\nwrites = \"none\"\nworking_directory = \"\"\nenvironment = {}\ntimeout = \"30s\"\noutput_limit = \"4kb\"\nfailure_severity = \"error\"\nguarantees = []\ndeterminism = \"deterministic\"\n",
-        )?;
-        assert!(
-            ConfigurationState::accept(directory.path()).has_validation_hooks(),
-            "accepted source-read-only hook must be reported"
-        );
-
-        fs::write(
-            directory.path().join("rift.toml"),
-            vec![
-                b'x';
-                usize::try_from(rift_server::CONFIGURATION_FILE_BYTES_MAX)
-                    .expect("configuration bound must fit usize")
-                    + 1
-            ],
-        )?;
-        assert!(matches!(
-            super::configuration_fingerprint(directory.path()),
-            ConfigurationFingerprint::Oversized(_)
-        ));
-        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3919,7 +3876,7 @@ mod tests {
                 &staged
             ),
             super::WatchImpact::Paths(vec![rift_core::ProjectPath::new(".tmpk3v9q2")?]),
-            "the publisher renames an extensionless staged file over its target; the \
+            "an external write renames an extensionless staged file over its target; the \
              publication holds nothing under that name, so the event names the path alone"
         );
         Ok(())
@@ -3987,68 +3944,6 @@ mod tests {
             ),
             super::WatchImpact::Paths(vec![rift_core::ProjectPath::new("LICENSE")?]),
             "a file the publication holds is read again by itself, whatever its name"
-        );
-        Ok(())
-    }
-
-    /// Waits under a bound until the pending work names `path`, or escalated to the
-    /// whole workspace, whichever the watcher's events produce first.
-    async fn path_pending_within_bound(
-        validation: &IndexValidation,
-        path: &rift_core::ProjectPath,
-    ) -> bool {
-        for _attempt in 0..LANE_ATTEMPTS_MAX {
-            let observed = {
-                let pending = validation.locked_pending();
-                pending.covers_whole_workspace() || pending.paths().any(|held| held == path)
-            };
-            if observed {
-                return true;
-            }
-            tokio::time::sleep(LANE_POLL).await;
-        }
-        false
-    }
-
-    #[tokio::test]
-    async fn a_change_the_publisher_lands_keeps_the_next_batch_incremental() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let current = stable_candidate(directory.path(), 0)?;
-        let (validation, _invalidations) =
-            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        validation.install_publication(&current);
-        let _watcher = super::workspace_watcher(directory.path(), &validation)
-            .map_err(|error| format!("watcher must start: {error:?}"))?;
-        let patch = "--- /dev/null\n+++ b/notes.md\n@@ -0,0 +1 @@\n+staged through the publisher\n";
-        let params = PatchParams {
-            patch: patch.into(),
-        };
-        let landed = ChangeService::new(directory.path()).patch(&current.reads, &params)?;
-        assert!(
-            matches!(landed, ChangeResult::Applied { .. }),
-            "the patch must land: {landed:?}"
-        );
-        let notes = rift_core::ProjectPath::new("notes.md")?;
-        assert!(
-            path_pending_within_bound(&validation, &notes).await,
-            "the watcher must report the landed write"
-        );
-
-        let mut request = validation.take_pending();
-        assert!(
-            !request.work.covers_whole_workspace(),
-            "a landed write names its own paths, the staged file's included: {:?}",
-            request.work
-        );
-        request.previous = Some(Arc::clone(&current));
-        let change_set = request.change_set(directory.path(), &current.configuration);
-        let ChangeSet::Incremental(changes) = change_set else {
-            return Err("a landed write resolves to an incremental change set".into());
-        };
-        assert!(
-            changes.paths().any(|path| path == &notes),
-            "the change set names the written file"
         );
         Ok(())
     }
@@ -4186,11 +4081,7 @@ mod tests {
 
     #[test]
     fn non_index_configuration_changes_reuse_the_published_tree() -> TestResult {
-        let configurations = [
-            "[execution]\nmax_code = \"1kb\"\n",
-            "[lsp.rust]\ncommand = \"rust-analyzer\"\n",
-            "[[hooks]]\nid = \"check\"\nkind = \"build\"\ncommand = [\"cargo\", \"check\"]\nchanged_paths = \"none\"\nwrites = \"none\"\nfailure_severity = \"error\"\ndeterminism = \"deterministic\"\n",
-        ];
+        let configurations = ["[server]\nnum_workers = 2\n", "[server]\nnum_workers = 3\n"];
         for configuration in configurations {
             let directory = tempfile::tempdir()?;
             fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
@@ -4461,7 +4352,7 @@ mod tests {
                 root: directory.path().to_path_buf(),
                 limits: WorkspaceIndexLimits::default(),
                 published: Arc::clone(&published),
-                change_lane: Arc::new(crate::server::ChangeLane::default()),
+
                 validation: Arc::clone(&validation),
                 blocking,
                 population: None,
@@ -4523,7 +4414,7 @@ mod tests {
                 root: directory.path().join("vanished"),
                 limits: WorkspaceIndexLimits::default(),
                 published: Arc::clone(&published),
-                change_lane: Arc::new(crate::server::ChangeLane::default()),
+
                 validation: Arc::clone(&validation),
                 blocking: crate::server::BlockingExecutor::isolated(2, 60_000),
                 population: None,
@@ -4839,7 +4730,7 @@ mod tests {
             root: root.to_path_buf(),
             limits: WorkspaceIndexLimits::default(),
             published: Arc::clone(state),
-            change_lane: Arc::new(crate::server::ChangeLane::default()),
+
             validation: Arc::clone(validation),
             blocking: BlockingExecutor::for_configuration(&ServerConfiguration::default()),
             population: None,
@@ -6284,7 +6175,7 @@ mod tests {
                 root: directory.path().to_path_buf(),
                 limits: WorkspaceIndexLimits::default(),
                 published: Arc::clone(&published),
-                change_lane: Arc::new(crate::server::ChangeLane::default()),
+
                 validation: Arc::clone(&validation),
                 blocking: blocking.clone(),
                 population: None,
@@ -6351,7 +6242,7 @@ mod tests {
             root: root.to_path_buf(),
             limits: WorkspaceIndexLimits::default(),
             published: Arc::clone(published),
-            change_lane: Arc::new(crate::server::ChangeLane::default()),
+
             validation: Arc::clone(validation),
             blocking: blocking.clone(),
             population: None,

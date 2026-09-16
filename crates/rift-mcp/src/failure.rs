@@ -1,13 +1,7 @@
-//! Wire projection of operating failures, hook findings, and stale-snapshot
-//! findings served on tool results.
-
-use std::fmt::Write as _;
+//! Wire projection of operating failures served on tool results.
 
 use rift_core::{ErrorName, Fault};
-use rift_protocol::configuration::CommandHook;
 use rift_protocol::error as wire;
-use rift_protocol::read::DiagnosticCode;
-use rift_server::{HookRun, HookStatus, ReadError};
 use rmcp::ErrorData;
 use rmcp::model::ErrorCode;
 
@@ -20,96 +14,6 @@ pub(crate) const RIFT_ERROR_CODE: ErrorCode = ErrorCode(-32000);
 /// Most `causes` entries one wire error carries, matching the advertised
 /// schema bound.
 pub(crate) const ERROR_CAUSES_MAX: usize = 8;
-
-/// Bytes of each captured hook stream a failure finding quotes. The finding
-/// also states the full sizes, so a truncated quote stays distinguishable
-/// from a short log.
-pub(crate) const HOOK_FINDING_STREAM_BYTES_MAX: usize = 1_024;
-
-/// The finding an applied change carries for one hook that did not pass:
-/// what ended the run, then each non-empty stream's size and bounded quote.
-pub(crate) fn hook_failure_diagnostic(
-    hook: &CommandHook,
-    run: &HookRun,
-) -> rift_protocol::read::Diagnostic {
-    let account = match &run.status {
-        HookStatus::Passed => unreachable!(
-            "a passing hook contributes guarantees, not findings: hook={:?}",
-            hook.id
-        ),
-        HookStatus::Failed => match run.exit_code {
-            Some(code) => format!("exited {code}"),
-            None => "exited nonzero".to_owned(),
-        },
-        HookStatus::TimedOut => format!("killed after {}ms", hook.timeout.milliseconds()),
-        HookStatus::Error(message) => message.clone(),
-    };
-    let mut message = format!("hook {} did not pass: {account}", hook.id);
-    for (stream_name, stream) in [("stdout", &run.stdout), ("stderr", &run.stderr)] {
-        if stream.total_bytes == 0 {
-            continue;
-        }
-        let quoted = bounded_prefix(&stream.text, HOOK_FINDING_STREAM_BYTES_MAX);
-        let _ = write!(
-            message,
-            "; {stream_name} ({} of {} bytes): {quoted}",
-            quoted.len(),
-            stream.total_bytes,
-        );
-    }
-    rift_protocol::read::Diagnostic {
-        severity: match hook.failure_severity {
-            rift_protocol::configuration::HookFailureSeverity::Warning => {
-                rift_protocol::read::Severity::Warning
-            }
-            rift_protocol::configuration::HookFailureSeverity::Error => {
-                rift_protocol::read::Severity::Error
-            }
-        },
-        code: Some(DiagnosticCode::HookFailed.code()),
-        message,
-        span: None,
-        related: Vec::new(),
-        tags: Vec::new(),
-        reliability: rift_protocol::read::DiagnosticReliability::Reliable,
-        continuation: rift_protocol::read::DiagnosticContinuation::Unknown,
-        extensions: rift_protocol::read::Extensions(std::collections::BTreeMap::new()),
-        language: None,
-    }
-}
-
-/// The longest prefix of `text` within `bytes_max` that ends on a character
-/// boundary. The walk back is bounded by UTF-8 itself: at most three steps.
-pub(crate) fn bounded_prefix(text: &str, bytes_max: usize) -> &str {
-    if text.len() <= bytes_max {
-        return text;
-    }
-    let mut end = bytes_max;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
-}
-
-/// Finding carried when follow-up snapshot cannot rebuild. Current-tree
-/// reads refuse that dirty epoch until one can.
-pub(crate) fn stale_snapshot_diagnostic(error: &ReadError) -> rift_protocol::read::Diagnostic {
-    rift_protocol::read::Diagnostic {
-        severity: rift_protocol::read::Severity::Warning,
-        code: Some(DiagnosticCode::SnapshotStale.code()),
-        message: format!(
-            "the change landed, and the read snapshot could not refresh; \
-             current-tree reads wait for a successful workspace reindex: {error}"
-        ),
-        span: None,
-        related: Vec::new(),
-        tags: Vec::new(),
-        reliability: rift_protocol::read::DiagnosticReliability::Reliable,
-        continuation: rift_protocol::read::DiagnosticContinuation::Unknown,
-        extensions: rift_protocol::read::Extensions(std::collections::BTreeMap::new()),
-        language: None,
-    }
-}
 
 /// Boundary view of a read failure: the projection a tool handler serves as
 /// the JSON-RPC error object the design documents - code `-32000`, the
@@ -200,7 +104,7 @@ mod tests {
     use rift_core::{CliCode, ErrorName, SourceVisibility};
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::error as wire;
-    use rift_server::{ReadFault, ReadService};
+    use rift_server::ReadService;
 
     use super::WireFailure;
 
@@ -253,112 +157,6 @@ mod tests {
             causes.len(),
             super::ERROR_CAUSES_MAX,
             "a chain deeper than the bound must truncate at the bound"
-        );
-    }
-
-    fn probe_hook() -> rift_protocol::configuration::CommandHook {
-        use rift_protocol::configuration::{
-            ChangedPaths, CommandInput, Determinism, HookFailureSeverity, HookKind, HookWrites,
-        };
-        rift_protocol::configuration::CommandHook {
-            id: "tests".to_owned(),
-            kind: HookKind::Test,
-            command: CommandInput::ProgramAndArguments(vec!["cargo".to_owned(), "test".to_owned()]),
-            changed_paths: ChangedPaths::None,
-            writes: HookWrites::None,
-            working_directory: rift_protocol::read::ProjectPath(String::new()),
-            environment: std::collections::BTreeMap::new(),
-            timeout: rift_protocol::configuration::Duration::from_millis(120_000),
-            output_limit: rift_protocol::configuration::ByteSize::from_bytes(4_096),
-            failure_severity: HookFailureSeverity::Error,
-            guarantees: Vec::new(),
-            determinism: Determinism::Deterministic,
-            include: Vec::new(),
-            exclude: Vec::new(),
-        }
-    }
-
-    fn silent_run(status: rift_server::HookStatus, exit_code: Option<i32>) -> rift_server::HookRun {
-        rift_server::HookRun {
-            id: "tests".to_owned(),
-            status,
-            exit_code,
-            stdout: rift_server::CapturedStream::default(),
-            stderr: rift_server::CapturedStream::default(),
-        }
-    }
-
-    #[test]
-    fn failed_hook_finding_quotes_exit_code_and_nonempty_streams() {
-        use rift_server::{CapturedStream, HookStatus};
-        let mut run = silent_run(HookStatus::Failed, Some(1));
-        run.stdout = CapturedStream {
-            text: "boom".to_owned(),
-            captured_bytes: 4,
-            total_bytes: 4,
-            truncated: false,
-        };
-        let finding = super::hook_failure_diagnostic(&probe_hook(), &run);
-        assert_eq!(finding.severity, rift_protocol::read::Severity::Error);
-        assert_eq!(finding.code.as_deref(), Some("rift.hook.failed"));
-        assert!(
-            finding.message.contains("exited 1")
-                && finding.message.contains("stdout (4 of 4 bytes): boom")
-                && !finding.message.contains("stderr"),
-            "{}",
-            finding.message
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "a passing hook contributes guarantees, not findings")]
-    fn passing_hook_finding_is_a_programmer_error() {
-        let run = silent_run(rift_server::HookStatus::Passed, Some(0));
-        let _ = super::hook_failure_diagnostic(&probe_hook(), &run);
-    }
-
-    #[test]
-    fn hook_finding_accounts_for_every_non_passing_outcome() {
-        use rift_server::HookStatus;
-        let cases = [
-            (HookStatus::Failed, None, "exited nonzero"),
-            (HookStatus::TimedOut, None, "killed after 120000ms"),
-            (
-                HookStatus::Error("failed to launch: missing".to_owned()),
-                None,
-                "failed to launch: missing",
-            ),
-        ];
-        for (status, exit_code, expected) in cases {
-            let finding =
-                super::hook_failure_diagnostic(&probe_hook(), &silent_run(status, exit_code));
-            assert!(
-                finding.message.contains(expected),
-                "{expected} missing from {}",
-                finding.message
-            );
-        }
-    }
-
-    #[test]
-    fn bounded_prefix_cuts_on_character_boundaries() {
-        assert_eq!(super::bounded_prefix("short", 16), "short");
-        assert_eq!(super::bounded_prefix("ééé", 3), "é");
-        assert_eq!(super::bounded_prefix("ééé", 4), "éé");
-    }
-
-    #[test]
-    fn stale_snapshot_finding_carries_its_code_and_the_render() {
-        let error = rift_server::ReadError::from(ReadFault::Unsupported {
-            capability: "probe".to_owned(),
-        });
-        let finding = super::stale_snapshot_diagnostic(&error);
-        assert_eq!(finding.code.as_deref(), Some("rift.snapshot.stale"));
-        assert_eq!(finding.severity, rift_protocol::read::Severity::Warning);
-        assert!(
-            finding.message.contains("the change landed"),
-            "{}",
-            finding.message
         );
     }
 

@@ -15,13 +15,13 @@ use rift_lsp::session::EngineLaunch;
 const SHELL_PROGRAM: &str = "sh";
 
 /// The fixed `initialize` answer every handshake-completing fixture writes,
-/// advertising rename so a lifecycle test may drive one request past the
+/// advertising references so a lifecycle test may drive one request past the
 /// handshake before its fixture exits, hangs, or answers no further.
 ///
 /// `EngineSession` allocates ids from zero, and `initialize` is always the
 /// first request a fresh session sends, so `id: 0` always matches.
 fn initialize_answer_frame() -> String {
-    let body = r#"{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"renameProvider":true}}}"#;
+    let body = r#"{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"referencesProvider":true}}}"#;
     format!("Content-Length: {}\r\n\r\n{body}", body.len())
 }
 

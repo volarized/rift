@@ -17,39 +17,11 @@ use serde_json::json;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-/// A `[[hooks]]` block whose `timeout` breaks its documented bound.
-const INVALID_CONFIGURATION: &str = r#"
-[[hooks]]
-id = "tests"
-kind = "test"
-command = ["cargo", "test"]
-changed_paths = "none"
-writes = "none"
-working_directory = ""
-environment = {}
-timeout = "0ms"
-output_limit = "4kb"
-failure_severity = "error"
-guarantees = []
-determinism = "deterministic"
-"#;
+/// A server table whose worker count breaks its documented bound.
+const INVALID_CONFIGURATION: &str = "[server]\nnum_workers = 0\n";
 
-/// The same block with its timeout inside the bound.
-const VALID_CONFIGURATION: &str = r#"
-[[hooks]]
-id = "tests"
-kind = "test"
-command = ["cargo", "test"]
-changed_paths = "none"
-writes = "none"
-working_directory = ""
-environment = {}
-timeout = "120s"
-output_limit = "4kb"
-failure_severity = "error"
-guarantees = []
-determinism = "deterministic"
-"#;
+/// The same table with its worker count inside the bound.
+const VALID_CONFIGURATION: &str = "[server]\nnum_workers = 4\n";
 
 /// A `[search.text]` block whose `max_chunk` breaks its documented 1kb..16mb bound.
 const INVALID_TEXT_CONFIGURATION: &str = r#"
@@ -115,37 +87,6 @@ async fn refused_call(
     };
     data.data
         .ok_or_else(|| "wire error data must be present".into())
-}
-
-#[tokio::test]
-async fn invalid_configuration_fails_reads_and_changes_typed() -> TestResult {
-    let directory = workspace_with(Some(INVALID_CONFIGURATION))?;
-    let client = client_for(directory.path()).await?;
-
-    let read = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
-    assert_eq!(read["code"], json!("configuration_invalid"));
-    assert_eq!(read["retry"], json!("operator_action"));
-    assert_eq!(read["phase"], json!("read"));
-    let message = read["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("hooks.timeout") && message.contains("1..=3600000"),
-        "the refusal must name the field and its range: {message}"
-    );
-
-    let change = refused_call(
-        &client,
-        "replace_symbol",
-        json!({
-            "symbol": "rift://symbol/rust/lib.rs/beacon",
-            "body": "pub fn beacon() -> u8 { 7 }"
-        }),
-    )
-    .await?;
-    assert_eq!(change["code"], json!("configuration_invalid"));
-    assert_eq!(change["phase"], json!("change"));
-
-    client.cancel().await?;
-    Ok(())
 }
 
 #[tokio::test]

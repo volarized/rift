@@ -7,10 +7,9 @@
 use lsp_types::{
     ClientCapabilities, DiagnosticClientCapabilities, DiagnosticServerCapabilities,
     DiagnosticWorkspaceClientCapabilities, DidChangeWatchedFilesClientCapabilities,
-    FileOperationFilter, GeneralClientCapabilities, InitializeResult, OneOf, PositionEncodingKind,
-    ReferenceClientCapabilities, RenameClientCapabilities, TextDocumentClientCapabilities,
-    WindowClientCapabilities, WorkspaceClientCapabilities, WorkspaceEditClientCapabilities,
-    WorkspaceFileOperationsClientCapabilities,
+    GeneralClientCapabilities, InitializeResult, OneOf, PositionEncodingKind,
+    ReferenceClientCapabilities, TextDocumentClientCapabilities, WindowClientCapabilities,
+    WorkspaceClientCapabilities,
 };
 use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, fault_label};
 use serde::Serialize;
@@ -53,23 +52,12 @@ impl Fault for CapabilitiesFault {
 pub type CapabilitiesError = Error<CapabilitiesFault>;
 
 /// What one engine advertised at initialize.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "each flag is one independently negotiated LSP capability, mirroring the \
-              protocol's own capability grid, not a boolean mode parameter"
-)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Capabilities {
     /// The negotiated position encoding.
     pub position_encoding: PositionEncoding,
-    /// Whether the engine serves `textDocument/rename`.
-    pub rename: bool,
-    /// Whether the engine serves `textDocument/prepareRename`.
-    pub prepare_rename: bool,
     /// Whether the engine serves `textDocument/references`.
     pub references: bool,
-    /// The `workspace/willRenameFiles` filters; absent when unserved.
-    pub will_rename_filters: Option<Vec<FileOperationFilter>>,
     /// Whether the engine serves `textDocument/diagnostic`.
     pub pull_diagnostics: bool,
     /// The identifier the engine registered its diagnostics under.
@@ -81,10 +69,7 @@ impl Default for Capabilities {
     fn default() -> Self {
         Self {
             position_encoding: PositionEncoding::Utf16,
-            rename: false,
-            prepare_rename: false,
             references: false,
-            will_rename_filters: None,
             pull_diagnostics: false,
             diagnostic_identifier: None,
         }
@@ -112,22 +97,11 @@ impl Capabilities {
                 }));
             }
         };
-        let (rename, prepare_rename) = match advertised.rename_provider.as_ref() {
-            Some(OneOf::Left(served)) => (*served, false),
-            Some(OneOf::Right(options)) => (true, options.prepare_provider == Some(true)),
-            None => (false, false),
-        };
         let references = match advertised.references_provider.as_ref() {
             Some(OneOf::Left(served)) => *served,
             Some(OneOf::Right(_options)) => true,
             None => false,
         };
-        let will_rename_filters = advertised
-            .workspace
-            .as_ref()
-            .and_then(|workspace| workspace.file_operations.as_ref())
-            .and_then(|operations| operations.will_rename.as_ref())
-            .map(|registration| registration.filters.clone());
         let (pull_diagnostics, diagnostic_identifier) =
             match advertised.diagnostic_provider.as_ref() {
                 Some(DiagnosticServerCapabilities::Options(options)) => {
@@ -140,62 +114,11 @@ impl Capabilities {
             };
         Ok(Self {
             position_encoding,
-            rename,
-            prepare_rename,
             references,
-            will_rename_filters,
             pull_diagnostics,
             diagnostic_identifier,
         })
     }
-
-    /// Whether the engine serves `workspace/willRenameFiles`.
-    #[must_use]
-    pub fn will_rename_files(&self) -> bool {
-        self.will_rename_filters.is_some()
-    }
-
-    /// Whether one project-relative file path matches the engine's
-    /// will-rename filters.
-    ///
-    /// At most [`WILL_RENAME_FILTERS_MAX`] filters are consulted. A filter
-    /// naming a non-`file` scheme or the folder pattern kind does not apply
-    /// to a file move, and a glob the matcher cannot compile matches
-    /// nothing. Absent filters match nothing: the capability gate, not this
-    /// check, owns that refusal.
-    #[must_use]
-    pub fn will_rename_matches(&self, path: &str) -> bool {
-        let Some(filters) = self.will_rename_filters.as_deref() else {
-            return false;
-        };
-        filters
-            .iter()
-            .take(WILL_RENAME_FILTERS_MAX)
-            .any(|filter| filter_matches(filter, path))
-    }
-}
-
-/// Most will-rename filters one match consults.
-pub const WILL_RENAME_FILTERS_MAX: usize = 64;
-
-/// Whether one file-operation filter applies to and matches a file path.
-fn filter_matches(filter: &FileOperationFilter, path: &str) -> bool {
-    if filter
-        .scheme
-        .as_deref()
-        .is_some_and(|scheme| scheme != "file")
-    {
-        return false;
-    }
-    if filter.pattern.matches == Some(lsp_types::FileOperationPatternKind::Folder) {
-        return false;
-    }
-    let ignore_case = filter
-        .pattern
-        .options
-        .as_ref()
-        .is_some_and(|options| options.ignore_case == Some(true));
-    glob_matches(&filter.pattern.glob, ignore_case, path)
 }
 
 /// Whether one LSP glob matches a slash-separated relative path.
@@ -214,8 +137,8 @@ pub(crate) fn glob_matches(glob: &str, ignore_case: bool, path: &str) -> bool {
 
 /// What the session offers every engine.
 ///
-/// UTF-8 positions preferred with the mandatory UTF-16 fallback, prepared
-/// renames, will-rename requests, and document diagnostic pulls.
+/// UTF-8 positions preferred with the mandatory UTF-16 fallback, references,
+/// and document diagnostic pulls.
 ///
 /// `window.workDoneProgress` is what makes an engine report the work it is
 /// doing: the protocol forbids server-initiated progress unless the client
@@ -249,14 +172,6 @@ pub fn offered() -> ClientCapabilities {
             diagnostic: Some(DiagnosticWorkspaceClientCapabilities {
                 refresh_support: Some(true),
             }),
-            workspace_edit: Some(WorkspaceEditClientCapabilities {
-                document_changes: Some(true),
-                ..WorkspaceEditClientCapabilities::default()
-            }),
-            file_operations: Some(WorkspaceFileOperationsClientCapabilities {
-                will_rename: Some(true),
-                ..WorkspaceFileOperationsClientCapabilities::default()
-            }),
             did_change_watched_files: Some(DidChangeWatchedFilesClientCapabilities {
                 dynamic_registration: Some(true),
                 relative_pattern_support: Some(true),
@@ -264,10 +179,6 @@ pub fn offered() -> ClientCapabilities {
             ..WorkspaceClientCapabilities::default()
         }),
         text_document: Some(TextDocumentClientCapabilities {
-            rename: Some(RenameClientCapabilities {
-                prepare_support: Some(true),
-                ..RenameClientCapabilities::default()
-            }),
             references: Some(ReferenceClientCapabilities::default()),
             diagnostic: Some(DiagnosticClientCapabilities {
                 dynamic_registration: Some(true),
@@ -286,10 +197,7 @@ pub fn offered() -> ClientCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lsp_types::{
-        DiagnosticOptions, FileOperationRegistrationOptions, RenameOptions, ServerCapabilities,
-        WorkspaceFileOperationsServerCapabilities, WorkspaceServerCapabilities,
-    };
+    use lsp_types::{DiagnosticOptions, ServerCapabilities};
 
     fn answer(capabilities: ServerCapabilities) -> InitializeResult {
         InitializeResult {
@@ -303,9 +211,7 @@ mod tests {
         let record =
             Capabilities::negotiated(&answer(ServerCapabilities::default())).expect("record");
         assert_eq!(record.position_encoding, PositionEncoding::Utf16);
-        assert!(!record.rename && !record.prepare_rename);
         assert!(!record.references);
-        assert!(!record.will_rename_files());
         assert!(!record.pull_diagnostics);
         assert_eq!(record.diagnostic_identifier, None);
     }
@@ -397,39 +303,8 @@ mod tests {
     }
 
     #[test]
-    fn rename_forms_map_to_the_rename_and_prepare_flags() {
-        let plain = answer(ServerCapabilities {
-            rename_provider: Some(OneOf::Left(true)),
-            ..ServerCapabilities::default()
-        });
-        let record = Capabilities::negotiated(&plain).expect("record");
-        assert!(record.rename && !record.prepare_rename);
-        let refused = answer(ServerCapabilities {
-            rename_provider: Some(OneOf::Left(false)),
-            ..ServerCapabilities::default()
-        });
-        assert!(!Capabilities::negotiated(&refused).expect("record").rename);
-        let prepared = answer(ServerCapabilities {
-            rename_provider: Some(OneOf::Right(RenameOptions {
-                prepare_provider: Some(true),
-                work_done_progress_options: lsp_types::WorkDoneProgressOptions::default(),
-            })),
-            ..ServerCapabilities::default()
-        });
-        let record = Capabilities::negotiated(&prepared).expect("record");
-        assert!(record.rename && record.prepare_rename);
-    }
-
-    #[test]
-    fn will_rename_filters_and_diagnostic_options_are_recorded() {
+    fn diagnostic_options_are_recorded() {
         let advertised = answer(ServerCapabilities {
-            workspace: Some(WorkspaceServerCapabilities {
-                workspace_folders: None,
-                file_operations: Some(WorkspaceFileOperationsServerCapabilities {
-                    will_rename: Some(FileOperationRegistrationOptions { filters: vec![] }),
-                    ..WorkspaceFileOperationsServerCapabilities::default()
-                }),
-            }),
             diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
                 identifier: Some("probe".to_owned()),
                 ..DiagnosticOptions::default()
@@ -437,83 +312,8 @@ mod tests {
             ..ServerCapabilities::default()
         });
         let record = Capabilities::negotiated(&advertised).expect("record");
-        assert!(record.will_rename_files());
         assert!(record.pull_diagnostics);
         assert_eq!(record.diagnostic_identifier.as_deref(), Some("probe"));
-    }
-
-    /// A record advertising exactly these will-rename filters.
-    fn filtered(filters: Vec<lsp_types::FileOperationFilter>) -> Capabilities {
-        Capabilities {
-            will_rename_filters: Some(filters),
-            ..Capabilities::default()
-        }
-    }
-
-    fn filter(glob: &str) -> lsp_types::FileOperationFilter {
-        lsp_types::FileOperationFilter {
-            scheme: None,
-            pattern: lsp_types::FileOperationPattern {
-                glob: glob.to_owned(),
-                matches: None,
-                options: None,
-            },
-        }
-    }
-
-    #[test]
-    fn will_rename_matches_follows_the_lsp_glob_grammar() {
-        let record = filtered(vec![filter("**/*.{ts,tsx}")]);
-        assert!(record.will_rename_matches("src/App.tsx"));
-        assert!(record.will_rename_matches("index.ts"));
-        assert!(!record.will_rename_matches("src/lib.rs"));
-        let single_segment = filtered(vec![filter("*.rs")]);
-        assert!(single_segment.will_rename_matches("lib.rs"));
-        assert!(
-            !single_segment.will_rename_matches("src/lib.rs"),
-            "`*` must not cross a path segment"
-        );
-        assert!(filtered(vec![filter("**/*")]).will_rename_matches("a/b/c.py"));
-        assert!(
-            !filtered(vec![filter("**/*.[")]).will_rename_matches("lib.rs"),
-            "a glob that does not compile matches nothing"
-        );
-        assert!(
-            !Capabilities::default().will_rename_matches("lib.rs"),
-            "absent filters match nothing"
-        );
-    }
-
-    #[test]
-    fn will_rename_filters_apply_by_scheme_kind_and_case_option() {
-        let mut untitled = filter("**/*.rs");
-        untitled.scheme = Some("untitled".to_owned());
-        assert!(!filtered(vec![untitled]).will_rename_matches("lib.rs"));
-        let mut file_scheme = filter("**/*.rs");
-        file_scheme.scheme = Some("file".to_owned());
-        assert!(filtered(vec![file_scheme]).will_rename_matches("lib.rs"));
-        let mut folders = filter("**/*.rs");
-        folders.pattern.matches = Some(lsp_types::FileOperationPatternKind::Folder);
-        assert!(
-            !filtered(vec![folders]).will_rename_matches("lib.rs"),
-            "a folder filter does not apply to a file move"
-        );
-        let mut cased = filter("**/*.RS");
-        assert!(!filtered(vec![cased.clone()]).will_rename_matches("lib.rs"));
-        cased.pattern.options = Some(lsp_types::FileOperationPatternOptions {
-            ignore_case: Some(true),
-        });
-        assert!(filtered(vec![cased]).will_rename_matches("lib.rs"));
-    }
-
-    #[test]
-    fn will_rename_matches_consults_filters_only_up_to_the_bound() {
-        let mut filters = vec![filter("**/*.py"); WILL_RENAME_FILTERS_MAX];
-        filters.push(filter("**/*.rs"));
-        assert!(
-            !filtered(filters).will_rename_matches("lib.rs"),
-            "the matching filter past the bound is never consulted"
-        );
     }
 
     #[test]
@@ -539,16 +339,12 @@ mod tests {
             Some(true),
             "diagnostic refresh requests can invalidate an earlier pull"
         );
-        let operations = workspace
-            .file_operations
-            .expect("file operations are offered");
-        assert_eq!(operations.will_rename, Some(true));
         let text_document = offered
             .text_document
             .expect("text document capabilities are offered");
         assert!(
             text_document.references.is_some(),
-            "the remove tools stand on textDocument/references being offered"
+            "reference requests require textDocument/references"
         );
         let window = offered.window.expect("window capabilities are offered");
         assert_eq!(

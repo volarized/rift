@@ -5,15 +5,12 @@
 //! base protocol backed by the linked-in ty crates. Every consumption site
 //! keeps its one engine contract: capability negotiation, settlement, and
 //! position encoding run exactly as they do over a spawned process, so
-//! rename, references, and diagnostics need no embedded-specific path.
+//! references and diagnostics need no embedded-specific path.
 //!
 //! The served surface is the subset the server itself asks engines for:
-//! `initialize`, document open and close, `textDocument/prepareRename`,
-//! `textDocument/rename`, `textDocument/references`, and the
-//! `textDocument/diagnostic` pull. `workspace/willRenameFiles` is not
-//! advertised, so a moved Python file lands with the references-not-updated
-//! warning the capability's absence carries. Ranges cross the wire in
-//! UTF-8 positions, the encoding the answer advertises.
+//! `initialize`, document open and close, `textDocument/references`, and the
+//! `textDocument/diagnostic` pull. Ranges cross the wire in UTF-8 positions,
+//! the encoding the answer advertises.
 //!
 //! ty analyzes the tree on disk: the database is rooted at the workspace,
 //! discovery stays inside it (`discover_without_uv` only when the tree
@@ -204,10 +201,7 @@ fn handle_message(message: &Value, root: &Path, documents: &DocumentStore) -> Ha
         }
         ("initialize", Some(id)) => Handled::Reply(reply(&id, &initialize_result())),
         ("shutdown", Some(id)) => Handled::Reply(reply(&id, &Value::Null)),
-        ("textDocument/prepareRename", Some(id)) => {
-            answered(&id, root, documents, &params, prepare_rename)
-        }
-        ("textDocument/rename", Some(id)) => answered(&id, root, documents, &params, rename),
+
         ("textDocument/references", Some(id)) => {
             answered(&id, root, documents, &params, references)
         }
@@ -263,13 +257,12 @@ fn error_reply(id: &Value, code: i64, message: &str) -> Value {
 }
 
 /// The capabilities this engine advertises: UTF-8 positions, prepare and
-/// rename, references, and the diagnostic pull. No file-operation
+/// references and the diagnostic pull. No file-operation
 /// capability is declared, so moves warn instead of asking.
 fn initialize_result() -> Value {
     json!({
         "capabilities": {
             "positionEncoding": "utf-8",
-            "renameProvider": { "prepareProvider": true },
             "referencesProvider": true,
             "diagnosticProvider": {
                 "interFileDependencies": true,
@@ -452,71 +445,6 @@ fn range_at(text: &str, range: TextRange) -> Result<Value, AnswerRefusal> {
     Ok(json!({ "start": start, "end": end }))
 }
 
-/// Answers `textDocument/prepareRename`: the renameable range, or `null`.
-fn prepare_rename(
-    database: &mut ProjectDatabase,
-    exchange: &Exchange<'_>,
-    params: &Value,
-) -> Result<Value, AnswerRefusal> {
-    let file = file_at(
-        database,
-        params.pointer("/textDocument/uri").unwrap_or(&Value::Null),
-    )?;
-    database.project().open_file(database, file);
-    let program_file = database.program_file(file);
-    let text = source_text(database, file);
-    let text = exchange.conversion_text(text.as_str());
-    let offset = offset_at(text, params.pointer("/position").unwrap_or(&Value::Null))?;
-    match ty_ide::can_rename(database, program_file, offset) {
-        Some(range) => range_at(text, range),
-        None => Ok(Value::Null),
-    }
-}
-
-/// Answers `textDocument/rename`: the workspace edit renaming every
-/// reference, or `null` when nothing renameable is declared at the position.
-fn rename(
-    database: &mut ProjectDatabase,
-    exchange: &Exchange<'_>,
-    params: &Value,
-) -> Result<Value, AnswerRefusal> {
-    let file = file_at(
-        database,
-        params.pointer("/textDocument/uri").unwrap_or(&Value::Null),
-    )?;
-    database.project().open_file(database, file);
-    let program_file = database.program_file(file);
-    let text = source_text(database, file);
-    let text = exchange.conversion_text(text.as_str());
-    let offset = offset_at(text, params.pointer("/position").unwrap_or(&Value::Null))?;
-    let new_name = params
-        .pointer("/newName")
-        .and_then(Value::as_str)
-        .ok_or_else(|| AnswerRefusal::Invalid("rename carries no newName".to_owned()))?;
-    if ty_ide::can_rename(database, program_file, offset).is_none() {
-        return Ok(Value::Null);
-    }
-    let Some(targets) = ty_ide::rename(database, program_file, offset, new_name) else {
-        return Ok(Value::Null);
-    };
-    let mut changes: serde_json::Map<String, Value> = serde_json::Map::new();
-    for target in &targets {
-        let Some((uri, edit_range)) =
-            target_location(database, exchange, target.file(), target.range())?
-        else {
-            continue;
-        };
-        let edit = json!({ "range": edit_range, "newText": new_name });
-        match changes.get_mut(&uri) {
-            Some(Value::Array(edits)) => edits.push(edit),
-            _ => {
-                changes.insert(uri, Value::Array(vec![edit]));
-            }
-        }
-    }
-    Ok(json!({ "changes": changes }))
-}
-
 /// Answers `textDocument/references`.
 fn references(
     database: &mut ProjectDatabase,
@@ -638,13 +566,9 @@ mod tests {
     }
 
     #[test]
-    fn test_initialize_advertises_utf8_rename_references_and_the_pull() {
+    fn test_initialize_advertises_utf8_references_and_the_pull() {
         let capabilities = initialize_result();
         assert_eq!(capabilities["capabilities"]["positionEncoding"], "utf-8");
-        assert_eq!(
-            capabilities["capabilities"]["renameProvider"]["prepareProvider"],
-            true
-        );
         assert_eq!(capabilities["capabilities"]["referencesProvider"], true);
         assert!(capabilities["capabilities"]["diagnosticProvider"].is_object());
         assert!(
@@ -698,36 +622,6 @@ mod tests {
             panic!("shutdown must reply");
         };
         assert_eq!(reply["result"], Value::Null);
-    }
-
-    /// The diagnostic pull reports ty's finding for a file on disk, end to
-    /// end through the message handler: database build, file resolution,
-    /// check, and range rendering.
-    /// prepareRename answers the declaration's own range for a plain
-    /// function, so the engine-backed rename path is reachable.
-    #[test]
-    fn test_prepare_rename_answers_a_range_for_a_function_name() {
-        let directory = tempfile::tempdir().expect("fixture directory");
-        let path = directory.path().join("service.py");
-        std::fs::write(&path, "def serve(port: int) -> int:\n    return port\n")
-            .expect("fixture file");
-        let message = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "textDocument/prepareRename",
-            "params": {
-                "textDocument": { "uri": path_to_uri(&path) },
-                "position": { "line": 0, "character": 4 },
-            },
-        });
-        let Handled::Reply(reply) = handle_message(&message, directory.path(), &empty_documents())
-        else {
-            panic!("prepareRename must reply");
-        };
-        assert!(
-            reply["result"].is_object(),
-            "a function name is renameable: {reply:#}"
-        );
     }
 
     #[test]
@@ -820,53 +714,6 @@ mod tests {
             serde_json::json!([]),
             "a position resolving no symbol answers the empty list"
         );
-    }
-
-    /// The rename refusal arms: a request without `newName` errs, and a
-    /// position ty cannot rename answers `null` for prepare and rename both.
-    #[test]
-    fn test_rename_refusals_answer_error_and_null() {
-        let directory = tempfile::tempdir().expect("fixture directory");
-        let path = directory.path().join("a.py");
-        std::fs::write(&path, "def helper():\n    return 1\n").expect("fixture");
-        let uri = path_to_uri(&path);
-        let nameless = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 5,
-            "method": "textDocument/rename",
-            "params": {
-                "textDocument": { "uri": uri },
-                "position": { "line": 0, "character": 4 },
-            },
-        });
-        let Handled::Reply(reply) = handle_message(&nameless, directory.path(), &empty_documents())
-        else {
-            panic!("rename must reply");
-        };
-        assert_eq!(reply["error"]["code"], INTERNAL_ERROR, "{reply:#}");
-
-        for method in ["textDocument/prepareRename", "textDocument/rename"] {
-            let keyword = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 6,
-                "method": method,
-                "params": {
-                    "textDocument": { "uri": uri },
-                    "position": { "line": 0, "character": 0 },
-                    "newName": "renamed",
-                },
-            });
-            let Handled::Reply(reply) =
-                handle_message(&keyword, directory.path(), &empty_documents())
-            else {
-                panic!("{method} must reply");
-            };
-            assert_eq!(
-                reply["result"],
-                Value::Null,
-                "`def` is not renameable: {method}, {reply:#}"
-            );
-        }
     }
 
     /// The serve loop over a raw transport: initialize answers a framed

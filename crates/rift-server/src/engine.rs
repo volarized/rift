@@ -256,6 +256,25 @@ struct SlotState {
     restarts: RestartBudget,
 }
 
+/// Keeps a session reusable only after its exchange finishes.
+///
+/// Cancellation can skip asynchronous document closes. Dropping this guard then drops
+/// the session under the slot lock, so the next request starts with no open documents.
+struct RequestSessionGuard<'slot> {
+    state: &'slot mut SlotState,
+    reported_state: &'slot watch::Sender<LspState>,
+    finished: bool,
+}
+
+impl Drop for RequestSessionGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            drop(self.state.session.take());
+            self.reported_state.send_replace(LspState::Failed);
+        }
+    }
+}
+
 /// The restarts one slot spent, and whether it ever started an engine.
 ///
 /// A slot's first start is the start, not a restart, so it is free. Every
@@ -421,6 +440,12 @@ impl EngineSlot {
         self.report_state(state);
     }
 
+    /// The workspace root spelling used in this engine's document URIs.
+    #[must_use]
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
     /// Named process key or inline exact language identity segment.
     #[must_use]
     pub fn name(&self) -> &str {
@@ -447,6 +472,11 @@ impl EngineSlot {
     ///
     /// Returns operation failure, retry refusal, analyzing exhaustion, start
     /// failure, or ended session.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future discards its session. The next request starts a replacement
+    /// within the configured restart budget.
     pub async fn request<T>(
         &self,
         operation: impl for<'session> FnMut(
@@ -482,6 +512,11 @@ impl EngineSlot {
     ///
     /// Returns operation failure, exhausted refusal, analyzing exhaustion,
     /// start failure, or ended session.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future can skip `finish`, so its session is discarded. The next
+    /// request starts a replacement within the configured restart budget.
     pub async fn request_exchange<T>(
         &self,
         begin: impl for<'session> FnMut(
@@ -533,6 +568,11 @@ impl EngineSlot {
     ///
     /// Returns operation failure, retry refusal, unready exhaustion, start
     /// failure, or ended session.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future can skip `finish`, so its session is discarded. The next
+    /// request starts a replacement within the configured restart budget.
     pub async fn request_settled<T: PartialEq>(
         &self,
         begin: impl for<'session> FnMut(
@@ -580,6 +620,9 @@ impl EngineSlot {
     }
 
     /// Shared bounded request loop.
+    ///
+    /// A canceled request discards its session before releasing the slot lock. A later
+    /// request spends the configured restart budget to start without open documents.
     async fn request_deciding<T>(
         &self,
         mut begin: impl for<'session> FnMut(
@@ -594,12 +637,17 @@ impl EngineSlot {
     ) -> Result<T, EngineError> {
         let retry = self.configuration.retry;
         let mut held = self.state.lock().await;
+        let mut guarded = RequestSessionGuard {
+            state: &mut held,
+            reported_state: &self.reported_state,
+            finished: false,
+        };
         let mut attempt: u64 = 1;
         let mut reported: Option<EngineError> = None;
         let mut exchange_started = false;
         let mut session_generation = 0_u64;
         loop {
-            let state = &mut *held;
+            let state = &mut *guarded.state;
             let session = match state.session.take() {
                 Some(running) if !running.is_ended() => state.session.insert(running),
                 dead => {
@@ -638,6 +686,7 @@ impl EngineSlot {
                 Ok(answer) => match decide(session, session_generation, answer, final_attempt) {
                     Answer::Ready(answer) => {
                         finish(session).await;
+                        guarded.finished = true;
                         return Ok(answer);
                     }
                     Answer::Retry(absorbed) => absorbed,
@@ -650,11 +699,13 @@ impl EngineSlot {
                 Err(error) if error.fault().is_refusal() => Transient::Refused(error),
                 Err(error) => {
                     finish(session).await;
+                    guarded.finished = true;
                     return Err(error);
                 }
             };
             let Some(wait) = retry.delay_after(attempt) else {
                 finish(session).await;
+                guarded.finished = true;
                 return self.exhausted(absorbed, retry.attempts);
             };
             tokio::time::sleep(wait).await;
@@ -816,6 +867,95 @@ mod tests {
     use super::*;
     use rift_protocol::configuration::{ByteSize, CommandInput, Duration as ConfiguredDuration};
     use rift_protocol::retry::RetryPolicy;
+
+    #[tokio::test]
+    async fn canceled_open_document_discards_session_and_preserves_restart_budget() {
+        let directory = tempfile::tempdir().expect("workspace");
+        std::fs::write(directory.path().join("a.py"), "def beacon(): return 1\n").expect("source");
+        std::fs::write(
+            directory.path().join("b.py"),
+            "from a import beacon\nvalue = beacon()\n",
+        )
+        .expect("caller");
+        let configuration: LspConfiguration = serde_json::from_value(serde_json::json!({
+            "embedded": "ty", "restart": { "attempts": 1 }
+        }))
+        .expect("embedded configuration");
+        let key = LspProcessKey::named("python");
+        let pool = EnginePool::new(
+            directory.path(),
+            BTreeMap::from([(key.clone(), configuration)]),
+            BTreeMap::from([("python".to_owned(), key.clone())]),
+        );
+        let slot = pool.engine_by_key(&key).expect("slot");
+        let opened = Arc::new(tokio::sync::Notify::new());
+        {
+            let operation_started = Arc::clone(&opened);
+            let exchange = slot.request_exchange(
+                |session| {
+                    Box::pin(async move {
+                        session
+                            .open(
+                                &rift_core::ProjectPath::new("a.py").expect("path"),
+                                "python",
+                                "def beacon(): return 1\n".to_owned(),
+                            )
+                            .await
+                    })
+                },
+                move |_session| {
+                    let started = Arc::clone(&operation_started);
+                    Box::pin(async move {
+                        started.notify_one();
+                        std::future::pending::<Result<(), EngineError>>().await
+                    })
+                },
+                |session| {
+                    Box::pin(async move {
+                        let _ = session
+                            .close(&rift_core::ProjectPath::new("a.py").expect("path"))
+                            .await;
+                    })
+                },
+            );
+            tokio::pin!(exchange);
+            tokio::select! {
+                result = &mut exchange => panic!("operation must wait: {result:?}"),
+                () = opened.notified() => {},
+            }
+        }
+        assert!(
+            slot.state.lock().await.session.is_none(),
+            "cancellation must drop open documents"
+        );
+        assert_eq!(pool.state_for_key(&key), Some(LspState::Failed));
+        std::fs::write(directory.path().join("a.py"), "\ndef beacon(): return 2\n")
+            .expect("changed source");
+        let version = slot
+            .request(|session| {
+                Box::pin(async move {
+                    session
+                        .open(
+                            &rift_core::ProjectPath::new("b.py").expect("path"),
+                            "python",
+                            "from a import beacon\nvalue = beacon()\n".to_owned(),
+                        )
+                        .await?;
+                    Ok(session.document_version())
+                })
+            })
+            .await
+            .expect("remaining restart starts a clean session");
+        assert_eq!(version, 1, "the other document opens in a new session");
+        let state = slot.state.lock().await;
+        assert_eq!(
+            state.restarts.spent.len(),
+            1,
+            "cancellation spends the existing restart budget"
+        );
+        drop(state);
+        pool.shutdown().await;
+    }
 
     fn table(program: &str) -> LspConfiguration {
         LspConfiguration {

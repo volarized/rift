@@ -18,7 +18,6 @@ autotests = false
 workspace = true
 
 [dependencies]
-diffy.workspace = true
 lsp-types.workspace = true
 percent-encoding.workspace = true
 rift-core.workspace = true

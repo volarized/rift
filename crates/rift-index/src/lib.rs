@@ -37,10 +37,10 @@ pub use semantic::BindingPolicy;
 pub use vector::{SemanticVectorStore, StoredVector};
 pub use workspace::{
     IndexedFile, ReadableSymbol, SymbolMatch, SymbolMatchRank, TextSourceFile,
-    VisibleWorkspaceEntry, WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError,
-    WorkspaceIndexFault, WorkspaceIndexLimits, WorkspaceIndexViolation, WorkspaceIndexWarning,
-    WorkspaceSourcePolicy, capture_digests, capture_digests_with_languages, source_line_matches,
-    symbol_matches, text_line_matches,
+    WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexFault,
+    WorkspaceIndexLimits, WorkspaceIndexViolation, WorkspaceIndexWarning, WorkspaceSourcePolicy,
+    capture_digests, capture_digests_with_languages, source_line_matches, symbol_matches,
+    text_line_matches,
 };
 
 /// Compile-time marker for index-layer ownership.

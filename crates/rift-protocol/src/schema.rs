@@ -26,10 +26,9 @@ mod keyword {
     pub(super) const CONST: &str = "const";
     pub(super) const ENUM: &str = "enum";
     pub(super) const DESCRIPTION: &str = "description";
-    pub(super) const MAX_ITEMS: &str = "maxItems";
+
     pub(super) const MAX_PROPERTIES: &str = "maxProperties";
-    pub(super) const MIN_LENGTH: &str = "minLength";
-    pub(super) const MAX_LENGTH: &str = "maxLength";
+
     pub(super) const PATTERN: &str = "pattern";
     pub(super) const PROPERTY_NAMES: &str = "propertyNames";
     pub(super) const TYPE: &str = "type";
@@ -59,9 +58,6 @@ use crate::read::LANGUAGE_IDENTITY_PATTERN;
 /// dialect. Acceptance refuses a name carrying `:`, because a process name
 /// is not a language identity.
 const LSP_NAME_PATTERN: &str = r"^[a-z][a-z0-9._-]*$";
-
-/// The charset a hook `id` takes: ASCII alphanumerics, `.`, `_`, and `-`.
-const HOOK_ID_PATTERN: &str = r"^[A-Za-z0-9._-]+$";
 
 /// The Rift extension keyword stating an accepted range schema validation
 /// cannot compare itself: the bounds of a string-spelled `ByteSize` or
@@ -158,11 +154,6 @@ fn constant<T: Serialize>(value: &T) -> Value {
     json!({ keyword::CONST: wire(value) })
 }
 
-/// A subclause bounding an array property's length.
-fn max_items(count: u64) -> Value {
-    json!({ keyword::MAX_ITEMS: count })
-}
-
 /// The same clause, carrying a reader-facing description.
 fn described(description: &str, mut clause: Value) -> Value {
     if let Some(object) = clause.as_object_mut() {
@@ -223,7 +214,7 @@ fn declare_empty_object_defaults(schema: &mut Schema, names: &[&str]) {
 }
 
 /// The object schema for one arm of a tagged union, selected by its constant `tag` value.
-/// [`ChangeResult`](crate::change::ChangeResult)'s struct variants generate as inline
+/// [`SearchHit`](crate::search::SearchHit)'s struct variants generate as inline
 /// `oneOf` object schemas rather than `$defs` entries, so a variant-scoped default has
 /// nowhere else to attach.
 fn tagged_union_arm<'schema>(
@@ -477,57 +468,6 @@ pub fn declare_dependencies_ranges(schema: &mut Schema) {
     }
 }
 
-/// Declares [`CommandHook`](crate::configuration::CommandHook) schema rules.
-///
-/// Duration and byte-size ceilings use `rift:range`; server enforces them
-/// during configuration loading. Transform hooks cannot carry guarantees.
-pub fn declare_hook_contract(schema: &mut Schema) {
-    use crate::configuration::{
-        ByteSize, CommandHook, Duration, HOOK_ENVIRONMENT_ENTRIES_MAX, HOOK_OUTPUT_BYTES_MAX,
-        HOOK_OUTPUT_BYTES_MIN, HOOK_TIMEOUT_MS_MAX, HookWrites,
-    };
-    let ranges = [
-        (
-            property!(CommandHook, timeout),
-            range(
-                &Duration::from_millis(1),
-                &Duration::from_millis(HOOK_TIMEOUT_MS_MAX),
-            ),
-        ),
-        (
-            property!(CommandHook, output_limit),
-            range(
-                &ByteSize::from_bytes(HOOK_OUTPUT_BYTES_MIN),
-                &ByteSize::from_bytes(HOOK_OUTPUT_BYTES_MAX),
-            ),
-        ),
-    ];
-    for (name, accepted) in ranges {
-        annotate_property(schema, name, RIFT_RANGE, accepted);
-    }
-    annotate_property(
-        schema,
-        property!(CommandHook, environment),
-        keyword::MAX_PROPERTIES,
-        json!(HOOK_ENVIRONMENT_ENTRIES_MAX),
-    );
-    annotate_property(
-        schema,
-        property!(CommandHook, id),
-        keyword::PATTERN,
-        json!(HOOK_ID_PATTERN),
-    );
-    for writes in [HookWrites::ChangedPaths, HookWrites::Workspace] {
-        append(
-            schema,
-            when(
-                properties(vec![(property!(CommandHook, writes), constant(&writes))]),
-                properties(vec![(property!(CommandHook, guarantees), max_items(0))]),
-            ),
-        );
-    }
-}
-
 /// An [`LspConfiguration`](crate::configuration::LspConfiguration)
 /// states its `Duration` and `ByteSize` ceilings as `rift:range` on their
 /// keys: schema validation alone cannot compare `"30s"` or `"4kb"` against
@@ -699,88 +639,6 @@ pub fn get_symbol_hit_addresses_one_location(schema: &mut Schema) {
     append(schema, one_of(vec![requires(&[path]), requires(&[unit])]));
 }
 
-/// [`InsertSymbolParams`](crate::change::InsertSymbolParams) addresses exactly one
-/// target, and `create_missing` combines only with `file`.
-pub fn insert_symbol_addresses_one_target(schema: &mut Schema) {
-    use crate::change::InsertSymbolParams;
-    let anchor = property!(InsertSymbolParams, anchor);
-    let file = property!(InsertSymbolParams, file);
-    let create_missing = property!(InsertSymbolParams, create_missing);
-    append(schema, one_of(vec![requires(&[anchor]), requires(&[file])]));
-    let anchor_and_create_missing = [anchor, create_missing];
-    append(
-        schema,
-        not(merged(vec![
-            requires(&anchor_and_create_missing),
-            properties(vec![(create_missing, constant(&true))]),
-        ])),
-    );
-}
-
-/// A [`PatchParams`](crate::change::PatchParams) states
-/// [`PATCH_BYTES_MAX`](crate::change::PATCH_BYTES_MAX) as `patch`'s inline-string
-/// length: the shared [`BodySource`](crate::change::BodySource) `$defs` entry carries
-/// no bound of its own, so every embedding stamps the limit its own runtime check
-/// enforces, as a sibling of the `$ref` the field generates.
-pub fn declare_patch_body_length(schema: &mut Schema) {
-    use crate::change::{PATCH_BYTES_MAX, PatchParams};
-    let patch = property!(PatchParams, patch);
-    annotate_property(schema, patch, keyword::MIN_LENGTH, json!(1));
-    annotate_property(schema, patch, keyword::MAX_LENGTH, json!(PATCH_BYTES_MAX));
-}
-
-/// A [`ReplaceSymbolParams`](crate::change::ReplaceSymbolParams) states
-/// [`BODY_BYTES_MAX`](crate::change::BODY_BYTES_MAX) as `body`'s inline-string
-/// `maxLength`, the same rule [`declare_patch_body_length`] states for `patch`.
-pub fn declare_replace_symbol_body_length(schema: &mut Schema) {
-    use crate::change::{BODY_BYTES_MAX, ReplaceSymbolParams};
-    annotate_property(
-        schema,
-        property!(ReplaceSymbolParams, body),
-        keyword::MAX_LENGTH,
-        json!(BODY_BYTES_MAX),
-    );
-}
-
-/// An [`InsertSymbolParams`](crate::change::InsertSymbolParams) states
-/// [`BODY_BYTES_MAX`](crate::change::BODY_BYTES_MAX) as `body`'s inline-string
-/// `maxLength`, the same rule [`declare_patch_body_length`] states for `patch`.
-pub fn declare_insert_symbol_body_length(schema: &mut Schema) {
-    use crate::change::{BODY_BYTES_MAX, InsertSymbolParams};
-    annotate_property(
-        schema,
-        property!(InsertSymbolParams, body),
-        keyword::MAX_LENGTH,
-        json!(BODY_BYTES_MAX),
-    );
-}
-
-/// A [`ReplaceNodeParams`](crate::change::ReplaceNodeParams) states
-/// [`BODY_BYTES_MAX`](crate::change::BODY_BYTES_MAX) as `body`'s inline-string
-/// `maxLength`, the same rule [`declare_patch_body_length`] states for `patch`.
-pub fn declare_replace_node_body_length(schema: &mut Schema) {
-    use crate::change::{BODY_BYTES_MAX, ReplaceNodeParams};
-    annotate_property(
-        schema,
-        property!(ReplaceNodeParams, body),
-        keyword::MAX_LENGTH,
-        json!(BODY_BYTES_MAX),
-    );
-}
-
-/// An [`InsertNodeParams`](crate::change::InsertNodeParams) states
-/// [`BODY_BYTES_MAX`](crate::change::BODY_BYTES_MAX) as `body`'s inline-string
-/// `maxLength`, the same rule [`declare_patch_body_length`] states for `patch`.
-pub fn declare_insert_node_body_length(schema: &mut Schema) {
-    use crate::change::{BODY_BYTES_MAX, InsertNodeParams};
-    annotate_property(
-        schema,
-        property!(InsertNodeParams, body),
-        keyword::MAX_LENGTH,
-        json!(BODY_BYTES_MAX),
-    );
-}
-
 /// A [`Node`](crate::read::Node) states `default: []` on `facets` and `regions`, and
 /// `default: {}` on `extensions`.
 pub fn declare_node_empty_defaults(schema: &mut Schema) {
@@ -903,42 +761,6 @@ pub fn declare_search_hit_target_file_empty_defaults(schema: &mut Schema) {
     }
 }
 
-/// A [`ChangeSummary`](crate::change::ChangeSummary) states `default: []` on `diagnostics`
-/// and `guarantees`. `files` carries its own `minItems: 1` and is never optional, so it
-/// states no default.
-pub fn declare_change_summary_empty_defaults(schema: &mut Schema) {
-    use crate::change::ChangeSummary;
-    declare_empty_array_defaults(
-        schema,
-        &[
-            property!(ChangeSummary, diagnostics),
-            property!(ChangeSummary, guarantees),
-        ],
-    );
-}
-
-/// The `refused` arm of [`ChangeResult`](crate::change::ChangeResult) states `default: []`
-/// on `diagnostics`. `preconditions` carries no default: a refusal's evidence is the
-/// answer, so it is never optional (proven by a same-named test in this module).
-pub fn declare_change_result_empty_defaults(schema: &mut Schema) {
-    const CHANGE_RESULT_TAG: &str = "status";
-    const CHANGE_RESULT_REFUSED: &str = "refused";
-    const REFUSED_DIAGNOSTICS: &str = "diagnostics";
-    if let Some(arm) = tagged_union_arm(schema, CHANGE_RESULT_TAG, CHANGE_RESULT_REFUSED) {
-        annotate_property_in(arm, REFUSED_DIAGNOSTICS, keyword::DEFAULT, json!([]));
-    }
-}
-
-/// MCP types a tool's `outputSchema` as `{ type: "object", ... }`. A tagged union such as
-/// [`ChangeResult`](crate::change::ChangeResult) derives as a bare `oneOf` of object arms, so
-/// the object type is declared beside the union; a client that validates the listing, such as
-/// the MCP Python SDK, refuses `tools/list` without it.
-pub fn declare_object_type(schema: &mut Schema) {
-    schema
-        .ensure_object()
-        .insert(keyword::TYPE.to_owned(), json!("object"));
-}
-
 /// A [`Diagnostic`](crate::diagnostic::Diagnostic) states `default: []` on `related` and
 /// `tags`, and `default: {}` on `extensions`.
 pub fn declare_diagnostic_empty_defaults(schema: &mut Schema) {
@@ -972,19 +794,6 @@ pub fn declare_workspace_language_summary_empty_defaults(schema: &mut Schema) {
         &[
             property!(WorkspaceLanguageSummary, include),
             property!(WorkspaceLanguageSummary, exclude),
-        ],
-    );
-}
-
-/// A [`WorkspaceHookSummary`](crate::workspace::WorkspaceHookSummary) states `default: []`
-/// on `include` and `exclude`.
-pub fn declare_workspace_hook_summary_empty_defaults(schema: &mut Schema) {
-    use crate::workspace::WorkspaceHookSummary;
-    declare_empty_array_defaults(
-        schema,
-        &[
-            property!(WorkspaceHookSummary, include),
-            property!(WorkspaceHookSummary, exclude),
         ],
     );
 }
@@ -1084,24 +893,6 @@ mod tests {
         );
     }
 
-    /// A hook `id` and an LSP `initialization_options` object are refused by
-    /// acceptance, so the schema states the same two rules.
-    #[test]
-    fn test_hook_id_and_initialization_options_state_their_accepted_forms() {
-        use crate::configuration::{CommandHook, LspConfiguration};
-
-        let hook = serde_json::to_value(schema_for!(CommandHook)).expect("hook schema");
-        assert_eq!(
-            hook["properties"]["id"][keyword::PATTERN],
-            json!(HOOK_ID_PATTERN)
-        );
-        let lsp = serde_json::to_value(schema_for!(LspConfiguration)).expect("lsp schema");
-        assert_eq!(
-            lsp["properties"]["initialization_options"][keyword::TYPE],
-            json!("object")
-        );
-    }
-
     #[test]
     fn test_append_creates_then_extends_one_keyword() {
         let mut schema = schema_from(json!({}));
@@ -1124,7 +915,7 @@ mod tests {
             json!({ "not": { "required": ["limit"] } })
         );
         assert_eq!(
-            when(requires(&["paths"]), max_items(0)),
+            when(requires(&["paths"]), json!({"maxItems": 0})),
             json!({ "if": { "required": ["paths"] }, "then": { "maxItems": 0 } })
         );
         assert_eq!(
@@ -1219,22 +1010,6 @@ mod tests {
     }
 
     #[test]
-    fn command_hook_schema_states_ranges_on_each_bounded_key() {
-        let schema =
-            serde_json::to_value(schema_for!(crate::configuration::CommandHook)).expect("schema");
-        let cases = [
-            ("timeout", json!({ "min": "1ms", "max": "1h" })),
-            ("output_limit", json!({ "min": "256b", "max": "4kb" })),
-        ];
-        for (name, accepted) in cases {
-            assert_eq!(
-                schema["properties"][name][RIFT_RANGE], accepted,
-                "{name} must state its accepted range"
-            );
-        }
-    }
-
-    #[test]
     fn lsp_configuration_schema_states_ranges_on_each_bounded_key() {
         let schema = serde_json::to_value(schema_for!(crate::configuration::LspConfiguration))
             .expect("schema");
@@ -1249,31 +1024,6 @@ mod tests {
                 "{name} must state its accepted range"
             );
         }
-    }
-
-    #[test]
-    fn insert_symbol_addresses_one_target_states_exclusive_composition() {
-        let mut schema = schema_from(json!({}));
-        insert_symbol_addresses_one_target(&mut schema);
-        assert_eq!(
-            schema.as_value(),
-            &json!({
-                "allOf": [
-                    {
-                        "oneOf": [
-                            { "required": ["anchor"] },
-                            { "required": ["file"] }
-                        ]
-                    },
-                    {
-                        "not": {
-                            "required": ["anchor", "create_missing"],
-                            "properties": { "create_missing": { "const": true } }
-                        }
-                    }
-                ]
-            })
-        );
     }
 
     #[test]
@@ -1293,65 +1043,6 @@ mod tests {
                 ]
             })
         );
-    }
-
-    /// The `property!` macro proves a field exists on the struct; this test
-    /// proves serde serves it under the same name, closing the rename gap.
-    #[test]
-    fn rule_properties_exist_in_model_schemas() {
-        let cases: [(&str, Value, &[&str]); 7] = [
-            (
-                "CommandHook",
-                serde_json::to_value(schema_for!(crate::configuration::CommandHook))
-                    .expect("schema"),
-                &["timeout", "output_limit", "writes", "guarantees"],
-            ),
-            (
-                "LspConfiguration",
-                serde_json::to_value(schema_for!(crate::configuration::LspConfiguration))
-                    .expect("schema"),
-                &["startup_timeout", "request_timeout", "output_limit"],
-            ),
-            (
-                "GetSymbolParams",
-                serde_json::to_value(schema_for!(crate::read::GetSymbolParams)).expect("schema"),
-                &["rev"],
-            ),
-            (
-                "NodesParams",
-                serde_json::to_value(schema_for!(crate::read::NodesParams)).expect("schema"),
-                &["rev"],
-            ),
-            (
-                "ExecutionConfiguration",
-                serde_json::to_value(schema_for!(crate::configuration::ExecutionConfiguration))
-                    .expect("schema"),
-                &["max_code", "max_timeout", "max_output"],
-            ),
-            (
-                "InsertSymbolParams",
-                serde_json::to_value(schema_for!(crate::change::InsertSymbolParams))
-                    .expect("schema"),
-                &["anchor", "file", "position", "body", "create_missing"],
-            ),
-            (
-                "SearchHit",
-                serde_json::to_value(schema_for!(SearchHit)).expect("schema"),
-                &["hit", "range", "line"],
-            ),
-        ];
-        for (model, schema, names) in cases {
-            let properties = schema["properties"]
-                .as_object()
-                .unwrap_or_else(|| panic!("{model} schema must carry properties"));
-            for name in names {
-                assert!(
-                    properties.contains_key(*name),
-                    "{model} schema must serve property {name}: a serde rename \
-                     would silently detach the rule from the model"
-                );
-            }
-        }
     }
 
     /// Collects each variant's tag value from a tagged union's generated
@@ -1400,75 +1091,6 @@ mod tests {
                  {SEARCH_HIT_TARGET_TAG}, got {target_tags:?}"
             );
         }
-    }
-
-    /// `PatchParams.patch` states the `BodySource` `$defs` `$ref`'s inline-string
-    /// length as a sibling of `$ref`, pinned to [`crate::change::PATCH_BYTES_MAX`].
-    #[test]
-    fn patch_params_schema_states_patch_body_length() {
-        use crate::change::PATCH_BYTES_MAX;
-        let schema = serde_json::to_value(schema_for!(crate::change::PatchParams)).expect("schema");
-        let patch = &schema["properties"]["patch"];
-        assert_eq!(patch["minLength"], json!(1));
-        assert_eq!(patch["maxLength"], json!(PATCH_BYTES_MAX));
-        assert!(
-            patch["$ref"].is_string(),
-            "patch must keep referencing the shared BodySource $defs entry: {patch}"
-        );
-    }
-
-    /// `ReplaceSymbolParams.body`, `InsertSymbolParams.body`, `ReplaceNodeParams.body`, and
-    /// `InsertNodeParams.body` each state the `BodySource` `$ref`'s inline-string
-    /// `maxLength` as a sibling of `$ref`, pinned to [`crate::change::BODY_BYTES_MAX`].
-    #[test]
-    fn body_carrying_params_schemas_state_body_length() {
-        use crate::change::{
-            BODY_BYTES_MAX, InsertNodeParams, InsertSymbolParams, ReplaceNodeParams,
-        };
-        let cases = [
-            (
-                "ReplaceSymbolParams",
-                serde_json::to_value(schema_for!(crate::change::ReplaceSymbolParams))
-                    .expect("schema"),
-            ),
-            (
-                "InsertSymbolParams",
-                serde_json::to_value(schema_for!(InsertSymbolParams)).expect("schema"),
-            ),
-            (
-                "ReplaceNodeParams",
-                serde_json::to_value(schema_for!(ReplaceNodeParams)).expect("schema"),
-            ),
-            (
-                "InsertNodeParams",
-                serde_json::to_value(schema_for!(InsertNodeParams)).expect("schema"),
-            ),
-        ];
-        for (model, schema) in cases {
-            let body = &schema["properties"]["body"];
-            assert_eq!(
-                body["maxLength"],
-                json!(BODY_BYTES_MAX),
-                "{model}.body must state the enforced maxLength"
-            );
-            assert!(
-                body["$ref"].is_string(),
-                "{model}.body must keep referencing the shared BodySource $defs entry: {body}"
-            );
-        }
-    }
-
-    /// `BodySource` generates exactly one `$defs` entry, shared by every embedding
-    /// rather than duplicated per field.
-    #[test]
-    fn body_source_is_one_defs_entry_shared_across_embeddings() {
-        let schema =
-            serde_json::to_value(schema_for!(crate::change::ReplaceSymbolParams)).expect("schema");
-        let defs = schema["$defs"].as_object().expect("schema carries $defs");
-        assert!(
-            defs.contains_key("BodySource"),
-            "BodySource must be its own $defs entry: {defs:?}"
-        );
     }
 
     /// The premise every `declare_*_empty_defaults` function is built on: schemars 1.2.2
@@ -1648,18 +1270,55 @@ mod tests {
     }
 
     #[test]
+    fn rule_properties_exist_in_model_schemas() {
+        let cases: [(&str, Value, &[&str]); 5] = [
+            (
+                "LspConfiguration",
+                serde_json::to_value(schema_for!(crate::configuration::LspConfiguration))
+                    .expect("schema"),
+                &["startup_timeout", "request_timeout", "output_limit"],
+            ),
+            (
+                "GetSymbolParams",
+                serde_json::to_value(schema_for!(crate::read::GetSymbolParams)).expect("schema"),
+                &["rev"],
+            ),
+            (
+                "NodesParams",
+                serde_json::to_value(schema_for!(crate::read::NodesParams)).expect("schema"),
+                &["rev"],
+            ),
+            (
+                "ExecutionConfiguration",
+                serde_json::to_value(schema_for!(crate::configuration::ExecutionConfiguration))
+                    .expect("schema"),
+                &["max_code", "max_timeout", "max_output"],
+            ),
+            (
+                "SearchHit",
+                serde_json::to_value(schema_for!(SearchHit)).expect("schema"),
+                &["hit", "range", "line"],
+            ),
+        ];
+        for (model, schema, names) in cases {
+            let properties = schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{model} schema must carry properties"));
+            for name in names {
+                assert!(
+                    properties.contains_key(*name),
+                    "{model} schema must serve property {name}: a serde rename \
+                     would silently detach the rule from the model"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn change_and_diagnostic_model_empty_defaults_are_declared() {
         let array = json!([]);
         let object = json!({});
         assert_default_cases(vec![
-            (
-                "ChangeSummary",
-                serde_json::to_value(schema_for!(crate::change::ChangeSummary)).expect("schema"),
-                vec![
-                    ("diagnostics", array.clone()),
-                    ("guarantees", array.clone()),
-                ],
-            ),
             (
                 "Diagnostic",
                 serde_json::to_value(schema_for!(crate::diagnostic::Diagnostic)).expect("schema"),
@@ -1680,40 +1339,21 @@ mod tests {
     #[test]
     fn workspace_model_empty_defaults_are_declared() {
         let array = json!([]);
-        assert_default_cases(vec![
-            (
-                "WorkspaceLanguageSummary",
-                serde_json::to_value(schema_for!(crate::workspace::WorkspaceLanguageSummary))
-                    .expect("schema"),
-                vec![("include", array.clone()), ("exclude", array.clone())],
-            ),
-            (
-                "WorkspaceHookSummary",
-                serde_json::to_value(schema_for!(crate::workspace::WorkspaceHookSummary))
-                    .expect("schema"),
-                vec![("include", array.clone()), ("exclude", array)],
-            ),
-        ]);
+        assert_default_cases(vec![(
+            "WorkspaceLanguageSummary",
+            serde_json::to_value(schema_for!(crate::workspace::WorkspaceLanguageSummary))
+                .expect("schema"),
+            vec![("include", array.clone()), ("exclude", array.clone())],
+        )]);
     }
 
-    /// `ChangeSummary.files` and `Relationship.facets` both carry `minItems: 1`, so neither
-    /// is ever empty: they state no `default` and stay in `required`, the deliberate
-    /// exception `declare_change_summary_empty_defaults` and
-    /// `declare_relationship_empty_defaults` leave alone.
     #[test]
     fn min_length_one_collections_state_no_default_and_stay_required() {
-        let cases = [
-            (
-                "ChangeSummary",
-                serde_json::to_value(schema_for!(crate::change::ChangeSummary)).expect("schema"),
-                "files",
-            ),
-            (
-                "Relationship",
-                serde_json::to_value(schema_for!(crate::read::Relationship)).expect("schema"),
-                "facets",
-            ),
-        ];
+        let cases = [(
+            "Relationship",
+            serde_json::to_value(schema_for!(crate::read::Relationship)).expect("schema"),
+            "facets",
+        )];
         for (model, schema, name) in cases {
             assert_eq!(
                 schema[keyword::PROPERTIES][name].get(keyword::DEFAULT),
@@ -1729,41 +1369,5 @@ mod tests {
                 "{model}.{name} must stay required: {schema:#}"
             );
         }
-    }
-
-    /// The `refused` arm of `ChangeResult` states `default: []` on `diagnostics` and
-    /// leaves it out of that arm's `required` list; `preconditions` states no default and
-    /// stays required, because a refusal's evidence is the answer.
-    #[test]
-    fn change_result_refused_arm_states_diagnostics_default_and_no_precondition_default() {
-        let schema =
-            serde_json::to_value(schema_for!(crate::change::ChangeResult)).expect("schema");
-        let arms = schema[keyword::ONE_OF].as_array().expect("oneOf arms");
-        let refused = arms
-            .iter()
-            .find(|arm| arm[keyword::PROPERTIES]["status"][keyword::CONST] == json!("refused"))
-            .expect("a refused arm");
-        assert_eq!(
-            refused[keyword::PROPERTIES]["diagnostics"][keyword::DEFAULT],
-            json!([]),
-            "{refused:#}"
-        );
-        assert_eq!(
-            refused[keyword::PROPERTIES]["preconditions"].get(keyword::DEFAULT),
-            None,
-            "{refused:#}"
-        );
-        let required: Vec<String> = refused[keyword::REQUIRED]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|value| value.as_str().map(str::to_owned))
-            .collect();
-        assert!(!required.contains(&"diagnostics".to_owned()), "{refused:#}");
-        assert!(
-            required.contains(&"preconditions".to_owned()),
-            "{refused:#}"
-        );
     }
 }

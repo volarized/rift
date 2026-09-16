@@ -371,6 +371,7 @@ mod tests {
             visibility: None,
             range,
             item_range: item,
+            name_range: None,
             body_range: body,
             signatures: Vec::new(),
             documentation: Vec::new(),

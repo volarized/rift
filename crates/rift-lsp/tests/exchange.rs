@@ -197,19 +197,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin> ScriptedEngine<T> {
 /// The work-done progress token every progress script mints.
 pub(crate) const PROGRESS_TOKEN: &str = "scripted/analysis";
 
-/// The capability grid most exchange-level tests need: rename, prepared
-/// rename, references, will-rename over every file, and pull diagnostics
+/// The capability grid most exchange-level tests need: references and pull diagnostics
 /// identified as `"scripted"`.
 pub(crate) fn full_capabilities() -> Value {
     json!({
         "positionEncoding": "utf-8",
-        "renameProvider": {"prepareProvider": true},
         "referencesProvider": true,
-        "workspace": {
-            "fileOperations": {
-                "willRename": {"filters": [{"pattern": {"glob": "**/*"}}]},
-            },
-        },
         "diagnosticProvider": {
             "identifier": "scripted",
             "interFileDependencies": false,

@@ -232,7 +232,7 @@ pub enum SearchHitTarget {
     },
     /// A node hit: one place in a syntax tree, without its enclosing symbol record.
     Node {
-        /// The syntax-tree node's identity, the full edit address `replace_node` accepts.
+        /// The syntax-tree node's identity in the captured source revision.
         node: NodeId,
     },
     /// A file hit: one entry of the tree, whether or not any provider reads it.

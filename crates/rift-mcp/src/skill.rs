@@ -22,13 +22,12 @@ pub const SKILL_NAME: &str = "rift";
 pub const TOOLS_REFERENCE_FILE: &str = "tools.md";
 /// Frontmatter `description`: Claude Code reads this to decide when to load
 /// the skill, so it leads with the trigger case.
-pub const SKILL_DESCRIPTION: &str = "Use when finding, reading, or editing code in a workspace \
+pub const SKILL_DESCRIPTION: &str = "Use when finding or reading code in a workspace \
     Rift serves: structured search across declarations and source text, symbol reads by exact \
-    name, syntax inspection, and witnessed edits that recompute their address before writing \
-    and run the workspace's configured hooks.";
+    name, and syntax inspection.";
 /// The plugin manifest's `description`: the canonical product sentence.
 const PLUGIN_DESCRIPTION: &str =
-    "Rift is an agentic development toolkit for reading, discovering, and editing codebases.";
+    "Rift is an agentic development toolkit for reading and discovering codebases.";
 /// POSIX installer command, verbatim from the docs landing page.
 const INSTALL_COMMAND_POSIX: &str =
     "curl --proto '=https' --tlsv1.2 -fsSL https://volar.sh/rift/install.sh | bash";
@@ -114,24 +113,6 @@ const DECISION_TABLE: &[DecisionRow] = &[
         tools: &["search"],
         note: Some("with a `traversal` block"),
     },
-    DecisionRow {
-        situation: "Code needs to change.",
-        tools: &[
-            "patch",
-            "replace_node",
-            "insert_node",
-            "insert_symbol",
-            "replace_symbol",
-            "rename_symbol",
-            "remove_node",
-            "remove_symbol",
-            "move_file",
-        ],
-        note: Some(
-            "over raw file writes: the server recomputes witnesses and runs the workspace's \
-             configured hooks",
-        ),
-    },
 ];
 
 /// Generates the skill from the served tool listing.
@@ -195,8 +176,7 @@ fn skill_markdown(form: SkillForm) -> String {
     rendered.push_str("# Rift\n\n");
     rendered.push_str(
         "Rift indexes this workspace's source and serves it over MCP: structured search, \
-         symbol reads by exact name, syntax inspection, and edits that carry their own \
-         address so a stale one refuses instead of splicing into moved code.\n\n",
+         symbol reads by exact name, and syntax inspection.\n\n",
     );
     rendered.push_str(
         "Start an unfamiliar repository at `rift://map`; it names the served languages and \
@@ -209,12 +189,6 @@ fn skill_markdown(form: SkillForm) -> String {
         rendered.push_str(&decision_row_markdown(row));
     }
     rendered.push('\n');
-    rendered.push_str(
-        "The edit tools apply through the server, which recomputes each address's witness \
-         before writing and refuses when the source moved since the address was read. Prefer \
-         them over writing files directly: a raw write bypasses that check and the \
-         workspace's configured hooks.\n\n",
-    );
     rendered.push_str("## When a call refuses\n\n");
     rendered.push_str(
         "Read `rift://logs` when a refusal alone does not say why; it carries the \

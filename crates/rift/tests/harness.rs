@@ -57,8 +57,7 @@ pub(crate) fn workspace() -> TestResult<tempfile::TempDir> {
 /// uses - a manifest whose `[lib]` path keeps every module file at the
 /// tree root, and whose empty `[workspace]` table stops cargo climbing
 /// out of the tempdir. `hub.rs` holds the declaration and `caller.rs`
-/// imports and calls it under a different name, so a rename of the
-/// declaration leaves no occurrence of the old name behind.
+/// imports and calls it, so an incoming reference reaches the caller.
 pub(crate) const RUST_PROJECT_MANIFEST: &str = "[package]\nname = \"rift_live_fixture\"\nversion = \"0.0.0\"\n\
      edition = \"2021\"\npublish = false\n\n[lib]\npath = \"lib.rs\"\n\n\
      [workspace]\n";
@@ -96,7 +95,7 @@ const SEMANTIC_DISABLED: &str = "[search.semantic]\ndisabled = true\n";
 
 /// One fixture workspace holding `files` and a `rift.toml` carrying the disabled
 /// semantic tier, the orphan-safety idle timeout, and `extra_toml` - an
-/// LSP configuration, a `[source]` policy, `[[hooks]]` entries, or any other
+/// LSP configuration, a `[source]` policy, or another
 /// table a case needs beyond the two every fixture already carries.
 pub(crate) fn laid_out_workspace(
     files: &[(&str, &str)],
@@ -218,8 +217,8 @@ pub(crate) fn arguments(
 pub(crate) const ACCEPTANCE_ATTEMPTS_MAX: usize = 8;
 
 /// One proxied tool call returning its structured result, retrying the
-/// refusal the server advertises as `retry: same_request`: an applied
-/// change moves the index, and a request whose snapshot predates the move
+/// refusal the server advertises as `retry: same_request`: a source
+/// change moves the index, and a request whose snapshot predates the change
 /// is refused rather than served stale.
 pub(crate) async fn proxied_call(
     client: &RunningService<RoleClient, ()>,

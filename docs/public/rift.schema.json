@@ -97,161 +97,6 @@
       "pattern": "^(?:0|[1-9][0-9]*)(?:b|kb|mb|gb|tb)$",
       "type": "string"
     },
-    "ChangedPaths": {
-      "description": "Whether the changed project paths ride the hook's command line.",
-      "oneOf": [
-        {
-          "const": "none",
-          "description": "The command runs exactly as configured.",
-          "type": "string"
-        },
-        {
-          "const": "append",
-          "description": "The changed project paths follow the configured command, in byte\norder, for a tool that takes files.",
-          "type": "string"
-        }
-      ]
-    },
-    "CommandHook": {
-      "additionalProperties": false,
-      "allOf": [
-        {
-          "if": {
-            "properties": {
-              "writes": {
-                "const": "changed_paths"
-              }
-            }
-          },
-          "then": {
-            "properties": {
-              "guarantees": {
-                "maxItems": 0
-              }
-            }
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "writes": {
-                "const": "workspace"
-              }
-            }
-          },
-          "then": {
-            "properties": {
-              "guarantees": {
-                "maxItems": 0
-              }
-            }
-          }
-        }
-      ],
-      "description": "One `[[hooks]]` command the server runs inside the changed tree.",
-      "properties": {
-        "changed_paths": {
-          "$ref": "#/$defs/ChangedPaths",
-          "default": "none",
-          "description": "Whether the server appends changed project paths after the configured command, in byte order."
-        },
-        "command": {
-          "$ref": "#/$defs/CommandInput",
-          "description": "Executable and literal arguments. Rift starts it directly without a shell."
-        },
-        "determinism": {
-          "$ref": "#/$defs/Determinism",
-          "description": "Whether an identical tree and environment are expected to reproduce the result."
-        },
-        "environment": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {},
-          "description": "Environment values added to the environment the server inherited.",
-          "maxProperties": 64,
-          "type": "object"
-        },
-        "exclude": {
-          "default": [],
-          "description": "Project-relative path patterns removed from hook selection.",
-          "items": {
-            "$ref": "#/$defs/PathPattern"
-          },
-          "maxItems": 64,
-          "type": "array"
-        },
-        "failure_severity": {
-          "$ref": "#/$defs/HookFailureSeverity",
-          "default": "error",
-          "description": "Severity the server reports when the hook does not pass."
-        },
-        "guarantees": {
-          "default": [],
-          "description": "What a passing validation establishes. Transform hooks cannot declare guarantees.",
-          "items": {
-            "$ref": "#/$defs/HookGuarantee"
-          },
-          "maxItems": 16,
-          "type": "array"
-        },
-        "id": {
-          "description": "Label for this hook's results, unique within the list.",
-          "maxLength": 64,
-          "minLength": 1,
-          "pattern": "^[A-Za-z0-9._-]+$",
-          "type": "string"
-        },
-        "include": {
-          "default": [],
-          "description": "Project-relative path patterns that select this hook. Empty selects every change.",
-          "items": {
-            "$ref": "#/$defs/PathPattern"
-          },
-          "maxItems": 64,
-          "type": "array"
-        },
-        "kind": {
-          "$ref": "#/$defs/HookKind",
-          "description": "What the hook is: a formatter, test suite, linter, build, or another command."
-        },
-        "output_limit": {
-          "$ref": "#/$defs/ByteSize",
-          "default": "4kb",
-          "description": "Bytes of each output stream the server keeps, 256b to 4kb. The full size is still reported.",
-          "rift:range": {
-            "max": "4kb",
-            "min": "256b"
-          }
-        },
-        "timeout": {
-          "$ref": "#/$defs/Duration",
-          "default": "2m",
-          "description": "Wall-clock bound before the server kills the process, 1ms to 1h.",
-          "rift:range": {
-            "max": "1h",
-            "min": "1ms"
-          }
-        },
-        "working_directory": {
-          "$ref": "#/$defs/ProjectPath",
-          "default": "",
-          "description": "Directory the process starts in, relative to the changed tree's root. Empty selects the\nroot. Absolute paths and `.` or `..` segments are refused."
-        },
-        "writes": {
-          "$ref": "#/$defs/HookWrites",
-          "default": "none",
-          "description": "Source files the server permits the hook to change."
-        }
-      },
-      "required": [
-        "id",
-        "kind",
-        "command",
-        "determinism"
-      ],
-      "type": "object"
-    },
     "CommandInput": {
       "oneOf": [
         {
@@ -274,74 +119,6 @@
             }
           ],
           "type": "array"
-        }
-      ]
-    },
-    "CoverageReach": {
-      "description": "How far the claim reaches.",
-      "oneOf": [
-        {
-          "const": "request",
-          "description": "Only what this request touched.",
-          "type": "string"
-        },
-        {
-          "const": "project",
-          "description": "Every visible file of the workspace.",
-          "type": "string"
-        },
-        {
-          "const": "dependencies",
-          "description": "The workspace's resolved dependencies.",
-          "type": "string"
-        },
-        {
-          "const": "all",
-          "description": "The workspace, its dependencies, and the standard library together.",
-          "type": "string"
-        }
-      ]
-    },
-    "CoverageScope": {
-      "description": "What a completeness statement covers - everything the request asked for, one file, or a\nstanding scope the answer holds over.",
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "description": "A standing scope identified by its name.",
-          "properties": {
-            "kind": {
-              "const": "reach",
-              "type": "string"
-            },
-            "reach": {
-              "$ref": "#/$defs/CoverageReach",
-              "description": "How far the claim reaches."
-            }
-          },
-          "required": [
-            "kind",
-            "reach"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "A single unit is just a file: the claim holds for that path and says nothing about any other.",
-          "properties": {
-            "kind": {
-              "const": "unit",
-              "type": "string"
-            },
-            "unit": {
-              "$ref": "#/$defs/FileId",
-              "description": "The file the claim is about."
-            }
-          },
-          "required": [
-            "kind",
-            "unit"
-          ],
-          "type": "object"
         }
       ]
     },
@@ -430,21 +207,6 @@
         }
       ]
     },
-    "Determinism": {
-      "description": "Whether an identical tree and environment are expected to reproduce a\nhook's result.",
-      "oneOf": [
-        {
-          "const": "deterministic",
-          "description": "The same tree and environment give the same answer.",
-          "type": "string"
-        },
-        {
-          "const": "best_effort",
-          "description": "The result may vary between identical runs.",
-          "type": "string"
-        }
-      ]
-    },
     "Duration": {
       "description": "A duration: an integer magnitude with a required unit suffix `ms`, `s`, `m`, `h`, or `d`.",
       "pattern": "^(?:0|[1-9][0-9]*)(?:ms|s|m|h|d)$",
@@ -502,41 +264,6 @@
       },
       "type": "object"
     },
-    "FileId": {
-      "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
-      "examples": [
-        "rift://file/src/lib.rs"
-      ],
-      "maxLength": 8192,
-      "minLength": 13,
-      "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
-      "type": "string"
-    },
-    "GuaranteeKind": {
-      "description": "A property a verifier can establish about an applied change.",
-      "oneOf": [
-        {
-          "const": "syntax_validated",
-          "description": "The changed source parses.",
-          "type": "string"
-        },
-        {
-          "const": "bindings_preserved",
-          "description": "Names still resolve to what they resolved to before the change.",
-          "type": "string"
-        },
-        {
-          "const": "references_updated",
-          "description": "References to the changed declarations were updated with them.",
-          "type": "string"
-        },
-        {
-          "const": "behavior_checked",
-          "description": "The change's behavior was exercised, such as by a test suite.",
-          "type": "string"
-        }
-      ]
-    },
     "HistoryConfiguration": {
       "additionalProperties": false,
       "description": "The `[providers.history]` table. The history provider's cost scales with\nhow far back it walks, so its depth is the budget worth setting.",
@@ -556,97 +283,6 @@
         }
       },
       "type": "object"
-    },
-    "HookFailureSeverity": {
-      "description": "Severity the server reports when a hook does not pass.",
-      "oneOf": [
-        {
-          "const": "warning",
-          "description": "The hook result reports a warning.",
-          "type": "string"
-        },
-        {
-          "const": "error",
-          "description": "The hook result reports an error.",
-          "type": "string"
-        }
-      ]
-    },
-    "HookGuarantee": {
-      "additionalProperties": false,
-      "description": "What a passing run of one hook establishes about the change it checked.",
-      "properties": {
-        "detail": {
-          "description": "The exact property the hook checks, and the limits on reading a pass.",
-          "maxLength": 1024,
-          "minLength": 1,
-          "type": "string"
-        },
-        "kind": {
-          "$ref": "#/$defs/GuaranteeKind",
-          "description": "Which property a pass establishes."
-        },
-        "scope": {
-          "$ref": "#/$defs/CoverageScope",
-          "description": "What the check covers."
-        }
-      },
-      "required": [
-        "kind",
-        "scope",
-        "detail"
-      ],
-      "type": "object"
-    },
-    "HookKind": {
-      "description": "What a hook is, as workspace configuration presents it.",
-      "oneOf": [
-        {
-          "const": "format",
-          "description": "A source formatter.",
-          "type": "string"
-        },
-        {
-          "const": "test",
-          "description": "A test suite.",
-          "type": "string"
-        },
-        {
-          "const": "lint",
-          "description": "A linter.",
-          "type": "string"
-        },
-        {
-          "const": "build",
-          "description": "A build.",
-          "type": "string"
-        },
-        {
-          "const": "other",
-          "description": "A hook none of the other kinds describe.",
-          "type": "string"
-        }
-      ]
-    },
-    "HookWrites": {
-      "description": "Source writes the server may retain from one hook.",
-      "oneOf": [
-        {
-          "const": "none",
-          "description": "A validation hook that may not change source files.",
-          "type": "string"
-        },
-        {
-          "const": "changed_paths",
-          "description": "A transform hook that may change only paths changed before hooks ran.",
-          "type": "string"
-        },
-        {
-          "const": "workspace",
-          "description": "A transform hook that may change any source file in the workspace.",
-          "type": "string"
-        }
-      ]
     },
     "LanguageConfiguration": {
       "additionalProperties": false,
@@ -906,15 +542,6 @@
         "max"
       ],
       "type": "object"
-    },
-    "ProjectPath": {
-      "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
-      "examples": [
-        "src/lib.rs"
-      ],
-      "maxLength": 1000,
-      "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
-      "type": "string"
     },
     "ProvidersConfiguration": {
       "additionalProperties": false,
@@ -1354,15 +981,6 @@
         "max_timeout": "30s"
       },
       "description": "Enablement and limits for caller-provided code."
-    },
-    "hooks": {
-      "default": [],
-      "description": "Hooks run in the changed tree, in list order, each time a change\napplies.",
-      "items": {
-        "$ref": "#/$defs/CommandHook"
-      },
-      "maxItems": 32,
-      "type": "array"
     },
     "languages": {
       "additionalProperties": {

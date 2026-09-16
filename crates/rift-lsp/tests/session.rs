@@ -144,32 +144,6 @@ async fn happy_engine_script(mut engine: ScriptedEngine<DuplexStream>) {
             json!({"uri": "file:///rift-elsewhere/out.rs", "diagnostics": []}),
         )
         .await;
-    let (id, params) = engine.expect_request("textDocument/rename").await;
-    let uri = params["textDocument"]["uri"]
-        .as_str()
-        .expect("uri")
-        .to_owned();
-    let sibling = format!("{uri}.sibling");
-    let edit = json!({"range": zero_range(), "newText": "renamed"});
-    engine
-        .respond(
-            &id,
-            json!({"changes": {uri: [edit.clone()], sibling: [edit]}}),
-        )
-        .await;
-    let (id, _params) = engine.expect_request("textDocument/prepareRename").await;
-    engine
-        .respond(
-            &id,
-            json!({"range": zero_range(), "placeholder": "renamed"}),
-        )
-        .await;
-    let (id, params) = engine.expect_request("workspace/willRenameFiles").await;
-    let new_uri = params["files"][0]["newUri"]
-        .as_str()
-        .expect("uri")
-        .to_owned();
-    engine.respond(&id, json!({"changes": {new_uri: []}})).await;
     let (id, params) = engine.expect_request("textDocument/references").await;
     assert_eq!(
         params["context"]["includeDeclaration"],
@@ -193,14 +167,13 @@ async fn happy_engine_script(mut engine: ScriptedEngine<DuplexStream>) {
 }
 
 #[tokio::test]
-async fn happy_engine_negotiates_renames_and_serves_diagnostics() {
+async fn happy_engine_negotiates_references_and_serves_diagnostics() {
     let (workspace, mut session, engine_task) = started(happy_engine_script).await;
 
     let record = session.capabilities();
     assert_eq!(record.position_encoding, PositionEncoding::Utf8);
-    assert!(record.rename && record.prepare_rename);
     assert!(record.references);
-    assert!(record.will_rename_files() && record.pull_diagnostics);
+    assert!(record.pull_diagnostics);
     assert_eq!(record.diagnostic_identifier.as_deref(), Some("scripted"));
     assert_eq!(
         session.root(),
@@ -212,52 +185,6 @@ async fn happy_engine_negotiates_renames_and_serves_diagnostics() {
         .open(&document, "rust", "fn a() {}\n".to_owned())
         .await
         .expect("didOpen is sent");
-    let edit = session
-        .rename(
-            &document,
-            Position {
-                line: 0,
-                character: 3,
-            },
-            "renamed",
-        )
-        .await
-        .expect("rename answers");
-    assert!(
-        session.published_diagnostics(&path("out.rs")).is_none(),
-        "a publish outside the root is never retained"
-    );
-    assert_eq!(edit.changes.expect("changes come back").len(), 2);
-
-    let published = session
-        .published_diagnostics(&document)
-        .expect("the didOpen publish was retained");
-    assert_eq!(published.len(), 1);
-    assert_eq!(published[0].message, "published diagnostic");
-    assert_eq!(
-        session.published_diagnostics_version(&document),
-        None,
-        "the scripted publish names no version, so none is retained"
-    );
-
-    let prepared = session
-        .prepare_rename(
-            &document,
-            Position {
-                line: 0,
-                character: 3,
-            },
-        )
-        .await
-        .expect("prepareRename answers");
-    assert!(prepared.is_some());
-
-    let moved = session
-        .will_rename_files(&document, &path("src/moved.rs"))
-        .await
-        .expect("willRenameFiles answers");
-    assert!(moved.is_some());
-
     let references = session
         .references(
             &document,
@@ -271,6 +198,22 @@ async fn happy_engine_negotiates_renames_and_serves_diagnostics() {
     assert!(
         references.is_empty(),
         "the scripted engine names no location, the declaration's own included"
+    );
+
+    assert!(
+        session.published_diagnostics(&path("out.rs")).is_none(),
+        "a publish outside the root is never retained"
+    );
+
+    let published = session
+        .published_diagnostics(&document)
+        .expect("the didOpen publish was retained");
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].message, "published diagnostic");
+    assert_eq!(
+        session.published_diagnostics_version(&document),
+        None,
+        "the scripted publish names no version, so none is retained"
     );
 
     let pulled = session
@@ -369,39 +312,24 @@ async fn engine_without_capabilities_gets_typed_refusals_before_any_request() {
     );
     let document = path("src/lib.rs");
     let refusal = session
-        .rename(
+        .references(
             &document,
             Position {
                 line: 0,
                 character: 0,
             },
-            "renamed",
         )
         .await
-        .expect_err("rename was never advertised");
+        .expect_err("request was never advertised");
     assert!(matches!(
         refusal.fault(),
-        EngineFault::CapabilityAbsent { capability } if capability == "textDocument/rename"
+        EngineFault::CapabilityAbsent { capability } if capability == "textDocument/references"
     ));
     assert_eq!(
         refusal.name(),
         ErrorName::Wire(ErrorCode::CapabilityUnavailable)
     );
     for absent in [
-        session
-            .prepare_rename(
-                &document,
-                Position {
-                    line: 0,
-                    character: 0,
-                },
-            )
-            .await
-            .err(),
-        session
-            .will_rename_files(&document, &path("b.rs"))
-            .await
-            .err(),
         session.pull_diagnostics(&document).await.err(),
         session
             .references(
@@ -500,13 +428,13 @@ async fn oversized_announcement_fails_the_start_as_limit_exceeded() {
 async fn result_outside_the_method_shape_is_typed_and_non_fatal() {
     let (_workspace, mut session, engine_task) = started(|mut engine| async move {
         engine.handshake(full_capabilities()).await;
-        let (id, _params) = engine.expect_request("textDocument/rename").await;
+        let (id, _params) = engine.expect_request("textDocument/references").await;
         engine.respond(&id, json!(42)).await;
-        let (id, _params) = engine.expect_request("textDocument/prepareRename").await;
+        let (id, _params) = engine.expect_request("textDocument/references").await;
         engine
             .respond(
                 &id,
-                json!({"range": zero_range(), "placeholder": "renamed"}),
+                json!([{"uri": "file:///lib.rs", "range": zero_range()}]),
             )
             .await;
         let (id, _params) = engine.expect_request("shutdown").await;
@@ -516,19 +444,18 @@ async fn result_outside_the_method_shape_is_typed_and_non_fatal() {
     .await;
     let document = path("src/lib.rs");
     let error = session
-        .rename(
+        .references(
             &document,
             Position {
                 line: 0,
                 character: 0,
             },
-            "renamed",
         )
         .await
-        .expect_err("a number is not a workspace edit");
+        .expect_err("a number is not a location list");
     assert!(matches!(error.fault(), EngineFault::ResultInvalid { .. }));
     session
-        .prepare_rename(
+        .references(
             &document,
             Position {
                 line: 0,
@@ -542,18 +469,18 @@ async fn result_outside_the_method_shape_is_typed_and_non_fatal() {
 }
 
 #[tokio::test]
-async fn refused_rename_is_typed_and_leaves_the_session_serving() {
+async fn refused_references_request_is_typed_and_leaves_the_session_serving() {
     let (_workspace, mut session, engine_task) = started(|mut engine| async move {
         engine.handshake(full_capabilities()).await;
-        let (id, _params) = engine.expect_request("textDocument/rename").await;
+        let (id, _params) = engine.expect_request("textDocument/references").await;
         engine
-            .refuse(&id, -32602, "new name is not an identifier")
+            .refuse(&id, -32602, "position is outside the document")
             .await;
-        let (id, _params) = engine.expect_request("textDocument/prepareRename").await;
+        let (id, _params) = engine.expect_request("textDocument/references").await;
         engine
             .respond(
                 &id,
-                json!({"range": zero_range(), "placeholder": "renamed"}),
+                json!([{"uri": "file:///lib.rs", "range": zero_range()}]),
             )
             .await;
         let (id, _params) = engine.expect_request("shutdown").await;
@@ -563,23 +490,22 @@ async fn refused_rename_is_typed_and_leaves_the_session_serving() {
     .await;
     let document = path("src/lib.rs");
     let refusal = session
-        .rename(
+        .references(
             &document,
             Position {
                 line: 0,
                 character: 0,
             },
-            "1nvalid",
         )
         .await
-        .expect_err("the engine refuses the name");
+        .expect_err("the engine refuses the position");
     assert!(matches!(
         refusal.fault(),
-        EngineFault::Refused { code: -32602, message, .. } if message == "new name is not an identifier"
+        EngineFault::Refused { code: -32602, message, .. } if message == "position is outside the document"
     ));
     assert_eq!(refusal.name(), ErrorName::Wire(ErrorCode::InvalidRequest));
     session
-        .prepare_rename(
+        .references(
             &document,
             Position {
                 line: 0,
@@ -596,18 +522,18 @@ async fn refused_rename_is_typed_and_leaves_the_session_serving() {
 /// fault carries the code, classifies as temporarily unavailable, and
 /// leaves the engine serving the next request.
 #[tokio::test]
-async fn cancelled_rename_is_a_retryable_refusal() {
+async fn cancelled_references_request_is_a_retryable_refusal() {
     let (_workspace, mut session, engine_task) = started(|mut engine| async move {
         engine.handshake(full_capabilities()).await;
-        let (id, _params) = engine.expect_request("textDocument/rename").await;
+        let (id, _params) = engine.expect_request("textDocument/references").await;
         engine
             .refuse(&id, -32802, "server cancelled the request")
             .await;
-        let (id, _params) = engine.expect_request("textDocument/prepareRename").await;
+        let (id, _params) = engine.expect_request("textDocument/references").await;
         engine
             .respond(
                 &id,
-                json!({"range": zero_range(), "placeholder": "renamed"}),
+                json!([{"uri": "file:///lib.rs", "range": zero_range()}]),
             )
             .await;
         let (id, _params) = engine.expect_request("shutdown").await;
@@ -617,13 +543,12 @@ async fn cancelled_rename_is_a_retryable_refusal() {
     .await;
     let document = path("src/lib.rs");
     let refusal = session
-        .rename(
+        .references(
             &document,
             Position {
                 line: 0,
                 character: 0,
             },
-            "renamed",
         )
         .await
         .expect_err("the engine cancels the request");
@@ -638,7 +563,7 @@ async fn cancelled_rename_is_a_retryable_refusal() {
         ErrorName::Wire(ErrorCode::TemporarilyUnavailable)
     );
     session
-        .prepare_rename(
+        .references(
             &document,
             Position {
                 line: 0,
@@ -655,18 +580,17 @@ async fn cancelled_rename_is_a_retryable_refusal() {
 async fn payload_without_an_envelope_ends_the_session() {
     let (_workspace, mut session, engine_task) = started(|mut engine| async move {
         engine.handshake(full_capabilities()).await;
-        let (_id, _params) = engine.expect_request("textDocument/rename").await;
+        let (_id, _params) = engine.expect_request("textDocument/references").await;
         engine.send(&json!({"jsonrpc": "2.0"})).await;
     })
     .await;
     let error = session
-        .rename(
+        .references(
             &path("src/lib.rs"),
             Position {
                 line: 0,
                 character: 0,
             },
-            "renamed",
         )
         .await
         .expect_err("the payload fits no envelope");
@@ -681,16 +605,14 @@ async fn payload_without_an_envelope_ends_the_session() {
 async fn cancelled_request_response_is_discarded_by_the_next_call() {
     let (_workspace, mut session, engine_task) = started(|mut engine| async move {
         engine.handshake(full_capabilities()).await;
-        let (id, _params) = engine.expect_request("textDocument/rename").await;
+        let (id, _params) = engine.expect_request("textDocument/references").await;
         tokio::time::sleep(Duration::from_millis(150)).await;
-        engine
-            .respond(&id, json!({"changes": {"file:///lib.rs": []}}))
-            .await;
-        let (id, _params) = engine.expect_request("textDocument/prepareRename").await;
+        engine.respond(&id, json!([])).await;
+        let (id, _params) = engine.expect_request("textDocument/references").await;
         engine
             .respond(
                 &id,
-                json!({"range": zero_range(), "placeholder": "renamed"}),
+                json!([{"uri": "file:///lib.rs", "range": zero_range()}]),
             )
             .await;
         let (id, _params) = engine.expect_request("shutdown").await;
@@ -701,13 +623,12 @@ async fn cancelled_request_response_is_discarded_by_the_next_call() {
     let document = path("src/lib.rs");
     let cancelled = tokio::time::timeout(
         Duration::from_millis(50),
-        session.rename(
+        session.references(
             &document,
             Position {
                 line: 0,
                 character: 0,
             },
-            "renamed",
         ),
     )
     .await;
@@ -716,7 +637,7 @@ async fn cancelled_request_response_is_discarded_by_the_next_call() {
         "the caller cancels before the delayed answer"
     );
     let prepared = session
-        .prepare_rename(
+        .references(
             &document,
             Position {
                 line: 0,
@@ -724,22 +645,22 @@ async fn cancelled_request_response_is_discarded_by_the_next_call() {
             },
         )
         .await
-        .expect("the stale rename response is settled and discarded");
-    assert!(prepared.is_some());
+        .expect("the stale request response is settled and discarded");
+    assert!(!prepared.is_empty());
     session.shutdown().await;
     join(engine_task).await;
 }
 
 /// Five server-initiated requests, each answered per the routing policy:
 /// configuration, registration, progress creation, diagnostic refresh, and an unserved probe.
-/// The rename answers only after every one of them settles.
+/// The request answers only after every one of them settles.
 #[tokio::test]
 async fn server_initiated_requests_are_routed_before_the_response() {
     let (_workspace, mut session, engine_task) = started(|mut engine| async move {
         engine.handshake(full_capabilities()).await;
         let opened = engine.next_message().await;
         assert_eq!(opened["method"], json!("textDocument/didOpen"));
-        let (rename_id, params) = engine.expect_request("textDocument/rename").await;
+        let (request_id, params) = engine.expect_request("textDocument/references").await;
         let uri = params["textDocument"]["uri"]
             .as_str()
             .expect("uri")
@@ -784,11 +705,10 @@ async fn server_initiated_requests_are_routed_before_the_response() {
         assert_eq!(unserved["error"]["code"], json!(-32601));
 
         let sibling = format!("{uri}.sibling");
-        let edit = json!({"range": zero_range(), "newText": "renamed"});
         engine
             .respond(
-                &rename_id,
-                json!({"changes": {uri: [edit.clone()], sibling: [edit]}}),
+                &request_id,
+                json!([{ "uri": uri, "range": zero_range() }, { "uri": sibling, "range": zero_range() }]),
             )
             .await;
         let (id, _params) = engine.expect_request("textDocument/diagnostic").await;
@@ -807,19 +727,18 @@ async fn server_initiated_requests_are_routed_before_the_response() {
         .expect("didOpen is sent");
     // The scripted engine dies unless configuration, registration,
     // progress, refresh, and the unserved probe are each answered per the routing
-    // policy before the rename itself answers.
-    let edit = session
-        .rename(
+    // policy before the request itself answers.
+    let locations = session
+        .references(
             &document,
             Position {
                 line: 0,
                 character: 3,
             },
-            "renamed",
         )
         .await
-        .expect("the rename answers after the server requests");
-    assert_eq!(edit.changes.expect("changes come back").len(), 2);
+        .expect("the request answers after the server requests");
+    assert_eq!(locations.len(), 2);
     assert_eq!(
         session.diagnostic_refresh_revision(),
         1,
@@ -846,11 +765,9 @@ async fn stderr_flood_is_drained_bounded_while_the_request_answers() {
         engine.handshake(full_capabilities()).await;
         let opened = engine.next_message().await;
         assert_eq!(opened["method"], json!("textDocument/didOpen"));
-        let (id, _params) = engine.expect_request("textDocument/rename").await;
-        let edit = json!({"range": zero_range(), "newText": "renamed"});
-        engine
-            .respond(&id, json!({"changes": {"file:///lib.rs": [edit]}}))
-            .await;
+        let (id, _params) = engine.expect_request("textDocument/references").await;
+        let location = json!({"uri": "file:///lib.rs", "range": zero_range()});
+        engine.respond(&id, json!([location])).await;
         let (id, _params) = engine.expect_request("shutdown").await;
         engine.respond(&id, Value::Null).await;
         engine.next_message().await;
@@ -867,16 +784,15 @@ async fn stderr_flood_is_drained_bounded_while_the_request_answers() {
         .await
         .expect("didOpen is sent");
     session
-        .rename(
+        .references(
             &document,
             Position {
                 line: 0,
                 character: 0,
             },
-            "renamed",
         )
         .await
-        .expect("the rename answers after the flood");
+        .expect("the request answers after the flood");
     let stderr = session.shutdown().await;
     assert_eq!(stderr.captured_bytes, 4_096);
     assert!(
@@ -895,7 +811,7 @@ async fn stderr_flood_is_drained_bounded_while_the_request_answers() {
 /// nothing is outstanding until a later exchange pumps those messages: the
 /// first pull reads the create request, answers it, reads the begin, and
 /// then answers with no items - the shape a loading engine produces. The
-/// `didOpen` before it adds a report, and the rename ends the token, so the
+/// `didOpen` before it adds a report, and the request ends the token, so the
 /// session reads as analyzing between them and settled after.
 #[tokio::test]
 async fn work_done_progress_decides_whether_the_engine_is_analyzing() {
@@ -909,12 +825,10 @@ async fn work_done_progress_decides_whether_the_engine_is_analyzing() {
         engine
             .respond(&id, json!({"kind": "full", "items": []}))
             .await;
-        let (id, _params) = engine.expect_request("textDocument/rename").await;
+        let (id, _params) = engine.expect_request("textDocument/references").await;
         engine.end_progress().await;
-        let edit = json!({"range": zero_range(), "newText": "renamed"});
-        engine
-            .respond(&id, json!({"changes": {"file:///lib.rs": [edit]}}))
-            .await;
+        let location = json!({"uri": "file:///lib.rs", "range": zero_range()});
+        engine.respond(&id, json!([location])).await;
         let (id, _params) = engine.expect_request("shutdown").await;
         engine.respond(&id, Value::Null).await;
         engine.next_message().await;
@@ -941,72 +855,19 @@ async fn work_done_progress_decides_whether_the_engine_is_analyzing() {
     );
 
     session
-        .rename(
+        .references(
             &document,
             Position {
                 line: 0,
                 character: 3,
             },
-            "renamed",
         )
         .await
-        .expect("the rename answers");
+        .expect("the request answers");
     assert!(
         !session.is_analyzing(),
-        "the end the rename consumed retires the token"
+        "the end the request consumed retires the token"
     );
-    session.shutdown().await;
-    join(engine_task).await;
-}
-
-/// The prepare behaviors answer a typed decline and a typed refusal, and
-/// both leave the engine serving.
-#[tokio::test]
-async fn prepare_behaviors_decline_and_refuse_with_typed_answers() {
-    let target = path("lib.rs");
-    let position = Position {
-        line: 0,
-        character: 0,
-    };
-
-    let (_workspace, mut session, engine_task) = started(|mut engine| async move {
-        engine.handshake(full_capabilities()).await;
-        let (id, _params) = engine.expect_request("textDocument/prepareRename").await;
-        engine.respond(&id, Value::Null).await;
-        let (id, _params) = engine.expect_request("shutdown").await;
-        engine.respond(&id, Value::Null).await;
-        engine.next_message().await;
-    })
-    .await;
-    let declined = session
-        .prepare_rename(&target, position)
-        .await
-        .expect("prepare answers");
-    assert!(declined.is_none(), "a null prepare answer declines");
-    assert!(
-        session.latest_answer_is_empty(),
-        "a null prepare answer remains retryable"
-    );
-    session.shutdown().await;
-    join(engine_task).await;
-
-    let (_workspace, mut session, engine_task) = started(|mut engine| async move {
-        engine.handshake(full_capabilities()).await;
-        let (id, _params) = engine.expect_request("textDocument/prepareRename").await;
-        engine.refuse(&id, -32602, "cannot rename here").await;
-        let (id, _params) = engine.expect_request("shutdown").await;
-        engine.respond(&id, Value::Null).await;
-        engine.next_message().await;
-    })
-    .await;
-    let refused = session
-        .prepare_rename(&target, position)
-        .await
-        .expect_err("the engine refuses the prepare");
-    assert!(matches!(
-        refused.fault(),
-        EngineFault::Refused { message, .. } if message == "cannot rename here"
-    ));
     session.shutdown().await;
     join(engine_task).await;
 }
@@ -1038,84 +899,6 @@ async fn progress_that_never_ends_keeps_the_engine_analyzing() {
         assert!(pulled.is_empty());
         assert!(session.is_analyzing());
     }
-    session.shutdown().await;
-    join(engine_task).await;
-}
-
-/// An engine that has announced no work of its own answers a will-rename
-/// with an edit set holding no edit - the answer of an engine that has
-/// nothing to update, and of one that has not indexed the file yet.
-///
-/// Every empty answer remains unconfirmed until engine announces work.
-/// Answer that proposed something is never unconfirmed.
-#[tokio::test]
-async fn an_empty_proposal_from_an_unannounced_engine_stays_unconfirmed() {
-    let (_workspace, mut session, engine_task) = started(|mut engine| async move {
-        engine.handshake(full_capabilities()).await;
-        for _attempt in 0..2 {
-            let (id, params) = engine.expect_request("workspace/willRenameFiles").await;
-            let new_uri = params["files"][0]["newUri"]
-                .as_str()
-                .expect("uri")
-                .to_owned();
-            engine.respond(&id, json!({"changes": {new_uri: []}})).await;
-        }
-        let opened = engine.next_message().await;
-        assert_eq!(opened["method"], json!("textDocument/didOpen"));
-        let (id, _params) = engine.expect_request("textDocument/diagnostic").await;
-        engine
-            .respond(
-                &id,
-                json!({"kind": "full", "items": [diagnostic("settled finding")]}),
-            )
-            .await;
-        let (id, _params) = engine.expect_request("shutdown").await;
-        engine.respond(&id, Value::Null).await;
-        engine.next_message().await;
-    })
-    .await;
-    let document = path("src/lib.rs");
-    assert_eq!(
-        session.readiness(),
-        EngineReadiness::Unconfirmed,
-        "this engine announces no work at all"
-    );
-
-    let proposal = session
-        .will_rename_files(&document, &path("src/moved.rs"))
-        .await
-        .expect("willRenameFiles answers");
-    assert!(
-        proposal.is_some(),
-        "the answer is an edit set, not a null: {proposal:#?}"
-    );
-    assert!(
-        session.latest_answer_is_empty(),
-        "edit set holding no edit remains unconfirmed"
-    );
-
-    session
-        .will_rename_files(&document, &path("src/moved.rs"))
-        .await
-        .expect("willRenameFiles answers again");
-    assert!(
-        session.latest_answer_is_empty(),
-        "configured retry policy, not session state, bounds resends"
-    );
-
-    session
-        .open(&document, "rust", "fn a() {}\n".to_owned())
-        .await
-        .expect("didOpen is sent");
-    let pulled = session
-        .pull_diagnostics(&document)
-        .await
-        .expect("the pull answers");
-    assert_eq!(pulled.len(), 1, "this engine reports one finding");
-    assert!(
-        !session.latest_answer_is_empty(),
-        "answer that said something is confirmed"
-    );
     session.shutdown().await;
     join(engine_task).await;
 }
@@ -1671,193 +1454,6 @@ async fn initialization_options_ride_the_initialize_params_exactly_when_configur
     join(engine_task).await;
 }
 
-/// A rename answer covering more than one file relays every keyed change
-/// intact, addressed by the composed document URIs.
-///
-/// The word-boundary scan that produced such an edit in earlier scripted
-/// fixtures was the scripted engine's own implementation, not a session
-/// behavior; the session's own responsibility - relaying a multi-file
-/// `WorkspaceEdit` without dropping or reshaping any entry - is what this
-/// test proves, with the edit fixed instead of computed by a scan.
-#[tokio::test]
-async fn multi_file_rename_edit_relays_every_change_intact() {
-    let workspace = tempfile::tempdir().expect("tempdir");
-    std::fs::write(workspace.path().join("lib.rs"), "pub fn beacon() {}\n")
-        .expect("fixture writes");
-    std::fs::write(
-        workspace.path().join("main.rs"),
-        "pub fn caller() { beacon(); }\n",
-    )
-    .expect("fixture writes");
-    let root = TreeRoot::new(workspace.path()).expect("root converts");
-    let (client, engine_side) = tokio::io::duplex(64 * 1024);
-    let engine_task = tokio::spawn(async move {
-        let mut engine = ScriptedEngine::new(engine_side);
-        engine.handshake(full_capabilities()).await;
-        let opened = engine.next_message().await;
-        assert_eq!(opened["method"], json!("textDocument/didOpen"));
-        let (id, _params) = engine.expect_request("textDocument/rename").await;
-        let library_uri = root
-            .document_uri(&path("lib.rs"))
-            .expect("uri composes")
-            .to_string();
-        let caller_uri = root
-            .document_uri(&path("main.rs"))
-            .expect("uri composes")
-            .to_string();
-        let library_edit = json!({
-            "range": {"start": {"line": 0, "character": 7}, "end": {"line": 0, "character": 13}},
-            "newText": "flare",
-        });
-        let caller_edit = json!({
-            "range": {"start": {"line": 0, "character": 18}, "end": {"line": 0, "character": 24}},
-            "newText": "flare",
-        });
-        engine
-            .respond(
-                &id,
-                json!({"changes": {library_uri: [library_edit], caller_uri: [caller_edit]}}),
-            )
-            .await;
-        let (id, _params) = engine.expect_request("shutdown").await;
-        engine.respond(&id, Value::Null).await;
-        engine.next_message().await;
-    });
-    let mut session = EngineSession::start_over_transport(
-        transport_launch(),
-        workspace.path(),
-        client,
-        tokio::io::empty(),
-    )
-    .await
-    .expect("the scripted engine completes the handshake");
-    let target = path("lib.rs");
-    session
-        .open(&target, "rust", "pub fn beacon() {}\n".to_owned())
-        .await
-        .expect("didOpen is sent");
-    let edit = session
-        .rename(
-            &target,
-            Position {
-                line: 0,
-                character: 7,
-            },
-            "flare",
-        )
-        .await
-        .expect("rename answers");
-    let proposal = serde_json::to_value(&edit).expect("the edit serializes");
-    let library_uri = session
-        .root()
-        .document_uri(&target)
-        .expect("the target uri composes")
-        .to_string();
-    let caller_uri = session
-        .root()
-        .document_uri(&path("main.rs"))
-        .expect("the caller uri composes")
-        .to_string();
-    assert_eq!(
-        proposal["changes"][&library_uri][0]["newText"],
-        json!("flare")
-    );
-    assert_eq!(
-        proposal["changes"][&caller_uri][0]["range"]["start"]["character"],
-        json!(18)
-    );
-    assert_eq!(
-        proposal["changes"]
-            .as_object()
-            .expect("changes is a map")
-            .len(),
-        2,
-        "every keyed file rides the relayed edit intact: {proposal:#}"
-    );
-    session.shutdown().await;
-    join(engine_task).await;
-}
-
-/// The mutating engine drifts the target on disk before answering, and its
-/// answer still derives from the bytes it was handed at `didOpen`, not the
-/// drifted disk: the session never reads disk itself, it relays exactly
-/// what the wire answered.
-#[tokio::test]
-async fn mutating_engine_drifts_the_target_and_answers_from_opened_bytes() {
-    let workspace = tempfile::tempdir().expect("tempdir");
-    let library = "pub fn beacon() {}\n";
-    let target_path = workspace.path().join("lib.rs");
-    std::fs::write(&target_path, library).expect("fixture writes");
-    let drift_target = target_path.clone();
-    let (client, engine_side) = tokio::io::duplex(64 * 1024);
-    let engine_task = tokio::spawn(async move {
-        let mut engine = ScriptedEngine::new(engine_side);
-        engine.handshake(full_capabilities()).await;
-        let opened = engine.next_message().await;
-        assert_eq!(opened["method"], json!("textDocument/didOpen"));
-        let (id, params) = engine.expect_request("textDocument/rename").await;
-        let uri = params["textDocument"]["uri"]
-            .as_str()
-            .expect("uri")
-            .to_owned();
-        let mutated = format!(
-            "{}// the engine drifted this file\n",
-            std::fs::read_to_string(&drift_target).expect("engine reads its target")
-        );
-        std::fs::write(&drift_target, mutated).expect("engine mutates its target");
-        let edit = json!({
-            "range": {"start": {"line": 0, "character": 7}, "end": {"line": 0, "character": 13}},
-            "newText": "flare",
-        });
-        engine.respond(&id, json!({"changes": {uri: [edit]}})).await;
-        let (id, _params) = engine.expect_request("shutdown").await;
-        engine.respond(&id, Value::Null).await;
-        engine.next_message().await;
-    });
-    let mut session = EngineSession::start_over_transport(
-        transport_launch(),
-        workspace.path(),
-        client,
-        tokio::io::empty(),
-    )
-    .await
-    .expect("the scripted engine completes the handshake");
-    let target = path("lib.rs");
-    session
-        .open(&target, "rust", library.to_owned())
-        .await
-        .expect("didOpen is sent");
-    let edit = session
-        .rename(
-            &target,
-            Position {
-                line: 0,
-                character: 7,
-            },
-            "flare",
-        )
-        .await
-        .expect("rename answers");
-    let drifted = std::fs::read_to_string(&target_path).expect("the target reads");
-    assert!(
-        drifted.contains("the engine drifted this file"),
-        "the engine mutated its target: {drifted}"
-    );
-    let proposal = serde_json::to_value(&edit).expect("the edit serializes");
-    let library_uri = session
-        .root()
-        .document_uri(&target)
-        .expect("the target uri composes")
-        .to_string();
-    assert_eq!(
-        proposal["changes"][&library_uri][0]["range"]["start"]["character"],
-        json!(7),
-        "the edits derive from the opened bytes, not the drifted disk"
-    );
-    session.shutdown().await;
-    join(engine_task).await;
-}
-
 /// The outside-root engine answers its fixed escape URI verbatim; the
 /// session relays it unchanged.
 #[tokio::test]
@@ -1866,12 +1462,11 @@ async fn outside_root_engine_answers_its_escape_uri() {
         engine.handshake(full_capabilities()).await;
         let opened = engine.next_message().await;
         assert_eq!(opened["method"], json!("textDocument/didOpen"));
-        let (id, _params) = engine.expect_request("textDocument/rename").await;
-        let edit = json!({"range": zero_range(), "newText": "renamed"});
+        let (id, _params) = engine.expect_request("textDocument/references").await;
         engine
             .respond(
                 &id,
-                json!({"changes": {"file:///rift-elsewhere/out.rs": [edit]}}),
+                json!([{ "uri": "file:///rift-elsewhere/out.rs", "range": zero_range() }]),
             )
             .await;
         let (id, _params) = engine.expect_request("shutdown").await;
@@ -1884,22 +1479,17 @@ async fn outside_root_engine_answers_its_escape_uri() {
         .open(&target, "rust", "pub fn beacon() {}\n".to_owned())
         .await
         .expect("didOpen is sent");
-    let edit = session
-        .rename(
+    let locations = session
+        .references(
             &target,
             Position {
                 line: 0,
                 character: 7,
             },
-            "flare",
         )
         .await
-        .expect("rename answers");
-    let proposal = serde_json::to_value(&edit).expect("the edit serializes");
-    assert!(
-        proposal["changes"]["file:///rift-elsewhere/out.rs"].is_array(),
-        "the escape URI rides the answer: {proposal:#}"
-    );
+        .expect("request answers");
+    assert_eq!(locations[0].uri.as_str(), "file:///rift-elsewhere/out.rs");
     session.shutdown().await;
     join(engine_task).await;
 }
@@ -2024,16 +1614,15 @@ async fn debug_of_a_spawned_session_names_its_pid_and_flips_ended_after_a_fault(
     );
     let document = path("src/lib.rs");
     let error = session
-        .rename(
+        .references(
             &document,
             Position {
                 line: 0,
                 character: 0,
             },
-            "renamed",
         )
         .await
-        .expect_err("the hanging engine never answers the rename");
+        .expect_err("the hanging engine never answers the request");
     assert!(matches!(error.fault(), EngineFault::TimedOut { .. }));
     let after = format!("{session:?}");
     assert!(
@@ -2052,13 +1641,12 @@ async fn engine_exit_mid_request_ends_the_session() {
             .expect("the engine answers initialize before it exits");
     let document = path("src/lib.rs");
     let error = session
-        .rename(
+        .references(
             &document,
             Position {
                 line: 0,
                 character: 0,
             },
-            "renamed",
         )
         .await
         .expect_err("the engine exits instead of answering");
@@ -2067,13 +1655,12 @@ async fn engine_exit_mid_request_ends_the_session() {
         EngineFault::ConnectionClosed { .. }
     ));
     let ended = session
-        .rename(
+        .references(
             &document,
             Position {
                 line: 0,
                 character: 0,
             },
-            "renamed",
         )
         .await
         .expect_err("the session refuses after its engine ended");

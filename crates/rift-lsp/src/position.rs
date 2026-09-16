@@ -4,7 +4,7 @@
 //! encoding. The index walks at most one line per conversion, so one call
 //! costs the bytes of the addressed line plus a binary search over line
 //! starts. A position past a line's end or the document's end is refused,
-//! never clamped: a clamp would silently move an engine's edit.
+//! never clamped: a clamp would silently move an engine's location.
 
 use lsp_types::Position;
 use rift_core::line::{LineEnding, lines_inclusive, without_ending};

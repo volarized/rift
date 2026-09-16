@@ -31,21 +31,3 @@ command = ["rustup", "run", "1.98", "rust-analyzer"]
 
 [languages.toml.lsp]
 command = ["tombi", "lsp"]
-
-[[hooks]]
-id = "format"
-kind = "format"
-command = ["cargo", "fmt", "--all"]
-writes = "workspace"
-failure_severity = "warning"
-determinism = "deterministic"
-
-[[hooks]]
-id = "check"
-kind = "build"
-command = ["just", "check"]
-timeout = "600s"
-determinism = "deterministic"
-guarantees = [
-  { kind = "syntax_validated", scope = { kind = "reach", reach = "project" }, detail = "cargo check and the architecture gate pass" },
-]

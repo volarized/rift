@@ -829,14 +829,14 @@ mod tests {
         let error = Error::new(ProbeFault::MissingTarget {
             path: "src/lib.rs".to_owned(),
         })
-        .with_context(ErrorContext::new("operation", "replace_symbol"));
+        .with_context(ErrorContext::new("operation", "get_symbol"));
         let context = error.context();
         let keys: Vec<&str> = context.iter().map(ErrorContext::key).collect();
         assert_eq!(keys, ["fault", "path", "operation"]);
         assert_eq!(
             error.to_string(),
             "the requested resource does not exist in the current snapshot: \
-             fault missing_target, path src/lib.rs, operation replace_symbol; \
+             fault missing_target, path src/lib.rs, operation get_symbol; \
              search or list first, then retry with an identity that answer returned"
         );
     }

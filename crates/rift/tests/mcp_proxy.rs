@@ -5,11 +5,9 @@
 //!
 //! Every test drives the compiled `rift` binary as an MCP stdio child
 //! against a throwaway workspace fixture. The proxy tests prove election,
-//! adoption, sharing, and re-election; the engine tests prove one applied
-//! change's observable outcome - the bytes a real engine rewrote on disk,
-//! or the finding it attached - through the whole chain: proxy, server,
-//! and engine all real processes, no scripted engine and no in-process
-//! shortcut. The tests serialize on one async mutex: the servers share the
+//! adoption, sharing, and re-election. The engine test reads incoming references
+//! through the proxy and verifies the configured engine starts. The tests
+//! serialize on one async mutex: the servers share the
 //! loopback election port range. Each fixture's `rift.toml` accepts a
 //! 60-second idle timeout as an orphan-safety net, and a drop guard stops
 //! any server a failed test leaves behind.
@@ -57,20 +55,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncReadExt as _;
 
 /// The tools the workspace server advertises, in served order.
-const SERVED_TOOL_NAMES: [&str; 12] = [
-    "get_symbol",
-    "insert_node",
-    "insert_symbol",
-    "move_file",
-    "nodes",
-    "patch",
-    "remove_node",
-    "remove_symbol",
-    "rename_symbol",
-    "replace_node",
-    "replace_symbol",
-    "search",
-];
+const SERVED_TOOL_NAMES: [&str; 3] = ["get_symbol", "nodes", "search"];
 
 #[test]
 fn proxied_engine_bound_covers_two_retry_sequences_and_election() {
@@ -160,69 +145,6 @@ fn held_port_in_range() -> TestResult<TcpListener> {
         }
     }
     Err("no free port in the serving range".into())
-}
-
-#[tokio::test]
-async fn cold_start_elects_a_server_that_survives_the_proxy() -> TestResult {
-    let _serial = SERIAL.lock().await;
-    let directory = workspace()?;
-    let root = directory.path();
-    let _cleanup = StopOnDrop::new(root);
-
-    let client = proxy_client(root).await?;
-    let initialized = serde_json::to_value(
-        client
-            .peer_info()
-            .ok_or("the proxy must return initialize data")?,
-    )?;
-    let advertised_identity = initialized["_meta"]["sh.volar/rift"].clone();
-
-    let listing = within("the proxied tool listing", client.list_tools(None)).await??;
-    assert_eq!(
-        listing
-            .tools
-            .iter()
-            .map(|tool| tool.name.as_ref())
-            .collect::<Vec<_>>(),
-        SERVED_TOOL_NAMES
-    );
-    assert_beacon(&beacon_lookup(&client).await?);
-
-    let serving = serving_document(root).ok_or("the proxy must have elected a server")?;
-    assert_eq!(
-        advertised_identity,
-        serde_json::to_value(&serving.identity)?,
-        "initialize and the lock document must identify the same server"
-    );
-
-    let inserted = proxied_call(
-        &client,
-        "insert_symbol",
-        &json!({
-            "anchor": "rift://symbol/rust/lib.rs/beacon",
-            "position": "after",
-            "body": "pub fn lantern() {}",
-        }),
-    )
-    .await?;
-    assert_eq!(inserted["status"], json!("applied"), "{inserted:#}");
-    let lantern = proxied_call(&client, "get_symbol", &json!({"name": "lantern"})).await?;
-    assert_eq!(
-        lantern["hits"][0]["symbol"]["name"],
-        json!("lantern"),
-        "{lantern:#}"
-    );
-
-    client.cancel().await?;
-    let survivor = serving_document(root).ok_or("the server must survive the proxy's exit")?;
-    assert_eq!(
-        survivor.pid, serving.pid,
-        "the same server must keep serving"
-    );
-
-    let stopped = run_rift(root, &["server", "stop"]).await?;
-    require_success(&stopped, "stop after the proxy session")?;
-    Ok(())
 }
 
 #[tokio::test]
@@ -501,30 +423,9 @@ async fn proxy_stderr_carries_lifecycle_lines_and_never_the_token() -> TestResul
     Ok(())
 }
 
-// The engine tier answers through the proxy, against the root the CLI
-// serves.
-//
-// `rift mcp` and `rift server start` serve the process working directory,
-// which they name `.`. Reads and writes below the root resolve against
-// that directory, so they cannot tell one spelling from another; the
-// engine is addressed in `file://` URIs, which carry no working
-// directory, so it is the one caller that can. Every test below drives
-// the real binary against a real elected server, and - gated behind
-// `RIFT_ENGINE_LIVE` - a real language engine, the way an agent reaches
-// Rift.
-
-/// A patch replacing one file with a malformed declaration.
-const RUST_PROJECT_SYNTAX_PATCH: &str = "--- a/caller.rs\n+++ b/caller.rs\n@@ -1,5 +1 @@\n-use crate::hub::beacon;\n-\n-pub fn total() -> i32 {\n-    beacon(2)\n-}\n+fn broken( {\n";
-
-/// A change applied through the whole real chain carries diagnostics for
-/// the file it changed and never the warning an unreachable engine degrades
-/// to. Engine versions may add findings beside the syntax provider's.
-///
-/// `rift-mcp`'s own `live_rust_analyzer.rs` proves this same shape without
-/// the proxy in the path; this proves it with the proxy, the election, and
-/// the daemon all real too.
+/// Incoming references use the configured engine through the real CLI proxy.
 #[tokio::test]
-async fn proxied_change_carries_diagnostics() -> TestResult {
+async fn live_proxied_read_resolves_incoming_references() -> TestResult {
     let _serial = SERIAL.lock().await;
     if !live_engine_gate::engine_live() {
         return Ok(());
@@ -533,39 +434,59 @@ async fn proxied_change_carries_diagnostics() -> TestResult {
     let root = directory.path();
     rust_engine::require_rust_analyzer(root);
     let _cleanup = StopOnDrop::new(root);
-
     let client = proxy_client(root).await?;
-    let structured = proxied_engine_call(
+    let declaration = proxied_call(&client, "get_symbol", &json!({"name": "beacon"})).await?;
+    let seed = declaration["hits"][0]["symbol"]["id"]
+        .as_str()
+        .ok_or("beacon declaration must carry its symbol identity")?;
+    let result = proxied_engine_call(
         &client,
-        "patch",
-        &json!({ "patch": RUST_PROJECT_SYNTAX_PATCH }),
+        "search",
+        &json!({"traversal": {
+            "seed": seed, "direction": "incoming", "facets": ["references"], "depth": 1
+        }}),
     )
     .await?;
-    assert_eq!(structured["status"], json!("applied"), "{structured:#}");
-    let findings = structured["summary"]["diagnostics"]
+    let caller = result["results"]
         .as_array()
-        .ok_or("the summary must carry findings")?;
-    let finding = findings
+        .ok_or("search must return its results")?
         .iter()
-        .find(|finding| finding["code"] == json!("rift.syntax.error"))
-        .ok_or("provider syntax finding must be among findings")?;
-    assert_eq!(finding["severity"], json!("error"));
-    assert_eq!(finding["reliability"], json!("recovered"));
-    let degraded = findings
-        .iter()
-        .any(|finding| finding["code"] == json!("rift.engine.failed"));
-    assert!(
-        !degraded,
-        "an addressed engine never degrades to a warning: {structured:#}"
-    );
+        .find(|hit| hit["hit"]["symbol"]["name"] == "total")
+        .ok_or_else(|| format!("incoming references must reach the caller: {result:#}"))?;
+    assert_eq!(caller["traversal_path"][0]["direction"], "incoming");
+    assert_eq!(caller["traversal_path"][0]["relationship"]["to"], seed);
     assert_eq!(
-        fs::read_to_string(root.join("caller.rs"))?,
-        "fn broken( {\n",
-        "the change stays applied with its finding attached"
+        caller["traversal_path"][0]["relationship"]["derivation"],
+        "resolution"
     );
-
+    let workspace = within(
+        "workspace resource",
+        client.read_resource(rmcp::model::ReadResourceRequestParams::new(
+            "rift://workspace",
+        )),
+    )
+    .await??;
+    let Some(rmcp::model::ResourceContents::TextResourceContents { text, .. }) =
+        workspace.contents.first()
+    else {
+        return Err("workspace must return text content".into());
+    };
+    let configuration: serde_json::Value = serde_json::from_str(text)?;
+    let rust = configuration["languages"]
+        .as_array()
+        .ok_or("workspace must list languages")?
+        .iter()
+        .find(|language| language["language"] == "rust")
+        .ok_or("workspace must report Rust")?;
+    assert_eq!(rust["lsp"]["state"], "ready", "{configuration}");
+    assert_eq!(
+        fs::read_to_string(root.join("hub.rs"))?,
+        harness::RUST_PROJECT_HUB
+    );
     client.cancel().await?;
-    let stopped = run_rift(root, &["server", "stop"]).await?;
-    require_success(&stopped, "stop after the diagnostics session")?;
+    require_success(
+        &run_rift(root, &["server", "stop"]).await?,
+        "stop after reference read",
+    )?;
     Ok(())
 }
