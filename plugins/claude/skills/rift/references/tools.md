@@ -67,5 +67,5 @@ Parameters:
 - `rev` - The version-control revision to search - a branch, tag, or commit id as the workspace's version control spells it.
 - `scope` - Which declarations `query` searches: the project tree, the public declarations of the cataloged dependency packages, or both.
 - `target` - Which entity kinds may be returned - a kind selector, never the text to search for; that is `query`.
-- `traversal` - A bounded relationship walk, standing alone or beside `query`.
+- `traversal` - A bounded relationship walk, standing alone or beside `query` or `change`.
 

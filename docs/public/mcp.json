@@ -786,6 +786,33 @@
               },
               {
                 "additionalProperties": false,
+                "description": "A relationship walk rode beside a comparison, and the graph it walked is the current\ntree's, the only relationship graph the server holds. Its edges are the current\ntree's edges, not those of either compared revision: a reached declaration is what\nreferences the changed declaration today, and a reference either compared revision\nheld and the current tree does not is absent. The warning states which tree supplied\nthe edges; it never states that the answer is incomplete for that tree. Rides every\nanswer whose `change` carries a `traversal`.",
+                "properties": {
+                  "code": {
+                    "const": "change_traversal_current_tree",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "unplaced": {
+                    "description": "Changed declarations the current tree holds no node for, so the walk started at\nnone of them. A declaration the head revision removed is counted here, as is one\nthe current tree no longer holds at the path the comparison found it in.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "unplaced",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "Cataloged packages with a source root are still being indexed, so a `dependencies`\nor `all` answer holds their declarations only once the index reaches them. The\nanswer is served from the packages indexed so far. Rides only an answer whose\n`scope` reaches dependencies.",
                 "properties": {
                   "code": {
@@ -2565,6 +2592,33 @@
               },
               {
                 "additionalProperties": false,
+                "description": "A relationship walk rode beside a comparison, and the graph it walked is the current\ntree's, the only relationship graph the server holds. Its edges are the current\ntree's edges, not those of either compared revision: a reached declaration is what\nreferences the changed declaration today, and a reference either compared revision\nheld and the current tree does not is absent. The warning states which tree supplied\nthe edges; it never states that the answer is incomplete for that tree. Rides every\nanswer whose `change` carries a `traversal`.",
+                "properties": {
+                  "code": {
+                    "const": "change_traversal_current_tree",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "unplaced": {
+                    "description": "Changed declarations the current tree holds no node for, so the walk started at\nnone of them. A declaration the head revision removed is counted here, as is one\nthe current tree no longer holds at the path the comparison found it in.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "unplaced",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "Cataloged packages with a source root are still being indexed, so a `dependencies`\nor `all` answer holds their declarations only once the index reaches them. The\nanswer is served from the packages indexed so far. Rides only an answer whose\n`scope` reaches dependencies.",
                 "properties": {
                   "code": {
@@ -3284,7 +3338,7 @@
           },
           "SearchTraversal": {
             "additionalProperties": false,
-            "description": "A bounded relationship walk starting at one symbol. From `seed`, the server visits its\nneighbors, then their neighbors, up to `depth` hops, following `direction` and narrowed to\n`facets`; each reached symbol keeps the shortest path the walk found to it.",
+            "description": "A bounded relationship walk starting at one symbol, or at every declaration a `change`\nfound changed. From each starting declaration, the server visits its neighbors, then\ntheir neighbors, up to `depth` hops, following `direction` and narrowed to `facets`;\neach reached symbol keeps the shortest path the walk found to it.",
             "properties": {
               "depth": {
                 "default": 1,
@@ -3308,8 +3362,15 @@
                 "type": "array"
               },
               "seed": {
-                "$ref": "#/$defs/SymbolId",
-                "description": "The declaration the walk starts at. The seed itself is never a hit."
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/SymbolId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The declaration the walk starts at, required when `traversal` stands without\n`change`. The seed itself is never a hit. A `traversal` beside `change` starts at\nevery changed declaration instead, so the server refuses a `seed` named beside it."
               },
               "to": {
                 "anyOf": [
@@ -3323,9 +3384,6 @@
                 "description": "When set, the answer keeps only the hit whose walk reaches this symbol. That hit's\npath is the shortest one the walk found. A `to` the walk cannot reach within `depth`\nanswers empty, not refused."
               }
             },
-            "required": [
-              "seed"
-            ],
             "type": "object"
           },
           "SymbolId": {
@@ -3381,6 +3439,42 @@
               }
             ],
             "description": "a search selects its result set with query, traversal, or change"
+          },
+          {
+            "description": "a traversal without change starts at seed",
+            "else": {
+              "properties": {
+                "traversal": {
+                  "required": [
+                    "seed"
+                  ]
+                }
+              }
+            },
+            "if": {
+              "required": [
+                "change"
+              ]
+            }
+          },
+          {
+            "description": "a traversal beside change starts at every changed declaration, never at seed",
+            "if": {
+              "required": [
+                "change"
+              ]
+            },
+            "then": {
+              "properties": {
+                "traversal": {
+                  "not": {
+                    "required": [
+                      "seed"
+                    ]
+                  }
+                }
+              }
+            }
           }
         ],
         "examples": [
@@ -3426,6 +3520,21 @@
             "query": "spawn_blocking",
             "scope": "dependencies",
             "target": "symbol"
+          },
+          {
+            "change": {
+              "base": "main",
+              "head": "HEAD"
+            },
+            "limit": 25,
+            "target": "symbol",
+            "traversal": {
+              "depth": 1,
+              "direction": "incoming",
+              "facets": [
+                "calls"
+              ]
+            }
           }
         ],
         "properties": {
@@ -3438,7 +3547,7 @@
                 "type": "null"
               }
             ],
-            "description": "Two committed revisions to compare, standing alone. Every declaration the two\nrevisions hold differently becomes a hit tagged `change`, carrying a `change` block\nthat names what differs and where the declaration lives on each side.\n`target: \"file\"` never carries a change hit, since the comparison reaches\ndeclarations alone, and `relevance` orders the hits by path, then name. `paths`\nnarrows which changed paths are compared. The server refuses `change` beside `rev`,\nsince `change` names its own revisions; beside `query`, since the two select\ndifferent result sets; beside `traversal`; and beside a `scope` past `project`."
+            "description": "Two committed revisions to compare, standing alone. Every declaration the two\nrevisions hold differently becomes a hit tagged `change`, carrying a `change` block\nthat names what differs and where the declaration lives on each side.\n`target: \"file\"` never carries a change hit, since the comparison reaches\ndeclarations alone, and `relevance` orders the hits by path, then name. `paths`\nnarrows which changed paths are compared. A `traversal` beside `change` walks from\nevery changed declaration. The server refuses `change` beside `rev`, since `change`\nnames its own revisions; beside `query`, since the two select different result sets;\nand beside a `scope` past `project`."
           },
           "include": {
             "description": "Extra payload to attach to every hit. Every entry costs response bytes per hit, so\nthe caller requests only what it will read.",
@@ -3520,7 +3629,7 @@
                 "type": "null"
               }
             ],
-            "description": "A bounded relationship walk, standing alone or beside `query`. A symbol the walk\nreaches becomes a hit tagged `relationship`; one also matched lexically keeps its\nlexical score and gains the walk's path. `target: \"file\"` never carries a walked hit,\nsince a traversal only reaches symbols. With no `query`, `relevance` orders hits by\nascending `distance`, then identity. Never combines with `rev`: the relationship\ngraph serves the current tree alone."
+            "description": "A bounded relationship walk, standing alone or beside `query` or `change`. A symbol\nthe walk reaches becomes a hit tagged `relationship`; one also matched lexically or\nfound changed keeps its own score and payload and gains the walk's path.\n`target: \"file\"` never carries a walked hit, since a traversal only reaches symbols.\nWith no `query`, `relevance` orders hits by ascending `distance`, then identity.\nBeside `change` the walk starts at every changed declaration, and the answer carries\n`change_traversal_current_tree`. Never combines with `rev`: the relationship graph\nserves the current tree alone."
           }
         },
         "rift:since": "v0.0.6",
@@ -4144,6 +4253,33 @@
                 "required": [
                   "code",
                   "paths_max",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A relationship walk rode beside a comparison, and the graph it walked is the current\ntree's, the only relationship graph the server holds. Its edges are the current\ntree's edges, not those of either compared revision: a reached declaration is what\nreferences the changed declaration today, and a reference either compared revision\nheld and the current tree does not is absent. The warning states which tree supplied\nthe edges; it never states that the answer is incomplete for that tree. Rides every\nanswer whose `change` carries a `traversal`.",
+                "properties": {
+                  "code": {
+                    "const": "change_traversal_current_tree",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "unplaced": {
+                    "description": "Changed declarations the current tree holds no node for, so the walk started at\nnone of them. A declaration the head revision removed is counted here, as is one\nthe current tree no longer holds at the path the comparison found it in.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "unplaced",
                   "detail"
                 ],
                 "type": "object"

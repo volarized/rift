@@ -5,12 +5,20 @@
 //! classifies every declaration the two sides disagree on through the same
 //! classifier a symbol timeline runs. Only the changed paths are read and
 //! parsed: the comparison never builds a whole revision index.
+//!
+//! A `traversal` riding beside the comparison seeds the sibling `traversal`
+//! module's walk at every changed declaration. That walk runs over the current
+//! tree's relationship graph, the only one the server holds, so every answer
+//! carrying it discloses which tree supplied the edges.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use rift_core::constants::SEARCH_RESULTS_DEFAULT;
-use rift_core::{LanguageFileSelections, ProjectPath, SourceVisibility, TextFileInclusion};
+use rift_core::{
+    LanguageFileSelections, ProjectPath, SourceVisibility, SymbolId as CoreSymbolId,
+    TextFileInclusion,
+};
 use rift_history::Repository;
 use rift_index::{
     IndexedFile, RevisionPaths, SymbolMatch, SymbolMatchRank, WorkspaceIndex, WorkspaceIndexLimits,
@@ -18,37 +26,49 @@ use rift_index::{
 };
 use rift_protocol::read::{
     MatchedField, PathSelector, ReadWarning, ResultOrder, SEARCH_CHANGE_PATHS_MAX, SearchChange,
-    SearchHit, SearchParams, SearchParamsTarget, SearchResult, SymbolChange, SymbolVersionKind,
+    SearchHit, SearchParams, SearchParamsTarget, SearchResult, SearchTraversal, SymbolChange,
+    SymbolVersionKind,
 };
 use rift_syntax::SyntaxSymbol;
 
+use crate::engine_read::EngineReferences;
 use crate::history::{SymbolShape, SymbolState, classify};
 use crate::read::{
-    ReadError, ReadFault, accepted_limit, page, project_path, results_truncation_warning,
-    source_warnings,
+    ReadError, ReadFault, ReadService, accepted_limit, page, project_path,
+    results_truncation_warning, source_warnings,
 };
 use crate::search::{
-    HitPayloads, bound_hits, build_symbol_hit, order_hits, path_matcher, validate_search,
+    HitPayloads, bound_hits, build_symbol_hit, hit_symbol_id, order_hits, path_matcher,
+    validate_search,
+};
+use crate::traversal::{
+    TRAVERSAL_NODES_MAX, TraversalRanking, TraversalSeeds, WalkMerge, merge_walk_hits,
+    traversal_truncation_warning, walk_traversal_with_references, walkable,
 };
 
 /// Answers one `search` request that carries `change`: the declarations the two
 /// named revisions hold differently, ordered and paged like any other search
 /// answer.
 ///
+/// `reads` is the current tree's snapshot, and a `traversal` riding beside the
+/// comparison walks its relationship graph - the only graph the server holds.
+///
 /// # Errors
 ///
 /// Returns [`ReadError`] when the request combines `change` with a field that
 /// selects another result set, when a revision spelling breaks its contract or
 /// resolves to no commit, when the workspace has no version-control repository,
-/// or when one side's changed paths cannot be indexed within bounds.
+/// when one side's changed paths cannot be indexed within bounds, or when a
+/// `traversal` rides beside the comparison in a workspace whose binding provider
+/// never built a relationship graph.
 pub fn search_change(
     root: &Path,
     params: &SearchParams,
     change: &SearchChange,
     limits: WorkspaceIndexLimits,
     visibility: &SourceVisibility,
-    text_inclusion: &TextFileInclusion,
-    languages: &LanguageFileSelections,
+    (text_inclusion, languages): (&TextFileInclusion, &LanguageFileSelections),
+    reads: &ReadService,
 ) -> Result<SearchResult, ReadError> {
     validate_search(params)?;
     let limit = accepted_limit(params.limit.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))?;
@@ -61,14 +81,131 @@ pub fn search_change(
         (text_inclusion, languages),
     )?;
     let mut results = compared.hits(params)?;
+    let walked = params
+        .traversal
+        .as_ref()
+        .map(|traversal| {
+            let payloads = HitPayloads::for_change(params);
+            collect_change_traversal_hits(reads, traversal, payloads, &mut results)
+        })
+        .transpose()?;
     order_change_hits(&mut results, params.order);
     let results_max_reached = bound_hits(&mut results, compared.head.results_max());
     let (results, pagination) = page(results, params.page_index, limit);
     Ok(SearchResult {
         results,
         pagination,
-        warnings: compared.warnings(results_max_reached),
+        warnings: compared.warnings(walked, results_max_reached),
     })
+}
+
+/// What one walk riding beside a comparison reports: the disclosure every such
+/// answer carries, and whether the shared walk budget stopped the walk.
+struct ChangeTraversalReport {
+    disclosure: ReadWarning,
+    truncated: bool,
+}
+
+impl ChangeTraversalReport {
+    /// The warnings this walk contributes: the disclosure, then the walk bound when
+    /// the shared budget stopped the walk before the reachable graph was exhausted.
+    fn warnings(self) -> Vec<ReadWarning> {
+        let mut warnings = vec![self.disclosure];
+        if self.truncated {
+            warnings.push(traversal_truncation_warning());
+        }
+        warnings
+    }
+}
+
+/// Seeds one relationship walk at every changed declaration and merges what it
+/// reaches into `results`.
+///
+/// The graph is the current tree's, so the report discloses that whatever the
+/// walk found. One walk budget covers every seed, so the symbols the walk
+/// discovers keep `TRAVERSAL_NODES_MAX` instead of multiplying it by the number
+/// of changed declarations.
+///
+/// # Errors
+///
+/// Returns [`ReadError`] naming the binding capability when this workspace's
+/// relationship store is empty because the binding provider never ran.
+fn collect_change_traversal_hits(
+    reads: &ReadService,
+    traversal: &SearchTraversal,
+    payloads: HitPayloads,
+    results: &mut Vec<SearchHit>,
+) -> Result<ChangeTraversalReport, ReadError> {
+    let store = reads.relationships();
+    if store.is_empty() && !reads.index().binding_enabled() {
+        return Err(ReadFault::unsupported(
+            "relationship traversal (providers.binding disabled)",
+        ));
+    }
+    let (seeds, unplaced) = change_seeds(reads, results);
+    let walk = walk_traversal_with_references(
+        store,
+        &TraversalSeeds::Changed(seeds),
+        traversal,
+        TRAVERSAL_NODES_MAX,
+        &EngineReferences::default(),
+    );
+    let merge = WalkMerge {
+        // A comparison's `paths` selects the changed paths compared, never where the
+        // walk may reach: a caller asking what a changed declaration affects is asking
+        // about the declarations outside that selection.
+        matcher: None,
+        root: reads.index().root(),
+        to: traversal.to.as_ref(),
+        ranking: TraversalRanking::Unranked,
+        payloads,
+    };
+    merge_walk_hits(reads, walk.discovered, merge, results)?;
+    Ok(ChangeTraversalReport {
+        disclosure: change_traversal_disclosure(unplaced),
+        truncated: walk.truncated,
+    })
+}
+
+/// The changed declarations the current tree can start a walk at, and how many of
+/// them it holds no node for.
+fn change_seeds(reads: &ReadService, results: &[SearchHit]) -> (Vec<CoreSymbolId>, u64) {
+    let mut seeds = Vec::new();
+    let mut unplaced: u64 = 0;
+    for hit in results {
+        match walkable_identity(reads, hit) {
+            Some(identity) => seeds.push(identity),
+            None => unplaced = unplaced.saturating_add(1),
+        }
+    }
+    (seeds, unplaced)
+}
+
+/// One change hit's declaration as a node the current tree can start a walk at.
+///
+/// Answers `None` when that tree holds no such node: a declaration the head
+/// revision removed, one the current tree no longer holds at the path the
+/// comparison found it in, and one whose identity no accepted evidence
+/// established alike.
+fn walkable_identity(reads: &ReadService, hit: &SearchHit) -> Option<CoreSymbolId> {
+    let identity = CoreSymbolId::new(hit_symbol_id(hit)?.0.clone()).ok()?;
+    walkable(reads, &identity).then_some(identity)
+}
+
+/// The disclosure every answer whose comparison carried a walk rides with.
+fn change_traversal_disclosure(unplaced: u64) -> ReadWarning {
+    let subject = match unplaced {
+        1 => "changed declaration has",
+        _ => "changed declarations have",
+    };
+    ReadWarning::ChangeTraversalCurrentTree {
+        unplaced,
+        detail: format!(
+            "the walk followed the current tree's relationship graph, the only graph \
+             this server holds, so its edges are neither compared revision's; {unplaced} \
+             {subject} no node in that tree and seeded no walk"
+        ),
+    }
 }
 
 /// One comparison's two sides: the read index each revision holds over the paths
@@ -239,14 +376,20 @@ impl ComparedRevisions {
     }
 
     /// The warnings one comparison answer carries: the changed-path bound when the
-    /// comparison reached it, the files either side left out of its index, then the
-    /// result bound when the hit set reached it.
-    fn warnings(&self, results_max_reached: Option<usize>) -> Vec<ReadWarning> {
+    /// comparison reached it, the files either side left out of its index, what a
+    /// walk riding beside the comparison reported, then the result bound when the
+    /// hit set reached it.
+    fn warnings(
+        &self,
+        walked: Option<ChangeTraversalReport>,
+        results_max_reached: Option<usize>,
+    ) -> Vec<ReadWarning> {
         let mut warnings = Vec::new();
         if self.truncated {
             warnings.push(change_truncation_warning());
         }
         warnings.extend(source_warnings(&self.left_out()));
+        warnings.extend(walked.into_iter().flat_map(ChangeTraversalReport::warnings));
         if let Some(results_max) = results_max_reached {
             warnings.push(results_truncation_warning(results_max));
         }
@@ -471,6 +614,7 @@ mod tests {
 
     use rift_core::{ErrorCode, ErrorName, Fault as _};
     use rift_history::fixture::{commit_all, git, init};
+    use rift_protocol::configuration::HistoryConfiguration;
     use rift_protocol::read::ProjectPath as WireProjectPath;
     use serde_json::{Value, json};
 
@@ -526,8 +670,19 @@ mod tests {
             Ok(self)
         }
 
-        /// Answers the comparison `params` asks for over this fixture.
+        /// Answers the comparison `params` asks for over this fixture, walking the
+        /// working tree's own graph wherever the request carries a `traversal`.
         fn search(&self, params: &serde_json::Value) -> Result<SearchResult, ReadError> {
+            self.search_against(params, &self.reads()?)
+        }
+
+        /// The same comparison against a named current-tree snapshot, for a test that
+        /// walks a graph other than the one this fixture's working tree holds.
+        fn search_against(
+            &self,
+            params: &serde_json::Value,
+            reads: &ReadService,
+        ) -> Result<SearchResult, ReadError> {
             let params: SearchParams =
                 serde_json::from_value(params.clone()).expect("test parameters must deserialize");
             let change = params.change.clone().expect("the test names a change");
@@ -537,8 +692,23 @@ mod tests {
                 &change,
                 self.limits,
                 &SourceVisibility::default(),
+                (
+                    &TextFileInclusion::default(),
+                    &LanguageFileSelections::default(),
+                ),
+                reads,
+            )
+        }
+
+        /// This fixture's working tree as the server publishes it: the snapshot whose
+        /// relationship graph a walk beside the comparison follows.
+        fn reads(&self) -> Result<ReadService, ReadError> {
+            ReadService::build(
+                self.directory.path(),
+                self.limits,
+                &SourceVisibility::default(),
                 &TextFileInclusion::default(),
-                &LanguageFileSelections::default(),
+                HistoryConfiguration::default(),
             )
         }
 
@@ -1070,31 +1240,6 @@ mod tests {
         Ok(())
     }
 
-    /// A walk seeded from a comparison is not served.
-    #[test]
-    fn change_beside_traversal_refuses_as_capability_unavailable() -> TestResult {
-        let fixture = Fixture::baseline(&[("src/lib.rs", "pub fn kept() {}\n")])?;
-
-        let error = fixture
-            .search(&json!({
-                "change": {"base": "baseline"},
-                "traversal": {"seed": "rift://symbol/rust/src/lib.rs/kept"}
-            }))
-            .expect_err("change beside traversal must refuse");
-
-        assert_eq!(
-            wire_code(&error),
-            ErrorName::Wire(ErrorCode::CapabilityUnavailable)
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("a traversal seeded from a change"),
-            "{error}"
-        );
-        Ok(())
-    }
-
     /// The dependency index serves the current tree alone, so a scope past
     /// `project` refuses beside a comparison of two committed revisions.
     #[test]
@@ -1203,5 +1348,301 @@ mod tests {
         );
         assert!(error.to_string().contains("change.base"), "{error}");
         Ok(())
+    }
+
+    /// The base revision of the impact fixture: `watched`, the declaration a later
+    /// revision widens, with `calls_watched` calling it; and, in a file of its own, an
+    /// unrelated declaration spelled the same, with a caller of its own.
+    const IMPACT_BASE: &[(&str, &str)] = &[
+        (
+            "lib.rs",
+            "pub fn watched() {}\npub fn calls_watched() {\n    watched();\n}\n",
+        ),
+        (
+            "other.rs",
+            "pub fn watched() {}\npub fn calls_legacy() {\n    watched();\n}\n",
+        ),
+    ];
+
+    /// The head revision of the impact fixture: `watched` takes a parameter, and its
+    /// caller's bytes are the base revision's.
+    const IMPACT_HEAD: &[(&str, &str)] = &[(
+        "lib.rs",
+        "pub fn watched(flag: bool) {}\npub fn calls_watched() {\n    watched();\n}\n",
+    )];
+
+    /// One walk riding beside a comparison of `baseline` against `HEAD`, reading the
+    /// declarations that reference every changed declaration.
+    fn impact_request() -> Value {
+        json!({
+            "change": {"base": "baseline"},
+            "traversal": {"direction": "incoming", "facets": ["calls"]}
+        })
+    }
+
+    /// Every hit's declaration name and the fields it was matched by, in answer order.
+    fn matched(answer: &SearchResult) -> Vec<(String, Vec<MatchedField>)> {
+        answer
+            .results
+            .iter()
+            .map(|hit| {
+                let name = match &hit.hit {
+                    rift_protocol::read::SearchHitTarget::Symbol { symbol } => symbol.name.clone(),
+                    _ => String::new(),
+                };
+                (name, hit.matched_by.clone())
+            })
+            .collect()
+    }
+
+    /// The hit `name` names, which every walked answer holds exactly once.
+    fn hit<'answer>(answer: &'answer SearchResult, name: &str) -> &'answer SearchHit {
+        let found: Vec<&SearchHit> = answer
+            .results
+            .iter()
+            .filter(|hit| match &hit.hit {
+                rift_protocol::read::SearchHitTarget::Symbol { symbol } => symbol.name == name,
+                _ => false,
+            })
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "{name} must be answered once: {:?}",
+            matched(answer)
+        );
+        found[0]
+    }
+
+    /// The changed declarations the current tree could not place, as the disclosure every
+    /// walked comparison carries reports them.
+    fn unplaced(answer: &SearchResult) -> Option<u64> {
+        answer.warnings.iter().find_map(|warning| match warning {
+            ReadWarning::ChangeTraversalCurrentTree { unplaced, .. } => Some(*unplaced),
+            _ => None,
+        })
+    }
+
+    /// A walk beside a comparison starts at the changed declaration and reaches the caller
+    /// one hop away, whose path names the declaration the walk started from.
+    #[test]
+    fn change_traversal_reaches_a_caller_of_the_changed_declaration() -> TestResult {
+        let fixture = Fixture::revisions(IMPACT_BASE, IMPACT_HEAD, &[])?;
+
+        let answer = fixture.search(&impact_request())?;
+
+        let caller = hit(&answer, "calls_watched");
+        assert_eq!(caller.matched_by, [MatchedField::Relationship]);
+        assert_eq!(caller.distance, Some(1));
+        let path = caller
+            .traversal_path
+            .as_ref()
+            .expect("a walked hit carries its path");
+        assert_eq!(
+            path[0].relationship.to.0, "rift://symbol/rust/lib.rs/watched",
+            "the first hop names the changed declaration the walk started at: {path:?}"
+        );
+        assert!(caller.change.is_none(), "{caller:?}");
+        assert_eq!(unplaced(&answer), Some(0), "{:?}", answer.warnings);
+        Ok(())
+    }
+
+    /// The walk starts at one declaration's identity, not at its name: a caller of an
+    /// unrelated declaration spelled the same is never reached.
+    #[test]
+    fn change_traversal_excludes_a_caller_of_a_same_named_declaration() -> TestResult {
+        let fixture = Fixture::revisions(IMPACT_BASE, IMPACT_HEAD, &[])?;
+
+        let answer = fixture.search(&impact_request())?;
+
+        let names: Vec<String> = matched(&answer).into_iter().map(|hit| hit.0).collect();
+        assert_eq!(
+            names,
+            ["calls_watched", "watched"],
+            "the caller of the unrelated declaration spelled the same stays out: {names:?}"
+        );
+        Ok(())
+    }
+
+    /// A declaration both revisions changed and the walk reached carries both matched
+    /// fields, keeps its `change` block beside the walk's path, and is answered once.
+    #[test]
+    fn change_traversal_absorbs_a_declaration_that_is_both_changed_and_reached() -> TestResult {
+        let base = [(
+            "lib.rs",
+            "pub fn watched() {}\npub fn calls_watched() {\n    watched();\n}\n",
+        )];
+        let head = [(
+            "lib.rs",
+            "pub fn watched(flag: bool) {}\npub fn calls_watched() {\n    watched(true);\n}\n",
+        )];
+        let fixture = Fixture::revisions(&base, &head, &[])?;
+
+        let answer = fixture.search(&impact_request())?;
+
+        let caller = hit(&answer, "calls_watched");
+        assert_eq!(
+            caller.matched_by,
+            [MatchedField::Change, MatchedField::Relationship]
+        );
+        assert_eq!(
+            caller.change.as_ref().map(|change| change.kind),
+            Some(SymbolVersionKind::BodyChanged),
+            "{caller:?}"
+        );
+        assert!(caller.traversal_path.is_some(), "{caller:?}");
+        assert_eq!(caller.distance, Some(1));
+        Ok(())
+    }
+
+    /// A declaration the head revision removed has no node in the current tree, so it
+    /// seeds no walk and the disclosure counts it.
+    #[test]
+    fn change_traversal_counts_a_removed_declaration_as_unplaced() -> TestResult {
+        let base = [
+            ("lib.rs", "pub fn watched() {}\n"),
+            ("gone.rs", "pub fn gone() {}\n"),
+        ];
+        let head = [("lib.rs", "pub fn watched(flag: bool) {}\n")];
+        let fixture = Fixture::revisions(&base, &head, &["gone.rs"])?;
+
+        let answer = fixture.search(&impact_request())?;
+
+        assert_eq!(unplaced(&answer), Some(1), "{:?}", answer.warnings);
+        Ok(())
+    }
+
+    /// A changed declaration nothing references is a legitimate empty impact: the answer
+    /// holds the change hit alone and still discloses which tree supplied the edges.
+    #[test]
+    fn change_traversal_with_no_reachable_caller_still_discloses_its_graph() -> TestResult {
+        let base = [("lib.rs", "pub fn watched() {}\n")];
+        let head = [("lib.rs", "pub fn watched(flag: bool) {}\n")];
+        let fixture = Fixture::revisions(&base, &head, &[])?;
+
+        let answer = fixture.search(&impact_request())?;
+
+        assert_eq!(
+            matched(&answer),
+            [("watched".to_owned(), vec![MatchedField::Change])]
+        );
+        assert_eq!(unplaced(&answer), Some(0), "{:?}", answer.warnings);
+        Ok(())
+    }
+
+    /// A comparison ranks nothing, so a walked hit riding beside one stays unscored the
+    /// way every change hit does, whatever `include` asks for.
+    #[test]
+    fn change_traversal_leaves_every_hit_unscored() -> TestResult {
+        let fixture = Fixture::revisions(IMPACT_BASE, IMPACT_HEAD, &[])?;
+
+        let answer = fixture.search(&json!({
+            "change": {"base": "baseline"},
+            "traversal": {"direction": "incoming", "facets": ["calls"]},
+            "include": ["score"]
+        }))?;
+
+        for hit in &answer.results {
+            assert!(hit.score.is_none(), "{hit:?}");
+        }
+        Ok(())
+    }
+
+    /// `to` keeps the one hit whose walk reaches the named symbol, the way it does beside
+    /// a `traversal` standing on its own.
+    #[test]
+    fn change_traversal_to_keeps_only_the_named_reached_declaration() -> TestResult {
+        let fixture = Fixture::revisions(IMPACT_BASE, IMPACT_HEAD, &[])?;
+
+        let answer = fixture.search(&json!({
+            "change": {"base": "baseline"},
+            "traversal": {
+                "direction": "incoming",
+                "facets": ["calls"],
+                "to": "rift://symbol/rust/other.rs/calls_legacy"
+            }
+        }))?;
+
+        let names: Vec<String> = matched(&answer).into_iter().map(|hit| hit.0).collect();
+        assert_eq!(names, ["watched"], "{names:?}");
+        Ok(())
+    }
+
+    /// A workspace whose binding provider never ran holds no relationship graph, so a
+    /// walk beside a comparison refuses the way a `traversal` standing alone does.
+    #[test]
+    fn change_traversal_refuses_a_workspace_with_no_relationship_graph() -> TestResult {
+        let fixture = Fixture::revisions(IMPACT_BASE, IMPACT_HEAD, &[])?;
+        let configuration = rift_protocol::configuration::BindingConfiguration {
+            enabled: false,
+            ..rift_protocol::configuration::BindingConfiguration::default()
+        };
+        let reads = ReadService::build_with_languages(
+            fixture.directory.path(),
+            fixture.limits,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+            rift_index::BindingPolicy::from(&configuration),
+            HistoryConfiguration::default(),
+            rift_protocol::dependencies::DependenciesConfiguration::default(),
+        )?;
+
+        let error = fixture
+            .search_against(&impact_request(), &reads)
+            .expect_err("a workspace with no relationship graph must refuse");
+
+        assert_eq!(
+            wire_code(&error),
+            ErrorName::Wire(ErrorCode::CapabilityUnavailable)
+        );
+        assert!(
+            error.to_string().contains("providers.binding disabled"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    /// Every walked comparison discloses which tree supplied the edges, and a walk the
+    /// shared node budget stopped names that bound once beside it.
+    #[test]
+    fn change_traversal_report_warns_the_disclosure_and_the_walk_bound() {
+        let ran = ChangeTraversalReport {
+            disclosure: change_traversal_disclosure(0),
+            truncated: false,
+        };
+        assert_eq!(ran.warnings(), [change_traversal_disclosure(0)]);
+        let stopped = ChangeTraversalReport {
+            disclosure: change_traversal_disclosure(2),
+            truncated: true,
+        };
+        assert_eq!(
+            stopped.warnings(),
+            [
+                change_traversal_disclosure(2),
+                traversal_truncation_warning()
+            ]
+        );
+    }
+
+    /// The disclosure names the tree whose edges the walk followed and counts the changed
+    /// declarations that tree holds no node for.
+    #[test]
+    fn change_traversal_disclosure_names_the_tree_and_counts_the_unplaced() {
+        let warning = change_traversal_disclosure(3);
+        let ReadWarning::ChangeTraversalCurrentTree { unplaced, detail } = warning else {
+            panic!("expected the walked-comparison disclosure: {warning:?}");
+        };
+        assert_eq!(unplaced, 3);
+        assert!(
+            detail.contains("current tree's relationship graph"),
+            "{detail}"
+        );
+        assert!(detail.contains("3 changed declarations have"), "{detail}");
+        let ReadWarning::ChangeTraversalCurrentTree { detail, .. } = change_traversal_disclosure(1)
+        else {
+            panic!("expected the walked-comparison disclosure");
+        };
+        assert!(detail.contains("1 changed declaration has"), "{detail}");
     }
 }

@@ -1383,6 +1383,10 @@ impl RiftMcp {
     /// under the same `[source]` policy and bounds a revision read applies, and
     /// `[providers.history] enabled = false` refuses it the same way. Neither side is the
     /// current tree, so the search index never takes part.
+    ///
+    /// A `traversal` riding beside the comparison walks the current publication's
+    /// relationship graph, so that publication is resolved once here and handed to the
+    /// comparison along with the revision policy.
     async fn change_search(
         &self,
         params: SearchParams,
@@ -1390,6 +1394,7 @@ impl RiftMcp {
     ) -> Result<Json<SearchResult>, ErrorData> {
         let resolved = self.published_workspace(wire::ErrorPhase::Read).await?;
         let revision_read = self.revision_read(&resolved.published)?;
+        let reads = Arc::clone(&resolved.published.reads);
         let RevisionRead {
             root,
             limits,
@@ -1406,8 +1411,8 @@ impl RiftMcp {
                     &change,
                     limits,
                     &visibility,
-                    &text_inclusion,
-                    &languages,
+                    (&text_inclusion, &languages),
+                    &reads,
                 )
             })
             .await

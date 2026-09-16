@@ -618,6 +618,37 @@ pub fn require_search_selector(schema: &mut Schema) {
     );
 }
 
+/// A [`SearchTraversal`](crate::search::SearchTraversal) names the declaration its walk
+/// starts at through `seed`, unless it rides beside `change`, which starts the walk at
+/// every changed declaration. The server enforces both halves, so the schema states them
+/// for a validating caller.
+pub fn require_traversal_seed(schema: &mut Schema) {
+    use crate::search::{SearchParams, SearchTraversal};
+    let change = property!(SearchParams, change);
+    let traversal = property!(SearchParams, traversal);
+    let seed = property!(SearchTraversal, seed);
+    append(
+        schema,
+        described(
+            "a traversal without change starts at seed",
+            otherwise(
+                requires(&[change]),
+                properties(vec![(traversal, requires(&[seed]))]),
+            ),
+        ),
+    );
+    append(
+        schema,
+        described(
+            "a traversal beside change starts at every changed declaration, never at seed",
+            when(
+                requires(&[change]),
+                properties(vec![(traversal, not(requires(&[seed])))]),
+            ),
+        ),
+    );
+}
+
 /// A [`SearchHit`] carries `range` and `line` together or not at all, and node
 /// and file hits always carry both.
 pub fn pair_range_with_line(schema: &mut Schema) {

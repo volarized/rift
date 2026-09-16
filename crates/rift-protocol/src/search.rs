@@ -327,6 +327,7 @@ pub enum SearchInclude {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::require_search_selector)]
+#[schemars(transform = schema::require_traversal_seed)]
 #[schemars(extend("rift:since" = "v0.0.6"))]
 #[schemars(extend("examples" = [
     {
@@ -371,6 +372,21 @@ pub enum SearchInclude {
         "query": "spawn_blocking",
         "scope": "dependencies",
         "limit": 10
+    },
+    {
+        "target": "symbol",
+        "change": {
+            "base": "main",
+            "head": "HEAD"
+        },
+        "traversal": {
+            "direction": "incoming",
+            "depth": 1,
+            "facets": [
+                "calls"
+            ]
+        },
+        "limit": 25
     }
 ]))]
 pub struct SearchParams {
@@ -419,12 +435,14 @@ pub struct SearchParams {
     /// refuses a revision search when the workspace has no version-control repository.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rev: Option<RevisionId>,
-    /// A bounded relationship walk, standing alone or beside `query`. A symbol the walk
-    /// reaches becomes a hit tagged `relationship`; one also matched lexically keeps its
-    /// lexical score and gains the walk's path. `target: "file"` never carries a walked hit,
-    /// since a traversal only reaches symbols. With no `query`, `relevance` orders hits by
-    /// ascending `distance`, then identity. Never combines with `rev`: the relationship
-    /// graph serves the current tree alone.
+    /// A bounded relationship walk, standing alone or beside `query` or `change`. A symbol
+    /// the walk reaches becomes a hit tagged `relationship`; one also matched lexically or
+    /// found changed keeps its own score and payload and gains the walk's path.
+    /// `target: "file"` never carries a walked hit, since a traversal only reaches symbols.
+    /// With no `query`, `relevance` orders hits by ascending `distance`, then identity.
+    /// Beside `change` the walk starts at every changed declaration, and the answer carries
+    /// `change_traversal_current_tree`. Never combines with `rev`: the relationship graph
+    /// serves the current tree alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traversal: Option<SearchTraversal>,
     /// Two committed revisions to compare, standing alone. Every declaration the two
@@ -432,9 +450,10 @@ pub struct SearchParams {
     /// that names what differs and where the declaration lives on each side.
     /// `target: "file"` never carries a change hit, since the comparison reaches
     /// declarations alone, and `relevance` orders the hits by path, then name. `paths`
-    /// narrows which changed paths are compared. The server refuses `change` beside `rev`,
-    /// since `change` names its own revisions; beside `query`, since the two select
-    /// different result sets; beside `traversal`; and beside a `scope` past `project`.
+    /// narrows which changed paths are compared. A `traversal` beside `change` walks from
+    /// every changed declaration. The server refuses `change` beside `rev`, since `change`
+    /// names its own revisions; beside `query`, since the two select different result sets;
+    /// and beside a `scope` past `project`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change: Option<SearchChange>,
 }
@@ -607,14 +626,18 @@ pub const SEARCH_TRAVERSAL_DEPTH_MAX: u64 = 2;
 /// silently deduplicated.
 pub const SEARCH_TRAVERSAL_FACETS_MAX: usize = RelationshipFacet::VARIANTS.len();
 
-/// A bounded relationship walk starting at one symbol. From `seed`, the server visits its
-/// neighbors, then their neighbors, up to `depth` hops, following `direction` and narrowed to
-/// `facets`; each reached symbol keeps the shortest path the walk found to it.
+/// A bounded relationship walk starting at one symbol, or at every declaration a `change`
+/// found changed. From each starting declaration, the server visits its neighbors, then
+/// their neighbors, up to `depth` hops, following `direction` and narrowed to `facets`;
+/// each reached symbol keeps the shortest path the walk found to it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchTraversal {
-    /// The declaration the walk starts at. The seed itself is never a hit.
-    pub seed: SymbolId,
+    /// The declaration the walk starts at, required when `traversal` stands without
+    /// `change`. The seed itself is never a hit. A `traversal` beside `change` starts at
+    /// every changed declaration instead, so the server refuses a `seed` named beside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<SymbolId>,
     /// Which edges the walk follows from each visited symbol. Omitted, `outgoing`.
     #[serde(default = "default_search_traversal_direction")]
     pub direction: TraversalDirection,
@@ -835,6 +858,48 @@ mod tests {
             .filter_map(|clause| clause["required"][0].as_str())
             .collect();
         assert_eq!(required, ["query", "traversal", "change"], "{schema:#}");
+    }
+
+    /// The schema states the same rule the server enforces: a walk names `seed` when it
+    /// stands without `change`, and names none beside one.
+    #[test]
+    fn search_params_schema_states_where_a_walk_starts() {
+        let schema = serde_json::to_value(schemars::schema_for!(SearchParams)).expect("schema");
+        let clauses = schema["allOf"]
+            .as_array()
+            .expect("the rules state an allOf");
+        let without_change = clauses
+            .iter()
+            .find(|clause| clause.get("else").is_some() && clause.get("if").is_some())
+            .expect("the standing-alone rule states an if/else");
+        assert_eq!(without_change["if"]["required"], json!(["change"]));
+        assert_eq!(
+            without_change["else"]["properties"]["traversal"]["required"],
+            json!(["seed"])
+        );
+        let beside_change = clauses
+            .iter()
+            .find(|clause| {
+                clause.get("then").is_some() && clause["if"]["required"] == json!(["change"])
+            })
+            .expect("the riding-beside rule states an if/then");
+        assert_eq!(
+            beside_change["then"]["properties"]["traversal"]["not"]["required"],
+            json!(["seed"])
+        );
+    }
+
+    /// A walk riding beside a comparison names no `seed`, and the model accepts it.
+    #[test]
+    fn search_params_with_change_and_a_seedless_traversal_parses() {
+        let params: SearchParams = serde_json::from_value(json!({
+            "change": {"base": "main"},
+            "traversal": {"direction": "incoming"}
+        }))
+        .expect("a walk beside a comparison must parse");
+        let traversal = params.traversal.expect("traversal must be present");
+        assert!(traversal.seed.is_none());
+        assert_eq!(traversal.direction, TraversalDirection::Incoming);
     }
 
     /// `head` takes a `#[serde(default = ...)]` function compiled apart from the
