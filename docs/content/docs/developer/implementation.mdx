@@ -8,16 +8,14 @@ This page goes into how Rift is built. It's developer-oriented - if you just wan
 check the [main documentation](/docs).
 
 <FlatDiagram
-  alt="An agent launches rift mcp, which proxies MCP from stdio to the rift server's /api/mcp route over Streamable HTTP. The server, an Axum application on Tokio, accepts rift.toml, mounts projections through Rift FS, and runs selected hooks on each change. Inside the providers-and-index box, providers publish Contributions, normalization builds the SymbolRecord graph, and the in-memory index serves readable Symbols and publishes lexical units and vectors through Toasty over SQLite into .rift/db; the database also records server logs. Inside the LSP engine box, the engine adapter sends plan requests to a language server child process and receives edit plans back; the adapter hands proposals to the server, which applies them to the targeted tree as witnessed edits."
+  alt="rift mcp forwards requests over Streamable HTTP to the Axum server on Tokio. Providers build an in-memory index and persist search data and logs through Toasty over SQLite."
   chart={`
     flowchart LR
       agent["agent"]:::agent -- "MCP over stdio" --> mcp["rift mcp<br/>rmcp proxy"]:::rift
       mcp -- "Streamable HTTP /api/mcp" --> server["rift server<br/>Axum on Tokio"]:::rift
       toml["rift.toml"]:::config -- "acceptance" --> server
-      server -- "mounts" --> fs["Rift FS<br/>NFS or FUSE"]:::rift
-      fs -- "serves" --> proj[".rift/projections/<br/>my-feature-one"]:::store
       subgraph indexing["providers and index"]
-        providers["providers<br/>tree-sitter + engines"]:::provider
+        providers["providers<br/>tree-sitter + binding"]:::provider
         normalization["normalization<br/>SymbolRecord graph"]:::rift
         memory["in-memory index<br/>symbols + nodes"]:::store
         db[".rift/db<br/>search index + server logs"]:::store
@@ -26,15 +24,6 @@ check the [main documentation](/docs).
         memory -- "publish units<br/>Toasty over SQLite" --> db
       end
       server -- "compositions" --> providers
-      subgraph engine["LSP engine"]
-        adapter["engine adapter"]:::provider
-        ls["language server<br/>stdio child"]:::provider
-        adapter -- "plan request" --> ls
-        ls -- "edit plan" --> adapter
-      end
-      providers -- "resolve" --> adapter
-      adapter -. "edit proposals" .-> server
-      server -- "on change" --> hooks["hooks"]:::hook
   `}
 />
 
@@ -42,7 +31,7 @@ check the [main documentation](/docs).
 
 <VersionBadge version="v0.0.11" />
 
-Rift is delivered as one binary, installed as the [Install](/docs#install) section describes.
+Rift is delivered as one binary, installed as the [Install](/docs/installation#install) section describes.
 The CLI is implemented with [clap](https://docs.rs/clap), and Rift's two main capabilities are
 implemented as `rift mcp` and `rift server`.
 
@@ -52,7 +41,7 @@ implemented as `rift mcp` and `rift server`.
 agent over the stdio transport and forwards each request to the workspace's `rift server` over
 Streamable HTTP; the process holds no state of its own - state lives in the `rift server`. To
 reach the workspace's server it checks the server lock file -
-[`ServerLock`](/docs/protocol/reference#ServerLock) at `.rift/server.json` - and starts a
+[`ServerLock`](/docs/developer/protocol/reference#ServerLock) at `.rift/server.json` - and starts a
 server when no live one stands behind it. Before it adopts a live server, the proxy compares
 package version, executable SHA-256, and canonical MCP schema SHA-256 from the lock with its own
 identity. A mismatch starts a matching server rather than forwarding across different binaries or
@@ -76,9 +65,9 @@ Startup runs one cycle:
 4. Run the initial scan and parse on a Tokio-managed blocking task, so traversal and parsing
    never occupy an async MCP worker.
 5. Bind the first free loopback port of the accepted
-   [`[server]` selection](/docs/configuration#server) - the pinned `port` or the configured
+   [`[server]` selection](/docs/developer/configuration#server) - the pinned `port` or the configured
    `port_range` - mint the bearer token, and write both into `.rift/server.json`.
-6. Serve until no request remains active and the [`idle_timeout`](/docs/configuration#server)
+6. Serve until no request remains active and the [`idle_timeout`](/docs/developer/configuration#server)
    span passes after the last response completes, then stop.
 
 `rift server start` runs that cycle detached, with the child's standard error on
@@ -107,7 +96,7 @@ unchecked; the server still mints its token and writes it into `.rift/server.jso
 Blocking tasks run on a Tokio-controlled worker pool. A request for blocking work lands in a
 queue, and a worker picks it up when one is free. This behavior is configurable via the
 `num_workers` and `worker_queue_timeout` keys in the
-[`[server]` section](/docs/configuration#server).
+[`[server]` section](/docs/developer/configuration#server).
 
 Freeing a large index can take longer than closing the listener. After the index supervisor
 stops, the blocking pool releases its retained index while the foreground process finishes
@@ -127,7 +116,7 @@ its result, so reads never combine state from two index revisions.
 
 <VersionBadge version="v0.0.25" />
 
-Watcher events and Rift-applied changes advance one workspace change counter and enter the same
+Watcher events advance one workspace change counter and enter the same
 serialized rebuild lane. Each observation carries the paths it saw, and the rebuild reads only
 those files, sharing every other file with the previous index. A watch failure, a written
 `.gitignore`, or a directory appearing or disappearing reads the whole workspace instead. A
@@ -142,8 +131,7 @@ asking for a whole rebuild.
 
 A read that meets a recorded rebuild failure at or past the published counter waits for nothing:
 it answers from the published index and carries `stale_index`, whose `detail` names the counter
-the failed rebuild answered for, the counter the tree is at, and the failure's causes. A change
-meeting the same failure refuses, and the next observation retries the rebuild.
+the failed rebuild answered for, the counter the tree is at, and the failure's causes. The next observation retries the rebuild.
 
 <VersionBadge version="v0.0.34" />
 
@@ -151,23 +139,6 @@ With debug capture enabled, `index.build` records its start and epoch before rea
 tree. A `get_symbol` history read records its start and retains a span until the history request
 ends. The corpus shutdown tests use these records to observe work in progress before issuing
 `rift server stop`; starting a client request alone does not prove that work has started.
-
-## Rift FS
-
-<VersionBadge version="planned" />
-
-Rift FS mounts each served tree through the host's native client: NFSv3 loopback via
-[nfsserve](https://github.com/xetdata/nfsserve) on macOS - an unprivileged mount, no kernel
-extension - and FUSE via [fuser](https://github.com/cberner/fuser) on Linux, unprivileged
-through `fusermount3`. A host where neither mounts falls back to a copy-backed tree with the
-same contract.
-
-The overlay holds a pinned lower layer and a per-tree upper store. The first write to a path
-detaches it into the store; a deletion leaves a whiteout; `.rift` is never served.
-
-Lower-layer reads go through a [foyer](https://github.com/foyer-rs/foyer) hybrid cache - hot
-256 KiB segments in memory, warm segments on disk. Removal force-unmounts without waiting on
-processes still inside.
 
 ## rift db
 
@@ -177,8 +148,7 @@ processes still inside.
 />
 
 One [SQLite](https://www.sqlite.org/) database at `.rift/db` holds the lexical index, semantic
-vectors, and server logs. The server lock, projection directories, and execution copies stay
-separate entries under `.rift`; the database carries stores that are rows, not trees. Access goes
+vectors, and server logs. The server lock stays in a separate file under `.rift`. Access goes
 through [Toasty](https://github.com/tokio-rs/toasty) models; the full-text surface is raw SQL,
 because Toasty 0.10 has no typed virtual-table or `MATCH` API, and the raw boundary stays confined
 to the FTS table and its rows.
@@ -204,7 +174,7 @@ server log; the next publication's transaction replaces the whole unit set.
 The database tables:
 
 - `lexical_units` - one row per indexed unit: a code symbol, or a text file split into chunks
-  past the [`[search.text]`](/docs/configuration#search) chunk bound.
+  past the [`[search.text]`](/docs/developer/configuration#search) chunk bound.
 - `lexical_index_state` - stamps the set with the tree revision that published it. One read
   transaction reads that stamp and runs the query, so a commit landing between the two cannot
   slip another tree's rows into an answer. A store holding another tree returns no rows at all:
@@ -223,8 +193,28 @@ two rebuilds captured from one publication both write what they read, and the se
 the first left.
 
 Search is a layered configuration: the default is this full-text store alone, and
-[`[search.semantic]`](/docs/configuration#search) adds the vector store below, whose ranking
+[`[search.semantic]`](/docs/developer/configuration#search) adds the vector store below, whose ranking
 the server fuses with this one by reciprocal rank.
+
+## Server logs
+
+The server records diagnostics beside the index in `.rift/db`. `rift server logs` prints them
+oldest first, with or without a running server:
+
+```sh
+rift server logs
+```
+
+The flags narrow what prints:
+
+- `-f`, `--follow` keeps printing records as the server writes them
+- `-n`, `--tail` prints only the newest records
+- `--since` takes a duration such as `10m`
+- `--level` selects one severity
+- `--component` selects records from one component
+
+Agents read these records through [`rift://logs`](/docs/mcp#resource-logs).
+The [`[logs]`](/docs/developer/configuration#logs) table bounds how many the server keeps.
 
 ## Semantic search
 
@@ -244,7 +234,7 @@ else is read as a BERT checkpoint through
 retrieval query carries the prefix that checkpoint was trained with. A static model runs no
 forward pass, so neither the prefix nor the pooling applies to it.
 
-The shipped [default](/docs/configuration#search) is static. A workspace is embedded once
+The shipped [default](/docs/developer/configuration#search) is static. A workspace is embedded once
 before its first search can rank semantically, and a forward pass over every declaration
 costs minutes on a laptop CPU where a row gather costs seconds.
 
@@ -255,7 +245,7 @@ is that a load holds the file's bytes once while the tensors are built.
 Every encoder call runs on a blocking thread. Candle's forward pass would otherwise hold a
 runtime worker for the length of a batch, and a request arriving meanwhile would wait behind
 it. Passes run one at a time, bounded by
-[`batch_declarations` and `max_tokens`](/docs/configuration#search). A BERT checkpoint's
+[`batch_declarations` and `max_tokens`](/docs/developer/configuration#search). A BERT checkpoint's
 attention memory grows with the square of the token window, and candle's kernels already
 spread one pass across the thread pool, so running several at once buys nothing and costs the
 machine its memory.
@@ -273,8 +263,8 @@ differs from the loaded model's is skipped, which invalidates a checkpoint that 
 rather than reading it as noise.
 
 Two sweeps keep the table bounded: one drops what the previous model wrote when
-[`model`](/docs/configuration#search) changes, the other drops digests no live declaration
-addresses. [`max_vectors`](/docs/configuration#search) bounds what the table may hold at all.
+[`model`](/docs/developer/configuration#search) changes, the other drops digests no live declaration
+addresses. [`max_vectors`](/docs/developer/configuration#search) bounds what the table may hold at all.
 
 The vector table joins the lexical index's migration set rather than opening a second database
 handle with its own. Toasty records applied migrations in one `__toasty_migrations` table per
@@ -302,18 +292,6 @@ Syntax providers wrap [tree-sitter](https://tree-sitter.github.io/tree-sitter/) 
 a Rift-owned adapter: grammar node kinds resolve to numeric ids once, and raw query and cursor
 APIs never leave the syntax crate.
 
-<VersionBadge version="v0.0.25" />
-
-An LSP-backed language engine is a child process the server spawns in stdio mode, rooted at the
-targeted tree's directory. The server starts one process per accepted inline or named LSP
-definition per targeted tree, and every exact language identity that selects that definition
-shares it. Semantic facts and edit plans return through the provider contract.
-
-After a change, the server sends one classified path batch to each affected engine before it
-opens final document bytes and pulls diagnostics. That batch invalidates readiness from earlier
-work. Fresh progress tokens, diagnostic refresh requests, and
-repeated full reports decide when those answers are settled.
-
 <VersionBadge version="v0.0.27" />
 
 The binding provider is the `rift-binding` crate, run in process by the index build. A syntax
@@ -331,27 +309,9 @@ resolutions beside the syntax publication. An item definition carries the same d
 binding as its syntax Contribution, the equivalence evidence normalization uses to join the
 two records.
 
-## Hooks and configuration
+## Configuration
 
-<VersionBadge version="v0.0.5" />
-
-`rift.toml` at the workspace root is accepted at startup and re-accepted on change; its schema
-is exported beside the MCP surface as [`rift.schema.json`](https://volar.sh/rift/rift.schema.json),
-so editors validate the file as it is written. A quantity value carries its unit:
-`timeout = "120s"`.
-
-A hook is a configured command the server runs inside the changed tree after direct edits land,
-with a declared environment, bounded output, and a timeout. A transform may retain successful
-source writes in its declared scope; Rift recomputes the result from original bytes to final bytes.
-Validation runs afterwards, may retain no source write, and attaches
-[`GuaranteeEvidence`](/docs/protocol/reference#GuaranteeEvidence) or a diagnostic without
-refusing the landed change. A hook that fails or does not finish still gates publication in a
-projection. The [configuration](/docs/configuration) page states the keys and defaults.
-
-<VersionBadge version="v0.0.25" />
-
-A hook declares its program in one `command` key: a string for a bare program, or a list holding
-the program and its literal arguments. The server starts that command directly and runs no shell.
-
-The server selects a change's hooks from its initially changed paths, through each hook's
-`include` and `exclude`, and fixes that list before the first hook runs.
+`rift.toml` at the workspace root is accepted at startup and re-accepted on change. Its schema
+is exported beside the MCP surface as [`rift.schema.json`](https://volar.sh/rift/rift.schema.json).
+A quantity value carries its unit: `timeout = "120s"`.
+The [configuration](/docs/developer/configuration) page states the keys and defaults.

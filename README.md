@@ -2,7 +2,7 @@
 
 [![Rift - agentic development toolkit for codebases](docs/public/og.png)](https://volar.sh/rift/)
 
-Rift is an agentic development toolkit for reading, discovering, and editing codebases.
+Rift is an agentic development toolkit for reading and discovering codebases.
 
 📖 [Read the documentation](https://volar.sh/rift/docs/)
 
@@ -38,10 +38,9 @@ installer resolves the latest release.
 
 ## MCP
 
-Run `rift mcp` from a codebase. Rift exposes structured reads (`search`, `get_symbol`, `nodes`)
-and precondition-guarded changes (`replace_symbol`, `insert_symbol`, `replace_node`,
-`insert_node`, `patch`, `rename_symbol`, `move_file`, `remove_symbol`, `remove_node`) over stdio
-MCP. Later reads include edits made through Rift or another filesystem tool, such as a formatter.
+Run `rift mcp` from a codebase. Rift exposes structured reads through `search`, `get_symbol`,
+and `nodes` over stdio MCP. Later reads include filesystem changes made by a formatter or
+another process.
 
 This repository's `.mcp.json` runs the local build through Cargo. An installed client configuration
 uses `rift` as command and `["mcp"]` as arguments.
@@ -80,10 +79,10 @@ just generate-check
 ## Rust development
 
 Rust uses the toolchain pinned by `rust-toolchain.toml`. Install `uv`, `just`, `cargo-audit`,
-`cargo-deny`, `cargo-llvm-cov`, and `cargo-nextest`, then run the same gates as CI from the
-repository root. The testing scripts use Python 3.12 and the locked environment in `scripts/`:
+`cargo-deny`, `cargo-llvm-cov`, and `cargo-nextest`, then run checks from the repository root.
+Python developer tooling lives in the locked `rift-dev` package under `dev/`:
 
-| Command | Gate |
+| Command | Check |
 | --- | --- |
 | `just format` | Rust formatting |
 | `just generate-check` | Generated protocol drift |
@@ -91,36 +90,36 @@ repository root. The testing scripts use Python 3.12 and the locked environment 
 | `just clippy` | Strict Clippy policy |
 | `just docs` | Warning-free Rust documentation |
 | `just audit` | Advisory, license, ban, and source policy |
-| `just test` | One instrumented fast-tier run, live engines included; holds an 86% line floor |
-| `just release-test` | Deterministic release archive contract |
-| `just installer-test` | Offline curl and irm installer contract |
+| `just test` | Unit tests without model downloads or corpus checkouts |
+| `just doctest` | Rust documentation examples |
+| `just release-test` | Release archive contract |
+| `just installer-test` | Offline installer contract |
 | `just testing-check` | Python lint, types, and tests |
-| `just rust-gate` | Every gate above |
+| `just rust-gate` | Local formatting, static checks, and unit tests |
 | `just corpus-sync [name]` | Fetch the pinned Bun, Next.js, and FastAPI trees |
-| `just corpus-test <name>` | Instrumented corpus suite for `bun`, `nextjs`, or `fastapi` |
+| `just corpus-test <name>` | Corpus suite for `bun`, `nextjs`, or `fastapi` |
 | `just artifact-test` | Build and serve the native release binary |
-| `just agent-test` | Validate all 12 MCP tools, nine edits, and three resources |
-| `just coldstart-test --binary <linux-binary>` | First use in a Linux container without network access |
-| `just full-gate [linux-binary]` | Fast tier, corpus, artifact, agent, and cold checks in sequence |
+| `just agent-test` | Validate three MCP tools and three resources |
+| `just integration-test` | Live models, corpus repositories, and served binary checks |
 
-GitHub Actions runs each target separately, so a failed gate stays visible by name.
-The fast Rust job has a 12-minute budget; each fast test has a 60-second deadline.
-The full tier runs nightly, on demand, on PRs labeled `full-gate`, and before release promotion.
-Each full-tier job has a 20-minute budget. Local corpus suites run one at a time.
-See [Testing](docs/content/docs/testing.mdx) for prerequisites, evidence, and release commands.
+Unit tests run on pull requests and pushes to `main`. Integration tests run on `main` after
+merge and on manual dispatch. CI reuses compiled test archives and caches dependencies.
+See [Testing](docs/content/docs/developer/testing.mdx) for prerequisites and commands.
 
-Install the pre-commit hook with `uvx pre-commit install`. It runs `just rust-gate`, including
-the same coverage and Cargo policy checks CI enforces.
+Run the developer package directly with:
+
+```sh
+uv run --locked --project dev rift-dev --help
+```
+
+Install the pre-commit hook with `uvx pre-commit install`. It runs `just rust-gate`.
 
 ## Rift releases
 
-Pushing a `vX.Y.Z` tag on a commit from `main` starts one Rift release pipeline. The tag version
-must match the workspace version. The pipeline creates a draft after native binaries and current
-documentation pass their validation gates. The release stays in draft until the full tier and
-installer and upgrade checks pass on all six targets. Before promotion, recorded checksums must
-still match the draft assets. The existing release environment gates draft creation and promotion.
+Pushing a `vX.Y.Z` tag on a commit from `main` starts the release pipeline. The tag version
+must match the workspace version. The pipeline builds native binaries, packages checksummed
+archives, and publishes the release.
 
-Each release contains checksummed archives with GitHub artifact attestations for Linux, macOS,
-and Windows on x86-64 and Arm64. Unix archives contain `rift`; Windows archives contain
-`rift.exe`. After release publication, the same pipeline deploys the latest documentation and
-installers to `volar.sh/rift`.
+Each release contains archives with GitHub artifact attestations for Linux, macOS, and Windows
+on x86-64 and Arm64. Unix archives contain `rift`; Windows archives contain `rift.exe`.
+The pipeline also deploys documentation and installers to `volar.sh/rift`.

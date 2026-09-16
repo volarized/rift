@@ -19,7 +19,7 @@ const inter = Inter({
 });
 
 const TITLE = "rift - agentic development toolkit";
-const DESCRIPTION = "Agentic development toolkit for reading, discovering and editing codebases.";
+const DESCRIPTION = "Agentic development toolkit for reading and discovering codebases.";
 
 // Next does not apply next.config `basePath` to metadata URLs, so every one of
 // them has to be prefixed by hand or it 404s under /rift.

@@ -32,7 +32,7 @@ const HEIGHT = 640;
 const SUPERSAMPLE = 2;
 
 const TITLE = "rift";
-const TAGLINE = ["Agentic development toolkit for reading,", "discovering and editing codebases."];
+const TAGLINE = ["Agentic development toolkit for", "reading and discovering codebases."];
 
 /** The four values of the design system. */
 const VOID = "#08080A";

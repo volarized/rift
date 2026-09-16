@@ -1,0 +1,491 @@
+---
+title: Architecture
+---
+
+import { FlatDiagram } from "@/components/flat-diagram";
+
+Rift works as a toolkit for agents such as Claude Code and Codex - practically any agentic
+appliance that supports MCP.
+
+When an agent has Rift configured as one of its MCP servers, the `rift mcp` process starts and
+checks whether a `rift server` is already running for that particular folder. We'll call this
+folder a **workspace** throughout this documentation.
+
+Each `rift mcp` process is short-lived and isolated, while development operations depend on
+state shared across requests and agents. To bridge that gap, `rift mcp` acts as a small proxy: it
+forwards every request to one `rift server` running locally for the workspace. The two processes
+communicate over [Streamable
+HTTP](https://modelcontextprotocol.io/specification/draft/basic/transports).
+
+The `rift server` coordinates source discovery and providers. Source
+resolvers identify project files, dependencies, and generated code. Providers analyze that source
+and produce facts such as symbols, syntax nodes, relationships, and diagnostics.
+
+The server stores searchable provider output in an embedded index under `.rift`. The
+[`search`](/docs/mcp#tool-search) tool always retrieves lexical matches; when
+`rift.toml` selects an embedding model, a local model adds vector ranking.
+
+<FlatDiagram
+  alt="An agent launches rift mcp, which forwards requests to one local server. Source resolvers catalog source files, providers supply code facts, and the server builds a searchable index."
+  chart={`
+    flowchart LR
+      agent["agent"]:::agent -- "MCP over stdio" --> mcp["rift mcp"]:::rift
+      mcp -- "HTTP :port" --> server["rift server<br/>one per workspace"]:::rift
+      agent -. "MCP over HTTP" .-> server
+      lock[".rift/server.json"]:::store -- "port + token" --> mcp
+      toml["rift.toml"]:::store -- "acceptance" --> server
+      server -- "discover" --> resolvers["source resolvers"]:::provider
+      server -- "facts" --> providers["providers"]:::provider
+      resolvers -- "inspect" --> workspace["workspace tree"]:::store
+      resolvers -- "units" --> catalog["source catalog<br/>project + dependencies"]:::store
+      providers -- "analyze" --> catalog
+      providers -- "Contributions" --> normalization["normalization<br/>SymbolRecord graph"]:::rift
+      normalization -- "readable Symbols" --> search["search index<br/>lexical + vectors"]:::store
+      server -- "query + rank" --> search
+      search -- "embeddings" --> localmodel["local embedding model<br/>ships with Rift"]:::model
+  `}
+/>
+
+## Server lifecycle
+
+<VersionBadge version="v0.0.11" />
+
+When the server starts, it writes `.rift/server.json` following the
+[`ServerLock`](/docs/developer/protocol/reference#ServerLock) model. The file gives each `rift mcp`
+process the port and token it needs to reach that server. For example:
+
+```json
+{
+  "port": 12345,
+  "token": "Zk3mQ8xW1vY5uT9rN2bH7cJ4dL6fP0sA8gE5iK2oM7q",
+  "pid": 4242,
+  "identity": {
+    "version": "0.0.25",
+    "executable_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "schema_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+}
+```
+
+When no live server stands behind the file, `rift mcp` starts one. An exclusive file lock
+elects one starter if several processes race; the winner builds its index, binds a port, and
+publishes the file, and the rest connect to it. The winner holds the lock from its election
+onward, so a `rift mcp` or `rift server start` that arrives while it is still indexing waits
+for its file instead of starting another server.
+
+The proxy adopts that server only when package version, executable SHA-256, and served MCP schema
+SHA-256 match its own identity. A mismatch is stale state, even when the recorded process and port
+are live, so requests never cross between binaries or tool schemas that interpret them differently.
+
+A reader that cannot reach the recorded port treats the file as stale. The election lock
+releases with its holder, so a stale file never has a live server behind it, and the next
+starter replaces the file. A server on its way out closes its port before it releases the
+lock, and the next starter waits for the release before electing a fresh one.
+
+To enforce a cross-process boundary between OS users, the server persists a token in
+`.rift/server.json`, which only the file's owner can read. Every request carries this token,
+and the server rejects one without it. Processes running as the same OS user can read the same
+token and are not separated by this boundary.
+
+A browser introduces another route to a localhost port: a remote page can issue requests through
+DNS rebinding or a forged origin. The HTTP server therefore accepts only the literal loopback
+`Host` for its bound port. It also rejects a present `Origin` unless that origin is loopback;
+non-browser MCP clients omit `Origin` and still authenticate with the token.
+
+<Callout type="info">
+You might be asking why there's a server at all. Assume your agent launches a couple of
+subagents. Each of them might also want to read the codebase through Rift, and each gets
+its own `rift mcp`, because MCP's stdio transport has the client launch its server as a
+subprocess.
+
+None of those short-lived processes can hold the things that are expensive and shared - the
+index - so a long-lived server holds them and every `rift mcp`
+reaches the same one.
+
+And why HTTP rather than a socket? Either way `rift mcp` has to find the running server, and
+HTTP lets an HTTP-capable agent connect to the port without `rift mcp`.
+</Callout>
+
+On startup the server reads `rift.toml` from the workspace root and accepts the workspace. The
+configuration allows you to describe:
+
+- which embedding model, if any, ranks search
+- which exact language entries select source files
+
+A change to the file takes effect for later requests once the server accepts it again. An
+invalid file keeps the workspace unusable until you fix it.
+
+A rebuild that fails - the tree crossed a configured bound, a file could not be read - leaves the
+last published snapshot served. A read answers from that snapshot and carries a `stale_index`
+warning naming the failure. The next filesystem
+event retries the rebuild, and a rebuild that publishes clears the warning.
+
+The server stops itself once no request remains active and the
+[`idle_timeout`](/docs/developer/configuration#server) span passes after the last response completes.
+`rift server stop` ends it sooner. The server removes its lock file on the way out, and the next
+`rift mcp` starts a fresh one. The database under `.rift` survives the exit.
+
+`rift server status` reports which of these states the workspace is in - a serving server with
+its port, pid, and version, a server still indexing, a stale `.rift/server.json`, or no server
+- and changes nothing. A server that fails to start, or panics, records why under
+`rift server logs --level error` before it exits, and a server `rift server start` spawned
+writes its standard error to `.rift/server.stderr`, truncated at each start.
+
+## Source discovery
+
+Before Rift analyzes code, source resolvers discover what belongs to the project and what its
+toolchain already resolved. The built-in project resolver catalogs workspace files.
+
+Dependency resolvers catalog what the workspace's package managers resolved. Each resolver
+claims one manifest file name, and every visible manifest with that name reaches it:
+
+- the Cargo resolver claims `Cargo.toml`, runs `cargo metadata --locked --offline` for each
+  top-level manifest, and catalogs every package outside the workspace members with the
+  directory its source was unpacked to; it also asks `rustc` for its sysroot and catalogs the
+  standard library source there
+- the uv resolver claims `pyproject.toml`, reads the `uv.lock` beside it, and finds each
+  distribution's installed source through the project environment: the `.venv` beside the
+  manifest, or the directory `UV_PROJECT_ENVIRONMENT` names; it catalogs the interpreter's
+  standard library from the environment's `pyvenv.cfg`
+- the npm resolver claims `package.json`, reads the `package-lock.json` beside it, and finds
+  each package under `node_modules`; when the lockfile pins `typescript`, it catalogs that
+  compiler's `lib.*.d.ts` set as the TypeScript standard library
+- the Bun resolver claims `package.json` too and reads `bun.lock` the same way, so a manifest
+  reaches whichever of the two has a lockfile beside it
+
+A resolver never downloads a package and never writes to the tree. The uv, npm, and Bun
+resolvers read lockfiles and probe directories, and run nothing. The Cargo resolver is the one
+that runs a toolchain, under `--locked`, which refuses to rewrite the lockfile, and `--offline`,
+which refuses the network. When `cargo` is not on the server's `PATH`, or exits with an error
+because `Cargo.lock` no longer matches `Cargo.toml`, it answers from the lockfile alone and
+probes the machine's package cache for each package's source. That answer lists what the
+lockfile pins, so it can over-approximate what the active feature set compiles; a package the
+cache does not hold is cataloged without a source root, whichever resolver cataloged it.
+
+The catalog keys each package by its
+[`PackageIdentity`](/docs/developer/protocol/reference#PackageIdentity): the package manager, the name,
+and the resolved version. Two versions of one package are two entries. Its inputs are the
+manifests and lockfiles the resolvers read, so a change to any of them re-catalogs on the next
+publication while every other file change leaves the catalog untouched. `rift://map` lists the
+packages the manifests declare directly.
+
+Each resolver reads at most 256 manifests per workspace, taken in path order from the visible
+paths carrying its manifest file name. Selecting the top-level manifests compares every manifest
+pair, so that work grows with the square of the manifest count.
+
+A workspace holding more manifests catalogs the packages those 256 resolve, and the resolver
+reports the rest as a degradation. A read whose `scope` reaches dependencies carries it as a
+`dependency_resolver_degraded` warning: the next.js repository holds 876 `package.json` files,
+so the warning reads `620 of 876 package.json manifests were not read: at most 256 are read
+per workspace`.
+
+Each readable file becomes a [`SourceUnit`](/docs/developer/protocol/reference#SourceUnit) in the
+source catalog. Its `location` says whether it belongs to the project, a dependency, the standard
+library, or an external source. Its `source_kind` separately says whether a human authored it or a
+tool generated it.
+
+Generated project code and generated dependency code therefore keep both facts. Declarations
+invented by a language tool have `source_kind: "synthetic"` and no source unit.
+
+A resolver publishes a new catalog revision when its inputs change: workspace files, manifests,
+lockfiles, toolchains, installed packages, or generated-source metadata. Fact providers consume
+that catalog. A parser such as tree-sitter can describe syntax in a supplied file, but cannot infer
+which package owns it or which generator produced it.
+
+### Dependency index
+
+<VersionBadge version="v0.0.32" languages={["Rust", "Python", "TypeScript"]} />
+
+The catalog says where each package's source sits; the dependency index reads it. For every
+cataloged package with a source root, the index selects the files that spell the package's
+API and keeps the declarations a caller outside the package can use:
+
+- Rust - every `.rs` file below the root; `pub` declarations, and the items of a `pub` trait
+- Python - every `.pyi` stub when the package ships any, else every `.py` module; names
+  without a leading underscore
+- TypeScript - every `.d.ts` declaration file; every member but `private` and `protected`
+  ones
+
+Directories named `tests`, `benches`, `examples`, `target`, `node_modules`, `__pycache__`,
+and `.git`, and any whose name ends in `tests`, are left out of every walk, and so is every
+symlink. The same syntax providers that parse the project's files parse these, so a
+dependency declaration is a [`Symbol`](/docs/developer/protocol/reference#Symbol) like any other and
+answers a [`get_symbol`](/docs/mcp#get_symbol-scope) lookup whose `scope` reaches
+dependencies.
+
+The index is bounded per package and in total: the `package_size`, `package_files`, and
+`index_size` keys of the [`[dependencies]`](/docs/developer/configuration#dependencies) table set the
+bounds, and the walk below one source root stops at a directory depth and an entry count of
+the index's own. A package that crosses a bound is skipped, and a lookup reports it as
+`dependency_package_skipped` naming the bound that refused it. The Rust standard library the
+Cargo resolver catalogs from the toolchain's `rust-src` holds more files than the default
+`package_files` allows, so it is skipped unless the bound is raised.
+
+The same table selects which cataloged packages the index plans at all: `include` and
+`exclude` are globs over each package's `<manager>/<name>`, and a package they drop stays in
+the catalog and on the map without ever being pending or skipped. `enabled = false` turns the
+index off and refuses every dependency-scoped lookup. `resolution = "static"` keeps the
+resolvers off the toolchains, so a catalog comes from the lockfiles and package caches alone,
+and `command_timeout` bounds each run `auto` makes.
+
+Indexing runs behind the answers. Each publication hands its catalog to the dependency lane,
+which builds one package at a time on the worker pool: direct dependencies first, then the
+standard library, then transitive dependencies. A lookup issued meanwhile answers from the
+packages built so far and reports the rest as `dependency_index_pending`.
+
+A package's declarations are built once and never revalidated: its source is what the package
+manager resolved, and nothing in the workspace moves it. A lockfile change re-catalogs on the
+next publication and re-plans the index: packages the new catalog no longer lists leave it,
+arrivals queue, and a package still cataloged keeps its build, or its refusal.
+
+## Providers
+
+Providers analyze cataloged source at different depths and publish immutable `Contribution`
+records in provider-owned symbol spaces. Rift normalizes applicable Contributions into
+workspace-local `SymbolRecord` values, then assembles readable `Symbol` values for one captured
+index revision.
+
+A condition the caller must weigh before relying on the answer - a stale index, an absent
+capability - arrives as a typed entry in the result's `warnings`.
+
+### Syntax
+
+Rift ships syntax providers based on
+[tree-sitter](https://tree-sitter.github.io/tree-sitter/) by default. They parse readable project,
+dependency, and generated units into declarations, syntax structure, and parse diagnostics. Project
+declarations also carry their syntax nodes and byte ranges.
+
+The server invalidates a changed path's syntax facts and search-index entries.
+
+### Binding
+
+<VersionBadge version="v0.0.27" languages={["Rust"]} />
+
+The fallback reaches further than the grammar alone. The **binding provider** resolves name
+binding - which declarations a name in the source can refer to - from the scopes, definitions,
+references, and imports each syntax provider extracts in its one parse. It joins files through
+the language's module layout and publishes the resolutions as Contributions under the provider
+id `binding`.
+
+Resolution keeps the language's own precedence: a definition in the nearest scope shadows an
+outer one, an explicit import shadows a wildcard one, and equally ranked candidates all stay in
+the answer. A reference the syntax facts cannot place stays unresolved.
+
+The provider runs inside the server during the index build, and the [`[providers.binding]`](/docs/developer/configuration#providers) table bounds every phase of its
+work. A breached bound never fails the build - the revision publishes with the syntax facts
+alone.
+
+### History
+
+The history source resolver reads the workspace's git objects in place, with no checkout or `git`
+subprocess. It publishes a bounded series of source catalogs keyed by revision. The same in-place
+access serves revision-addressed reads: `get_symbol`, `search`, and `nodes` accept a `rev`, and
+the server indexes that commit's tree - the same syntax providers, over committed bytes - without
+touching the working tree.
+
+<VersionBadge
+  version="v0.0.13"
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
+/>
+
+Asking for a symbol's history walks that same object store: the server follows first parents
+from the served revision along the declaration's current path and parses the committed bytes at
+each revision that changed the file - the same syntax provider, per revision. Comparing adjacent
+parsed states gives the symbol a timeline: introduced, body changed, signature changed, removed.
+
+The walk is bounded by
+[`providers.history.max_revisions`](/docs/developer/configuration#providers), because its cost scales
+with how far back it reaches, and a workspace without version control serves no history facts.
+
+### Custom
+
+Custom integrations implement a [source resolver](/docs/developer/protocol/core#source-discovery), a
+[fact provider](/docs/developer/protocol/core#semantic-facts), or both. The contracts stay separate even
+when one integration implements both capabilities. A family with no serving provider surfaces
+as a typed entry in `warnings`, which keeps an empty answer distinct from a complete answer with
+no facts.
+
+One integration can connect several cooperating pieces through a **provider composition**. Like a
+[scikit-learn pipeline](https://scikit-learn.org/stable/modules/compose.html), the composition gives
+each step a stable name and feeds its output into compatible inputs.
+
+The composition API can change the flow before Rift starts:
+
+- insert, replace, or remove a named step
+- transform one step's input or output
+- branch one output into several providers, then publish each provider's Contributions
+- nest one composition inside another
+
+Provider compositions support several flow shapes:
+
+- syntax and semantics consume the same source catalog, then publish separate Contributions
+- history maps syntax analysis over source catalogs keyed by Git revision, then aggregates
+  revision-qualified facts
+- a custom external step can produce generated source or facts for another provider to analyze
+
+A transform that changes source units or facts becomes a named, revisioned step and publishes new
+Contributions, so later answers still identify its inputs.
+
+For example, a CSS integration can send templates and configuration to a registered Tailwind CLI,
+parse its generated CSS with a CSS syntax provider, and publish those facts beside authored CSS. The
+server runs the command with declared inputs, environment, timeout, and output limits; the
+composition step decodes its output.
+
+Rift validates the composition's inputs, outputs, merge rules, and cycles before it runs. The server
+then owns scheduling, caching, and invalidation; MCP requests do not assemble or modify the
+composition. Composition controls data flow and provider selection. It cannot establish
+Contribution equivalence or `SymbolRecord` identity.
+
+The workspace resource assigns each provider a stable
+[`ProviderId`](/docs/developer/protocol/reference#ProviderId) and reports its lifecycle state. A
+provider derives an immutable Contribution collection from one tree revision, then publishes the
+collection atomically.
+
+While a provider catches up after a change, requests may serve its previous revision, and the
+result carries a `stale_index` entry in `warnings` naming the two tree revision digests. A
+provider with no usable revision contributes nothing, and the result's `warnings` say so.
+
+A read captures one tree revision, one index revision where it searches, and the provider
+revisions it uses. Later writes create new revisions; they do not alter the captured result. A
+request addresses one page with `page_index`, and a page past the end returns an empty page
+with the true `total_pages`.
+
+Normalization validates equivalence evidence without using provider order, candidate names, or
+provider composition as identity evidence. It retains unresolved and conflicting records instead
+of forcing one `SymbolId`. When Rift assembles a readable Symbol, provider order selects scalar
+presentation fields and combines list facts without discarding conflicting Contributions.
+
+## Index
+
+<VersionBadge
+  version="v0.0.8"
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
+/>
+
+The server keeps an immutable index over the project's source. Tree-sitter extracts
+declarations and syntax nodes from the files the workspace's source policy includes.
+
+The server watches the workspace and validates the published index against it before each
+current-tree read, so a read serves the tree as it stands and never combines state from two
+index revisions. The [implementation](/docs/developer/implementation#rift-server) page describes the
+watcher, the rebuild lane, and the swap that keep this true.
+
+When the published index lags the tree a read captured, the result says so: a `stale_index`
+entry in `warnings` carries the digests of the tree revision the index covers and the revision
+the read captured, so the caller knows the answer may miss the newest writes.
+
+<VersionBadge
+  version="v0.0.9"
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
+/>
+
+Each rebuild derives lexical units for [`search`](/docs/mcp#tool-search).
+
+<VersionBadge version="v0.0.25" />
+
+The rebuild derives one unit per indexed symbol, and chunks from every bounded UTF-8 file without
+a NUL byte whose effective language entry or
+[`[search.text].include`](/docs/developer/configuration#search) selects it. Syntax providers enrich files
+their effective language entry selects. The units persist in the workspace database at
+`.rift/db`, stamped with the tree revision that published them.
+
+The rebuilt index becomes current as soon as its syntax index is built, and the units are written
+behind that publication, in one transaction with the stamp. A whole replace on a large workspace
+runs for longer than a read is willing to wait, so the publication never waits for it.
+
+A search that captures the publication before its transaction lands is ranked by identifier
+matching alone and carries a `lexical_ranking_unavailable` warning naming the tree revision the
+store is still committing; the store's ranking joins the answer once the transaction ends. A
+transaction that refuses leaves the previous rows and stamp intact and is recorded in
+[`rift://logs`](/docs/mcp#resource-logs), and the next publication replaces the whole
+unit set rather than applying its change on top of rows the store missed.
+
+The semantic tier's vectors are not part of that transaction. Embedding one declaration can cost
+more than a read is willing to wait, so vectors are refreshed after the index publishes, and a
+search whose vectors are still being written ranks lexically and reports the tier's readiness in
+`warnings`.
+
+Both tiers answer under one tree revision: the full-text store reads its stamp and its rows in
+one transaction, and the vectors a pass published carry the tree they were described for. A store
+that has moved past the tree a request captured returns nothing, and the request captures the
+publication the store already answers for. What `lexical_ranking_unavailable` tells a caller
+about is a store that has not yet committed the captured tree, one that missed a commit, or one
+that will not answer at all because it refused to load or holds no indexed tree.
+
+<VersionBadge version="v0.0.32" />
+
+A file past the per-file byte bound, one its syntax provider refuses under a node or depth
+bound, or one holding a declaration the Contribution contract refuses, is left out of the
+index: it answers no search or lookup, counts nowhere in
+[`rift://map`](/docs/mcp#resource-map), and is named in
+[`rift://logs`](/docs/mcp#resource-logs) with the bound it crossed or the field the
+contract refused. One minified bundle therefore never blocks the workspace. The
+[`[source]`](/docs/developer/configuration#source)
+exclusion remains the way to keep such files out of the walk altogether.
+
+### Search
+
+[`search`](/docs/mcp#tool-search) is for reads where the exact name isn't known.
+It ranks symbol names, signatures, documentation, and file content from the index.
+
+What the index holds comes from normalized Contributions. Syntax providers contribute each
+declaration's name, signature, and documentation; the lexical tier adds file content - source
+and plain text alike - so a hit can land in a comment, a configuration key, or a README as well
+as a declaration. Binding facts join the same Symbol after normalization establishes their
+association.
+
+Matching serves two query shapes. An identifier-shaped query - `ReadService`,
+`num_workers` - matches the declaration names it resembles. A prose query - `visible source
+included` - ranks by [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) term relevance
+over names, signatures, documentation, and content together.
+
+The server indexes names both as spelled and split into words on case and separator boundaries,
+so `get user name` reaches a declaration spelled `getUserName`, and a concept-level search does
+not depend on guessing the identifier first.
+
+#### Semantic ranking
+
+<VersionBadge
+  version="v0.0.16"
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
+/>
+
+The lexical ranking answers a query that shares a token with the code. A query that shares
+none - a description of what a declaration does, in the words a bug report would use - reaches
+nothing lexically, and no amount of ranking repairs that, because the words are not there.
+
+An embedding puts the query and the declaration in one space, so a paraphrase finds code it
+has no word in common with. It replaces nothing. A caller who quotes a real name - a symbol, a
+configuration key, a line from a traceback - has handed the lexical ranking an exact token to
+score, while the embedding maps that name into a space where its near neighbours crowd it.
+
+A declaration is embedded as its own source under its qualified name. The name carries the
+module the source doesn't state; the source carries the identifiers and documentation an
+encoder trained on code reads best. The path is left out, because the lexical ranking already
+covers it.
+
+The two rankings are combined by reciprocal rank rather than by averaging their scores. A
+full-text relevance score and a cosine similarity share no scale, so a weighted average of the
+two is decided by whichever side happens to spread wider.
+[`fusion_k`](/docs/developer/configuration#search) sets how sharply a top rank counts, and the two
+`weight` keys set each ranking's share.
+
+Preparation runs behind the answers. A search issued before the vectors are in is answered
+lexically and says so, rather than waiting for a model to load.
+
+Vectors are stored per model and addressed by the text they were embedded from. A declaration
+that moves or is renamed keeps its text, so it keeps its vector; changing the configured model
+embeds the workspace again rather than mixing two spaces.
+
+### Retrieve symbol
+
+[`get_symbol`](/docs/mcp#tool-get_symbol) retrieves a declaration when its name is
+known. The answer carries the declaration's body inline, so reading a function takes one call
+rather than a search followed by a file read.
+
+A Symbol carries `id` when the index established one identity for the declaration; a symbol
+the providers could not settle answers without an `id`, and a retained provider disagreement
+lands as a `symbol_disagreement` entry in the result's `warnings`.
+
+Asking for history attaches the symbol's committed timeline to the same answer.
+

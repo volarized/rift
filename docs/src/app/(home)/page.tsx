@@ -81,21 +81,21 @@ const DIFFERENCES: {
   {
     statement: "Code facts with symbol history.",
     title: "Programming language providers",
-    body: "Rift combines syntax and history, and will add semantic analysis to give agents the best available context.",
+    body: "Rift combines syntax and symbol history to give agents context about the code they read.",
     solid: "sphere",
   },
   {
-    statement: "Staged changes with verification.",
-    title: "Reversible filesystem projections",
-    body: "Rift will let agents collect changes in a pinned projection, inspect them, then publish them into the workspace.",
+    statement: "Source from the project and its dependencies.",
+    title: "Dependency discovery",
+    body: "Rift finds installed dependencies and makes their public declarations available beside project source.",
     line: "shimizu",
     // The butterfly stands in the x - z plane; turn it to face the camera.
     tilt: 1.5,
   },
   {
-    statement: "Structured reads and guarded edits.",
+    statement: "Structured code reads.",
     title: "MCP tools and resources",
-    body: "Agents read declarations and provider facts, then precisely edit symbols with a clear blast radius.",
+    body: "Agents find declarations, inspect syntax, and follow relationships through MCP tools.",
     line: "tsucs1",
     tilt: 0.9,
     spin: 0.4,
@@ -121,8 +121,7 @@ export default function HomePage() {
             </h1>
 
             <Body className="max-w-115">
-              Rift is an agentic development toolkit for reading, discovering, and editing
-              codebases.
+              Rift is an agentic development toolkit for reading and discovering codebases.
             </Body>
           </div>
 
@@ -150,7 +149,7 @@ export default function HomePage() {
         <div className="grid gap-5">
           <Statement>Agents depend on context and tooling.</Statement>
           <Body className="text-balance">
-            rift provides contextual, parser-precise codebase reading and editing tools.
+            rift provides contextual, parser-precise codebase reading tools.
           </Body>
         </div>
       </Section>

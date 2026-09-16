@@ -1,0 +1,32 @@
+---
+title: Protocol
+---
+
+<VersionBadge version="v0.0.35" />
+
+Rift publishes one generated contract through these definitions:
+
+- [Core model](/docs/developer/protocol/core) - source discovery, identities, and provider facts shared by protocol surfaces
+- [MCP](/docs/mcp) - the tools and resources an agent calls
+- [SCIP](/docs/developer/protocol/scip) - the planned export for tools that consume SCIP indexes
+
+The Rust models in `crates/rift-protocol` are the source of truth. The served tool surface is
+exported as JSON Schema at [`mcp.json`](https://volar.sh/rift/mcp.json), and the
+[reference](/docs/developer/protocol/reference) explains it.
+
+## How a request finds its target
+
+An agent's `rift mcp` reads the workspace's
+[`ServerLock`](/docs/developer/protocol/reference#ServerLock) - or starts the server that writes
+it - and forwards MCP requests to the endpoint it names. Each request carries its own arguments. The server retains no capture between paged reads: a
+request names its page with `page_index`, and each page is computed from that request.
+
+## Versioning
+
+Rift uses [MCP's protocol versioning](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning)
+without adding another version field. The MCP client carries standard MCP version metadata; Rift
+tool arguments contain only arguments declared by each tool's input schema.
+
+The server advertises its current tool and resource schemas through MCP. A release freezes its
+exported contract for implementers and generated clients; callers do not select a snapshot on
+each request.

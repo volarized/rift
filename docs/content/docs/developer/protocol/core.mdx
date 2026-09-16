@@ -1,0 +1,100 @@
+---
+title: Core
+---
+
+The core models describe source files and the facts providers return about them. The
+[reference](/docs/developer/protocol/reference) links their generated schemas.
+
+## Paths and files
+
+[`ProjectPath`](/docs/developer/protocol/reference#ProjectPath) is a normalized UTF-8 path relative
+to the workspace root. It uses `/`, contains no `.` or `..` component, and cannot name `.rift`,
+where the server stores its own state. Normalized means Unicode NFC.
+
+The index skips symlinks. A linked file answers under its own path when the source policy includes it.
+
+## Source locations
+
+[`TextRange`](/docs/developer/protocol/reference#TextRange) is a pair of half-open UTF-8 byte offsets.
+Each provider converts its toolchain's positions to byte offsets, so ranges from different
+providers use one scale.
+
+[`nodes`](/docs/mcp#tool-nodes) returns the syntax nodes covering one byte position,
+outermost first. Each node carries its grammar kind and byte range.
+
+## Source discovery
+
+Source resolvers run before syntax or semantic analysis. They inspect workspace files and resolved
+toolchain state, then publish a source catalog made of
+[`SourceUnit`](/docs/developer/protocol/reference#SourceUnit) records. A resolver discovers installed
+dependencies; it does not download packages or change the environment.
+
+[`SourceLocation`](/docs/developer/protocol/reference#SourceLocation) names a unit's owner: project,
+dependency, standard library, or external source.
+[`SourceKind`](/docs/developer/protocol/reference#SourceKind) names how the source came to exist:
+authored or generated. The two stay separate because generated code can belong to the project or
+to a dependency.
+
+A generated unit names its generator and can carry
+[`SourceMapping`](/docs/developer/protocol/reference#SourceMapping) records back to its inputs. A
+synthetic declaration has no source unit.
+
+```json
+{
+  "id": "rift://source/pypi/pydantic/main.py",
+  "location": {
+    "kind": "dependency",
+    "package": { "manager": "pypi", "name": "pydantic", "version": "2.8.2" }
+  },
+  "path": "pydantic/main.py",
+  "source_kind": "authored",
+  "languages": [{ "name": "python" }],
+  "digest": "6f2a9c31",
+  "mappings": []
+}
+```
+
+An id is two parts: the resolver identity (`pypi`), then that resolver's own human-readable key
+for the unit (`pydantic/main.py`). `digest` is the short form every content digest takes on the
+wire - the first eight hex characters of a SHA-256, the same convention `NodeId`'s witness uses;
+the server computes and compares the full digest internally, so it never travels whole.
+
+[`SourceResolverSummary`](/docs/developer/protocol/reference#SourceResolverSummary) reports each resolver's
+identity, locations, catalog revision, and lifecycle state. Resolver revisions change with files,
+manifests, lockfiles, toolchains, installed packages, or generated-source metadata. Fact-provider
+revisions change after providers analyze a catalog revision.
+
+## Semantic facts
+
+Providers return facts in families: symbols, the syntax nodes that write them, relationships
+between symbols, resolved types, diagnostics, and history. A family no provider can produce
+refuses with `capability_unavailable`. Signatures and documentation travel on the symbol itself,
+covered under the `types` family.
+
+A read result carries the answer, `pagination`, and `warnings`. A condition the caller must
+weigh - an index that lags the tree - arrives as a typed entry in `warnings`; the
+[Reads](/docs/mcp#reads) section on the MCP page states the paging and warning
+contract.
+
+[`SymbolOrigin`](/docs/developer/protocol/reference#SymbolOrigin) keeps source location separate from
+source kind. A synthetic symbol carries neither a location nor a package; dependency and
+standard-library symbols can carry facts even when their provider cannot return source bytes.
+The declaration's own source-catalog unit, where its location differs from the project, rides on
+the [`get_symbol`](/docs/mcp#tool-get_symbol) hit itself, addressed by `unit` beside the
+`path` a project declaration carries.
+
+## History facts
+
+The `history` family is resolved from the workspace's version-control history rather than from
+the current tree. A [`SymbolHistory`](/docs/developer/protocol/reference#SymbolHistory) is one
+symbol's timeline - each [`SymbolVersion`](/docs/developer/protocol/reference#SymbolVersion) names
+the [`RevisionId`](/docs/developer/protocol/reference#RevisionId) that touched it and what the
+revision did: introduced it, changed its body, changed its signature, moved it, removed it.
+
+The history provider correlates declarations across revisions using their parsed structure and
+surrounding changes. A [`SymbolId`](/docs/developer/protocol/reference#SymbolId) can change when a
+language includes a module path in its qualified name; the timeline still records the move.
+
+The walk is bounded by the configured history depth, and the timeline rides a
+[`get_symbol`](/docs/mcp#tool-get_symbol) hit when the request asks for history.
+

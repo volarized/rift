@@ -1,5 +1,5 @@
 ---
-title: Claude Code
+title: Agentic usage
 ---
 
 <VersionBadge version="v0.0.29" />
@@ -65,26 +65,15 @@ project entry or disable the plugin for that project.
 The generated `SKILL.md` carries a decision table pointing the agent at the tool that answers
 its situation:
 
-- [`search`](/docs/protocol/mcp#tool-search) answers when the target is unknown.
-- [`get_symbol`](/docs/protocol/mcp#tool-get_symbol) answers when the declaration name is known.
-- [`nodes`](/docs/protocol/mcp#tool-nodes) answers when the syntax structure at one position is
+- [`search`](/docs/mcp#tool-search) answers when the target is unknown.
+- [`get_symbol`](/docs/mcp#tool-get_symbol) answers when the declaration name is known.
+- [`nodes`](/docs/mcp#tool-nodes) answers when the syntax structure at one position is
   needed.
 - `search` with a `traversal` block answers a symbol's neighbors, its impact (who breaks when it
   changes), or a path between two symbols.
-- The edit tools - [`patch`](/docs/protocol/mcp#tool-patch),
-  [`replace_node`](/docs/protocol/mcp#tool-replace_node),
-  [`insert_node`](/docs/protocol/mcp#tool-insert_node),
-  [`insert_symbol`](/docs/protocol/mcp#tool-insert_symbol),
-  [`replace_symbol`](/docs/protocol/mcp#tool-replace_symbol),
-  [`rename_symbol`](/docs/protocol/mcp#tool-rename_symbol),
-  [`remove_node`](/docs/protocol/mcp#tool-remove_node),
-  [`remove_symbol`](/docs/protocol/mcp#tool-remove_symbol), and
-  [`move_file`](/docs/protocol/mcp#tool-move_file) - answer when the code needs to change, over
-  raw file writes: the server recomputes each address's witness before writing and runs the
-  workspace's configured [hooks](/docs/configuration#hooks).
 
-The skill also points the agent at [`rift://map`](/docs/protocol/mcp#resource-map) as the first
-read in an unfamiliar repository, and at [`rift://logs`](/docs/protocol/mcp#resource-logs) when a
+The skill also points the agent at [`rift://map`](/docs/mcp#resource-map) as the first
+read in an unfamiliar repository, and at [`rift://logs`](/docs/mcp#resource-logs) when a
 refusal alone doesn't say why.
 
 ## Steering
@@ -117,9 +106,9 @@ indexes. `rift steer` catches that first call and redirects it.
 
 Claude Code runs `rift steer` before the first `Grep` or `Glob` call in a session and pipes it
 the tool call as JSON on stdin. In a workspace Rift has indexed and version control tracks, that
-first call is denied: the reason names the [`search`](/docs/protocol/mcp#tool-search) call that
-answers the same question, [`get_symbol`](/docs/protocol/mcp#tool-get_symbol) for a known name,
-and [`rift://map`](/docs/protocol/mcp#resource-map) for orientation.
+first call is denied: the reason names the [`search`](/docs/mcp#tool-search) call that
+answers the same question, [`get_symbol`](/docs/mcp#tool-get_symbol) for a known name,
+and [`rift://map`](/docs/mcp#resource-map) for orientation.
 
 The same `Grep` or `Glob` call passes if the agent retries it, and every later call in that
 session passes without a prompt. `rift steer` marks the session with a file under

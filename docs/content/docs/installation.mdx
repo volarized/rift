@@ -1,0 +1,63 @@
+---
+title: Installation
+description: Install Rift and connect an MCP client.
+---
+
+Rift runs locally in the folder containing your codebase. Install the binary, then configure
+Claude Code or another MCP client to launch `rift mcp` in that folder.
+
+## Install
+
+<PlatformTabs>
+
+<Tab value="Linux and macOS">
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://volar.sh/rift/install.sh | bash
+```
+
+</Tab>
+
+<Tab value="Windows PowerShell">
+
+```powershell
+irm https://volar.sh/rift/install.ps1 | iex
+```
+
+</Tab>
+
+</PlatformTabs>
+
+The installer downloads the latest verified release for your platform and installs it for the
+current user. To install a specific version, set the `RIFT_VERSION` environment variable to its
+release tag.
+
+## MCP configuration
+
+An MCP client launches `rift mcp` in the folder containing the codebase. Register it in the
+client's MCP configuration - for Claude Code, `.mcp.json` in the project root:
+
+```json
+{
+  "mcpServers": {
+    "rift": {
+      "command": "rift",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+## Update
+
+```sh
+rift update
+```
+
+The command downloads the latest verified release for your platform and replaces the current
+executable. While it runs, the command reports each stage on the terminal: the release it found,
+the download with its byte progress, checksum verification, extraction, and installation.
+
+## CLI
+
+<CliHelp />

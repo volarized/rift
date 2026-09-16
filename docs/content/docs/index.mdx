@@ -1,69 +1,30 @@
 ---
 title: Rift
-description: Install Rift, connect its MCP server, and read a workspace.
+description: Read and discover code through Rift's MCP tools.
 ---
 
 <VersionBadge
-  version="v0.0.34"
+  version="v0.0.35"
   languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
 />
 
-Rift is an agentic development toolkit for reading, discovering, and editing codebases.
+Rift is an agentic development toolkit for reading and discovering codebases.
 
 Rift provides [MCP](https://modelcontextprotocol.io/specification/2026-07-28) agents structured
-reads and edits for various programming languages in the project workspace.
+reads for various programming languages in the project workspace.
 
 <Callout type="info">
-Currently, Rust, Python, JavaScript and TypeScript (including TSX), Markdown, JSON, YAML, and
-TOML are supported, and more languages will be added in upcoming releases.
+Rift supports Rust, Python, JavaScript and TypeScript (including TSX), Markdown, JSON, YAML, and TOML.
 </Callout>
 
-## Install
-
-<PlatformTabs>
-
-<Tab value="Linux and macOS">
-
-```sh
-curl --proto '=https' --tlsv1.2 -fsSL https://volar.sh/rift/install.sh | bash
-```
-
-</Tab>
-
-<Tab value="Windows PowerShell">
-
-```powershell
-irm https://volar.sh/rift/install.ps1 | iex
-```
-
-</Tab>
-
-</PlatformTabs>
-
-The installer downloads the latest verified release for your platform and installs it for the
-current user. To install a specific version, set the `RIFT_VERSION` environment variable to its
-release tag.
-
-## MCP configuration
-
-An MCP client launches `rift mcp` in the folder containing the codebase. Register it in the
-client's MCP configuration - for Claude Code, `.mcp.json` in the project root:
-
-```json
-{
-  "mcpServers": {
-    "rift": {
-      "command": "rift",
-      "args": ["mcp"]
-    }
-  }
-}
-```
+[Installation](/docs/installation) connects Rift to your MCP client.
+[Agentic usage](/docs/agentic-usage) installs the skill that teaches Claude Code which tool to call.
+The [MCP surface](/docs/mcp) defines each tool and resource.
 
 ## Reads
 
 Rift reads the source files in the folder where the MCP client launches `rift mcp`. Later calls
-include edits made through Rift, your editor, a formatter, or another process.
+include filesystem changes made by a formatter or another process.
 
 ### Search
 
@@ -71,7 +32,7 @@ When you know what the code does but not its name, ask your agent to search for 
 
 > Use Rift to find all information about server startup.
 
-The agent calls [`search`](/docs/protocol/mcp#tool-search) with the query `server startup`, which
+The agent calls [`search`](/docs/mcp#tool-search) with the query `server startup`, which
 returns matching declarations and source lines with their paths.
 
 ### Retrieve symbol
@@ -80,85 +41,16 @@ When you know the declaration name, ask for it directly:
 
 > Use Rift to retrieve the `ReadService` declaration.
 
-The agent calls [`get_symbol`](/docs/protocol/mcp#tool-get_symbol), which returns the declaration
+The agent calls [`get_symbol`](/docs/mcp#tool-get_symbol), which returns the declaration
 and its source excerpt. It can pass a returned path and byte position to
-[`nodes`](/docs/protocol/mcp#tool-nodes) when it needs the surrounding syntax structure.
+[`nodes`](/docs/mcp#tool-nodes) when it needs the surrounding syntax structure.
 
-The [MCP reference](/docs/protocol/mcp#reads) defines request fields and result shapes for client
-integrations. The [index architecture](/docs/architecture#index) explains how Rift keeps those
+The [MCP reference](/docs/mcp#reads) defines request fields and result shapes for client
+integrations. The [index architecture](/docs/developer/architecture#index) explains how Rift keeps those
 reads aligned with filesystem changes.
 
-## Edits
 
-The change tools edit the workspace. Each resolves its address against the published index, proves
-its preconditions against the bytes on disk, and only then writes - atomically, behind one
-application lock, so two concurrent changes collide as a clean refusal rather than as
-interleaved bytes:
+## Developer documentation
 
-- [`replace_symbol`](/docs/protocol/mcp#tool-replace_symbol) rewrites one declaration addressed by
-  symbol; the parser derives the span.
-- [`insert_symbol`](/docs/protocol/mcp#tool-insert_symbol) lands a new declaration before or after
-  its anchor, or content at a file target; `create_missing` creates a missing file target first.
-- [`replace_node`](/docs/protocol/mcp#tool-replace_node) replaces one syntax node through a
-  witnessed address from `nodes`; a stale witness refuses with the expected and observed values.
-- [`insert_node`](/docs/protocol/mcp#tool-insert_node) inserts content before or after a node
-  addressed the same way `replace_node` is; the body lands verbatim, with none of
-  `insert_symbol`'s blank-line or column handling.
-- [`patch`](/docs/protocol/mcp#tool-patch) applies unified-diff hunks, several files in one
-  change; a context mismatch refuses and the tree stays untouched.
-- [`rename_symbol`](/docs/protocol/mcp#tool-rename_symbol) renames a declaration and every
-  reference the configured [language engine](/docs/configuration#languages-and-lsp) resolves.
-- [`move_file`](/docs/protocol/mcp#tool-move_file) moves one file, and an engine that supports it
-  updates the imports that pointed at the old path.
-- [`remove_symbol`](/docs/protocol/mcp#tool-remove_symbol) removes one declaration addressed by
-  symbol, checked against the configured language engine's references first; a standing
-  reference refuses unless `force` applies it anyway.
-- [`remove_node`](/docs/protocol/mcp#tool-remove_node) removes one syntax node through a
-  witnessed address from `nodes`, checked the same way when the node names a declaration.
-
-A change that cannot land returns a refusal naming the failed precondition, and the tree is
-untouched. After a change applies, the server re-parses what it touched and reports parser
-findings on the result. Every failure carries a stable error code and a suggested action.
-
-## Update
-
-```sh
-rift update
-```
-
-The command downloads the latest verified release for your platform and replaces the current
-executable. While it runs, the command reports each stage on the terminal: the release it found,
-the download with its byte progress, checksum verification, extraction, and installation.
-
-## Server logs
-
-When a tool refuses and the refusal alone doesn't say why, read the server's own diagnostics. The
-server records them beside the index in `.rift/db`, and `rift server logs` prints them oldest
-first, with or without a running server:
-
-```sh
-rift server logs
-```
-
-The flags narrow what prints:
-
-- `-f`, `--follow` keeps printing records as the server writes them
-- `-n`, `--tail` prints only the newest records
-- `--since` takes a duration such as `10m`
-- `--level` selects one severity
-- `--component` selects one component: `index`, `search`, `engine`, `change`, or `logs`
-
-Those are the records an agent reads through the
-[`rift://logs`](/docs/protocol/mcp#resource-logs) resource, and the
-[`[logs]`](/docs/configuration#logs) table bounds how many the server keeps.
-
-## CLI
-
-<CliHelp />
-
-## Planned pages
-
-[Architecture](/docs/architecture), [Configuration](/docs/configuration), and the
-[Protocol](/docs/protocol) section carry a Planned badge where they describe the design ahead of
-implementation. Each release moves parts of those pages into the shipped surface this page
-describes.
+The [developer documentation](/docs/developer) explains how the server builds its index,
+accepts workspace configuration, and serves requests.
