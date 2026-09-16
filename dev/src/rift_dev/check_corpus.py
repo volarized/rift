@@ -19,6 +19,7 @@ from rift_dev.corpus_assertions import (
     READ_COUNT,
     SYMBOL_COUNT,
     active_stdout,
+    churn_answer,
     database_bytes,
     exact_degradation,
     fields,
@@ -40,15 +41,17 @@ from rift_dev.rift_test_client import (
     JsonObject,
     Server,
     array_value,
+    gate_deadline,
     object_value,
     require,
     string_value,
 )
 
+READ_SECONDS = 30.0
 SEED = 34
 POLL_SECONDS = 0.1
 OBSERVATION_SECONDS = 60.0
-CONFIGURATION = '[search.semantic]\ndisabled = true\n[logs]\npage_records = 5000\ncapture = "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info"\n'
+CONFIGURATION = '[server]\nreadiness_timeout = "30s"\n[search.semantic]\ndisabled = true\n[logs]\npage_records = 5000\ncapture = "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info"\n'
 SAMPLE_LANGUAGES = {
     "bun": ("rust", "typescript", "typescript:tsx"),
     "nextjs": ("rust", "typescript", "typescript:tsx"),
@@ -58,6 +61,18 @@ REQUIRED_LANGUAGES = {
     "bun": {"rust", "typescript"},
     "nextjs": {"typescript"},
     "fastapi": {"python"},
+}
+
+
+CHURN_REQUESTS: dict[str, JsonObject] = {
+    "search": {
+        "query": "corpus_probe",
+        "target": "symbol",
+        "include": ["source"],
+        "limit": 1,
+    },
+    "get_symbol": {"name": "corpus_probe"},
+    "nodes": {"path": PROBE_PATH, "position": 0},
 }
 
 
@@ -507,37 +522,78 @@ class Corpus:
             self.record("stop", state="after_churn", process_gone=True)
 
     async def churn(self, client: Client) -> None:
+        """Read complete source revisions while external writes continue every two seconds."""
         path = self.root / PROBE_PATH
-        completed: list[Json] = []
+        sources: list[str] = []
+        timings: dict[str, list[float]] = {name: [] for name in CHURN_REQUESTS}
+        overlaps = 0
 
         def write(edit: int) -> None:
-            path.write_text(
-                f"pub fn corpus_probe() {{ let value = {edit}; }}\n",
-                encoding="utf-8",
-            )
-            completed.append(edit)
+            source = f"pub fn corpus_probe() {{ let value = {edit}; }}\n"
+            path.write_text(source, encoding="utf-8")
+            sources.append(source.rstrip("\n"))
 
         async def writer() -> None:
             for edit in range(1, self.pin.seconds // 2):
                 await asyncio.sleep(2.0)
                 write(edit)
 
+        async def read(name: str, expected: list[str], identity: str | None) -> str:
+            nonlocal overlaps
+            before = len(sources)
+            started = time.monotonic()
+            try:
+                async with gate_deadline(f"churn {name}", READ_SECONDS):
+                    answer = await client.call(name, CHURN_REQUESTS[name])
+            finally:
+                elapsed = time.monotonic() - started
+                timings[name].append(elapsed)
+                changed = len(sources) - before
+                overlaps += changed
+                self.record("churn_read", tool=name, seconds=elapsed, writes=changed)
+            return churn_answer(name, answer, expected, identity)
+
         write(0)
-        task = asyncio.create_task(writer())
+        task: asyncio.Task[None] | None = None
         try:
-            for read in range(READ_COUNT):
-                answer = await client.call("search", {"query": "test", "limit": 1})
-                warnings(answer)
-                require(not task.done(), f"churn ended before read {read}")
+            identity = await read("get_symbol", sources, None)
+            task = asyncio.create_task(writer())
+            rounds = 0
+            async with gate_deadline("corpus churn", self.pin.seconds):
+                while rounds < READ_COUNT or overlaps < 2:
+                    for name in CHURN_REQUESTS:
+                        await read(name, sources, identity)
+                    rounds += 1
+                    if task.done():
+                        await task
+                        raise AssertionError("churn writer ended before reads")
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            final = [sources[-1]]
+            for name in CHURN_REQUESTS:
+                await read(name, final, identity)
+            require(
+                path.read_text(encoding="utf-8").rstrip("\n") == final[0],
+                "reads changed probe source",
+            )
             self.record(
                 "churn",
-                reads=READ_COUNT,
-                edits=len(completed),
+                reads=rounds * len(CHURN_REQUESTS),
+                rounds=rounds,
+                edits=len(sources),
+                overlapping_writes=overlaps,
+                read_seconds_max=READ_SECONDS,
+                latency={
+                    name: {"calls": len(values), "maximum_seconds": max(values)}
+                    for name, values in timings.items()
+                },
+                final_source=final[0],
                 temporarily_unavailable=0,
             )
         finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
             path.unlink(missing_ok=True)
 
     async def symlink_root(self) -> None:
