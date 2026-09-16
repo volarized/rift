@@ -388,7 +388,7 @@ def probe_units(root: Path) -> int:
 
 def churn_answer(
     tool: str, answer: JsonObject, sources: list[str], identity: str | None
-) -> str:
+) -> tuple[str, str]:
     """Require one probe declaration with source from a complete authored revision."""
     warnings(answer)
     if tool == "nodes":
@@ -425,4 +425,4 @@ def churn_answer(
         span.get("start") == 0 and span.get("end") == len(source.encode()),
         f"{tool} probe range disagrees with source",
     )
-    return found
+    return found, source
