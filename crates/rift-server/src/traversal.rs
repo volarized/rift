@@ -5,15 +5,16 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
-use rift_core::{LoopBudget, SymbolId as CoreSymbolId};
+use rift_core::{Language, LoopBudget, SymbolId as CoreSymbolId};
 use rift_index::{
     IndexedFile, PathMatcher, RelationshipEdge, RelationshipStore, SymbolMatch, SymbolMatchRank,
-    WorkspaceIndex,
+    WorkspaceIndex, produced_relationship_facets,
 };
 use rift_protocol::read::{
     ExactKind, Extensions, GraphHop, HopDirection, MatchedField, ReadWarning, Relationship,
-    RelationshipDerivation, SEARCH_TRAVERSAL_DEPTH_MAX, SEARCH_TRAVERSAL_DEPTH_MIN,
-    SEARCH_TRAVERSAL_FACETS_MAX, SearchHit, SearchTraversal, SymbolId, TraversalDirection,
+    RelationshipDerivation, RelationshipFacet, SEARCH_TRAVERSAL_DEPTH_MAX,
+    SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX, SearchHit, SearchTraversal, SymbolId,
+    TraversalDirection,
 };
 use rift_syntax::SyntaxSymbol;
 
@@ -54,6 +55,14 @@ pub(crate) fn validate_traversal(traversal: &SearchTraversal) -> Result<(), Read
 /// discovering new symbols and truncates the same way on every call over the same graph.
 pub(crate) const TRAVERSAL_NODES_MAX: usize = 10_000;
 
+/// What one traversal lane reports beside the hits it merged: the coverage the request asked
+/// for that no provider populates, and whether the walk stopped at its node bound.
+#[derive(Debug, Default)]
+pub(crate) struct TraversalReport {
+    pub(crate) coverage_missing: Option<ReadWarning>,
+    pub(crate) truncated: bool,
+}
+
 /// Fourth hit-collection lane: a bounded relationship walk from `traversal.seed`, merged into
 /// `results` alongside whatever the lexical and ranked lanes already placed there. Runs after
 /// them so a symbol also reached by the walk absorbs it instead of duplicating it.
@@ -71,7 +80,7 @@ pub(crate) fn collect_traversal_hits(
     references: &EngineReferences,
     payloads: HitPayloads,
     results: &mut Vec<SearchHit>,
-) -> Result<bool, ReadError> {
+) -> Result<TraversalReport, ReadError> {
     let store = reads.relationships();
     if store.is_empty() && !reads.index().binding_enabled() && !references.resolved(&traversal.seed)
     {
@@ -80,6 +89,7 @@ pub(crate) fn collect_traversal_hits(
         ));
     }
     let seed = resolve_traversal_seed(reads, &traversal.seed)?;
+    let coverage_missing = relationship_coverage_missing(reads, traversal, &seed);
     let walk =
         walk_traversal_with_references(store, &seed, traversal, TRAVERSAL_NODES_MAX, references);
     for (identity, path) in walk.discovered {
@@ -101,7 +111,114 @@ pub(crate) fn collect_traversal_hits(
         }
         merge_traversal_hit(reads.index(), results, file, symbol, path, payloads)?;
     }
-    Ok(walk.truncated)
+    Ok(TraversalReport {
+        coverage_missing,
+        truncated: walk.truncated,
+    })
+}
+
+/// The relationship coverage `traversal` asks for that no provider populates: the requested
+/// facets outside every provider's image, and the seed's language when the requested
+/// direction leaves the binding lane as the only provider.
+///
+/// Answers `None` when every requested facet and the seed's language have a provider: an
+/// empty answer then means the walk ran and the seed has no neighbor under the request.
+fn relationship_coverage_missing(
+    reads: &ReadService,
+    traversal: &SearchTraversal,
+    seed: &CoreSymbolId,
+) -> Option<ReadWarning> {
+    relationship_coverage_warning(
+        unproducible_facets(&traversal.facets),
+        uncovered_language(reads, traversal, seed),
+    )
+}
+
+/// The requested facets no provider populates, in the request's own order, deduplicated.
+///
+/// The store's own image is every provider's image: `role_facet` maps every reference role
+/// onto [`produced_relationship_facets`], and the engine lane adds `References` alone, which
+/// that image already holds. An empty `requested` list asks for every facet the walk can
+/// follow, so it names no gap.
+///
+/// `validate_traversal` refuses a list longer than `SEARCH_TRAVERSAL_FACETS_MAX` before this
+/// runs, which bounds both the scan and the deduplication it carries.
+fn unproducible_facets(requested: &[RelationshipFacet]) -> Vec<RelationshipFacet> {
+    let produced = produced_relationship_facets();
+    let mut missing: Vec<RelationshipFacet> = Vec::new();
+    for facet in requested {
+        if !produced.contains(facet) && !missing.contains(facet) {
+            missing.push(*facet);
+        }
+    }
+    missing
+}
+
+/// The seed declaration's language when no provider populates relationships for it in the
+/// requested direction.
+///
+/// The binding lane alone populates outgoing edges: every engine-resolved hop carries
+/// [`HopDirection::Incoming`], and `combined_edges` admits those hops for an `incoming` or
+/// `both` walk alone. An `outgoing` walk from a language whose indexed files carry no
+/// name-binding facts therefore has no provider, while an `incoming` or `both` walk may
+/// still be answered by a configured language engine this lane cannot ask, so those
+/// directions report no language gap.
+fn uncovered_language(
+    reads: &ReadService,
+    traversal: &SearchTraversal,
+    seed: &CoreSymbolId,
+) -> Option<Language> {
+    if traversal.direction != TraversalDirection::Outgoing {
+        return None;
+    }
+    let index = reads.index();
+    let (file, _symbol) = resolve_graph_symbol(index, seed)?;
+    let language = file.syntax().language();
+    (!index.carries_binding_facts(language)).then(|| language.clone())
+}
+
+/// The `relationship_coverage_missing` warning naming what has no provider, or `None` when
+/// neither `facets` nor `language` names a gap.
+fn relationship_coverage_warning(
+    facets: Vec<RelationshipFacet>,
+    language: Option<Language>,
+) -> Option<ReadWarning> {
+    let clauses: Vec<String> = facet_gap_clause(&facets)
+        .into_iter()
+        .chain(language.as_ref().map(language_gap_clause))
+        .collect();
+    if clauses.is_empty() {
+        return None;
+    }
+    Some(ReadWarning::RelationshipCoverageMissing {
+        facets,
+        language,
+        detail: clauses.join("; "),
+    })
+}
+
+/// The detail clause for a facet gap, naming each facet in its wire spelling.
+fn facet_gap_clause(facets: &[RelationshipFacet]) -> Option<String> {
+    let named: Vec<String> = facets.iter().map(rift_core::fault_label).collect();
+    let (subject, reference) = match named.len() {
+        0 => return None,
+        1 => ("facet", "it"),
+        _ => ("facets", "them"),
+    };
+    Some(format!(
+        "no provider populates the requested {subject} {named}, so the walk followed no edge \
+         under {reference}",
+        named = named.join(", "),
+    ))
+}
+
+/// The detail clause for a language gap, naming the language's identity segment.
+fn language_gap_clause(language: &Language) -> String {
+    format!(
+        "no provider populates outgoing relationships for {}, so the walk followed no edge \
+         from a declaration in it",
+        language.identity_segment(),
+    )
 }
 
 /// Resolves a traversal's `seed`, refusing `not_found` naming it when the identity exists
@@ -223,7 +340,7 @@ enum TraversalEdge<'edge> {
 }
 
 impl TraversalEdge<'_> {
-    fn eligible(&self, facets: &[rift_protocol::read::RelationshipFacet]) -> bool {
+    fn eligible(&self, facets: &[RelationshipFacet]) -> bool {
         if facets.is_empty() {
             return true;
         }
@@ -279,8 +396,8 @@ fn combined_edges<'edge>(
         .collect();
     let mut edges = Vec::new();
     for (edge, direction) in traversal_edges(store, current, direction) {
-        let confirms = direction == HopDirection::Incoming
-            && edge.facet() == rift_protocol::read::RelationshipFacet::References;
+        let confirms =
+            direction == HopDirection::Incoming && edge.facet() == RelationshipFacet::References;
         let confirmed = confirms
             .then(|| resolved.remove(edge.from().as_str()))
             .flatten();
@@ -792,6 +909,143 @@ pub(crate) mod tests {
         );
     }
 
+    /// An empty `facets` list asks for every facet the walk can follow, and a list drawn
+    /// from `role_facet`'s own image names no gap.
+    #[test]
+    fn unproducible_facets_names_nothing_for_an_empty_or_fully_produced_list() {
+        assert!(super::unproducible_facets(&[]).is_empty());
+        assert!(
+            super::unproducible_facets(&[
+                RelationshipFacet::Calls,
+                RelationshipFacet::Imports,
+                RelationshipFacet::References,
+                RelationshipFacet::Declares,
+                RelationshipFacet::Reads,
+                RelationshipFacet::Writes,
+                RelationshipFacet::HasType,
+            ])
+            .is_empty()
+        );
+    }
+
+    /// The gap lists exactly the requested facets no provider populates, keeping the
+    /// request's own order, and never the produced ones beside them.
+    #[test]
+    fn unproducible_facets_keeps_only_the_unproduced_ones_in_request_order() {
+        assert_eq!(
+            super::unproducible_facets(&[
+                RelationshipFacet::Implements,
+                RelationshipFacet::Calls,
+                RelationshipFacet::Extends,
+            ]),
+            [RelationshipFacet::Implements, RelationshipFacet::Extends]
+        );
+        assert_eq!(
+            super::unproducible_facets(&[
+                RelationshipFacet::Extends,
+                RelationshipFacet::Implements,
+            ]),
+            [RelationshipFacet::Extends, RelationshipFacet::Implements]
+        );
+    }
+
+    /// A caller repeating one facet gets it named once: the warning reports the set that
+    /// has no provider, not the request's own repetition.
+    #[test]
+    fn unproducible_facets_names_a_repeated_facet_once() {
+        assert_eq!(
+            super::unproducible_facets(&[
+                RelationshipFacet::Implements,
+                RelationshipFacet::Implements,
+                RelationshipFacet::Extends,
+                RelationshipFacet::Implements,
+            ]),
+            [RelationshipFacet::Implements, RelationshipFacet::Extends]
+        );
+    }
+
+    #[test]
+    fn relationship_coverage_warning_is_absent_when_neither_member_names_a_gap() {
+        assert!(super::relationship_coverage_warning(Vec::new(), None).is_none());
+    }
+
+    /// A facet gap names each unproduced facet in the detail and carries no language.
+    #[test]
+    fn relationship_coverage_warning_names_every_unproduced_facet() {
+        let warning = super::relationship_coverage_warning(
+            vec![RelationshipFacet::Implements, RelationshipFacet::Extends],
+            None,
+        )
+        .ok_or("a facet gap raises the warning")
+        .expect("warning");
+        let ReadWarning::RelationshipCoverageMissing {
+            facets,
+            language,
+            detail,
+        } = warning
+        else {
+            panic!("expected the relationship coverage variant");
+        };
+        assert_eq!(
+            facets,
+            [RelationshipFacet::Implements, RelationshipFacet::Extends]
+        );
+        assert_eq!(language, None);
+        assert!(detail.contains("implements, extends"), "{detail}");
+    }
+
+    /// A language gap names the language's identity segment and carries no facet.
+    #[test]
+    fn relationship_coverage_warning_names_the_language_and_its_direction() {
+        let toml = rift_core::Language {
+            name: "toml".to_owned(),
+            dialect: None,
+        };
+        let warning = super::relationship_coverage_warning(Vec::new(), Some(toml.clone()))
+            .ok_or("a language gap raises the warning")
+            .expect("warning");
+        let ReadWarning::RelationshipCoverageMissing {
+            facets,
+            language,
+            detail,
+        } = warning
+        else {
+            panic!("expected the relationship coverage variant");
+        };
+        assert!(facets.is_empty(), "{facets:?}");
+        assert_eq!(language, Some(toml));
+        assert!(
+            detail.contains("outgoing relationships for toml"),
+            "{detail}"
+        );
+    }
+
+    /// Both gaps ride one warning, each naming what it found, so a caller holding an empty
+    /// answer reads every reason the walk could not run.
+    #[test]
+    fn relationship_coverage_warning_carries_a_facet_gap_beside_a_language_gap() {
+        let warning = super::relationship_coverage_warning(
+            vec![RelationshipFacet::Implements],
+            Some(rift_core::Language {
+                name: "toml".to_owned(),
+                dialect: None,
+            }),
+        )
+        .ok_or("both gaps raise the warning")
+        .expect("warning");
+        let ReadWarning::RelationshipCoverageMissing { detail, .. } = warning else {
+            panic!("expected the relationship coverage variant");
+        };
+        assert!(
+            detail.contains("the requested facet implements"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("outgoing relationships for toml"),
+            "{detail}"
+        );
+    }
+
     #[test]
     fn walk_traversal_from_an_edgeless_seed_finds_nothing() {
         let store = call_graph_store();
@@ -1007,6 +1261,123 @@ pub(crate) mod tests {
         }))?;
         let result = service.search(&params, &[])?;
         assert!(result.results.is_empty(), "{:#?}", result.results);
+        assert!(
+            result.warnings.is_empty(),
+            "a walk that ran and found nothing carries no coverage warning: {:#?}",
+            result.warnings
+        );
+        Ok(())
+    }
+
+    /// An empty answer over a produced facet stays bare, so the warning keeps naming an
+    /// absent provider alone.
+    #[test]
+    fn search_traversal_over_a_produced_facet_carries_no_coverage_warning() -> TestResult {
+        let (_directory, service) = live_call_graph_fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "traversal": {
+                "seed": "rift://symbol/rust/lib.rs/root",
+                "facets": ["calls"]
+            }
+        }))?;
+        let result = service.search(&params, &[])?;
+        assert!(!result.results.is_empty(), "{:#?}", result.results);
+        assert!(result.warnings.is_empty(), "{:#?}", result.warnings);
+        Ok(())
+    }
+
+    /// `implements` reaches no reference role, so the walk could not have answered it. The
+    /// produced `calls` beside it still answers, and the warning names the one gap.
+    #[test]
+    fn search_traversal_over_an_unproduced_facet_warns_relationship_coverage_missing() -> TestResult
+    {
+        let (_directory, service) = live_call_graph_fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "traversal": {
+                "seed": "rift://symbol/rust/lib.rs/root",
+                "facets": ["implements", "calls"]
+            }
+        }))?;
+        let result = service.search(&params, &[])?;
+        let [
+            ReadWarning::RelationshipCoverageMissing {
+                facets,
+                language,
+                detail,
+            },
+        ] = result.warnings.as_slice()
+        else {
+            panic!("expected one coverage warning: {:#?}", result.warnings);
+        };
+        assert_eq!(facets, &[RelationshipFacet::Implements]);
+        assert_eq!(language, &None);
+        assert!(detail.contains("implements"), "{detail}");
+        Ok(())
+    }
+
+    /// A TOML workspace: no provider supplies name-binding facts for it, so an outgoing
+    /// walk from one of its declarations has no provider and says so.
+    #[test]
+    fn search_traversal_from_a_language_with_no_binding_facts_warns_its_language() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("settings.toml"), "beacon = 7\n")?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "traversal": {
+                "seed": "rift://symbol/toml/settings.toml/beacon"
+            }
+        }))?;
+        let result = service.search(&params, &[])?;
+        assert!(result.results.is_empty(), "{:#?}", result.results);
+        let [
+            ReadWarning::RelationshipCoverageMissing {
+                facets,
+                language,
+                detail,
+            },
+        ] = result.warnings.as_slice()
+        else {
+            panic!("expected one coverage warning: {:#?}", result.warnings);
+        };
+        assert!(facets.is_empty(), "{facets:?}");
+        assert_eq!(
+            language.as_ref().map(rift_core::Language::identity_segment),
+            Some("toml".to_owned())
+        );
+        assert!(
+            detail.contains("outgoing relationships for toml"),
+            "{detail}"
+        );
+        Ok(())
+    }
+
+    /// An `incoming` walk over the same language stays bare: a configured language engine
+    /// answers incoming references, and this lane cannot ask whether one is configured.
+    #[test]
+    fn search_traversal_incoming_from_that_language_carries_no_language_warning() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("settings.toml"), "beacon = 7\n")?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "traversal": {
+                "seed": "rift://symbol/toml/settings.toml/beacon",
+                "direction": "incoming"
+            }
+        }))?;
+        let result = service.search(&params, &[])?;
+        assert!(result.warnings.is_empty(), "{:#?}", result.warnings);
         Ok(())
     }
 
