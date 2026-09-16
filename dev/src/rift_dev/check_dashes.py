@@ -1,11 +1,6 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.10"
-# dependencies = []
-# ///
 """Flag em-dash and en-dash characters in prose and source files.
 
-The documenter skill bans "—" (em-dash) and "–" (en-dash) everywhere a
+The documenter skill bans "\u2014" (em-dash) and "\u2013" (en-dash) everywhere a
 reader sees text; the author's dash is the plain hyphen-minus. Each occurrence
 prints as path:line:column with highlighted context so it can be targeted and
 replaced. Exit 0 means no findings; exit 1 lists them; exit 2 is a usage error.
@@ -13,7 +8,7 @@ replaced. Exit 0 means no findings; exit 1 lists them; exit 2 is a usage error.
 `just dashes` runs it over every reader-facing surface; the same command
 takes explicit paths while a change is still in progress:
 
-    uv run --script scripts/check_dashes.py [PATH ...]
+    uv run --project dev rift-dev dashes [PATH ...]
 
 With no PATH arguments the script scans the default reader-facing surfaces
 relative to the current directory: docs/content, docs/src/app, crates,
@@ -27,8 +22,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-EM_DASH = "—"
-EN_DASH = "–"
+EM_DASH = "\u2014"
+EN_DASH = "\u2013"
 DASH_NAMES = {EM_DASH: "em-dash U+2014", EN_DASH: "en-dash U+2013"}
 
 DEFAULT_TARGETS = ("docs/content", "docs/src/app", "crates", "README.md")
@@ -102,7 +97,7 @@ def scan_file(path: Path) -> list[tuple[int, int, str, str]]:
                 continue
             start = max(0, column - 1 - CONTEXT_CHARS)
             end = min(len(line), column + CONTEXT_CHARS)
-            context = line[start : end]
+            context = line[start:end]
             if start > 0:
                 context = "..." + context
             if end < len(line):
@@ -124,13 +119,15 @@ def main(arguments: list[str]) -> int:
         targets = [Path(argument) for argument in arguments]
         missing = [target for target in targets if not target.exists()]
         if missing:
-            print(f"error: no such path: {', '.join(str(m) for m in missing)}")
-            return 2
+            raise FileNotFoundError(
+                f"no such path: {', '.join(str(m) for m in missing)}"
+            )
     else:
         targets = [Path(name) for name in DEFAULT_TARGETS if Path(name).exists()]
         if not targets:
-            print("error: none of the default targets exist here; pass paths explicitly")
-            return 2
+            raise FileNotFoundError(
+                "none of the default targets exist here; pass paths explicitly"
+            )
 
     use_color = sys.stdout.isatty()
     total = 0
@@ -153,7 +150,3 @@ def main(arguments: list[str]) -> int:
     print(f"\n{total} banned dash character(s) across {dirty_files} file(s).")
     print(ADVICE)
     return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))

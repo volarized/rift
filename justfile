@@ -32,14 +32,14 @@ generate-check:
 check:
     cargo metadata --locked --format-version 1 > /dev/null
     cargo check --workspace --all-targets --all-features --locked
-    uv run --script scripts/check_rust_architecture.py
+    uv run --locked --project dev rift-dev rust-architecture
 
 # The em-dash ban, over every surface a reader meets: the docs pages and
 # the app shell, the prose inside the crates, the README, the artifacts
 # `just generate` writes, and the CI configuration's own comments. The
 # scanner itself is not among them: it spells the banned characters.
 dashes:
-    uv run --script scripts/check_dashes.py \
+    uv run --locked --project dev rift-dev dashes \
         docs/content docs/src/app crates README.md docs/public .github \
         plugins .claude-plugin
 
@@ -48,7 +48,7 @@ dashes:
 # carries the scenarios the served surface fails today; anything else fails
 # the gate.
 conformance binary="":
-    uv run --script scripts/check_mcp_conformance.py {{ if binary == "" { "" } else { "--binary " + quote(binary) } }}
+    uv run --locked --project dev rift-dev conformance {{ if binary == "" { "" } else { "--binary " + quote(binary) } }}
 
 
 clippy:
@@ -75,31 +75,19 @@ clean:
         fi
     done
 
-# CI transfers only nextest's runtime archive and the plain CLI used by conformance.
+# Archive unit tests once; execution jobs reuse the compiled binaries.
 fast-archive:
     cargo llvm-cov nextest-archive --workspace --all-targets --all-features --locked --profile ci --archive-file target/fast.tar.zst
-    tar --zstd -cf target/fast-cli.tar.zst -C target/debug rift
 
-# One run of every suite, live engines and the live model hub included: the
-# engine tier's own code is only exercised against a real language server, and
-# the semantic search tier's acquisition only against the real hub, so a
-# hermetic run would report both uncovered. Needs rust-analyzer on the default
-# toolchain, bun on the PATH, and network reach to huggingface.co; the model is
-# cached per machine, so only the first run pays for the download. Coverage is
-# this run's artifact, not a second run.
+# Unit tests use local fixtures and require no language servers or model downloads.
 test archive="":
     mkdir -p "${CARGO_LLVM_COV_TARGET_DIR:-target/llvm-cov-target}"
-    RIFT_ENGINE_LIVE=1 RIFT_SEARCH_LIVE=1 cargo llvm-cov nextest {{ if archive == "" { "--workspace --all-targets --all-features --locked" } else { "--archive-file " + quote(archive) + " --extract-overwrite --workspace-remap ." } }} --profile ci --no-tests fail --lcov --output-path lcov.info --fail-under-lines 86
+    cargo llvm-cov nextest {{ if archive == "" { "--workspace --all-targets --all-features --locked" } else { "--archive-file " + quote(archive) + " --extract-overwrite --workspace-remap ." } }} --profile ci --no-tests fail --lcov --output-path lcov.info --fail-under-lines 86
 
-# The live-engine suites alone, for iterating on them without paying for
-# the instrumented workspace run.
-engine-test:
-    RIFT_ENGINE_LIVE=1 cargo nextest run --locked --no-tests fail -p rift-lsp -p rift-mcp --test live_rust_analyzer --test live_typescript --test live_toml
-
-# The live semantic-search suite alone, for iterating on it without paying for
-# the instrumented workspace run. Reaches the real model hub.
-search-test:
-    RIFT_SEARCH_LIVE=1 cargo nextest run --locked --no-tests fail -p rift-mcp --test live_semantic_search
+# Live integrations share the corpus archive and its optimized Cargo profile.
+live-test archive="":
+    mkdir -p "${CARGO_LLVM_COV_TARGET_DIR:-target/llvm-cov-target}"
+    RIFT_ENGINE_LIVE=1 RIFT_SEARCH_LIVE=1 cargo llvm-cov nextest --no-report --profile integration --no-tests fail {{ if archive == "" { "--workspace --all-targets --all-features --locked --cargo-profile corpus" } else { "--archive-file " + quote(archive) + " --extract-overwrite --workspace-remap ." } }} -E 'binary(/^live_/) or test(/^live_/)'
 
 release-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_release.py
@@ -108,58 +96,44 @@ installer-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_installers.py
 
 testing-check:
-    uv run --locked --python 3.12 --project scripts ruff check scripts
-    uv run --locked --python 3.12 --project scripts ty check --extra-search-path scripts --extra-search-path tools/rift-release/src scripts
-    uv run --locked --python 3.12 --project scripts pytest scripts
+    uv run --locked --python 3.12 --project dev ruff check dev
+    uv run --locked --python 3.12 --project dev ty check dev
+    uv run --locked --python 3.12 --project dev pytest dev/tests
 
 corpus-sync name="":
-    uv run --locked --python 3.12 --project scripts python scripts/check_corpus.py sync {{ if name == "" { "" } else { quote(name) } }}
+    uv run --locked --python 3.12 --project dev rift-dev corpus sync {{ if name == "" { "" } else { quote(name) } }}
 
-# The same instrumented build supplies every CI corpus case through nextest's archive.
-corpus-archive:
-    cargo llvm-cov nextest-archive --locked -p rift --test corpus_bun --test corpus_nextjs --test corpus_fastapi --cargo-profile corpus --profile corpus --archive-file target/corpus.tar.zst
+# One archive supplies every integration job. Save the plain CLI before test builds.
+integration-archive:
+    cargo build --locked --profile corpus -p rift
+    tar --zstd -cf target/integration-cli.tar.zst -C target/corpus rift
+    cargo llvm-cov nextest-archive --workspace --all-targets --all-features --locked --cargo-profile corpus --profile integration --archive-file target/integration.tar.zst
 
-# Each repository runs alone. --no-report preserves the fast tier's profiles
-# so full-gate can merge coverage without running those tests a second time.
 corpus-test name test_name="" archive="":
-    # Nextest requires the archive extraction destination to exist on a cold checkout.
     mkdir -p "${CARGO_LLVM_COV_TARGET_DIR:-target/llvm-cov-target}"
-    cargo llvm-cov nextest --no-report --profile corpus --no-tests fail --run-ignored all {{ if archive == "" { "--locked -p rift --test " + quote("corpus_" + name) + " --cargo-profile corpus" } else { "--archive-file " + quote(archive) + " --extract-overwrite -E " + quote("binary(=corpus_" + name + ")") } }} {{ if test_name == "" { "" } else { "-- --exact " + quote(test_name) } }}
+    cargo llvm-cov nextest --no-report --profile corpus --no-tests fail --run-ignored all {{ if archive == "" { "--locked -p rift --test " + quote("corpus_" + name) + " --cargo-profile corpus" } else { "--archive-file " + quote(archive) + " --extract-overwrite --workspace-remap . -E " + quote("binary(=corpus_" + name + ")") } }} {{ if test_name == "" { "" } else { "-- --exact " + quote(test_name) } }}
 
 artifact-test *args:
-    uv run --locked --python 3.12 --project scripts python scripts/check_artifact.py {{ args }}
+    uv run --locked --python 3.12 --project dev rift-dev artifact {{ args }}
 
 agent-test *args:
-    uv run --locked --python 3.12 --project scripts python scripts/check_agent.py {{ args }}
+    uv run --locked --python 3.12 --project dev rift-dev agent {{ args }}
 
 coldstart-test *args:
-    uv run --locked --python 3.12 --project scripts python scripts/check_coldstart.py {{ args }}
+    uv run --locked --python 3.12 --project dev rift-dev coldstart {{ args }}
 
-installer-live-test tag target *args:
-    uv run --locked --python 3.12 --project scripts python scripts/check_release_gate.py --mode install --tag {{ quote(tag) }} --target {{ quote(target) }} {{ args }}
-
-upgrade-test from_tag to_tag target *args:
-    uv run --locked --python 3.12 --project scripts python scripts/check_release_gate.py --mode upgrade --from-tag {{ quote(from_tag) }} --tag {{ quote(to_tag) }} --target {{ quote(target) }} {{ args }}
-
-# One large workspace at a time on the development machine. The CI full tier
-# runs these repositories on separate runners with separate job budgets.
-full-gate linux_binary="":
-    command -v lcov
-    @echo "Full gate runs the instrumented suite, then corpus and artifact checks in sequence."
-    just test
-    cp lcov.info target/fast.lcov
+# Corpus servers run sequentially on development machines.
+integration-test:
     just corpus-sync
     just corpus-test fastapi
     just corpus-test bun
     just corpus-test nextjs
-    cargo llvm-cov report --profile corpus --lcov --output-path target/corpus.lcov
-    lcov --add-tracefile target/fast.lcov --add-tracefile target/corpus.lcov --output-file lcov.info --no-markers
-    lcov --summary lcov.info --fail-under-lines 86 --no-markers
+    just live-test
     just artifact-test
     just agent-test
-    just coldstart-test {{ if linux_binary == "" { "" } else { "--binary " + quote(linux_binary) } }}
+    just conformance
 
-rust-gate: format dashes generate-check conformance check clippy docs doctest audit test release-test installer-test testing-check
+rust-gate: format dashes generate-check check clippy docs doctest audit test release-test installer-test testing-check
 
 # One signed tag on the commit `origin/main` names right now. The recipe reads
 # that commit from the remote, so the local checkout's branch and its uncommitted

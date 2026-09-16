@@ -12,7 +12,7 @@ from contextlib import closing
 from pathlib import Path
 from urllib.parse import unquote
 
-from rift_test_client import (
+from rift_dev.rift_test_client import (
     JsonObject,
     array_value,
     object_value,
@@ -215,71 +215,11 @@ def lexical_breach(answer: JsonObject, maximum: int) -> int:
     return observed
 
 
-def identity_resolved(answer: JsonObject, symbol: str) -> None:
-    """Issue #264: a read identity must reach change resolution."""
-    status = answer.get("status")
-    require(
-        status in ("applied", "refused", "unchanged"),
-        f"{symbol}: unknown change outcome {answer}",
-    )
-    if status != "refused":
-        return
-    conditions = array_value(answer.get("preconditions"), "change preconditions")
-    require(
-        bool(conditions) or answer.get("reason") != "unmet_precondition",
-        f"{symbol}: missing refused precondition",
-    )
-    for value in conditions:
-        condition = object_value(value, "change precondition")
-        missing = (
-            condition.get("kind") == "target_exists"
-            and condition.get("status") == "failed"
-        )
-        require(
-            not missing,
-            f"read identity cannot be addressed by replace_symbol: {symbol}: {answer}",
-        )
-
-
 def no_failed_builds(found: list[JsonObject]) -> None:
     failures = [
         record for record in found if record.get("message") == "index rebuild failed"
     ]
     require(not failures, f"index build failed: {failures}")
-
-
-def capture_count(found: list[JsonObject], after: int) -> int:
-    """Count completed source captures and publications after the recorded edit boundary."""
-    recent = [
-        row for row in found if number(row["identity"], "record identity") > after
-    ]
-    captures = [
-        row
-        for row in recent
-        if row.get("message") == "index.build"
-        and row.get("target") == "rift_server::read"
-        and fields(row).get("span") == "closed"
-    ]
-    publications = [
-        row
-        for row in recent
-        if row.get("operation") == "index.publish"
-        and fields(row).get("trigger") == "rift_change"
-    ]
-    require(
-        len(captures) == 1 and len(publications) == 1,
-        f"one edit must capture and publish once: {recent}",
-    )
-    require(
-        fields(captures[0]).get("changed_count") == "1",
-        f"capture lost changed_count: {captures}",
-    )
-    required = {"files_count", "tree_revision", "outcome"}
-    require(
-        required.issubset(fields(captures[0])), f"capture lost named fields: {captures}"
-    )
-    require(fields(captures[0]).get("outcome") == "ok", f"capture failed: {captures}")
-    return len(captures)
 
 
 def exact_degradation(found: list[JsonObject], expected: str | None) -> None:
@@ -381,7 +321,7 @@ def active_stdout(output: str, operation: str, epoch: str | None) -> str:
 
 @dataclasses.dataclass(frozen=True)
 class LexicalContent:
-    """Exact stored rows, excluding the one path the edit changes."""
+    """Exact stored rows, excluding the probe path."""
 
     units: int
     bytes: int
@@ -444,20 +384,3 @@ def probe_units(root: Path) -> int:
         ).fetchone()
     require(row is not None, "lexical probe count returned no row")
     return number(row[0], "lexical probe units")
-
-
-def change_patch(path: str, previous: str, replacement: str) -> str:
-    """Build the complete one-line fixture patch, preserving its exact newline."""
-    require(
-        previous.count("\n") <= 1 and replacement.count("\n") <= 1,
-        "corpus probe must contain at most one source line",
-    )
-    before = f"a/{path}" if previous else "/dev/null"
-    after = f"b/{path}" if replacement else "/dev/null"
-    old = "1,1" if previous else "0,0"
-    new = "1,1" if replacement else "0,0"
-    return (
-        f"--- {before}\n+++ {after}\n@@ -{old} +{new} @@\n"
-        + (f"-{previous}" if previous else "")
-        + (f"+{replacement}" if replacement else "")
-    )
