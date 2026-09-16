@@ -536,7 +536,7 @@ pub(crate) mod tests {
     use rift_index::{BindingPolicy, RelationshipStore, WorkspaceIndexLimits};
     use rift_protocol::configuration::{BindingConfiguration, HistoryConfiguration};
     use rift_protocol::read::{
-        MatchedField, ReadWarning, RelationshipFacet, SearchHitTarget, SearchParams,
+        MatchedField, ReadWarning, RelationshipFacet, SearchHitTarget, SearchParams, SearchResult,
         SearchTraversal, TraversalDirection,
     };
     use rift_provider::{
@@ -969,29 +969,20 @@ pub(crate) mod tests {
         assert!(super::relationship_coverage_warning(Vec::new(), None).is_none());
     }
 
-    /// A facet gap names each unproduced facet in the detail and carries no language.
+    /// A facet gap names each unproduced facet in its wire spelling and carries no language.
     #[test]
     fn relationship_coverage_warning_names_every_unproduced_facet() {
-        let warning = super::relationship_coverage_warning(
-            vec![RelationshipFacet::Implements, RelationshipFacet::Extends],
-            None,
-        )
-        .ok_or("a facet gap raises the warning")
-        .expect("warning");
-        let ReadWarning::RelationshipCoverageMissing {
-            facets,
-            language,
-            detail,
-        } = warning
-        else {
-            panic!("expected the relationship coverage variant");
-        };
+        let gap = vec![RelationshipFacet::Implements, RelationshipFacet::Extends];
         assert_eq!(
-            facets,
-            [RelationshipFacet::Implements, RelationshipFacet::Extends]
+            super::relationship_coverage_warning(gap.clone(), None),
+            Some(ReadWarning::RelationshipCoverageMissing {
+                facets: gap,
+                language: None,
+                detail: "no provider populates the requested facets implements, extends, so \
+                         the walk followed no edge under them"
+                    .to_owned(),
+            })
         );
-        assert_eq!(language, None);
-        assert!(detail.contains("implements, extends"), "{detail}");
     }
 
     /// A language gap names the language's identity segment and carries no facet.
@@ -1001,22 +992,15 @@ pub(crate) mod tests {
             name: "toml".to_owned(),
             dialect: None,
         };
-        let warning = super::relationship_coverage_warning(Vec::new(), Some(toml.clone()))
-            .ok_or("a language gap raises the warning")
-            .expect("warning");
-        let ReadWarning::RelationshipCoverageMissing {
-            facets,
-            language,
-            detail,
-        } = warning
-        else {
-            panic!("expected the relationship coverage variant");
-        };
-        assert!(facets.is_empty(), "{facets:?}");
-        assert_eq!(language, Some(toml));
-        assert!(
-            detail.contains("outgoing relationships for toml"),
-            "{detail}"
+        assert_eq!(
+            super::relationship_coverage_warning(Vec::new(), Some(toml.clone())),
+            Some(ReadWarning::RelationshipCoverageMissing {
+                facets: Vec::new(),
+                language: Some(toml),
+                detail: "no provider populates outgoing relationships for toml, so the walk \
+                         followed no edge from a declaration in it"
+                    .to_owned(),
+            })
         );
     }
 
@@ -1024,25 +1008,24 @@ pub(crate) mod tests {
     /// answer reads every reason the walk could not run.
     #[test]
     fn relationship_coverage_warning_carries_a_facet_gap_beside_a_language_gap() {
-        let warning = super::relationship_coverage_warning(
-            vec![RelationshipFacet::Implements],
-            Some(rift_core::Language {
-                name: "toml".to_owned(),
-                dialect: None,
-            }),
-        )
-        .ok_or("both gaps raise the warning")
-        .expect("warning");
-        let ReadWarning::RelationshipCoverageMissing { detail, .. } = warning else {
-            panic!("expected the relationship coverage variant");
+        let toml = rift_core::Language {
+            name: "toml".to_owned(),
+            dialect: None,
         };
-        assert!(
-            detail.contains("the requested facet implements"),
-            "{detail}"
-        );
-        assert!(
-            detail.contains("outgoing relationships for toml"),
-            "{detail}"
+        assert_eq!(
+            super::relationship_coverage_warning(
+                vec![RelationshipFacet::Implements],
+                Some(toml.clone())
+            ),
+            Some(ReadWarning::RelationshipCoverageMissing {
+                facets: vec![RelationshipFacet::Implements],
+                language: Some(toml),
+                detail: "no provider populates the requested facet implements, so the walk \
+                         followed no edge under it; no provider populates outgoing \
+                         relationships for toml, so the walk followed no edge from a \
+                         declaration in it"
+                    .to_owned(),
+            })
         );
     }
 
@@ -1269,17 +1252,41 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// One TOML declaration and nothing else: no shipped provider supplies name-binding
+    /// facts for TOML, so the index carries no relationship coverage for it.
+    fn toml_fixture() -> TestResult<(TempDir, ReadService)> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("settings.toml"), "beacon = 7\n")?;
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let text = rift_core::TextFileInclusion::default();
+        let history = HistoryConfiguration::default();
+        let service = ReadService::build(directory.path(), limits, &visibility, &text, history)?;
+        Ok((directory, service))
+    }
+
+    /// The one `relationship_coverage_missing` warning `result` carries, or `None` when it
+    /// carries no warning at all or more than one.
+    fn coverage_warning(result: &SearchResult) -> Option<&ReadWarning> {
+        result
+            .warnings
+            .first()
+            .filter(|_| result.warnings.len() == 1)
+            .filter(|warning| matches!(warning, ReadWarning::RelationshipCoverageMissing { .. }))
+    }
+
     /// An empty answer over a produced facet stays bare, so the warning keeps naming an
     /// absent provider alone.
     #[test]
     fn search_traversal_over_a_produced_facet_carries_no_coverage_warning() -> TestResult {
         let (_directory, service) = live_call_graph_fixture()?;
-        let params: SearchParams = serde_json::from_value(json!({
+        let request = json!({
             "traversal": {
                 "seed": "rift://symbol/rust/lib.rs/root",
                 "facets": ["calls"]
             }
-        }))?;
+        });
+        let params: SearchParams = serde_json::from_value(request)?;
         let result = service.search(&params, &[])?;
         assert!(!result.results.is_empty(), "{:#?}", result.results);
         assert!(result.warnings.is_empty(), "{:#?}", result.warnings);
@@ -1292,67 +1299,49 @@ pub(crate) mod tests {
     fn search_traversal_over_an_unproduced_facet_warns_relationship_coverage_missing() -> TestResult
     {
         let (_directory, service) = live_call_graph_fixture()?;
-        let params: SearchParams = serde_json::from_value(json!({
+        let request = json!({
             "traversal": {
                 "seed": "rift://symbol/rust/lib.rs/root",
                 "facets": ["implements", "calls"]
             }
-        }))?;
+        });
+        let params: SearchParams = serde_json::from_value(request)?;
         let result = service.search(&params, &[])?;
-        let [
-            ReadWarning::RelationshipCoverageMissing {
-                facets,
-                language,
-                detail,
-            },
-        ] = result.warnings.as_slice()
-        else {
-            panic!("expected one coverage warning: {:#?}", result.warnings);
-        };
-        assert_eq!(facets, &[RelationshipFacet::Implements]);
-        assert_eq!(language, &None);
-        assert!(detail.contains("implements"), "{detail}");
+        assert!(
+            coverage_warning(&result).is_some_and(|warning| matches!(
+                warning,
+                ReadWarning::RelationshipCoverageMissing { facets, language, .. }
+                    if *facets == [RelationshipFacet::Implements] && language.is_none()
+            )),
+            "{:#?}",
+            result.warnings
+        );
         Ok(())
     }
 
-    /// A TOML workspace: no provider supplies name-binding facts for it, so an outgoing
-    /// walk from one of its declarations has no provider and says so.
+    /// An outgoing walk from a TOML declaration has no provider at all, so the answer names
+    /// the language rather than leaving an empty result set to read as an absent neighbor.
     #[test]
     fn search_traversal_from_a_language_with_no_binding_facts_warns_its_language() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("settings.toml"), "beacon = 7\n")?;
-        let service = ReadService::build(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::default(),
-            HistoryConfiguration::default(),
-        )?;
-        let params: SearchParams = serde_json::from_value(json!({
+        let (_directory, service) = toml_fixture()?;
+        let request = json!({
             "traversal": {
                 "seed": "rift://symbol/toml/settings.toml/beacon"
             }
-        }))?;
+        });
+        let params: SearchParams = serde_json::from_value(request)?;
         let result = service.search(&params, &[])?;
         assert!(result.results.is_empty(), "{:#?}", result.results);
-        let [
-            ReadWarning::RelationshipCoverageMissing {
-                facets,
-                language,
-                detail,
-            },
-        ] = result.warnings.as_slice()
-        else {
-            panic!("expected one coverage warning: {:#?}", result.warnings);
-        };
-        assert!(facets.is_empty(), "{facets:?}");
-        assert_eq!(
-            language.as_ref().map(rift_core::Language::identity_segment),
-            Some("toml".to_owned())
-        );
         assert!(
-            detail.contains("outgoing relationships for toml"),
-            "{detail}"
+            coverage_warning(&result).is_some_and(|warning| matches!(
+                warning,
+                ReadWarning::RelationshipCoverageMissing { facets, language, detail }
+                    if facets.is_empty()
+                        && language.as_ref().is_some_and(|named| named.name == "toml")
+                        && detail.contains("outgoing relationships for toml")
+            )),
+            "{:#?}",
+            result.warnings
         );
         Ok(())
     }
@@ -1361,21 +1350,14 @@ pub(crate) mod tests {
     /// answers incoming references, and this lane cannot ask whether one is configured.
     #[test]
     fn search_traversal_incoming_from_that_language_carries_no_language_warning() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("settings.toml"), "beacon = 7\n")?;
-        let service = ReadService::build(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::default(),
-            HistoryConfiguration::default(),
-        )?;
-        let params: SearchParams = serde_json::from_value(json!({
+        let (_directory, service) = toml_fixture()?;
+        let request = json!({
             "traversal": {
                 "seed": "rift://symbol/toml/settings.toml/beacon",
                 "direction": "incoming"
             }
-        }))?;
+        });
+        let params: SearchParams = serde_json::from_value(request)?;
         let result = service.search(&params, &[])?;
         assert!(result.warnings.is_empty(), "{:#?}", result.warnings);
         Ok(())
@@ -1384,11 +1366,12 @@ pub(crate) mod tests {
     #[test]
     fn search_traversal_refuses_capability_unavailable_when_binding_is_disabled() -> TestResult {
         let (_directory, service) = binding_disabled_fixture()?;
-        let params: SearchParams = serde_json::from_value(json!({
+        let request = json!({
             "traversal": {
                 "seed": "rift://symbol/rust/lib.rs/beacon"
             }
-        }))?;
+        });
+        let params: SearchParams = serde_json::from_value(request)?;
         let error = service
             .search(&params, &[])
             .expect_err("a disabled binding provider must refuse the traversal lane");
