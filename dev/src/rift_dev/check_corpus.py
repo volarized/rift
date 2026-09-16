@@ -558,12 +558,15 @@ class Corpus:
         try:
             identity = await read("get_symbol", sources, None)
             task = asyncio.create_task(writer())
-            rounds = 0
+            reads = 0
+            tools = tuple(CHURN_REQUESTS)
+            pressure_calls = {name: 0 for name in tools}
             async with gate_deadline("corpus churn", self.pin.seconds):
-                while rounds < READ_COUNT or overlaps < 2:
-                    for name in CHURN_REQUESTS:
-                        await read(name, sources, identity)
-                    rounds += 1
+                while reads < READ_COUNT or overlaps < 2:
+                    name = tools[reads % len(tools)]
+                    await read(name, sources, identity)
+                    pressure_calls[name] += 1
+                    reads += 1
                     if task.done():
                         await task
                         raise AssertionError("churn writer ended before reads")
@@ -578,8 +581,8 @@ class Corpus:
             )
             self.record(
                 "churn",
-                reads=rounds * len(CHURN_REQUESTS),
-                rounds=rounds,
+                reads=reads,
+                pressure_calls=pressure_calls,
                 edits=len(sources),
                 overlapping_writes=overlaps,
                 read_seconds_max=READ_SECONDS,

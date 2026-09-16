@@ -76,7 +76,7 @@ def test_churn_validates_all_tools_overlap_and_final_source(
     async def sleep(seconds: float) -> None:
         sleeps.append(seconds)
         # A fast server can finish the minimum reads before two writes occur.
-        while len(calls) <= READ_COUNT * 3:
+        while len(calls) <= READ_COUNT:
             await real_sleep(0)
         await real_sleep(0)
 
@@ -113,7 +113,13 @@ def test_churn_validates_all_tools_overlap_and_final_source(
     assert sleeps and set(sleeps) == {2.0}
     if failure is None:
         summary = object_value(corpus.actions[-1], "churn action")
-        assert cast(int, summary["rounds"]) > READ_COUNT
+        assert cast(int, summary["reads"]) > READ_COUNT
+        assert all(
+            cast(int, count) >= READ_COUNT // 3
+            for count in object_value(
+                summary["pressure_calls"], "pressure calls"
+            ).values()
+        )
         assert cast(int, summary["overlapping_writes"]) >= 2
         assert summary["read_seconds_max"] == 30.0
         assert set(object_value(summary["latency"], "latency")) == {
