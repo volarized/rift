@@ -247,7 +247,7 @@ pub(crate) enum SymbolState {
 
 /// The byte regions the classifier compares between two adjacent states of
 /// one declaration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub(crate) struct SymbolShape {
     /// The declaration bytes outside the item node: attached outer
     /// attributes and doc comments.
@@ -261,7 +261,7 @@ pub(crate) struct SymbolShape {
 
 impl SymbolShape {
     /// Cuts one declaration's compared regions out of its file source.
-    fn from_source(source: &str, symbol: &SyntaxSymbol) -> Self {
+    pub(crate) fn from_source(source: &str, symbol: &SyntaxSymbol) -> Self {
         let mut attachment =
             clipped(source, symbol.range.start, symbol.item_range.start).to_owned();
         attachment.push_str(clipped(source, symbol.item_range.end, symbol.range.end));

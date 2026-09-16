@@ -505,7 +505,7 @@ fn merge_traversal_hit(
     let mut hit = build_symbol_hit(
         index,
         matched,
-        traversal_hit_score(distance),
+        Some(traversal_hit_score(distance)),
         vec![MatchedField::Relationship],
         payloads,
     )?;
