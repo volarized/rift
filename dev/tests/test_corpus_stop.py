@@ -7,9 +7,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from check_corpus import Corpus
-from corpus_cache import pins
-from rift_test_client import Client, JsonObject, Server, object_value
+from rift_dev.check_corpus import Corpus
+from rift_dev.corpus_cache import pins
+from rift_dev.rift_test_client import Client, JsonObject, Server, object_value
 
 
 @pytest.mark.parametrize("operation", ["rebuild", "history"])
@@ -32,7 +32,7 @@ def test_stop_observes_active_work_while_log_writes_are_pending(
             output += started
             if completed:
                 output += (
-                    'INFO index.build{epoch=1}: rift_mcp::validation: close\n'
+                    "INFO index.build{epoch=1}: rift_mcp::validation: close\n"
                     if operation == "rebuild"
                     else 'DEBUG get_symbol{phase="history"}: rift_server::history: close\n'
                 )

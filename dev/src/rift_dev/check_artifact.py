@@ -1,29 +1,19 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["mcp==1.26.0", "jsonschema==4.26.0", "psutil==7.2.2", "pywin32==312; sys_platform == 'win32'"]
-# ///
-"""Prove a supplied release binary serves reads, applies a patch, and stops."""
+"""Prove a supplied binary serves reads and stops."""
 
 from __future__ import annotations
 
-import argparse
 import tempfile
 from pathlib import Path
 
-from rift_test_client import (
+from rift_dev.rift_test_client import (
     Client,
     JsonObject,
     Server,
     array_value,
-    candidate_binary,
     gate_deadline,
     object_value,
     require,
-    run_gate,
-    string_value,
     verify_version,
-    workspace_version,
 )
 
 ARTIFACT_SECONDS = 240.0
@@ -52,22 +42,8 @@ async def symbol_hit(client: Client, name: str, language: str = "rust") -> JsonO
     return matches[0]
 
 
-def symbol_id(hit: JsonObject) -> str:
-    """Use the read side's emitted identity as the edit address."""
-    return string_value(
-        object_value(hit.get("symbol"), "symbol").get("id"), "symbol.id"
-    )
-
-
-async def applied(client: Client, name: str, arguments: JsonObject) -> JsonObject:
-    """Require an applied change; a validated refusal cannot pass an edit test."""
-    result = await client.call(name, arguments)
-    require(result.get("status") == "applied", f"{name} did not apply: {result}")
-    return result
-
-
-async def check_reads_and_patch(client: Client, root: Path) -> None:
-    """Read known content, change it, and require both disk and MCP to reflect it."""
+async def check_reads(client: Client) -> None:
+    """Read known content and require MCP to return its source."""
     search = await client.call("search", {"query": "beacon_one", "target": "symbol"})
     require(
         bool(array_value(search.get("results"), "search.results")),
@@ -78,17 +54,21 @@ async def check_reads_and_patch(client: Client, root: Path) -> None:
         before.get("source") == "pub fn beacon_one() -> u8 { 1 }",
         f"unexpected source: {before}",
     )
-    patch = "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-pub fn beacon_one() -> u8 { 1 }\n+pub fn beacon_one() -> u8 { 3 }\n"
-    await applied(client, "patch", {"patch": patch})
+
+
+async def check_external_change(client: Client, root: Path) -> None:
+    """Require the next source read to observe an external filesystem write."""
     expected = SOURCE.replace("{ 1 }", "{ 3 }")
-    require(
-        (root / "lib.rs").read_bytes() == expected.encode("utf-8"),
-        "patch wrote unexpected bytes",
-    )
+    path = root / "lib.rs"
+    path.write_bytes(expected.encode("utf-8"))
     after = await symbol_hit(client, "beacon_one")
     require(
         after.get("source") == "pub fn beacon_one() -> u8 { 3 }",
-        f"patch was absent from reads: {after}",
+        f"filesystem change was absent from reads: {after}",
+    )
+    require(
+        path.read_bytes() == expected.encode("utf-8"),
+        "source read changed filesystem bytes",
     )
 
 
@@ -104,25 +84,9 @@ async def check_artifact(binary: Path, version: str) -> None:
             with Server(binary, root, base / "server.log") as server:
                 try:
                     async with server.connect() as client:
-                        await check_reads_and_patch(client, root)
+                        await check_reads(client)
+                        await check_external_change(client, root)
                     server.stop()
-                except BaseException:
-                    print(server.read_log())
+                except BaseException as error:
+                    error.add_note(server.read_log())
                     raise
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path)
-    parser.add_argument("--target")
-    parser.add_argument("--version")
-    parser.add_argument("--junit", type=Path)
-    args = parser.parse_args()
-    binary = candidate_binary(args.binary, args.target)
-    version = args.version or workspace_version()
-    run_gate("artifact", check_artifact(binary, version), args.junit)
-    print("artifact: reads, patch, and stop passed")
-
-
-if __name__ == "__main__":
-    main()

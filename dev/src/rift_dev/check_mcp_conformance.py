@@ -1,8 +1,3 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.10"
-# dependencies = []
-# ///
 """Run the MCP conformance suite against a live rift server.
 
 The runner is `@modelcontextprotocol/conformance`, pinned in
@@ -22,23 +17,20 @@ of this repository and leaves nothing behind.
 
 Usage:
 
-    uv run --script scripts/check_mcp_conformance.py [--binary path/to/rift]
+    uv run --project dev rift-dev conformance [--binary path/to/rift]
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import signal
 import subprocess
-import sys
 import tempfile
 import time
-from collections.abc import Sequence
 from pathlib import Path
 
-REPOSITORY = Path(__file__).resolve().parent.parent
+REPOSITORY = Path(__file__).resolve().parents[3]
 TOOL_DIRECTORY = REPOSITORY / "tools" / "mcp-conformance"
 EXPECTED_FAILURES = TOOL_DIRECTORY / "expected-failures.yml"
 
@@ -196,10 +188,7 @@ def stop_server(server: subprocess.Popen[bytes]) -> None:
     except subprocess.TimeoutExpired:
         pass
     end_group(server, getattr(signal, "SIGKILL", signal.SIGTERM))
-    try:
-        server.wait(timeout=STOP_SECONDS_MAX)
-    except subprocess.TimeoutExpired:
-        print("warning: the server outlasted its stop", file=sys.stderr)
+    server.wait(timeout=STOP_SECONDS_MAX)
 
 
 def end_group(server: subprocess.Popen[bytes], number: int) -> None:
@@ -244,13 +233,8 @@ def run_suite(port: int) -> int:
     return completed.returncode
 
 
-def main(arguments: Sequence[str] | None = None) -> int:
+def main(supplied: Path | None = None) -> int:
     """Serve one throwaway workspace and score it against the baseline."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--binary", type=Path, help="Use this supplied binary without building"
-    )
-    supplied: Path | None = parser.parse_args(arguments).binary
     binary = supplied.resolve() if supplied is not None else build_server_binary()
     if not binary.is_file():
         raise RuntimeError(f"conformance binary does not exist: {binary}")
@@ -273,11 +257,3 @@ def main(arguments: Sequence[str] | None = None) -> int:
             return run_suite(port)
         finally:
             stop_server(server)
-
-
-if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except (RuntimeError, subprocess.SubprocessError) as failure:
-        print(f"error: {failure}", file=sys.stderr)
-        raise SystemExit(1) from failure

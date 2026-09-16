@@ -7,8 +7,8 @@ import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-import check_coldstart
 import pytest
+from rift_dev import check_coldstart
 
 
 def test_failed_container_start_still_attempts_cleanup(
@@ -51,8 +51,7 @@ def test_expired_gate_still_removes_container(
     from types import SimpleNamespace
     from unittest.mock import Mock
 
-    import release_process
-    import rift_test_client
+    from rift_dev import release_process, rift_test_client
 
     binary = tmp_path / "rift"
     binary.write_bytes(b"\x7fELFbinary")
@@ -93,7 +92,7 @@ def test_stop_waits_for_delayed_process_exit_and_status(
     import threading
     import time
 
-    from release_process import owned_process, run
+    from rift_dev.release_process import owned_process, run
 
     request = tmp_path / "stop.request"
     status = tmp_path / "server.exit"
