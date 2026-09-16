@@ -558,7 +558,10 @@ refuses `resource_not_found`.
 
 A `traversal` riding beside `change` starts its walk at every changed declaration instead of at
 one named `seed`. The block keeps its `direction`, `facets`, `depth`, and `to`; it names no
-`seed`, and the server refuses one beside `change` with `invalid_request` naming the field.
+`seed`, and the server refuses one beside `change` with `invalid_request` naming the field. A
+workspace whose binding provider never built a relationship graph refuses
+`capability_unavailable` naming `relationship traversal (providers.binding disabled)`, the same
+way it refuses a walk standing alone.
 
 Each declaration the walk reaches becomes a hit tagged `matched_by: ["relationship"]`, carrying
 `distance` and the `traversal_path` a seeded walk's hit carries. The changed declaration the
@@ -626,7 +629,7 @@ language answers for them.
 
 One walk budget covers every starting declaration, so the symbols one comparison's walk
 discovers keep the same node bound a seeded walk keeps rather than that bound per changed
-declaration. A walk the server stops at it attaches one `traversal_truncated` entry to
+declaration. A walk the server stops at that bound attaches one `traversal_truncated` entry to
 `warnings` however many declarations changed. The result set keeps its own bound and its
 `results_truncated` warning.
 
