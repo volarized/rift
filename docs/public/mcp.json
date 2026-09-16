@@ -759,6 +759,33 @@
               },
               {
                 "additionalProperties": false,
+                "description": "The comparison reached `paths_max` changed paths and stopped there, so declarations\nin the changed paths past it are missing from this answer. Narrow the comparison\nwith `paths`, or name two revisions that differ in fewer files.",
+                "properties": {
+                  "code": {
+                    "const": "change_truncated",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "paths_max": {
+                    "description": "Changed paths the comparison stopped at, equal to the bound it reached.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "paths_max",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "Cataloged packages with a source root are still being indexed, so a `dependencies`\nor `all` answer holds their declarations only once the index reaches them. The\nanswer is served from the packages indexed so far. Rides only an answer whose\n`scope` reaches dependencies.",
                 "properties": {
                   "code": {
@@ -2511,6 +2538,33 @@
               },
               {
                 "additionalProperties": false,
+                "description": "The comparison reached `paths_max` changed paths and stopped there, so declarations\nin the changed paths past it are missing from this answer. Narrow the comparison\nwith `paths`, or name two revisions that differ in fewer files.",
+                "properties": {
+                  "code": {
+                    "const": "change_truncated",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "paths_max": {
+                    "description": "Changed paths the comparison stopped at, equal to the bound it reached.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "paths_max",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "Cataloged packages with a source root are still being indexed, so a `dependencies`\nor `all` answer holds their declarations only once the index reaches them. The\nanswer is served from the packages indexed so far. Rides only an answer whose\n`scope` reaches dependencies.",
                 "properties": {
                   "code": {
@@ -2934,7 +2988,7 @@
       }
     },
     {
-      "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies, and by a\nbounded relationship `traversal` from one seed symbol. `rev` searches a\nversion-control revision instead of the current tree, and never combines with\n`traversal`. `scope` reaches past the project tree: `dependencies` answers `query`\nfrom the public declarations of the cataloged packages alone, `all` from both,\nordered together. Use `get_symbol` when the declaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the search index's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate ranked units against one snapshot and merge them into\nresults computed from another.",
+      "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies, and by a\nbounded relationship `traversal` from one seed symbol. `change` answers the\ndeclarations two committed revisions hold differently, in place of `query` and\n`traversal`. `rev` searches a version-control revision instead of the current tree,\nand never combines with `traversal` or `change`. `scope` reaches past the project\ntree: `dependencies` answers `query` from the public declarations of the cataloged\npackages alone, `all` from both, ordered together. Use `get_symbol` when the\ndeclaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the search index's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate ranked units against one snapshot and merge them into\nresults computed from another.",
       "input_schema": {
         "$defs": {
           "PathPattern": {
@@ -3154,6 +3208,25 @@
             "pattern": "^[A-Za-z0-9._/-]{1,128}$",
             "type": "string"
           },
+          "SearchChange": {
+            "additionalProperties": false,
+            "description": "Two committed revisions to compare. The answer is the declarations the two revisions\nhold differently: `base` is the revision compared from, `head` the revision compared\nto. Both sides name a commit; uncommitted working-tree bytes take part in no\ncomparison.",
+            "properties": {
+              "base": {
+                "$ref": "#/$defs/RevisionId",
+                "description": "The revision compared from - a branch, tag, or commit id as the workspace's version\ncontrol spells it."
+              },
+              "head": {
+                "$ref": "#/$defs/RevisionId",
+                "default": "HEAD",
+                "description": "The revision compared to, spelled the same way. Omitted, `HEAD`."
+              }
+            },
+            "required": [
+              "base"
+            ],
+            "type": "object"
+          },
           "SearchInclude": {
             "description": "Extra payload to attach to every hit. Every entry costs response bytes per hit, so the\ncaller requests only what it will read.",
             "oneOf": [
@@ -3288,6 +3361,28 @@
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
+        "allOf": [
+          {
+            "anyOf": [
+              {
+                "required": [
+                  "query"
+                ]
+              },
+              {
+                "required": [
+                  "traversal"
+                ]
+              },
+              {
+                "required": [
+                  "change"
+                ]
+              }
+            ],
+            "description": "a search selects its result set with query, traversal, or change"
+          }
+        ],
         "examples": [
           {
             "include": [
@@ -3334,6 +3429,17 @@
           }
         ],
         "properties": {
+          "change": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/SearchChange"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Two committed revisions to compare, standing alone. Every declaration the two\nrevisions hold differently becomes a hit tagged `change`, carrying a `change` block\nthat names what differs and where the declaration lives on each side.\n`target: \"file\"` never carries a change hit, since the comparison reaches\ndeclarations alone, and `relevance` orders the hits by path, then name. `paths`\nnarrows which changed paths are compared. The server refuses `change` beside `rev`,\nsince `change` names its own revisions; beside `query`, since the two select\ndifferent result sets; beside `traversal`; and beside a `scope` past `project`."
+          },
           "include": {
             "description": "Extra payload to attach to every hit. Every entry costs response bytes per hit, so\nthe caller requests only what it will read.",
             "items": {
@@ -3594,6 +3700,11 @@
               {
                 "const": "relationship",
                 "description": "A relationship traversal reached the hit.",
+                "type": "string"
+              },
+              {
+                "const": "change",
+                "description": "A comparison of two committed revisions found the declaration changed.",
                 "type": "string"
               }
             ]
@@ -4012,6 +4123,33 @@
               },
               {
                 "additionalProperties": false,
+                "description": "The comparison reached `paths_max` changed paths and stopped there, so declarations\nin the changed paths past it are missing from this answer. Narrow the comparison\nwith `paths`, or name two revisions that differ in fewer files.",
+                "properties": {
+                  "code": {
+                    "const": "change_truncated",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "paths_max": {
+                    "description": "Changed paths the comparison stopped at, equal to the bound it reached.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "paths_max",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "Cataloged packages with a source root are still being indexed, so a `dependencies`\nor `all` answer holds their declarations only once the index reaches them. The\nanswer is served from the packages indexed so far. Rides only an answer whose\n`scope` reaches dependencies.",
                 "properties": {
                   "code": {
@@ -4369,6 +4507,17 @@
             ],
             "description": "One search hit. Its file, node, or symbol payload carries the canonical identity.\nDependency and synthetic symbols can have no readable source; node and file hits cannot.",
             "properties": {
+              "change": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/SymbolChange"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "How the declaration differs between the two revisions `change` named, present when\nthe comparison produced this hit. The hit's `hit.symbol`, `path`, `range`, `line`,\nand `source` read the head revision, except for a removed declaration, which keeps\nits base-side identity, path, range, and source - the head revision no longer holds\nit. A change hit carries no `score`, since a comparison ranks nothing."
+              },
               "distance": {
                 "description": "Number of edges in `traversal_path`. It is present exactly when `traversal_path` is\npresent and equals its length.",
                 "format": "uint64",
@@ -4805,6 +4954,42 @@
             ],
             "type": "object"
           },
+          "SymbolChange": {
+            "additionalProperties": false,
+            "description": "How one declaration differs between the two compared revisions, and where it lives on\neach side.",
+            "properties": {
+              "base_path": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ProjectPath"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Where the declaration lived at the base revision. Absent for a declaration the head\nrevision introduced."
+              },
+              "head_path": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ProjectPath"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Where the declaration lives at the head revision. Absent for a declaration the head\nrevision removed."
+              },
+              "kind": {
+                "$ref": "#/$defs/SymbolVersionKind",
+                "description": "What the head revision did to the declaration."
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
           "SymbolFacet": {
             "description": "One portable category a symbol falls into. Kinds are language-specific; facets are\nshared, so a filter written once applies to every served language.",
             "oneOf": [
@@ -5005,6 +5190,41 @@
               "source_kind"
             ],
             "type": "object"
+          },
+          "SymbolVersionKind": {
+            "description": "What the revision did to the symbol.",
+            "oneOf": [
+              {
+                "const": "introduced",
+                "description": "The revision brought the symbol into existence.",
+                "type": "string"
+              },
+              {
+                "const": "body_changed",
+                "description": "The revision changed the implementation without touching the signature.",
+                "type": "string"
+              },
+              {
+                "const": "signature_changed",
+                "description": "The revision changed the declared interface.",
+                "type": "string"
+              },
+              {
+                "const": "moved",
+                "description": "The revision relocated the declaration to another path.",
+                "type": "string"
+              },
+              {
+                "const": "removed",
+                "description": "The revision deleted the declaration.",
+                "type": "string"
+              },
+              {
+                "const": "decorators_changed",
+                "description": "The revision changed the annotations on the declaration.",
+                "type": "string"
+              }
+            ]
           },
           "TextRange": {
             "additionalProperties": false,

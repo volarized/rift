@@ -84,6 +84,10 @@ name = "schema_export"
 path = "tests/schema_export.rs"
 
 [[test]]
+name = "search_change"
+path = "tests/search_change.rs"
+
+[[test]]
 name = "search_traversal"
 path = "tests/search_traversal.rs"
 
