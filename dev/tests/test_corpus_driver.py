@@ -103,3 +103,48 @@ def test_churn_write_failure_prevents_first_read(tmp_path: Path) -> None:
     with pytest.raises(IsADirectoryError):
         asyncio.run(corpus.churn(cast(Client, client)))
     client.call.assert_not_awaited()
+
+
+@pytest.mark.parametrize("returned_identity", ["sample", "different"])
+def test_sampled_symbol_must_resolve_through_nodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, returned_identity: str
+) -> None:
+    from rift_dev import check_corpus
+
+    monkeypatch.setattr(check_corpus, "SYMBOL_COUNT", 1)
+    source = "def sample(): pass\n"
+    (tmp_path / "source.py").write_text(source)
+    corpus = Corpus(pins()["fastapi"], tmp_path / "rift", tmp_path / "report.json")
+    corpus.root = tmp_path
+    hit: JsonObject = {
+        "hit": {"symbol": {"id": "sample", "language": "python"}},
+        "path": "source.py",
+        "range": {"start": 0, "end": len(source.encode())},
+    }
+    client = AsyncMock(spec=Client)
+    client.resource.return_value = {
+        "languages": [
+            {
+                "language": "python",
+                "enabled": True,
+                "syntax": True,
+                "include": ["**/*.py"],
+            }
+        ],
+    }
+
+    async def call(name: str, arguments: JsonObject) -> JsonObject:
+        if name == "search":
+            return {"results": [hit], "warnings": []}
+        assert name == "nodes"
+        assert arguments == {"path": "source.py", "position": 0}
+        return {"nodes": [{"symbol": returned_identity}]}
+
+    client.call.side_effect = call
+    with (
+        pytest.raises(AssertionError, match="omitted sampled declaration")
+        if returned_identity != "sample"
+        else nullcontext()
+    ):
+        asyncio.run(corpus.symbols(cast(Client, client), [hit]))
+    assert (tmp_path / "source.py").read_text() == source
