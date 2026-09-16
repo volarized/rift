@@ -4,14 +4,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use lsp_types::{Location, Position};
 use rift_core::{ProjectPath, SymbolId as CoreSymbolId};
-use rift_index::IndexedFile;
+use rift_index::{IndexedFile, RelationshipStore};
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::position::LineIndex;
 use rift_lsp::session::{EngineError, EngineFault, EngineSession};
 use rift_lsp::uri::{TreeRoot, UriFault};
 use rift_protocol::read::{
     ExactKind, Extensions, GraphHop, HopDirection, Relationship, RelationshipDerivation,
-    RelationshipFacet, SearchParams, SearchParamsTarget, SymbolId, TraversalDirection,
+    RelationshipFacet, SearchParams, SearchParamsTarget, SearchTraversal, SymbolId,
+    TraversalDirection,
 };
 use rift_syntax::SyntaxSymbol;
 
@@ -68,6 +69,92 @@ impl EngineReferences {
     }
 }
 
+/// Whether this search can request references from a configured language engine.
+///
+/// The indexed walk includes intermediate declarations that a depth-two traversal can
+/// reach before its first engine request. No engine starts during this check.
+///
+/// # Errors
+///
+/// Returns the same request validation errors as the reference resolver.
+pub fn uses_engine_references(
+    reads: &ReadService,
+    engines: &EnginePool,
+    params: &SearchParams,
+) -> Result<bool, ReadError> {
+    reads.validate_engine_search(params)?;
+    let Some(traversal) = reference_traversal(params) else {
+        return Ok(false);
+    };
+    validate_traversal(traversal)?;
+    let seed = CoreSymbolId::new(traversal.seed.0.clone())
+        .map_err(|_| ReadFault::invalid("traversal.seed", "not a symbol identity"))?;
+    Ok(reachable_reference_source(
+        reads.relationships(),
+        &seed,
+        traversal,
+        |identity| reference_source(reads, engines, identity).is_some(),
+    ))
+}
+
+fn reachable_reference_source(
+    store: &RelationshipStore,
+    seed: &CoreSymbolId,
+    traversal: &SearchTraversal,
+    has_source: impl Fn(&CoreSymbolId) -> bool,
+) -> bool {
+    if has_source(seed) {
+        return true;
+    }
+    if traversal.depth == 1 {
+        return false;
+    }
+    let mut prior = traversal.clone();
+    prior.depth -= 1;
+    walk_traversal_with_references(
+        store,
+        seed,
+        &prior,
+        TRAVERSAL_NODES_MAX,
+        &EngineReferences::default(),
+    )
+    .discovered
+    .into_iter()
+    .any(|(identity, _)| has_source(&identity))
+}
+
+fn reference_traversal(params: &SearchParams) -> Option<&SearchTraversal> {
+    params.traversal.as_ref().filter(|traversal| {
+        let current = params.rev.is_none();
+        let symbols = matches!(
+            params.target,
+            SearchParamsTarget::All | SearchParamsTarget::Symbol
+        );
+        let incoming = matches!(
+            traversal.direction,
+            TraversalDirection::Incoming | TraversalDirection::Both
+        );
+        let references = traversal.facets.is_empty()
+            || traversal.facets.contains(&RelationshipFacet::References);
+        current && symbols && incoming && references
+    })
+}
+
+fn reference_source<'source>(
+    reads: &'source ReadService,
+    engines: &'source EnginePool,
+    identity: &CoreSymbolId,
+) -> Option<(
+    &'source EngineSlot,
+    &'source IndexedFile,
+    &'source SyntaxSymbol,
+)> {
+    let (file, symbol) = resolve_graph_symbol(reads.index(), identity)?;
+    symbol.name_range?;
+    let slot = engines.engine_for(file.syntax().language())?;
+    Some((slot, file, symbol))
+}
+
 /// Resolves incoming references while retaining every indexed relationship.
 ///
 /// Only current-tree symbol traversals with the `references` facet consult engines.
@@ -89,21 +176,10 @@ pub async fn resolve_engine_references(
     engines: &EnginePool,
     params: &SearchParams,
 ) -> Result<EngineReferences, ReadError> {
-    reads.validate_engine_search(params)?;
-    let Some(traversal) = params.traversal.as_ref().filter(|traversal| {
-        let current = params.rev.is_none();
-        let symbols = matches!(
-            params.target,
-            SearchParamsTarget::All | SearchParamsTarget::Symbol
-        );
-        let incoming = matches!(
-            traversal.direction,
-            TraversalDirection::Incoming | TraversalDirection::Both
-        );
-        let references = traversal.facets.is_empty()
-            || traversal.facets.contains(&RelationshipFacet::References);
-        current && symbols && incoming && references
-    }) else {
+    if !uses_engine_references(reads, engines, params)? {
+        return Ok(EngineReferences::default());
+    }
+    let Some(traversal) = reference_traversal(params) else {
         return Ok(EngineReferences::default());
     };
     validate_traversal(traversal)?;
@@ -169,15 +245,9 @@ async fn resolve_symbol_references(
     engines: &EnginePool,
     identity: &CoreSymbolId,
 ) -> Result<Option<Vec<GraphHop>>, ReadError> {
-    let Some((file, symbol)) = resolve_graph_symbol(reads.index(), identity) else {
+    let Some((slot, file, symbol)) = reference_source(reads, engines, identity) else {
         return Ok(None);
     };
-    let Some(slot) = engines.engine_for(file.syntax().language()) else {
-        return Ok(None);
-    };
-    if symbol.name_range.is_none() {
-        return Ok(None);
-    }
     let target = ReferenceTarget::new(slot.workspace_root(), reads.index().root(), file, symbol)?;
     let report = match references_on_engine(slot, &target).await {
         Ok(report) => report,
@@ -606,6 +676,7 @@ mod tests {
         let reads = reads(directory.path())?;
         let params = request(&symbol(&reads, "beacon"));
         let engines = EnginePool::new(directory.path(), BTreeMap::new(), BTreeMap::new());
+        assert!(!super::uses_engine_references(&reads, &engines, &params)?);
         let references = resolve_engine_references(&reads, &engines, &params).await?;
         assert!(references.is_empty());
         assert_eq!(
@@ -793,6 +864,57 @@ mod tests {
                 .results
                 .is_empty()
         );
+        Ok(())
+    }
+    #[test]
+    fn engine_eligibility_preserves_indexed_only_searches() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let reads = reads(directory.path())?;
+        let configuration = serde_json::from_value(json!({"command":"/refused-engine"}))?;
+        let engines = pool(directory.path(), "rust", configuration);
+        let base = request(&symbol(&reads, "beacon"));
+        assert!(super::uses_engine_references(&reads, &engines, &base)?);
+        let mut outgoing = base.clone();
+        outgoing.traversal.as_mut().expect("traversal").direction =
+            rift_protocol::read::TraversalDirection::Outgoing;
+        let mut calls = base.clone();
+        calls.traversal.as_mut().expect("traversal").facets =
+            vec![rift_protocol::read::RelationshipFacet::Calls];
+        let mut files = base;
+        files.target = rift_protocol::read::SearchParamsTarget::File;
+        for params in [outgoing, calls, files] {
+            assert!(!super::uses_engine_references(&reads, &engines, &params)?);
+        }
+        assert_eq!(
+            engines.state_for_key(&LspProcessKey::named("test")),
+            Some(rift_protocol::workspace::LspState::Stopped)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn depth_two_reaches_engine_configured_caller_of_unconfigured_seed() -> TestResult {
+        let store = crate::traversal::tests::call_graph_store();
+        let seed = rift_core::SymbolId::new("rift://symbol/rust/lib.rs/leaf")?;
+        let caller = rift_core::SymbolId::new("rift://symbol/rust/lib.rs/branch_a")?;
+        let mut traversal = request(&SymbolId(seed.as_str().to_owned()))
+            .traversal
+            .expect("traversal");
+        traversal.facets.clear();
+        let selected = |identity: &rift_core::SymbolId| identity == &caller;
+        assert!(!selected(&seed));
+        assert!(!super::reachable_reference_source(
+            &store, &seed, &traversal, selected
+        ));
+        traversal.depth = 2;
+        assert!(super::reachable_reference_source(
+            &store, &seed, &traversal, selected
+        ));
+        traversal.facets = vec![rift_protocol::read::RelationshipFacet::References];
+        assert!(!super::reachable_reference_source(
+            &store, &seed, &traversal, selected
+        ));
         Ok(())
     }
 }

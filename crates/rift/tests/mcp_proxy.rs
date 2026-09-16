@@ -452,7 +452,7 @@ async fn live_proxied_read_resolves_incoming_references() -> TestResult {
         .ok_or("search must return its results")?
         .iter()
         .find(|hit| hit["hit"]["symbol"]["name"] == "total")
-        .ok_or("incoming references must reach the caller")?;
+        .ok_or_else(|| format!("incoming references must reach the caller: {result:#}"))?;
     assert_eq!(caller["traversal_path"][0]["direction"], "incoming");
     assert_eq!(caller["traversal_path"][0]["relationship"]["to"], seed);
     assert_eq!(

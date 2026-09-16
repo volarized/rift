@@ -410,7 +410,7 @@ fn absorb_traversal_match(existing: &mut SearchHit, path: Vec<GraphHop>, distanc
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::error::Error;
     use std::fs;
     use std::sync::Arc;
@@ -567,7 +567,7 @@ mod tests {
     /// `root` calls `branch_a` and `branch_b`, each of which calls `leaf`; `root` also
     /// imports `helper` directly, so one hop from `root` mixes a `calls` pair with one
     /// `imports` edge.
-    fn call_graph_store() -> RelationshipStore {
+    pub(crate) fn call_graph_store() -> RelationshipStore {
         let contributions = vec![
             graph_definition("root", "rift://symbol/rust/lib.rs/root", (0, 40)),
             graph_definition("branch_a", "rift://symbol/rust/lib.rs/branch_a", (40, 80)),

@@ -16,7 +16,7 @@ pub use configuration::{
     CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, ConfigurationFault, load_configuration,
 };
 pub use engine::{EnginePool, EngineSlot, LspProcessKey};
-pub use engine_read::{EngineReferences, resolve_engine_references};
+pub use engine_read::{EngineReferences, resolve_engine_references, uses_engine_references};
 pub use read::{DependencyStore, ReadError, ReadFault, ReadService, wire_digest};
 pub use rift_core::CapturedStream;
 
