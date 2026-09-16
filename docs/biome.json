@@ -12,6 +12,7 @@
       "!**/.source",
       "!**/.next",
       "!**/bun.lock",
+      "!public/icons",
       "!public/schemas",
       "!public/rift.schema.json",
       "!public/mcp.json",
