@@ -312,15 +312,17 @@ fn binding_replaced(
     revisions: (ProviderRevision, SourceRevision, TreeRevision),
     publication_limits: PublicationLimits,
 ) -> Result<Option<PublicationSet>, WorkspaceSemanticError> {
-    let units = binding_units(documents, project_paths, limits)?;
-    if units.is_empty() {
-        return Ok(None);
-    }
-    let assembled: Vec<(SourceUnitId, ContributionOrigin, &UnitBindingFacts)> = units
-        .iter()
-        .map(|(unit, origin, facts)| (unit.clone(), origin.clone(), facts))
-        .collect();
-    let graph = assemble(&assembled, limits)?;
+    let graph = {
+        let units = binding_units(documents, project_paths, limits)?;
+        if units.is_empty() {
+            return Ok(None);
+        }
+        let assembled: Vec<(SourceUnitId, ContributionOrigin, &UnitBindingFacts)> = units
+            .iter()
+            .map(|(unit, origin, facts)| (unit.clone(), origin.clone(), facts))
+            .collect();
+        assemble(&assembled, limits)?
+    };
     let linked = LinkedGraph::link(&graph, limits)?;
     let resolutions = resolve_all(&linked, limits, &NeverCancelled)?;
     let (provider_revision, source_revision, tree_revision) = revisions;

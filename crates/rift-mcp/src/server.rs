@@ -546,21 +546,29 @@ const WARNING_DETAIL_BYTES_MAX: usize = 4096;
 /// Most moved paths one `stale_index` detail names before it counts the rest.
 const STALE_INDEX_PATHS_MAX: usize = 5;
 
-/// Publications a read waits for before it answers from the one it holds.
-///
-/// A workspace with a rebuild in flight lands it on the first of these, so a read that
-/// can answer for the tree as it stands still does. A workspace whose hook rewrites files
-/// with the bytes they already hold never lets the published and observed epochs meet,
-/// and this bound is what stops such a read from spending its whole readiness budget on a
-/// wait that cannot converge. A publication that never lands at all still parks the read
-/// until its readiness deadline, which is the refusal a stalled index owes its caller.
-const READ_PUBLICATION_WAITS_MAX: usize = 3;
+/// What a read must resolve before its next request-time capture.
+#[derive(Clone, Copy)]
+enum ReadWait {
+    /// The first capture checks content even when observations are ahead.
+    Capture,
+    /// Changed source waits for publication or a successful superseded capture.
+    Rebuild,
+    /// Changed configuration waits for acceptance and publication.
+    Configuration,
+}
 
 /// Why an answer is served from a publication the request-time capture found behind the
 /// tree.
 enum StaleIndexReason<'a> {
     /// The rebuild recorded past that publication failed.
     RebuildFailed(&'a RecordedRebuildFailure),
+    /// A successful capture after the publication was superseded by later changes.
+    RebuildSuperseded {
+        /// The successful candidate's filesystem epoch.
+        epoch: u64,
+        /// What this request's exact capture found ahead of the publication.
+        changes: &'a PathChanges,
+    },
     /// Every reconciliation attempt found the tree moved again, so the request never
     /// captured the tree the publication was built for.
     TreeKeptMoving {
@@ -581,6 +589,17 @@ impl StaleIndexReason<'_> {
         let served = served_from(index_tree_revision, captured_tree_revision, moved);
         let detail = match self {
             Self::RebuildFailed(failure) => failure.detail(&served),
+            Self::RebuildSuperseded { epoch, changes } => {
+                let found = moved_paths(changes).map_or_else(
+                    || "the configuration file moved".to_owned(),
+                    |named| format!("{named} moved"),
+                );
+                format!(
+                    "a successful index capture at epoch {epoch} was superseded before \
+                     publication; the request-time capture found {found}{served}; \
+                     the index supervisor keeps rebuilding the changed files"
+                )
+            }
             Self::TreeKeptMoving { changes } => {
                 let found = moved_paths(changes).map_or_else(
                     || "the configuration file moved".to_owned(),
@@ -735,17 +754,10 @@ enum CaptureMovement {
 }
 
 impl CaptureMovement {
-    /// Classifies `captured` against `published`: its recorded files path by path, and
-    /// the configuration file's state against the published one. Nothing when the
-    /// capture matches the publication.
-    fn between(
-        published: &PublishedWorkspace,
-        captured: &WorkspaceDigests,
-        configuration: ConfigurationFingerprint,
-    ) -> Option<Self> {
-        let recorded_files_moved =
-            !PathChanges::between(&published.reads.workspace_digests(), captured).is_empty();
-        let configuration_moved = published.configuration.fingerprint != configuration;
+    /// Classifies the request's already-computed path changes and configuration movement.
+    /// Nothing when its capture matches the publication.
+    fn from_changes(changes: &PathChanges, configuration_moved: bool) -> Option<Self> {
+        let recorded_files_moved = !changes.is_empty();
         match (recorded_files_moved, configuration_moved) {
             (true, false) => Some(Self::RecordedFiles),
             (false, true) => Some(Self::Configuration),
@@ -2093,8 +2105,8 @@ impl RiftMcp {
         let waited_ms = timeout.as_millis();
         if published == observed {
             return format!(
-                "the index settled at epoch {published} but the tree kept moving under the \
-                 request for {waited_ms}ms; read rift://logs for the rebuilds it made"
+                "the index settled at epoch {published}, but workspace validation did not finish \
+                 within {waited_ms}ms; read rift://logs for capture and rebuild records"
             );
         }
         format!(
@@ -2144,19 +2156,23 @@ impl RiftMcp {
     /// publication whenever the capture folds to its fingerprint under its configuration,
     /// whatever the epoch counter reads, while a change still waits for the two to agree.
     ///
-    /// The second is the attempt budget. A read that spends it answers from the
+    /// The second is the attempt budget. A successful superseded capture already proves
+    /// movement: a read checks the tree once and answers stale with that recorded epoch.
+    /// A read without that completed work that spends its capture budget answers from the
     /// publication the last attempt resolved and carries a `stale_index` warning naming
-    /// what that attempt's capture found ahead. Refusing instead leaves a workspace under
-    /// back-to-back rebuilds with no readable index at all, and the rebuild each attempt
-    /// asked for still publishes behind the answer.
+    /// what that attempt's capture found ahead. This keeps a workspace under back-to-back
+    /// rebuilds readable, and each attempt still asks for a rebuild. Configuration movement
+    /// waits for acceptance and publication before the next capture; the last capture
+    /// refuses if its configuration moved.
     async fn reconcile_workspace(
         &self,
         phase: wire::ErrorPhase,
     ) -> Result<ResolvedWorkspace, ErrorData> {
         let answers_stale = matches!(phase, wire::ErrorPhase::Read);
         let mut spent = None;
+        let mut wait = ReadWait::Capture;
         for _attempt in 0..INDEX_CAPTURE_ATTEMPTS_MAX {
-            let (current, rebuild_failure) = self.await_current_workspace(phase).await?;
+            let (current, rebuild_failure) = self.await_current_workspace(phase, wait).await?;
             let capture = self.capture_tree(&current).await;
             let (digests, configuration_fingerprint) = match capture {
                 Ok(capture) => capture,
@@ -2174,37 +2190,64 @@ impl RiftMcp {
                 current.configuration.accepted(phase)?;
                 return Ok(ResolvedWorkspace::current(current));
             }
+            let changes = PathChanges::between(&current.reads.workspace_digests(), &digests);
+            let moved = CaptureMovement::from_changes(&changes, !configuration_matches);
             if let Some(failure) = rebuild_failure {
                 current.configuration.accepted(phase)?;
-                let stale = CaptureMovement::between(&current, &digests, configuration_fingerprint)
-                    .map(|moved| failure.stale_index(&current, &digests, moved));
+                let stale = moved.map(|moved| failure.stale_index(&current, &digests, moved));
                 return Ok(ResolvedWorkspace {
                     published: current,
                     stale,
                 });
             }
             let observed = if configuration_matches {
-                let changes = PathChanges::between(&current.reads.workspace_digests(), &digests);
                 self.validation
                     .observe_paths(changes.iter().map(|(path, _)| path.clone()))
             } else {
                 self.validation.observe_whole_workspace()
             };
             observed.map_err(|error| error.tool_error(phase))?;
-            spent = Some((current, digests, configuration_fingerprint));
-        }
-        if answers_stale && let Some((current, digests, configuration_fingerprint)) = spent {
-            current.configuration.accepted(phase)?;
-            let changes = PathChanges::between(&current.reads.workspace_digests(), &digests);
-            let stale = CaptureMovement::between(&current, &digests, configuration_fingerprint)
-                .map(|moved| {
+            if answers_stale
+                && configuration_matches
+                && let Some(epoch) = self.validation.superseded_after(current.epoch)
+            {
+                current.configuration.accepted(phase)?;
+                let stale = moved.map(|moved| {
                     stale_index_warning(
                         &current,
                         &digests,
                         moved,
-                        &StaleIndexReason::TreeKeptMoving { changes: &changes },
+                        &StaleIndexReason::RebuildSuperseded {
+                            epoch,
+                            changes: &changes,
+                        },
                     )
                 });
+                return Ok(ResolvedWorkspace {
+                    published: current,
+                    stale,
+                });
+            }
+            wait = if configuration_matches {
+                ReadWait::Rebuild
+            } else {
+                ReadWait::Configuration
+            };
+            spent = Some((current, digests, changes, moved));
+        }
+        if answers_stale
+            && matches!(wait, ReadWait::Rebuild)
+            && let Some((current, digests, changes, moved)) = spent
+        {
+            current.configuration.accepted(phase)?;
+            let stale = moved.map(|moved| {
+                stale_index_warning(
+                    &current,
+                    &digests,
+                    moved,
+                    &StaleIndexReason::TreeKeptMoving { changes: &changes },
+                )
+            });
             return Ok(ResolvedWorkspace {
                 published: current,
                 stale,
@@ -2258,13 +2301,12 @@ impl RiftMcp {
     /// carries the failure, a change refuses with it at the observed epoch and waits for
     /// the retry at an older one.
     ///
-    /// A read never waits for the two epochs to agree. The epoch counts observations and
-    /// the capture compares content, so a workspace whose hook rewrites files with the
-    /// bytes they already hold moves the epoch forever and the wait can never be
-    /// satisfied; the read takes the publication this loop already holds and lets
-    /// `reconcile_workspace`'s capture decide whether it answers. A change keeps the
-    /// wait and its budget, because a write resolves its address against the tree it is
-    /// about to modify.
+    /// A read's first capture compares content even when observations are ahead. Changed
+    /// source then waits for publication, unless a successful capture after the current
+    /// publication was superseded. That completed work proves continued movement, so the
+    /// read reaches its bounded captures and stale answer without waiting for a publication
+    /// the moving tree keeps superseding. A later publication makes that exception
+    /// obsolete. Configuration movement and changes keep waiting for the epochs to agree.
     ///
     /// Every other job of this loop stands for a read: a watcher the backend reported
     /// broken refuses, a supervisor that stopped refuses while the epochs disagree, and a
@@ -2273,8 +2315,8 @@ impl RiftMcp {
     async fn await_current_workspace(
         &self,
         phase: wire::ErrorPhase,
+        wait: ReadWait,
     ) -> Result<(Arc<PublishedWorkspace>, Option<RecordedRebuildFailure>), ErrorData> {
-        let mut waited = 0_usize;
         loop {
             let changed = self.validation.changed.notified();
             tokio::pin!(changed);
@@ -2324,11 +2366,15 @@ impl RiftMcp {
                     FailureVerdict::Wait => {}
                 }
             }
-            if matches!(phase, wire::ErrorPhase::Read) && waited >= READ_PUBLICATION_WAITS_MAX {
+            let capture = match wait {
+                ReadWait::Capture => true,
+                ReadWait::Rebuild => self.validation.superseded_after(current.epoch).is_some(),
+                ReadWait::Configuration => false,
+            };
+            if matches!(phase, wire::ErrorPhase::Read) && capture {
                 return Ok((current, None));
             }
             changed.as_mut().await;
-            waited += 1;
         }
     }
 
@@ -4217,7 +4263,10 @@ pub fn beacon() -> u64 {
         );
 
         let skipped = get_symbol(&reads, "beacon").await?;
-        assert!(skipped.hits.is_empty());
+        assert!(
+            skipped.hits.is_empty(),
+            "oversized source must leave the symbol index: {skipped:#?}"
+        );
         assert!(skipped.warnings.iter().any(|warning| matches!(
             warning,
             ReadWarning::SourceUnavailable { unit: Some(unit), detail }
@@ -4946,32 +4995,41 @@ pub fn beacon() -> u64 {
         let (directory, assembled) = unsupervised_fixture().await?;
         let server = &assembled.server;
         let current = Arc::clone(&server.published.read().await.current);
+        let published = current.reads.workspace_digests();
         let (matching, configuration) = server.capture_tree(&current).await?;
+        let changes = rift_index::PathChanges::between(&published, &matching);
         assert_eq!(
-            CaptureMovement::between(&current, &matching, configuration),
+            CaptureMovement::from_changes(
+                &changes,
+                current.configuration.fingerprint != configuration
+            ),
             None,
             "a capture matching its publication moved nothing"
         );
         assert_eq!(
-            CaptureMovement::between(
-                &current,
-                &matching,
-                super::ConfigurationFingerprint::MissingOrUnreadable
+            CaptureMovement::from_changes(
+                &changes,
+                current.configuration.fingerprint
+                    != super::ConfigurationFingerprint::MissingOrUnreadable
             ),
             Some(CaptureMovement::Configuration)
         );
 
         fs::write(directory.path().join("notes.txt"), "beacon notes\n")?;
         let (with_text, configuration) = server.capture_tree(&current).await?;
+        let changes = rift_index::PathChanges::between(&published, &with_text);
         assert_eq!(
-            CaptureMovement::between(&current, &with_text, configuration),
+            CaptureMovement::from_changes(
+                &changes,
+                current.configuration.fingerprint != configuration
+            ),
             Some(CaptureMovement::RecordedFiles)
         );
         assert_eq!(
-            CaptureMovement::between(
-                &current,
-                &with_text,
-                super::ConfigurationFingerprint::MissingOrUnreadable
+            CaptureMovement::from_changes(
+                &changes,
+                current.configuration.fingerprint
+                    != super::ConfigurationFingerprint::MissingOrUnreadable
             ),
             Some(CaptureMovement::RecordedFilesAndConfiguration)
         );
@@ -5542,15 +5600,184 @@ pub fn beacon() -> u64 {
         Ok(())
     }
 
-    /// A workspace whose publications keep landing while the observed epoch stays ahead of
-    /// them: the shape a hook that rewrites files with the bytes they already hold leaves
-    /// behind. The read waits for a bounded number of those publications and then answers
-    /// from the one it holds, rather than spending its whole readiness budget to refuse
-    /// with "the index is N filesystem events behind the tree". The capture finds the tree
-    /// ahead, so the answer carries `stale_index`.
+    /// Captures a candidate successfully, then edits its source before publication.
+    async fn supersede_rebuild(assembled: &UnsupervisedServer, next_source: String) -> TestResult {
+        let server = &assembled.server;
+        let validation = Arc::clone(&server.validation);
+        let dependencies = Arc::clone(&server.dependencies);
+        let path = CoreProjectPath::new("lib.rs")?;
+        let outcome = rebuild_workspace(
+            &assembled.context,
+            server.validation.take_pending(),
+            move |root: &std::path::Path, limits, request: &RebuildRequest| {
+                let candidate = build_workspace_candidate(root, limits, request, &dependencies)?;
+                assert!(matches!(candidate, WorkspaceCandidate::Stable { .. }));
+                fs::write(root.join("lib.rs"), &next_source)
+                    .expect("the later source edit must land");
+                validation.observe_paths([path.clone()])?;
+                Ok(candidate)
+            },
+        )
+        .await?;
+        assert_eq!(outcome, RebuildOutcome::Superseded);
+        Ok(())
+    }
+
+    /// Successful captures can all be superseded before publication. The recorded
+    /// completed work lets a later read answer from the existing snapshot with its warning.
     #[tokio::test]
-    async fn a_read_whose_epoch_runs_ahead_answers_within_its_wait_bound() -> TestResult {
+    async fn a_read_after_successful_superseded_rebuilds_answers_without_publication() -> TestResult
+    {
         let (directory, assembled) = unsupervised_fixture().await?;
+        let server = &assembled.server;
+        let path = CoreProjectPath::new("lib.rs")?;
+        fs::write(directory.path().join("lib.rs"), "pub fn lantern0() {}\n")?;
+        server.validation.observe_paths([path.clone()])?;
+        for round in 1..=super::INDEX_CAPTURE_ATTEMPTS_MAX {
+            supersede_rebuild(&assembled, format!("pub fn lantern{round}() {{}}\n")).await?;
+            assert_eq!(server.published.read().await.current.epoch, 0);
+        }
+        let (published, failure) = server.published.read().await.snapshot();
+        assert_eq!(published.epoch, 0);
+        assert!(
+            failure.is_none(),
+            "successful captures record no rebuild failure"
+        );
+        let (expected_capture, _) = captured_tree(directory.path(), &published)?;
+        let expected_revision = super::wire_digest(
+            expected_capture
+                .tree_revision()
+                .ok_or("captured tree revision")?,
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rounds = Arc::clone(&calls);
+        let root = directory.path().to_path_buf();
+        server.force_capture(move |current| {
+            let round = rounds.fetch_add(1, Ordering::Relaxed);
+            if round != 0 {
+                return Err(ReadFault::unavailable(
+                    "test capture",
+                    "a second capture repeats proven movement",
+                ));
+            }
+            captured_tree(&root, current)
+        });
+
+        let answer = tokio::time::timeout(UNWAITED_READ_MAX, run_search(server, "beacon"))
+            .await
+            .map_err(
+                |_| "a read must not wait for a publication superseded builds cannot produce",
+            )??;
+        assert!(
+            !answer.results.is_empty(),
+            "the original publication answers"
+        );
+        let (index, captured, detail) = stale_index_of(&answer.warnings)?;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(index, published.reads.tree_revision());
+        assert_eq!(captured, expected_revision.0);
+        assert_ne!(index, captured);
+        assert!(detail.contains("lib.rs moved"), "{detail}");
+        assert!(detail.contains("superseded before publication"), "{detail}");
+        assert!(
+            !detail.contains("bounded reconciliation attempts"),
+            "{detail}"
+        );
+        Ok(())
+    }
+
+    /// A successful superseded capture wakes an existing read. Its exception ends when
+    /// the next publication lands, so a later ordinary edit still waits for fresh content.
+    #[tokio::test]
+    async fn a_superseded_capture_wakes_a_read_and_a_publication_restores_its_wait() -> TestResult {
+        use std::future::{Future as _, poll_fn};
+        use std::task::Poll;
+
+        let (directory, assembled) = unsupervised_fixture().await?;
+        let server = &assembled.server;
+        let path = CoreProjectPath::new("lib.rs")?;
+        fs::write(directory.path().join("lib.rs"), "pub fn lantern0() {}\n")?;
+        server.validation.observe_paths([path.clone()])?;
+        let root = directory.path().to_path_buf();
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rounds = Arc::clone(&captures);
+        server.force_capture(move |current| {
+            rounds.fetch_add(1, Ordering::Relaxed);
+            captured_tree(&root, current)
+        });
+
+        let mut waiting = Box::pin(get_symbol(server, "beacon"));
+        poll_fn(|context| {
+            assert!(waiting.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            captures.load(Ordering::Relaxed),
+            1,
+            "the read reached its publication wait"
+        );
+        supersede_rebuild(&assembled, "pub fn lantern1() {}\n".to_owned()).await?;
+        let stale = tokio::time::timeout(UNWAITED_READ_MAX, waiting)
+            .await
+            .map_err(|_| "a superseded capture must wake the waiting read")??;
+        assert_eq!(stale.hits.len(), 1);
+        stale_index_of(&stale.warnings)?;
+
+        let outcome = rebuild_workspace(
+            &assembled.context,
+            server.validation.take_pending(),
+            workspace_capture(&server.dependencies),
+        )
+        .await?;
+        assert_eq!(outcome, RebuildOutcome::Published);
+        let published_epoch = server.published.read().await.current.epoch;
+        assert!(
+            server
+                .validation
+                .superseded_after(published_epoch)
+                .is_none()
+        );
+
+        fs::write(directory.path().join("lib.rs"), "pub fn lantern2() {}\n")?;
+        server.validation.observe_paths([path])?;
+        captures.store(0, Ordering::Relaxed);
+        let mut waiting = Box::pin(get_symbol(server, "lantern2"));
+        poll_fn(|context| {
+            assert!(waiting.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            captures.load(Ordering::Relaxed),
+            1,
+            "the later edit still waits for publication"
+        );
+        let outcome = rebuild_workspace(
+            &assembled.context,
+            server.validation.take_pending(),
+            workspace_capture(&server.dependencies),
+        )
+        .await?;
+        assert_eq!(outcome, RebuildOutcome::Published);
+        let fresh = tokio::time::timeout(UNWAITED_READ_MAX, waiting)
+            .await
+            .map_err(|_| "the later publication must wake the read")??;
+        assert_eq!(fresh.hits.len(), 1, "the new declaration must answer");
+        assert!(
+            stale_index_of(&fresh.warnings).is_err(),
+            "the published edit answers fresh"
+        );
+        Ok(())
+    }
+
+    /// Changed content waits while no successful superseded capture proves movement.
+    #[tokio::test]
+    async fn a_read_waits_for_a_pending_edit_without_a_superseded_capture() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "[server]\nreadiness_timeout = \"1s\"\n")?;
+        let assembled = unsupervised_server(directory.path()).await?;
         let server = &assembled.server;
         fs::write(
             directory.path().join("lib.rs"),
@@ -5559,30 +5786,84 @@ pub fn beacon() -> u64 {
         let epoch = observe_without_recording_a_failure(server, "lib.rs", 3)?;
         assert_eq!(epoch, 3);
         assert_eq!(server.published.read().await.current.epoch, 0);
-        // The publications a churning workspace keeps landing, without ever catching the
-        // observations: what the read spends its bounded waits on.
-        let landing = Arc::clone(&server.validation);
-        let churn = tokio::spawn(async move {
-            loop {
-                landing.changed.notify_waiters();
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let error = tokio::time::timeout(UNWAITED_READ_MAX, get_symbol(server, "beacon"))
+            .await
+            .map_err(|_| "a pending edit must resolve inside the readiness bound")?
+            .expect_err("a read waits for changed content before any superseded capture");
+        assert!(
+            error.message.contains("filesystem events behind the tree"),
+            "{error:?}"
+        );
+        Ok(())
+    }
+
+    /// A captured configuration change still needs acceptance before a read can use its
+    /// policy. Without a publisher, the existing readiness deadline refuses the read.
+    #[tokio::test]
+    async fn a_read_waits_for_configuration_acceptance_before_answering() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "[server]\nreadiness_timeout = \"1s\"\n")?;
+        let assembled = unsupervised_server(directory.path()).await?;
+        let server = &assembled.server;
+        fs::write(directory.path().join("lib.rs"), "pub fn lantern0() {}\n")?;
+        server
+            .validation
+            .observe_paths([CoreProjectPath::new("lib.rs")?])?;
+        supersede_rebuild(&assembled, "pub fn lantern1() {}\n".to_owned()).await?;
+        super::hermetic_workspace(directory.path(), "[server]\nreadiness_timeout = \"0ms\"\n")?;
+
+        let error = tokio::time::timeout(UNWAITED_READ_MAX, get_symbol(server, "beacon"))
+            .await
+            .map_err(|_| "configuration acceptance must stay inside the readiness bound")?
+            .expect_err("an unpublished configuration must not answer from the old policy");
+
+        assert!(
+            error.message.contains("filesystem events behind the tree"),
+            "{error:?}"
+        );
+        let wire = error.data.ok_or("typed refusal")?;
+        assert_eq!(wire["code"], json!("temporarily_unavailable"));
+        assert_eq!(wire["phase"], json!("read"));
+        Ok(())
+    }
+
+    /// Configuration movement on the last capture must not use the exhausted read's
+    /// stale fallback under the previous policy.
+    #[tokio::test]
+    async fn a_read_refuses_configuration_movement_on_its_last_capture() -> TestResult {
+        let (directory, server) = fixture().await?;
+        let root = directory.path().to_path_buf();
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rounds = Arc::clone(&captures);
+        server.force_capture(move |current| {
+            let round = rounds.fetch_add(1, Ordering::Relaxed) + 1;
+            fs::write(
+                root.join("lib.rs"),
+                format!("pub fn lantern{round}() {{}}\n"),
+            )
+            .expect("the source edit must land");
+            if round == super::INDEX_CAPTURE_ATTEMPTS_MAX {
+                super::hermetic_workspace(&root, "[server]\nreadiness_timeout = \"0ms\"\n")
+                    .expect("the configuration edit must land");
             }
+            captured_tree(&root, current)
         });
 
-        let answer = tokio::time::timeout(UNWAITED_READ_MAX, get_symbol(server, "beacon"))
+        let error = tokio::time::timeout(UNWAITED_READ_MAX, get_symbol(&server, "beacon"))
             .await
-            .map_err(|_| "a read whose epoch runs ahead must answer inside its wait bound")??;
+            .map_err(|_| "the last capture must refuse within the read bound")?
+            .expect_err("configuration movement must not answer from the old policy");
 
-        churn.abort();
-        let (index, captured, detail) = stale_index_of(&answer.warnings)?;
-        assert_ne!(
-            captured, index,
-            "the captured tree is ahead of the snapshot"
+        assert_eq!(
+            captures.load(Ordering::Relaxed),
+            super::INDEX_CAPTURE_ATTEMPTS_MAX
         );
         assert!(
-            detail.contains("bounded reconciliation attempts"),
-            "{detail}"
+            error.message.contains("bounded reconciliation attempts"),
+            "{error:?}"
         );
+        assert_eq!(error.data.ok_or("typed refusal")?["phase"], json!("read"));
         Ok(())
     }
 
@@ -5857,51 +6138,60 @@ pub fn beacon() -> u64 {
         Ok(())
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn reads_time_out_while_publication_is_stalled() -> TestResult {
-        let (_directory, server) = fixture().await?;
-        // Advance the observed epoch without an invalidation signal, so no
-        // rebuild ever publishes a matching snapshot and the read must wait.
+    #[tokio::test]
+    async fn a_read_answers_matching_content_while_publication_is_stalled() -> TestResult {
+        let (_directory, assembled) = unsupervised_fixture().await?;
+        let server = &assembled.server;
+        // An observation without changed bytes needs no new publication for a read.
         server
             .validation
             .observed_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let error = get_symbol(&server, "beacon")
+        let answer = tokio::time::timeout(UNWAITED_READ_MAX, get_symbol(server, "beacon"))
             .await
-            .expect_err("a stalled publication must miss the freshness deadline");
+            .map_err(|_| "matching content must answer without a publication")??;
+        assert_eq!(answer.hits.len(), 1, "the publication answers");
         assert!(
-            error.message.contains("filesystem events behind the tree"),
-            "unexpected refusal: {error:?}"
+            stale_index_of(&answer.warnings).is_err(),
+            "matching content must not warn stale: {:?}",
+            answer.warnings
         );
         Ok(())
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_stalled_read_names_the_epochs_it_waited_on() -> TestResult {
+    async fn a_stalled_change_names_the_epochs_it_waited_on() -> TestResult {
         let (_directory, server) = fixture().await?;
         server
             .validation
             .observed_epoch
             .fetch_add(3, std::sync::atomic::Ordering::SeqCst);
 
-        let error = get_symbol(&server, "beacon")
+        let error = server
+            .published_workspace(super::wire::ErrorPhase::Change)
             .await
-            .expect_err("a stalled publication must refuse");
+            .map(|_current| ())
+            .expect_err("a stalled publication must refuse a change");
 
         assert!(error.message.contains("published epoch 0"), "{error:?}");
         assert!(error.message.contains("observed epoch 3"), "{error:?}");
         assert!(error.message.contains("rift://logs"), "{error:?}");
+        assert_eq!(error.data.ok_or("typed refusal")?["phase"], json!("change"));
         Ok(())
     }
 
     #[tokio::test]
-    async fn a_stall_after_the_epoch_settled_names_tree_movement() -> TestResult {
+    async fn a_stall_after_the_epoch_settled_names_unfinished_validation() -> TestResult {
         let (_directory, server) = fixture().await?;
 
         let detail = server.readiness_stall(Duration::from_millis(25)).await;
 
         assert!(detail.contains("the index settled at epoch 0"), "{detail}");
-        assert!(detail.contains("tree kept moving"), "{detail}");
+        assert!(
+            detail.contains("workspace validation did not finish"),
+            "{detail}"
+        );
+        assert!(detail.contains("capture and rebuild records"), "{detail}");
         assert!(detail.contains("25ms"), "{detail}");
         Ok(())
     }
@@ -7195,25 +7485,23 @@ pub fn beacon() -> u64 {
         Ok(())
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn search_times_out_while_publication_is_stalled_like_every_other_read() -> TestResult {
-        let (_directory, server) = fixture().await?;
-        // Advance the observed epoch without an invalidation signal, so no rebuild ever
-        // publishes a matching snapshot and the read must wait. `search` resolves the
-        // published workspace exactly once (the TOCTOU fix in this review round), so a
-        // stalled publication fails the whole request the same way every other current-tree
-        // tool does, rather than merely degrading the lexical tier: `lexical_search_matches`
-        // is never even reached with a snapshot to validate against.
+    #[tokio::test]
+    async fn search_answers_matching_content_while_publication_is_stalled() -> TestResult {
+        let (_directory, assembled) = unsupervised_fixture().await?;
+        let server = &assembled.server;
+        // Search validates its publication by content, as every read does.
         server
             .validation
             .observed_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let error = run_search(&server, "beacon")
+        let answer = tokio::time::timeout(UNWAITED_READ_MAX, run_search(server, "beacon"))
             .await
-            .expect_err("a stalled publication must miss the freshness deadline");
+            .map_err(|_| "matching content must answer without a publication")??;
+        assert!(!answer.results.is_empty(), "the publication answers");
         assert!(
-            error.message.contains("filesystem events behind the tree"),
-            "unexpected refusal: {error:?}"
+            stale_index_of(&answer.warnings).is_err(),
+            "matching content must not warn stale: {:?}",
+            answer.warnings
         );
         Ok(())
     }

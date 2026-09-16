@@ -67,6 +67,20 @@ skip = [
   { name = "cpufeatures", version = "0.2.17" },
   { name = "base64", version = "0.22.1" },
 
+  # waitpid-any 0.3.0 pins windows-sys 0.59, which pins windows-targets 0.52.
+  # Its process handle API keeps the stopped process distinct from a replacement;
+  # these import libraries cannot be aligned with notify's windows-targets 0.53.
+  { name = "windows-sys", version = "0.59.0" },
+  { name = "windows-targets", version = "0.52.6" },
+  { name = "windows_aarch64_gnullvm", version = "0.52.6" },
+  { name = "windows_aarch64_msvc", version = "0.52.6" },
+  { name = "windows_i686_gnu", version = "0.52.6" },
+  { name = "windows_i686_gnullvm", version = "0.52.6" },
+  { name = "windows_i686_msvc", version = "0.52.6" },
+  { name = "windows_x86_64_gnu", version = "0.52.6" },
+  { name = "windows_x86_64_gnullvm", version = "0.52.6" },
+  { name = "windows_x86_64_msvc", version = "0.52.6" },
+
   { name = "base64", version = "0.13.1" },
   { name = "bit-set", version = "0.11.1" },
   { name = "bit-vec", version = "0.10.1" },

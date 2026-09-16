@@ -586,6 +586,17 @@ impl ReadService {
         self.index.digest(path)
     }
 
+    /// The exact warning this snapshot holds for a file it left out, before wire warning
+    /// limits are applied. Index construction keeps these warnings in project-path order.
+    #[must_use]
+    pub fn file_warning(&self, path: &CoreProjectPath) -> Option<&WorkspaceIndexWarning> {
+        let warnings = self.index.warnings();
+        warnings
+            .binary_search_by(|warning| warning.path().cmp(path))
+            .ok()
+            .map(|position| &warnings[position])
+    }
+
     /// Whether this snapshot holds at least one file below `directory`, the files it
     /// left out included.
     ///

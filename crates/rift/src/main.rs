@@ -1,5 +1,10 @@
 //! Rift CLI.
 
+/// Use one allocator for Rust and C allocations across Linux index rebuilds.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod install;
 mod progress;
 mod server;

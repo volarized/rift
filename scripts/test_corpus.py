@@ -381,6 +381,7 @@ class Decisions(unittest.TestCase):
     ) -> None:
         start = 'DEBUG rift_mcp::validation: index capture started component="index" operation="index.build" phase="start" epoch=7\n'
         self.assertEqual(active_stdout(start, "rebuild", "7"), start.strip())
+        self.assertEqual(active_stdout(start, "rebuild", None), start.strip())
         wrong_close = 'INFO index.build{component="index" epoch=6}: rift_mcp::validation: close time.busy=1s\n'
         self.assertEqual(
             active_stdout(start + wrong_close, "rebuild", "7"), start.strip()
@@ -389,6 +390,17 @@ class Decisions(unittest.TestCase):
         for output, epoch in ((start, "8"), (start + matching_close, "7"), ("", "7")):
             with self.assertRaises(AssertionError):
                 active_stdout(output, "rebuild", epoch)
+        for output in (
+            start.replace('component="index"', 'component="dependency"'),
+            start.replace('operation="index.build"', 'operation="index.publish"'),
+            start.replace('phase="start"', 'phase="complete"'),
+            start.replace("epoch=7", "epoch=0"),
+            start.replace("epoch=7", ""),
+            start + matching_close,
+            start + 'INFO index snapshot published operation="index.publish"\n',
+        ):
+            with self.assertRaises(AssertionError):
+                active_stdout(output, "rebuild", None)
 
     def test_synchronous_history_refuses_finished_or_partial_records(self) -> None:
         start = 'DEBUG rift_server::history: symbol history started component="index" operation="get_symbol" phase="start"\n'

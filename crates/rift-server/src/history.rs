@@ -39,6 +39,7 @@ struct ParsedRevision {
 /// distinct committed blob.
 #[derive(Debug)]
 pub(crate) struct SymbolTimelines {
+    _span: tracing::Span,
     repository: Repository,
     start: ResolvedRevision,
     revisions_max: usize,
@@ -75,7 +76,20 @@ impl SymbolTimelines {
         .map_err(ReadFault::history)?;
         let revisions_max =
             usize::try_from(history.max_revisions.min(HISTORY_REVISIONS_MAX)).unwrap_or(usize::MAX);
+        let span = tracing::debug_span!(
+            "get_symbol",
+            component = "index",
+            operation = "get_symbol",
+            phase = "history"
+        );
+        tracing::debug!(
+            component = "index",
+            operation = "get_symbol",
+            phase = "start",
+            "symbol history started"
+        );
         Ok(Self {
+            _span: span,
             repository,
             start,
             revisions_max,
@@ -104,6 +118,7 @@ impl SymbolTimelines {
             revisions_max,
             walks,
             parses,
+            ..
         } = self;
         let history = match walks.entry(path.as_str().to_owned()) {
             Entry::Occupied(walked) => walked.into_mut(),
