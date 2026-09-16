@@ -9,8 +9,10 @@ from pathlib import Path
 from rift_dev.check_artifact import (
     check_external_change,
     check_reads,
+    incoming_references,
     lay_out_workspace,
     symbol_hit,
+    symbol_id,
 )
 from rift_dev.rift_test_client import (
     Client,
@@ -26,6 +28,53 @@ from rift_dev.rift_test_client import (
 AGENT_SECONDS = 300.0
 READ_TOOLS = {"search", "get_symbol", "nodes"}
 RESOURCE_URIS = {"rift://map", "rift://workspace", "rift://logs"}
+
+
+PYTHON_SOURCE = "def serve(port: int) -> int:\n    return port\n\n\ndef caller() -> int:\n    return serve(8080)\n"
+PYTHON_CONFIGURATION = """
+[languages.python.lsp]
+embedded = "ty"
+startup_timeout = "2m"
+request_timeout = "2m"
+retry = { attempts = 12, delay = "250ms", delay_limit = "2s" }
+"""
+
+
+async def check_embedded_references(client: Client, root: Path) -> None:
+    """Require the embedded engine to resolve a caller through a read request."""
+    seed = symbol_id(await symbol_hit(client, "serve", "python"))
+    caller = symbol_id(await symbol_hit(client, "caller", "python"))
+    answer = await incoming_references(client, seed)
+    resolved = []
+    for value in array_value(answer.get("results"), "search.results"):
+        hit = object_value(value, "search hit")
+        symbol = object_value(
+            object_value(hit.get("hit"), "hit").get("symbol"), "symbol"
+        )
+        if symbol.get("id") == caller:
+            resolved.append(hit)
+    require(len(resolved) == 1, f"engine references omitted caller: {answer}")
+    hops = array_value(resolved[0].get("traversal_path"), "traversal_path")
+    require(len(hops) == 1, f"expected one reference step: {hops}")
+    hop = object_value(hops[0], "hop")
+    relationship = object_value(hop.get("relationship"), "relationship")
+    require(
+        relationship.get("from") == caller and relationship.get("to") == seed,
+        f"reference endpoints differ: {relationship}",
+    )
+    require(
+        relationship.get("derivation") == "resolution",
+        f"reference was not resolved by the engine: {relationship}",
+    )
+    require(
+        relationship.get("facets") == ["references"],
+        f"reference facets differ: {relationship}",
+    )
+    require(hop.get("direction") == "incoming", f"reference direction differs: {hop}")
+    require(
+        (root / "service.py").read_bytes() == PYTHON_SOURCE.encode(),
+        "reference read changed source bytes",
+    )
 
 
 async def check_resources(client: Client) -> None:
@@ -87,12 +136,22 @@ async def check_agent(binary: Path, version: str | None = None) -> None:
             root = base / "workspace"
             root.mkdir()
             lay_out_workspace(root)
+            configuration = root / "rift.toml"
+            configuration.write_text(
+                configuration.read_text() + PYTHON_CONFIGURATION,
+                encoding="utf-8",
+                newline="",
+            )
+            (root / "service.py").write_text(
+                PYTHON_SOURCE, encoding="utf-8", newline=""
+            )
             with Server(binary, root, base / "server.log") as server:
                 try:
                     async with server.connect() as client:
                         await check_resources(client)
                         await check_reads(client)
                         await check_external_change(client, root)
+                        await check_embedded_references(client, root)
                         await declaration_node(client, "beacon_one")
                         client.require_complete(READ_TOOLS)
                     server.stop()

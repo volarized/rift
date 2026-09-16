@@ -13,6 +13,7 @@ from rift_dev.rift_test_client import (
     gate_deadline,
     object_value,
     require,
+    string_value,
     verify_version,
 )
 
@@ -40,6 +41,29 @@ async def symbol_hit(client: Client, name: str, language: str = "rust") -> JsonO
     ]
     require(len(matches) == 1, f"expected one {name} declaration: {answer}")
     return matches[0]
+
+
+def symbol_id(hit: JsonObject) -> str:
+    """Use the read side's emitted identity as the traversal seed."""
+    return string_value(
+        object_value(hit.get("symbol"), "symbol").get("id"), "symbol.id"
+    )
+
+
+async def incoming_references(client: Client, seed: str) -> JsonObject:
+    """Read one incoming reference step through the served traversal surface."""
+    return await client.call(
+        "search",
+        {
+            "traversal": {
+                "seed": seed,
+                "direction": "incoming",
+                "facets": ["references"],
+                "depth": 1,
+            },
+            "target": "symbol",
+        },
+    )
 
 
 async def check_reads(client: Client) -> None:

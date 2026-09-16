@@ -16,8 +16,9 @@ from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.shared.exceptions import McpError
 
-from rift_dev.check_artifact import symbol_hit
+from rift_dev.check_artifact import incoming_references, symbol_hit, symbol_id
 from rift_dev.release_process import owned_environment, run
 from rift_dev.rift_test_client import (
     Client,
@@ -122,6 +123,38 @@ async def check_first_use(client: Client, name: str) -> None:
     )
 
 
+async def check_missing_executable(client: Client, name: str) -> None:
+    """Keep syntax reads after a configured language engine fails to launch."""
+    configuration = '[languages.rust.lsp]\ncommand = ["rust-analyzer"]\n'
+    container_command(
+        name, ["sh", "-c", 'printf %s "$1" > rift.toml', "sh", configuration]
+    )
+    hit = await symbol_hit(client, "beacon_cold")
+    try:
+        await incoming_references(client, symbol_id(hit))
+    except McpError as launch_error:
+        detail = object_value(launch_error.error.data, "engine error")
+        require(
+            detail.get("code") == "capability_unavailable",
+            f"unexpected engine error: {detail}",
+        )
+        require(
+            "launch_failed" in str(launch_error),
+            f"engine failure lost launch cause: {launch_error}",
+        )
+    else:
+        raise AssertionError("missing configured engine answered references")
+    require(
+        (await symbol_hit(client, "beacon_cold")).get("source") == SOURCE.rstrip("\n"),
+        "engine failure removed syntax reads",
+    )
+    logs = await client.resource("rift://logs/component/engine")
+    require(
+        bool(array_value(logs.get("records"), "engine logs")),
+        "engine launch failure was not recorded",
+    )
+
+
 async def check_coldstart(binary: Path, image: str, version: str | None = None) -> None:
     """Run supplied bytes under Docker and remove the container on every outcome."""
     async with gate_deadline("coldstart", COLDSTART_SECONDS):
@@ -195,6 +228,7 @@ async def check_coldstart(binary: Path, image: str, version: str | None = None) 
                     client = Client(session, START_SECONDS)
                     await client.initialize()
                     await check_first_use(client, name)
+                    await check_missing_executable(client, name)
             stop_container(name, pid)
         except BaseException as error:
             failure = error
