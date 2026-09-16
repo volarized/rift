@@ -1,15 +1,8 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["mcp==1.26.0", "jsonschema==4.26.0", "psutil==7.2.2", "pywin32==312; sys_platform == 'win32'"]
-# ///
 """Fetch pinned trees or run their bounded suites through the compiled Rift binary."""
 
 from __future__ import annotations
 
-import argparse
 import asyncio
-import dataclasses
 import json
 import os
 import tempfile
@@ -18,18 +11,18 @@ import traceback
 from collections.abc import Callable
 from pathlib import Path
 
-from corpus_assertions import (
+from mcp.shared.exceptions import McpError
+
+from rift_dev.corpus_assertions import (
     PROBE_PATH,
     PROBE_SOURCE,
     READ_COUNT,
     SYMBOL_COUNT,
     active_stdout,
-    capture_count,
-    change_patch,
+    churn_answer,
     database_bytes,
     exact_degradation,
     fields,
-    identity_resolved,
     language_counts,
     lexical_breach,
     lexical_content,
@@ -41,23 +34,24 @@ from corpus_assertions import (
     sample_symbols,
     warnings,
 )
-from corpus_cache import Pin, git, measure, pins
-from mcp.shared.exceptions import McpError
-from rift_test_client import (
+from rift_dev.corpus_cache import Pin, git
+from rift_dev.rift_test_client import (
     Client,
     Json,
     JsonObject,
     Server,
     array_value,
+    gate_deadline,
     object_value,
     require,
     string_value,
 )
 
+READ_SECONDS = 30.0
 SEED = 34
 POLL_SECONDS = 0.1
 OBSERVATION_SECONDS = 60.0
-CONFIGURATION = '[search.semantic]\ndisabled = true\n[logs]\npage_records = 5000\ncapture = "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info"\n'
+CONFIGURATION = '[server]\nreadiness_timeout = "30s"\n[search.semantic]\ndisabled = true\n[logs]\npage_records = 5000\ncapture = "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info"\n'
 SAMPLE_LANGUAGES = {
     "bun": ("rust", "typescript", "typescript:tsx"),
     "nextjs": ("rust", "typescript", "typescript:tsx"),
@@ -67,6 +61,18 @@ REQUIRED_LANGUAGES = {
     "bun": {"rust", "typescript"},
     "nextjs": {"typescript"},
     "fastapi": {"python"},
+}
+
+
+CHURN_REQUESTS: dict[str, JsonObject] = {
+    "search": {
+        "query": "corpus_probe",
+        "target": "symbol",
+        "include": ["source"],
+        "limit": 1,
+    },
+    "get_symbol": {"name": "corpus_probe"},
+    "nodes": {"path": PROBE_PATH, "position": 0},
 }
 
 
@@ -213,7 +219,7 @@ class Corpus:
                     )
                 await self.left_out(client)
                 await self.symbols(client, candidates)
-                await self.single_capture(client)
+                await self.lexical_persistence(client)
                 if self.pin.name == "nextjs":
                     await self.symlinks(client)
                 no_failed_builds(
@@ -321,7 +327,7 @@ class Corpus:
         )
 
     async def symbols(self, client: Client, candidates: list[JsonObject]) -> None:
-        """Issue #264: exercise 200 emitted addresses without changing their bytes."""
+        """Resolve 200 sampled symbol identities through syntax reads."""
         initial = language_counts(candidates)
         pool = list(candidates)
         workspace = await client.resource("rift://workspace")
@@ -390,75 +396,53 @@ class Corpus:
             )
             content = path.read_bytes()
             require(0 <= start < end <= len(content), "symbol range exceeds source")
-            body = content[start:end].decode()
+            # Declarations can start with attached comments or attributes. Extraction
+            # keeps their end equal to the item end, so its final byte is in the item.
             answer = await client.call(
-                "replace_symbol", {"symbol": identity, "body": body}
+                "nodes", {"path": str(path.relative_to(self.root)), "position": end - 1}
             )
-            identity_resolved(answer, identity)
+            nodes = objects(answer, "nodes")
             require(
-                path.read_bytes() == content,
-                f"byte-equal symbol replacement changed {path}",
+                any(node.get("symbol") == identity for node in nodes),
+                f"nodes omitted sampled declaration: {identity} at {end - 1}; "
+                f"returned {[(node.get('kind'), node.get('range'), node.get('symbol')) for node in nodes]}",
             )
+            require(path.read_bytes() == content, f"read changed {path}")
         self.record("identities", count=len(identities), seed=SEED)
 
-    async def single_capture(self, client: Client) -> None:
+    async def lexical_persistence(self, client: Client) -> None:
+        """Preserve unrelated lexical rows after external source creation and removal."""
         before = lexical_content(self.root)
-        byte_sizes = database_bytes(self.root)
-        prior = records(await client.resource("rift://logs/component/index"))
-        last = max(
-            (number(row["identity"], "record identity") for row in prior), default=0
-        )
-        started = time.monotonic()
-        applied = await client.call(
-            "patch", {"patch": change_patch(PROBE_PATH, "", PROBE_SOURCE)}
-        )
-        require(applied.get("status") == "applied", f"probe patch refused: {applied}")
-        found = await observed(
-            client,
-            "rift://logs/component/index",
-            lambda rows: any(
-                row.get("operation") == "index.publish"
-                and fields(row).get("trigger") == "rift_change"
-                and number(row["identity"], "record identity") > last
-                for row in rows
-            ),
-        )
-        require(
-            time.monotonic() - started <= OBSERVATION_SECONDS,
-            "edit publication exceeded 60 seconds",
-        )
-        await self.await_probe(True)
-        require(
-            (self.root / PROBE_PATH).read_bytes() == PROBE_SOURCE.encode(),
-            "published probe changed source bytes",
-        )
+        sizes = database_bytes(self.root)
+        path = self.root / PROBE_PATH
+        path.write_bytes(PROBE_SOURCE.encode())
         answer = await client.call("get_symbol", {"name": "corpus_probe"})
         hits = objects(answer, "hits")
         require(
-            len(hits) == 1 and hits[0].get("source") == PROBE_SOURCE.removesuffix("\n"),
-            f"newly published probe source differs: {hits}",
+            len(hits) == 1 and hits[0].get("source") == PROBE_SOURCE.rstrip("\n"),
+            f"new source was absent from reads: {answer}",
         )
-        found = records(await client.resource("rift://logs/component/index"))
-        captures = capture_count(found, last)
+        await self.await_probe(True)
         require(
             lexical_content(self.root) == before,
-            "one edit changed unrelated persisted lexical rows",
+            "source creation changed unrelated persisted lexical rows",
+        )
+        require(
+            path.read_bytes() == PROBE_SOURCE.encode(),
+            "source read changed probe bytes",
         )
         self.record(
-            "capture",
-            count=captures,
-            source_bytes=len(PROBE_SOURCE.encode()),
-            before=byte_sizes,
-            after=database_bytes(self.root),
+            "lexical_persistence", before=sizes, after=database_bytes(self.root)
         )
-        removed = await client.call(
-            "patch", {"patch": change_patch(PROBE_PATH, PROBE_SOURCE, "")}
+        path.unlink()
+        answer = await client.call("get_symbol", {"name": "corpus_probe"})
+        require(
+            not objects(answer, "hits"), f"removed source remained indexed: {answer}"
         )
-        require(removed.get("status") == "applied", f"probe removal refused: {removed}")
         await self.await_probe(False)
         require(
             lexical_content(self.root) == before,
-            "probe removal changed unrelated persisted lexical rows",
+            "source removal changed unrelated persisted lexical rows",
         )
 
     async def await_probe(self, present: bool) -> None:
@@ -540,37 +524,113 @@ class Corpus:
             self.record("stop", state="after_churn", process_gone=True)
 
     async def churn(self, client: Client) -> None:
+        """Read complete source revisions while external writes continue every two seconds."""
         path = self.root / PROBE_PATH
-        completed: list[Json] = []
+        sources: list[str] = []
+        timings: dict[str, list[float]] = {name: [] for name in CHURN_REQUESTS}
+        overlaps = 0
 
         def write(edit: int) -> None:
-            path.write_text(
-                f"pub fn corpus_probe() {{ let value = {edit}; }}\n",
-                encoding="utf-8",
-            )
-            completed.append(edit)
+            source = f"pub fn corpus_probe() {{ let value = {edit}; }}\n"
+            path.write_text(source, encoding="utf-8")
+            sources.append(source.rstrip("\n"))
 
         async def writer() -> None:
             for edit in range(1, self.pin.seconds // 2):
                 await asyncio.sleep(2.0)
                 write(edit)
 
+        async def read(name: str, identity: str | None) -> tuple[str, int]:
+            nonlocal overlaps
+            before = len(sources)
+            started = time.monotonic()
+            codes: list[str] = []
+            revision: int | None = None
+            try:
+                async with gate_deadline(f"churn {name}", READ_SECONDS):
+                    answer = await client.call(name, CHURN_REQUESTS[name])
+                codes = [
+                    string_value(warning.get("code"), "warning code")
+                    for warning in warnings(answer)
+                ]
+                found, source = churn_answer(name, answer, sources, identity)
+                revision = sources.index(source)
+                require(
+                    revision >= before - 1 or "stale_index" in codes,
+                    f"{name} returned old source without stale_index",
+                )
+                return found, revision
+            finally:
+                elapsed = time.monotonic() - started
+                timings[name].append(elapsed)
+                changed = len(sources) - before
+                overlaps += changed
+                self.record(
+                    "churn_read",
+                    tool=name,
+                    seconds=elapsed,
+                    writes=changed,
+                    source_revision=revision,
+                    source_revision_at_start=before - 1,
+                    warning_codes=codes,
+                )
+
         write(0)
-        task = asyncio.create_task(writer())
+        task: asyncio.Task[None] | None = None
         try:
-            for read in range(READ_COUNT):
-                answer = await client.call("search", {"query": "test", "limit": 1})
-                warnings(answer)
-                require(not task.done(), f"churn ended before read {read}")
+            identity, _revision = await read("get_symbol", None)
+            task = asyncio.create_task(writer())
+            reads = 0
+            tools = tuple(CHURN_REQUESTS)
+            pressure_calls = {name: 0 for name in tools}
+            async with gate_deadline("corpus churn", self.pin.seconds):
+                while reads < READ_COUNT or overlaps < 2:
+                    name = tools[reads % len(tools)]
+                    await read(name, identity)
+                    pressure_calls[name] += 1
+                    reads += 1
+                    if task.done():
+                        await task
+                        raise AssertionError("churn writer ended before reads")
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            final = [sources[-1]]
+            convergence = time.monotonic()
+            async with gate_deadline("churn final source", READ_SECONDS):
+                for name in CHURN_REQUESTS:
+                    while True:
+                        _identity, revision = await read(name, identity)
+                        if revision == len(sources) - 1:
+                            break
+                        # read already refused every older answer without stale_index.
+                        await asyncio.sleep(POLL_SECONDS)
+            self.record(
+                "churn_convergence",
+                seconds=time.monotonic() - convergence,
+                source_revision=len(sources) - 1,
+            )
+            require(
+                path.read_text(encoding="utf-8").rstrip("\n") == final[0],
+                "reads changed probe source",
+            )
             self.record(
                 "churn",
-                reads=READ_COUNT,
-                edits=len(completed),
+                reads=reads,
+                pressure_calls=pressure_calls,
+                edits=len(sources),
+                overlapping_writes=overlaps,
+                read_seconds_max=READ_SECONDS,
+                latency={
+                    name: {"calls": len(values), "maximum_seconds": max(values)}
+                    for name, values in timings.items()
+                },
+                final_source=final[0],
                 temporarily_unavailable=0,
             )
         finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
             path.unlink(missing_ok=True)
 
     async def symlink_root(self) -> None:
@@ -578,40 +638,16 @@ class Corpus:
         link.symlink_to(self.root, target_is_directory=True)
         with self.server(link) as server:
             async with server.connect() as client:
-                applied = await client.call(
-                    "patch", {"patch": change_patch(PROBE_PATH, "", PROBE_SOURCE)}
-                )
+                answer = await client.call("search", {"query": "test", "limit": 1})
                 require(
-                    applied.get("status") == "applied",
-                    f"symlink-root patch refused: {applied}",
-                )
-                moved = await client.call(
-                    "move_file", {"from": PROBE_PATH, "to": "rift_corpus_moved.rs"}
-                )
-                require(
-                    moved.get("status") == "applied",
-                    f"symlink-root move refused: {moved}",
-                )
-                require(
-                    (self.root / "rift_corpus_moved.rs").read_bytes()
-                    == PROBE_SOURCE.encode(),
-                    "move changed file bytes",
-                )
-                require(
-                    not (self.root / PROBE_PATH).exists(), "move retained its old path"
-                )
-                removed = await client.call(
-                    "patch",
-                    {"patch": change_patch("rift_corpus_moved.rs", PROBE_SOURCE, "")},
-                )
-                require(
-                    removed.get("status") == "applied", "moved probe removal refused"
+                    bool(objects(answer, "results")),
+                    "symlink root has no search results",
                 )
                 no_failed_builds(
                     records(await client.resource("rift://logs/component/index"))
                 )
             server.stop()
-        self.record("symlink_root", move="applied")
+        self.record("symlink_root", reads=True)
 
     async def shallow(self, root: Path) -> None:
         self.pin.checkout(root, depth=1)
@@ -699,24 +735,12 @@ class Corpus:
     async def stop_states(self) -> None:
         with self.server() as server:
             async with server.connect() as client:
-                previous = ""
-                for edit in range(15):
-                    replacement = f"pub fn corpus_probe() {{ let value = {edit}; }}\n"
-                    answer = await client.call(
-                        "patch",
-                        {"patch": change_patch(PROBE_PATH, previous, replacement)},
-                    )
-                    require(
-                        answer.get("status") == "applied",
-                        f"edit {edit} refused: {answer}",
-                    )
-                    previous = replacement
+                await client.call("search", {"query": "test", "limit": 1})
                 no_failed_builds(
                     records(await client.resource("rift://logs/component/index"))
                 )
             server.stop()
-        (self.root / PROBE_PATH).unlink()
-        self.record("stop", state="after_fifteen_edits", edits=15, process_gone=True)
+        self.record("stop", state="idle", process_gone=True)
         await self.stop_during("rebuild")
         await self.stop_during("history")
 
@@ -789,42 +813,3 @@ async def observed(
                 return found
             await asyncio.sleep(POLL_SECONDS)
     raise AssertionError(f"required record never reached {uri}")
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("sync", "measure", "test"))
-    parser.add_argument("name", nargs="?", choices=("bun", "nextjs", "fastapi"))
-    parser.add_argument("--binary", type=Path)
-    parser.add_argument("--report", type=Path)
-    parser.add_argument(
-        "--case", choices=("workspace", "stop", "churn"), default="workspace"
-    )
-    arguments = parser.parse_args()
-    selected = pins()
-    if arguments.name:
-        selected = {arguments.name: selected[arguments.name]}
-    for pin in selected.values():
-        if arguments.command == "sync":
-            print(pin.sync(), flush=True)
-        elif arguments.command == "measure":
-            print(
-                json.dumps(
-                    dataclasses.asdict(
-                        measure(git(pin.cache, "ls-tree", "-r", "-l", "-z", pin.commit))
-                    )
-                )
-            )
-        else:
-            require(
-                arguments.name is not None and arguments.binary is not None,
-                "test requires one corpus name and --binary",
-            )
-            report = arguments.report or Path(
-                f"target/test-results/corpus/{pin.name}/{arguments.case}/report.json"
-            )
-            asyncio.run(Corpus(pin, arguments.binary, report, arguments.case).run())
-
-
-if __name__ == "__main__":
-    main()

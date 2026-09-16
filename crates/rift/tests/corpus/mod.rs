@@ -17,16 +17,14 @@ const CLEANUP_SECONDS_MAX: Duration = Duration::from_secs(30);
 /// output budget. The Python harness bounds each server and joins its children.
 pub(super) async fn run(name: &str, case: &str) -> Result<(), Box<dyn std::error::Error>> {
     let (root, binary) = runtime_paths(|name| std::env::var_os(name))?;
-    let script = root.join("scripts/check_corpus.py");
     let supplied_report = std::env::var_os("RIFT_CORPUS_REPORT").map(PathBuf::from);
     let report = report_path(&root, name, case, supplied_report.as_deref())?;
     let mut command = tokio::process::Command::new("uv");
     command
         .arg("run")
         .args(["--locked", "--python", "3.12", "--project"])
-        .arg(root.join("scripts"))
-        .arg("python")
-        .arg(script)
+        .arg(root.join("dev"))
+        .args(["rift-dev", "corpus"])
         .args(["test", name, "--binary"])
         .arg(binary)
         .args(["--case", case])

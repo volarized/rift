@@ -71,3 +71,15 @@ updates:
     groups:
       actions-minor-patch:
         update-types: [minor, patch]
+
+  - package-ecosystem: uv
+    directory: /dev
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "🤖 build"
+      prefix-development: "🤖 build"
+      include: scope
+    groups:
+      dev-minor-patch:
+        update-types: [minor, patch]

@@ -8,12 +8,13 @@ import re
 import shutil
 import tempfile
 from pathlib import Path, PurePosixPath
-from typing import cast
 
 import tomllib
-from release_process import run_bytes
 
-PINS = Path(__file__).resolve().parent.parent / "crates/rift/tests/corpus/pins.toml"
+from rift_dev.config import CorpusPins
+from rift_dev.release_process import run_bytes
+
+PINS = Path(__file__).resolve().parents[3] / "crates/rift/tests/corpus/pins.toml"
 GIT_SECONDS_MAX = 600.0
 GIT_OUTPUT_BYTES_MAX = 16 * 1024 * 1024
 TREE_FILES_MAX = 100_000
@@ -226,50 +227,20 @@ def measure(tree: bytes) -> Measurement:
 def pins(path: Path = PINS) -> dict[str, Pin]:
     """Read the closed corpus set and reject invalid names or unconstrained pins."""
     with path.open("rb") as stream:
-        document = cast(dict[str, dict[str, object]], tomllib.load(stream))
+        document = CorpusPins.model_validate(tomllib.load(stream))
     result: dict[str, Pin] = {}
-    for name, row in document.items():
-        repository, tag, commit = (
-            string(row, key) for key in ("repository", "tag", "commit")
-        )
-        if not re.fullmatch(r"[a-z0-9_]+", name):
-            raise ValueError(f"invalid corpus name: {name}")
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
-            raise ValueError(f"invalid repository: {repository}")
-        if not re.fullmatch(r"[0-9a-f]{40}", commit):
-            raise ValueError(
-                f"{name}: commit must contain 40 lowercase hexadecimal digits"
-            )
-        measured = Measurement(
-            *(
-                integer(row, key)
-                for key in ("files", "bytes", "symlinks", "depth", "package_json")
-            )
-        )
+    for name in ("bun", "nextjs", "fastapi"):
+        row = getattr(document, name)
         result[name] = Pin(
             name,
-            repository,
-            tag,
-            commit,
-            measured,
-            string(row, "oversized_path"),
-            integer(row, "oversized_bytes"),
-            integer(row, "seconds"),
+            row.repository,
+            row.tag,
+            row.commit,
+            Measurement(
+                row.files, row.bytes, row.symlinks, row.depth, row.package_json
+            ),
+            row.oversized_path,
+            row.oversized_bytes,
+            row.seconds,
         )
-    if set(result) != {"bun", "nextjs", "fastapi"}:
-        raise ValueError("pins must contain bun, nextjs, and fastapi")
     return result
-
-
-def string(row: dict[str, object], key: str) -> str:
-    value = row[key]
-    if not isinstance(value, str):
-        raise TypeError(f"{key} must be a string")
-    return value
-
-
-def integer(row: dict[str, object], key: str) -> int:
-    value = row[key]
-    if type(value) is not int or value < 0:
-        raise ValueError(f"{key} must be a nonnegative integer")
-    return value

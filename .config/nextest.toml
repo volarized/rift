@@ -14,10 +14,11 @@ leak-timeout = { period = "200ms", result = "fail" }
 live = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'binary(/^live_/)'
+filter = 'binary(/^live_/) or test(/^live_/)'
 test-group = 'live'
 
 [profile.ci]
+default-filter = "not binary(/^live_/) and not binary(/^corpus_/) and not test(/^live_/)"
 global-timeout = "480s"
 fail-fast = false
 failure-output = "immediate-final"
@@ -45,4 +46,13 @@ filter = 'binary(=corpus_nextjs) & (test(=test_nextjs_corpus) | test(=test_nextj
 slow-timeout = { period = "720s", terminate-after = 1, grace-period = "30s" }
 
 [profile.corpus.junit]
+path = "junit.xml"
+
+[profile.integration]
+default-filter = "binary(/^live_/) or binary(/^corpus_/) or test(/^live_/)"
+global-timeout = "19m"
+fail-fast = false
+failure-output = "immediate-final"
+
+[profile.integration.junit]
 path = "junit.xml"

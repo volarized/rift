@@ -3,8 +3,8 @@
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-import check_mcp_conformance as conformance
 import pytest
+from rift_dev import check_mcp_conformance as conformance
 
 
 def test_supplied_binary_never_builds_and_preserves_failure_cleanup(
@@ -21,7 +21,7 @@ def test_supplied_binary_never_builds_and_preserves_failure_cleanup(
         patch.object(conformance, "run_suite", return_value=7),
         patch.object(conformance, "stop_server") as stop,
     ):
-        assert conformance.main(["--binary", str(binary)]) == 7
+        assert conformance.main(binary) == 7
     build.assert_not_called()
     assert start.call_args.args[0] == binary.resolve()
     stop.assert_called_once_with(server)
@@ -36,6 +36,6 @@ def test_missing_supplied_binary_refuses_without_build_or_install(
         patch.object(conformance, "install_runner") as install,
         pytest.raises(RuntimeError, match="does not exist"),
     ):
-        conformance.main(["--binary", str(tmp_path / "missing")])
+        conformance.main(tmp_path / "missing")
     build.assert_not_called()
     install.assert_not_called()

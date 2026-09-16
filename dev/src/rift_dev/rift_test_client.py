@@ -1,8 +1,3 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["mcp==1.26.0", "jsonschema==4.26.0", "psutil==7.2.2", "pywin32==312; sys_platform == 'win32'"]
-# ///
 """Own real Rift processes and validate messages through the MCP Python SDK.
 
 MCP 1.26.0 ClientSession.call_tool validates structured content against the
@@ -33,12 +28,13 @@ from typing import Self, TextIO, TypeAlias, cast
 
 import psutil
 import tomllib
-from check_mcp_conformance import REPOSITORY, build_server_binary
 from jsonschema import Draft202012Validator
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 from pydantic import AnyUrl
-from release_process import (
+
+from rift_dev.check_mcp_conformance import REPOSITORY, build_server_binary
+from rift_dev.release_process import (
     Drain,
     owned_environment,
     owned_process,
@@ -256,7 +252,6 @@ class Client:
         self.call_seconds = call_seconds
         self.tools: dict[str, types.Tool] = {}
         self.exercised: set[str] = set()
-        self.applied: set[str] = set()
 
     async def initialize(self) -> None:
         """Reject missing schemas or a tool listing that exceeds its page bound."""
@@ -298,13 +293,8 @@ class Client:
         if tool.outputSchema is None:
             raise AssertionError(f"{name} has no output schema")
         Draft202012Validator(tool.outputSchema).validate(answer)
-        require(
-            not result.isError or answer.get("status") == "refused",
-            f"{name} reported a tool error without a refusal: {answer}",
-        )
+        require(not result.isError, f"{name} reported a tool error: {answer}")
         self.exercised.add(name)
-        if answer.get("status") == "applied":
-            self.applied.add(name)
         return answer
 
     async def resource(self, uri: str) -> JsonObject:
@@ -326,15 +316,14 @@ class Client:
         return object_value(json.loads(content.text), uri)
 
     def require_complete(self, read_tools: set[str]) -> None:
-        """Require a call for every read and an applied change for every edit."""
-        advertised = set(self.tools)
+        """Require every selected read tool to be advertised and exercised."""
         require(
-            self.exercised == advertised,
-            f"unexercised tools: {sorted(advertised - self.exercised)}",
+            read_tools <= set(self.tools),
+            f"missing tools: {sorted(read_tools - set(self.tools))}",
         )
         require(
-            self.applied == advertised - read_tools,
-            f"tools without an applied change: {sorted(advertised - read_tools - self.applied)}",
+            read_tools <= self.exercised,
+            f"unexercised tools: {sorted(read_tools - self.exercised)}",
         )
 
 

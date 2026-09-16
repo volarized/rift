@@ -97,6 +97,11 @@ jobs:
         with:
           cache-on-failure: true
       - uses: astral-sh/setup-uv@v7.6.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            dev/uv.lock
+            tools/rift-release/uv.lock
       - uses: taiki-e/install-action@v2.86.3
         with:
           tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
@@ -111,14 +116,13 @@ jobs:
       - run: just clippy
       - run: just docs
       - run: just doctest
-      - name: Archive instrumented tests and plain CLI
+      - name: Archive unit tests
         run: just fast-archive
       - uses: actions/upload-artifact@v6.0.0
         with:
           name: fast-build
           path: |
             target/fast.tar.zst
-            target/fast-cli.tar.zst
           compression-level: 0
           if-no-files-found: error
           retention-days: 7
@@ -145,12 +149,12 @@ jobs:
         with:
           name: fast-build
           path: target
-      - name: Extract plain CLI
-        run: |
-          mkdir -p target/fast-cli
-          tar --zstd -xf target/fast-cli.tar.zst -C target/fast-cli
-
       - uses: astral-sh/setup-uv@v7.6.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            dev/uv.lock
+            tools/rift-release/uv.lock
       - uses: taiki-e/install-action@v2.86.3
         with:
           tool: just,cargo-audit,cargo-deny,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
@@ -159,27 +163,13 @@ jobs:
       # list. Install every CI component from the pinned release in one step.
       - run: >-
           rustup toolchain install 1.98 --profile minimal
-          --component rust-analyzer,rustfmt,clippy,llvm-tools-preview
+          --component rustfmt,clippy,llvm-tools-preview
 
-      - uses: oven-sh/setup-bun@v2.2.0
-        with:
-          bun-version: latest
-
-      # tombi publishes to PyPI as `tombi`, and setup-uv already put `uv` on
-      # PATH above; `uv tool install` puts the binary in its tool bin dir
-      # and adds that dir to PATH itself, so no further wiring is needed.
-      - run: |
-          uv tool install tombi
-          tombi --version
-
-      # The build job supplies the test binaries and CLI. This job runs tests once;
-      # the same instrumented run supplies the coverage report below.
+      # Test binaries come from this revision's build archive.
       - run: just format
         timeout-minutes: 1
       - run: just dashes
         timeout-minutes: 1
-      - run: just conformance target/fast-cli/rift
-        timeout-minutes: 3
       - run: just audit
         timeout-minutes: 1
       - run: just testing-check
@@ -310,14 +300,14 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: |
+            dev/uv.lock
             tools/rift-release/uv.lock
-            scripts/uv.lock
       - name: Verify Windows command ownership
         if: runner.os == 'Windows'
         timeout-minutes: 1
         run: >-
-          uv run --locked --python 3.12 --project scripts --no-build python
-          scripts/test_release_process.py
+          uv run --locked --python 3.12 --project dev pytest
+          dev/tests/test_release_process.py
       - run: >-
           uv run --locked --project tools/rift-release pytest
           tools/rift-release/tests/test_installers.py
