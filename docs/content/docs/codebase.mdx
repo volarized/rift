@@ -54,8 +54,12 @@ the same syntax provider and compares adjacent symbol states, so a
 signature, or decorators, as well as its introduction or removal.
 
 [History reads](/docs/developer/architecture#history) follow the declaration's current path and stop
-at the configured revision bound. Git co-change correlation is not implemented: the current walk
-compares one symbol along one file's history.
+at the configured revision bound, comparing one declaration along one file's history.
+
+Two committed revisions compare through the same parse. Rift reads the paths they hold differently,
+parses each side with the file's syntax provider, and matches declarations across them. A
+[change comparison](/docs/mcp#search-change) then names changed declarations, where `git diff` names
+changed lines.
 
 ## Dependency source
 
