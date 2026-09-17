@@ -76,18 +76,42 @@ clean:
         fi
     done
 
-# Archive unit tests once; execution jobs reuse the compiled binaries.
+# Archive unit tests once; execution jobs reuse the compiled binaries. The
+# execution job's limit counts the transfer as well as the run, so the archive
+# carries less of both: the filterset leaves out the binaries `profile.ci`
+# never runs, and the compression level trades build time for bytes. Measured
+# over one revision, the two together take 1.161gb to 982mb, and level 9 costs
+# 17 seconds where level 19 costs six minutes for 15% more.
 fast-archive:
-    cargo llvm-cov nextest-archive --workspace --all-targets --all-features --locked --profile ci --archive-file target/fast.tar.zst
+    cargo llvm-cov nextest-archive --workspace --all-targets --all-features --locked --profile ci --archive-file target/fast.tar.zst --zstd-level 9 -E 'not binary(/^corpus_/) and not binary(/^live_/)'
+
+# The directory cargo-llvm-cov builds into and nextest extracts an archive into.
+# Nextest will not create it, so it exists before an archive run. Cargo writes a
+# target directory's `CACHEDIR.TAG` only when it creates that directory itself,
+# and cargo-llvm-cov refuses to clean stale objects out of one carrying no tag:
+# a report taken over an uncleaned directory counts every source file twice,
+# once from a stale object with no hits, and the floor fails on a green suite.
+[private]
+coverage-target:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target="${CARGO_LLVM_COV_TARGET_DIR:-target/llvm-cov-target}"
+    mkdir -p "$target"
+    tag="$target/CACHEDIR.TAG"
+    if [ ! -f "$tag" ]; then
+        {
+            echo "Signature: 8a477f597d28d172789f06886806bc55"
+            echo "# This file is a cache directory tag created by cargo."
+            echo "# For information about cache directory tags see https://bford.info/cachedir/"
+        } > "$tag"
+    fi
 
 # Unit tests use local fixtures and require no language servers or model downloads.
-test archive="":
-    mkdir -p "${CARGO_LLVM_COV_TARGET_DIR:-target/llvm-cov-target}"
+test archive="": coverage-target
     cargo llvm-cov nextest {{ if archive == "" { "--workspace --all-targets --all-features --locked" } else { "--archive-file " + quote(archive) + " --extract-overwrite --workspace-remap ." } }} --profile ci --no-tests fail --lcov --output-path lcov.info --fail-under-lines 86
 
 # Live integrations share the corpus archive and its optimized Cargo profile.
-live-test archive="":
-    mkdir -p "${CARGO_LLVM_COV_TARGET_DIR:-target/llvm-cov-target}"
+live-test archive="": coverage-target
     RIFT_ENGINE_LIVE=1 RIFT_SEARCH_LIVE=1 cargo llvm-cov nextest --no-report --profile integration --no-tests fail {{ if archive == "" { "--workspace --all-targets --all-features --locked --cargo-profile corpus" } else { "--archive-file " + quote(archive) + " --extract-overwrite --workspace-remap ." } }} -E 'binary(/^live_/) or test(/^live_/)'
 
 release-test:
@@ -110,8 +134,7 @@ integration-archive:
     tar --zstd -cf target/integration-cli.tar.zst -C target/corpus rift
     cargo llvm-cov nextest-archive --workspace --all-targets --all-features --locked --cargo-profile corpus --profile integration --archive-file target/integration.tar.zst
 
-corpus-test name test_name="" archive="":
-    mkdir -p "${CARGO_LLVM_COV_TARGET_DIR:-target/llvm-cov-target}"
+corpus-test name test_name="" archive="": coverage-target
     cargo llvm-cov nextest --no-report --profile corpus --no-tests fail --run-ignored all {{ if archive == "" { "--locked -p rift --test " + quote("corpus_" + name) + " --cargo-profile corpus" } else { "--archive-file " + quote(archive) + " --extract-overwrite --workspace-remap . -E " + quote("binary(=corpus_" + name + ")") } }} {{ if test_name == "" { "" } else { "-- --exact " + quote(test_name) } }}
 
 artifact-test *args:

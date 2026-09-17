@@ -10,6 +10,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
+from rift_dev.check_corpus import CLEANUP_RESERVE_SECONDS, Corpus
 from rift_dev.corpus_assertions import (
     PROBE_PATH,
     PROBE_SOURCE,
@@ -545,3 +546,29 @@ class PersistedContent(unittest.TestCase):
                     self.assertRaisesRegex(AssertionError, "row count"),
                 ):
                     lexical_content(root)
+
+
+class CaseBudgets(unittest.TestCase):
+    """A case stops its own actions before nextest ends the case."""
+
+    def test_the_work_budget_reserves_cleanup_inside_the_pinned_deadline(self) -> None:
+        for pin in pins().values():
+            with tempfile.TemporaryDirectory() as directory:
+                corpus = Corpus(
+                    pin,
+                    Path(directory) / "rift",
+                    Path(directory) / "report.json",
+                    case="stop" if pin.name == "bun" else "workspace",
+                )
+                budget = corpus.work_seconds()
+                self.assertLess(
+                    budget,
+                    pin.seconds,
+                    f"{pin.name}: the actions must stop before the case's deadline",
+                )
+                self.assertEqual(budget, pin.seconds - CLEANUP_RESERVE_SECONDS)
+                self.assertGreater(
+                    budget,
+                    pin.seconds / 2,
+                    f"{pin.name}: the reserve must not take the case's own time",
+                )

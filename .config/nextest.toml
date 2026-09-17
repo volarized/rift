@@ -8,14 +8,21 @@ slow-timeout = { period = "60s", terminate-after = 1, grace-period = "10s" }
 retries = 0
 leak-timeout = { period = "200ms", result = "fail" }
 
-# These suites start language engines or share the model download cache.
-# Nextest runs each test in a process, so an in-process mutex cannot serialize them.
+# These suites take a resource the machine holds once: the language engines and
+# the model download cache, and the loopback port range one elected server binds.
+# Nextest runs each test in a process, so an in-process mutex cannot serialize
+# them, and only a group keeps two of them off the resource at once.
 [test-groups]
 live = { max-threads = 1 }
+election = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = 'binary(/^live_/) or test(/^live_/)'
 test-group = 'live'
+
+[[profile.default.overrides]]
+filter = 'binary(=server_cli) or binary(=mcp_proxy) or binary(=end_to_end) or binary(=logs_resource)'
+test-group = 'election'
 
 [profile.ci]
 default-filter = "not binary(/^live_/) and not binary(/^corpus_/) and not test(/^live_/)"

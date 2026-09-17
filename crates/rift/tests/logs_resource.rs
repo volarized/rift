@@ -17,9 +17,7 @@ mod harness;
 #[expect(dead_code, reason = "shared end-to-end helper, used by sibling suites")]
 mod rust_engine;
 
-use harness::{
-    SERIAL, StopOnDrop, TestResult, proxy_client, require_success, run_rift, within, workspace,
-};
+use harness::{StopOnDrop, TestResult, proxy_client, require_success, run_rift, within, workspace};
 use rmcp::model::ReadResourceRequestParams;
 use serde_json::Value;
 
@@ -116,7 +114,6 @@ async fn awaited(transcript: &std::path::Path, needle: &str) -> bool {
 
 #[tokio::test]
 async fn the_proxy_lists_the_log_resource_and_its_templates() -> TestResult {
-    let _serial = SERIAL.lock().await;
     let directory = workspace()?;
     let _stop = StopOnDrop::new(directory.path());
     let client = proxy_client(directory.path()).await?;
@@ -155,7 +152,6 @@ async fn the_proxy_lists_the_log_resource_and_its_templates() -> TestResult {
 
 #[tokio::test]
 async fn a_served_workspace_records_its_own_startup() -> TestResult {
-    let _serial = SERIAL.lock().await;
     let directory = workspace()?;
     let _stop = StopOnDrop::new(directory.path());
     let client = proxy_client(directory.path()).await?;
@@ -176,7 +172,6 @@ async fn a_served_workspace_records_its_own_startup() -> TestResult {
 
 #[tokio::test]
 async fn a_component_read_returns_only_that_component() -> TestResult {
-    let _serial = SERIAL.lock().await;
     let directory = workspace()?;
     let _stop = StopOnDrop::new(directory.path());
     let client = proxy_client(directory.path()).await?;
@@ -193,7 +188,6 @@ async fn a_component_read_returns_only_that_component() -> TestResult {
 
 #[tokio::test]
 async fn the_logs_command_prints_the_recorded_set_oldest_first() -> TestResult {
-    let _serial = SERIAL.lock().await;
     let directory = workspace()?;
     let _stop = StopOnDrop::new(directory.path());
     let client = proxy_client(directory.path()).await?;
@@ -235,7 +229,6 @@ async fn the_logs_command_prints_the_recorded_set_oldest_first() -> TestResult {
 
 #[tokio::test]
 async fn the_logs_command_honors_its_tail_and_level() -> TestResult {
-    let _serial = SERIAL.lock().await;
     let directory = workspace()?;
     let _stop = StopOnDrop::new(directory.path());
     let client = proxy_client(directory.path()).await?;
@@ -275,7 +268,6 @@ async fn an_unrecorded_workspace_says_so_and_creates_no_state() -> TestResult {
 
 #[tokio::test]
 async fn a_followed_read_prints_a_record_the_server_writes_later() -> TestResult {
-    let _serial = SERIAL.lock().await;
     let directory = workspace()?;
     let _stop = StopOnDrop::new(directory.path());
     let client = proxy_client(directory.path()).await?;
