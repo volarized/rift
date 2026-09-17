@@ -3,7 +3,9 @@
 //! captures the configuration fingerprint beside the tree fingerprint on every request, and
 //! a mismatch triggers a full rebuild whose lexical commit lands before the rebuild
 //! publishes - so a single request issued after `rift.toml` names an exclusion already
-//! answers from the narrowed set.
+//! answers from the narrowed set. `[source].force_include` reaches the same path the other
+//! way: a file the workspace's `.gitignore` hides joins the index on the next request after
+//! the key lands, and `exclude` still decides over it.
 
 mod hermetic_search;
 
@@ -188,6 +190,100 @@ async fn force_include_still_reaches_a_file_source_exclude_dropped() -> TestResu
             .iter()
             .any(|hit| hit["path"] == json!("phantom_symbol.rs"))),
         "force_include must still reach a source-excluded file: {forced:#}"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// `[source].force_include` reaches a file the workspace's own `.gitignore` hides, through
+/// the same reconcile path `exclude` uses: the file is absent before the key lands and
+/// answers on the next request after it, with no server restart.
+///
+/// The assertions read hit paths rather than counts, for the reason the test above records:
+/// `rift.toml` is itself an indexed source file and spells the paths it names.
+#[tokio::test]
+async fn source_force_include_reaches_a_gitignored_file_on_the_next_request() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    fs::create_dir_all(directory.path().join("notes"))?;
+    fs::write(directory.path().join(".gitignore"), "notes/\n")?;
+    fs::write(
+        directory.path().join("notes/plan.txt"),
+        "Wandering falcon migrations chart northern coastal thermals precisely.\n",
+    )?;
+    fs::write(
+        directory.path().join("rift.toml"),
+        hermetic_search::SEMANTIC_DISABLED,
+    )?;
+    let client = client_for(directory.path()).await?;
+
+    let hidden = call(
+        &client,
+        "search",
+        json!({ "query": "wandering falcon migrations" }),
+    )
+    .await?;
+    assert!(
+        hidden["results"].as_array().is_some_and(|results| !results
+            .iter()
+            .any(|hit| hit["path"] == json!("notes/plan.txt"))),
+        "a gitignored file must stay out of the index before force_include names it: \
+         {hidden:#}"
+    );
+
+    let forcing_configuration = format!(
+        "{}\n[source]\nforce_include = [\"notes/**\"]\n",
+        hermetic_search::SEMANTIC_DISABLED
+    );
+    fs::write(directory.path().join("rift.toml"), forcing_configuration)?;
+
+    let reached = call(
+        &client,
+        "search",
+        json!({ "query": "wandering falcon migrations" }),
+    )
+    .await?;
+    assert!(
+        reached["results"].as_array().is_some_and(|results| results
+            .iter()
+            .any(|hit| hit["path"] == json!("notes/plan.txt"))),
+        "force_include must put the gitignored file in the index the next request reads: \
+         {reached:#}"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// `[source].exclude` decides before `[source].force_include`: both lists are the operator's
+/// own statement in one table, and the narrower one wins.
+#[tokio::test]
+async fn source_exclude_wins_over_source_force_include() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    fs::create_dir_all(directory.path().join("notes"))?;
+    fs::write(directory.path().join(".gitignore"), "notes/\n")?;
+    fs::write(
+        directory.path().join("notes/plan.txt"),
+        "Wandering falcon migrations chart northern coastal thermals precisely.\n",
+    )?;
+    let configuration = format!(
+        "{}\n[source]\nexclude = [\"notes/**\"]\nforce_include = [\"notes/**\"]\n",
+        hermetic_search::SEMANTIC_DISABLED
+    );
+    fs::write(directory.path().join("rift.toml"), configuration)?;
+    let client = client_for(directory.path()).await?;
+
+    let answer = call(
+        &client,
+        "search",
+        json!({ "query": "wandering falcon migrations" }),
+    )
+    .await?;
+    assert!(
+        answer["results"].as_array().is_some_and(|results| !results
+            .iter()
+            .any(|hit| hit["path"] == json!("notes/plan.txt"))),
+        "an excluded path stays out although force_include also names it: {answer:#}"
     );
 
     client.cancel().await?;

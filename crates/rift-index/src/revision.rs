@@ -211,7 +211,12 @@ impl RevisionPaths {
     pub fn build(root: &Path, visibility: &SourceVisibility) -> Result<Self, WorkspaceIndexError> {
         Ok(Self {
             root: root.to_path_buf(),
-            matcher: PathMatcher::build(root, visibility.include(), visibility.exclude())?,
+            matcher: PathMatcher::build_with_force_include(
+                root,
+                visibility.include(),
+                visibility.exclude(),
+                visibility.force_include(),
+            )?,
         })
     }
 
@@ -266,6 +271,23 @@ mod tests {
         fs::write(directory.path().join("README.txt"), "prose\n").expect("prose");
         commit_all(directory.path(), "introduce committed");
         directory
+    }
+
+    /// One predicate owns visibility, so a revision read keeps the paths
+    /// `force_include` names exactly as the current-tree walk does.
+    #[test]
+    fn test_revision_paths_keep_a_force_included_path_include_never_names() {
+        let directory = committed_workspace();
+        let visibility = SourceVisibility::new(vec!["src/**".to_owned()], Vec::new(), true)
+            .with_force_include(vec!["README.txt".to_owned()]);
+        let visible = RevisionPaths::build(directory.path(), &visibility).expect("visible paths");
+
+        assert!(visible.includes("src/lib.rs"));
+        assert!(
+            visible.includes("README.txt"),
+            "a force_include match needs no include match at a revision either"
+        );
+        assert!(!visible.includes("other.txt"));
     }
 
     fn open_head(root: &Path) -> (Repository, ResolvedRevision) {

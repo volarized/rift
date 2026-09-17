@@ -24,18 +24,28 @@ use rift_protocol::error::ErrorCode;
 pub struct SourceVisibility {
     include: Vec<String>,
     exclude: Vec<String>,
+    force_include: Vec<String>,
     respect_gitignore: bool,
 }
 
 impl SourceVisibility {
-    /// Builds one visibility policy from its three switches.
+    /// Builds one visibility policy from its three switches, reaching past `.gitignore`
+    /// nowhere. [`Self::with_force_include`] adds the globs that reach past it.
     #[must_use]
     pub const fn new(include: Vec<String>, exclude: Vec<String>, respect_gitignore: bool) -> Self {
         Self {
             include,
             exclude,
+            force_include: Vec::new(),
             respect_gitignore,
         }
+    }
+
+    /// Sets the globs whose matches stay visible although `.gitignore` hides them.
+    #[must_use]
+    pub fn with_force_include(mut self, force_include: Vec<String>) -> Self {
+        self.force_include = force_include;
+        self
     }
 
     /// Patterns a file must match to stay visible; empty includes every file.
@@ -48,6 +58,12 @@ impl SourceVisibility {
     #[must_use]
     pub fn exclude(&self) -> &[String] {
         &self.exclude
+    }
+
+    /// Patterns whose matches stay visible although `.gitignore` hides them.
+    #[must_use]
+    pub fn force_include(&self) -> &[String] {
+        &self.force_include
     }
 
     /// Whether the workspace's own `.gitignore` chain hides matching files.
@@ -74,6 +90,7 @@ impl From<&SourceConfiguration> for SourceVisibility {
             patterns(&source.exclude),
             source.respect_gitignore,
         )
+        .with_force_include(patterns(&source.force_include))
     }
 }
 
@@ -242,12 +259,14 @@ mod tests {
         let source = SourceConfiguration {
             include: vec![PathPattern("src/**".to_owned())],
             exclude: vec![PathPattern("src/generated/**".to_owned())],
+            force_include: vec![PathPattern("notes/**".to_owned())],
             respect_gitignore: false,
             ..SourceConfiguration::default()
         };
         let visibility = SourceVisibility::from(&source);
         assert_eq!(visibility.include(), ["src/**"]);
         assert_eq!(visibility.exclude(), ["src/generated/**"]);
+        assert_eq!(visibility.force_include(), ["notes/**"]);
         assert!(!visibility.respect_gitignore());
     }
 
@@ -274,6 +293,7 @@ mod tests {
         let visibility = SourceVisibility::default();
         assert!(visibility.include().is_empty());
         assert!(visibility.exclude().is_empty());
+        assert!(visibility.force_include().is_empty());
         assert!(visibility.respect_gitignore());
     }
 

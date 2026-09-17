@@ -9,7 +9,49 @@ use ignore::overrides::{Override, OverrideBuilder};
 
 use crate::workspace::{WorkspaceIndexError, WorkspaceIndexViolation, index_error_caused_by};
 
-/// Compiled include/exclude glob matcher over paths below one root.
+/// What the `[source]` globs say about one path, in the table's own precedence order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathVerdict {
+    /// `exclude` matched, so the path is dropped whatever else also matched it.
+    Excluded,
+    /// `force_include` matched, so the path stays visible although `.gitignore` hides it.
+    ForceIncluded,
+    /// Nothing dropped the path, and `include` left it standing.
+    Included,
+    /// A configured `include` matched nothing on this path.
+    NotIncluded,
+}
+
+/// The directories a `force_include` glob can reach, owned so a walk filter can carry them.
+#[derive(Debug, Clone)]
+pub struct ForceIncludeReach {
+    root: PathBuf,
+    prefixes: Vec<PathBuf>,
+}
+
+impl ForceIncludeReach {
+    /// Whether no `force_include` pattern is configured, so no walk has to run for one.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.prefixes.is_empty()
+    }
+
+    /// Whether one directory can hold a path a `force_include` pattern matches. A prefix
+    /// the directory is still above answers true, so the walk descends toward it.
+    #[must_use]
+    pub fn reaches(&self, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        self.prefixes.iter().any(|prefix| {
+            prefix.as_os_str().is_empty()
+                || relative.starts_with(prefix)
+                || prefix.starts_with(relative)
+        })
+    }
+}
+
+/// Compiled include/exclude/force-include glob matcher over paths below one root.
 #[derive(Debug)]
 pub struct PathMatcher {
     root: PathBuf,
@@ -17,11 +59,13 @@ pub struct PathMatcher {
     include_prefixes: Vec<PathBuf>,
     exclude: Option<Override>,
     excluded_subtree_prefixes: Vec<PathBuf>,
+    force_include: Option<Override>,
+    force_include_reach: ForceIncludeReach,
 }
 
 impl PathMatcher {
-    /// Compiles `include` and `exclude` glob lists rooted at `root`. Empty `include` includes
-    /// every path; a path matching `exclude` is dropped even where `include` also matched it.
+    /// Compiles `include` and `exclude` glob lists rooted at `root`, reaching past
+    /// `.gitignore` nowhere. [`Self::build_with_force_include`] compiles the reaching list too.
     ///
     /// # Errors
     ///
@@ -30,6 +74,22 @@ impl PathMatcher {
         root: &Path,
         include: &[String],
         exclude: &[String],
+    ) -> Result<Self, WorkspaceIndexError> {
+        Self::build_with_force_include(root, include, exclude, &[])
+    }
+
+    /// Compiles all three glob lists rooted at `root`. Empty `include` includes every path;
+    /// `exclude` drops a path whatever else matched it; `force_include` keeps a path without
+    /// an `include` match, and [`PathVerdict`] states the order the three decide in.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] when a pattern is not a valid glob.
+    pub fn build_with_force_include(
+        root: &Path,
+        include: &[String],
+        exclude: &[String],
+        force_include: &[String],
     ) -> Result<Self, WorkspaceIndexError> {
         Ok(Self {
             root: root.to_path_buf(),
@@ -43,22 +103,61 @@ impl PathMatcher {
                 .iter()
                 .filter_map(|pattern| excluded_subtree_prefix(pattern))
                 .collect(),
+            force_include: compiled_override(root, force_include)?,
+            force_include_reach: ForceIncludeReach {
+                root: root.to_path_buf(),
+                prefixes: force_include
+                    .iter()
+                    .map(|pattern| literal_prefix(pattern))
+                    .collect(),
+            },
         })
     }
 
-    /// Whether `path` passes: included whenever `include` is configured, and not dropped by
-    /// `exclude`.
+    /// The directories this matcher's `force_include` patterns can reach, owned so a walk
+    /// filter can carry them.
+    #[must_use]
+    pub fn force_include_reach(&self) -> ForceIncludeReach {
+        self.force_include_reach.clone()
+    }
+
+    /// Whether one directory can hold a path a `force_include` pattern matches.
+    #[must_use]
+    pub fn force_include_reaches(&self, path: &Path) -> bool {
+        self.force_include_reach.reaches(path)
+    }
+
+    /// What the three glob lists say about `path`, in the order they decide in.
+    #[must_use]
+    pub fn verdict(&self, path: &Path) -> PathVerdict {
+        let dropped = self
+            .exclude
+            .as_ref()
+            .is_some_and(|overrides| matches(overrides, path));
+        if dropped {
+            return PathVerdict::Excluded;
+        }
+        let forced = self
+            .force_include
+            .as_ref()
+            .is_some_and(|overrides| matches(overrides, path));
+        if forced {
+            return PathVerdict::ForceIncluded;
+        }
+        match &self.include {
+            Some(overrides) if !matches(overrides, path) => PathVerdict::NotIncluded,
+            _ => PathVerdict::Included,
+        }
+    }
+
+    /// Whether `path` passes the `[source]` globs alone, with `.gitignore` not consulted:
+    /// [`PathVerdict::Included`] or [`PathVerdict::ForceIncluded`].
     #[must_use]
     pub fn includes(&self, path: &Path) -> bool {
-        let included = match &self.include {
-            Some(overrides) => matches(overrides, path),
-            None => true,
-        };
-        let dropped = match &self.exclude {
-            Some(overrides) => matches(overrides, path),
-            None => false,
-        };
-        included && !dropped
+        matches!(
+            self.verdict(path),
+            PathVerdict::Included | PathVerdict::ForceIncluded
+        )
     }
 
     /// Whether one directory can contain a path this matcher includes.
@@ -67,12 +166,16 @@ impl PathMatcher {
         let Ok(relative) = path.strip_prefix(&self.root) else {
             return false;
         };
-        let included = self.include_prefixes.is_empty()
-            || self.include_prefixes.iter().any(|prefix| {
+        let reaches = |prefixes: &[PathBuf]| {
+            prefixes.iter().any(|prefix| {
                 prefix.as_os_str().is_empty()
                     || relative.starts_with(prefix)
                     || prefix.starts_with(relative)
-            });
+            })
+        };
+        let included = self.include_prefixes.is_empty()
+            || reaches(&self.include_prefixes)
+            || self.force_include_reach.reaches(path);
         let dropped = self
             .excluded_subtree_prefixes
             .iter()
@@ -228,6 +331,85 @@ mod tests {
         assert!(matcher.includes(&candidate));
         let excluded = root.join("other.rs");
         assert!(!matcher.includes(&excluded));
+    }
+
+    #[test]
+    fn test_verdict_follows_the_source_table_precedence() {
+        let root = Path::new("/workspace");
+        let matcher = PathMatcher::build_with_force_include(
+            root,
+            &["src/**".to_owned()],
+            &["notes/secret/**".to_owned()],
+            &["notes/**".to_owned()],
+        )
+        .expect("valid globs");
+
+        assert_eq!(
+            matcher.verdict(Path::new("/workspace/notes/secret/key.txt")),
+            PathVerdict::Excluded,
+            "exclude decides before force_include"
+        );
+        assert_eq!(
+            matcher.verdict(Path::new("/workspace/notes/plan.txt")),
+            PathVerdict::ForceIncluded,
+            "force_include keeps a path include never named"
+        );
+        assert_eq!(
+            matcher.verdict(Path::new("/workspace/src/lib.rs")),
+            PathVerdict::Included
+        );
+        assert_eq!(
+            matcher.verdict(Path::new("/workspace/other.rs")),
+            PathVerdict::NotIncluded
+        );
+    }
+
+    #[test]
+    fn test_includes_keeps_a_force_included_path() {
+        let root = Path::new("/workspace");
+        let matcher = PathMatcher::build_with_force_include(
+            root,
+            &["src/**".to_owned()],
+            &[],
+            &["notes/**".to_owned()],
+        )
+        .expect("valid globs");
+        assert!(matcher.includes(Path::new("/workspace/notes/plan.txt")));
+        assert!(matcher.may_include_descendant(Path::new("/workspace/notes")));
+    }
+
+    #[test]
+    fn test_force_include_reach_covers_its_prefixes_alone() {
+        let root = Path::new("/workspace");
+        let matcher =
+            PathMatcher::build_with_force_include(root, &[], &[], &["notes/**".to_owned()])
+                .expect("valid glob");
+        let reach = matcher.force_include_reach();
+
+        assert!(!reach.is_empty());
+        assert!(reach.reaches(root), "the walk starts at the root");
+        assert!(reach.reaches(Path::new("/workspace/notes")));
+        assert!(reach.reaches(Path::new("/workspace/notes/deep/plan.txt")));
+        assert!(!reach.reaches(Path::new("/workspace/node_modules")));
+        assert!(!reach.reaches(Path::new("/elsewhere/notes")));
+    }
+
+    #[test]
+    fn test_force_include_reach_is_empty_without_patterns() {
+        let root = Path::new("/workspace");
+        let matcher = PathMatcher::build(root, &[], &[]).expect("valid globs");
+        assert!(matcher.force_include_reach().is_empty());
+    }
+
+    #[test]
+    fn test_invalid_force_include_glob_refuses_with_source_pattern_invalid() {
+        let root = Path::new("/workspace");
+        let error = PathMatcher::build_with_force_include(root, &[], &[], &["[".to_owned()])
+            .expect_err("an unclosed character class must be refused");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::SourcePatternInvalid
+        );
     }
 
     #[test]

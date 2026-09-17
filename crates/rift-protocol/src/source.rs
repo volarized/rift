@@ -42,6 +42,11 @@ pub struct SourceConfiguration {
     /// here is dropped even when `include` also matches it.
     #[schemars(length(max = 512))]
     pub exclude: Vec<PathPattern>,
+    /// Exact file paths or globs that stay visible although the workspace's `.gitignore`
+    /// hides them, in [`PathPattern`] syntax. A match here needs no `include` match, and a
+    /// match `exclude` also names is still dropped.
+    #[schemars(length(max = 512))]
+    pub force_include: Vec<PathPattern>,
     /// Whether the workspace's own `.gitignore` files, root and nested, hide the paths they
     /// match. Global and parent-directory gitignore sources are never read.
     pub respect_gitignore: bool,
@@ -61,6 +66,7 @@ impl Default for SourceConfiguration {
         Self {
             include: Vec::new(),
             exclude: Vec::new(),
+            force_include: Vec::new(),
             respect_gitignore: true,
             files: default_source_files(),
             workspace_size: default_source_workspace_size(),
@@ -224,7 +230,39 @@ mod tests {
             vec![PathPattern("**/generated/**".to_owned())]
         );
         assert!(!configuration.source.respect_gitignore);
+        assert!(configuration.source.force_include.is_empty());
         assert_eq!(configuration.validate(), Ok(()));
+    }
+
+    #[test]
+    fn test_source_configuration_parses_force_include_globs() {
+        let configuration: WorkspaceConfiguration = serde_json::from_value(json!({
+            "source": {
+                "force_include": [".plans/**"],
+            }
+        }))
+        .expect("a force_include list must parse");
+        assert_eq!(
+            configuration.source.force_include,
+            vec![PathPattern(".plans/**".to_owned())]
+        );
+        assert!(
+            configuration.source.respect_gitignore,
+            "reaching past one gitignored subtree does not turn the chain off"
+        );
+        assert_eq!(configuration.validate(), Ok(()));
+    }
+
+    #[test]
+    fn test_source_schema_advertises_the_force_include_bound() {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let table = &schema["$defs"]["SourceConfiguration"]["properties"];
+        assert_eq!(
+            table["force_include"]["maxItems"], table["include"]["maxItems"],
+            "the three glob lists carry one bound"
+        );
+        assert_eq!(table["force_include"]["default"], json!([]));
     }
 
     #[test]

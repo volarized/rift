@@ -22,7 +22,7 @@ pub use dependency::{
     PackageFiles, PackageIndex, PackageIndexError, PackageIndexFault, PackageIndexViolation,
     PackageSelection, SkippedPackage, WALK_ENTRIES_MAX_DEFAULT, package_files,
 };
-pub use glob::PathMatcher;
+pub use glob::{ForceIncludeReach, PathMatcher, PathVerdict};
 pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
 pub use lexical::{
     LexicalChange, LexicalIndexError, LexicalIndexFault, LexicalIndexLimits, LexicalIndexViolation,
