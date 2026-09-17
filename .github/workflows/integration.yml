@@ -33,12 +33,21 @@ jobs:
       - name: Build and archive integrations
         timeout-minutes: 38
         run: just integration-archive
+      # Two artifacts, because the two consumers need different bytes: the
+      # corpus jobs run the instrumented archive, and the artifact job serves
+      # the plain CLI. One artifact made the artifact job download an archive
+      # it never opens.
       - uses: actions/upload-artifact@v6.0.0
         with:
-          name: integration-build
-          path: |
-            target/integration.tar.zst
-            target/integration-cli.tar.zst
+          name: integration-archive
+          path: target/integration.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@v6.0.0
+        with:
+          name: integration-cli
+          path: target/integration-cli.tar.zst
           compression-level: 0
           if-no-files-found: error
           retention-days: 7
@@ -81,7 +90,7 @@ jobs:
           cache-dependency-glob: dev/uv.lock
       - uses: actions/download-artifact@v7.0.0
         with:
-          name: integration-build
+          name: integration-archive
           path: target
       - uses: taiki-e/install-action@v2.86.3
         with:
@@ -134,7 +143,9 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-  live:
+  # The supplied binary serves real requests: the artifact and agent checks, the
+  # MCP conformance runner, and cold first use in a container.
+  artifact:
     needs: integration-build
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -144,7 +155,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v7.0.0
         with:
-          name: integration-build
+          name: integration-cli
           path: target
       - uses: astral-sh/setup-uv@v7.6.0
         with:
@@ -152,26 +163,20 @@ jobs:
           cache-dependency-glob: dev/uv.lock
       - uses: taiki-e/install-action@v2.86.3
         with:
-          tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
-      - run: rustup component add llvm-tools-preview rust-analyzer
+          tool: just
+      # The conformance runner is a Bun package; the checks around it drive the
+      # supplied binary through the Python harness. None of them compiles Rust,
+      # and none starts an external language engine: the agent checks use the
+      # embedded `ty`, and the cold container is meant to have no engine at all.
       - uses: oven-sh/setup-bun@v2.2.0
         with:
           bun-version: latest
       - uses: actions/cache@v6.1.0
         with:
-          path: |
-            ~/.bun/install/cache
-            ~/.cache/huggingface/hub
-          key: integration-dependencies-${{ runner.os }}-${{ hashFiles('dev/uv.lock', 'Cargo.lock', 'tools/mcp-conformance/bun.lock') }}
-          restore-keys: integration-dependencies-${{ runner.os }}-
+          path: ~/.bun/install/cache
+          key: conformance-${{ runner.os }}-${{ hashFiles('tools/mcp-conformance/bun.lock') }}
+          restore-keys: conformance-${{ runner.os }}-
       - run: uv sync --locked --python 3.12 --project dev
-      - run: uv tool install tombi
-      - name: Run live integrations
-        id: live
-        run: just live-test target/integration.tar.zst
-      - name: Report integration coverage
-        if: ${{ !cancelled() && steps.live.outcome != 'skipped' }}
-        run: cargo llvm-cov report --nextest-archive-file target/integration.tar.zst --lcov --output-path target/integration.lcov
       - name: Extract compiled CLI
         run: |
           mkdir -p target/integration-cli
@@ -183,22 +188,11 @@ jobs:
           just conformance target/integration-cli/rift
       - name: Validate cold first use
         run: just coldstart-test --binary target/integration-cli/rift --junit target/integration/coldstart.xml
-      - uses: codecov/codecov-action@v5.5.5
-        if: ${{ !cancelled() && steps.live.outcome != 'skipped' }}
-        with:
-          disable_search: true
-          fail_ci_if_error: true
-          files: target/integration.lcov
-          flags: integration
-          token: ${{ secrets.CODECOV_TOKEN }}
       - uses: actions/upload-artifact@v6.0.0
         if: always()
         with:
-          name: integration-results
-          path: |
-            target/integration/
-            target/integration.lcov
-            target/nextest/integration/junit.xml
+          name: artifact-results
+          path: target/integration/
           if-no-files-found: error
           retention-days: 7
 

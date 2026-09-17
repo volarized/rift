@@ -25,9 +25,8 @@ JUSTFILE = REPOSITORY / "justfile"
 # The archive the integration jobs run from names the test targets it carries.
 ARCHIVED_TARGET = re.compile(r"--test\s+([a-z0-9_]+)")
 
-# `profile.integration` selects a binary by name, and a test inside any binary by
-# the test's own name.
-INTEGRATION_BINARY_PREFIXES = ("live_", "corpus_")
+# The live profile selects a binary by name, and a test inside any binary by the
+# test's own name.
 INTEGRATION_TEST = re.compile(
     r"#\[(?:tokio::)?test[^\]]*\]\s*(?:pub\s+)?(?:async\s+)?fn\s+(live_[a-z0-9_]*)"
 )
@@ -131,60 +130,63 @@ def suites_taking_the_election() -> set[str]:
     return taking
 
 
-def archived_integration_targets() -> set[str]:
+def recipe_body(name: str) -> str:
+    """One justfile recipe's body."""
+    return JUSTFILE.read_text(encoding="utf-8").split(f"\n{name}:")[1].split("\n\n")[0]
+
+
+def archived_corpus_targets() -> set[str]:
     """The test targets `just integration-archive` builds into its archive."""
-    recipe = JUSTFILE.read_text(encoding="utf-8").split("\nintegration-archive:")[1]
-    return set(ARCHIVED_TARGET.findall(recipe.split("\n\n")[0]))
+    return set(ARCHIVED_TARGET.findall(recipe_body("integration-archive")))
 
 
-def suites_the_integration_profile_runs() -> set[str]:
-    """Every test binary `profile.integration` selects, by binary or by test name."""
-    selected: set[str] = set()
+def suites(selected: str) -> set[str]:
+    """Every test binary a profile selects: one whose name carries the prefix,
+    and, for the live profile, one holding a test named for it."""
+    found: set[str] = set()
     for directory in sorted(REPOSITORY.glob("crates/*/tests")):
         for path in sorted(directory.glob("*.rs")):
             source = path.read_text(encoding="utf-8")
             if not TEST_ATTRIBUTE.search(source):
                 continue
-            if path.stem.startswith(
-                INTEGRATION_BINARY_PREFIXES
-            ) or INTEGRATION_TEST.search(source):
-                selected.add(path.stem)
-    return selected
+            named = path.stem.startswith(selected)
+            holds = selected == "live_" and INTEGRATION_TEST.search(source)
+            if named or holds:
+                found.add(path.stem)
+    return found
 
 
-class IntegrationArchive(unittest.TestCase):
-    """The archive carries every suite the integration profile runs.
+class ArchivedSuites(unittest.TestCase):
+    """Each archive carries the suites its own profile runs.
 
-    The archive names its targets, and the profile selects them by two rules: a
-    binary whose name begins `live_` or `corpus_`, and a test whose own name
-    begins `live_` inside any binary. A suite the second rule reaches and the
-    archive leaves out stops running with nothing to say so.
+    The corpus suites need the optimized build and travel in the integration
+    archive; the live suites read the same build the unit suites do and travel
+    in the fast archive. A suite selected by a profile whose archive leaves it
+    out stops running with nothing to say so, which is why the live profile's
+    second rule - a test named `live_` inside any binary - is checked too.
     """
 
-    def test_the_archive_carries_every_suite_the_profile_selects(self) -> None:
-        archived = archived_integration_targets()
-        selected = suites_the_integration_profile_runs()
-        self.assertTrue(selected, "no suite reaches the integration profile")
-        self.assertEqual(
-            sorted(selected - archived),
-            [],
-            "the integration archive leaves out suites its profile runs: "
-            f"{sorted(selected - archived)}",
+    def test_the_integration_archive_carries_exactly_the_corpus_suites(self) -> None:
+        archived = archived_corpus_targets()
+        corpus = suites("corpus_")
+        self.assertTrue(corpus, "no corpus suite exists")
+        self.assertEqual(sorted(archived), sorted(corpus))
+
+    def test_the_fast_archive_keeps_every_suite_the_live_profile_runs(self) -> None:
+        body = recipe_body("fast-archive")
+        live = suites("live_")
+        self.assertTrue(live, "no live suite exists")
+        self.assertIn("not binary(/^corpus_/)", body)
+        self.assertNotIn(
+            "live_",
+            body,
+            "the fast archive is what the live suites run from, so its filterset "
+            f"leaves none of them out: {sorted(live)}",
         )
 
-    def test_the_archive_carries_no_suite_the_profile_never_runs(self) -> None:
-        archived = archived_integration_targets()
-        selected = suites_the_integration_profile_runs()
-        self.assertEqual(
-            sorted(archived - selected),
-            [],
-            "the integration archive builds suites its profile never runs: "
-            f"{sorted(archived - selected)}",
-        )
-
-    def test_no_library_test_reaches_the_integration_profile(self) -> None:
-        """The archive names no `--lib` target, so a `live_` test in a library
-        would be selected by the profile and absent from the archive."""
+    def test_no_library_test_reaches_the_live_profile(self) -> None:
+        """No archive names a `--lib` target, so a `live_` test in a library
+        would be selected by the profile and absent from every archive."""
         offenders = [
             f"{path.relative_to(REPOSITORY)}::{name}"
             for path in sorted(REPOSITORY.glob("crates/*/src/**/*.rs"))
@@ -193,7 +195,7 @@ class IntegrationArchive(unittest.TestCase):
         self.assertEqual(
             offenders,
             [],
-            f"a library test named `live_` never reaches the archive: {offenders}",
+            f"a library test named `live_` never reaches an archive: {offenders}",
         )
 
 

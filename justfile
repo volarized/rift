@@ -76,14 +76,14 @@ clean:
         fi
     done
 
-# Archive unit tests once; execution jobs reuse the compiled binaries. The
-# execution job's limit counts the transfer as well as the run, so the archive
-# carries less of both: the filterset leaves out the binaries `profile.ci`
-# never runs, and the compression level trades build time for bytes. Measured
-# over one revision, the two together take 1.161gb to 982mb, and level 9 costs
-# 17 seconds where level 19 costs six minutes for 15% more.
+# Archive the unit and live suites once; both execution jobs reuse these
+# binaries. The execution job's limit counts the transfer as well as the run, so
+# the archive carries less of both: the filterset leaves out the corpus binaries,
+# which only the corpus profile runs and which need the optimized build, and the
+# compression level trades build time for bytes. Measured over one revision,
+# level 9 costs 17 seconds where level 19 costs six minutes for 15% more.
 fast-archive:
-    cargo llvm-cov nextest-archive --workspace --all-targets --all-features --locked --profile ci --archive-file target/fast.tar.zst --zstd-level 9 -E 'not binary(/^corpus_/) and not binary(/^live_/)'
+    cargo llvm-cov nextest-archive --workspace --all-targets --all-features --locked --profile ci --archive-file target/fast.tar.zst --zstd-level 9 -E 'not binary(/^corpus_/)'
 
 # The directory cargo-llvm-cov builds into and nextest extracts an archive into.
 # Nextest will not create it, so it exists before an archive run. Cargo writes a
@@ -111,8 +111,11 @@ test archive="": coverage-target
     cargo llvm-cov nextest {{ if archive == "" { "--workspace --all-targets --all-features --locked" } else { "--archive-file " + quote(archive) + " --extract-overwrite --workspace-remap ." } }} --profile ci --no-tests fail --lcov --output-path lcov.info --fail-under-lines 86
 
 # Live integrations share the corpus archive and its optimized Cargo profile.
+# The live suites drive real language engines. They read the same build the unit
+# suites do, so they reuse the fast archive instead of an optimized build of
+# their own: what they exercise is the engine, not the speed of Rift's own code.
 live-test archive="": coverage-target
-    RIFT_ENGINE_LIVE=1 RIFT_SEARCH_LIVE=1 cargo llvm-cov nextest --no-report --profile integration --no-tests fail {{ if archive == "" { "--workspace --all-targets --all-features --locked --cargo-profile corpus" } else { "--archive-file " + quote(archive) + " --extract-overwrite --workspace-remap ." } }} -E 'binary(/^live_/) or test(/^live_/)'
+    RIFT_ENGINE_LIVE=1 RIFT_SEARCH_LIVE=1 cargo llvm-cov nextest --profile live --no-tests fail {{ if archive == "" { "--workspace --all-targets --all-features --locked" } else { "--archive-file " + quote(archive) + " --extract-overwrite --workspace-remap ." } }} --lcov --output-path target/live.lcov
 
 release-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_release.py
@@ -129,15 +132,15 @@ corpus-sync name="":
     uv run --locked --python 3.12 --project dev rift-dev corpus sync {{ if name == "" { "" } else { quote(name) } }}
 
 # One archive supplies every integration job. Save the plain CLI before test builds.
-# The archive carries the targets `profile.integration` runs and no others:
-# `--all-targets` compiled and linked every test binary in the workspace, and each
-# one links the whole workspace. `mcp_proxy` is named for the `live_` test it
-# holds, which the profile selects by test name rather than by binary;
-# `dev/tests/test_delivery.py` refuses a selection that leaves such a binary out.
+# The archive carries the corpus suites and nothing else. `--all-targets` built
+# and linked every test binary in the workspace, and each one links the whole
+# workspace; the live suites moved to the fast archive, which is built once for
+# every pull request. `dev/tests/test_delivery.py` refuses a selection that
+# leaves out a suite the corpus profile runs.
 integration-archive:
     cargo build --locked --profile corpus -p rift
     tar --zstd -cf target/integration-cli.tar.zst -C target/corpus rift
-    cargo llvm-cov nextest-archive --workspace --all-features --locked --cargo-profile corpus --profile integration --archive-file target/integration.tar.zst --test corpus_bun --test corpus_fastapi --test corpus_nextjs --test mcp_proxy --test live_rust_analyzer --test live_typescript --test live_semantic_search
+    cargo llvm-cov nextest-archive --workspace --all-features --locked --cargo-profile corpus --profile corpus --archive-file target/integration.tar.zst --test corpus_bun --test corpus_fastapi --test corpus_nextjs
 
 corpus-test name test_name="" archive="": coverage-target
     cargo llvm-cov nextest --no-report --profile corpus --no-tests fail --run-ignored all {{ if archive == "" { "--locked -p rift --test " + quote("corpus_" + name) + " --cargo-profile corpus" } else { "--archive-file " + quote(archive) + " --extract-overwrite --workspace-remap . -E " + quote("binary(=corpus_" + name + ")") } }} {{ if test_name == "" { "" } else { "-- --exact " + quote(test_name) } }}

@@ -55,11 +55,11 @@ slow-timeout = { period = "720s", terminate-after = 1, grace-period = "30s" }
 [profile.corpus.junit]
 path = "junit.xml"
 
-[profile.integration]
-default-filter = "binary(/^live_/) or binary(/^corpus_/) or test(/^live_/)"
+[profile.live]
+default-filter = "binary(/^live_/) or test(/^live_/)"
 global-timeout = "19m"
 fail-fast = false
 failure-output = "immediate-final"
 
-[profile.integration.junit]
+[profile.live.junit]
 path = "junit.xml"
