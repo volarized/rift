@@ -82,6 +82,7 @@ fn table(script: String, languages: &[&str]) -> ProcessFixture {
         initialization_options: None,
         startup_timeout: Duration::from_millis(10_000),
         request_timeout: Duration::from_millis(10_000),
+        settle_delay: Duration::from_millis(500),
         output_limit: ByteSize::from_bytes(4_096),
         retry: RetryPolicy::default(),
         restart: RestartPolicy::default(),

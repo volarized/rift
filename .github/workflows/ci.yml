@@ -252,6 +252,63 @@ jobs:
           report_type: test_results
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  # The live suites drive real language engines: rust-analyzer, the TypeScript
+  # server Bun installs, and the model hub the semantic tier reads. They run
+  # against the same build the unit suites do, so they reuse that archive rather
+  # than compiling an optimized one of their own - what they exercise is the
+  # engine integration, and any pull request can break it.
+  #
+  # They report no coverage, so `rust` remains the one job uploading a coverage
+  # report for a pull request. See the note in `codecov.yml`.
+  live:
+    needs: rust-build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Require successful build
+        if: ${{ !cancelled() && needs.rust-build.result != 'success' }}
+        run: |
+          echo "::error::Rust build did not succeed"
+          exit 1
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v7.0.0
+        with:
+          name: fast-build
+          path: target
+      - uses: taiki-e/install-action@v2.86.3
+        with:
+          tool: just,cargo-nextest@0.9.140
+      - run: >-
+          rustup toolchain install 1.98 --profile minimal
+          --component rust-analyzer
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: latest
+      - uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.bun/install/cache
+            ~/.cache/huggingface/hub
+          key: live-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: live-${{ runner.os }}-
+      - name: Run live engines
+        id: live
+        timeout-minutes: 15
+        run: just live-test target/fast.tar.zst
+      - uses: actions/upload-artifact@v6.0.0
+        if: ${{ !cancelled() && steps.live.outcome != 'skipped' }}
+        with:
+          name: live-results
+          path: |
+            target/nextest/live/junit.xml
+          if-no-files-found: error
+          retention-days: 7
+
   # Feature resolution is per target: a dependency graph that compiles on
   # Linux proves nothing about the Windows graph (v0.0.2 shipped a Windows
   # build break CI never saw). Every OS in the release build matrix needs a

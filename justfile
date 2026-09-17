@@ -76,19 +76,56 @@ clean:
         fi
     done
 
-# Archive unit tests once; execution jobs reuse the compiled binaries.
+# Archive the unit and live suites once; both execution jobs reuse these
+# binaries. The execution job's limit counts the transfer as well as the run, so
+# the archive carries less of both: the filterset leaves out the corpus binaries,
+# which only the corpus profile runs and which need the optimized build, and the
+# compression level trades build time for bytes. Measured over one revision,
+# level 9 costs 17 seconds where level 19 costs six minutes for 15% more.
 fast-archive:
-    cargo llvm-cov nextest-archive --workspace --all-targets --all-features --locked --profile ci --archive-file target/fast.tar.zst
+    cargo llvm-cov nextest-archive --workspace --all-targets --all-features --locked --profile ci --archive-file target/fast.tar.zst --zstd-level 9 -E 'not binary(/^corpus_/)'
+
+# The directory cargo-llvm-cov builds into and nextest extracts an archive into.
+# Nextest will not create it, so it exists before an archive run. Cargo writes a
+# target directory's `CACHEDIR.TAG` only when it creates that directory itself,
+# and cargo-llvm-cov refuses to clean stale objects out of one carrying no tag:
+# a report taken over an uncleaned directory counts every source file twice,
+# once from a stale object with no hits, and the floor fails on a green suite.
+[private]
+coverage-target:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target="${CARGO_LLVM_COV_TARGET_DIR:-target/llvm-cov-target}"
+    mkdir -p "$target"
+    tag="$target/CACHEDIR.TAG"
+    if [ ! -f "$tag" ]; then
+        {
+            echo "Signature: 8a477f597d28d172789f06886806bc55"
+            echo "# This file is a cache directory tag created by cargo."
+            echo "# For information about cache directory tags see https://bford.info/cachedir/"
+        } > "$tag"
+    fi
 
 # Unit tests use local fixtures and require no language servers or model downloads.
-test archive="":
-    mkdir -p "${CARGO_LLVM_COV_TARGET_DIR:-target/llvm-cov-target}"
+test archive="": coverage-target
     cargo llvm-cov nextest {{ if archive == "" { "--workspace --all-targets --all-features --locked" } else { "--archive-file " + quote(archive) + " --extract-overwrite --workspace-remap ." } }} --profile ci --no-tests fail --lcov --output-path lcov.info --fail-under-lines 86
 
-# Live integrations share the corpus archive and its optimized Cargo profile.
-live-test archive="":
-    mkdir -p "${CARGO_LLVM_COV_TARGET_DIR:-target/llvm-cov-target}"
-    RIFT_ENGINE_LIVE=1 RIFT_SEARCH_LIVE=1 cargo llvm-cov nextest --no-report --profile integration --no-tests fail {{ if archive == "" { "--workspace --all-targets --all-features --locked --cargo-profile corpus" } else { "--archive-file " + quote(archive) + " --extract-overwrite --workspace-remap ." } }} -E 'binary(/^live_/) or test(/^live_/)'
+# The live suites drive real language engines. They read the same build the unit
+# suites do, so they reuse the fast archive instead of an optimized build of
+# their own: what they exercise is the engine, not the speed of Rift's own code.
+#
+# They report no coverage. Measured against the unit report on one tree, the eight
+# live tests reach three lines it does not, out of 78,757, so the report they add
+# is a workspace-wide one whose lines are almost all zero. Uploading it made a
+# pull request's patch figure read from whichever job reported first.
+# Nextest extracts an archive into a directory it opens rather than creates, and a
+# missing one refuses the run with exit code 96.
+[private]
+live-archive-target:
+    mkdir -p target/live-archive
+
+live-test archive="": live-archive-target
+    RIFT_ENGINE_LIVE=1 RIFT_SEARCH_LIVE=1 cargo nextest run --profile live --no-tests fail {{ if archive == "" { "--workspace --all-targets --all-features --locked" } else { "--archive-file " + quote(archive) + " --extract-to target/live-archive --extract-overwrite --workspace-remap ." } }}
 
 release-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_release.py
@@ -105,13 +142,17 @@ corpus-sync name="":
     uv run --locked --python 3.12 --project dev rift-dev corpus sync {{ if name == "" { "" } else { quote(name) } }}
 
 # One archive supplies every integration job. Save the plain CLI before test builds.
+# The archive carries the corpus suites and nothing else. `--all-targets` built
+# and linked every test binary in the workspace, and each one links the whole
+# workspace; the live suites moved to the fast archive, which is built once for
+# every pull request. `dev/tests/test_delivery.py` refuses a selection that
+# leaves out a suite the corpus profile runs.
 integration-archive:
     cargo build --locked --profile corpus -p rift
     tar --zstd -cf target/integration-cli.tar.zst -C target/corpus rift
-    cargo llvm-cov nextest-archive --workspace --all-targets --all-features --locked --cargo-profile corpus --profile integration --archive-file target/integration.tar.zst
+    cargo llvm-cov nextest-archive --workspace --all-features --locked --cargo-profile corpus --profile corpus --archive-file target/integration.tar.zst --test corpus_bun --test corpus_fastapi --test corpus_nextjs
 
-corpus-test name test_name="" archive="":
-    mkdir -p "${CARGO_LLVM_COV_TARGET_DIR:-target/llvm-cov-target}"
+corpus-test name test_name="" archive="": coverage-target
     cargo llvm-cov nextest --no-report --profile corpus --no-tests fail --run-ignored all {{ if archive == "" { "--locked -p rift --test " + quote("corpus_" + name) + " --cargo-profile corpus" } else { "--archive-file " + quote(archive) + " --extract-overwrite --workspace-remap . -E " + quote("binary(=corpus_" + name + ")") } }} {{ if test_name == "" { "" } else { "-- --exact " + quote(test_name) } }}
 
 artifact-test *args:

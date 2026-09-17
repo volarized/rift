@@ -38,9 +38,9 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use harness::{
-    LIBRARY, PROXIED_ENGINE_CALL_MAX, SERIAL, StopOnDrop, TestResult, arguments,
-    laid_out_workspace, proxied_call, proxied_engine_call, proxy_client, proxy_command,
-    require_success, run_rift, rust_engine_workspace, within, workspace,
+    LIBRARY, PROXIED_ENGINE_CALL_MAX, StopOnDrop, TestResult, arguments, laid_out_workspace,
+    proxied_call, proxied_engine_call, proxy_client, proxy_command, require_success, run_rift,
+    rust_engine_workspace, within, workspace,
 };
 use rift_mcp::{PRESENCE_POLL_INTERVAL, START_WAIT_MAX, ServerPresence, claim, probe};
 use rift_protocol::lock::{
@@ -149,7 +149,6 @@ fn held_port_in_range() -> TestResult<TcpListener> {
 
 #[tokio::test]
 async fn warm_start_adopts_the_running_server() -> TestResult {
-    let _serial = SERIAL.lock().await;
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
@@ -171,7 +170,6 @@ async fn warm_start_adopts_the_running_server() -> TestResult {
 
 #[tokio::test]
 async fn concurrent_proxies_share_one_elected_server() -> TestResult {
-    let _serial = SERIAL.lock().await;
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
@@ -206,7 +204,6 @@ async fn concurrent_proxies_share_one_elected_server() -> TestResult {
 
 #[tokio::test]
 async fn proxy_session_reconnects_after_a_server_restart() -> TestResult {
-    let _serial = SERIAL.lock().await;
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
@@ -236,7 +233,6 @@ async fn proxy_session_reconnects_after_a_server_restart() -> TestResult {
 
 #[tokio::test]
 async fn stale_lock_document_yields_a_fresh_election() -> TestResult {
-    let _serial = SERIAL.lock().await;
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
@@ -273,7 +269,6 @@ async fn stale_lock_document_yields_a_fresh_election() -> TestResult {
 /// test deliberately spends about two windows of wall clock.
 #[tokio::test]
 async fn held_election_without_a_server_refuses_with_operator_guidance() -> TestResult {
-    let _serial = SERIAL.lock().await;
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
@@ -349,7 +344,6 @@ async fn held_election_without_a_server_refuses_with_operator_guidance() -> Test
 #[tokio::test]
 async fn a_spawned_server_that_cannot_bind_its_port_refuses_with_its_captured_stderr() -> TestResult
 {
-    let _serial = SERIAL.lock().await;
     let held = held_port_in_range()?;
     let port = held.local_addr()?.port();
     let directory = laid_out_workspace(&[("lib.rs", LIBRARY)], &format!("port = {port}\n"))?;
@@ -388,7 +382,6 @@ async fn a_spawned_server_that_cannot_bind_its_port_refuses_with_its_captured_st
 
 #[tokio::test]
 async fn proxy_stderr_carries_lifecycle_lines_and_never_the_token() -> TestResult {
-    let _serial = SERIAL.lock().await;
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
@@ -426,7 +419,6 @@ async fn proxy_stderr_carries_lifecycle_lines_and_never_the_token() -> TestResul
 /// Incoming references use the configured engine through the real CLI proxy.
 #[tokio::test]
 async fn live_proxied_read_resolves_incoming_references() -> TestResult {
-    let _serial = SERIAL.lock().await;
     if !live_engine_gate::engine_live() {
         return Ok(());
     }

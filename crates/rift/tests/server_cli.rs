@@ -1,11 +1,12 @@
 //! Real-binary contract of `rift server start|stop|restart|status`.
 //!
 //! Every test drives the compiled `rift` binary against a throwaway
-//! workspace fixture. The tests serialize on one mutex: the servers share
-//! the loopback election port range, and serial runs keep "the old port is
-//! free again" assertions honest. Each fixture's `rift.toml` accepts a
-//! 60-second idle timeout as an orphan-safety net, and a drop guard stops
-//! any server a failed test leaves behind.
+//! workspace fixture. The servers share the loopback election port range,
+//! which the machine holds once, so the `election` nextest group admits one
+//! of these tests at a time and keeps "the old port is free again"
+//! assertions honest. Each fixture's `rift.toml` accepts a 60-second idle
+//! timeout as an orphan-safety net, and a drop guard stops any server a
+//! failed test leaves behind.
 
 use std::error::Error;
 use std::fs;
@@ -13,7 +14,6 @@ use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use rift_mcp::{START_POLL_ATTEMPT_COUNT, ServerPresence, probe, stderr_file_path};
@@ -58,9 +58,6 @@ const DOCUMENT_GONE_GRACE: Duration = Duration::from_secs(2);
 /// It outlasts `SERVER_STOP_DEADLINE`, the server-side stop's span, so a deadline
 /// derived where the server began listening would already be spent when the stop lands.
 const IDLE_SPAN_PAST_STOP_DEADLINE: Duration = Duration::from_secs(9);
-
-/// Serializes the tests: the served port range is machine-global.
-static SERIAL: Mutex<()> = Mutex::new(());
 
 fn stale_identity() -> ProductIdentity {
     ProductIdentity {
@@ -278,7 +275,6 @@ fn wait_until_port_refuses(port: u16) -> TestResult {
 
 #[test]
 fn start_serves_stop_shuts_down_and_both_repeat_idempotently() -> TestResult {
-    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
@@ -346,7 +342,6 @@ fn start_serves_stop_shuts_down_and_both_repeat_idempotently() -> TestResult {
 
 #[test]
 fn foreground_start_serves_until_stopped_and_exits_cleanly() -> TestResult {
-    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
@@ -387,7 +382,6 @@ fn foreground_start_serves_until_stopped_and_exits_cleanly() -> TestResult {
 
 #[test]
 fn a_stop_after_a_long_serving_span_still_runs_every_stage_inside_its_budget() -> TestResult {
-    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
@@ -436,7 +430,6 @@ fn a_stop_after_a_long_serving_span_still_runs_every_stage_inside_its_budget() -
 
 #[test]
 fn stop_during_the_lexical_commit_behind_the_publication_ends_the_process() -> TestResult {
-    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let directory = workspace()?;
     let root = directory.path();
     write_large_fixture(root)?;
@@ -486,7 +479,6 @@ fn stop_during_the_lexical_commit_behind_the_publication_ends_the_process() -> T
 
 #[test]
 fn stop_during_a_running_capture_ends_the_process() -> TestResult {
-    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let directory = workspace()?;
     let root = directory.path();
     write_large_fixture(root)?;
@@ -538,7 +530,6 @@ fn stop_during_a_running_capture_ends_the_process() -> TestResult {
 
 #[test]
 fn stop_issued_during_a_rebuild_ends_the_process_as_the_document_goes() -> TestResult {
-    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let directory = workspace()?;
     let root = directory.path();
     write_large_fixture(root)?;
@@ -606,7 +597,6 @@ fn stop_issued_during_a_rebuild_ends_the_process_as_the_document_goes() -> TestR
 
 #[test]
 fn a_stop_reports_success_only_once_the_election_it_waited_on_released() -> TestResult {
-    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let directory = workspace()?;
     let root = directory.path();
     write_large_fixture(root)?;
@@ -690,7 +680,6 @@ fn a_stop_reports_success_only_once_the_election_it_waited_on_released() -> Test
 
 #[test]
 fn concurrent_starts_agree_on_one_elected_server() -> TestResult {
-    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
@@ -733,7 +722,6 @@ fn concurrent_starts_agree_on_one_elected_server() -> TestResult {
 
 #[test]
 fn stale_document_is_replaced_by_a_fresh_election() -> TestResult {
-    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
@@ -766,7 +754,6 @@ fn stale_document_is_replaced_by_a_fresh_election() -> TestResult {
 
 #[test]
 fn restart_replaces_the_serving_process() -> TestResult {
-    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
@@ -800,7 +787,6 @@ fn restart_replaces_the_serving_process() -> TestResult {
 
 #[test]
 fn stop_without_a_server_reports_and_discards_stale_state() -> TestResult {
-    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let directory = workspace()?;
     let root = directory.path();
 
@@ -832,7 +818,6 @@ fn stop_without_a_server_reports_and_discards_stale_state() -> TestResult {
 /// exited child's pid and points at the stderr file that holds the refusal.
 #[test]
 fn start_reports_a_server_that_exits_before_publishing() -> TestResult {
-    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
@@ -868,7 +853,6 @@ fn start_reports_a_server_that_exits_before_publishing() -> TestResult {
 
 #[test]
 fn status_reports_absent_stale_and_serving_states() -> TestResult {
-    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);

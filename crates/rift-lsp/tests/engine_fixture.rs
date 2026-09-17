@@ -40,6 +40,11 @@ const FIXTURE_TIMEOUT: Duration = Duration::from_mins(2);
 /// Bytes of standard error the fixture's launch keeps captured.
 const FIXTURE_STDERR_CAPTURE_BYTES: usize = 65_536;
 
+/// Quiet a live engine's work record holds before the session calls it
+/// ready: the `lsp.settle_delay` default, so the live suites read the
+/// bound production runs under.
+const FIXTURE_SETTLE_DELAY: Duration = Duration::from_millis(500);
+
 impl EngineFixture {
     /// The launch this fixture's data resolves to, under the shared
     /// timeout and capture bounds every live suite runs with.
@@ -51,6 +56,7 @@ impl EngineFixture {
             initialization_options: self.initialization_options.clone(),
             startup_timeout: FIXTURE_TIMEOUT,
             request_timeout: FIXTURE_TIMEOUT,
+            settle_delay: FIXTURE_SETTLE_DELAY,
             stderr_capture_bytes: FIXTURE_STDERR_CAPTURE_BYTES,
         }
     }

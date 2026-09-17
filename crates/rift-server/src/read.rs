@@ -46,6 +46,17 @@ pub enum ReadFault {
     History(HistoryError),
     /// A language engine failed while serving the request.
     Engine(rift_lsp::session::EngineError),
+    /// A language engine answered about bytes the served revision does not carry, so
+    /// its answer cannot be mapped into the tree this read serves. The engine holds an
+    /// older revision of the file, and no resend of the same request changes that: a
+    /// read that meets this drops the engine's contribution, keeps the indexed answer,
+    /// and warns.
+    EngineAnswer {
+        /// The engine operation whose answer could not be mapped.
+        operation: &'static str,
+        /// What did not fit the served bytes.
+        detail: String,
+    },
 
     /// A cataloged package's index could not assemble the declaration a lookup matched.
     Dependency(Box<PackageIndexError>),
@@ -130,7 +141,9 @@ impl Fault for ReadFault {
             }
             Self::Invalid { .. } => ErrorName::Wire(ErrorCode::InvalidRequest),
             Self::NotFound { .. } => ErrorName::Wire(ErrorCode::ResourceNotFound),
-            Self::SourceUnavailable { .. } => ErrorName::Wire(ErrorCode::ContentUnavailable),
+            Self::SourceUnavailable { .. } | Self::EngineAnswer { .. } => {
+                ErrorName::Wire(ErrorCode::ContentUnavailable)
+            }
             Self::Storage { .. } => ErrorName::Wire(ErrorCode::StorageFailure),
             Self::Task { .. } | Self::LockPoisoned { .. } => {
                 ErrorName::Wire(ErrorCode::InternalError)
@@ -174,7 +187,9 @@ impl Fault for ReadFault {
                 ErrorContext::new("operation", *operation),
                 ErrorContext::new("io", io.clone()),
             ],
-            Self::Task { operation, detail } | Self::Unavailable { operation, detail } => vec![
+            Self::Task { operation, detail }
+            | Self::Unavailable { operation, detail }
+            | Self::EngineAnswer { operation, detail } => vec![
                 ErrorContext::new("operation", *operation),
                 ErrorContext::new("detail", detail.clone()),
             ],
@@ -203,6 +218,7 @@ impl Fault for ReadFault {
             | Self::Storage { .. }
             | Self::Task { .. }
             | Self::Unavailable { .. }
+            | Self::EngineAnswer { .. }
             | Self::CapacityTimeout { .. }
             | Self::LockPoisoned { .. } => None,
         }
@@ -223,17 +239,25 @@ impl Fault for ReadFault {
             | Self::Storage { .. }
             | Self::Task { .. }
             | Self::Unavailable { .. }
+            | Self::EngineAnswer { .. }
             | Self::CapacityTimeout { .. }
             | Self::LockPoisoned { .. } => None,
         }
     }
 
-    /// A path whose extension no shipped provider parses can never be served: unlike
+    /// Two faults the registry's own action would send to the wrong place. A path whose
+    /// extension no shipped provider parses can never be served: unlike
     /// [`Self::Unsupported`], which also classifies a capability the operator could turn
-    /// on, no `rift.toml` table adds a syntax grammar this release does not ship.
+    /// on, no `rift.toml` table adds a syntax grammar this release does not ship. And the
+    /// `content_unavailable` action names a body-less read, which answers a source file
+    /// that is not UTF-8; an engine holding an older revision of a file is cleared by the
+    /// engine reading the new bytes, not by a narrower request.
     fn action_override(&self) -> Option<&'static str> {
         match self {
             Self::UnclaimedExtension { .. } => Some("address a path a shipped provider parses"),
+            Self::EngineAnswer { .. } => {
+                Some("read the request again once the engine has read the served revision")
+            }
             _ => None,
         }
     }
@@ -319,6 +343,19 @@ impl ReadFault {
     /// Classifies validation work that cannot finish within its deadline.
     pub fn unavailable(operation: &'static str, detail: impl Into<String>) -> ReadError {
         Error::new(Self::Unavailable {
+            operation,
+            detail: detail.into(),
+        })
+    }
+
+    /// Classifies an engine answer the served revision's bytes cannot carry.
+    ///
+    /// The caller that meets this refusal cannot clear it by resending: the engine
+    /// answers about the revision it holds until it has read the new bytes. Callers
+    /// inside the engine tier degrade to the indexed answer instead of surfacing it.
+    #[must_use]
+    pub fn engine_answer(operation: &'static str, detail: impl Into<String>) -> ReadError {
+        Error::new(Self::EngineAnswer {
             operation,
             detail: detail.into(),
         })
@@ -4443,6 +4480,30 @@ pub fn compute() -> i32 {
             )
         );
         Ok(())
+    }
+
+    /// An engine answer the served bytes cannot carry is a condition of the
+    /// tree, not a failure of the server: it classifies as content the caller
+    /// cannot have, and no resend of the same request clears it.
+    #[test]
+    fn an_unmappable_engine_answer_classifies_as_content_the_request_cannot_have() {
+        let error = ReadFault::engine_answer("engine references", "character out of range");
+        assert_eq!(error.descriptor().code(), "content_unavailable");
+        assert_eq!(
+            error.descriptor().retry(),
+            rift_protocol::error::RetryDirective::Never,
+            "no resend reaches bytes the engine has not read yet"
+        );
+        assert_eq!(
+            error.to_string(),
+            "the addressed content exists but its bytes cannot be served: \
+             operation engine references, detail character out of range; read \
+             the request again once the engine has read the served revision"
+        );
+        assert!(
+            Error::source(&error).is_none(),
+            "the fault carries the engine's account, not the engine's failure"
+        );
     }
 
     #[test]

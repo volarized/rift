@@ -47,6 +47,15 @@ fn path(value: &str) -> ProjectPath {
     ProjectPath::new(value).expect("fixture path is valid")
 }
 
+/// Quiet a scripted engine's work record holds before the session calls it
+/// ready.
+///
+/// Short enough to wait out in a test, long enough that the gap between two
+/// of the scripted engine's own tokens falls inside it: a test that asserts
+/// `Ready` waits this out and then runs one more exchange, because
+/// settlement is read past, never observed from outside.
+const SETTLE_DELAY: Duration = Duration::from_millis(50);
+
 /// A launch for `start_over_transport`: `program`, `arguments`, and
 /// `environment` are never read over a transport that is already
 /// connected.
@@ -58,6 +67,7 @@ fn transport_launch() -> EngineLaunch {
         initialization_options: None,
         startup_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(5),
+        settle_delay: SETTLE_DELAY,
         stderr_capture_bytes: 4_096,
     }
 }
@@ -811,8 +821,12 @@ async fn stderr_flood_is_drained_bounded_while_the_request_answers() {
 /// nothing is outstanding until a later exchange pumps those messages: the
 /// first pull reads the create request, answers it, reads the begin, and
 /// then answers with no items - the shape a loading engine produces. The
-/// `didOpen` before it adds a report, and the request ends the token, so the
-/// session reads as analyzing between them and settled after.
+/// `didOpen` before it adds a report, and the request ends the token.
+///
+/// The end alone does not settle the engine: a language server empties its
+/// outstanding work between load phases. The session reads as analyzing
+/// until one exchange reads the engine quiet a whole settle delay past that
+/// end.
 #[tokio::test]
 async fn work_done_progress_decides_whether_the_engine_is_analyzing() {
     let (_workspace, mut session, engine_task) = started(|mut engine| async move {
@@ -828,6 +842,8 @@ async fn work_done_progress_decides_whether_the_engine_is_analyzing() {
         let (id, _params) = engine.expect_request("textDocument/references").await;
         engine.end_progress().await;
         let location = json!({"uri": "file:///lib.rs", "range": zero_range()});
+        engine.respond(&id, json!([location])).await;
+        let (id, _params) = engine.expect_request("textDocument/references").await;
         engine.respond(&id, json!([location])).await;
         let (id, _params) = engine.expect_request("shutdown").await;
         engine.respond(&id, Value::Null).await;
@@ -865,8 +881,26 @@ async fn work_done_progress_decides_whether_the_engine_is_analyzing() {
         .await
         .expect("the request answers");
     assert!(
+        session.is_analyzing(),
+        "the end the request consumed retires the token, and the record has \
+         not yet been read quiet for the settle delay"
+    );
+
+    tokio::time::sleep(SETTLE_DELAY).await;
+    session
+        .references(
+            &document,
+            Position {
+                line: 0,
+                character: 3,
+            },
+        )
+        .await
+        .expect("the request answers again");
+    assert!(
         !session.is_analyzing(),
-        "the end the request consumed retires the token"
+        "a later exchange reads the engine quiet one settle delay past its \
+         last token"
     );
     session.shutdown().await;
     join(engine_task).await;
@@ -989,7 +1023,8 @@ async fn an_empty_references_answer_from_an_unannounced_engine_stays_unconfirmed
 
 /// Readiness moves through its three states in the order the protocol
 /// traffic proves them: unconfirmed before any progress, analyzing while a
-/// token is outstanding, ready once every announced token has ended.
+/// token is outstanding or the record's quiet is younger than the settle
+/// delay, ready once an exchange has read that quiet out.
 #[tokio::test]
 async fn readiness_moves_from_unconfirmed_through_analyzing_to_ready() {
     let (_workspace, mut session, engine_task) = started(|mut engine| async move {
@@ -999,6 +1034,8 @@ async fn readiness_moves_from_unconfirmed_through_analyzing_to_ready() {
         engine.respond(&id, json!([])).await;
         let (id, _params) = engine.expect_request("textDocument/references").await;
         engine.end_progress().await;
+        engine.respond(&id, json!([])).await;
+        let (id, _params) = engine.expect_request("textDocument/references").await;
         engine.respond(&id, json!([])).await;
         let (id, _params) = engine.expect_request("shutdown").await;
         engine.respond(&id, Value::Null).await;
@@ -1032,8 +1069,21 @@ async fn readiness_moves_from_unconfirmed_through_analyzing_to_ready() {
         .expect("references answers again");
     assert_eq!(
         session.readiness(),
+        EngineReadiness::Analyzing,
+        "the end this exchange read retires the only outstanding token, and \
+         an engine between two of its phases empties its record the same way"
+    );
+
+    tokio::time::sleep(SETTLE_DELAY).await;
+    session
+        .references(&document, position)
+        .await
+        .expect("references answers a third time");
+    assert_eq!(
+        session.readiness(),
         EngineReadiness::Ready,
-        "the end this exchange read retires the only outstanding token"
+        "this exchange read the engine quiet one settle delay past its last \
+         token"
     );
 
     session
@@ -1057,7 +1107,9 @@ async fn readiness_moves_from_unconfirmed_through_analyzing_to_ready() {
 ///
 /// `EngineSession` records only whether the engine was analyzing; the
 /// resend loop is the caller's, exactly as `EngineSlot::request` runs it.
-/// This proves the primitive that loop retries on.
+/// This proves the primitive that loop retries on. The wait between
+/// attempts stands in for `lsp.retry`'s own delay, which is what carries a
+/// caller past the settle delay.
 #[tokio::test]
 async fn a_provisional_answer_is_retried_until_the_engine_settles() {
     let (_workspace, mut session, engine_task) = started(|mut engine| async move {
@@ -1075,6 +1127,8 @@ async fn a_provisional_answer_is_retried_until_the_engine_settles() {
         let (id, _params) = engine.expect_request("textDocument/references").await;
         engine.end_progress().await;
         engine.respond(&id, json!([])).await;
+        let (id, _params) = engine.expect_request("textDocument/references").await;
+        engine.respond(&id, json!([])).await;
         let (id, _params) = engine.expect_request("shutdown").await;
         engine.respond(&id, Value::Null).await;
         engine.next_message().await;
@@ -1086,7 +1140,10 @@ async fn a_provisional_answer_is_retried_until_the_engine_settles() {
         character: 3,
     };
     let mut settled = None;
-    for _attempt in 0..3 {
+    for attempt in 0..4 {
+        if attempt > 0 {
+            tokio::time::sleep(SETTLE_DELAY).await;
+        }
         let answer = session
             .references(&document, position)
             .await
@@ -1532,6 +1589,7 @@ fn launch_naming(program: &str) -> EngineLaunch {
         initialization_options: None,
         startup_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(5),
+        settle_delay: SETTLE_DELAY,
         stderr_capture_bytes: 4_096,
     }
 }

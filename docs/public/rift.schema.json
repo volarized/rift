@@ -488,6 +488,15 @@
           },
           "description": "How often Rift sends this process the same request again while its\nanswer stays unsettled - a refusal the process invites again, or an\nanswer it gave while still analyzing - and how the waits between\nthose attempts grow."
         },
+        "settle_delay": {
+          "$ref": "#/$defs/Duration",
+          "default": "500ms",
+          "description": "Quiet the process's work record holds before a read calls it ready,\n10ms to 1m. A language server empties its outstanding work several\ntimes inside one project load, so Rift reports the process ready only\nonce that record has been empty this long at the last engine output\nRift read. Raise it for a process whose load falls silent for longer\nthan the default between phases.",
+          "rift:range": {
+            "max": "1m",
+            "min": "10ms"
+          }
+        },
         "startup_timeout": {
           "$ref": "#/$defs/Duration",
           "default": "30s",

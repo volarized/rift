@@ -48,6 +48,10 @@ from rift_dev.rift_test_client import (
 )
 
 READ_SECONDS = 30.0
+# Seconds a case keeps inside its own deadline for the served tree's removal,
+# the report write, and the process exit. Nextest allows the same grace after
+# it ends a corpus case, so the two bounds agree on what cleanup costs.
+CLEANUP_RESERVE_SECONDS = 30.0
 SEED = 34
 POLL_SECONDS = 0.1
 OBSERVATION_SECONDS = 60.0
@@ -116,23 +120,35 @@ class Corpus:
             },
         )
 
+    def work_seconds(self) -> float:
+        """The wall clock this case's own actions get.
+
+        Nextest ends the case at the pinned deadline, so the actions stop before
+        it: the reserve is the room the served tree's removal, the report write,
+        and the process exit need inside that same deadline. A case that crosses
+        this bound fails naming the action it was running, instead of being
+        killed with no evidence of where it stood.
+        """
+        return max(self.pin.seconds - CLEANUP_RESERVE_SECONDS, 1.0)
+
     async def run(self) -> None:
         """A timeout fails the suite after server cleanup writes its evidence."""
         started = time.monotonic()
         self.started = started
         status = "failed"
         failure = ""
+        budget = self.work_seconds()
         self.report.parent.mkdir(parents=True, exist_ok=True)
         try:
-            async with asyncio.timeout(self.pin.seconds):
+            async with asyncio.timeout(budget):
                 with tempfile.TemporaryDirectory(
                     prefix=f"rift-corpus-{self.pin.name}-"
                 ) as directory:
                     await self.tree(Path(directory).resolve())
                 elapsed = time.monotonic() - started
                 require(
-                    elapsed <= self.pin.seconds,
-                    f"{self.pin.name}: elapsed {elapsed:.3f}s exceeded {self.pin.seconds}s",
+                    elapsed <= budget,
+                    f"{self.pin.name}: elapsed {elapsed:.3f}s exceeded {budget}s",
                 )
                 status = "passed"
         except BaseException as error:
@@ -536,7 +552,7 @@ class Corpus:
             sources.append(source.rstrip("\n"))
 
         async def writer() -> None:
-            for edit in range(1, self.pin.seconds // 2):
+            for edit in range(1, int(self.work_seconds()) // 2):
                 await asyncio.sleep(2.0)
                 write(edit)
 
@@ -583,7 +599,7 @@ class Corpus:
             reads = 0
             tools = tuple(CHURN_REQUESTS)
             pressure_calls = {name: 0 for name in tools}
-            async with gate_deadline("corpus churn", self.pin.seconds):
+            async with gate_deadline("corpus churn", self.work_seconds()):
                 while reads < READ_COUNT or overlaps < 2:
                     name = tools[reads % len(tools)]
                     await read(name, identity)

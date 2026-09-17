@@ -6,6 +6,7 @@ mod failure;
 mod http;
 mod identity;
 pub mod logs;
+mod parameters;
 mod proxy;
 mod resource;
 pub mod schema;
@@ -22,8 +23,8 @@ pub use election::{
 };
 pub use http::{HttpServeError, HttpServeFault, HttpServer, TokenCheck, serve_http};
 pub use logs::{
-    LOG_QUEUE_RECORDS, LogDrain, LogSink, PANIC_PAYLOAD_BYTES_MAX, install_panic_hook, log_capture,
-    logs_configuration,
+    LOG_QUEUE_RECORDS, LOG_SETTLE_TIMEOUT, LogDrain, LogSettlement, LogSink,
+    PANIC_PAYLOAD_BYTES_MAX, install_panic_hook, log_capture, logs_configuration,
 };
 pub use proxy::{ProxyFault, ProxyServeError, serve_proxy};
 pub use server::RiftMcp;

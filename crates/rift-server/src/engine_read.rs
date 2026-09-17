@@ -10,9 +10,9 @@ use rift_lsp::position::LineIndex;
 use rift_lsp::session::{EngineError, EngineFault, EngineSession};
 use rift_lsp::uri::{TreeRoot, UriFault};
 use rift_protocol::read::{
-    ExactKind, Extensions, GraphHop, HopDirection, Relationship, RelationshipDerivation,
-    RelationshipFacet, SearchParams, SearchParamsTarget, SearchTraversal, SymbolId,
-    TraversalDirection,
+    ExactKind, Extensions, GraphHop, HopDirection, Language, ReadWarning, Relationship,
+    RelationshipDerivation, RelationshipFacet, SearchParams, SearchParamsTarget, SearchTraversal,
+    SymbolId, TraversalDirection,
 };
 use rift_syntax::SyntaxSymbol;
 
@@ -28,6 +28,7 @@ use crate::traversal::{
 pub struct EngineReferences {
     revision: Option<String>,
     incoming: BTreeMap<CoreSymbolId, Vec<GraphHop>>,
+    analysis_unavailable: Option<ReadWarning>,
 }
 
 impl EngineReferences {
@@ -35,6 +36,24 @@ impl EngineReferences {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.incoming.values().all(Vec::is_empty)
+    }
+
+    /// The warning this read carries when the engine tier contributed nothing it could
+    /// stand behind. Absent when every consulted engine answered.
+    #[must_use]
+    pub fn analysis_unavailable(&self) -> Option<&ReadWarning> {
+        self.analysis_unavailable.as_ref()
+    }
+
+    /// Drops every edge the engines contributed and records why.
+    ///
+    /// An engine answering about bytes the served revision does not carry holds an
+    /// older view of the whole tree, not of one location, so the edges it already gave
+    /// for this read are dropped with the rest. The indexed relationships answer, and
+    /// the warning names the analysis that is missing from them.
+    fn degrade(&mut self, warning: ReadWarning) {
+        self.incoming.clear();
+        self.analysis_unavailable = Some(warning);
     }
 
     #[cfg(test)]
@@ -167,9 +186,15 @@ fn reference_source<'source>(
 /// its request deadline and validates the captured tree again before using the result.
 /// Engines without references support leave the indexed answer unchanged.
 ///
+/// An engine answering about bytes the served revision does not carry, or answering more
+/// than the traversal bound carries, has its whole contribution dropped: the result holds
+/// the indexed relationships and an `engine_analysis_unavailable` warning naming what is
+/// missing. No such condition refuses the read, because no resend of the same request
+/// clears it.
+///
 /// # Errors
 ///
-/// Returns invalid traversal, engine failure, or an engine range outside published source.
+/// Returns invalid traversal or engine failure.
 ///
 /// # Cancel safety
 ///
@@ -196,7 +221,12 @@ pub async fn resolve_engine_references(
     let mut pending = vec![seed.clone()];
     let mut requested = BTreeSet::new();
     for depth in 0..traversal.depth {
-        extend_references(reads, engines, &mut references, pending, &mut requested).await?;
+        if let Some(warning) =
+            extend_references(reads, engines, &mut references, pending, &mut requested).await?
+        {
+            references.degrade(warning);
+            return Ok(references);
+        }
         if depth + 1 == traversal.depth {
             break;
         }
@@ -223,44 +253,110 @@ async fn extend_references(
     references: &mut EngineReferences,
     pending: Vec<CoreSymbolId>,
     requested: &mut BTreeSet<CoreSymbolId>,
-) -> Result<(), ReadError> {
+) -> Result<Option<ReadWarning>, ReadError> {
     let stored: usize = references.incoming.values().map(Vec::len).sum();
     let mut remaining = TRAVERSAL_NODES_MAX - stored;
     for identity in pending {
         if !requested.insert(identity.clone()) {
             continue;
         }
-        let Some(edges) = resolve_symbol_references(reads, engines, &identity).await? else {
-            continue;
+        let (edges, language) = match resolve_symbol_references(reads, engines, &identity).await? {
+            SymbolReferences::Resolved { edges, language } => (edges, language),
+            SymbolReferences::NotServed => continue,
+            SymbolReferences::Unmapped { language, detail } => {
+                return Ok(Some(engine_analysis_warning(language, detail)));
+            }
         };
-        remaining = remaining.checked_sub(edges.len()).ok_or_else(|| {
-            ReadFault::unavailable(
-                "engine references",
-                "reference edges exceed the traversal node bound",
-            )
-        })?;
+        let Some(left) = remaining.checked_sub(edges.len()) else {
+            return Ok(Some(engine_analysis_warning(
+                language,
+                format!(
+                    "the engines answered more incoming references than the \
+                     {TRAVERSAL_NODES_MAX}-node traversal bound carries"
+                ),
+            )));
+        };
+        remaining = left;
         references.incoming.insert(identity, edges);
     }
-    Ok(())
+    Ok(None)
+}
+
+/// What one seed's engine request contributed to a traversal.
+enum SymbolReferences {
+    /// The edges the engine resolved, possibly none, and the seed's language.
+    Resolved {
+        /// Incoming edges the engine named, mapped into the served tree.
+        edges: Vec<GraphHop>,
+        /// The seed declaration's language, the one whose engine answered.
+        language: Language,
+    },
+    /// No engine serves this seed, or the one that does advertises no references
+    /// capability. The indexed answer stands unchanged, and carries no warning: the
+    /// caller asked for relationships, not for an engine.
+    NotServed,
+    /// The engine answered about bytes the served revision does not carry, so nothing it
+    /// said maps into the tree this read serves.
+    Unmapped {
+        /// The seed declaration's language, the one whose engine answered.
+        language: Language,
+        /// What did not fit the served bytes.
+        detail: String,
+    },
+}
+
+/// The warning a read carries once the engine tier's contribution is dropped.
+fn engine_analysis_warning(language: Language, detail: impl Into<String>) -> ReadWarning {
+    ReadWarning::EngineAnalysisUnavailable {
+        language: Some(language),
+        detail: detail.into(),
+    }
 }
 
 async fn resolve_symbol_references(
     reads: &ReadService,
     engines: &EnginePool,
     identity: &CoreSymbolId,
-) -> Result<Option<Vec<GraphHop>>, ReadError> {
+) -> Result<SymbolReferences, ReadError> {
     let Some((slot, file, symbol)) = reference_source(reads, engines, identity) else {
-        return Ok(None);
+        return Ok(SymbolReferences::NotServed);
     };
+    let language = file.syntax().language().clone();
     let target = ReferenceTarget::new(slot.workspace_root(), reads.index().root(), file, symbol)?;
     let report = match references_on_engine(slot, &target).await {
         Ok(report) => report,
         Err(error) if matches!(error.fault(), EngineFault::CapabilityAbsent { .. }) => {
-            return Ok(None);
+            return Ok(SymbolReferences::NotServed);
         }
         Err(error) => return Err(ReadFault::engine(error)),
     };
-    map_references(reads, identity, report, slot.workspace_root()).map(Some)
+    symbol_references(
+        map_references(reads, identity, report, slot.workspace_root()),
+        language,
+    )
+}
+
+/// What one mapped engine answer contributes to the read.
+///
+/// An answer the served bytes cannot carry drops the engine's contribution and
+/// leaves the indexed relationships standing. Every other failure is the engine
+/// tier's own, and still refuses the read: a broken document URI or a workspace
+/// root the server cannot address says nothing about the engine's revision, and
+/// degrading it would hide a defect behind a warning.
+fn symbol_references(
+    mapped: Result<Vec<GraphHop>, ReadError>,
+    language: Language,
+) -> Result<SymbolReferences, ReadError> {
+    match mapped {
+        Ok(edges) => Ok(SymbolReferences::Resolved { edges, language }),
+        Err(error) if matches!(error.fault(), ReadFault::EngineAnswer { .. }) => {
+            Ok(SymbolReferences::Unmapped {
+                language,
+                detail: error.detail(),
+            })
+        }
+        Err(error) => Err(error),
+    }
 }
 
 struct ReferenceTarget {
@@ -396,7 +492,7 @@ fn map_references(
     report: ReferenceReport,
     workspace_root: &std::path::Path,
 ) -> Result<Vec<GraphHop>, ReadError> {
-    let locations = report.locations.map_err(|observed| ReadFault::unavailable(
+    let locations = report.locations.map_err(|observed| ReadFault::engine_answer(
         "engine references", format!("reference locations {observed} exceed the {TRAVERSAL_NODES_MAX}-node traversal bound")))?;
     let root = TreeRoot::new(workspace_root)
         .map_err(|error| ReadFault::task("reference root conversion", error.detail()))?;
@@ -451,12 +547,12 @@ fn reference_caller(
     let convert = |position| {
         index
             .byte_offset(encoding, position)
-            .map_err(|error| ReadFault::unavailable("engine references", error.detail()))
+            .map_err(|error| ReadFault::engine_answer("engine references", error.detail()))
     };
     let start = convert(location.range.start)? as u64;
     let end = convert(location.range.end)? as u64;
     if start > end {
-        return Err(ReadFault::unavailable(
+        return Err(ReadFault::engine_answer(
             "engine references",
             "reference range ends before it starts",
         ));
@@ -682,6 +778,43 @@ mod tests {
         Ok(())
     }
 
+    /// An unmappable answer degrades; every other mapping failure still
+    /// refuses, because it says nothing about what revision the engine holds.
+    #[test]
+    fn only_an_unmappable_answer_degrades_the_engine_contribution() {
+        let language = super::Language {
+            name: "rust".to_owned(),
+            dialect: None,
+        };
+        assert!(matches!(
+            super::symbol_references(Ok(Vec::new()), language.clone()),
+            Ok(super::SymbolReferences::Resolved { edges, .. }) if edges.is_empty()
+        ));
+        let unmapped = super::symbol_references(
+            Err(super::ReadFault::engine_answer(
+                "engine references",
+                "character out of range",
+            )),
+            language.clone(),
+        );
+        assert!(matches!(
+            unmapped,
+            Ok(super::SymbolReferences::Unmapped { detail, .. })
+                if detail.contains("character out of range")
+        ));
+        let refused = super::symbol_references(
+            Err(super::ReadFault::task(
+                "reference URI conversion",
+                "scheme refused",
+            )),
+            language,
+        );
+        assert!(
+            refused.is_err(),
+            "a failure that is not the engine's revision still refuses the read"
+        );
+    }
+
     #[tokio::test]
     async fn reference_sources_require_indexed_declaration_name_ranges() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -700,17 +833,15 @@ mod tests {
                 .iter()
                 .all(|symbol| symbol.name_range.is_none())
         );
-        assert!(
-            super::resolve_symbol_references(&reads, &engines, &target)
-                .await?
-                .is_none()
-        );
+        assert!(matches!(
+            super::resolve_symbol_references(&reads, &engines, &target).await?,
+            super::SymbolReferences::NotServed
+        ));
         let absent = rift_core::SymbolId::new("rift://symbol/toml/absent.toml/beacon")?;
-        assert!(
-            super::resolve_symbol_references(&reads, &engines, &absent)
-                .await?
-                .is_none()
-        );
+        assert!(matches!(
+            super::resolve_symbol_references(&reads, &engines, &absent).await?,
+            super::SymbolReferences::NotServed
+        ));
         assert_eq!(
             engines.state_for_key(&LspProcessKey::named("test")),
             Some(rift_protocol::workspace::LspState::Stopped)
@@ -732,7 +863,7 @@ mod tests {
         let engines = pool(directory.path(), "python", configuration);
         let mut params = request(&symbol(&reads, "beacon"));
         params.traversal.as_mut().expect("traversal").depth = 2;
-        let result = resolve_engine_references(&reads, &engines, &params).await;
+        let result = Box::pin(resolve_engine_references(&reads, &engines, &params)).await;
         engines.shutdown().await;
         let references = result?;
         let seed = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;
@@ -791,20 +922,31 @@ mod tests {
         command.truncate(1);
         command.push(script.to_string_lossy().into_owned());
         let engines = pool(directory.path(), "rust", fixture.configuration);
-        let result =
-            resolve_engine_references(&reads, &engines, &request(&symbol(&reads, "beacon"))).await;
+        let result = Box::pin(resolve_engine_references(
+            &reads,
+            &engines,
+            &request(&symbol(&reads, "beacon")),
+        ))
+        .await;
         std::io::Write::write_all(&mut release, b"done\n")?;
         engines.shutdown().await;
-        let error = result.expect_err("oversized engine answer");
+        let references = result?;
         assert!(
-            matches!(error.fault(), crate::ReadFault::Unavailable { .. }),
-            "{error:?}"
+            references.is_empty(),
+            "an answer past the bound contributes no edge"
+        );
+        let Some(rift_protocol::read::ReadWarning::EngineAnalysisUnavailable { language, detail }) =
+            references.analysis_unavailable()
+        else {
+            panic!("an oversized engine answer warns: {references:?}");
+        };
+        assert_eq!(
+            language.as_ref().map(|language| language.name.as_str()),
+            Some("rust")
         );
         assert!(
-            error
-                .detail()
-                .contains(&format!("reference locations {count}")),
-            "{error}"
+            detail.contains(&format!("reference locations {count}")),
+            "{detail}"
         );
         Ok(())
     }
@@ -850,12 +992,14 @@ mod tests {
         )
         .await;
         engines.shutdown().await;
-        let error = result.expect_err("cumulative edge bound");
+        let Some(rift_protocol::read::ReadWarning::EngineAnalysisUnavailable { detail, .. }) =
+            result?
+        else {
+            panic!("the cumulative edge bound warns");
+        };
         assert!(
-            error
-                .detail()
-                .contains("reference edges exceed the traversal node bound"),
-            "{error}"
+            detail.contains("more incoming references than the"),
+            "{detail}"
         );
         assert!(references.incoming(&target).is_empty());
         Ok(())
@@ -889,7 +1033,7 @@ mod tests {
         let params = request(&symbol(&reads, "beacon"));
         let engines = EnginePool::new(directory.path(), BTreeMap::new(), BTreeMap::new());
         assert!(!super::uses_engine_references(&reads, &engines, &params)?);
-        let references = resolve_engine_references(&reads, &engines, &params).await?;
+        let references = Box::pin(resolve_engine_references(&reads, &engines, &params)).await?;
         assert!(references.is_empty());
         assert_eq!(
             reads.search(&params, &[])?,
@@ -907,8 +1051,12 @@ mod tests {
             json!({"command":"/refused-engine","retry":{"attempts":1},"restart":{"attempts":0}}),
         )?;
         let engines = pool(directory.path(), "rust", configuration);
-        let result =
-            resolve_engine_references(&reads, &engines, &request(&symbol(&reads, "beacon"))).await;
+        let result = Box::pin(resolve_engine_references(
+            &reads,
+            &engines,
+            &request(&symbol(&reads, "beacon")),
+        ))
+        .await;
         engines.shutdown().await;
         let error = result.expect_err("absolute program is refused");
         assert!(matches!(error.fault(), crate::ReadFault::Engine(_)));
@@ -929,7 +1077,7 @@ mod tests {
         )?;
         let engines = pool(directory.path(), "python", configuration);
         let params = request(&symbol(&reads, "beacon"));
-        let resolved = resolve_engine_references(&reads, &engines, &params).await;
+        let resolved = Box::pin(resolve_engine_references(&reads, &engines, &params)).await;
         engines.shutdown().await;
         let references = resolved?;
         assert!(
@@ -975,7 +1123,7 @@ mod tests {
         command[2] = command[2].replace("referencesProvider\":true", "referencesProvider\":null");
         // true and null have identical byte lengths, so the fixture's frame stays valid.
         let engines = pool(directory.path(), "rust", fixture.configuration);
-        let result = resolve_engine_references(&reads, &engines, &params).await;
+        let result = Box::pin(resolve_engine_references(&reads, &engines, &params)).await;
         engines.shutdown().await;
         let references = result?;
         assert!(references.is_empty());
@@ -996,8 +1144,12 @@ mod tests {
         let mut fixture = super::process_lifecycle::answers(&[response], &["rust"]);
         fixture.retry.attempts = 1;
         let engines = pool(directory.path(), "rust", fixture.configuration);
-        let result =
-            resolve_engine_references(&reads, &engines, &request(&symbol(&reads, "beacon"))).await;
+        let result = Box::pin(resolve_engine_references(
+            &reads,
+            &engines,
+            &request(&symbol(&reads, "beacon")),
+        ))
+        .await;
         engines.shutdown().await;
         let error = result.expect_err("engine refused references");
         assert!(matches!(error.fault(), crate::ReadFault::Engine(_)));
@@ -1029,7 +1181,7 @@ mod tests {
                 .extend(invalid.as_object().expect("overrides").clone());
             let params = serde_json::from_value(value)?;
             let expected = reads.search(&params, &[]).expect_err("invalid search");
-            let error = resolve_engine_references(&reads, &engines, &params)
+            let error = Box::pin(resolve_engine_references(&reads, &engines, &params))
                 .await
                 .expect_err("invalid search before engine");
             assert_eq!(error.descriptor().code(), expected.descriptor().code());
@@ -1065,7 +1217,7 @@ mod tests {
         )?;
         let engines = pool(directory.path(), "python", configuration);
         let params = request(&symbol(&reads, "beacon"));
-        let result = resolve_engine_references(&reads, &engines, &params).await;
+        let result = Box::pin(resolve_engine_references(&reads, &engines, &params)).await;
         engines.shutdown().await;
         let references = result?;
         assert!(references.is_empty());

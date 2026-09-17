@@ -403,6 +403,16 @@ enum Answer<T> {
 /// A configuration fault - an empty program, an absolute one - answers the
 /// same way every time, so it surfaces at once instead of spending the
 /// restart budget on a start that cannot succeed.
+/// The causes under one start failure, joined for a record.
+///
+/// An engine failure renders its registry text, which names the fault and the
+/// caller's next step. The operating error behind it - the missing program, the
+/// refused permission - lives in the source chain alone, and that is what an
+/// operator reading `rift://logs` needs.
+fn start_cause(failure: &EngineError) -> String {
+    rift_core::causes(failure).join(": ")
+}
+
 fn restart_may_help(error: &EngineError) -> bool {
     error.name() != ErrorName::Wire(ErrorCode::ConfigurationInvalid)
 }
@@ -756,6 +766,10 @@ impl EngineSlot {
     /// or [`EngineFault::Ended`] when this call has no failure of its own
     /// to report, which is the honest answer for a budget an earlier
     /// request already spent.
+    ///
+    /// Every start that fails is recorded before this returns, cause included.
+    /// The refusal reaches the caller, and `rift://logs` is where the agent
+    /// holding that refusal looks for the program that could not run.
     async fn start_within_budget(
         &self,
         budget: &mut RestartBudget,
@@ -765,10 +779,17 @@ impl EngineSlot {
             if !budget.claim(&self.configuration.restart, Instant::now()) {
                 self.report_state(LspState::Failed);
                 let engine = self.name();
+                let surfaced = reported
+                    .as_ref()
+                    .map_or_else(String::new, ToString::to_string);
+                let cause = reported.as_ref().map_or_else(String::new, start_cause);
                 tracing::warn!(
                     component = "engine",
                     engine,
+                    program = self.program(),
                     attempts = self.configuration.restart.attempts,
+                    error = surfaced,
+                    cause,
                     "language engine restart budget is spent for this window"
                 );
                 return Err(reported.unwrap_or_else(|| Error::new(EngineFault::Ended)));
@@ -799,11 +820,48 @@ impl EngineSlot {
                 }
                 Err(failure) if !restart_may_help(&failure) => {
                     self.report_state(LspState::Failed);
+                    self.record_start_failure(&failure, false);
                     return Err(failure);
                 }
-                Err(failure) => reported = Some(failure),
+                Err(failure) => {
+                    self.record_start_failure(&failure, true);
+                    reported = Some(failure);
+                }
             }
         }
+    }
+
+    /// The program this slot starts, for a record naming what could not run. An embedded
+    /// engine has no command line of its own, so it is named by the program it stands for.
+    fn program(&self) -> &str {
+        match (
+            self.configuration.embedded,
+            self.configuration.command.as_ref(),
+        ) {
+            (Some(EmbeddedEngine::Ty), _) => "ty",
+            (None, Some(command)) => command.program(),
+            (None, None) => {
+                unreachable!("acceptance refuses an LSP table naming neither command nor embedded")
+            }
+        }
+    }
+
+    /// Records one start that failed, naming the program and the cause.
+    ///
+    /// A start gives up in three places, and the budget's own record names the
+    /// budget. Without this, a missing program reached the caller as
+    /// `launch_failed` and left the workspace log holding nothing that says
+    /// which program was missing.
+    fn record_start_failure(&self, failure: &EngineError, retrying: bool) {
+        tracing::warn!(
+            component = "engine",
+            engine = self.name(),
+            program = self.program(),
+            retrying,
+            error = %failure,
+            cause = start_cause(failure),
+            "language engine did not start"
+        );
     }
 
     /// The launch derived from this accepted LSP process configuration;
@@ -820,6 +878,7 @@ impl EngineSlot {
             request_timeout: Duration::from_millis(
                 self.configuration.request_timeout.milliseconds(),
             ),
+            settle_delay: Duration::from_millis(self.configuration.settle_delay.milliseconds()),
             stderr_capture_bytes: usize::try_from(self.configuration.output_limit.bytes())
                 .unwrap_or(usize::MAX),
         }
@@ -843,6 +902,7 @@ impl EngineSlot {
             request_timeout: Duration::from_millis(
                 self.configuration.request_timeout.milliseconds(),
             ),
+            settle_delay: Duration::from_millis(self.configuration.settle_delay.milliseconds()),
             stderr_capture_bytes: usize::try_from(self.configuration.output_limit.bytes())
                 .unwrap_or(usize::MAX),
         }
@@ -867,6 +927,160 @@ mod tests {
     use super::*;
     use rift_protocol::configuration::{ByteSize, CommandInput, Duration as ConfiguredDuration};
     use rift_protocol::retry::RetryPolicy;
+
+    /// Collects the records one test's engine start emits, so a test reads what
+    /// `rift://logs` would carry without opening a store.
+    #[derive(Clone, Default)]
+    struct RecordedEvents(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl RecordedEvents {
+        /// The records emitted so far, one rendered line each.
+        fn lines(&self) -> Vec<String> {
+            self.0.lock().expect("the recorder is not poisoned").clone()
+        }
+
+        /// The one record whose message matches, or a panic naming everything seen.
+        fn naming(&self, message: &str) -> String {
+            let lines = self.lines();
+            lines
+                .iter()
+                .find(|line| line.contains(message))
+                .unwrap_or_else(|| panic!("no record says {message:?}: {lines:#?}"))
+                .clone()
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RecordedEvents {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Rendered(String);
+            impl tracing::field::Visit for Rendered {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+            }
+            let mut rendered = Rendered(event.metadata().level().to_string());
+            event.record(&mut rendered);
+            self.0
+                .lock()
+                .expect("the recorder is not poisoned")
+                .push(rendered.0);
+        }
+    }
+
+    /// Serves one slot whose configured program is `command`, and returns the refusal
+    /// a request earns beside every record the attempt emitted.
+    async fn start_refusal(command: &str, attempts: u64) -> (EngineError, RecordedEvents) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let directory = tempfile::tempdir().expect("workspace");
+        let configuration: LspConfiguration = serde_json::from_value(serde_json::json!({
+            "command": [command], "restart": { "attempts": attempts }
+        }))
+        .expect("configuration");
+        let key = LspProcessKey::named("rust");
+        let pool = EnginePool::new(
+            directory.path(),
+            BTreeMap::from([(key.clone(), configuration)]),
+            BTreeMap::from([("rust".to_owned(), key.clone())]),
+        );
+        let slot = pool.engine_by_key(&key).expect("slot");
+        let recorded = RecordedEvents::default();
+        let failure = {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(recorded.clone()),
+            );
+            slot.request(|session| Box::pin(async move { Ok(session.document_version()) }))
+                .await
+                .expect_err("a program that cannot start answers nothing")
+        };
+        pool.shutdown().await;
+        (failure, recorded)
+    }
+
+    /// An embedded engine is named by the program it stands for. It has no command line, and
+    /// a record naming an empty program would say nothing about which engine failed.
+    #[tokio::test]
+    async fn an_embedded_engine_is_named_by_the_program_it_stands_for() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let configuration: LspConfiguration =
+            serde_json::from_value(serde_json::json!({ "embedded": "ty" })).expect("configuration");
+        let key = LspProcessKey::named("python");
+        let pool = EnginePool::new(
+            directory.path(),
+            BTreeMap::from([(key.clone(), configuration)]),
+            BTreeMap::from([("python".to_owned(), key.clone())]),
+        );
+        let slot = pool.engine_by_key(&key).expect("slot");
+        assert_eq!(slot.program(), "ty");
+        pool.shutdown().await;
+    }
+
+    /// A configured program that does not exist reaches the caller as `launch_failed`, and
+    /// the workspace log names the program and the operating error behind it. Cold first use
+    /// read `rift://logs/component/engine` after exactly this refusal and found it empty.
+    #[tokio::test]
+    async fn a_missing_program_is_recorded_with_its_cause() {
+        let (failure, recorded) = start_refusal("rift-engine-that-does-not-exist", 1).await;
+        assert!(
+            matches!(failure.fault(), EngineFault::LaunchFailed { .. }),
+            "a missing program answers launch_failed: {failure:?}"
+        );
+        let record = recorded.naming("language engine did not start");
+        assert!(record.starts_with("WARN"), "{record}");
+        assert!(
+            record.contains("component=\"engine\"")
+                && record.contains("program=\"rift-engine-that-does-not-exist\"")
+                && record.contains("No such file or directory"),
+            "the record names the component, the program and the cause: {record}"
+        );
+    }
+
+    /// The spent budget names the failure it is surfacing. On its own it said the budget was
+    /// spent, which is the outcome and not the reason the caller was refused.
+    #[tokio::test]
+    async fn the_spent_restart_budget_names_the_failure_it_surfaces() {
+        let (_, recorded) = start_refusal("rift-engine-that-does-not-exist", 1).await;
+        let record = recorded.naming("restart budget is spent");
+        assert!(
+            record.contains("program=\"rift-engine-that-does-not-exist\"")
+                && record.contains("No such file or directory"),
+            "the budget record carries the cause: {record}"
+        );
+    }
+
+    /// A program no restart can fix returns at once, and records before it does. That arm
+    /// never reaches the budget, so nothing else would have recorded it.
+    #[tokio::test]
+    async fn a_program_no_restart_can_fix_is_recorded_before_it_refuses() {
+        let (failure, recorded) = start_refusal("/rift-engine-absolute", 4).await;
+        assert!(
+            !restart_may_help(&failure),
+            "an absolute program is refused without spending a restart: {failure:?}"
+        );
+        let record = recorded.naming("language engine did not start");
+        assert!(
+            record.contains("retrying=false")
+                && record.contains("program=\"/rift-engine-absolute\""),
+            "the record names the program and that no restart follows: {record}"
+        );
+        assert!(
+            !recorded
+                .lines()
+                .iter()
+                .any(|line| line.contains("restart budget is spent")),
+            "the budget is untouched: {:#?}",
+            recorded.lines()
+        );
+    }
 
     #[tokio::test]
     async fn canceled_open_document_discards_session_and_preserves_restart_budget() {
@@ -965,6 +1179,7 @@ mod tests {
             initialization_options: Some(serde_json::json!({ "engine": "fake" })),
             startup_timeout: ConfiguredDuration::from_millis(10_000),
             request_timeout: ConfiguredDuration::from_millis(20_000),
+            settle_delay: ConfiguredDuration::from_millis(500),
             output_limit: ByteSize::from_bytes(2_048),
             retry: RetryPolicy::default(),
             restart: RestartPolicy::default(),

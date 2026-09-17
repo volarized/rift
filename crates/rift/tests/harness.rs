@@ -38,9 +38,6 @@ pub(crate) const PROXIED_CALL_MAX: Duration = Duration::from_mins(1);
 /// Bound on one proxied call that starts and settles a language engine.
 pub(crate) const PROXIED_ENGINE_CALL_MAX: Duration = Duration::from_mins(2);
 
-/// Serializes the tests: the served port range is machine-global.
-pub(crate) static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// The declaration every non-engine fixture serves, and the file
 /// referencing it.
 pub(crate) const LIBRARY: &str = "pub fn beacon() {}\n";

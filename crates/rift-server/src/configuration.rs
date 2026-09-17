@@ -8,8 +8,12 @@
 use std::path::Path;
 
 use rift_core::constants::WORKSPACE_CONFIGURATION_FILE;
+use rift_core::line::lines_inclusive;
 use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault};
 use rift_protocol::configuration::{ConfigurationViolation, WorkspaceConfiguration};
+use rift_protocol::schema::{
+    DocumentStep, ExpectedShape, configuration_schema, document_steps, expected_shape, named_member,
+};
 
 /// Bytes a `rift.toml` may hold, at most. The file states bounded tables
 /// and language entries; one this large is not configuration.
@@ -43,8 +47,16 @@ pub enum ConfigurationFault {
     /// The file is not the documented TOML shape: a syntax error, an
     /// unknown key, a missing required key, or a malformed value.
     Malformed {
-        /// The parser's account, with its line and column.
-        detail: String,
+        /// Where the parser stopped, as `line <n> column <n>`. Absent when
+        /// the parser named no position in the file.
+        location: Option<String>,
+        /// The documented key the parser stopped inside, members joined by
+        /// `.`. Absent when it stopped before reaching one.
+        key: Option<String>,
+        /// What the documented shape accepts there, and a value it takes.
+        /// Boxed so one refusal's evidence does not widen every configuration
+        /// `Result` the crate returns.
+        shape: Box<ExpectedShape>,
     },
     /// The file parsed and one of its values breaks a documented bound.
     Invalid(ConfigurationViolation),
@@ -76,8 +88,23 @@ impl Fault for ConfigurationFault {
                 context.push(ErrorContext::new("bytes", bytes.to_string()));
                 context.push(ErrorContext::new("bytes_max", bytes_max.to_string()));
             }
-            Self::Malformed { detail } => {
-                context.push(ErrorContext::new("detail", detail.clone()));
+            Self::Malformed {
+                location,
+                key,
+                shape,
+            } => {
+                if let Some(key) = key {
+                    context.push(ErrorContext::new("key", key.clone()));
+                }
+                if let Some(location) = location {
+                    context.push(ErrorContext::new("location", location.clone()));
+                }
+                if !shape.accepted().is_empty() {
+                    context.push(ErrorContext::new("accepted", shape.accepted().join(", ")));
+                }
+                if let Some(example) = shape.example() {
+                    context.push(ErrorContext::new("example", example.to_string()));
+                }
             }
             Self::Invalid(violation) => context.extend(violation.context()),
         }
@@ -118,6 +145,57 @@ pub fn load_configuration(root: &Path) -> Result<WorkspaceConfiguration, Configu
     accept_configuration(&raw)
 }
 
+/// Reads the documented shape out of one configuration text.
+///
+/// A refusal names the key the parser stopped inside, where in the file it
+/// stopped, what the documented shape accepts there, and a value it takes.
+/// The parser's own account is not carried: it speaks of Rust types and serde
+/// grammar, which name nothing the operator can write in `rift.toml`.
+fn accept_shape(raw: &str) -> Result<WorkspaceConfiguration, ConfigurationError> {
+    let deserializer = match toml::Deserializer::parse(raw) {
+        Ok(deserializer) => deserializer,
+        Err(error) => return Err(malformed(raw, error.span(), &[])),
+    };
+    match serde_path_to_error::deserialize(deserializer) {
+        Ok(configuration) => Ok(configuration),
+        Err(refused) => {
+            let steps = document_steps(refused.path());
+            Err(malformed(raw, refused.inner().span(), &steps))
+        }
+    }
+}
+
+/// One refusal of the documented shape, described against the schema the
+/// workspace publishes.
+fn malformed(
+    raw: &str,
+    span: Option<std::ops::Range<usize>>,
+    steps: &[DocumentStep<'_>],
+) -> ConfigurationError {
+    let shape = expected_shape(&configuration_schema(), steps);
+    Error::new(ConfigurationFault::Malformed {
+        location: span.map(|span| position_of(raw, span.start)),
+        key: named_member(&steps[..shape.followed()]),
+        shape: Box::new(shape),
+    })
+}
+
+/// Where one byte offset stands in the file, counting lines and columns from
+/// one, the way an editor does.
+fn position_of(raw: &str, offset: usize) -> String {
+    let mut line = 1;
+    let mut consumed = 0;
+    for text in lines_inclusive(raw) {
+        if consumed + text.len() > offset {
+            break;
+        }
+        consumed += text.len();
+        line += 1;
+    }
+    let column = raw[consumed..offset.min(raw.len())].chars().count() + 1;
+    format!("line {line} column {column}")
+}
+
 /// Accepts one configuration text: size bound, shape, then value bounds.
 /// Split from the read so every refusal path is testable without a
 /// filesystem.
@@ -129,11 +207,7 @@ fn accept_configuration(raw: &str) -> Result<WorkspaceConfiguration, Configurati
             bytes_max: CONFIGURATION_FILE_BYTES_MAX,
         }));
     }
-    let configuration: WorkspaceConfiguration = toml::from_str(raw).map_err(|error| {
-        Error::new(ConfigurationFault::Malformed {
-            detail: error.to_string(),
-        })
-    })?;
+    let configuration = accept_shape(raw)?;
     configuration
         .validate()
         .map_err(|violation| Error::new(ConfigurationFault::Invalid(violation)))?;
@@ -247,9 +321,22 @@ download_timeout = "5m"
             error.name(),
             ErrorName::Wire(ErrorCode::ConfigurationInvalid)
         );
+        let message = error.to_string();
         assert!(
-            error.to_string().contains("max_codes"),
-            "the refusal must name the unknown key: {error}"
+            message.contains("key execution") && message.contains("location line 2 column 1"),
+            "the refusal names the table and the line the unknown key stands on: {message}"
+        );
+        assert!(
+            message.contains("accepted max_code, max_concurrent, max_output, max_timeout"),
+            "the refusal names the keys that table accepts: {message}"
+        );
+        assert!(
+            message.contains(r#"example {"max_code":"16kb""#),
+            "the refusal shows a value that table takes: {message}"
+        );
+        assert!(
+            !message.contains("unknown field") && !message.contains("expected one of"),
+            "a refusal never speaks serde's grammar: {message}"
         );
     }
 
@@ -261,6 +348,48 @@ download_timeout = "5m"
             error.fault(),
             ConfigurationFault::Malformed { .. }
         ));
+        let message = error.to_string();
+        assert!(
+            message.contains("location line 1 column "),
+            "a syntax error names where the parser stopped: {message}"
+        );
+    }
+
+    /// A value of the wrong shape is refused by its own key, with a value
+    /// that key takes. The refusal never names a Rust type: `u64` and
+    /// `Duration` are names only this repository holds.
+    #[test]
+    fn test_a_value_of_the_wrong_shape_names_its_key_and_a_value_it_takes() {
+        let error = accept_configuration("[server]\nnum_workers = \"four\"\n")
+            .expect_err("a value of the wrong shape must refuse the file");
+        let message = error.to_string();
+        assert!(
+            message.contains("key server.num_workers"),
+            "the refusal names the key: {message}"
+        );
+        assert!(
+            message.contains("location line 2 column "),
+            "the refusal names where the parser stopped: {message}"
+        );
+        assert!(
+            message.contains("example "),
+            "the refusal shows a value the key takes: {message}"
+        );
+        assert!(
+            !message.contains("invalid type") && !message.contains("u64"),
+            "a refusal never speaks serde's grammar or names a Rust type: {message}"
+        );
+    }
+
+    /// A position is counted the way an editor counts, from one, and a byte
+    /// offset inside a line lands on that line.
+    #[test]
+    fn test_a_position_counts_lines_and_columns_from_one() {
+        let raw = "alpha\nbeta\ngamma\n";
+        assert_eq!(position_of(raw, 0), "line 1 column 1");
+        assert_eq!(position_of(raw, 6), "line 2 column 1");
+        assert_eq!(position_of(raw, 9), "line 2 column 4");
+        assert_eq!(position_of(raw, raw.len()), "line 4 column 1");
     }
 
     #[test]

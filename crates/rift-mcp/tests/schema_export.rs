@@ -31,6 +31,52 @@ fn check_request(directory: &tempfile::TempDir) -> TestResult<schema::ExportRequ
     ])?)
 }
 
+/// Every `rift://` identity the served document advertises spells its path with the one shared
+/// character class. Four models carried that class by hand and one of them dropped `@`, so the
+/// server returned node identities its own schema refused; a fifth identity cannot repeat it.
+#[test]
+fn every_served_identity_pattern_spells_its_path_with_the_shared_class() -> TestResult {
+    fn patterns(node: &Value, found: &mut Vec<String>) {
+        match node {
+            Value::Object(members) => {
+                for (key, value) in members {
+                    match value {
+                        Value::String(pattern) if key == "pattern" => found.push(pattern.clone()),
+                        _ => patterns(value, found),
+                    }
+                }
+            }
+            Value::Array(entries) => entries.iter().for_each(|entry| patterns(entry, found)),
+            _ => {}
+        }
+    }
+
+    let mut found = Vec::new();
+    patterns(
+        &serde_json::from_str(&schema::schema_document())?,
+        &mut found,
+    );
+    patterns(
+        &serde_json::from_str(&schema::configuration_schema_document())?,
+        &mut found,
+    );
+    let identities: Vec<&String> = found
+        .iter()
+        .filter(|pattern| pattern.starts_with("^rift://"))
+        .collect();
+    assert!(
+        identities.len() >= 4,
+        "the served document advertises one pattern per identity: {identities:?}"
+    );
+    for pattern in identities {
+        assert!(
+            pattern.contains(rift_protocol::read::IDENTITY_PATH_CHARACTER),
+            "an identity pattern spells its path with the shared class: {pattern}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn run_without_arguments_writes_default_output_directory() -> TestResult {
     let directory = tempfile::tempdir()?;

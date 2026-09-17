@@ -118,6 +118,14 @@ pub const LSP_REQUEST_TIMEOUT_MS_MIN: u64 = 1_000;
 pub const LSP_REQUEST_TIMEOUT_MS_MAX: u64 = 600_000;
 /// Milliseconds `lsp.request_timeout` holds when the key is absent.
 const LSP_REQUEST_TIMEOUT_MS_DEFAULT: u64 = 60_000;
+/// Milliseconds an engine's work record stays empty before it reads ready,
+/// at least: ten milliseconds.
+pub const LSP_SETTLE_DELAY_MS_MIN: u64 = 10;
+/// Milliseconds an engine's work record stays empty before it reads ready,
+/// at most: one minute.
+pub const LSP_SETTLE_DELAY_MS_MAX: u64 = 60_000;
+/// Milliseconds `lsp.settle_delay` holds when the key is absent.
+const LSP_SETTLE_DELAY_MS_DEFAULT: u64 = 500;
 /// Bytes of each LSP process's standard error Rift keeps, at least.
 pub const LSP_OUTPUT_BYTES_MIN: u64 = 1_024;
 /// Bytes of each LSP process's standard error Rift keeps, at most.
@@ -1594,6 +1602,14 @@ pub struct LspConfiguration {
     /// Wall-clock bound on each later LSP request, 1s to 10m.
     #[serde(default = "default_lsp_request_timeout")]
     pub request_timeout: Duration,
+    /// Quiet the process's work record holds before a read calls it ready,
+    /// 10ms to 1m. A language server empties its outstanding work several
+    /// times inside one project load, so Rift reports the process ready only
+    /// once that record has been empty this long at the last engine output
+    /// Rift read. Raise it for a process whose load falls silent for longer
+    /// than the default between phases.
+    #[serde(default = "default_lsp_settle_delay")]
+    pub settle_delay: Duration,
     /// Bytes of the process's standard error Rift keeps, 1kb to 8mb. The
     /// full size is still reported.
     #[serde(default = "default_lsp_output_limit")]
@@ -1616,6 +1632,10 @@ fn default_lsp_startup_timeout() -> Duration {
 
 fn default_lsp_request_timeout() -> Duration {
     Duration::from_millis(LSP_REQUEST_TIMEOUT_MS_DEFAULT)
+}
+
+fn default_lsp_settle_delay() -> Duration {
+    Duration::from_millis(LSP_SETTLE_DELAY_MS_DEFAULT)
 }
 
 fn default_lsp_output_limit() -> ByteSize {
@@ -2226,6 +2246,12 @@ fn lsp_bounds_violation(lsp: &LspConfiguration) -> Option<ConfigurationViolation
             LSP_REQUEST_TIMEOUT_MS_MAX,
         ),
         (
+            "lsp.settle_delay",
+            lsp.settle_delay.milliseconds(),
+            LSP_SETTLE_DELAY_MS_MIN,
+            LSP_SETTLE_DELAY_MS_MAX,
+        ),
+        (
             "lsp.output_limit",
             lsp.output_limit.bytes(),
             LSP_OUTPUT_BYTES_MIN,
@@ -2252,6 +2278,7 @@ mod tests {
             initialization_options: None,
             startup_timeout: Duration::from_millis(LSP_STARTUP_TIMEOUT_MS_DEFAULT),
             request_timeout: Duration::from_millis(LSP_REQUEST_TIMEOUT_MS_DEFAULT),
+            settle_delay: Duration::from_millis(LSP_SETTLE_DELAY_MS_DEFAULT),
             output_limit: ByteSize::from_bytes(LSP_OUTPUT_BYTES_DEFAULT),
             retry: RetryPolicy::default(),
             restart: RestartPolicy::default(),

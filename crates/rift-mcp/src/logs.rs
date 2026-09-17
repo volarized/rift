@@ -14,14 +14,15 @@
 
 use std::fmt::{self, Write as _};
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rift_core::causes;
 use rift_index::{LOG_BATCH_RECORDS_MAX, LogRecord, LogStore};
 use rift_protocol::configuration::LogsConfiguration;
 use tokio::sync::mpsc::{self, Receiver, Sender, error::TrySendError};
+use tokio::sync::{Notify, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
@@ -36,6 +37,10 @@ pub const LOG_QUEUE_RECORDS: usize = 4_096;
 /// Wall-clock span the drain task waits for more records before writing what it
 /// holds.
 pub const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+/// Longest a `rift://logs` read waits for the drain to write through the sequence the sink had
+/// stamped when the read began. A read past this answers with what the store holds: a log read
+/// never fails, and never hangs, because the log lane is slow.
+pub const LOG_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Attempts one batch gets before the drain gives it up. A batch that fails
 /// every attempt is dropped and counted, never retried forever: the queue
 /// behind it keeps filling while this one waits.
@@ -50,14 +55,146 @@ const LOG_WRITE_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 /// [`rift_index::LOG_FIELDS_BYTES_MAX`].
 const SPAN_FIELDS_BYTES_MAX: usize = 1 << 10;
 
+tokio::task_local! {
+    /// Set while the drain writes one batch. A record the write itself produces is not a
+    /// record of this workspace's own work: `[logs] capture` accepts any filter that parses,
+    /// so a filter admitting the storage driver's targets would otherwise make each batch
+    /// written produce the records of the next one. The marker is task-local and the write
+    /// runs on the drain's task alone, so an event another task emits during the write is
+    /// still recorded.
+    static WRITING_BATCH: ();
+}
+
+/// Whether this event came out of the drain's own write.
+fn inside_the_drains_write() -> bool {
+    WRITING_BATCH.try_with(|()| ()).is_ok()
+}
+
+/// One record on its way to the drain, under the sequence the sink stamped on it.
+///
+/// The sequence is what a read waits on. A count cannot serve: a full queue drops the newest
+/// record while older ones are still queued, so the number of records the lane has finished
+/// with says nothing about which ones.
+#[derive(Debug)]
+struct QueuedRecord {
+    sequence: u64,
+    record: LogRecord,
+}
+
+/// How far the drain has got through the sequence the sink stamps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LaneProgress {
+    /// Highest sequence the drain has written. Every lower sequence is written or dropped,
+    /// because the queue is first in, first out.
+    written_through: u64,
+    /// Records the lane is finished with: written by the drain, or dropped by a full queue.
+    finished: u64,
+}
+
+/// What the log lane has taken, and how far it has got.
+///
+/// A `rift://logs` read stamps its target from `accepted` on entry and waits for the drain to
+/// write through it, so the read sees the records its own request produced rather than
+/// whatever the drain's timer had committed by then. Without it the drain's
+/// [`LOG_FLUSH_INTERVAL`] is a window in which a caller reads back its own missing diagnostic.
+#[derive(Debug)]
+pub struct LogSettlement {
+    accepted: AtomicU64,
+    progress: watch::Sender<LaneProgress>,
+    flush: Notify,
+    draining: AtomicBool,
+}
+
+impl LogSettlement {
+    /// Stamps one record on its way into the queue and answers its sequence. Stamped before
+    /// the send, so a read taken immediately after a traced call cannot observe a sequence
+    /// that misses it.
+    fn accept(&self) -> u64 {
+        self.accepted.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// One record the queue had no room for. It is finished with, and no sequence advances:
+    /// a record the drain never sees is one no read can wait for.
+    fn finish_dropped(&self) {
+        self.progress.send_modify(|progress| progress.finished += 1);
+    }
+
+    /// One written batch: `count` records finished, the highest sequence among them written.
+    fn finish_written(&self, count: u64, written_through: u64) {
+        self.progress.send_modify(|progress| {
+            progress.finished += count;
+            progress.written_through = progress.written_through.max(written_through);
+        });
+    }
+
+    /// Whether a read stamped at `target` may proceed.
+    ///
+    /// Either the drain has written through that sequence, or the lane has finished with
+    /// everything it has taken, which says the record at `target` was dropped and no wait
+    /// will produce it.
+    fn reached(&self, progress: LaneProgress, target: u64) -> bool {
+        progress.written_through >= target
+            || progress.finished >= self.accepted.load(Ordering::SeqCst)
+    }
+
+    /// Waits for the drain to write through the sequence this read stamped on entry.
+    ///
+    /// Returns at once when no drain is running and when the lane is already there. Past
+    /// [`LOG_SETTLE_TIMEOUT`] the read proceeds with whatever the store holds.
+    async fn settle_for_read(&self) {
+        if !self.draining.load(Ordering::SeqCst) {
+            return;
+        }
+        let target = self.accepted.load(Ordering::SeqCst);
+        let mut progress = self.progress.subscribe();
+        if self.reached(*progress.borrow_and_update(), target) {
+            return;
+        }
+        self.flush.notify_one();
+        let reached = async {
+            while progress.changed().await.is_ok() {
+                if self.reached(*progress.borrow_and_update(), target) {
+                    return;
+                }
+            }
+        };
+        let _ = tokio::time::timeout(LOG_SETTLE_TIMEOUT, reached).await;
+    }
+}
+
+/// The settlement of the lane this process installed, when it installed one.
+///
+/// The sink is one process-wide `tracing` layer, so its settlement is process-wide too. A
+/// process that records nothing - every command but the foreground server - leaves this empty
+/// and its log reads wait for nothing.
+static INSTALLED_SETTLEMENT: Mutex<Option<Arc<LogSettlement>>> = Mutex::new(None);
+
+/// Waits for this process's log lane to write through the sequence it has stamped, if it has a
+/// lane. Every `rift://logs` read calls this before it opens the store.
+///
+/// # Panics
+///
+/// Panics when the installed lane's lock is poisoned, which needs a panic while it is held:
+/// the guard covers one `Arc` clone and nothing that can fail.
+pub async fn settle_for_read() {
+    let installed = INSTALLED_SETTLEMENT
+        .lock()
+        .expect("the installed settlement is not poisoned")
+        .clone();
+    if let Some(settlement) = installed {
+        settlement.settle_for_read().await;
+    }
+}
+
 /// The `tracing` layer that copies admitted events into the queue.
 ///
 /// Cloning shares one queue: the layer is installed once, and a clone held for
 /// a test observes the same drops.
 #[derive(Clone, Debug)]
 pub struct LogSink {
-    sender: Sender<LogRecord>,
+    sender: Sender<QueuedRecord>,
     dropped: Arc<AtomicU64>,
+    settlement: Arc<LogSettlement>,
 }
 
 impl LogSink {
@@ -68,12 +205,21 @@ impl LogSink {
     }
 
     /// Queues one record, counting a drop rather than waiting for room.
+    ///
+    /// The record takes its sequence before the send, and a send that finds no room finishes
+    /// it again: a read waiting on the sequence must never wait for a record no drain sees.
     fn send(&self, record: LogRecord) {
-        match self.sender.try_send(record) {
+        if inside_the_drains_write() {
+            return;
+        }
+        let sequence = self.settlement.accept();
+        match self.sender.try_send(QueuedRecord { sequence, record }) {
             Err(TrySendError::Full(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
+                self.settlement.finish_dropped();
             }
-            Ok(()) | Err(TrySendError::Closed(_)) => {}
+            Err(TrySendError::Closed(_)) => self.settlement.finish_dropped(),
+            Ok(()) => {}
         }
     }
 }
@@ -81,15 +227,16 @@ impl LogSink {
 /// The queue's reading end, and the task that writes it into the store.
 #[derive(Debug)]
 pub struct LogDrain {
-    receiver: Receiver<LogRecord>,
+    receiver: Receiver<QueuedRecord>,
     dropped: Arc<AtomicU64>,
+    settlement: Arc<LogSettlement>,
 }
 
 impl LogDrain {
     /// One queued record, without waiting; for a test that reads the queue without a store.
     #[cfg(test)]
     pub(crate) fn try_recv_record(&mut self) -> Result<LogRecord, mpsc::error::TryRecvError> {
-        self.receiver.try_recv()
+        self.receiver.try_recv().map(|queued| queued.record)
     }
 
     /// Writes records until the queue closes, draining buffered records after cancellation.
@@ -114,6 +261,7 @@ impl LogDrain {
     ) {
         let mut batch = Vec::with_capacity(LOG_BATCH_RECORDS_MAX);
         let mut closing = false;
+        self.settlement.draining.store(true, Ordering::SeqCst);
         loop {
             let received = tokio::select! {
                 biased;
@@ -133,23 +281,20 @@ impl LogDrain {
                     self.receiver.close();
                     closing = true;
                 }
+                () = self.settlement.flush.notified(), if !closing => {}
                 () = tokio::time::sleep(LOG_FLUSH_INTERVAL), if !closing => {}
                 else => {}
             }
             while batch.len() < LOG_BATCH_RECORDS_MAX {
                 match self.receiver.try_recv() {
-                    Ok(record) => batch.push(record),
+                    Ok(queued) => batch.push(queued),
                     Err(_) => break,
                 }
             }
-            self.note_drops(&mut batch);
-            self.write_batch(&store, &batch, retention_records).await;
-            batch.clear();
+            self.write_turn(&store, &mut batch, retention_records).await;
         }
-        self.note_drops(&mut batch);
-        if !batch.is_empty() {
-            self.write_batch(&store, &batch, retention_records).await;
-        }
+        self.write_turn(&store, &mut batch, retention_records).await;
+        self.settlement.draining.store(false, Ordering::SeqCst);
     }
 
     /// Writes one batch, retrying a refused write before giving it up.
@@ -158,9 +303,41 @@ impl LogDrain {
     /// another process or an operating failure. A batch that still fails after
     /// [`LOG_WRITE_ATTEMPTS_MAX`] is counted as dropped, which the next batch
     /// records: the queue behind this one is still filling.
+    /// Writes one batch and reports how far through the sequence the lane now is.
+    ///
+    /// The highest sequence in the batch is written through, and every lower one is written or
+    /// was dropped, because the queue is first in, first out.
+    async fn write_turn(
+        &self,
+        store: &LogStore,
+        batch: &mut Vec<QueuedRecord>,
+        retention_records: u64,
+    ) {
+        self.note_drops(batch);
+        if batch.is_empty() {
+            return;
+        }
+        let written_through = batch
+            .iter()
+            .map(|queued| queued.sequence)
+            .max()
+            .unwrap_or(0);
+        // The drop notice carries no sequence, because the sink never stamped it. Counting it
+        // among the records finished with would let `finished` pass `accepted`, and a read
+        // waiting on a record still queued would be released by that overshoot.
+        let stamped = batch.iter().filter(|queued| queued.sequence != 0).count() as u64;
+        let records: Vec<LogRecord> = batch.iter().map(|queued| queued.record.clone()).collect();
+        self.write_batch(store, &records, retention_records).await;
+        self.settlement.finish_written(stamped, written_through);
+        batch.clear();
+    }
+
     async fn write_batch(&self, store: &LogStore, batch: &[LogRecord], retention_records: u64) {
         for attempt in 1..=LOG_WRITE_ATTEMPTS_MAX {
-            match store.append(batch, retention_records).await {
+            match WRITING_BATCH
+                .scope((), store.append(batch, retention_records))
+                .await
+            {
                 Ok(_dropped) => return,
                 Err(error) if attempt == LOG_WRITE_ATTEMPTS_MAX => {
                     self.dropped
@@ -179,7 +356,7 @@ impl LogDrain {
 
     /// Appends one record naming the drops so far, when there are any. The
     /// count is what a reader needs to know the run is missing records.
-    fn note_drops(&self, batch: &mut Vec<LogRecord>) {
+    fn note_drops(&self, batch: &mut Vec<QueuedRecord>) {
         if batch.len() == LOG_BATCH_RECORDS_MAX {
             return;
         }
@@ -187,29 +364,57 @@ impl LogDrain {
         if dropped == 0 {
             return;
         }
-        batch.push(LogRecord::new(
-            now_ms(),
-            "warn",
-            "rift_mcp::logs",
-            "logs",
-            "logs.drain",
-            "the log queue was full and dropped records",
-            &format!("{{\"dropped\":{dropped}}}"),
-        ));
+        // The drain mints this one, so it carries no sequence of its own: sequence zero is
+        // below every stamped record and never raises what the lane has written through.
+        batch.push(QueuedRecord {
+            sequence: 0,
+            record: LogRecord::new(
+                now_ms(),
+                "warn",
+                "rift_mcp::logs",
+                "logs",
+                "logs.drain",
+                "the log queue was full and dropped records",
+                &format!("{{\"dropped\":{dropped}}}"),
+            ),
+        });
     }
 }
 
-/// Builds the layer and its drain, sharing one bounded queue.
+/// Builds the layer and its drain, sharing one bounded queue and one settlement.
+///
+/// # Panics
+///
+/// Panics when the installed lane's lock is poisoned, which needs a panic while it is held:
+/// the guard covers one `Arc` replacement and nothing that can fail.
 #[must_use]
 pub fn log_capture() -> (LogSink, LogDrain) {
     let (sender, receiver) = mpsc::channel(LOG_QUEUE_RECORDS);
     let dropped = Arc::new(AtomicU64::new(0));
+    let settlement = Arc::new(LogSettlement {
+        accepted: AtomicU64::new(0),
+        progress: watch::Sender::new(LaneProgress::default()),
+        flush: Notify::new(),
+        draining: AtomicBool::new(false),
+    });
+    // A `rift://logs` read reaches the lane through this, because the sink is installed as one
+    // process-wide layer and the reading server never holds it. The newest lane wins, which is
+    // what a test building a second one means.
+    INSTALLED_SETTLEMENT
+        .lock()
+        .expect("the installed settlement is not poisoned")
+        .replace(Arc::clone(&settlement));
     (
         LogSink {
             sender,
             dropped: Arc::clone(&dropped),
+            settlement: Arc::clone(&settlement),
         },
-        LogDrain { receiver, dropped },
+        LogDrain {
+            receiver,
+            dropped,
+            settlement,
+        },
     )
 }
 
@@ -559,9 +764,189 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        LOG_QUEUE_RECORDS, PANIC_PAYLOAD_BYTES_MAX, RecordedFields, SPAN_FIELDS_BYTES_MAX,
-        caused_by, install_panic_hook, log_capture, panic_payload, quoted,
+        LOG_QUEUE_RECORDS, LOG_SETTLE_TIMEOUT, LogSettlement, PANIC_PAYLOAD_BYTES_MAX,
+        RecordedFields, SPAN_FIELDS_BYTES_MAX, caused_by, install_panic_hook, log_capture,
+        panic_payload, quoted,
     };
+
+    /// One lane with `accepted` sequences stamped, the drain written through
+    /// `written_through`, and a drain that is running or is not.
+    fn settlement(accepted: u64, written_through: u64, draining: bool) -> LogSettlement {
+        LogSettlement {
+            accepted: std::sync::atomic::AtomicU64::new(accepted),
+            progress: tokio::sync::watch::Sender::new(super::LaneProgress {
+                written_through,
+                finished: written_through,
+            }),
+            flush: tokio::sync::Notify::new(),
+            draining: std::sync::atomic::AtomicBool::new(draining),
+        }
+    }
+
+    /// A process that installed no drain waits for nothing. Every command but the foreground
+    /// server records through no lane, and a log read there must not pay the bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_waits_for_a_drain_that_is_not_running() {
+        let started = tokio::time::Instant::now();
+        settlement(4, 0, false).settle_for_read().await;
+        assert_eq!(
+            tokio::time::Instant::now(),
+            started,
+            "a read with no drain behind it waits for nothing"
+        );
+    }
+
+    /// A settled queue costs a read nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_over_a_settled_queue_waits_for_nothing() {
+        let started = tokio::time::Instant::now();
+        settlement(4, 4, true).settle_for_read().await;
+        assert_eq!(tokio::time::Instant::now(), started);
+    }
+
+    /// A drain that stops settling still lets the read through, at the bound. A log read never
+    /// hangs because the log lane is stuck.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_past_the_settle_bound_still_answers() {
+        let started = tokio::time::Instant::now();
+        settlement(4, 1, true).settle_for_read().await;
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            LOG_SETTLE_TIMEOUT,
+            "the read answers at the bound"
+        );
+    }
+
+    /// A record the queue had no room for settles as it is accepted, so a read never waits out
+    /// the bound for a record no drain will ever see.
+    /// A record the drain's own write produced is not a record. `[logs] capture` accepts any
+    /// filter that parses, and one admitting the storage driver made each batch written produce
+    /// the records of the next, so the queue dropped the diagnostics the operator wanted.
+    #[tokio::test]
+    async fn a_record_the_drains_write_produced_is_not_queued() {
+        let (sink, mut drain) = log_capture();
+        super::WRITING_BATCH
+            .scope((), async {
+                sink.send(record("the storage driver wrote a batch"));
+            })
+            .await;
+        assert!(
+            queued(&mut drain).is_empty(),
+            "the write's own record stays out of the queue it is draining"
+        );
+        assert_eq!(
+            sink.settlement.accepted.load(Ordering::SeqCst),
+            0,
+            "a record the lane never takes advances no sequence"
+        );
+    }
+
+    /// The marker is task-local, so a record another task emits while the drain writes is still
+    /// recorded: the lane suppresses its own writes, not the workspace's work.
+    #[tokio::test]
+    async fn a_record_from_another_task_during_the_write_is_queued() {
+        let (sink, mut drain) = log_capture();
+        let emitter = sink.clone();
+        super::WRITING_BATCH
+            .scope((), async move {
+                tokio::spawn(async move { emitter.send(record("the index left a file out")) })
+                    .await
+                    .expect("the emitting task runs");
+            })
+            .await;
+        assert_eq!(
+            queued(&mut drain).len(),
+            1,
+            "another task's record is unaffected by the drain's write"
+        );
+    }
+
+    /// The lane finishes with exactly the records it took. The drain mints a drop notice of
+    /// its own, and counting that among the records finished with pushes the total past what
+    /// the sink stamped, which would release a read waiting on a record still queued.
+    #[tokio::test]
+    async fn the_lane_finishes_with_exactly_the_records_it_took() {
+        let (_directory, store) = store().await;
+        let (sink, mut drain) = log_capture();
+        for index in 0..=LOG_QUEUE_RECORDS {
+            sink.send(record(&format!("record {index}")));
+        }
+        assert_eq!(
+            sink.dropped(),
+            1,
+            "the queue holds one record less than sent"
+        );
+
+        // A short first turn, so the batch stays under the size at which the drain defers its
+        // drop notice, and that turn writes the notice.
+        let mut batch = Vec::new();
+        for _ in 0..8 {
+            batch.push(drain.receiver.try_recv().expect("the queue holds records"));
+        }
+        drain.write_turn(&store, &mut batch, 10_000).await;
+        assert_eq!(
+            store.count().await.expect("the count reads"),
+            9,
+            "the first turn writes its records and one drop notice"
+        );
+
+        while let Ok(queued) = drain.receiver.try_recv() {
+            batch.push(queued);
+        }
+        drain.write_turn(&store, &mut batch, 10_000).await;
+
+        let finished = sink.settlement.progress.borrow().finished;
+        let accepted = sink.settlement.accepted.load(Ordering::SeqCst);
+        assert_eq!(
+            finished, accepted,
+            "the lane took {accepted} records and finished with {finished}"
+        );
+    }
+
+    /// A read whose own record the full queue dropped still answers. The sequence it waits on
+    /// never reaches the drain, so the lane's finished count is what releases it.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_record_does_not_hold_a_read() {
+        let (sink, _drain) = log_capture();
+        sink.settlement.draining.store(true, Ordering::SeqCst);
+        for index in 0..=LOG_QUEUE_RECORDS {
+            sink.send(record(&format!("record {index}")));
+        }
+        assert_eq!(
+            sink.dropped(),
+            1,
+            "the queue holds one record less than sent"
+        );
+        let settlement = Arc::clone(&sink.settlement);
+        settlement.finish_written(LOG_QUEUE_RECORDS as u64, LOG_QUEUE_RECORDS as u64);
+        let started = tokio::time::Instant::now();
+        settlement.settle_for_read().await;
+        assert_eq!(
+            tokio::time::Instant::now(),
+            started,
+            "the lane finished with every record it took, so the read does not wait"
+        );
+    }
+
+    /// A read waits for the sequence it stamped, not for a count. A full queue drops the
+    /// newest record while older ones wait, so a lane that has finished with as many records
+    /// as the read stamped can still be holding the read's own record.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_waits_for_its_own_sequence_not_for_a_count() {
+        let lane = settlement(0, 0, true);
+        lane.accepted.store(10, Ordering::SeqCst);
+        lane.progress.send_modify(|progress| {
+            progress.written_through = 4;
+            progress.finished = 9;
+        });
+        let started = tokio::time::Instant::now();
+        lane.settle_for_read().await;
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            LOG_SETTLE_TIMEOUT,
+            "nine records finished with does not mean sequence ten was written"
+        );
+    }
     use tracing::field::Visit;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -570,7 +955,7 @@ mod tests {
     fn queued(drain: &mut super::LogDrain) -> Vec<rift_index::LogRecord> {
         let mut records = Vec::new();
         while let Ok(record) = drain.receiver.try_recv() {
-            records.push(record);
+            records.push(record.record);
         }
         records
     }

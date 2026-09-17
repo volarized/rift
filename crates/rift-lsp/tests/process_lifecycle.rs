@@ -35,6 +35,7 @@ fn shell_launch(script: String) -> EngineLaunch {
         initialization_options: None,
         startup_timeout: Duration::from_secs(10),
         request_timeout: Duration::from_secs(10),
+        settle_delay: Duration::from_millis(500),
         stderr_capture_bytes: 4_096,
     }
 }

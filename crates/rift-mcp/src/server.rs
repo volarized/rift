@@ -33,7 +33,7 @@ use rift_server::{
     DependencyStore, EnginePool, EngineReferences, LspProcessKey, ReadError, ReadFault,
     ReadService, resolve_engine_references, uses_engine_references, wire_digest,
 };
-use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
+use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{
     Implementation, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
     ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ServerCapabilities,
@@ -47,6 +47,7 @@ use tracing::Instrument as _;
 
 use crate::dependency::{DependencyLane, DependencyRequest};
 use crate::failure::WireFailure;
+use crate::parameters::Parameters;
 use crate::resource;
 use crate::storage::WorkspaceStorage;
 use crate::validation::{
@@ -2091,6 +2092,9 @@ impl RiftMcp {
             current.configuration.logs_configuration().page_records
         };
         let query = resource::log_query(uri, page_records)?;
+        // The drain writes on a timer, so a read taken right after the request that produced a
+        // record would answer without it. This waits for the lane to reach what it has taken.
+        crate::logs::settle_for_read().await;
         let Some(store) = self.logs.as_ref() else {
             return Ok(resource::logs_unavailable(
                 uri,
@@ -3493,6 +3497,110 @@ mod tests {
         let wire = data.data.ok_or("wire error data must be present")?;
         assert_eq!(wire["code"], json!("invalid_request"));
         Ok(())
+    }
+
+    /// A member sent in the wrong shape is refused by the member's own name,
+    /// with an example of the value it takes.
+    ///
+    /// The refusal never names a Rust type: `PathSelector` is a name only this
+    /// repository holds, and a caller reading it has nothing to look up. The
+    /// example comes from the same schema the caller lists, so it can be sent
+    /// back verbatim.
+    #[tokio::test]
+    async fn a_member_in_the_wrong_shape_is_refused_by_name_with_an_example() -> TestResult {
+        let data = failing_call(
+            &json!({"query": "beacon", "paths": ["crates/rift-server/src/read.rs"]}),
+            "search",
+        )
+        .await?;
+        assert_eq!(data.code, ErrorCode(-32000));
+        assert_eq!(
+            data.message.as_ref(),
+            "the request does not match the documented form: tool search, field paths, \
+             accepted exclude, force_include, include, \
+             example {\"exclude\":[\"src/generated/**\"],\"include\":[\"src/**\"]}; \
+             correct the reported field and resend the request"
+        );
+        let wire = data.data.ok_or("wire error data must be present")?;
+        assert_eq!(wire["code"], json!("invalid_request"));
+        assert_eq!(wire["retry"], json!("never"));
+        Ok(())
+    }
+
+    /// A member the tool does not serve is refused by naming the members it
+    /// does, and an example of the whole request.
+    #[tokio::test]
+    async fn an_unserved_member_is_refused_by_naming_the_served_ones() -> TestResult {
+        let data =
+            failing_call(&json!({"query": "beacon", "path": "src/lib.rs"}), "search").await?;
+        let message = data.message.as_ref();
+        assert!(
+            message.starts_with(
+                "the request does not match the documented form: tool search, accepted "
+            ),
+            "{message}"
+        );
+        assert!(message.contains("paths"), "{message}");
+        assert!(message.contains("example {"), "{message}");
+        assert!(
+            !message.contains("unknown field") && !message.contains("struct"),
+            "a refusal never speaks serde's grammar: {message}"
+        );
+        Ok(())
+    }
+
+    /// A closed set's member is refused by listing the values it takes.
+    #[tokio::test]
+    async fn a_value_outside_a_closed_set_is_refused_by_listing_the_set() -> TestResult {
+        let data = failing_call(&json!({"query": "beacon", "target": "nodes"}), "search").await?;
+        let message = data.message.as_ref();
+        assert!(
+            message.contains("field target, accepted all, file, symbol"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("unknown variant"),
+            "a refusal never speaks serde's grammar: {message}"
+        );
+        Ok(())
+    }
+
+    /// Every served tool's input schema carries an authored example, at its
+    /// root and on every object a caller can address inside it.
+    ///
+    /// A refusal shows the caller an example of the value it should have sent,
+    /// read from this schema. An object with no example leaves the caller with
+    /// the example of whatever holds it, which is the defect this gate exists
+    /// to keep out.
+    #[test]
+    fn every_served_input_schema_carries_an_example_for_every_object() {
+        for tool in crate::schema::tool_listing() {
+            let schema = serde_json::Value::Object(tool.input_schema.as_ref().clone());
+            assert!(
+                schema.get("examples").is_some_and(|examples| examples
+                    .as_array()
+                    .is_some_and(|examples| !examples.is_empty())),
+                "tool {} states no example request",
+                tool.name
+            );
+            let definitions = schema
+                .get("$defs")
+                .and_then(serde_json::Value::as_object)
+                .into_iter()
+                .flatten();
+            for (name, definition) in definitions {
+                if definition.get("properties").is_none() {
+                    continue;
+                }
+                assert!(
+                    definition.get("examples").is_some_and(|examples| examples
+                        .as_array()
+                        .is_some_and(|examples| !examples.is_empty())),
+                    "tool {}: {name} states no example value",
+                    tool.name
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -4904,6 +5012,58 @@ mod tests {
                 && text.contains("src/deep.rs")
                 && text.contains("too_deep"),
             "the logs must name the left-out file and its bound: {text}"
+        );
+        Ok(())
+    }
+
+    /// A record emitted immediately before a `rift://logs` read appears in that read, with the
+    /// drain still running. The drain writes on its own timer and nothing made the read wait
+    /// for it, so a caller reading back the diagnostic behind its own refusal was answered
+    /// without it: cold first use met exactly this on `rift://logs/component/engine`.
+    ///
+    /// The sink captures under the workspace's own `[logs] capture` default, the filter a
+    /// served workspace records under. Without it the lane also takes the storage driver's own
+    /// trace records, and the read then waits out its bound behind thousands of them.
+    #[tokio::test]
+    async fn a_record_emitted_before_a_read_appears_in_that_read() -> TestResult {
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "")?;
+
+        let (sink, drain) = crate::logs::log_capture();
+        let capture = crate::logs::logs_configuration(directory.path()).capture;
+        let filter = tracing_subscriber::EnvFilter::try_new(&capture)?;
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(sink.with_filter(filter)),
+        );
+        let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
+        let store = storage.logs().ok_or("the log store must open")?;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let drain_task = tokio::spawn(drain.run(store, 10_000, cancellation.clone()));
+        let server =
+            RiftMcp::build_with_storage(directory.path(), WorkspaceIndexLimits::default(), storage)
+                .await?;
+
+        tracing::warn!(component = "engine", "the beacon engine did not start");
+        let logs = server.read_logs("rift://logs/component/engine").await?;
+        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = logs
+            .contents
+            .first()
+            .ok_or("a log read answers with one content")?
+        else {
+            return Err("a log read answers with text".into());
+        };
+        let answered = text.clone();
+
+        cancellation.cancel();
+        drain_task.await?;
+        assert!(
+            answered.contains("the beacon engine did not start"),
+            "the read answers with the record the same task emitted: {answered}"
         );
         Ok(())
     }

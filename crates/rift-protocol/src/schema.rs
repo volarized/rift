@@ -33,6 +33,255 @@ mod keyword {
     pub(super) const PROPERTY_NAMES: &str = "propertyNames";
     pub(super) const TYPE: &str = "type";
     pub(super) const DEFAULT: &str = "default";
+
+    pub(super) const DEFS: &str = "$defs";
+    pub(super) const REF: &str = "$ref";
+    pub(super) const ITEMS: &str = "items";
+    pub(super) const EXAMPLES: &str = "examples";
+    pub(super) const NULL: &str = "null";
+}
+
+/// References and unions one schema walk follows before it answers with what
+/// it has reached. A model may refer to itself, and a caller reaches the walk
+/// by sending one value the schema refuses, so the walk is bounded.
+const SCHEMA_REFERENCES_MAX: usize = 32;
+
+/// One step of the path into a document the server refused.
+///
+/// A refusal names the member it stopped at, so the caller reads the shape of
+/// that member rather than of the whole request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DocumentStep<'step> {
+    /// A member of an object, by the name the wire spells.
+    Member(&'step str),
+    /// An element of an array.
+    Element,
+}
+
+/// The schema the workspace configuration declares.
+///
+/// One spelling for every reader: the document `rift.schema.json` publishes,
+/// and the document a refused `rift.toml` is described against.
+#[must_use]
+pub fn configuration_schema() -> Value {
+    schemars::schema_for!(crate::configuration::WorkspaceConfiguration).to_value()
+}
+
+/// The path into a refused document the deserializer stopped at.
+///
+/// The walk ends at the first segment that addresses neither a member nor an
+/// element: a segment the schema cannot follow would misalign every segment
+/// after it, and a refusal naming a member the schema never had helps nobody.
+#[must_use]
+pub fn document_steps(path: &serde_path_to_error::Path) -> Vec<DocumentStep<'_>> {
+    let mut steps = Vec::new();
+    for segment in path {
+        match segment {
+            serde_path_to_error::Segment::Map { key } => steps.push(DocumentStep::Member(key)),
+            serde_path_to_error::Segment::Seq { .. } => steps.push(DocumentStep::Element),
+            _ => break,
+        }
+    }
+    steps
+}
+
+/// The wire spelling of the value a refusal stops at: members joined by `.`,
+/// each element written `[]`. Absent for the whole document.
+#[must_use]
+pub fn named_member(steps: &[DocumentStep<'_>]) -> Option<String> {
+    if steps.is_empty() {
+        return None;
+    }
+    let mut name = String::new();
+    for step in steps {
+        match step {
+            DocumentStep::Member(member) => {
+                if !name.is_empty() {
+                    name.push('.');
+                }
+                name.push_str(member);
+            }
+            DocumentStep::Element => name.push_str("[]"),
+        }
+    }
+    Some(name)
+}
+
+/// What a schema declares at one path: the members it accepts there, and an
+/// example of the value it takes.
+///
+/// Both are read from the schema the server serves, so a refusal states names
+/// and values the caller can look up in the same document it was written
+/// against.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ExpectedShape {
+    accepted: Vec<String>,
+    example: Option<Value>,
+    followed: usize,
+}
+
+impl ExpectedShape {
+    /// What the addressed schema accepts, in wire spelling, sorted: an object's
+    /// member names, or a closed set's values. Empty where the schema states
+    /// neither.
+    #[must_use]
+    pub fn accepted(&self) -> &[String] {
+        &self.accepted
+    }
+
+    /// An example of the value the addressed schema takes. Absent when neither
+    /// the addressed schema nor any schema above it carries one.
+    #[must_use]
+    pub const fn example(&self) -> Option<&Value> {
+        self.example.as_ref()
+    }
+
+    /// How many steps of the requested path the schema declares. A caller
+    /// names the value it refused by this many steps, so a refusal never
+    /// addresses a member the served schema never had.
+    #[must_use]
+    pub const fn followed(&self) -> usize {
+        self.followed
+    }
+}
+
+/// The shape `schema` declares at `path`.
+///
+/// The walk resolves `$ref` against the root's `$defs` and unwraps the union
+/// an optional member is spelled as. It carries the deepest value it has
+/// passed, so a member that states none of its own still answers with the
+/// value of what holds it. A path that leaves the schema answers with what the
+/// last schema it reached declares.
+#[must_use]
+pub fn expected_shape(schema: &Value, path: &[DocumentStep<'_>]) -> ExpectedShape {
+    let root = schema;
+    let mut node = resolved(root, schema);
+    let mut example = declared_value(node);
+    let mut followed = 0;
+    for step in path {
+        let Some(reached) = declared_member(node, *step) else {
+            break;
+        };
+        node = resolved(root, reached);
+        followed += 1;
+        if let Some(found) = declared_value(node).or_else(|| declared_value(reached)) {
+            example = Some(found);
+        }
+    }
+    ExpectedShape {
+        accepted: accepted_members(node),
+        example: example.cloned(),
+        followed,
+    }
+}
+
+/// The schema one step reaches, before its reference is resolved, or `None`
+/// where the schema declares no such step.
+fn declared_member<'schema>(
+    node: &'schema Value,
+    step: DocumentStep<'_>,
+) -> Option<&'schema Value> {
+    match step {
+        DocumentStep::Member(name) => node.get(keyword::PROPERTIES)?.get(name),
+        DocumentStep::Element => node.get(keyword::ITEMS),
+    }
+}
+
+/// The schema `node` stands for: its `$ref` target, or the one branch of its
+/// `anyOf` or `oneOf` that is not the null one, or `node` itself.
+///
+/// An optional member is spelled as a union of its own schema and the null
+/// one, so unwrapping that union reaches the member's real shape. A union with
+/// more than one branch left is a closed set or a real choice, and stays whole:
+/// what it accepts is every branch, not the first.
+///
+/// The walk is bounded by [`SCHEMA_REFERENCES_MAX`]: a model that refers to
+/// itself is a legal schema, and a caller reaches this walk by sending one bad
+/// value, so an unbounded one would hand every caller a way to stall a read.
+/// A schema deeper than the bound answers with the last node reached, which
+/// states less than the target would and never less than nothing.
+fn resolved<'schema>(root: &'schema Value, node: &'schema Value) -> &'schema Value {
+    let mut node = node;
+    for _ in 0..SCHEMA_REFERENCES_MAX {
+        if let Some(target) = referenced(root, node) {
+            node = target;
+            continue;
+        }
+        match value_branches(node).as_slice() {
+            [branch] => node = branch,
+            _ => return node,
+        }
+    }
+    node
+}
+
+/// The definition one schema's `$ref` names, where it names one this document
+/// carries.
+fn referenced<'schema>(root: &'schema Value, node: &'schema Value) -> Option<&'schema Value> {
+    let name = node
+        .get(keyword::REF)
+        .and_then(Value::as_str)?
+        .strip_prefix("#/$defs/")?;
+    root.get(keyword::DEFS)?.get(name)
+}
+
+/// The branches of a union that declare a value, the null branch left out.
+/// Empty for a schema that is no union.
+fn value_branches(node: &Value) -> Vec<&Value> {
+    [keyword::ANY_OF, keyword::ONE_OF]
+        .into_iter()
+        .filter_map(|keyword| node.get(keyword))
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter(|branch| !is_null_schema(branch))
+        .collect()
+}
+
+/// Whether a branch declares the absent value alone.
+fn is_null_schema(branch: &Value) -> bool {
+    branch.get(keyword::TYPE).and_then(Value::as_str) == Some(keyword::NULL)
+}
+
+/// A value one schema states it takes: its first authored example, or the
+/// default it holds when the key is absent. A default is a value the schema
+/// accepts by construction, so it stands where no example is authored; a
+/// `null` default states absence and states no value at all.
+fn declared_value(node: &Value) -> Option<&Value> {
+    if let Some(example) = node
+        .get(keyword::EXAMPLES)
+        .and_then(Value::as_array)
+        .and_then(|examples| examples.first())
+    {
+        return Some(example);
+    }
+    node.get(keyword::DEFAULT).filter(|value| !value.is_null())
+}
+
+/// What one schema accepts, sorted: an object's member names, or the values of
+/// a closed set, however that set is spelled. Empty where the schema states
+/// neither.
+fn accepted_members(node: &Value) -> Vec<String> {
+    let mut accepted: Vec<String> =
+        if let Some(properties) = node.get(keyword::PROPERTIES).and_then(Value::as_object) {
+            properties.keys().cloned().collect()
+        } else if let Some(values) = node.get(keyword::ENUM).and_then(Value::as_array) {
+            string_values(values.iter())
+        } else {
+            string_values(
+                value_branches(node)
+                    .into_iter()
+                    .filter_map(|branch| branch.get(keyword::CONST)),
+            )
+        };
+    accepted.sort();
+    accepted
+}
+
+/// The string values of a set of schema values, anything else left out.
+fn string_values<'value>(values: impl Iterator<Item = &'value Value>) -> Vec<String> {
+    values
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect()
 }
 
 /// The serde property name of one model field, proven against the model:
@@ -477,7 +726,8 @@ pub fn declare_lsp_ranges(schema: &mut Schema) {
     use crate::configuration::{
         ByteSize, Duration, LSP_ENVIRONMENT_ENTRIES_MAX, LSP_OUTPUT_BYTES_MAX,
         LSP_OUTPUT_BYTES_MIN, LSP_REQUEST_TIMEOUT_MS_MAX, LSP_REQUEST_TIMEOUT_MS_MIN,
-        LSP_STARTUP_TIMEOUT_MS_MAX, LSP_STARTUP_TIMEOUT_MS_MIN, LspConfiguration,
+        LSP_SETTLE_DELAY_MS_MAX, LSP_SETTLE_DELAY_MS_MIN, LSP_STARTUP_TIMEOUT_MS_MAX,
+        LSP_STARTUP_TIMEOUT_MS_MIN, LspConfiguration,
     };
     let ranges = [
         (
@@ -492,6 +742,13 @@ pub fn declare_lsp_ranges(schema: &mut Schema) {
             range(
                 &Duration::from_millis(LSP_REQUEST_TIMEOUT_MS_MIN),
                 &Duration::from_millis(LSP_REQUEST_TIMEOUT_MS_MAX),
+            ),
+        ),
+        (
+            property!(LspConfiguration, settle_delay),
+            range(
+                &Duration::from_millis(LSP_SETTLE_DELAY_MS_MIN),
+                &Duration::from_millis(LSP_SETTLE_DELAY_MS_MAX),
             ),
         ),
         (
@@ -879,6 +1136,176 @@ mod tests {
 
     fn schema_from(value: Value) -> Schema {
         Schema::try_from(value).expect("test schema literal must be a valid schema object")
+    }
+
+    /// A schema shaped like a served tool's: an optional member spelled as a
+    /// union with the null branch, a closed set spelled as consts, an array of
+    /// a referenced type, and an example on the root alone.
+    fn addressed_schema() -> Value {
+        json!({
+            "type": "object",
+            "examples": [{"query": "beacon"}],
+            "properties": {
+                "query": {"type": "string"},
+                "paths": {
+                    "anyOf": [{"$ref": "#/$defs/PathSelector"}, {"type": "null"}]
+                },
+                "target": {"$ref": "#/$defs/Target"},
+                "order": {"enum": ["relevance", "path"]}
+            },
+            "$defs": {
+                "PathSelector": {
+                    "type": "object",
+                    "examples": [{"include": ["src/**"]}],
+                    "properties": {
+                        "include": {"type": "array", "items": {"$ref": "#/$defs/Pattern"}},
+                        "exclude": {"type": "array", "items": {"$ref": "#/$defs/Pattern"}}
+                    }
+                },
+                "Pattern": {"type": "string", "examples": ["src/**"]},
+                "Target": {
+                    "oneOf": [
+                        {"const": "symbol", "type": "string"},
+                        {"const": "file", "type": "string"}
+                    ]
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn an_empty_path_answers_the_whole_document_shape() {
+        let shape = expected_shape(&addressed_schema(), &[]);
+        assert_eq!(shape.followed(), 0);
+        assert_eq!(shape.accepted(), ["order", "paths", "query", "target"]);
+        assert_eq!(shape.example(), Some(&json!({"query": "beacon"})));
+    }
+
+    #[test]
+    fn an_optional_member_resolves_through_its_union_and_reference() {
+        let shape = expected_shape(&addressed_schema(), &[DocumentStep::Member("paths")]);
+        assert_eq!(shape.followed(), 1);
+        assert_eq!(shape.accepted(), ["exclude", "include"]);
+        assert_eq!(shape.example(), Some(&json!({"include": ["src/**"]})));
+    }
+
+    #[test]
+    fn an_element_step_reaches_the_item_schema_and_its_example() {
+        let shape = expected_shape(
+            &addressed_schema(),
+            &[
+                DocumentStep::Member("paths"),
+                DocumentStep::Member("include"),
+                DocumentStep::Element,
+            ],
+        );
+        assert_eq!(shape.followed(), 3);
+        assert!(shape.accepted().is_empty(), "a pattern accepts no member");
+        assert_eq!(shape.example(), Some(&json!("src/**")));
+    }
+
+    /// A member with no example of its own answers with the example of the
+    /// value that holds it, so a refusal always shows a value to send.
+    #[test]
+    fn a_member_without_an_example_answers_the_one_above_it() {
+        let shape = expected_shape(&addressed_schema(), &[DocumentStep::Member("query")]);
+        assert_eq!(shape.followed(), 1);
+        assert_eq!(shape.example(), Some(&json!({"query": "beacon"})));
+    }
+
+    /// A refusal names the value it stopped at the way the wire spells it.
+    #[test]
+    fn a_named_member_joins_members_by_dot_and_writes_each_element() {
+        assert_eq!(named_member(&[]), None, "the whole document has no name");
+        assert_eq!(
+            named_member(&[DocumentStep::Member("paths")]),
+            Some("paths".to_owned())
+        );
+        assert_eq!(
+            named_member(&[
+                DocumentStep::Member("paths"),
+                DocumentStep::Member("include"),
+                DocumentStep::Element,
+            ]),
+            Some("paths.include[]".to_owned())
+        );
+    }
+
+    /// A path segment addressing neither a member nor an element ends the walk,
+    /// because a step the schema cannot follow would misalign every step after
+    /// it. serde reports an enum's variant as such a segment.
+    #[test]
+    fn a_segment_the_schema_cannot_follow_ends_the_path() {
+        #[derive(Debug, serde::Deserialize)]
+        enum Choice {
+            First {
+                #[expect(
+                    dead_code,
+                    reason = "the field exists so serde reports the variant it failed inside"
+                )]
+                count: u32,
+            },
+        }
+
+        let refused = serde_path_to_error::deserialize::<_, Choice>(json!({
+            "First": {"count": "seven"}
+        }))
+        .expect_err("a count that is not a number must refuse");
+        let segments: Vec<String> = refused
+            .path()
+            .iter()
+            .map(|segment| format!("{segment:?}"))
+            .collect();
+        assert!(
+            segments.iter().any(|segment| segment.starts_with("Enum")),
+            "serde reports the variant as an enum segment: {segments:?}"
+        );
+        assert!(
+            document_steps(refused.path()).is_empty(),
+            "the walk stops at the variant rather than following it"
+        );
+    }
+
+    /// A model may refer to itself, and a caller reaches this walk by sending
+    /// one value the schema refuses. The walk answers with what it reached
+    /// rather than following the cycle.
+    #[test]
+    fn a_schema_that_refers_to_itself_stops_at_the_reference_bound() {
+        let cyclic = json!({
+            "type": "object",
+            "properties": {"node": {"$ref": "#/$defs/Node"}},
+            "$defs": {
+                "Node": {"$ref": "#/$defs/Node"}
+            }
+        });
+        let shape = expected_shape(&cyclic, &[DocumentStep::Member("node")]);
+        assert_eq!(shape.followed(), 1);
+        assert!(shape.accepted().is_empty());
+        assert_eq!(shape.example(), None);
+    }
+
+    #[test]
+    fn a_closed_set_answers_its_values_however_it_is_spelled() {
+        let by_const = expected_shape(&addressed_schema(), &[DocumentStep::Member("target")]);
+        assert_eq!(by_const.accepted(), ["file", "symbol"]);
+        let by_enum = expected_shape(&addressed_schema(), &[DocumentStep::Member("order")]);
+        assert_eq!(by_enum.accepted(), ["path", "relevance"]);
+    }
+
+    /// A step the schema does not declare stops the walk, and `followed`
+    /// reports the prefix it did declare: a refusal then names the member the
+    /// served schema has, never one it never had.
+    #[test]
+    fn a_step_outside_the_schema_stops_the_walk_at_the_declared_prefix() {
+        let shape = expected_shape(
+            &addressed_schema(),
+            &[DocumentStep::Member("paths"), DocumentStep::Element],
+        );
+        assert_eq!(shape.followed(), 1);
+        assert_eq!(shape.accepted(), ["exclude", "include"]);
+        let absent = expected_shape(&addressed_schema(), &[DocumentStep::Member("path")]);
+        assert_eq!(absent.followed(), 0);
+        assert_eq!(absent.accepted(), ["order", "paths", "query", "target"]);
     }
 
     /// The advertised table-key forms and the acceptance rules they mirror

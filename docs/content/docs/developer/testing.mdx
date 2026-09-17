@@ -18,6 +18,10 @@ just test
 
 The unit suite runs without external language servers, model downloads, or corpus checkouts.
 The test selection keeps those dependencies in the integration suite.
+
+Some suites start a server that binds the loopback port range, which is machine-global. Nextest
+runs each test in its own process, so those suites share one `election` test group that admits a
+single test at a time.
 `just doctest` runs Rust documentation examples through `cargo test --doc`, because nextest
 does not support doctests on stable Rust.
 
@@ -33,18 +37,22 @@ dependency caches avoid compiling unchanged dependencies on each run.
 
 ## Integration tests
 
-Live suites require `rust-analyzer`, Bun, and tombi, plus network access for model weights and
-corpus source. Install the language tools with `rustup component add rust-analyzer` and
-`uv tool install tombi`; the TypeScript suite starts its language server through Bun.
-Model and package caches are reused between runs. Run the integration suite from the repository root:
+Live suites require `rust-analyzer` and Bun, plus network access for model weights; the corpus
+suites also need the pinned corpus source. Install the language tool with
+`rustup component add rust-analyzer`; the TypeScript suite starts its language server through
+Bun. Model and package caches are reused between runs. Run the heavy suites from the repository
+root:
 
 ```sh
 just integration-test
 ```
 
-`just live-test` selects the live language-engine and model suites. CI builds the CLI and an
-instrumented test archive once with `just integration-archive`, then passes the archive to
-`just live-test target/integration.tar.zst` and the corpus jobs.
+`just live-test` selects the live language-engine and model suites. They read the same build the
+unit suites do, so CI runs them on every pull request from the same archive `just fast-archive`
+writes: what they exercise is the engine integration, which any change can break. The corpus
+suites need the optimized build and stay on their own workflow, where
+`just integration-archive` writes the CLI and an instrumented archive of the corpus suites
+alone.
 
 For one corpus repository, fetch its pinned source and run its suite:
 
@@ -58,6 +66,11 @@ just corpus-test nextjs
 Corpus suites use the optimized Cargo `corpus` profile with debug assertions, overflow checks,
 and line tables. Nextest runs one corpus test at a time. CI reuses one compiled archive across
 the corpus jobs.
+
+Each corpus case stops its own actions thirty seconds before the deadline nextest ends it at, so
+removing the served checkout and writing the JSON report land inside that same deadline. A case
+that crosses the bound fails naming the action it was running, rather than being killed with no
+evidence of where it stood.
 
 The cache lives under `~/.cache/rift-corpus`. Each suite creates a disposable checkout at the
 commit in `crates/rift/tests/corpus/pins.toml`. Fetches retain 50 commits of history; a separate

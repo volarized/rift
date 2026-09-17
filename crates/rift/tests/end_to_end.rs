@@ -15,8 +15,8 @@ mod harness;
 mod rust_engine;
 
 use harness::{
-    SERIAL, StopOnDrop, TestResult, laid_out_workspace, proxied_call, proxy_client,
-    require_success, run_rift,
+    StopOnDrop, TestResult, laid_out_workspace, proxied_call, proxy_client, require_success,
+    run_rift,
 };
 use serde_json::json;
 
@@ -36,7 +36,6 @@ use serde_json::json;
 /// as a flat file hit whose `matched_by` claims the `content` lane.
 #[tokio::test]
 async fn search_reaches_the_mdx_file_and_the_extensionless_justfile() -> TestResult {
-    let _serial = SERIAL.lock().await;
     let directory = laid_out_workspace(
         &[
             (
