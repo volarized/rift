@@ -139,6 +139,46 @@ class CacheOwnership(unittest.TestCase):
         self.assertTrue(cache_savers(), "no workflow step writes the Rust cache")
 
 
+def jobs_with_step_limits() -> list[tuple[str, str, int, list[int]]]:
+    """Every job that bounds a step, with its own limit and those step limits.
+
+    A step limit written as a workflow expression resolves from the matrix at
+    run time and is left out: what it bounds is a leg of the job, not the job.
+    """
+    bounded: list[tuple[str, str, int, list[int]]] = []
+    for name, document in workflow_documents().items():
+        for job_name, job in (document.get("jobs") or {}).items():
+            job_limit = job.get("timeout-minutes")
+            if not isinstance(job_limit, int):
+                continue
+            steps = [
+                step["timeout-minutes"]
+                for step in job.get("steps") or []
+                if isinstance(step.get("timeout-minutes"), int)
+            ]
+            if steps:
+                bounded.append((name, job_name, job_limit, steps))
+    return bounded
+
+
+class JobBudgets(unittest.TestCase):
+    """A job's limit covers the work its steps do not bound."""
+
+    def test_a_job_limit_leaves_room_past_its_longest_step(self) -> None:
+        for workflow, job_name, job_limit, steps in jobs_with_step_limits():
+            longest = max(steps)
+            self.assertGreater(
+                job_limit,
+                longest,
+                f"{workflow}:{job_name} bounds a step at {longest} minutes inside a "
+                f"{job_limit}-minute job, leaving nothing for the setup, the cache "
+                "save, and the artifact upload around it",
+            )
+
+    def test_the_repository_declares_bounded_steps_to_check(self) -> None:
+        self.assertTrue(jobs_with_step_limits(), "no job bounds a step of its own")
+
+
 class MachineGlobalSuites(unittest.TestCase):
     """A machine-global resource is serialized by a nextest test group.
 

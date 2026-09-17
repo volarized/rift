@@ -13,9 +13,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # The corpus profile compiles the whole workspace optimized and instrumented,
+  # and the one run that finished inside the former 30-minute job limit did so
+  # by eight seconds. The compile owns a limit of its own, and the job keeps
+  # room past it for the cache save and the archive upload that follow.
   integration-build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -27,6 +31,7 @@ jobs:
         with:
           tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
       - name: Build and archive integrations
+        timeout-minutes: 38
         run: just integration-archive
       - uses: actions/upload-artifact@v6.0.0
         with:
