@@ -182,6 +182,76 @@ async fn search_query_and_traversal_merge_carry_both_matched_by_entries_and_the_
     Ok(())
 }
 
+/// `implements` reaches no reference role, so no provider populates it and the served answer
+/// says so instead of leaving the caller to read an empty result set as an absent neighbor.
+#[tokio::test]
+async fn search_traversal_over_an_unproduced_facet_serves_the_coverage_warning() -> TestResult {
+    let (_directory, client, _server_task) = served_workspace(CALL_GRAPH_FILES, None).await?;
+
+    let structured = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({
+                "traversal": {
+                    "seed": "rift://symbol/rust/src/lib.rs/root",
+                    "facets": ["implements"]
+                }
+            }),
+        ),
+    )
+    .await?;
+
+    assert!(results(&structured).is_empty(), "{structured}");
+    let warnings = structured["warnings"]
+        .as_array()
+        .ok_or("the answer must carry warnings")?;
+    assert_eq!(warnings.len(), 1, "{structured}");
+    assert_eq!(
+        warnings[0]["code"],
+        json!("relationship_coverage_missing"),
+        "{structured}"
+    );
+    assert_eq!(warnings[0]["facets"], json!(["implements"]), "{structured}");
+    assert!(
+        warnings[0]["language"].is_null(),
+        "a facet gap omits the language member: {structured}"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// The same walk narrowed to a produced facet carries no warning, so the code keeps naming
+/// an absent provider rather than an empty answer.
+#[tokio::test]
+async fn search_traversal_over_a_produced_facet_serves_no_coverage_warning() -> TestResult {
+    let (_directory, client, _server_task) = served_workspace(CALL_GRAPH_FILES, None).await?;
+
+    let structured = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({
+                "traversal": {
+                    "seed": "rift://symbol/rust/src/lib.rs/root",
+                    "facets": ["calls"]
+                }
+            }),
+        ),
+    )
+    .await?;
+
+    assert_eq!(symbol_names(&structured), ["branch_a", "branch_b"]);
+    assert!(
+        structured["warnings"].is_null(),
+        "a walk every provider covers carries no warning: {structured}"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
 fn results(structured: &Value) -> Vec<Value> {
     structured["results"]
         .as_array()

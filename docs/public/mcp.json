@@ -721,6 +721,44 @@
               },
               {
                 "additionalProperties": false,
+                "description": "No provider populates part of the relationship coverage the traversal asked for, so\nthe walk had nothing to follow there whatever the graph holds. The warning states\nthat a provider is absent; it never states that the seed has no such neighbor. An\nempty answer carrying it means the walk could not run; an empty answer without it\nmeans the walk ran and the seed has no neighbor under the request.",
+                "properties": {
+                  "code": {
+                    "const": "relationship_coverage_missing",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "facets": {
+                    "description": "The requested facets no provider populates, in the request's own order,\ndeduplicated. Absent when every requested facet has a provider.",
+                    "items": {
+                      "$ref": "#/$defs/RelationshipFacet"
+                    },
+                    "type": "array"
+                  },
+                  "language": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/$defs/Language"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "The seed declaration's language, when the gap is the language rather than the\nfacet. Absent when the language has a provider."
+                  }
+                },
+                "required": [
+                  "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "Cataloged packages with a source root are still being indexed, so a `dependencies`\nor `all` answer holds their declarations only once the index reaches them. The\nanswer is served from the packages indexed so far. Rides only an answer whose\n`scope` reaches dependencies.",
                 "properties": {
                   "code": {
@@ -790,6 +828,156 @@
                   "reason"
                 ],
                 "type": "object"
+              }
+            ]
+          },
+          "RelationshipFacet": {
+            "description": "One portable category an edge falls into. The local kinds `import` and `use` can share\nthe `imports` facet, which lets one query cross languages.",
+            "oneOf": [
+              {
+                "const": "contains",
+                "description": "The source contains the target within its scope.",
+                "type": "string"
+              },
+              {
+                "const": "declares",
+                "description": "The source declares the target.",
+                "type": "string"
+              },
+              {
+                "const": "augments",
+                "description": "The source adds to a declaration made elsewhere.",
+                "type": "string"
+              },
+              {
+                "const": "references",
+                "description": "The source mentions the target.",
+                "type": "string"
+              },
+              {
+                "const": "calls",
+                "description": "The source invokes the target.",
+                "type": "string"
+              },
+              {
+                "const": "constructs",
+                "description": "The source creates an instance of the target.",
+                "type": "string"
+              },
+              {
+                "const": "reads",
+                "description": "The source reads the target's value.",
+                "type": "string"
+              },
+              {
+                "const": "writes",
+                "description": "The source assigns to the target.",
+                "type": "string"
+              },
+              {
+                "const": "imports",
+                "description": "The source brings the target into scope.",
+                "type": "string"
+              },
+              {
+                "const": "exports",
+                "description": "The source exposes the target outside its unit.",
+                "type": "string"
+              },
+              {
+                "const": "extends",
+                "description": "The source inherits from the target.",
+                "type": "string"
+              },
+              {
+                "const": "implements",
+                "description": "The source fulfils the target's interface.",
+                "type": "string"
+              },
+              {
+                "const": "has_type",
+                "description": "The source is typed by the target.",
+                "type": "string"
+              },
+              {
+                "const": "overrides",
+                "description": "The source replaces the target inherited from a supertype.",
+                "type": "string"
+              },
+              {
+                "const": "aliases",
+                "description": "The source is another name for the target.",
+                "type": "string"
+              },
+              {
+                "const": "generates",
+                "description": "The source produces the target as generated code.",
+                "type": "string"
+              },
+              {
+                "const": "depends_on",
+                "description": "The source requires the target to build or run.",
+                "type": "string"
+              },
+              {
+                "const": "annotated_by",
+                "description": "The source carries the target as an annotation.",
+                "type": "string"
+              },
+              {
+                "const": "throws",
+                "description": "The source can raise the target.",
+                "type": "string"
+              },
+              {
+                "const": "catches",
+                "description": "The source handles the target when raised.",
+                "type": "string"
+              },
+              {
+                "const": "bounded_by",
+                "description": "The source's type parameter is constrained by the target.",
+                "type": "string"
+              },
+              {
+                "const": "instantiates",
+                "description": "The source applies concrete arguments to the generic target.",
+                "type": "string"
+              },
+              {
+                "const": "specializes",
+                "description": "The source is a specialization of the generic target.",
+                "type": "string"
+              },
+              {
+                "const": "overloads",
+                "description": "The source and target are separately dispatched forms of one name.",
+                "type": "string"
+              },
+              {
+                "const": "mixes_in",
+                "description": "The source incorporates the target as a mixin.",
+                "type": "string"
+              },
+              {
+                "const": "embeds",
+                "description": "The source embeds the target within its own definition.",
+                "type": "string"
+              },
+              {
+                "const": "tests",
+                "description": "The source exercises the target as a test.",
+                "type": "string"
+              },
+              {
+                "const": "configures",
+                "description": "The source supplies configuration for the target.",
+                "type": "string"
+              },
+              {
+                "const": "binds",
+                "description": "The source binds a name or value to the target.",
+                "type": "string"
               }
             ]
           },
@@ -2285,6 +2473,44 @@
               },
               {
                 "additionalProperties": false,
+                "description": "No provider populates part of the relationship coverage the traversal asked for, so\nthe walk had nothing to follow there whatever the graph holds. The warning states\nthat a provider is absent; it never states that the seed has no such neighbor. An\nempty answer carrying it means the walk could not run; an empty answer without it\nmeans the walk ran and the seed has no neighbor under the request.",
+                "properties": {
+                  "code": {
+                    "const": "relationship_coverage_missing",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "facets": {
+                    "description": "The requested facets no provider populates, in the request's own order,\ndeduplicated. Absent when every requested facet has a provider.",
+                    "items": {
+                      "$ref": "#/$defs/RelationshipFacet"
+                    },
+                    "type": "array"
+                  },
+                  "language": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/$defs/Language"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "The seed declaration's language, when the gap is the language rather than the\nfacet. Absent when the language has a provider."
+                  }
+                },
+                "required": [
+                  "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "Cataloged packages with a source root are still being indexed, so a `dependencies`\nor `all` answer holds their declarations only once the index reaches them. The\nanswer is served from the packages indexed so far. Rides only an answer whose\n`scope` reaches dependencies.",
                 "properties": {
                   "code": {
@@ -2393,6 +2619,156 @@
               {
                 "const": "enclosing",
                 "description": "The full extent including what surrounds the node proper.",
+                "type": "string"
+              }
+            ]
+          },
+          "RelationshipFacet": {
+            "description": "One portable category an edge falls into. The local kinds `import` and `use` can share\nthe `imports` facet, which lets one query cross languages.",
+            "oneOf": [
+              {
+                "const": "contains",
+                "description": "The source contains the target within its scope.",
+                "type": "string"
+              },
+              {
+                "const": "declares",
+                "description": "The source declares the target.",
+                "type": "string"
+              },
+              {
+                "const": "augments",
+                "description": "The source adds to a declaration made elsewhere.",
+                "type": "string"
+              },
+              {
+                "const": "references",
+                "description": "The source mentions the target.",
+                "type": "string"
+              },
+              {
+                "const": "calls",
+                "description": "The source invokes the target.",
+                "type": "string"
+              },
+              {
+                "const": "constructs",
+                "description": "The source creates an instance of the target.",
+                "type": "string"
+              },
+              {
+                "const": "reads",
+                "description": "The source reads the target's value.",
+                "type": "string"
+              },
+              {
+                "const": "writes",
+                "description": "The source assigns to the target.",
+                "type": "string"
+              },
+              {
+                "const": "imports",
+                "description": "The source brings the target into scope.",
+                "type": "string"
+              },
+              {
+                "const": "exports",
+                "description": "The source exposes the target outside its unit.",
+                "type": "string"
+              },
+              {
+                "const": "extends",
+                "description": "The source inherits from the target.",
+                "type": "string"
+              },
+              {
+                "const": "implements",
+                "description": "The source fulfils the target's interface.",
+                "type": "string"
+              },
+              {
+                "const": "has_type",
+                "description": "The source is typed by the target.",
+                "type": "string"
+              },
+              {
+                "const": "overrides",
+                "description": "The source replaces the target inherited from a supertype.",
+                "type": "string"
+              },
+              {
+                "const": "aliases",
+                "description": "The source is another name for the target.",
+                "type": "string"
+              },
+              {
+                "const": "generates",
+                "description": "The source produces the target as generated code.",
+                "type": "string"
+              },
+              {
+                "const": "depends_on",
+                "description": "The source requires the target to build or run.",
+                "type": "string"
+              },
+              {
+                "const": "annotated_by",
+                "description": "The source carries the target as an annotation.",
+                "type": "string"
+              },
+              {
+                "const": "throws",
+                "description": "The source can raise the target.",
+                "type": "string"
+              },
+              {
+                "const": "catches",
+                "description": "The source handles the target when raised.",
+                "type": "string"
+              },
+              {
+                "const": "bounded_by",
+                "description": "The source's type parameter is constrained by the target.",
+                "type": "string"
+              },
+              {
+                "const": "instantiates",
+                "description": "The source applies concrete arguments to the generic target.",
+                "type": "string"
+              },
+              {
+                "const": "specializes",
+                "description": "The source is a specialization of the generic target.",
+                "type": "string"
+              },
+              {
+                "const": "overloads",
+                "description": "The source and target are separately dispatched forms of one name.",
+                "type": "string"
+              },
+              {
+                "const": "mixes_in",
+                "description": "The source incorporates the target as a mixin.",
+                "type": "string"
+              },
+              {
+                "const": "embeds",
+                "description": "The source embeds the target within its own definition.",
+                "type": "string"
+              },
+              {
+                "const": "tests",
+                "description": "The source exercises the target as a test.",
+                "type": "string"
+              },
+              {
+                "const": "configures",
+                "description": "The source supplies configuration for the target.",
+                "type": "string"
+              },
+              {
+                "const": "binds",
+                "description": "The source binds a name or value to the target.",
                 "type": "string"
               }
             ]
@@ -3592,6 +3968,44 @@
                 "required": [
                   "code",
                   "visited",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "No provider populates part of the relationship coverage the traversal asked for, so\nthe walk had nothing to follow there whatever the graph holds. The warning states\nthat a provider is absent; it never states that the seed has no such neighbor. An\nempty answer carrying it means the walk could not run; an empty answer without it\nmeans the walk ran and the seed has no neighbor under the request.",
+                "properties": {
+                  "code": {
+                    "const": "relationship_coverage_missing",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "facets": {
+                    "description": "The requested facets no provider populates, in the request's own order,\ndeduplicated. Absent when every requested facet has a provider.",
+                    "items": {
+                      "$ref": "#/$defs/RelationshipFacet"
+                    },
+                    "type": "array"
+                  },
+                  "language": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/$defs/Language"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "The seed declaration's language, when the gap is the language rather than the\nfacet. Absent when the language has a provider."
+                  }
+                },
+                "required": [
+                  "code",
                   "detail"
                 ],
                 "type": "object"

@@ -34,14 +34,15 @@ check:
     cargo check --workspace --all-targets --all-features --locked
     uv run --locked --project dev rift-dev rust-architecture
 
-# The em-dash ban, over every surface a reader meets: the docs pages and
-# the app shell, the prose inside the crates, the README, the artifacts
-# `just generate` writes, and the CI configuration's own comments. The
-# scanner itself is not among them: it spells the banned characters.
+# The em-dash ban, over every surface a reader meets: the docs pages, the
+# app shell and the components it renders, the prose inside the crates, the
+# README, the artifacts `just generate` writes, and the CI configuration's
+# own comments. The scanner itself is not among them: it spells the banned
+# characters.
 dashes:
     uv run --locked --project dev rift-dev dashes \
-        docs/content docs/src/app crates README.md docs/public .github \
-        plugins .claude-plugin
+        docs/content docs/src/app docs/src/components crates README.md \
+        docs/public .github plugins .claude-plugin
 
 # The MCP specification's own conformance runner, over a throwaway workspace
 # one foreground server serves. `tools/mcp-conformance/expected-failures.yml`

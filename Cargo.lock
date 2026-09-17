@@ -4025,6 +4025,7 @@ dependencies = [
  "rift-syntax",
  "serde",
  "sha2",
+ "strum",
  "tempfile",
  "toasty",
  "toasty-core",

@@ -402,6 +402,13 @@ A walk the server stops at its node bound attaches a `traversal_truncated` entry
 `warnings`, naming how many symbols it visited: hits reachable beyond the bound are missing,
 and a tighter `facets` list, a smaller `depth`, or a less-connected `seed` fits the walk under it.
 
+A walk no provider can answer attaches a `relationship_coverage_missing` entry to `warnings`.
+Its `facets` names the requested facets no provider populates, such as `implements`; its
+`language` names the seed declaration's language when an `outgoing` walk starts in a language
+no provider supplies relationships for. An empty result set carrying this warning means the
+walk could not run; an empty result set without it means the walk ran and the seed has no
+neighbor under the request.
+
 ### Language-engine references [#search-engine-references]
 
 <VersionBadge version="v0.0.35" languages={["Rust", "TypeScript", "Python"]} />

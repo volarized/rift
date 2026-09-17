@@ -29,7 +29,9 @@ use crate::read::{
     excerpt, page, project_path, results_truncation_warning, source_warnings, text_range,
     validate_common, wire_symbol,
 };
-use crate::traversal::{collect_traversal_hits, traversal_truncation_warning, validate_traversal};
+use crate::traversal::{
+    TraversalReport, collect_traversal_hits, traversal_truncation_warning, validate_traversal,
+};
 
 impl ReadService {
     /// Searches indexed declarations and source lines, optionally narrowed or extended by
@@ -99,14 +101,14 @@ impl ReadService {
                 &mut results,
             )?;
         }
-        let mut traversal_truncated = false;
+        let mut traversal_report = TraversalReport::default();
         if let Some(traversal) = params.traversal.as_ref()
             && matches!(
                 params.target,
                 SearchParamsTarget::All | SearchParamsTarget::Symbol
             )
         {
-            traversal_truncated = collect_traversal_hits(
+            traversal_report = collect_traversal_hits(
                 self,
                 selected.matcher.as_ref(),
                 self.index().root(),
@@ -131,7 +133,7 @@ impl ReadService {
                 warnings,
                 params.scope,
                 dependencies.as_deref(),
-                traversal_truncated,
+                traversal_report,
                 results_max_reached,
             ),
         })
@@ -155,18 +157,19 @@ impl ReadService {
     }
 
     /// The warnings one search answer carries: those the collection gathered - the
-    /// snapshot's own and the force-included files it left out - then the traversal bound
-    /// when the walk hit it, the result bound when the pool reached it, and the dependency
+    /// snapshot's own and the force-included files it left out - then what the traversal
+    /// lane reported, the result bound when the pool reached it, and the dependency
     /// warnings when `scope` reaches dependencies.
     fn search_warnings(
         &self,
         mut warnings: Vec<ReadWarning>,
         scope: SearchScope,
         dependencies: Option<&DependencyIndex>,
-        traversal_truncated: bool,
+        traversal: TraversalReport,
         results_max_reached: Option<usize>,
     ) -> Vec<ReadWarning> {
-        if traversal_truncated {
+        warnings.extend(traversal.coverage_missing);
+        if traversal.truncated {
             warnings.push(traversal_truncation_warning());
         }
         if let Some(results_max) = results_max_reached {

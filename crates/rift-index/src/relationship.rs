@@ -24,7 +24,8 @@
 //! [`RelationshipStore::dropped_edges`] report the truncation.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 use rift_core::{
     DeclarationBinding, LoopBudget, ReferenceRole, SourceRange, SourceUnitId, SymbolId,
@@ -32,6 +33,7 @@ use rift_core::{
 use rift_protocol::configuration::BINDING_GRAPH_LINKS_MAX;
 use rift_protocol::read::RelationshipFacet;
 use rift_provider::{NormalizedGraph, NormalizedReference, NormalizedTarget};
+use strum::VariantArray as _;
 
 /// Most edges one [`RelationshipStore`] holds across both directions combined.
 ///
@@ -157,6 +159,23 @@ const fn role_facet(role: ReferenceRole) -> RelationshipFacet {
         ReferenceRole::Type => RelationshipFacet::HasType,
         ReferenceRole::Unknown => RelationshipFacet::References,
     }
+}
+
+/// Every [`RelationshipFacet`] an edge in any [`RelationshipStore`] can carry: the image of
+/// `role_facet` over every [`ReferenceRole`] a provider can declare, resolved once.
+///
+/// A facet outside this set names an analysis no reference role maps onto, so no store edge
+/// carries it and a walk narrowed to it follows nothing.
+#[must_use]
+pub fn produced_relationship_facets() -> &'static BTreeSet<RelationshipFacet> {
+    static PRODUCED: OnceLock<BTreeSet<RelationshipFacet>> = OnceLock::new();
+    PRODUCED.get_or_init(|| {
+        ReferenceRole::VARIANTS
+            .iter()
+            .copied()
+            .map(role_facet)
+            .collect()
+    })
 }
 
 /// The edges one reference contributes: one per [`NormalizedTarget::Symbol`] target. A
@@ -442,6 +461,22 @@ mod tests {
                 "role {role:?} maps to {expected:?}"
             );
         }
+    }
+
+    /// The produced set is `role_facet`'s image over every reference role, so it holds the
+    /// seven facets the mapping emits and no facet a walk could never follow.
+    #[test]
+    fn produced_relationship_facets_holds_every_mapped_facet_and_no_other() {
+        let expected = std::collections::BTreeSet::from([
+            RelationshipFacet::Declares,
+            RelationshipFacet::Reads,
+            RelationshipFacet::Writes,
+            RelationshipFacet::Imports,
+            RelationshipFacet::Calls,
+            RelationshipFacet::HasType,
+            RelationshipFacet::References,
+        ]);
+        assert_eq!(super::produced_relationship_facets(), &expected);
     }
 
     #[test]
