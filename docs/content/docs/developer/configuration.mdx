@@ -92,28 +92,46 @@ workspace whose index will not settle still answers `rift://logs`.
 [source]
 include = []
 exclude = []
+force_include = []
 respect_gitignore = true
 files = 100000
 workspace_size = "512mb"
 ```
 
-Empty `include` includes every file `exclude` and `.gitignore` leave standing; a match in `exclude`
-drops a file even when `include` also matches it. `respect_gitignore`, on by default, applies the
-workspace's own `.gitignore` files, root and nested; the server never reads global or
-parent-directory ignore sources.
+The four glob lists decide in one order:
+
+1. `exclude` drops a file, whatever else matched it.
+2. `force_include` keeps a file `.gitignore` would hide, and keeps it without an `include` match.
+3. `respect_gitignore`, on by default, applies the workspace's own `.gitignore` files, root and
+   nested; the server never reads global or parent-directory ignore sources.
+4. `include`, when it is not empty, is what a remaining file has to match. Empty `include`
+   includes every file the steps above leave standing.
+
+`force_include` is what an operator reaches for when a directory belongs in the index and outside
+version control at once - design documents, a scratch corpus, a generated tree the build ignores:
+
+```toml
+[source]
+force_include = [".plans/**"]
+```
+
+A workspace naming no `force_include` pattern indexes exactly what it indexed before. A workspace
+naming one walks those subtrees a second time with `.gitignore` not consulted, spending the same
+`files` budget as the first walk.
 
 `.git`, `.rift`, and `target` stay invisible whatever this table says: no `include`, `exclude`,
-or `.gitignore` entry can make the server serve them.
+`force_include`, or `.gitignore` entry can make the server serve them.
 
 `files` bounds how many files the index holds, 1000 to 5000000, and `workspace_size` bounds the
 bytes they hold together, 16mb to 64gb. The server refuses to index a workspace past either bound
 and names the key in the refusal; a change to either key rebuilds the index, as a change to
-`include` or `exclude` does.
+`include`, `exclude`, or `force_include` does.
 
 `source` shapes what the index walks: a file it excludes stops reaching `search` and
 [`get_symbol`](/docs/mcp#tool-get_symbol) results. A single `search` request can still
 reach one such file on demand, through the request-side `force_include` override on `search`'s
-`paths` selector.
+`paths` selector. The two differ in reach and lifetime: the request field pulls at most 256 files
+into one answer, while this table's `force_include` puts them in the index every read serves from.
 
 ## Dependencies
 
