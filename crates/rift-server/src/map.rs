@@ -13,8 +13,9 @@ use rift_core::{Contribution, ProviderId, SymbolRecord};
 use rift_dependency::DependencyCatalog;
 use rift_index::WorkspaceIndex;
 use rift_protocol::map::{
-    MAP_DOCS_MAX, MAP_ENTRY_POINTS_MAX, MAP_HUBS_MAX, MAP_MODULE_DEPTH_MAX, MAP_PACKAGES_MAX,
-    MapHub, MapLanguage, MapModule, WorkspaceMap,
+    MAP_DOCS_MAX, MAP_ENTRY_POINTS_MAX, MAP_HUBS_MAX, MAP_MODULE_DEPTH_MAX,
+    MAP_MODULE_RELATIONSHIPS_MAX, MAP_PACKAGES_MAX, MapHub, MapLanguage, MapModule,
+    MapModuleRelationship, WorkspaceMap,
 };
 use rift_protocol::read::{Digest, Language, Pagination, ProjectPath, SymbolFacet, SymbolId};
 use rift_protocol::workspace::{WORKSPACE_LANGUAGE_SUMMARIES_MAX, WORKSPACE_SOURCE_UNITS_MAX};
@@ -43,6 +44,7 @@ pub(crate) fn build_workspace_map(
 ) -> WorkspaceMap {
     let graph = index.normalized_graph();
     let unit_paths = source_unit_paths(index);
+    let records_by_identity = records_by_identity(graph);
     let mut language_counts: BTreeMap<String, (Language, FileSymbolCounts)> = BTreeMap::new();
     let mut directory_counts: BTreeMap<ProjectPath, FileSymbolCounts> = BTreeMap::new();
     let mut file_languages: BTreeMap<CoreProjectPath, Language> = BTreeMap::new();
@@ -101,9 +103,10 @@ pub(crate) fn build_workspace_map(
         revision,
         languages,
         modules: module_tree(&directory_counts),
-        hubs: hubs(graph),
+        hubs: hubs(graph, &records_by_identity),
         entry_points: entry_points(graph),
         docs: docs(index),
+        module_relationships: module_relationships(graph, &unit_paths, &records_by_identity),
         packages,
         pagination: Pagination {
             page_index: 0,
@@ -142,6 +145,78 @@ fn record_home_path<'a>(
         .filter_map(|key| graph.contribution(key))
         .find_map(Contribution::source)
         .and_then(|binding| unit_paths.get(binding.unit()))
+}
+
+/// Every graph record that established an identity, keyed by it. Both rankings need this
+/// index, so it is built once and lent to each.
+fn records_by_identity(graph: &NormalizedGraph) -> BTreeMap<&CoreSymbolId, &SymbolRecord> {
+    graph
+        .records()
+        .iter()
+        .filter_map(|record| record.identity().map(|identity| (identity, record)))
+        .collect()
+}
+
+/// The module one project path belongs to: the deepest ancestor directory the module tree
+/// lists, which is the last one [`credit_directories`] credits. `None` for a file directly at
+/// the workspace root, which credits no directory and so belongs to no listed module.
+fn owning_module(path: &CoreProjectPath) -> Option<ProjectPath> {
+    let mut segments: Vec<&str> = path.as_str().split('/').collect();
+    segments.pop();
+    let depth = segments.len().min(MAP_MODULE_DEPTH_MAX);
+    (depth > 0).then(|| ProjectPath(segments[..depth].join("/")))
+}
+
+/// The modules this revision resolved a reference between, ranked by that count descending
+/// with the two paths breaking ties, capped at [`MAP_MODULE_RELATIONSHIPS_MAX`].
+///
+/// Every entry is a resolved reference: no heuristic and no historical correlation
+/// contributes one. A reference whose source or target is not project-located contributes
+/// nothing, since a dependency or standard-library declaration is already reported by
+/// `packages`. A pair whose two sides fold to one module is dropped, because a module
+/// referencing itself says nothing about structure. The tally rides the pass over
+/// `graph.references()` the ranking already makes, so it adds no walk.
+fn module_relationships(
+    graph: &NormalizedGraph,
+    unit_paths: &BTreeMap<CoreSourceUnitId, CoreProjectPath>,
+    records_by_identity: &BTreeMap<&CoreSymbolId, &SymbolRecord>,
+) -> Vec<MapModuleRelationship> {
+    let mut counts: BTreeMap<(ProjectPath, ProjectPath), u64> = BTreeMap::new();
+    for reference in graph.references() {
+        let Some(from) = unit_paths
+            .get(reference.binding().unit())
+            .and_then(owning_module)
+        else {
+            continue;
+        };
+        for target in reference.targets() {
+            let NormalizedTarget::Symbol(identity) = target else {
+                continue;
+            };
+            let Some(to) = records_by_identity
+                .get(identity)
+                .and_then(|record| record_home_path(graph, record, unit_paths))
+                .and_then(owning_module)
+            else {
+                continue;
+            };
+            if from == to {
+                continue;
+            }
+            *counts.entry((from.clone(), to)).or_insert(0) += 1;
+        }
+    }
+    let mut ranked: Vec<((ProjectPath, ProjectPath), u64)> = counts.into_iter().collect();
+    ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    ranked.truncate(MAP_MODULE_RELATIONSHIPS_MAX);
+    ranked
+        .into_iter()
+        .map(|((from, to), references)| MapModuleRelationship {
+            from,
+            to,
+            references,
+        })
+        .collect()
 }
 
 /// Credits `path`'s ancestor directories, up to [`MAP_MODULE_DEPTH_MAX`] levels deep, applying
@@ -238,11 +313,16 @@ fn entry_points(graph: &NormalizedGraph) -> Vec<SymbolId> {
 }
 
 /// The most-referenced symbols, ranked by reference count descending with identity breaking
-/// ties, capped at [`MAP_HUBS_MAX`]. A candidate whose record cannot be assembled - no
-/// established identity, or no provider ever contributed portable facts for it - is skipped
+/// ties, capped at [`MAP_HUBS_MAX`]. `records_by_identity` is the caller's one index over the
+/// graph's established identities, shared with [`module_relationships`]. A candidate whose
+/// record cannot be assembled - no established identity, or no provider ever contributed
+/// portable facts for it - is skipped
 /// rather than reported with a guessed kind; ranking continues past it toward the next
 /// candidate, bounded by the same reference graph the tally already walked once.
-fn hubs(graph: &NormalizedGraph) -> Vec<MapHub> {
+fn hubs(
+    graph: &NormalizedGraph,
+    records_by_identity: &BTreeMap<&CoreSymbolId, &SymbolRecord>,
+) -> Vec<MapHub> {
     let mut reference_counts: BTreeMap<CoreSymbolId, u64> = BTreeMap::new();
     for reference in graph.references() {
         for target in reference.targets() {
@@ -254,11 +334,6 @@ fn hubs(graph: &NormalizedGraph) -> Vec<MapHub> {
     let mut ranked: Vec<(CoreSymbolId, u64)> = reference_counts.into_iter().collect();
     ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
 
-    let records_by_identity: BTreeMap<&CoreSymbolId, &SymbolRecord> = graph
-        .records()
-        .iter()
-        .filter_map(|record| record.identity().map(|identity| (identity, record)))
-        .collect();
     let precedence = [syntax_provider_id()];
 
     let mut hubs = Vec::new();
@@ -310,9 +385,13 @@ mod tests {
     use std::fmt::Write as _;
     use std::fs;
 
+    use std::collections::BTreeMap;
+
     use rift_core::SourceVisibility;
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::configuration::HistoryConfiguration;
+    use rift_protocol::map::{MapModule, WorkspaceMap};
+    use rift_protocol::read::ProjectPath;
     use tempfile::TempDir;
 
     use crate::read::ReadService;
@@ -498,9 +577,17 @@ mod tests {
         assert!(map.hubs.is_empty());
         assert!(map.entry_points.is_empty());
         assert!(map.docs.is_empty());
+        assert!(map.module_relationships.is_empty());
 
         let value = serde_json::to_value(&map)?;
-        for field in ["languages", "modules", "hubs", "entry_points", "docs"] {
+        for field in [
+            "languages",
+            "modules",
+            "hubs",
+            "entry_points",
+            "docs",
+            "module_relationships",
+        ] {
             assert!(value.get(field).is_none(), "field={field}");
         }
         Ok(())
@@ -650,10 +737,164 @@ mod tests {
             ghost_resolved,
             "the ghost target must resolve to an established identity so the skip arm runs"
         );
-        let hubs = super::hubs(&graph);
+        let hubs = super::hubs(&graph, &super::records_by_identity(&graph));
         assert!(
             hubs.iter().all(|hub| !hub.symbol.0.ends_with("/ghost")),
             "a record with no portable facts never ranks as a hub: hubs={hubs:?}"
+        );
+        Ok(())
+    }
+
+    /// One workspace of `files`, served, with its orientation snapshot.
+    fn served_map(files: &[(&str, &str)]) -> TestResult<(tempfile::TempDir, WorkspaceMap)> {
+        let directory = tempfile::tempdir()?;
+        for (path, contents) in files {
+            let path = directory.path().join(path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, contents)?;
+        }
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let map = service.workspace_map();
+        Ok((directory, map))
+    }
+
+    /// `src/lib.rs` calls a declaration `src/inner/mod.rs` defines, so one resolved reference
+    /// crosses the two modules the tree lists.
+    const CROSSING_FILES: &[(&str, &str)] = &[
+        (
+            "src/lib.rs",
+            "mod inner;\npub fn beacon() {\n    inner::helper();\n}\n",
+        ),
+        ("src/inner/mod.rs", "pub fn helper() {}\n"),
+    ];
+
+    fn pairs(map: &WorkspaceMap) -> Vec<(&str, &str, u64)> {
+        map.module_relationships
+            .iter()
+            .map(|relationship| {
+                (
+                    relationship.from.0.as_str(),
+                    relationship.to.0.as_str(),
+                    relationship.references,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn owning_module_folds_a_path_to_its_deepest_listed_ancestor() {
+        let path = |value: &str| rift_core::ProjectPath::new(value).expect("fixture path");
+        assert_eq!(super::owning_module(&path("README.md")), None);
+        assert_eq!(
+            super::owning_module(&path("src/lib.rs")),
+            Some(ProjectPath("src".to_owned()))
+        );
+        assert_eq!(
+            super::owning_module(&path("a/b/c/d/e/deep.rs")),
+            Some(ProjectPath("a/b/c".to_owned())),
+            "a path deeper than MAP_MODULE_DEPTH_MAX folds into the deepest listed ancestor"
+        );
+    }
+
+    #[test]
+    fn a_resolved_reference_crossing_two_modules_becomes_one_relationship() -> TestResult {
+        let (_directory, map) = served_map(CROSSING_FILES)?;
+        assert_eq!(pairs(&map), [("src", "src/inner", 1)]);
+        Ok(())
+    }
+
+    #[test]
+    fn every_relationship_endpoint_names_a_listed_module() -> TestResult {
+        let (_directory, map) = served_map(CROSSING_FILES)?;
+        let mut listed: Vec<&str> = Vec::new();
+        let mut pending: Vec<&MapModule> = map.modules.iter().collect();
+        while let Some(module) = pending.pop() {
+            listed.push(module.path.0.as_str());
+            pending.extend(module.children.iter());
+        }
+        for relationship in &map.module_relationships {
+            assert!(
+                listed.contains(&relationship.from.0.as_str()),
+                "from={} listed={listed:?}",
+                relationship.from.0
+            );
+            assert!(
+                listed.contains(&relationship.to.0.as_str()),
+                "to={} listed={listed:?}",
+                relationship.to.0
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn several_references_over_one_pair_answer_as_one_relationship() -> TestResult {
+        let (_directory, map) = served_map(&[
+            (
+                "src/lib.rs",
+                "mod inner;\npub fn beacon() {\n    inner::helper();\n    inner::helper();\n}\n",
+            ),
+            ("src/inner/mod.rs", "pub fn helper() {}\n"),
+        ])?;
+        assert_eq!(pairs(&map), [("src", "src/inner", 2)]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_reference_inside_one_module_is_no_relationship() -> TestResult {
+        let (_directory, map) = served_map(&[(
+            "src/lib.rs",
+            "pub fn helper() {}\npub fn beacon() {\n    helper();\n}\n",
+        )])?;
+        assert!(
+            map.module_relationships.is_empty(),
+            "a module referencing itself says nothing about structure: {:?}",
+            map.module_relationships
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_reference_from_a_root_file_contributes_no_endpoint() -> TestResult {
+        let (_directory, map) = served_map(&[
+            (
+                "lib.rs",
+                "mod inner;\npub fn beacon() {\n    inner::helper();\n}\n",
+            ),
+            ("inner/mod.rs", "pub fn helper() {}\n"),
+        ])?;
+        assert!(
+            map.module_relationships.is_empty(),
+            "a file directly at the workspace root belongs to no listed module: {:?}",
+            map.module_relationships
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn module_relationships_are_stable_across_two_builds_of_one_tree() -> TestResult {
+        let (_first_directory, first) = served_map(CROSSING_FILES)?;
+        let (_second_directory, second) = served_map(CROSSING_FILES)?;
+        assert_eq!(first.module_relationships, second.module_relationships);
+        Ok(())
+    }
+
+    #[test]
+    fn a_graph_with_no_resolved_reference_answers_with_no_relationship() -> TestResult {
+        let graph = fact_less_target_graph()?;
+        let unit_paths = BTreeMap::new();
+        let records = super::records_by_identity(&graph);
+        assert!(
+            super::module_relationships(&graph, &unit_paths, &records).is_empty(),
+            "a reference whose source unit maps to no project path contributes nothing"
         );
         Ok(())
     }
