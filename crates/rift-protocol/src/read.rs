@@ -968,6 +968,20 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
+    /// A language engine serves the seed's language, and this read dropped what it
+    /// answered: the answer addressed bytes the served revision does not carry. The
+    /// indexed relationships stand; whatever the engine resolves on top of them is
+    /// missing. The warning states that an engine's analysis is absent from this answer;
+    /// it never states that the seed has no such neighbor. A later read served from a
+    /// revision the engine has caught up with carries the engine's edges again.
+    EngineAnalysisUnavailable {
+        /// The seed declaration's language, whose engine's answer was dropped.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<Language>,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
     /// The comparison reached `paths_max` changed paths and stopped there, so declarations
     /// in the changed paths past it are missing from this answer. Narrow the comparison
     /// with `paths`, or name two revisions that differ in fewer files.

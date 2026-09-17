@@ -94,6 +94,7 @@ impl ReadService {
         let mut results = Vec::new();
         let mut warnings = self.warnings();
         warnings.extend(selected.warnings());
+        warnings.extend(references.analysis_unavailable().cloned());
         if let Some(query) = query {
             let criteria = SearchCriteria {
                 query,
