@@ -10,6 +10,42 @@ use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// The ASCII punctuation an identity's path keeps literal: the RFC 3986 path set less its
+/// alphanumerics, spelled in the order a regular-expression character class takes, with `-`
+/// last. `rift_core::encode_path` escapes every other byte, and that crate's own test binds
+/// its escape set to this spelling, so a pattern cannot drift from the encoder that mints the
+/// values it describes.
+macro_rules! identity_path_punctuation {
+    () => {
+        r"._~!$&'()*+,;=:@/-"
+    };
+}
+
+/// One character of a `rift://` identity's path: a kept byte, or one percent-escape.
+macro_rules! identity_path_character {
+    () => {
+        concat!(
+            r"(?:[A-Za-z0-9",
+            identity_path_punctuation!(),
+            r"]|%[0-9A-F]{2})"
+        )
+    };
+}
+
+/// The language segment a `rift://node/` or `rift://symbol/` identity carries before its path:
+/// one word, or two joined by `:`.
+macro_rules! identity_language_segment {
+    () => {
+        r"[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?"
+    };
+}
+
+/// The ASCII punctuation an identity's path keeps literal, for the tests that bind the encoder
+/// and the served patterns to one alphabet.
+pub const IDENTITY_PATH_PUNCTUATION: &str = identity_path_punctuation!();
+/// The character class every served `rift://` identity pattern uses for its path.
+pub const IDENTITY_PATH_CHARACTER: &str = identity_path_character!();
+
 /// The spelling [`Language::identity_segment`] and [`Language::from_identity_segment`]
 /// agree on: one lowercase language word, or two joined by `:`. The
 /// `[languages.<identity>]` configuration table key uses the same grammar.
@@ -129,7 +165,7 @@ pub struct FileId(
     #[schemars(example = &"rift://file/src/lib.rs")]
     #[schemars(length(min = 13, max = 8192))]
     #[schemars(regex(
-        pattern = r"^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$"
+        pattern = concat!(r"^rift://file/", identity_path_character!(), r"{1,1000}$")
     ))]
     pub String,
 );
@@ -603,7 +639,13 @@ pub struct NodeId(
     #[schemars(example = &"rift://node/rust/lib.rs@220-268#3f9a1c2e")]
     #[schemars(length(min = 27, max = 8192))]
     #[schemars(regex(
-        pattern = r"^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/-]|%[0-9A-F]{2}){1,1000}@\d+-\d+#[0-9a-f]{8}$"
+        pattern = concat!(
+            r"^rift://node/",
+            identity_language_segment!(),
+            r"/",
+            identity_path_character!(),
+            r"{1,1000}@\d+-\d+#[0-9a-f]{8}$"
+        )
     ))]
     pub String,
 );
@@ -1436,7 +1478,11 @@ pub struct SourceSpan {
 pub struct SourceUnitId(
     #[schemars(length(min = 17, max = 8192))]
     #[schemars(regex(
-        pattern = r"^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,8192}$"
+        pattern = concat!(
+            r"^rift://source/[a-z][a-z0-9_.-]{0,127}/",
+            identity_path_character!(),
+            r"{1,8192}$"
+        )
     ))]
     pub String,
 );
@@ -1617,7 +1663,13 @@ pub struct SymbolId(
     #[schemars(example = &"rift://symbol/rust/crates/rift-server/src/read.rs/ReadService")]
     #[schemars(length(min = 17, max = 8192))]
     #[schemars(regex(
-        pattern = r"^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:/@-]|%[0-9A-F]{2}){1,1000}$"
+        pattern = concat!(
+            r"^rift://symbol/",
+            identity_language_segment!(),
+            r"/",
+            identity_path_character!(),
+            r"{1,1000}$"
+        )
     ))]
     pub String,
 );
@@ -1800,10 +1852,10 @@ pub struct TypeExpression {
 #[cfg(test)]
 mod tests {
     use super::{
-        Digest, Duration, FileId, GetSymbolParams, LANGUAGE_IDENTITY_PATTERN, Language,
-        PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX, PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning,
-        RelationshipFacet, RevisionId, RevisionIdViolation, SearchScope, SourceUnitId, Symbol,
-        SymbolId,
+        Digest, Duration, FileId, GetSymbolParams, IDENTITY_PATH_CHARACTER,
+        LANGUAGE_IDENTITY_PATTERN, Language, NodeId, PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX,
+        PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning, RelationshipFacet, RevisionId,
+        RevisionIdViolation, SearchScope, SourceUnitId, Symbol, SymbolId,
     };
     use schemars::schema_for;
     use serde_json::json;
@@ -2096,6 +2148,46 @@ mod tests {
                 r"^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,8192}$"
             )
         );
+    }
+
+    /// Every served identity spells its path with the one shared character class, and each
+    /// accepts an `@` inside that path. `rift_core::encode_path` keeps `@` literal because RFC
+    /// 3986 lists it in the path set, so a pattern that left it out refused an identity the
+    /// server had itself minted: every npm scoped package directory reached it.
+    #[test]
+    fn every_identity_pattern_accepts_the_path_bytes_the_encoder_keeps() {
+        let cases = [
+            (
+                serde_json::to_value(schema_for!(FileId)).expect("file schema"),
+                "rift://file/packages/@scope/name/package.json",
+            ),
+            (
+                serde_json::to_value(schema_for!(NodeId)).expect("node schema"),
+                "rift://node/json/packages/@scope/name/package.json@920-1004#b7fb41b1",
+            ),
+            (
+                serde_json::to_value(schema_for!(SourceUnitId)).expect("source unit schema"),
+                "rift://source/project/packages/@scope/name/package.json",
+            ),
+            (
+                serde_json::to_value(schema_for!(SymbolId)).expect("symbol schema"),
+                "rift://symbol/json/packages/@scope/name/package.json/name",
+            ),
+        ];
+        for (schema, identity) in cases {
+            let pattern = schema["pattern"].as_str().expect("an advertised pattern");
+            assert!(
+                pattern.contains(IDENTITY_PATH_CHARACTER),
+                "an identity pattern spells its path with the shared class: {pattern}"
+            );
+            let validator =
+                jsonschema::validator_for(&json!({ "type": "string", "pattern": pattern }))
+                    .expect("the advertised pattern compiles");
+            assert!(
+                validator.is_valid(&json!(identity)),
+                "{pattern} must accept {identity}"
+            );
+        }
     }
 
     /// The tier warnings carry the evidence a caller weighs, so each one is pinned to the

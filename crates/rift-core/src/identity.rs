@@ -517,6 +517,25 @@ mod tests {
         assert_eq!(encode_path("café"), "caf%C3%A9");
     }
 
+    /// The escape set and the served identity patterns describe one alphabet. A byte this set
+    /// keeps literal is a byte every `rift://` pattern accepts; a byte it escapes reaches the
+    /// wire as `%XX`, which those patterns accept separately. Drift between the two returns an
+    /// identity the server minted and its own schema refuses.
+    #[test]
+    fn the_escape_set_keeps_exactly_the_bytes_the_served_patterns_accept() {
+        for byte in 0x20_u8..0x7f {
+            let character = char::from(byte).to_string();
+            let kept = encode_path(&character) == character;
+            let advertised = byte.is_ascii_alphanumeric()
+                || rift_protocol::read::IDENTITY_PATH_PUNCTUATION.contains(&character);
+            assert_eq!(
+                kept, advertised,
+                "byte {byte:#04x} ({character}) is kept literal by the encoder and accepted by \
+                 the served patterns, or by neither"
+            );
+        }
+    }
+
     #[test]
     fn symbol_identity_pins_the_exact_wire_spelling_with_escaped_characters() {
         let identity = symbol_identity("rust", "src/café mod.rs", "Rift::separated name");

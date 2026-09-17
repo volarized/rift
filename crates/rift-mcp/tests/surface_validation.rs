@@ -74,6 +74,10 @@ fn corpus() -> Vec<(&'static str, Value)> {
         ),
         ("nodes", json!({ "path": "lib.rs", "position": 0 })),
         ("nodes", json!({ "path": "lib.rs", "position": 8 })),
+        (
+            "nodes",
+            json!({ "path": "packages/@scope/name/package.json", "position": 4 }),
+        ),
     ];
     requests.extend(dependency_scope_search_corpus());
     requests.extend(revision_read_corpus());
@@ -533,6 +537,14 @@ async fn served_fixture() -> TestResult<(
     )?;
     // No syntax provider claims it; `nodes` names the missing extension.
     fs::write(directory.path().join("justfile"), "default:\n    echo hi\n")?;
+    // An npm scoped package directory, so the corpus mints an identity whose path holds the
+    // `@` RFC 3986 keeps literal. The served `NodeId` pattern left `@` out and refused the
+    // identity the server had just minted.
+    fs::create_dir_all(directory.path().join("packages/@scope/name"))?;
+    fs::write(
+        directory.path().join("packages/@scope/name/package.json"),
+        "{\n  \"name\": \"@scope/name\"\n}\n",
+    )?;
     // A committed baseline, so the corpus can prove revision-addressed reads:
     // `hidden.rs` stays gitignored and uncommitted, everything else lands in
     // the fixture's one commit on `main`.
