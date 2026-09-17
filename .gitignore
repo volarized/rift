@@ -41,3 +41,7 @@ CLAUDE.md
 
 .feedback
 .doppel/
+
+.pytest_cache/
+.mypy_cache/
+*.profraw

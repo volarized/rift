@@ -35,3 +35,13 @@ command = ["rustup", "run", "1.98", "rust-analyzer"]
 
 [languages.toml.lsp]
 command = ["tombi", "lsp"]
+
+# The default package bounds skip the largest cataloged packages on this machine: the
+# generated binding crates (`windows@0.62.2` alone holds 108mb of source), the icon and
+# type packages under `docs/node_modules`, and the Rust standard library, whose `library`
+# tree selects 2458 files. Each bound is set past the largest observed package so those
+# packages are read rather than skipped, and `index_size` carries the sum.
+[dependencies]
+package_size = "128mb"
+package_files = 8000
+index_size = "1gb"
