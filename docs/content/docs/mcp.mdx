@@ -777,6 +777,8 @@ costs a lookup. The answer carries:
 - `hubs` - the most-referenced symbols, ranked by reference count descending
 - `entry_points` - symbols where execution starts
 - `docs` - markdown files, in path order
+- `module_relationships` - the modules a resolved reference reaches between, ranked by that
+  count descending
 - `packages` - the packages the workspace's manifests declare directly, as their package
   managers resolved them, in `manager`, `name`, `version` order; a transitive dependency is
   cataloged but not listed
@@ -784,12 +786,20 @@ costs a lookup. The answer carries:
 
 <VersionBadge version="v0.0.29" languages={["Rust"]} />
 
-`hubs` and `entry_points` need facts only the Rust provider currently supplies. `hubs` ranks
+`hubs`, `entry_points`, and `module_relationships` need facts only the Rust provider currently
+supplies. `hubs` ranks
 [`SymbolId`](/docs/developer/protocol/reference#SymbolId)s by the reference counts the
 [binding provider](/docs/developer/architecture#semantics) resolves; `entry_points` lists symbols
 carrying the `entrypoint` [`SymbolFacet`](/docs/developer/protocol/reference#SymbolFacet) - a file-scope
-`fn main`, not one nested in a module, an `impl` block, or another function. Both stay empty for
+`fn main`, not one nested in a module, an `impl` block, or another function. Each stays empty for
 a workspace with no such facts.
+
+`module_relationships` folds both ends of every resolved reference to the module `modules` lists
+them under, drops a pair whose two ends fold to one module, and counts what is left. A reference
+whose source or target is not project-located contributes none: a dependency declaration is
+reported by `packages` instead. The list carries at most 100 entries, ordered by `references`
+descending, then `from`, then `to`, so a workspace past that bound keeps the strongest pairs and
+two reads of one tree agree.
 
 <VersionBadge version="v0.0.32" languages={["Rust", "Python", "TypeScript"]} />
 
@@ -836,6 +846,13 @@ workspace holding more lists what the manifests it read declare.
   ],
   "entry_points": ["rift://symbol/rust/crates/rift/src/main.rs/main"],
   "docs": ["README.md"],
+  "module_relationships": [
+    {
+      "from": "crates/rift-server",
+      "to": "crates/rift-protocol",
+      "references": 87
+    }
+  ],
   "packages": [
     { "manager": "cargo", "name": "tokio", "version": "1.53.1" }
   ],
