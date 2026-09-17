@@ -820,6 +820,7 @@ impl EngineSlot {
             request_timeout: Duration::from_millis(
                 self.configuration.request_timeout.milliseconds(),
             ),
+            settle_delay: Duration::from_millis(self.configuration.settle_delay.milliseconds()),
             stderr_capture_bytes: usize::try_from(self.configuration.output_limit.bytes())
                 .unwrap_or(usize::MAX),
         }
@@ -843,6 +844,7 @@ impl EngineSlot {
             request_timeout: Duration::from_millis(
                 self.configuration.request_timeout.milliseconds(),
             ),
+            settle_delay: Duration::from_millis(self.configuration.settle_delay.milliseconds()),
             stderr_capture_bytes: usize::try_from(self.configuration.output_limit.bytes())
                 .unwrap_or(usize::MAX),
         }
@@ -965,6 +967,7 @@ mod tests {
             initialization_options: Some(serde_json::json!({ "engine": "fake" })),
             startup_timeout: ConfiguredDuration::from_millis(10_000),
             request_timeout: ConfiguredDuration::from_millis(20_000),
+            settle_delay: ConfiguredDuration::from_millis(500),
             output_limit: ByteSize::from_bytes(2_048),
             retry: RetryPolicy::default(),
             restart: RestartPolicy::default(),

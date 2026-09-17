@@ -42,6 +42,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command};
+use tokio::time::Instant;
 
 use crate::capabilities::{Capabilities, CapabilitiesError, glob_matches, offered};
 use crate::correlation::{self, Correlation, CorrelationError, METHOD_NOT_FOUND_CODE, RequestId};
@@ -108,6 +109,9 @@ pub struct EngineLaunch {
     pub startup_timeout: Duration,
     /// Wall-clock bound on each later request.
     pub request_timeout: Duration,
+    /// Quiet the work record holds, up to the session's last read of engine
+    /// output, before the session calls the engine ready.
+    pub settle_delay: Duration,
     /// Bytes of standard error kept as the captured prefix.
     pub stderr_capture_bytes: usize,
 }
@@ -407,6 +411,8 @@ fn watch_kind(change: FileChangeType) -> Option<WatchKind> {
 struct WorkProgress {
     announced: bool,
     outstanding: Vec<ProgressToken>,
+    last_transition: Option<Instant>,
+    last_read: Option<Instant>,
 }
 
 impl WorkProgress {
@@ -417,8 +423,9 @@ impl WorkProgress {
     /// non-empty, so the session reads as analyzing either way, and an
     /// end for the dropped token retires nothing. The announcement holds
     /// whatever the bound does with the token.
-    fn began(&mut self, token: ProgressToken) {
+    fn began(&mut self, token: ProgressToken, now: Instant) {
         self.announced = true;
+        self.last_transition = Some(now);
         if self.outstanding.len() >= PROGRESS_TOKENS_MAX || self.outstanding.contains(&token) {
             return;
         }
@@ -426,11 +433,12 @@ impl WorkProgress {
     }
 
     /// Retires one token the engine ended.
-    fn ended(&mut self, token: &ProgressToken) {
+    fn ended(&mut self, token: &ProgressToken, now: Instant) {
         let held = self.outstanding.len();
         self.outstanding.retain(|held| held != token);
         if self.outstanding.len() < held {
             self.announced = true;
+            self.last_transition = Some(now);
         }
     }
 
@@ -438,8 +446,32 @@ impl WorkProgress {
     ///
     /// Outstanding work remains outstanding. With no outstanding token,
     /// next answer needs fresh progress or repeated report evidence.
-    fn invalidated(&mut self) {
+    fn invalidated(&mut self, now: Instant) {
         self.announced = false;
+        self.last_transition = Some(now);
+    }
+
+    /// Stamps the moment the session last read the engine's own output.
+    ///
+    /// Settlement is read past, never observed from outside: the record
+    /// answers ready only once the session has read engine bytes at least
+    /// one settle delay after the record's last transition.
+    fn read(&mut self, now: Instant) {
+        self.last_read = Some(now);
+    }
+
+    /// Whether the record has stayed empty for `settle_delay`, up to the
+    /// session's last read of engine output.
+    ///
+    /// A load's phases end and begin in bursts, so the set empties several
+    /// times inside one load. An emptiness the session has not read past
+    /// proves nothing, and neither does one shorter than the engine's own
+    /// silence between phases.
+    fn is_settled(&self, settle_delay: Duration) -> bool {
+        let (Some(transition), Some(read)) = (self.last_transition, self.last_read) else {
+            return false;
+        };
+        read.saturating_duration_since(transition) >= settle_delay
     }
 
     /// Whether any announced work is still outstanding.
@@ -452,15 +484,17 @@ impl WorkProgress {
         self.announced
     }
 
-    /// The readiness this record proves, from the announcement and
-    /// outstanding-token facts alone.
-    fn readiness(&self) -> EngineReadiness {
+    /// The readiness this record proves: what was announced, what is
+    /// outstanding, and how long the record has been quiet.
+    fn readiness(&self, settle_delay: Duration) -> EngineReadiness {
         if self.is_outstanding() {
             EngineReadiness::Analyzing
         } else if !self.is_announced() {
             EngineReadiness::Unconfirmed
-        } else {
+        } else if self.is_settled(settle_delay) {
             EngineReadiness::Ready
+        } else {
+            EngineReadiness::Analyzing
         }
     }
 }
@@ -523,6 +557,7 @@ pub struct EngineSession {
     capabilities: Capabilities,
     root: TreeRoot,
     request_timeout: Duration,
+    settle_delay: Duration,
     published: BTreeMap<ProjectPath, PublishedReport>,
     progress: WorkProgress,
     diagnostic_refresh_revision: u64,
@@ -592,9 +627,7 @@ impl EngineSession {
             Box::new(stdout),
             stderr_drain,
             workspace_root,
-            launch.startup_timeout,
-            launch.request_timeout,
-            launch.initialization_options,
+            launch,
         )
         .await
     }
@@ -628,9 +661,7 @@ impl EngineSession {
             Box::new(read_half),
             stderr_drain,
             workspace_root,
-            launch.startup_timeout,
-            launch.request_timeout,
-            launch.initialization_options,
+            launch,
         )
         .await
     }
@@ -639,19 +670,13 @@ impl EngineSession {
     /// handshake, ending the session and propagating the failure if it
     /// fails. Shared by [`EngineSession::start`] and
     /// [`EngineSession::start_over_transport`], the only two constructors.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one field per assembled struct member"
-    )]
     async fn assembled(
         child: Option<Child>,
         stdin: EngineWriter,
         stdout: EngineReader,
         stderr_drain: tokio::task::JoinHandle<CapturedStream>,
         workspace_root: &Path,
-        startup_timeout: Duration,
-        request_timeout: Duration,
-        initialization_options: Option<Value>,
+        launch: EngineLaunch,
     ) -> Result<Self, EngineError> {
         let root = TreeRoot::new(workspace_root)
             .map_err(|source| Error::new(EngineFault::Document { source }))?;
@@ -665,7 +690,8 @@ impl EngineSession {
             queue: VecDeque::new(),
             capabilities: Capabilities::default(),
             root,
-            request_timeout,
+            request_timeout: launch.request_timeout,
+            settle_delay: launch.settle_delay,
             published: BTreeMap::new(),
             progress: WorkProgress::default(),
             diagnostic_refresh_revision: 0,
@@ -675,7 +701,11 @@ impl EngineSession {
             ended: false,
         };
         if let Err(error) = session
-            .handshake(workspace_root, startup_timeout, initialization_options)
+            .handshake(
+                workspace_root,
+                launch.startup_timeout,
+                launch.initialization_options,
+            )
             .await
         {
             session.end().await;
@@ -723,22 +753,30 @@ impl EngineSession {
     /// The record only holds what the session has read, and the session
     /// reads only while a call runs, so the query answers the state as of
     /// the most recent answer. An engine that reports no progress at all
-    /// never reads as analyzing, and its answers are final at once.
+    /// never reads as analyzing, and its answers are final at once. An
+    /// engine between two of its own tokens reads as analyzing too, until
+    /// the record has been quiet for `lsp.settle_delay`.
     /// Equivalent to `readiness() == EngineReadiness::Analyzing`.
     #[must_use]
     pub fn is_analyzing(&self) -> bool {
-        self.progress.is_outstanding()
+        self.readiness() == EngineReadiness::Analyzing
     }
 
     /// What this session has proven about the engine's own settlement.
     ///
     /// Reads only what the session has read so far, so the answer is as of
     /// the most recent exchange; see [`EngineReadiness`] for what each
-    /// state means and [`EngineSession::is_analyzing`] for the outstanding
+    /// state means and [`EngineSession::is_analyzing`] for the analyzing
     /// half of it alone.
+    ///
+    /// `Ready` needs the work record empty and quiet for the launch's
+    /// `settle_delay`, measured up to the session's last read of engine
+    /// output. A language server ends and begins its load phases in bursts,
+    /// so the record empties several times inside one load; emptiness at one
+    /// instant is not settlement.
     #[must_use]
     pub fn readiness(&self) -> EngineReadiness {
-        self.progress.readiness()
+        self.progress.readiness(self.settle_delay)
     }
 
     /// Revision of diagnostic refresh requests received from engine.
@@ -949,7 +987,7 @@ impl EngineSession {
         paths: &[(ProjectPath, FileChangeType)],
     ) -> Result<Vec<ProjectPath>, EngineError> {
         if !paths.is_empty() {
-            self.progress.invalidated();
+            self.progress.invalidated(Instant::now());
         }
         let matched: Vec<(ProjectPath, FileChangeType)> = paths
             .iter()
@@ -1200,6 +1238,7 @@ impl EngineSession {
                     method: method.to_owned(),
                 }));
             }
+            self.progress.read(Instant::now());
             let messages = self
                 .framing
                 .feed(&chunk[..read])
@@ -1259,11 +1298,12 @@ impl EngineSession {
             return;
         };
         let ProgressParamsValue::WorkDone(work) = progress.value;
+        let now = Instant::now();
         match work {
             WorkDoneProgress::Begin(_) | WorkDoneProgress::Report(_) => {
-                self.progress.began(progress.token);
+                self.progress.began(progress.token, now);
             }
-            WorkDoneProgress::End(_) => self.progress.ended(&progress.token),
+            WorkDoneProgress::End(_) => self.progress.ended(&progress.token, now),
         }
     }
 
@@ -1282,7 +1322,7 @@ impl EngineSession {
                 ) else {
                     return;
                 };
-                self.progress.began(created.token);
+                self.progress.began(created.token, Instant::now());
             }
             WorkspaceDiagnosticRefresh::METHOD => {
                 self.diagnostic_refresh_revision =
@@ -1819,50 +1859,122 @@ mod tests {
         );
     }
 
+    /// The settle delay every record test in this module reads against.
+    const TEST_SETTLE_DELAY: Duration = Duration::from_millis(500);
+
     #[test]
     fn progress_record_retires_ended_tokens_and_stays_bounded() {
         let token = |index: usize| ProgressToken::String(format!("rift/work/{index}"));
+        let start = Instant::now();
+        let at = |millis: u64| start + Duration::from_millis(millis);
         let mut record = WorkProgress::default();
         assert!(
             !record.is_announced() && !record.is_outstanding(),
             "a session that has read no progress has heard no announcement"
         );
-        record.began(token(0));
-        record.began(token(0));
+        record.began(token(0), at(0));
+        record.began(token(0), at(0));
         assert_eq!(
             record.outstanding.len(),
             1,
             "a token already outstanding is not doubled"
         );
-        record.ended(&token(0));
+        record.ended(&token(0), at(0));
         assert!(!record.is_outstanding(), "an ended token retires");
         assert!(
             record.is_announced(),
             "the announcement outlives the work it announced"
         );
-        record.invalidated();
-        assert_eq!(record.readiness(), EngineReadiness::Unconfirmed);
-        record.began(token(1));
-        record.invalidated();
+        record.invalidated(at(0));
+        record.read(at(1_000));
         assert_eq!(
-            record.readiness(),
+            record.readiness(TEST_SETTLE_DELAY),
+            EngineReadiness::Unconfirmed
+        );
+        record.began(token(1), at(1_000));
+        record.invalidated(at(1_000));
+        assert_eq!(
+            record.readiness(TEST_SETTLE_DELAY),
             EngineReadiness::Analyzing,
             "invalidation retains outstanding work"
         );
-        record.ended(&token(1));
+        record.ended(&token(1), at(1_000));
+        record.read(at(1_500));
         assert_eq!(
-            record.readiness(),
+            record.readiness(TEST_SETTLE_DELAY),
             EngineReadiness::Ready,
             "ending retained work proves readiness after invalidation"
         );
         for index in 0..PROGRESS_TOKENS_MAX {
-            record.began(token(index));
+            record.began(token(index), at(2_000));
         }
-        record.began(token(PROGRESS_TOKENS_MAX));
+        record.began(token(PROGRESS_TOKENS_MAX), at(2_000));
         assert_eq!(
             record.outstanding.len(),
             PROGRESS_TOKENS_MAX,
             "a token past the bound is dropped"
+        );
+    }
+
+    /// An emptied record reads analyzing until the session has read engine
+    /// output at least one settle delay after the last transition.
+    ///
+    /// rust-analyzer ends and creates its load tokens in bursts:
+    /// `rustAnalyzer/Fetching` ends at 0.711s and
+    /// `rustAnalyzer/Building CrateGraph` is created one millisecond later,
+    /// while the phase that resolves references ends at 16.354s. A read
+    /// taken in one of those gaps must not report the load finished.
+    #[test]
+    fn an_emptied_record_reads_analyzing_until_a_read_passes_the_settle_delay() {
+        let start = Instant::now();
+        let at = |millis: u64| start + Duration::from_millis(millis);
+        let fetching = ProgressToken::String("rustAnalyzer/Fetching".to_owned());
+        let crate_graph = ProgressToken::String("rustAnalyzer/Building CrateGraph".to_owned());
+        let mut record = WorkProgress::default();
+
+        record.began(fetching.clone(), at(0));
+        record.read(at(711));
+        record.ended(&fetching, at(711));
+        assert_eq!(
+            record.readiness(TEST_SETTLE_DELAY),
+            EngineReadiness::Analyzing,
+            "a read inside the gap between two tokens has read no quiet"
+        );
+        record.read(at(712));
+        record.began(crate_graph.clone(), at(712));
+        assert_eq!(
+            record.readiness(TEST_SETTLE_DELAY),
+            EngineReadiness::Analyzing,
+            "the next phase's token is outstanding"
+        );
+        record.read(at(712));
+        record.ended(&crate_graph, at(712));
+        assert_eq!(
+            record.readiness(TEST_SETTLE_DELAY),
+            EngineReadiness::Analyzing,
+            "a quiet the session has not read past proves nothing"
+        );
+        record.read(at(1_211));
+        assert_eq!(
+            record.readiness(TEST_SETTLE_DELAY),
+            EngineReadiness::Analyzing,
+            "one millisecond short of the delay is not settled"
+        );
+        record.read(at(1_212));
+        assert_eq!(
+            record.readiness(TEST_SETTLE_DELAY),
+            EngineReadiness::Ready,
+            "a read one delay past the last transition settles the record"
+        );
+        assert!(
+            !record.is_outstanding(),
+            "settlement never contradicts the outstanding half"
+        );
+        record.invalidated(at(1_212));
+        assert_eq!(
+            record.readiness(TEST_SETTLE_DELAY),
+            EngineReadiness::Unconfirmed,
+            "changed workspace bytes move a settled record back"
         );
     }
 
