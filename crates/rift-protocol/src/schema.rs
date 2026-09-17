@@ -41,6 +41,11 @@ mod keyword {
     pub(super) const NULL: &str = "null";
 }
 
+/// References and unions one schema walk follows before it answers with what
+/// it has reached. A model may refer to itself, and a caller reaches the walk
+/// by sending one value the schema refuses, so the walk is bounded.
+const SCHEMA_REFERENCES_MAX: usize = 32;
+
 /// One step of the path into a document the server refused.
 ///
 /// A refusal names the member it stopped at, so the caller reads the shape of
@@ -189,19 +194,35 @@ fn declared_member<'schema>(
 /// one, so unwrapping that union reaches the member's real shape. A union with
 /// more than one branch left is a closed set or a real choice, and stays whole:
 /// what it accepts is every branch, not the first.
+///
+/// The walk is bounded by [`SCHEMA_REFERENCES_MAX`]: a model that refers to
+/// itself is a legal schema, and a caller reaches this walk by sending one bad
+/// value, so an unbounded one would hand every caller a way to stall a read.
+/// A schema deeper than the bound answers with the last node reached, which
+/// states less than the target would and never less than nothing.
 fn resolved<'schema>(root: &'schema Value, node: &'schema Value) -> &'schema Value {
-    if let Some(name) = node
+    let mut node = node;
+    for _ in 0..SCHEMA_REFERENCES_MAX {
+        if let Some(target) = referenced(root, node) {
+            node = target;
+            continue;
+        }
+        match value_branches(node).as_slice() {
+            [branch] => node = branch,
+            _ => return node,
+        }
+    }
+    node
+}
+
+/// The definition one schema's `$ref` names, where it names one this document
+/// carries.
+fn referenced<'schema>(root: &'schema Value, node: &'schema Value) -> Option<&'schema Value> {
+    let name = node
         .get(keyword::REF)
-        .and_then(Value::as_str)
-        .and_then(|reference| reference.strip_prefix("#/$defs/"))
-        && let Some(target) = root.get(keyword::DEFS).and_then(|defs| defs.get(name))
-    {
-        return resolved(root, target);
-    }
-    match value_branches(node).as_slice() {
-        [branch] => resolved(root, branch),
-        _ => node,
-    }
+        .and_then(Value::as_str)?
+        .strip_prefix("#/$defs/")?;
+    root.get(keyword::DEFS)?.get(name)
 }
 
 /// The branches of a union that declare a value, the null branch left out.
@@ -1190,6 +1211,24 @@ mod tests {
         let shape = expected_shape(&addressed_schema(), &[DocumentStep::Member("query")]);
         assert_eq!(shape.followed(), 1);
         assert_eq!(shape.example(), Some(&json!({"query": "beacon"})));
+    }
+
+    /// A model may refer to itself, and a caller reaches this walk by sending
+    /// one value the schema refuses. The walk answers with what it reached
+    /// rather than following the cycle.
+    #[test]
+    fn a_schema_that_refers_to_itself_stops_at_the_reference_bound() {
+        let cyclic = json!({
+            "type": "object",
+            "properties": {"node": {"$ref": "#/$defs/Node"}},
+            "$defs": {
+                "Node": {"$ref": "#/$defs/Node"}
+            }
+        });
+        let shape = expected_shape(&cyclic, &[DocumentStep::Member("node")]);
+        assert_eq!(shape.followed(), 1);
+        assert!(shape.accepted().is_empty());
+        assert_eq!(shape.example(), None);
     }
 
     #[test]
