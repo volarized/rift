@@ -900,6 +900,15 @@
           "minimum": 1000,
           "type": "integer"
         },
+        "force_include": {
+          "default": [],
+          "description": "Exact file paths or globs that stay visible although the workspace's `.gitignore`\nhides them, in [`PathPattern`] syntax. A match here needs no `include` match, and a\nmatch `exclude` also names is still dropped.",
+          "items": {
+            "$ref": "#/$defs/PathPattern"
+          },
+          "maxItems": 512,
+          "type": "array"
+        },
         "include": {
           "default": [],
           "description": "Exact file paths or globs a file must match to stay visible, in [`PathPattern`] syntax.\nEmpty includes every file `exclude` and `.gitignore` leave standing.",
@@ -1087,6 +1096,7 @@
       "default": {
         "exclude": [],
         "files": 100000,
+        "force_include": [],
         "include": [],
         "respect_gitignore": true,
         "workspace_size": "512mb"

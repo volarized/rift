@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Read as _;
@@ -33,7 +33,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::change_set::{FileDigest, PathChanges, WorkspaceDigests, tree_revision_of};
 use crate::chunk::text_chunks;
-use crate::glob::PathMatcher;
+use crate::glob::{ForceIncludeReach, PathMatcher, PathVerdict};
 use crate::language::{ClassifiedPath, LanguagePolicyError, WorkspaceLanguagePolicy};
 use crate::lexical::{LexicalUnit, LexicalUnitKind, LimitBreach};
 use crate::relationship::RelationshipStore;
@@ -712,7 +712,12 @@ impl WorkspaceSourcePolicy {
     ) -> Result<Self, WorkspaceIndexError> {
         let watched_root = root.to_path_buf();
         let root = canonical_root(root)?;
-        let matcher = PathMatcher::build(&root, visibility.include(), visibility.exclude())?;
+        let matcher = PathMatcher::build_with_force_include(
+            &root,
+            visibility.include(),
+            visibility.exclude(),
+            visibility.force_include(),
+        )?;
         let language = WorkspaceLanguagePolicy::build(&root, languages, text_inclusion)?;
         let gitignore = visibility
             .respect_gitignore()
@@ -875,20 +880,22 @@ impl WorkspaceSourcePolicy {
     }
 
     /// Carries the checks [`Self::visible`] and [`Self::includes`] share, against a path
-    /// [`Self::normalized_path`] already resolved: above the hard floor, kept by the
-    /// `[source]` matcher, and not excluded by the workspace's `.gitignore` chain. Neither
-    /// caller normalizes twice.
+    /// [`Self::normalized_path`] already resolved: above the hard floor, then the `[source]`
+    /// globs in their own precedence, with the workspace's `.gitignore` chain deciding only
+    /// what `force_include` did not already keep. Neither caller normalizes twice.
     fn visible_normalized(&self, path: &Path) -> bool {
         let above_hard_floor = hard_floor_includes_path(&self.root, path);
         if !above_hard_floor {
             return false;
         }
-        let configuration_includes = self.matcher.includes(path);
-        let gitignore_includes = self
-            .gitignore
-            .as_ref()
-            .is_none_or(|gitignore| !gitignore.excludes(path, false));
-        configuration_includes && gitignore_includes
+        match self.matcher.verdict(path) {
+            PathVerdict::Excluded | PathVerdict::NotIncluded => false,
+            PathVerdict::ForceIncluded => true,
+            PathVerdict::Included => self
+                .gitignore
+                .as_ref()
+                .is_none_or(|gitignore| !gitignore.excludes(path, false)),
+        }
     }
 
     /// Returns whether one directory can contain visible Rust source.
@@ -902,12 +909,15 @@ impl WorkspaceSourcePolicy {
         if !above_hard_floor {
             return false;
         }
-        let configuration_includes = self.matcher.may_include_descendant(path);
-        let gitignore_includes = self
-            .gitignore
+        if !self.matcher.may_include_descendant(path) {
+            return false;
+        }
+        if self.matcher.force_include_reaches(path) {
+            return true;
+        }
+        self.gitignore
             .as_ref()
-            .is_none_or(|gitignore| !gitignore.excludes(path, true));
-        configuration_includes && gitignore_includes
+            .is_none_or(|gitignore| !gitignore.excludes(path, true))
     }
 
     /// Maps one event path onto the project-relative path the index keys files by, or
@@ -2160,68 +2170,143 @@ struct DiscoveredPaths {
     text: Vec<PathBuf>,
 }
 
+impl DiscoveredPaths {
+    /// Records one classified path against the shared `files_max` budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] when the budget is already spent, naming the
+    /// `[source]` key that owns it and the path that crossed it.
+    fn admit(
+        &mut self,
+        files_max: usize,
+        path: &Path,
+        class: ClassifiedPath,
+    ) -> Result<(), WorkspaceIndexError> {
+        let total = self.source.len() + self.text.len();
+        if total >= files_max {
+            return Err(index_error_over_limit(
+                WorkspaceIndexViolation::TooManyFiles,
+                path,
+                SOURCE_FILES_FIELD,
+                total.saturating_add(1),
+                files_max,
+            ));
+        }
+        match class {
+            ClassifiedPath::Source(provider) => self.source.push((path.to_path_buf(), provider)),
+            ClassifiedPath::Text => self.text.push(path.to_path_buf()),
+        }
+        Ok(())
+    }
+}
+
 /// Source and baseline text paths visible below `root`: the hard floor (`.git`, `.rift`,
 /// `target`, symlinks) is always applied, `visibility.respect_gitignore()` then layers the
-/// workspace's own `.gitignore` chain, and `visibility.include()`/`.exclude()` narrow or drop
-/// candidate files. A provider extension adds syntax facts; every other accepted file joins
-/// baseline text. Both classes use the same `.gitignore` and `[source]` policy.
+/// workspace's own `.gitignore` chain, and the `[source]` globs decide in their own order -
+/// `exclude` drops, `force_include` keeps what `.gitignore` hid, `include` narrows the rest.
+/// A provider extension adds syntax facts; every other accepted file joins baseline text.
+/// Both classes use the same `.gitignore` and `[source]` policy.
 ///
 /// Directories are walked in file-name order so a bound violation is reported
 /// deterministically; both returned lists are sorted by path. Source and text paths share one
-/// `files_max` budget, counted as they are discovered.
+/// `files_max` budget, counted as they are discovered, and [`discover_forced`] spends the same
+/// budget on what the `.gitignore`-respecting walk could not reach.
 fn discover(
     root: &Path,
     limits: WorkspaceIndexLimits,
     visibility: &SourceVisibility,
     language: &WorkspaceLanguagePolicy,
 ) -> Result<DiscoveredPaths, WorkspaceIndexError> {
-    let matcher = PathMatcher::build(root, visibility.include(), visibility.exclude())?;
+    let matcher = PathMatcher::build_with_force_include(
+        root,
+        visibility.include(),
+        visibility.exclude(),
+        visibility.force_include(),
+    )?;
     let gitignore = GitignorePolicy::from_respecting(visibility.respect_gitignore());
     let mut discovered = DiscoveredPaths::default();
     for entry in source_walk(root, limits.directory_depth_max, gitignore) {
         let entry = entry.map_err(|error| walk_error(root, error))?;
-        let file_type = entry.file_type();
-        if file_type.is_some_and(|file_type| file_type.is_dir()) {
-            if entry.depth() > limits.directory_depth_max {
-                return Err(index_error_at(
-                    WorkspaceIndexViolation::TooDeep,
-                    entry.path(),
-                ));
-            }
+        let Some(path) = walked_file(&entry, limits.directory_depth_max)? else {
             continue;
-        }
-        if !file_type.is_some_and(|file_type| file_type.is_file()) {
-            continue;
-        }
-        let path = entry.path();
+        };
         if !matcher.includes(path) {
             continue;
         }
         let Some(class) = language.classifies(path)? else {
             continue;
         };
-        let total = discovered.source.len() + discovered.text.len();
-        if total >= limits.files_max {
-            return Err(index_error_over_limit(
-                WorkspaceIndexViolation::TooManyFiles,
-                path,
-                SOURCE_FILES_FIELD,
-                total.saturating_add(1),
-                limits.files_max,
-            ));
-        }
-        match class {
-            ClassifiedPath::Source(provider) => {
-                discovered.source.push((path.to_path_buf(), provider));
-            }
-            ClassifiedPath::Text => discovered.text.push(path.to_path_buf()),
-        }
+        discovered.admit(limits.files_max, path, class)?;
     }
+    discover_forced(root, limits, &matcher, language, &mut discovered)?;
     discovered
         .source
         .sort_by(|left, right| left.0.cmp(&right.0));
     discovered.text.sort();
     Ok(discovered)
+}
+
+/// The paths `force_include` reaches that the `.gitignore`-respecting walk could not yield.
+///
+/// A workspace naming no `force_include` pattern runs nothing here. Otherwise the walk skips
+/// the `.gitignore` chain, descends only the subtrees the patterns can reach, and admits a
+/// path whose verdict is [`PathVerdict::ForceIncluded`]. It shares `files_max` with the first
+/// walk, and a path the first walk already recorded is skipped rather than recorded twice.
+fn discover_forced(
+    root: &Path,
+    limits: WorkspaceIndexLimits,
+    matcher: &PathMatcher,
+    language: &WorkspaceLanguagePolicy,
+    discovered: &mut DiscoveredPaths,
+) -> Result<(), WorkspaceIndexError> {
+    let reach = matcher.force_include_reach();
+    if reach.is_empty() {
+        return Ok(());
+    }
+    let recorded: HashSet<PathBuf> = discovered
+        .source
+        .iter()
+        .map(|(path, _)| path.clone())
+        .chain(discovered.text.iter().cloned())
+        .collect();
+    for entry in forced_walk(root, limits.directory_depth_max, reach) {
+        let entry = entry.map_err(|error| walk_error(root, error))?;
+        let Some(path) = walked_file(&entry, limits.directory_depth_max)? else {
+            continue;
+        };
+        if matcher.verdict(path) != PathVerdict::ForceIncluded || recorded.contains(path) {
+            continue;
+        }
+        let Some(class) = language.classifies(path)? else {
+            continue;
+        };
+        discovered.admit(limits.files_max, path, class)?;
+    }
+    Ok(())
+}
+
+/// The file one walked entry names: `None` for a directory within `directory_depth_max` and
+/// for an entry that is neither file nor directory, and a [`WorkspaceIndexViolation::TooDeep`]
+/// refusal for a directory past that bound. Both walks report the bound the same way.
+fn walked_file(
+    entry: &DirEntry,
+    directory_depth_max: usize,
+) -> Result<Option<&Path>, WorkspaceIndexError> {
+    let file_type = entry.file_type();
+    if file_type.is_some_and(|file_type| file_type.is_dir()) {
+        if entry.depth() > directory_depth_max {
+            return Err(index_error_at(
+                WorkspaceIndexViolation::TooDeep,
+                entry.path(),
+            ));
+        }
+        return Ok(None);
+    }
+    if !file_type.is_some_and(|file_type| file_type.is_file()) {
+        return Ok(None);
+    }
+    Ok(Some(entry.path()))
 }
 
 /// Compiles bounded workspace `.gitignore` chain for direct event matching.
@@ -2516,6 +2601,23 @@ fn source_walk(root: &Path, directory_depth_max: usize, gitignore: GitignorePoli
         .sort_by_file_name(OsStr::cmp)
         .filter_entry(hard_floor_includes)
         .git_ignore(gitignore == GitignorePolicy::Respect);
+    builder.build()
+}
+
+/// One walk over the subtrees `force_include` reaches, with `.gitignore` not consulted. The
+/// hard floor, depth bound, and file-name order are [`source_walk`]'s; `reach` prunes every
+/// directory the patterns cannot lead to, so a workspace's ignored build output is never
+/// descended for a pattern that names one other directory.
+fn forced_walk(root: &Path, directory_depth_max: usize, reach: ForceIncludeReach) -> Walk {
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .standard_filters(false)
+        .require_git(false)
+        .follow_links(false)
+        .max_depth(Some(directory_depth_max.saturating_add(1)))
+        .sort_by_file_name(OsStr::cmp)
+        .filter_entry(move |entry| hard_floor_includes(entry) && reach.reaches(entry.path()))
+        .git_ignore(false);
     builder.build()
 }
 
@@ -3802,6 +3904,191 @@ mod tests {
             .force_include_files(&[], 10)
             .expect("an empty force_include list must not walk for matches");
         assert!(extra.is_empty());
+    }
+
+    /// One visible source file and one note below a directory `.gitignore` hides.
+    fn hidden_notes_fixture() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        fs::create_dir_all(directory.path().join("src")).expect("source directory");
+        fs::create_dir_all(directory.path().join("notes")).expect("notes directory");
+        fs::write(directory.path().join(".gitignore"), "notes/\n").expect("ignore policy");
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n").expect("source");
+        fs::write(directory.path().join("notes/plan.txt"), "plan\n").expect("note");
+        directory
+    }
+
+    /// Whether the built index holds `path` in its baseline text catalog.
+    fn holds_text(index: &WorkspaceIndex, path: &str) -> bool {
+        let path = ProjectPath::new(path).expect("fixture path");
+        index.text_file(&path).is_some()
+    }
+
+    fn built(root: &Path, visibility: &SourceVisibility) -> WorkspaceIndex {
+        WorkspaceIndex::build(
+            root,
+            WorkspaceIndexLimits::default(),
+            visibility,
+            &TextFileInclusion::default(),
+        )
+        .expect("index")
+    }
+
+    #[test]
+    fn test_source_force_include_indexes_a_gitignored_path() {
+        let directory = hidden_notes_fixture();
+        let visibility =
+            SourceVisibility::default().with_force_include(vec!["notes/**".to_owned()]);
+        let index = built(directory.path(), &visibility);
+        assert!(
+            holds_text(&index, "notes/plan.txt"),
+            "force_include must reach a path the workspace's own .gitignore hides"
+        );
+    }
+
+    #[test]
+    fn test_a_gitignored_path_stays_hidden_without_force_include() {
+        let directory = hidden_notes_fixture();
+        let index = built(directory.path(), &SourceVisibility::default());
+        assert!(
+            !holds_text(&index, "notes/plan.txt"),
+            "the same tree without force_include indexes exactly what it indexed before"
+        );
+    }
+
+    #[test]
+    fn test_source_exclude_wins_over_force_include() {
+        let directory = hidden_notes_fixture();
+        let visibility = SourceVisibility::new(Vec::new(), vec!["notes/**".to_owned()], true)
+            .with_force_include(vec!["notes/**".to_owned()]);
+        let index = built(directory.path(), &visibility);
+        assert!(
+            !holds_text(&index, "notes/plan.txt"),
+            "both lists are the operator's own statement, and the narrower one decides"
+        );
+    }
+
+    #[test]
+    fn test_source_force_include_needs_no_include_match() {
+        let directory = hidden_notes_fixture();
+        let visibility = SourceVisibility::new(vec!["src/**".to_owned()], Vec::new(), true)
+            .with_force_include(vec!["notes/**".to_owned()]);
+        let index = built(directory.path(), &visibility);
+        assert!(
+            holds_text(&index, "notes/plan.txt"),
+            "a force_include match is kept although include names another subtree"
+        );
+        assert_eq!(index.file_count(), 1, "the included source stays indexed");
+    }
+
+    #[test]
+    fn test_source_force_include_leaves_other_gitignored_paths_hidden() {
+        let directory = hidden_notes_fixture();
+        fs::create_dir_all(directory.path().join("cache")).expect("cache directory");
+        fs::write(directory.path().join(".gitignore"), "notes/\ncache/\n").expect("ignore policy");
+        fs::write(directory.path().join("cache/entry.txt"), "entry\n").expect("cache entry");
+        let visibility =
+            SourceVisibility::default().with_force_include(vec!["notes/**".to_owned()]);
+        let index = built(directory.path(), &visibility);
+        assert!(holds_text(&index, "notes/plan.txt"));
+        assert!(
+            !holds_text(&index, "cache/entry.txt"),
+            "a gitignored path outside every force_include glob stays hidden"
+        );
+    }
+
+    #[test]
+    fn test_source_force_include_never_reaches_the_hard_floor() {
+        let directory = hidden_notes_fixture();
+        fs::create_dir_all(directory.path().join("target")).expect("target directory");
+        fs::write(directory.path().join("target/note.txt"), "built\n").expect("built artifact");
+        let visibility = SourceVisibility::default()
+            .with_force_include(vec!["target/**".to_owned(), "notes/**".to_owned()]);
+        let index = built(directory.path(), &visibility);
+        assert!(holds_text(&index, "notes/plan.txt"));
+        assert!(
+            !holds_text(&index, "target/note.txt"),
+            "the hard floor stays unreachable whatever the [source] table says"
+        );
+    }
+
+    #[test]
+    fn test_source_force_include_records_a_visible_path_once() {
+        let directory = hidden_notes_fixture();
+        let visibility = SourceVisibility::default()
+            .with_force_include(vec!["notes/**".to_owned(), "src/**".to_owned()]);
+        let index = built(directory.path(), &visibility);
+        assert_eq!(
+            index.file_count(),
+            1,
+            "a path the gitignore-respecting walk already recorded is not recorded twice"
+        );
+        assert!(holds_text(&index, "notes/plan.txt"));
+    }
+
+    #[test]
+    fn test_source_force_include_shares_the_files_bound() {
+        let directory = hidden_notes_fixture();
+        let visibility =
+            SourceVisibility::default().with_force_include(vec!["notes/**".to_owned()]);
+        let limits = WorkspaceIndexLimits {
+            files_max: 1,
+            ..WorkspaceIndexLimits::default()
+        };
+        let error = WorkspaceIndex::build(
+            directory.path(),
+            limits,
+            &visibility,
+            &TextFileInclusion::default(),
+        )
+        .expect_err("the second walk spends the same budget as the first");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::TooManyFiles
+        );
+        let evidence = error.fault().limit_evidence().expect("limit evidence");
+        assert_eq!((evidence.limit, evidence.required), (1, 2));
+    }
+
+    #[test]
+    fn test_source_force_include_invalid_glob_refuses() {
+        let directory = hidden_notes_fixture();
+        let visibility = SourceVisibility::default().with_force_include(vec!["[".to_owned()]);
+        let error = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &visibility,
+            &TextFileInclusion::default(),
+        )
+        .expect_err("an unclosed character class must be refused");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::SourcePatternInvalid
+        );
+    }
+
+    #[test]
+    fn test_workspace_source_policy_force_include_survives_gitignore() {
+        let directory = hidden_notes_fixture();
+        let visibility = SourceVisibility::new(vec!["src/**".to_owned()], Vec::new(), true)
+            .with_force_include(vec!["notes/**".to_owned()]);
+        let policy = WorkspaceSourcePolicy::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &visibility,
+            &TextFileInclusion::default(),
+        )
+        .expect("source policy");
+
+        assert!(
+            policy.visible(&directory.path().join("notes/plan.txt")),
+            "a filesystem event on a force-included path reaches the index"
+        );
+        assert!(
+            policy.may_include_descendant(&directory.path().join("notes")),
+            "the walk descends toward a force_include glob although include names another subtree"
+        );
+        assert!(policy.visible(&directory.path().join("src/lib.rs")));
+        assert!(!policy.visible(&directory.path().join("target/note.txt")));
     }
 
     #[cfg(unix)]
