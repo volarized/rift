@@ -86,8 +86,7 @@ fn corpus() -> Vec<(&'static str, Value)> {
 /// `scope` on `search` reaches the same helper `get_symbol`'s scoped requests reach: a
 /// dependency hit carries `unit` in place of `path`, `all` merges it with the project
 /// hits, and a `file` target answers empty from the package side since a package
-/// contributes declarations alone. Ordered ahead of every write corpus, so the project
-/// `beacon` declarations the `all` request merges still stand where the fixture put them.
+/// contributes declarations alone.
 fn dependency_scope_search_corpus() -> Vec<(&'static str, Value)> {
     vec![
         (
@@ -110,9 +109,9 @@ fn dependency_scope_search_corpus() -> Vec<(&'static str, Value)> {
 }
 
 /// `traversal` requests over the one real call edge the fixture already carries -
-/// `remove_caller.rs`'s `calls_watched` calling `remove_watched.rs`'s `beacon_watched` - so
-/// this corpus proves the new params without perturbing any other corpus entry's fixture
-/// source. Ordered ahead of `remove_corpus()`, which removes `beacon_watched`. `rev` combined
+/// `traversal_caller.rs`'s `calls_beacon_callee` calling `traversal_callee.rs`'s
+/// `beacon_callee` - so this corpus proves the new params without perturbing any other
+/// corpus entry's fixture source. `rev` combined
 /// with `traversal` is proven refused, not accepted, by
 /// `search_traversal_with_rev_refuses_capability_unavailable` below; a runtime refusal has no
 /// structured content to validate against this corpus's output schema.
@@ -122,7 +121,7 @@ fn traversal_search_corpus() -> Vec<(&'static str, Value)> {
             "search",
             json!({
                 "traversal": {
-                    "seed": "rift://symbol/rust/remove_caller.rs/calls_watched"
+                    "seed": "rift://symbol/rust/traversal_caller.rs/calls_beacon_callee"
                 }
             }),
         ),
@@ -130,7 +129,7 @@ fn traversal_search_corpus() -> Vec<(&'static str, Value)> {
             "search",
             json!({
                 "traversal": {
-                    "seed": "rift://symbol/rust/remove_watched.rs/beacon_watched",
+                    "seed": "rift://symbol/rust/traversal_callee.rs/beacon_callee",
                     "direction": "incoming",
                     "depth": 2
                 }
@@ -140,8 +139,8 @@ fn traversal_search_corpus() -> Vec<(&'static str, Value)> {
             "search",
             json!({
                 "traversal": {
-                    "seed": "rift://symbol/rust/remove_caller.rs/calls_watched",
-                    "to": "rift://symbol/rust/remove_watched.rs/beacon_watched"
+                    "seed": "rift://symbol/rust/traversal_caller.rs/calls_beacon_callee",
+                    "to": "rift://symbol/rust/traversal_callee.rs/beacon_callee"
                 }
             }),
         ),
@@ -151,7 +150,7 @@ fn traversal_search_corpus() -> Vec<(&'static str, Value)> {
             "search",
             json!({
                 "traversal": {
-                    "seed": "rift://symbol/rust/remove_caller.rs/calls_watched",
+                    "seed": "rift://symbol/rust/traversal_caller.rs/calls_beacon_callee",
                     "facets": ["implements"]
                 }
             }),
@@ -523,18 +522,14 @@ async fn served_fixture() -> TestResult<(
         directory.path().join("notes.txt"),
         "Beacon telemetry guidance covers rotating every legacy sensor unit safely.\n",
     )?;
-    // The declaration and caller also serve traversal requests.
+    // The one real call edge the traversal corpus walks.
     fs::write(
-        directory.path().join("remove_lonely.rs"),
-        "pub fn beacon_lonely() {}\n",
+        directory.path().join("traversal_callee.rs"),
+        "pub fn beacon_callee() {}\n",
     )?;
     fs::write(
-        directory.path().join("remove_watched.rs"),
-        "pub fn beacon_watched() {}\n",
-    )?;
-    fs::write(
-        directory.path().join("remove_caller.rs"),
-        "pub fn calls_watched() {\n    beacon_watched();\n}\n",
+        directory.path().join("traversal_caller.rs"),
+        "pub fn calls_beacon_callee() {\n    beacon_callee();\n}\n",
     )?;
     // No syntax provider claims it; `nodes` names the missing extension.
     fs::write(directory.path().join("justfile"), "default:\n    echo hi\n")?;
@@ -655,8 +650,7 @@ fn tool_validators(
 const ACCEPTANCE_ATTEMPTS_MAX: usize = 8;
 
 /// Calls one tool, retrying the refusal the server advertises as
-/// `retry: same_request`: the workspace's own filesystem watcher can
-/// observe a corpus change's write and move the index between one
+/// `retry: same_request`: the refusal reports movement between one
 /// request's snapshot and its acceptance, and the wire contract answers
 /// that race with a bounded retry rather than a failure.
 async fn call_tool_retrying_acceptance(
@@ -844,7 +838,7 @@ async fn search_traversal_with_rev_refuses_capability_unavailable() -> TestResul
         &json!({
             "rev": "main",
             "traversal": {
-                "seed": "rift://symbol/rust/remove_caller.rs/calls_watched"
+                "seed": "rift://symbol/rust/traversal_caller.rs/calls_beacon_callee"
             }
         }),
     )?;

@@ -113,6 +113,11 @@ const DECISION_TABLE: &[DecisionRow] = &[
         tools: &["search"],
         note: Some("with a `traversal` block"),
     },
+    DecisionRow {
+        situation: "What two committed revisions differ in, or what a change affects, is needed.",
+        tools: &["search"],
+        note: Some("with a `change` block"),
+    },
 ];
 
 /// Generates the skill from the served tool listing.
@@ -178,6 +183,7 @@ fn skill_markdown(form: SkillForm) -> String {
         "Rift indexes this workspace's source and serves it over MCP: structured search, \
          symbol reads by exact name, and syntax inspection.\n\n",
     );
+    rendered.push_str("Rift writes no source: apply a change with your own edit tools.\n\n");
     rendered.push_str(
         "Start an unfamiliar repository at `rift://map`; it names the served languages and \
          the workspace's own layout before any tool call.\n\n",
@@ -404,6 +410,32 @@ mod tests {
         assert!(plugin.contains("https://volar.sh/rift/install.ps1"));
         let installed = skill_markdown(SkillForm::Installed);
         assert!(!installed.contains("## Without the rift CLI"));
+    }
+
+    #[test]
+    fn opening_prose_sends_a_change_back_to_the_agents_own_tools() {
+        for form in [SkillForm::Installed, SkillForm::Plugin] {
+            let rendered = skill_markdown(form);
+            assert!(
+                rendered
+                    .contains("Rift writes no source: apply a change with your own edit tools."),
+                "{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn decision_table_routes_a_revision_comparison_to_search() {
+        for form in [SkillForm::Installed, SkillForm::Plugin] {
+            let rendered = skill_markdown(form);
+            assert!(
+                rendered.contains(
+                    "| What two committed revisions differ in, or what a change affects, is \
+                     needed. | `search` (with a `change` block) |"
+                ),
+                "{rendered}"
+            );
+        }
     }
 
     #[test]

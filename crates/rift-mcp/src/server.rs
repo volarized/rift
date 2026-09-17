@@ -156,7 +156,7 @@ impl BlockingExecutor {
 ///
 /// The CLI serves the process working directory, which it names `.`, and every
 /// filesystem operation below the root resolves against that same directory, so
-/// a relative root reads and writes correctly. A language engine does not: it is
+/// a relative root reads correctly. A language engine does not: it is
 /// addressed in `file://` URIs, which carry no working directory, so a relative
 /// root refuses every engine-backed operation. Resolution happens here, where the
 /// server takes ownership of the root, rather than at each entry point that could
