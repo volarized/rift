@@ -257,6 +257,9 @@ jobs:
   # against the same build the unit suites do, so they reuse that archive rather
   # than compiling an optimized one of their own - what they exercise is the
   # engine integration, and any pull request can break it.
+  #
+  # They report no coverage, so `rust` remains the one job uploading a coverage
+  # report for a pull request. See the note in `codecov.yml`.
   live:
     needs: rust-build
     if: ${{ !cancelled() }}
@@ -279,10 +282,10 @@ jobs:
           path: target
       - uses: taiki-e/install-action@v2.86.3
         with:
-          tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
+          tool: just,cargo-nextest@0.9.140
       - run: >-
           rustup toolchain install 1.98 --profile minimal
-          --component llvm-tools-preview,rust-analyzer
+          --component rust-analyzer
       - uses: oven-sh/setup-bun@v2.2.0
         with:
           bun-version: latest
@@ -297,21 +300,11 @@ jobs:
         id: live
         timeout-minutes: 15
         run: just live-test target/fast.tar.zst
-      - name: Upload live coverage
-        if: ${{ !cancelled() && steps.live.outcome != 'skipped' }}
-        uses: codecov/codecov-action@v5.5.5
-        with:
-          disable_search: true
-          fail_ci_if_error: true
-          files: target/live.lcov
-          flags: live
-          token: ${{ secrets.CODECOV_TOKEN }}
       - uses: actions/upload-artifact@v6.0.0
         if: ${{ !cancelled() && steps.live.outcome != 'skipped' }}
         with:
           name: live-results
           path: |
-            target/live.lcov
             target/nextest/live/junit.xml
           if-no-files-found: error
           retention-days: 7

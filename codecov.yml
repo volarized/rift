@@ -7,15 +7,20 @@ flag_management:
     - name: corpus
       carryforward: true
 
-# Two jobs upload coverage for one pull request: `rust` sends the unit report and
-# `live` sends the engine report. Each on its own describes a fraction of the run,
-# and the `live` job finishes minutes ahead of `rust`, so a status computed on its
-# arrival read the patch at 13% while the same commit's merged report read 99.5%.
-# Notifications wait for both. `dev/tests/test_delivery.py` refuses a count that
-# disagrees with the coverage uploads `ci` performs.
+# One job uploads coverage for a pull request, so a notification never describes a
+# fraction of the run. When the live suites uploaded a second report, Codecov
+# computed the patch from whichever job reported first and a pull request read 13%
+# against a merged 99.5%; `after_n_builds: 2` did not hold that notification, which
+# fired on a single upload. The live suites now report no coverage at all, which
+# they had almost none of to give: measured on one tree they reached three lines
+# the unit report did not, out of 78,757.
+#
+# `dev/tests/test_delivery.py` refuses a count that disagrees with the coverage
+# uploads `ci` performs, so a second coverage job has to settle this again rather
+# than silently reopen the window.
 codecov:
   notify:
-    after_n_builds: 2
+    after_n_builds: 1
 
 coverage:
   precision: 2
@@ -36,7 +41,7 @@ coverage:
 comment:
   layout: "reach, diff, flags, files"
   require_changes: false
-  after_n_builds: 2
+  after_n_builds: 1
 
 github_checks:
   annotations: true

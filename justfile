@@ -110,12 +110,22 @@ coverage-target:
 test archive="": coverage-target
     cargo llvm-cov nextest {{ if archive == "" { "--workspace --all-targets --all-features --locked" } else { "--archive-file " + quote(archive) + " --extract-overwrite --workspace-remap ." } }} --profile ci --no-tests fail --lcov --output-path lcov.info --fail-under-lines 86
 
-# Live integrations share the corpus archive and its optimized Cargo profile.
 # The live suites drive real language engines. They read the same build the unit
 # suites do, so they reuse the fast archive instead of an optimized build of
 # their own: what they exercise is the engine, not the speed of Rift's own code.
-live-test archive="": coverage-target
-    RIFT_ENGINE_LIVE=1 RIFT_SEARCH_LIVE=1 cargo llvm-cov nextest --profile live --no-tests fail {{ if archive == "" { "--workspace --all-targets --all-features --locked" } else { "--archive-file " + quote(archive) + " --extract-overwrite --workspace-remap ." } }} --lcov --output-path target/live.lcov
+#
+# They report no coverage. Measured against the unit report on one tree, the eight
+# live tests reach three lines it does not, out of 78,757, so the report they add
+# is a workspace-wide one whose lines are almost all zero. Uploading it made a
+# pull request's patch figure read from whichever job reported first.
+# Nextest extracts an archive into a directory it opens rather than creates, and a
+# missing one refuses the run with exit code 96.
+[private]
+live-archive-target:
+    mkdir -p target/live-archive
+
+live-test archive="": live-archive-target
+    RIFT_ENGINE_LIVE=1 RIFT_SEARCH_LIVE=1 cargo nextest run --profile live --no-tests fail {{ if archive == "" { "--workspace --all-targets --all-features --locked" } else { "--archive-file " + quote(archive) + " --extract-to target/live-archive --extract-overwrite --workspace-remap ." } }}
 
 release-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_release.py
