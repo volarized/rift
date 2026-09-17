@@ -37,9 +37,9 @@ pub const LOG_QUEUE_RECORDS: usize = 4_096;
 /// Wall-clock span the drain task waits for more records before writing what it
 /// holds.
 pub const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
-/// Longest a `rift://logs` read waits for the drain to finish with the records the sink has
-/// already taken. A read past this answers with what the store holds: a log read never fails,
-/// and never hangs, because the log lane is slow.
+/// Longest a `rift://logs` read waits for the drain to write through the sequence the sink had
+/// stamped when the read began. A read past this answers with what the store holds: a log read
+/// never fails, and never hangs, because the log lane is slow.
 pub const LOG_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Attempts one batch gets before the drain gives it up. A batch that fails
 /// every attempt is dropped and counted, never retried forever: the queue
@@ -322,10 +322,13 @@ impl LogDrain {
             .map(|queued| queued.sequence)
             .max()
             .unwrap_or(0);
+        // The drop notice carries no sequence, because the sink never stamped it. Counting it
+        // among the records finished with would let `finished` pass `accepted`, and a read
+        // waiting on a record still queued would be released by that overshoot.
+        let stamped = batch.iter().filter(|queued| queued.sequence != 0).count() as u64;
         let records: Vec<LogRecord> = batch.iter().map(|queued| queued.record.clone()).collect();
         self.write_batch(store, &records, retention_records).await;
-        self.settlement
-            .finish_written(batch.len() as u64, written_through);
+        self.settlement.finish_written(stamped, written_through);
         batch.clear();
     }
 
@@ -855,6 +858,48 @@ mod tests {
             queued(&mut drain).len(),
             1,
             "another task's record is unaffected by the drain's write"
+        );
+    }
+
+    /// The lane finishes with exactly the records it took. The drain mints a drop notice of
+    /// its own, and counting that among the records finished with pushes the total past what
+    /// the sink stamped, which would release a read waiting on a record still queued.
+    #[tokio::test]
+    async fn the_lane_finishes_with_exactly_the_records_it_took() {
+        let (_directory, store) = store().await;
+        let (sink, mut drain) = log_capture();
+        for index in 0..=LOG_QUEUE_RECORDS {
+            sink.send(record(&format!("record {index}")));
+        }
+        assert_eq!(
+            sink.dropped(),
+            1,
+            "the queue holds one record less than sent"
+        );
+
+        // A short first turn, so the batch stays under the size at which the drain defers its
+        // drop notice, and that turn writes the notice.
+        let mut batch = Vec::new();
+        for _ in 0..8 {
+            batch.push(drain.receiver.try_recv().expect("the queue holds records"));
+        }
+        drain.write_turn(&store, &mut batch, 10_000).await;
+        assert_eq!(
+            store.count().await.expect("the count reads"),
+            9,
+            "the first turn writes its records and one drop notice"
+        );
+
+        while let Ok(queued) = drain.receiver.try_recv() {
+            batch.push(queued);
+        }
+        drain.write_turn(&store, &mut batch, 10_000).await;
+
+        let finished = sink.settlement.progress.borrow().finished;
+        let accepted = sink.settlement.accepted.load(Ordering::SeqCst);
+        assert_eq!(
+            finished, accepted,
+            "the lane took {accepted} records and finished with {finished}"
         );
     }
 
