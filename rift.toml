@@ -8,6 +8,10 @@ include = []
 # restates something the same answer already carries; the generated plugin skill under
 # `plugins/claude` restates the served tool descriptions the same way.
 exclude = [".claude/**", ".agents/**", "docs/public/**", "plugins/claude/skills/**"]
+# `.gitignore` keeps `.plans/` out of version control on purpose: campaign documents live
+# outside the tree until they become code. They are still what a reader of this repository
+# asks about, so the index reaches them here.
+force_include = [".plans/**"]
 respect_gitignore = true
 
 # The name binding provider and the semantic ranking both run by default; the explicit
