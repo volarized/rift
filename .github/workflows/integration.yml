@@ -27,7 +27,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.2
         with:
           shared-key: integration
-      - uses: taiki-e/install-action@v2.86.3
+      - uses: taiki-e/install-action@v2.87.12
         with:
           tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
       - name: Build and archive integrations
@@ -92,7 +92,7 @@ jobs:
         with:
           name: integration-archive
           path: target
-      - uses: taiki-e/install-action@v2.86.3
+      - uses: taiki-e/install-action@v2.87.12
         with:
           tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
       - run: rustup component add llvm-tools-preview
@@ -161,7 +161,7 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
-      - uses: taiki-e/install-action@v2.86.3
+      - uses: taiki-e/install-action@v2.87.12
         with:
           tool: just
       # The conformance runner is a Bun package; the checks around it drive the
@@ -231,7 +231,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.2
         with:
           shared-key: native-${{ matrix.target }}
-      - uses: taiki-e/install-action@v2.86.3
+      - uses: taiki-e/install-action@v2.87.12
         with:
           tool: cargo-nextest@0.9.140
       - name: Install target
