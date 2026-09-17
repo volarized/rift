@@ -6,6 +6,7 @@ mod failure;
 mod http;
 mod identity;
 pub mod logs;
+mod parameters;
 mod proxy;
 mod resource;
 pub mod schema;

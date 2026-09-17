@@ -759,6 +759,37 @@
               },
               {
                 "additionalProperties": false,
+                "description": "A language engine serves the seed's language, and this read dropped what it\nanswered: the answer addressed bytes the served revision does not carry. The\nindexed relationships stand; whatever the engine resolves on top of them is\nmissing. The warning states that an engine's analysis is absent from this answer;\nit never states that the seed has no such neighbor. A later read served from a\nrevision the engine has caught up with carries the engine's edges again.",
+                "properties": {
+                  "code": {
+                    "const": "engine_analysis_unavailable",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "language": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/$defs/Language"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "The seed declaration's language, whose engine's answer was dropped."
+                  }
+                },
+                "required": [
+                  "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "The comparison reached `paths_max` changed paths and stopped there, so declarations\nin the changed paths past it are missing from this answer. Narrow the comparison\nwith `paths`, or name two revisions that differ in fewer files.",
                 "properties": {
                   "code": {
@@ -2565,6 +2596,37 @@
               },
               {
                 "additionalProperties": false,
+                "description": "A language engine serves the seed's language, and this read dropped what it\nanswered: the answer addressed bytes the served revision does not carry. The\nindexed relationships stand; whatever the engine resolves on top of them is\nmissing. The warning states that an engine's analysis is absent from this answer;\nit never states that the seed has no such neighbor. A later read served from a\nrevision the engine has caught up with carries the engine's edges again.",
+                "properties": {
+                  "code": {
+                    "const": "engine_analysis_unavailable",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "language": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/$defs/Language"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "The seed declaration's language, whose engine's answer was dropped."
+                  }
+                },
+                "required": [
+                  "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "The comparison reached `paths_max` changed paths and stopped there, so declarations\nin the changed paths past it are missing from this answer. Narrow the comparison\nwith `paths`, or name two revisions that differ in fewer files.",
                 "properties": {
                   "code": {
@@ -3056,6 +3118,16 @@
           "PathSelector": {
             "additionalProperties": false,
             "description": "Which files a query runs over, as three lists of globs matched against the project-relative\npath. The same glob engine backs the workspace's `[source]` policy. `include: [\"src/**\"]`\nselects the source tree; `exclude: [\"src/generated/**\"]` then removes generated output.",
+            "examples": [
+              {
+                "exclude": [
+                  "src/generated/**"
+                ],
+                "include": [
+                  "src/**"
+                ]
+              }
+            ],
             "properties": {
               "exclude": {
                 "default": [],
@@ -3265,6 +3337,12 @@
           "SearchChange": {
             "additionalProperties": false,
             "description": "Two committed revisions to compare. The answer is the declarations the two revisions\nhold differently: `base` is the revision compared from, `head` the revision compared\nto. Both sides name a commit; uncommitted working-tree bytes take part in no\ncomparison.",
+            "examples": [
+              {
+                "base": "main",
+                "head": "HEAD"
+              }
+            ],
             "properties": {
               "base": {
                 "$ref": "#/$defs/RevisionId",
@@ -3339,6 +3417,13 @@
           "SearchTraversal": {
             "additionalProperties": false,
             "description": "A bounded relationship walk starting at one symbol, or at every declaration a `change`\nfound changed. From each starting declaration, the server visits its neighbors, then\ntheir neighbors, up to `depth` hops, following `direction` and narrowed to `facets`;\neach reached symbol keeps the shortest path the walk found to it.",
+            "examples": [
+              {
+                "depth": 1,
+                "direction": "incoming",
+                "seed": "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
+              }
+            ],
             "properties": {
               "depth": {
                 "default": 1,
@@ -4222,6 +4307,37 @@
                       }
                     ],
                     "description": "The seed declaration's language, when the gap is the language rather than the\nfacet. Absent when the language has a provider."
+                  }
+                },
+                "required": [
+                  "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A language engine serves the seed's language, and this read dropped what it\nanswered: the answer addressed bytes the served revision does not carry. The\nindexed relationships stand; whatever the engine resolves on top of them is\nmissing. The warning states that an engine's analysis is absent from this answer;\nit never states that the seed has no such neighbor. A later read served from a\nrevision the engine has caught up with carries the engine's edges again.",
+                "properties": {
+                  "code": {
+                    "const": "engine_analysis_unavailable",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "language": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/$defs/Language"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "The seed declaration's language, whose engine's answer was dropped."
                   }
                 },
                 "required": [

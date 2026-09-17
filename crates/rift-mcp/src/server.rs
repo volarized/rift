@@ -33,7 +33,7 @@ use rift_server::{
     DependencyStore, EnginePool, EngineReferences, LspProcessKey, ReadError, ReadFault,
     ReadService, resolve_engine_references, uses_engine_references, wire_digest,
 };
-use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
+use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{
     Implementation, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
     ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ServerCapabilities,
@@ -47,6 +47,7 @@ use tracing::Instrument as _;
 
 use crate::dependency::{DependencyLane, DependencyRequest};
 use crate::failure::WireFailure;
+use crate::parameters::Parameters;
 use crate::resource;
 use crate::storage::WorkspaceStorage;
 use crate::validation::{
@@ -3493,6 +3494,109 @@ mod tests {
         let wire = data.data.ok_or("wire error data must be present")?;
         assert_eq!(wire["code"], json!("invalid_request"));
         Ok(())
+    }
+
+    /// A member sent in the wrong shape is refused by the member's own name,
+    /// with an example of the value it takes.
+    ///
+    /// The refusal never names a Rust type: `PathSelector` is a name only this
+    /// repository holds, and a caller reading it has nothing to look up. The
+    /// example comes from the same schema the caller lists, so it can be sent
+    /// back verbatim.
+    #[tokio::test]
+    async fn a_member_in_the_wrong_shape_is_refused_by_name_with_an_example() -> TestResult {
+        let data = failing_call(
+            &json!({"query": "beacon", "paths": ["crates/rift-server/src/read.rs"]}),
+            "search",
+        )
+        .await?;
+        assert_eq!(data.code, ErrorCode(-32000));
+        assert_eq!(
+            data.message.as_ref(),
+            "the request does not match the documented form: tool search, field paths, \
+             accepted exclude, force_include, include, \
+             example {\"exclude\":[\"src/generated/**\"],\"include\":[\"src/**\"]}; \
+             correct the reported field and resend the request"
+        );
+        let wire = data.data.ok_or("wire error data must be present")?;
+        assert_eq!(wire["code"], json!("invalid_request"));
+        assert_eq!(wire["retry"], json!("never"));
+        Ok(())
+    }
+
+    /// A member the tool does not serve is refused by naming the members it
+    /// does, and an example of the whole request.
+    #[tokio::test]
+    async fn an_unserved_member_is_refused_by_naming_the_served_ones() -> TestResult {
+        let data =
+            failing_call(&json!({"query": "beacon", "path": "src/lib.rs"}), "search").await?;
+        let message = data.message.as_ref();
+        assert!(
+            message.starts_with(
+                "the request does not match the documented form: tool search, accepted "
+            ),
+            "{message}"
+        );
+        assert!(message.contains("paths"), "{message}");
+        assert!(message.contains("example {"), "{message}");
+        assert!(
+            !message.contains("unknown field") && !message.contains("struct"),
+            "a refusal never speaks serde's grammar: {message}"
+        );
+        Ok(())
+    }
+
+    /// A closed set's member is refused by listing the values it takes.
+    #[tokio::test]
+    async fn a_value_outside_a_closed_set_is_refused_by_listing_the_set() -> TestResult {
+        let data = failing_call(&json!({"query": "beacon", "target": "nodes"}), "search").await?;
+        let message = data.message.as_ref();
+        assert!(
+            message.contains("field target, accepted all, file, symbol"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("unknown variant"),
+            "a refusal never speaks serde's grammar: {message}"
+        );
+        Ok(())
+    }
+
+    /// Every served tool's input schema carries an authored example, at its
+    /// root and on every object a caller can address inside it.
+    ///
+    /// A refusal shows the caller an example of the value it should have sent,
+    /// read from this schema. An object with no example leaves the caller with
+    /// the example of whatever holds it, which is the defect this gate exists
+    /// to keep out.
+    #[test]
+    fn every_served_input_schema_carries_an_example_for_every_object() {
+        for tool in crate::schema::tool_listing() {
+            let schema = serde_json::Value::Object(tool.input_schema.as_ref().clone());
+            assert!(
+                schema.get("examples").is_some_and(|examples| examples
+                    .as_array()
+                    .is_some_and(|examples| !examples.is_empty())),
+                "tool {} states no example request",
+                tool.name
+            );
+            let Some(definitions) = schema.get("$defs").and_then(serde_json::Value::as_object)
+            else {
+                continue;
+            };
+            for (name, definition) in definitions {
+                if definition.get("properties").is_none() {
+                    continue;
+                }
+                assert!(
+                    definition.get("examples").is_some_and(|examples| examples
+                        .as_array()
+                        .is_some_and(|examples| !examples.is_empty())),
+                    "tool {}: {name} states no example value",
+                    tool.name
+                );
+            }
+        }
     }
 
     #[tokio::test]

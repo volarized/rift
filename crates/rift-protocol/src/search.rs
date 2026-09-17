@@ -141,6 +141,12 @@ pub const FORCE_INCLUDE_FIELD: &str = "paths.force_include";
 /// selects the source tree; `exclude: ["src/generated/**"]` then removes generated output.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("examples" = [
+    {
+        "include": ["src/**"],
+        "exclude": ["src/generated/**"]
+    }
+]))]
 pub struct PathSelector {
     /// Globs a path has to match to be searched at all. Empty includes every visible file.
     #[serde(default)]
@@ -278,6 +284,12 @@ pub const SEARCH_CHANGE_PATHS_MAX: u64 = 512;
 /// comparison.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("examples" = [
+    {
+        "base": "main",
+        "head": "HEAD"
+    }
+]))]
 pub struct SearchChange {
     /// The revision compared from - a branch, tag, or commit id as the workspace's version
     /// control spells it.
@@ -632,6 +644,13 @@ pub const SEARCH_TRAVERSAL_FACETS_MAX: usize = RelationshipFacet::VARIANTS.len()
 /// each reached symbol keeps the shortest path the walk found to it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("examples" = [
+    {
+        "seed": "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService",
+        "direction": "incoming",
+        "depth": 1
+    }
+]))]
 pub struct SearchTraversal {
     /// The declaration the walk starts at, required when `traversal` stands without
     /// `change`. The seed itself is never a hit. A `traversal` beside `change` starts at
