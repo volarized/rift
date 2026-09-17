@@ -219,6 +219,30 @@ impl PathHistory {
     }
 }
 
+/// The committed files two revisions hold differently, and whether the
+/// comparison listed all of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedFiles {
+    paths: Vec<String>,
+    truncated: bool,
+}
+
+impl ChangedFiles {
+    /// The workspace-relative paths the two revisions hold differently,
+    /// sorted and deduplicated.
+    #[must_use]
+    pub fn paths(&self) -> &[String] {
+        &self.paths
+    }
+
+    /// Whether the comparison stopped at its path bound. `true` means the
+    /// two revisions differ in paths this listing does not carry.
+    #[must_use]
+    pub const fn is_truncated(&self) -> bool {
+        self.truncated
+    }
+}
+
 /// The git repository that versions one workspace root.
 ///
 /// The workspace may sit below the repository's working-tree root; listings
@@ -375,6 +399,70 @@ impl Repository {
             .find_object(file.blob)
             .map_err(|error| storage("read blob", &error))?;
         Ok(object.detach().data)
+    }
+
+    /// Lists the committed regular files `base` and `head` hold
+    /// differently, workspace-relative, passing `includes`, sorted and
+    /// deduplicated.
+    ///
+    /// The comparison is by blob object id alone, the same policy
+    /// `path_revisions` applies. gix's tree comparison "does not do rename
+    /// tracking" (`gix-diff-0.66.0/src/tree/function.rs:23`), so a file that
+    /// moved is one deletion beside one addition; pairing the two back up is
+    /// the caller's decision, taken over the declarations inside them.
+    /// Symbolic links and submodules are never listed, and a committed path
+    /// whose bytes are not UTF-8 names no readable file, so the comparison
+    /// passes over it.
+    ///
+    /// The walk stops once `paths_max` paths pass `includes` and reports
+    /// itself truncated, so one comparison's work stays proportional to that
+    /// bound plus the tree breadth already queued when it was reached.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HistoryError`] for an unreadable object store or a tree
+    /// that cannot be decoded.
+    pub fn changed_files(
+        &self,
+        base: &ResolvedRevision,
+        head: &ResolvedRevision,
+        includes: &dyn Fn(&str) -> bool,
+        paths_max: usize,
+    ) -> Result<ChangedFiles, HistoryError> {
+        let base_tree = self.commit_tree(base)?;
+        let head_tree = self.commit_tree(head)?;
+        let mut recorder = ChangedPathRecorder::new(self.prefix.as_bytes(), includes, paths_max);
+        let outcome = gix::diff::tree(
+            tree_entries(&base_tree),
+            tree_entries(&head_tree),
+            &mut gix::diff::tree::State::default(),
+            &self.inner,
+            &mut recorder,
+        );
+        // The delegate stops the walk by breaking, which gix reports as a
+        // cancelled comparison; the recorder's own flag says whether the
+        // break was this bound rather than a real failure.
+        match outcome {
+            Ok(()) => {}
+            Err(gix::diff::tree::Error::Cancelled) if recorder.truncated => {}
+            Err(error) => return Err(storage("compare commit trees", &error)),
+        }
+        let mut paths = recorder.paths;
+        paths.sort_unstable();
+        paths.dedup();
+        Ok(ChangedFiles {
+            paths,
+            truncated: recorder.truncated,
+        })
+    }
+
+    /// The tree one resolved revision's commit points at.
+    fn commit_tree(&self, revision: &ResolvedRevision) -> Result<gix::Tree<'_>, HistoryError> {
+        self.inner
+            .find_commit(revision.commit)
+            .map_err(|error| storage("read commit", &error))?
+            .tree()
+            .map_err(|error| storage("read commit tree", &error))
     }
 
     /// Lists the first-parent commits from `revision` whose tree changed
@@ -547,6 +635,85 @@ fn utf8_path(relative: &[u8], filepath: &[u8]) -> Result<String, HistoryError> {
         })
 }
 
+/// One tree's entries, as the comparison reads them.
+fn tree_entries<'tree>(tree: &'tree gix::Tree<'_>) -> gix::objs::TreeRefIter<'tree> {
+    gix::objs::TreeRefIter::from_bytes(&tree.data, tree.id.kind())
+}
+
+/// A [`gix::diff::tree::Recorder`] behind a path budget: it tracks the
+/// compared path the way gix's own recorder does, and keeps the blob paths
+/// inside the workspace that pass `includes`, up to `paths_max`. The budget
+/// counts accepted paths alone, so a revision pair differing only in files
+/// the workspace policy excludes never reports itself truncated.
+struct ChangedPathRecorder<'a> {
+    inner: gix::diff::tree::Recorder,
+    prefix: &'a [u8],
+    includes: &'a dyn Fn(&str) -> bool,
+    paths_max: usize,
+    paths: Vec<String>,
+    truncated: bool,
+}
+
+impl<'a> ChangedPathRecorder<'a> {
+    fn new(prefix: &'a [u8], includes: &'a dyn Fn(&str) -> bool, paths_max: usize) -> Self {
+        Self {
+            inner: gix::diff::tree::Recorder::default(),
+            prefix,
+            includes,
+            paths_max,
+            paths: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    /// The workspace-relative path this change names, or `None` for a path
+    /// outside the workspace, one whose bytes are not UTF-8, or one the
+    /// caller's predicate drops.
+    fn accepted(&self, filepath: &[u8]) -> Option<String> {
+        let relative = strip_workspace_prefix(filepath, self.prefix)?;
+        let relative = std::str::from_utf8(relative).ok()?;
+        (self.includes)(relative).then(|| relative.to_owned())
+    }
+}
+
+impl gix::diff::tree::Visit for ChangedPathRecorder<'_> {
+    fn pop_front_tracked_path_and_set_current(&mut self) {
+        self.inner.pop_front_tracked_path_and_set_current();
+    }
+
+    fn push_back_tracked_path_component(&mut self, component: &gix::bstr::BStr) {
+        self.inner.push_back_tracked_path_component(component);
+    }
+
+    fn push_path_component(&mut self, component: &gix::bstr::BStr) {
+        self.inner.push_path_component(component);
+    }
+
+    fn pop_path_component(&mut self) {
+        self.inner.pop_path_component();
+    }
+
+    fn visit(&mut self, change: gix::diff::tree::visit::Change) -> ChangeVisitAction {
+        if !change.entry_mode().is_blob() {
+            // A tree added or deleted whole is announced before its blobs,
+            // which the walk goes on to announce one by one.
+            return std::ops::ControlFlow::Continue(());
+        }
+        let Some(path) = self.accepted(self.inner.path()) else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        if self.paths.len() >= self.paths_max {
+            self.truncated = true;
+            return std::ops::ControlFlow::Break(());
+        }
+        self.paths.push(path);
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+/// The comparison's per-change instruction, spelled once.
+type ChangeVisitAction = std::ops::ControlFlow<()>;
+
 /// A [`gix::traverse::tree::Recorder`] behind an entry budget: every visited
 /// entry spends one unit, and a spent budget stops descent and recording, so
 /// the walk's work stays proportional to `entries_max` plus the breadth
@@ -650,6 +817,168 @@ mod tests {
 
     fn include_all(_: &str) -> bool {
         true
+    }
+
+    /// The paths two revisions differ in: the added file, the modified one,
+    /// and the removed one, with the untouched file left out.
+    #[test]
+    fn test_changed_files_lists_additions_modifications_and_deletions() {
+        let directory = repository_fixture();
+        let root = directory.path();
+        fs::write(root.join("steady.rs"), "pub fn steady() {}\n").expect("source");
+        fs::write(root.join("gone.rs"), "pub fn gone() {}\n").expect("source");
+        commit_all(root, "baseline");
+        git(root, &["tag", "baseline"]);
+        fs::write(root.join("lib.rs"), "pub fn beacon(flag: bool) {}\n").expect("source");
+        fs::create_dir_all(root.join("nested")).expect("directory");
+        fs::write(root.join("nested/added.rs"), "pub fn added() {}\n").expect("source");
+        fs::remove_file(root.join("gone.rs")).expect("removal");
+        commit_all(root, "change the tree");
+
+        let repository = Repository::open(root).expect("repository");
+        let base = repository.resolve("baseline").expect("base resolves");
+        let head = repository.resolve("HEAD").expect("head resolves");
+        let changed = repository
+            .changed_files(&base, &head, &include_all, 64)
+            .expect("comparison");
+
+        assert_eq!(changed.paths(), ["gone.rs", "lib.rs", "nested/added.rs"]);
+        assert!(!changed.is_truncated());
+    }
+
+    /// Two revisions holding one tree answer no changed path at all.
+    #[test]
+    fn test_changed_files_lists_nothing_for_two_equal_trees() {
+        let directory = repository_fixture();
+        let repository = Repository::open(directory.path()).expect("repository");
+        let head = repository.resolve("HEAD").expect("head resolves");
+        let changed = repository
+            .changed_files(&head, &head, &include_all, 64)
+            .expect("comparison");
+        assert!(changed.paths().is_empty());
+        assert!(!changed.is_truncated());
+    }
+
+    /// The path bound counts the paths that pass `includes`, and a
+    /// comparison that reaches it answers what fit and says so.
+    #[test]
+    fn test_changed_files_stops_at_the_path_bound_and_reports_truncation() {
+        let directory = repository_fixture();
+        let root = directory.path();
+        git(root, &["tag", "baseline"]);
+        for index in 0..4 {
+            fs::write(root.join(format!("added{index}.rs")), "pub fn added() {}\n")
+                .expect("source");
+        }
+        commit_all(root, "add four files");
+
+        let repository = Repository::open(root).expect("repository");
+        let base = repository.resolve("baseline").expect("base resolves");
+        let head = repository.resolve("HEAD").expect("head resolves");
+        let changed = repository
+            .changed_files(&base, &head, &include_all, 2)
+            .expect("comparison");
+
+        assert_eq!(changed.paths().len(), 2);
+        assert!(changed.is_truncated());
+    }
+
+    /// The predicate drops paths before the budget is spent, so a pair
+    /// differing only in excluded files answers empty and untruncated.
+    #[test]
+    fn test_changed_files_applies_includes_before_the_path_bound() {
+        let directory = repository_fixture();
+        let root = directory.path();
+        git(root, &["tag", "baseline"]);
+        fs::create_dir_all(root.join("vendor")).expect("directory");
+        for index in 0..4 {
+            fs::write(
+                root.join(format!("vendor/dep{index}.rs")),
+                "pub fn vendored() {}\n",
+            )
+            .expect("source");
+        }
+        commit_all(root, "add vendored files");
+
+        let repository = Repository::open(root).expect("repository");
+        let base = repository.resolve("baseline").expect("base resolves");
+        let head = repository.resolve("HEAD").expect("head resolves");
+        let outside_vendor = |path: &str| !path.starts_with("vendor/");
+        let changed = repository
+            .changed_files(&base, &head, &outside_vendor, 2)
+            .expect("comparison");
+
+        assert!(changed.paths().is_empty());
+        assert!(!changed.is_truncated());
+    }
+
+    /// A workspace below the repository root lists changed paths relative to
+    /// itself, and never a changed path outside it.
+    #[test]
+    fn test_changed_files_relativizes_to_the_workspace_below_the_repository_root() {
+        let directory = repository_fixture();
+        let root = directory.path();
+        fs::create_dir_all(root.join("inner")).expect("directory");
+        fs::write(root.join("inner/lib.rs"), "pub fn inner() {}\n").expect("source");
+        commit_all(root, "baseline");
+        git(root, &["tag", "baseline"]);
+        fs::write(root.join("inner/lib.rs"), "pub fn inner(flag: bool) {}\n").expect("source");
+        fs::write(root.join("lib.rs"), "pub fn beacon(flag: bool) {}\n").expect("source");
+        commit_all(root, "change both");
+
+        let repository = Repository::open(&root.join("inner")).expect("repository");
+        let base = repository.resolve("baseline").expect("base resolves");
+        let head = repository.resolve("HEAD").expect("head resolves");
+        let changed = repository
+            .changed_files(&base, &head, &include_all, 64)
+            .expect("comparison");
+
+        assert_eq!(changed.paths(), ["lib.rs"]);
+    }
+
+    /// A symbolic link is never a comparison's changed path, the same policy
+    /// the tree listing applies.
+    #[cfg(unix)]
+    #[test]
+    fn test_changed_files_never_lists_a_symbolic_link() {
+        let directory = repository_fixture();
+        let root = directory.path();
+        git(root, &["tag", "baseline"]);
+        std::os::unix::fs::symlink("lib.rs", root.join("link.rs")).expect("symlink");
+        commit_all(root, "add a link");
+
+        let repository = Repository::open(root).expect("repository");
+        let base = repository.resolve("baseline").expect("base resolves");
+        let head = repository.resolve("HEAD").expect("head resolves");
+        let changed = repository
+            .changed_files(&base, &head, &include_all, 64)
+            .expect("comparison");
+
+        assert!(changed.paths().is_empty());
+    }
+
+    /// A commit whose tree names a subtree the object store does not hold fails
+    /// the comparison rather than answering a partial listing.
+    #[test]
+    fn test_changed_files_refuses_a_tree_the_object_store_cannot_read() {
+        let directory = repository_fixture();
+        let root = directory.path();
+        crate::fixture::commit_missing_subtree(root, "refs/heads/broken");
+
+        let repository = Repository::open(root).expect("repository");
+        let base = repository.resolve("main").expect("base resolves");
+        let broken = repository.resolve("broken").expect("broken resolves");
+        let error = repository
+            .changed_files(&base, &broken, &include_all, 64)
+            .expect_err("an unreadable tree must refuse");
+
+        assert!(matches!(
+            error.fault(),
+            HistoryFault::Storage {
+                operation: "compare commit trees",
+                ..
+            }
+        ));
     }
 
     #[test]

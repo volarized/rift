@@ -1,5 +1,6 @@
 //! Long-lived workspace application service.
 
+mod change;
 mod configuration;
 mod dependency;
 mod embedded;
@@ -12,6 +13,7 @@ mod read;
 mod search;
 mod traversal;
 
+pub use change::search_change;
 pub use configuration::{
     CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, ConfigurationFault, load_configuration,
 };

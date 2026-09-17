@@ -600,6 +600,24 @@ pub fn error_limit_rides_limit_exceeded(schema: &mut Schema) {
     );
 }
 
+/// A [`SearchParams`](crate::search::SearchParams) selects its result set with `query`,
+/// `traversal`, or `change`. The server refuses a request naming none of the three, so the
+/// schema states the same rule for a validating caller.
+pub fn require_search_selector(schema: &mut Schema) {
+    use crate::search::SearchParams;
+    append(
+        schema,
+        described(
+            "a search selects its result set with query, traversal, or change",
+            any_of(vec![
+                requires(&[property!(SearchParams, query)]),
+                requires(&[property!(SearchParams, traversal)]),
+                requires(&[property!(SearchParams, change)]),
+            ]),
+        ),
+    );
+}
+
 /// A [`SearchHit`] carries `range` and `line` together or not at all, and node
 /// and file hits always carry both.
 pub fn pair_range_with_line(schema: &mut Schema) {

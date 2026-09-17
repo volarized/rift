@@ -433,6 +433,120 @@ one `[server] readiness_timeout` deadline. Exhausted attempts or an expired dead
 A stale publication uses indexed relationships and carries `stale_index`. Each engine request
 also uses the configured engine retry and restart bounds.
 
+### Change [#search-change]
+
+<VersionBadge
+  version="v0.0.36"
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
+/>
+
+`change` answers the declarations two committed revisions hold differently. `base` names the
+revision compared from and `head` the revision compared to, each a branch, tag, or commit id
+spelled the way git spells it; an omitted `head` is `HEAD`. Both sides name a commit, so
+uncommitted working-tree bytes take part in no comparison.
+
+The server lists the paths the two revisions hold differently, reads and parses those paths
+alone on each side, and matches declarations within one path by the provider's qualified name
+and kind. A declaration both revisions hold whose bytes are equal produces no hit; one whose
+bytes differ is classified the way a [symbol timeline](#revision-reads) classifies two adjacent
+revisions, into `signature_changed`, `body_changed`, or `decorators_changed`. A declaration only
+`head` holds is `introduced`, and one only `base` holds is `removed`.
+
+A deletion and an addition in two different paths whose declarations match one to one - same
+qualified name, same kind, same bytes - are one declaration that `moved`. Anything ambiguous
+stays an addition beside a removal: two same-named declarations removed against one added leave
+three hits, because no evidence says which removal the addition answers.
+
+Each hit is tagged `matched_by: ["change"]` and carries a
+[`SymbolChange`](/docs/developer/protocol/reference#SymbolChange) as `change`, naming the `kind`
+above and the `base_path` and `head_path` the declaration lives at on each side. The hit's
+`symbol`, `path`, `range`, `line`, and `source` read the head revision:
+
+**Request:**
+
+```json
+{ "change": { "base": "main", "head": "HEAD" }, "include": ["source"] }
+```
+
+**Search hit:**
+
+```json
+{
+  "hit": {
+    "target": "symbol",
+    "symbol": {
+      "id": "rift://symbol/rust/src/config.rs/load_config",
+      "language": "rust",
+      "name": "load_config",
+      "kind": "function",
+      "facets": ["value", "callable", "public"],
+      "visibility": "pub"
+    }
+  },
+  "matched_by": ["change"],
+  "change": {
+    "kind": "signature_changed",
+    "base_path": "src/config.rs",
+    "head_path": "src/config.rs"
+  },
+  "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path, strict: bool) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
+  "range": { "start": 0, "end": 207 },
+  "line": 1,
+  "path": "src/config.rs"
+}
+```
+
+A removed declaration is the exception: the head revision no longer holds it, so its hit keeps
+its base-side identity, path, range, and source, and its `change` carries `base_path` alone:
+
+**Search hit:**
+
+```json
+{
+  "hit": {
+    "target": "symbol",
+    "symbol": {
+      "id": "rift://symbol/rust/src/legacy.rs/load_legacy_config",
+      "language": "rust",
+      "name": "load_legacy_config",
+      "kind": "function",
+      "facets": ["value", "callable", "public"],
+      "visibility": "pub"
+    }
+  },
+  "matched_by": ["change"],
+  "change": { "kind": "removed", "base_path": "src/legacy.rs" },
+  "source": "pub fn load_legacy_config() {}",
+  "range": { "start": 0, "end": 30 },
+  "line": 1,
+  "path": "src/legacy.rs"
+}
+```
+
+A comparison ranks nothing, so no hit carries a `score` even when `include` names one. Ordering
+is deterministic for identical inputs: `relevance` has no score to rank by here and orders
+changed declarations by path, then by name, while `path` and `identity` order as they do in
+every other search answer. `paths` narrows which changed paths are compared, through the same
+glob engine every other selector uses. `target: "file"` never carries a change hit, since the
+comparison reaches declarations alone.
+
+A comparison the server stops at its changed-path bound attaches a `change_truncated` entry to
+`warnings` naming that bound: declarations in the changed paths past it are absent from the
+answer, and `paths` narrows a further comparison onto them. The result set keeps its own bound
+and its `results_truncated` warning. A changed file either revision cannot read - bytes past the
+per-file byte bound, bytes that are not UTF-8, or a syntax tree the provider refuses -
+contributes no declaration, and the changed paths beside it still answer.
+
+`change` stands alone. The server refuses it beside `rev` with `invalid_request`, since `change`
+names its own revisions; beside `query` with `invalid_request`, since the two select different
+result sets; and beside `traversal` with `capability_unavailable`, since a walk seeded from a
+change is not served. A `scope` past `project` refuses with `invalid_request`, because the
+dependency index serves the current tree alone.
+[`[providers.history]`](/docs/developer/configuration#providers) owns the capability the way it owns
+[revision-addressed reads](#revision-reads): `enabled = false` refuses a comparison, a workspace
+with no git repository refuses `capability_unavailable`, and a revision neither side resolves
+refuses `resource_not_found`.
+
 ### Dependency scope [#search-scope]
 
 <VersionBadge version="v0.0.32" languages={["Rust", "Python", "TypeScript"]} />

@@ -77,6 +77,7 @@ fn corpus() -> Vec<(&'static str, Value)> {
     ];
     requests.extend(dependency_scope_search_corpus());
     requests.extend(revision_read_corpus());
+    requests.extend(change_search_corpus());
     requests.extend(lexical_search_corpus());
     requests.extend(traversal_search_corpus());
     requests
@@ -179,6 +180,20 @@ fn revision_read_corpus() -> Vec<(&'static str, Value)> {
             json!({ "path": "lib.rs", "position": 0, "rev": "main" }),
         ),
     ]
+}
+
+/// A comparison of the fixture's two committed revisions: the `baseline` tag holds
+/// everything before `change_witness.rs` arrived, so this answer carries one
+/// `introduced` hit and validates the `change` arm of the served output schema
+/// against a real payload.
+fn change_search_corpus() -> Vec<(&'static str, Value)> {
+    vec![(
+        "search",
+        json!({
+            "change": { "base": "baseline", "head": "HEAD" },
+            "include": ["source"]
+        }),
+    )]
 }
 
 fn arguments(value: &Value) -> TestResult<serde_json::Map<String, Value>> {
@@ -517,6 +532,14 @@ async fn served_fixture() -> TestResult<(
     fs::write(directory.path().join("rift.toml"), configuration)?;
     rift_history::fixture::init(directory.path());
     rift_history::fixture::commit_all(directory.path(), "fixture baseline");
+    // A second commit, tagged apart from it, so a `change` request compares two
+    // committed revisions that really differ.
+    rift_history::fixture::git(directory.path(), &["tag", "baseline"]);
+    fs::write(
+        directory.path().join("change_witness.rs"),
+        "pub fn change_witness() {}\n",
+    )?;
+    rift_history::fixture::commit_all(directory.path(), "introduce the change witness");
     let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {

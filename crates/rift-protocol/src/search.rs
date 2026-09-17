@@ -5,7 +5,7 @@
 use crate::read::{
     Language, NodeId, PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX, Pagination, ProjectPath, ReadWarning,
     Relationship, RelationshipFacet, RevisionId, SearchScope, SourceUnitId, Symbol, SymbolId,
-    TextRange,
+    SymbolVersionKind, TextRange,
 };
 use crate::schema;
 use schemars::JsonSchema;
@@ -57,6 +57,8 @@ pub enum MatchedField {
     Path,
     /// A relationship traversal reached the hit.
     Relationship,
+    /// A comparison of two committed revisions found the declaration changed.
+    Change,
 }
 
 /// Project-relative glob using *, ?, **, and character classes. Forward-slash separated on
@@ -218,6 +220,13 @@ pub struct SearchHit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1_u64, max = 2_u64))]
     pub distance: Option<u64>,
+    /// How the declaration differs between the two revisions `change` named, present when
+    /// the comparison produced this hit. The hit's `hit.symbol`, `path`, `range`, `line`,
+    /// and `source` read the head revision, except for a removed declaration, which keeps
+    /// its base-side identity, path, range, and source - the head revision no longer holds
+    /// it. A change hit carries no `score`, since a comparison ranks nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<SymbolChange>,
 }
 
 /// What a search hit is. Tagged, so the payload correlation survives code generation.
@@ -247,6 +256,58 @@ pub enum SearchHitTarget {
     },
 }
 
+/// The field path the server names when a comparison's base revision spelling breaks the
+/// contract [`RevisionId`] advertises.
+pub const CHANGE_BASE_FIELD: &str = "change.base";
+
+/// The field path the server names when a comparison's head revision spelling breaks that
+/// same contract.
+pub const CHANGE_HEAD_FIELD: &str = "change.head";
+
+/// Default `head` for a change comparison: the revision the workspace's version control
+/// currently has checked out.
+pub const SEARCH_CHANGE_HEAD_DEFAULT: &str = "HEAD";
+
+/// Most changed paths one comparison reads. A comparison that reaches it answers from the
+/// paths that fit and warns `change_truncated`.
+pub const SEARCH_CHANGE_PATHS_MAX: u64 = 512;
+
+/// Two committed revisions to compare. The answer is the declarations the two revisions
+/// hold differently: `base` is the revision compared from, `head` the revision compared
+/// to. Both sides name a commit; uncommitted working-tree bytes take part in no
+/// comparison.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchChange {
+    /// The revision compared from - a branch, tag, or commit id as the workspace's version
+    /// control spells it.
+    pub base: RevisionId,
+    /// The revision compared to, spelled the same way. Omitted, `HEAD`.
+    #[serde(default = "default_search_change_head")]
+    pub head: RevisionId,
+}
+
+fn default_search_change_head() -> RevisionId {
+    RevisionId(SEARCH_CHANGE_HEAD_DEFAULT.to_owned())
+}
+
+/// How one declaration differs between the two compared revisions, and where it lives on
+/// each side.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SymbolChange {
+    /// What the head revision did to the declaration.
+    pub kind: SymbolVersionKind,
+    /// Where the declaration lived at the base revision. Absent for a declaration the head
+    /// revision introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_path: Option<ProjectPath>,
+    /// Where the declaration lives at the head revision. Absent for a declaration the head
+    /// revision removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_path: Option<ProjectPath>,
+}
+
 /// Extra payload to attach to every hit. Every entry costs response bytes per hit, so the
 /// caller requests only what it will read.
 #[derive(
@@ -261,9 +322,11 @@ pub enum SearchInclude {
 }
 
 /// Criteria for one search. The caller supplies a lexical `query`, a relationship
-/// `traversal`, or both; `paths` narrows the files eligible for either.
+/// `traversal`, or both, or a `change` comparing two committed revisions; `paths` narrows
+/// the files eligible for any of them.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = schema::require_search_selector)]
 #[schemars(extend("rift:since" = "v0.0.6"))]
 #[schemars(extend("examples" = [
     {
@@ -364,6 +427,16 @@ pub struct SearchParams {
     /// graph serves the current tree alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traversal: Option<SearchTraversal>,
+    /// Two committed revisions to compare, standing alone. Every declaration the two
+    /// revisions hold differently becomes a hit tagged `change`, carrying a `change` block
+    /// that names what differs and where the declaration lives on each side.
+    /// `target: "file"` never carries a change hit, since the comparison reaches
+    /// declarations alone, and `relevance` orders the hits by path, then name. `paths`
+    /// narrows which changed paths are compared. The server refuses `change` beside `rev`,
+    /// since `change` names its own revisions; beside `query`, since the two select
+    /// different result sets; beside `traversal`; and beside a `scope` past `project`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<SearchChange>,
 }
 
 fn default_search_params_target() -> SearchParamsTarget {
@@ -587,9 +660,9 @@ pub enum TraversalDirection {
 mod tests {
     use super::{
         PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX, PathPattern, PathPatternViolation,
-        SEARCH_TRAVERSAL_DEPTH_DEFAULT, SEARCH_TRAVERSAL_DEPTH_MAX, SEARCH_TRAVERSAL_DEPTH_MIN,
-        SEARCH_TRAVERSAL_FACETS_MAX, SearchHit, SearchParams, SearchScope, SearchTraversal,
-        TraversalDirection,
+        SEARCH_CHANGE_HEAD_DEFAULT, SEARCH_TRAVERSAL_DEPTH_DEFAULT, SEARCH_TRAVERSAL_DEPTH_MAX,
+        SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX, SearchChange, SearchHit,
+        SearchParams, SearchScope, SearchTraversal, TraversalDirection,
     };
     use serde_json::json;
 
@@ -743,6 +816,57 @@ mod tests {
         assert_eq!(
             hit_properties["distance"]["maximum"],
             json!(SEARCH_TRAVERSAL_DEPTH_MAX)
+        );
+    }
+
+    /// The schema states the same rule the server enforces: a request selects its
+    /// result set with `query`, `traversal`, or `change`.
+    #[test]
+    fn search_params_schema_states_the_three_result_set_selectors() {
+        let schema = serde_json::to_value(schemars::schema_for!(SearchParams)).expect("schema");
+        let selector = schema["allOf"]
+            .as_array()
+            .and_then(|clauses| clauses.iter().find(|clause| clause.get("anyOf").is_some()))
+            .expect("the selector rule states an anyOf");
+        let required: Vec<&str> = selector["anyOf"]
+            .as_array()
+            .expect("the rule lists its alternatives")
+            .iter()
+            .filter_map(|clause| clause["required"][0].as_str())
+            .collect();
+        assert_eq!(required, ["query", "traversal", "change"], "{schema:#}");
+    }
+
+    /// `head` takes a `#[serde(default = ...)]` function compiled apart from the
+    /// schema; this pins the advertised default to the constant that function returns.
+    #[test]
+    fn search_change_schema_head_default_equals_the_enforced_constant() {
+        let schema = serde_json::to_value(schemars::schema_for!(SearchChange)).expect("schema");
+        assert_eq!(
+            schema["properties"]["head"]["default"],
+            json!(SEARCH_CHANGE_HEAD_DEFAULT)
+        );
+    }
+
+    /// A `change` naming `base` alone compares it against `HEAD`.
+    #[test]
+    fn search_change_with_base_alone_compares_against_head() {
+        let params: SearchParams =
+            serde_json::from_value(json!({"change": {"base": "main"}})).expect("a change parses");
+        let change = params.change.expect("change must be present");
+        assert_eq!(change.base.0, "main");
+        assert_eq!(change.head.0, SEARCH_CHANGE_HEAD_DEFAULT);
+    }
+
+    /// `deny_unknown_fields` refuses a comparison naming a side this model never
+    /// served, such as an uncommitted working-tree side.
+    #[test]
+    fn search_change_rejects_an_unknown_field() {
+        let result: Result<SearchChange, _> =
+            serde_json::from_value(json!({"base": "main", "worktree": true}));
+        assert!(
+            result.is_err(),
+            "an unknown comparison field must fail deserialization"
         );
     }
 

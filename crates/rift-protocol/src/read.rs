@@ -23,11 +23,12 @@ pub(crate) const LANGUAGE_IDENTITY_BYTES_MAX: usize = LANGUAGE_WORD_BYTES_MAX * 
 // `search` so this module stays below its size bound; re-exporting them here keeps every
 // existing `rift_protocol::read::SearchParams`-style path resolving.
 pub use crate::search::{
-    GraphHop, HopDirection, MatchedField, PathPattern, PathPatternViolation, PathSelector,
-    ResultOrder, SEARCH_TRAVERSAL_DEPTH_DEFAULT, SEARCH_TRAVERSAL_DEPTH_MAX,
-    SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX, SearchHit, SearchHitTarget,
-    SearchInclude, SearchParams, SearchParamsTarget, SearchResult, SearchTraversal,
-    TraversalDirection,
+    CHANGE_BASE_FIELD, CHANGE_HEAD_FIELD, GraphHop, HopDirection, MatchedField, PathPattern,
+    PathPatternViolation, PathSelector, ResultOrder, SEARCH_CHANGE_HEAD_DEFAULT,
+    SEARCH_CHANGE_PATHS_MAX, SEARCH_TRAVERSAL_DEPTH_DEFAULT, SEARCH_TRAVERSAL_DEPTH_MAX,
+    SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX, SearchChange, SearchHit,
+    SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget, SearchResult,
+    SearchTraversal, SymbolChange, TraversalDirection,
 };
 // Diagnostic-family models (`Diagnostic`, its context, and their neighbors) live in
 // `diagnostic` so this module stays below its size bound; re-exporting them here keeps every
@@ -963,6 +964,16 @@ pub enum ReadWarning {
         /// facet. Absent when the language has a provider.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         language: Option<Language>,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
+    /// The comparison reached `paths_max` changed paths and stopped there, so declarations
+    /// in the changed paths past it are missing from this answer. Narrow the comparison
+    /// with `paths`, or name two revisions that differ in fewer files.
+    ChangeTruncated {
+        /// Changed paths the comparison stopped at, equal to the bound it reached.
+        paths_max: u64,
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
         detail: String,

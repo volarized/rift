@@ -394,6 +394,17 @@ async fn embed_prepared(published: &RwLock<IndexState>, population: &PopulationL
     population.request(current);
 }
 
+/// The workspace policy one read of committed source applies: what a revision
+/// snapshot and a revision comparison both need before they touch git objects.
+struct RevisionRead {
+    root: std::path::PathBuf,
+    limits: rift_index::WorkspaceIndexLimits,
+    visibility: SourceVisibility,
+    text_inclusion: rift_core::TextFileInclusion,
+    languages: rift_core::LanguageFileSelections,
+    history: rift_protocol::configuration::HistoryConfiguration,
+}
+
 /// One current-tree request's publication, and the warning it carries when that
 /// publication is served in spite of a recorded rebuild failure.
 struct ResolvedWorkspace {
@@ -1335,11 +1346,13 @@ impl RiftMcp {
 
     /// Searches indexed declarations and source lines by lexical `query`, merged with
     /// full-text matches from included `[search.text]` files and declaration bodies, and by a
-    /// bounded relationship `traversal` from one seed symbol. `rev` searches a
-    /// version-control revision instead of the current tree, and never combines with
-    /// `traversal`. `scope` reaches past the project tree: `dependencies` answers `query`
-    /// from the public declarations of the cataloged packages alone, `all` from both,
-    /// ordered together. Use `get_symbol` when the declaration name is known.
+    /// bounded relationship `traversal` from one seed symbol. `change` answers the
+    /// declarations two committed revisions hold differently, in place of `query` and
+    /// `traversal`. `rev` searches a version-control revision instead of the current tree,
+    /// and never combines with `traversal` or `change`. `scope` reaches past the project
+    /// tree: `dependencies` answers `query` from the public declarations of the cataloged
+    /// packages alone, `all` from both, ordered together. Use `get_symbol` when the
+    /// declaration name is known.
     ///
     /// For a current-tree search, the published workspace is resolved exactly once and
     /// threaded through both the search index's revision check and the executed
@@ -1351,6 +1364,9 @@ impl RiftMcp {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<Json<SearchResult>, ErrorData> {
+        if let Some(change) = params.change.clone() {
+            return self.change_search(params, change).await;
+        }
         let Some(rev) = params.rev.clone() else {
             return self.current_tree_search(params).await;
         };
@@ -1358,6 +1374,45 @@ impl RiftMcp {
         // search never consults it.
         self.read_at(Some(rev), move |reads| reads.search(&params, &[]))
             .await
+    }
+
+    /// Compares the two committed revisions `change` names and answers the declarations
+    /// they hold differently.
+    ///
+    /// The comparison reads both sides from the workspace's git objects with no checkout,
+    /// under the same `[source]` policy and bounds a revision read applies, and
+    /// `[providers.history] enabled = false` refuses it the same way. Neither side is the
+    /// current tree, so the search index never takes part.
+    async fn change_search(
+        &self,
+        params: SearchParams,
+        change: rift_protocol::read::SearchChange,
+    ) -> Result<Json<SearchResult>, ErrorData> {
+        let resolved = self.published_workspace(wire::ErrorPhase::Read).await?;
+        let revision_read = self.revision_read(&resolved.published)?;
+        let RevisionRead {
+            root,
+            limits,
+            visibility,
+            text_inclusion,
+            languages,
+            history: _,
+        } = revision_read;
+        self.blocking
+            .run("revision comparison read", move || {
+                rift_server::search_change(
+                    &root,
+                    &params,
+                    &change,
+                    limits,
+                    &visibility,
+                    &text_inclusion,
+                    &languages,
+                )
+            })
+            .await
+            .map(Json)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
     }
 
     /// Ranks and reads one current-tree search against one publication.
@@ -1627,23 +1682,14 @@ impl RiftMcp {
         let Some(rev) = rev else {
             return self.current_tree_read(&resolved, operation).await;
         };
-        let published = resolved.published;
-        let configuration = published.configuration.accepted(wire::ErrorPhase::Read)?;
-        if !configuration.providers.history.enabled {
-            return Err(ReadError::from(ReadFault::Unsupported {
-                capability: "revision reads (providers.history disabled)".to_owned(),
-            })
-            .tool_error(wire::ErrorPhase::Read));
-        }
-        let visibility = SourceVisibility::from(&configuration.source);
-        let text_inclusion = rift_core::TextFileInclusion::from(&configuration.search);
-        let languages = rift_core::LanguageFileSelections::from(&configuration);
-        let history = configuration.providers.history.clone();
-        let root = self.root.clone();
-        let limits = published
-            .configuration
-            .index_limits(self.limits)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        let RevisionRead {
+            root,
+            limits,
+            visibility,
+            text_inclusion,
+            languages,
+            history,
+        } = self.revision_read(&resolved.published)?;
         self.blocking
             .run("revision workspace read", move || {
                 let reads = ReadService::at_revision_with_languages(
@@ -1660,6 +1706,34 @@ impl RiftMcp {
             .await
             .map(Json)
             .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+    }
+
+    /// The workspace policy one read of committed source applies, derived once from the
+    /// accepted configuration: the served root, the index bounds, the `[source]` matcher,
+    /// the `[search.text]` selection, the configured language entries, and the
+    /// `[providers.history]` table a served snapshot carries forward.
+    ///
+    /// Committed source is what `[providers.history]` gates, so a workspace that turns the
+    /// table off refuses here, before any revision is resolved.
+    fn revision_read(&self, published: &PublishedWorkspace) -> Result<RevisionRead, ErrorData> {
+        let configuration = published.configuration.accepted(wire::ErrorPhase::Read)?;
+        if !configuration.providers.history.enabled {
+            return Err(ReadError::from(ReadFault::Unsupported {
+                capability: "revision reads (providers.history disabled)".to_owned(),
+            })
+            .tool_error(wire::ErrorPhase::Read));
+        }
+        Ok(RevisionRead {
+            root: self.root.clone(),
+            limits: published
+                .configuration
+                .index_limits(self.limits)
+                .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?,
+            visibility: SourceVisibility::from(&configuration.source),
+            text_inclusion: rift_core::TextFileInclusion::from(&configuration.search),
+            languages: rift_core::LanguageFileSelections::from(&configuration),
+            history: configuration.providers.history.clone(),
+        })
     }
 
     /// Runs one read against `resolved`'s current-tree snapshot, behind the acceptance

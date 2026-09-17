@@ -15,9 +15,10 @@ use rift_index::{
     WorkspaceIndex,
 };
 use rift_protocol::read::{
-    MatchedField, PathPattern, PathSelector, ProjectPath as WireProjectPath, ReadWarning,
-    ResultOrder, SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget,
-    SearchResult, SearchScope, SourceUnitId, Symbol, SymbolId,
+    CHANGE_BASE_FIELD, CHANGE_HEAD_FIELD, MatchedField, PathPattern, PathSelector,
+    ProjectPath as WireProjectPath, ReadWarning, ResultOrder, SearchChange, SearchHit,
+    SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget, SearchResult, SearchScope,
+    SourceUnitId, Symbol, SymbolId,
 };
 use rift_search::{Declaration, DescribedUnit, RankedUnit};
 use rift_syntax::{ByteRange, SyntaxSymbol};
@@ -68,6 +69,13 @@ impl ReadService {
     ) -> Result<SearchResult, ReadError> {
         references.validate_revision(self)?;
         validate_search(params)?;
+        if params.change.is_some() {
+            // One snapshot holds one tree; a comparison needs two, and reaches its own
+            // through `search_change`.
+            return Err(ReadFault::unsupported(
+                "a revision comparison on a captured snapshot",
+            ));
+        }
         self.validate_dependency_scope(params.scope, params.rev.as_ref())?;
         if self.revision().is_some() && force_include_requested(params) {
             return Err(ReadFault::unsupported("force_include at a revision"));
@@ -316,6 +324,16 @@ pub(crate) struct HitPayloads {
 }
 
 impl HitPayloads {
+    /// The payloads one comparison attaches. Its hits come from the compared revisions'
+    /// own indexes rather than the published one, so the line is resolved where the hit is
+    /// built instead of being deferred to the page.
+    pub(crate) fn for_change(params: &SearchParams) -> Self {
+        Self {
+            defer_line: false,
+            ..Self::requested(params)
+        }
+    }
+
     fn requested(params: &SearchParams) -> Self {
         let include = params.include.as_deref().unwrap_or_default();
         Self {
@@ -363,6 +381,9 @@ pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
     if let Some(selector) = params.paths.as_ref() {
         validate_path_selector(selector)?;
     }
+    if let Some(change) = params.change.as_ref() {
+        validate_change(change, params)?;
+    }
     if let Some(traversal) = params.traversal.as_ref() {
         validate_traversal(traversal)?;
         if params.rev.is_some() {
@@ -380,11 +401,52 @@ pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
     Ok(())
 }
 
+/// Refuses a `change` beside a field that selects another result set or another tree, and
+/// a revision spelling that breaks the charset [`RevisionId`] advertises.
+///
+/// The `change` block names both sides of the comparison itself, so `rev` has nothing left
+/// to address; `query` and `traversal` each select a result set of their own. A `scope`
+/// past `project` follows the rule every revision-addressed read applies, since the
+/// dependency index serves the current tree alone.
+fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), ReadError> {
+    if params.rev.is_some() {
+        return Err(ReadFault::invalid(
+            "change",
+            "change names its own revisions",
+        ));
+    }
+    if params.query.is_some() {
+        return Err(ReadFault::invalid(
+            "change",
+            "query and change select different result sets",
+        ));
+    }
+    if params.traversal.is_some() {
+        return Err(ReadFault::unsupported("a traversal seeded from a change"));
+    }
+    if params.scope != SearchScope::Project {
+        return Err(ReadFault::invalid(
+            "scope",
+            "dependencies are served for the current tree alone",
+        ));
+    }
+    let sides = [
+        (CHANGE_BASE_FIELD, &change.base),
+        (CHANGE_HEAD_FIELD, &change.head),
+    ];
+    for (field, revision) in sides {
+        if let Some(violation) = revision.violation() {
+            return Err(ReadFault::invalid(field, violation.as_str()));
+        }
+    }
+    Ok(())
+}
+
 /// The lexical `query` the request carries, if any: refused when the request carries
-/// neither `query` nor `traversal`, and when the query is empty.
+/// none of `query`, `traversal`, and `change`, and when the query is empty.
 fn accepted_query(params: &SearchParams) -> Result<Option<&str>, ReadError> {
     let query = params.query.as_deref();
-    if query.is_none() && params.traversal.is_none() {
+    if query.is_none() && params.traversal.is_none() && params.change.is_none() {
         return Err(ReadFault::invalid("query", "missing"));
     }
     if query.is_some_and(str::is_empty) {
@@ -414,7 +476,7 @@ fn validate_path_selector(selector: &PathSelector) -> Result<(), ReadError> {
 /// is set. `force_include` is compiled separately, into [`SelectedPaths`]: it reaches files
 /// the index never held, so it never narrows the indexed candidate set this matcher
 /// screens.
-fn path_matcher(
+pub(crate) fn path_matcher(
     root: &Path,
     selector: Option<&PathSelector>,
 ) -> Result<Option<PathMatcher>, ReadError> {
@@ -601,7 +663,7 @@ fn dependency_symbol_hit(
         symbol,
         matched,
         (None, Some(unit)),
-        symbol_match_score(matched.rank),
+        Some(symbol_match_score(matched.rank)),
         vec![MatchedField::Name],
         payloads,
     ))
@@ -613,7 +675,13 @@ fn symbol_search_hit(
     payloads: HitPayloads,
 ) -> Result<SearchHit, ReadError> {
     let score = symbol_match_score(matched.rank);
-    build_symbol_hit(index, matched, score, vec![MatchedField::Name], payloads)
+    build_symbol_hit(
+        index,
+        matched,
+        Some(score),
+        vec![MatchedField::Name],
+        payloads,
+    )
 }
 
 /// Builds one symbol hit's wire shape. `symbol_search_hit` and `merge_symbol_hit` share
@@ -623,7 +691,7 @@ fn symbol_search_hit(
 pub(crate) fn build_symbol_hit(
     index: &WorkspaceIndex,
     matched: SymbolMatch<'_>,
-    score: f64,
+    score: Option<f64>,
     matched_by: Vec<MatchedField>,
     payloads: HitPayloads,
 ) -> Result<SearchHit, ReadError> {
@@ -650,7 +718,7 @@ fn assembled_symbol_hit(
     symbol: Symbol,
     matched: SymbolMatch<'_>,
     (path, unit): (Option<WireProjectPath>, Option<SourceUnitId>),
-    score: f64,
+    score: Option<f64>,
     matched_by: Vec<MatchedField>,
     payloads: HitPayloads,
 ) -> SearchHit {
@@ -660,7 +728,7 @@ fn assembled_symbol_hit(
         hit: SearchHitTarget::Symbol {
             symbol: Box::new(symbol),
         },
-        score: Some(score),
+        score,
         matched_by,
         source: payloads
             .source
@@ -671,6 +739,7 @@ fn assembled_symbol_hit(
         unit,
         traversal_path: None,
         distance: None,
+        change: None,
     }
 }
 
@@ -728,6 +797,7 @@ fn file_search_hit(
         unit: None,
         traversal_path: None,
         distance: None,
+        change: None,
     }
 }
 
@@ -762,6 +832,7 @@ fn text_search_hit(
         unit: None,
         traversal_path: None,
         distance: None,
+        change: None,
     }
 }
 
@@ -936,7 +1007,7 @@ fn merge_symbol_hit(
     results.push(build_symbol_hit(
         index,
         matched,
-        score,
+        Some(score),
         vec![MatchedField::Ranked],
         payloads,
     )?);
@@ -1003,6 +1074,7 @@ fn ranked_file_hit(
         unit: None,
         traversal_path: None,
         distance: None,
+        change: None,
     }
 }
 
@@ -1016,6 +1088,12 @@ fn order_and_bound_hits(
     results_max: usize,
 ) -> Option<usize> {
     order_hits(results, order);
+    bound_hits(results, results_max)
+}
+
+/// Cuts an ordered hit set to the server's result bound, answering the bound when the set
+/// reached it so the answer can warn `results_truncated`.
+pub(crate) fn bound_hits(results: &mut Vec<SearchHit>, results_max: usize) -> Option<usize> {
     let reached = results.len() >= results_max;
     results.truncate(results_max);
     reached.then_some(results_max)
@@ -1028,7 +1106,7 @@ fn order_and_bound_hits(
 ///
 /// `path` order lists every project path first, then the dependency hits, which carry
 /// `unit` in its place, in unit order, so a mixed `all` answer never interleaves the two.
-fn order_hits(results: &mut [SearchHit], order: ResultOrder) {
+pub(crate) fn order_hits(results: &mut [SearchHit], order: ResultOrder) {
     results.sort_by(|left, right| hit_ordering(left, right, order));
 }
 
@@ -1673,6 +1751,28 @@ pub fn compute() -> i32 {
             error.to_string(),
             "the request does not match the documented form: field limit, \
              violation zero; correct the reported field and resend the request"
+        );
+        Ok(())
+    }
+
+    /// One snapshot holds one tree; a request carrying `change` names two, and the
+    /// comparison that reads them reaches its own revisions instead.
+    #[test]
+    fn search_on_a_captured_snapshot_refuses_a_change_comparison() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let params: SearchParams =
+            serde_json::from_value(json!({"change": {"base": "main", "head": "HEAD"}}))?;
+
+        let error = service
+            .search(&params, &[])
+            .expect_err("a comparison on one snapshot must refuse");
+
+        assert!(matches!(error.fault(), ReadFault::Unsupported { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("a revision comparison on a captured snapshot"),
+            "{error}"
         );
         Ok(())
     }
@@ -2806,7 +2906,7 @@ pub fn compute() -> i32 {
                 symbol,
                 rank: SymbolMatchRank::NameExact,
             },
-            0.5,
+            Some(0.5),
             vec![MatchedField::Name],
             super::HitPayloads::default(),
         )?;
@@ -3344,6 +3444,7 @@ pub fn compute() -> i32 {
             unit: None,
             traversal_path: None,
             distance: None,
+            change: None,
         }
     }
 
@@ -3429,6 +3530,7 @@ pub fn compute() -> i32 {
             unit: None,
             traversal_path: None,
             distance: None,
+            change: None,
         }
     }
 

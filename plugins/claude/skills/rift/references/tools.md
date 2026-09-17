@@ -42,11 +42,13 @@ Parameters:
 
 Searches indexed declarations and source lines by lexical `query`, merged with
 full-text matches from included `[search.text]` files and declaration bodies, and by a
-bounded relationship `traversal` from one seed symbol. `rev` searches a
-version-control revision instead of the current tree, and never combines with
-`traversal`. `scope` reaches past the project tree: `dependencies` answers `query`
-from the public declarations of the cataloged packages alone, `all` from both,
-ordered together. Use `get_symbol` when the declaration name is known.
+bounded relationship `traversal` from one seed symbol. `change` answers the
+declarations two committed revisions hold differently, in place of `query` and
+`traversal`. `rev` searches a version-control revision instead of the current tree,
+and never combines with `traversal` or `change`. `scope` reaches past the project
+tree: `dependencies` answers `query` from the public declarations of the cataloged
+packages alone, `all` from both, ordered together. Use `get_symbol` when the
+declaration name is known.
 For a current-tree search, the published workspace is resolved exactly once and
 threaded through both the search index's revision check and the executed
 `ReadService::search` call: a concurrent rebuild between two separate resolutions
@@ -55,6 +57,7 @@ results computed from another.
 
 Parameters:
 
+- `change` - Two committed revisions to compare, standing alone.
 - `include` - Extra payload to attach to every hit.
 - `limit` - Most hits to return in one page, at most 10,000; the server refuses a larger `limit` naming the field.
 - `order` - Which total order the page comes back in.
