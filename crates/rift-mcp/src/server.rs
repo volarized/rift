@@ -2092,6 +2092,9 @@ impl RiftMcp {
             current.configuration.logs_configuration().page_records
         };
         let query = resource::log_query(uri, page_records)?;
+        // The drain writes on a timer, so a read taken right after the request that produced a
+        // record would answer without it. This waits for the lane to reach what it has taken.
+        crate::logs::settle_for_read().await;
         let Some(store) = self.logs.as_ref() else {
             return Ok(resource::logs_unavailable(
                 uri,
@@ -5009,6 +5012,58 @@ mod tests {
                 && text.contains("src/deep.rs")
                 && text.contains("too_deep"),
             "the logs must name the left-out file and its bound: {text}"
+        );
+        Ok(())
+    }
+
+    /// A record emitted immediately before a `rift://logs` read appears in that read, with the
+    /// drain still running. The drain writes on its own timer and nothing made the read wait
+    /// for it, so a caller reading back the diagnostic behind its own refusal was answered
+    /// without it: cold first use met exactly this on `rift://logs/component/engine`.
+    ///
+    /// The sink captures under the workspace's own `[logs] capture` default, the filter a
+    /// served workspace records under. Without it the lane also takes the storage driver's own
+    /// trace records, and the read then waits out its bound behind thousands of them.
+    #[tokio::test]
+    async fn a_record_emitted_before_a_read_appears_in_that_read() -> TestResult {
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "")?;
+
+        let (sink, drain) = crate::logs::log_capture();
+        let capture = crate::logs::logs_configuration(directory.path()).capture;
+        let filter = tracing_subscriber::EnvFilter::try_new(&capture)?;
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(sink.with_filter(filter)),
+        );
+        let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
+        let store = storage.logs().ok_or("the log store must open")?;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let drain_task = tokio::spawn(drain.run(store, 10_000, cancellation.clone()));
+        let server =
+            RiftMcp::build_with_storage(directory.path(), WorkspaceIndexLimits::default(), storage)
+                .await?;
+
+        tracing::warn!(component = "engine", "the beacon engine did not start");
+        let logs = server.read_logs("rift://logs/component/engine").await?;
+        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = logs
+            .contents
+            .first()
+            .ok_or("a log read answers with one content")?
+        else {
+            return Err("a log read answers with text".into());
+        };
+        let answered = text.clone();
+
+        cancellation.cancel();
+        drain_task.await?;
+        assert!(
+            answered.contains("the beacon engine did not start"),
+            "the read answers with the record the same task emitted: {answered}"
         );
         Ok(())
     }
