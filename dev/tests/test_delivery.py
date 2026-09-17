@@ -20,6 +20,17 @@ import yaml
 REPOSITORY = Path(__file__).resolve().parents[2]
 WORKFLOWS = REPOSITORY / ".github/workflows"
 NEXTEST_CONFIGURATION = REPOSITORY / ".config/nextest.toml"
+JUSTFILE = REPOSITORY / "justfile"
+
+# The archive the integration jobs run from names the test targets it carries.
+ARCHIVED_TARGET = re.compile(r"--test\s+([a-z0-9_]+)")
+
+# `profile.integration` selects a binary by name, and a test inside any binary by
+# the test's own name.
+INTEGRATION_BINARY_PREFIXES = ("live_", "corpus_")
+INTEGRATION_TEST = re.compile(
+    r"#\[(?:tokio::)?test[^\]]*\]\s*(?:pub\s+)?(?:async\s+)?fn\s+(live_[a-z0-9_]*)"
+)
 
 # The action every Rust job restores its build directory with.
 RUST_CACHE = "Swatinem/rust-cache@"
@@ -118,6 +129,72 @@ def suites_taking_the_election() -> set[str]:
             if any(marker in text for text in reached for marker in ELECTION_MARKERS):
                 taking.add(name)
     return taking
+
+
+def archived_integration_targets() -> set[str]:
+    """The test targets `just integration-archive` builds into its archive."""
+    recipe = JUSTFILE.read_text(encoding="utf-8").split("\nintegration-archive:")[1]
+    return set(ARCHIVED_TARGET.findall(recipe.split("\n\n")[0]))
+
+
+def suites_the_integration_profile_runs() -> set[str]:
+    """Every test binary `profile.integration` selects, by binary or by test name."""
+    selected: set[str] = set()
+    for directory in sorted(REPOSITORY.glob("crates/*/tests")):
+        for path in sorted(directory.glob("*.rs")):
+            source = path.read_text(encoding="utf-8")
+            if not TEST_ATTRIBUTE.search(source):
+                continue
+            if path.stem.startswith(
+                INTEGRATION_BINARY_PREFIXES
+            ) or INTEGRATION_TEST.search(source):
+                selected.add(path.stem)
+    return selected
+
+
+class IntegrationArchive(unittest.TestCase):
+    """The archive carries every suite the integration profile runs.
+
+    The archive names its targets, and the profile selects them by two rules: a
+    binary whose name begins `live_` or `corpus_`, and a test whose own name
+    begins `live_` inside any binary. A suite the second rule reaches and the
+    archive leaves out stops running with nothing to say so.
+    """
+
+    def test_the_archive_carries_every_suite_the_profile_selects(self) -> None:
+        archived = archived_integration_targets()
+        selected = suites_the_integration_profile_runs()
+        self.assertTrue(selected, "no suite reaches the integration profile")
+        self.assertEqual(
+            sorted(selected - archived),
+            [],
+            "the integration archive leaves out suites its profile runs: "
+            f"{sorted(selected - archived)}",
+        )
+
+    def test_the_archive_carries_no_suite_the_profile_never_runs(self) -> None:
+        archived = archived_integration_targets()
+        selected = suites_the_integration_profile_runs()
+        self.assertEqual(
+            sorted(archived - selected),
+            [],
+            "the integration archive builds suites its profile never runs: "
+            f"{sorted(archived - selected)}",
+        )
+
+    def test_no_library_test_reaches_the_integration_profile(self) -> None:
+        """The archive names no `--lib` target, so a `live_` test in a library
+        would be selected by the profile and absent from the archive."""
+        offenders = [
+            f"{path.relative_to(REPOSITORY)}::{name}"
+            for path in sorted(REPOSITORY.glob("crates/*/src/**/*.rs"))
+            for name in INTEGRATION_TEST.findall(path.read_text(encoding="utf-8"))
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            f"a library test named `live_` never reaches the archive: {offenders}",
+        )
 
 
 class CacheOwnership(unittest.TestCase):

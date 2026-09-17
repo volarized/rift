@@ -129,10 +129,15 @@ corpus-sync name="":
     uv run --locked --python 3.12 --project dev rift-dev corpus sync {{ if name == "" { "" } else { quote(name) } }}
 
 # One archive supplies every integration job. Save the plain CLI before test builds.
+# The archive carries the targets `profile.integration` runs and no others:
+# `--all-targets` compiled and linked every test binary in the workspace, and each
+# one links the whole workspace. `mcp_proxy` is named for the `live_` test it
+# holds, which the profile selects by test name rather than by binary;
+# `dev/tests/test_delivery.py` refuses a selection that leaves such a binary out.
 integration-archive:
     cargo build --locked --profile corpus -p rift
     tar --zstd -cf target/integration-cli.tar.zst -C target/corpus rift
-    cargo llvm-cov nextest-archive --workspace --all-targets --all-features --locked --cargo-profile corpus --profile integration --archive-file target/integration.tar.zst
+    cargo llvm-cov nextest-archive --workspace --all-features --locked --cargo-profile corpus --profile integration --archive-file target/integration.tar.zst --test corpus_bun --test corpus_fastapi --test corpus_nextjs --test mcp_proxy --test live_rust_analyzer --test live_typescript --test live_semantic_search
 
 corpus-test name test_name="" archive="": coverage-target
     cargo llvm-cov nextest --no-report --profile corpus --no-tests fail --run-ignored all {{ if archive == "" { "--locked -p rift --test " + quote("corpus_" + name) + " --cargo-profile corpus" } else { "--archive-file " + quote(archive) + " --extract-overwrite --workspace-remap . -E " + quote("binary(=corpus_" + name + ")") } }} {{ if test_name == "" { "" } else { "-- --exact " + quote(test_name) } }}
