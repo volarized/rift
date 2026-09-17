@@ -831,9 +831,8 @@ impl EngineSlot {
         }
     }
 
-    /// The program this slot starts, for a record naming what could not run.
-    /// Acceptance refuses a table naming neither `command` nor `embedded`, so the
-    /// empty answer is unreachable through an accepted configuration.
+    /// The program this slot starts, for a record naming what could not run. An embedded
+    /// engine has no command line of its own, so it is named by the program it stands for.
     fn program(&self) -> &str {
         match (
             self.configuration.embedded,
@@ -841,7 +840,9 @@ impl EngineSlot {
         ) {
             (Some(EmbeddedEngine::Ty), _) => "ty",
             (None, Some(command)) => command.program(),
-            (None, None) => "",
+            (None, None) => {
+                unreachable!("acceptance refuses an LSP table naming neither command nor embedded")
+            }
         }
     }
 
@@ -1003,6 +1004,24 @@ mod tests {
         };
         pool.shutdown().await;
         (failure, recorded)
+    }
+
+    /// An embedded engine is named by the program it stands for. It has no command line, and
+    /// a record naming an empty program would say nothing about which engine failed.
+    #[tokio::test]
+    async fn an_embedded_engine_is_named_by_the_program_it_stands_for() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let configuration: LspConfiguration =
+            serde_json::from_value(serde_json::json!({ "embedded": "ty" })).expect("configuration");
+        let key = LspProcessKey::named("python");
+        let pool = EnginePool::new(
+            directory.path(),
+            BTreeMap::from([(key.clone(), configuration)]),
+            BTreeMap::from([("python".to_owned(), key.clone())]),
+        );
+        let slot = pool.engine_by_key(&key).expect("slot");
+        assert_eq!(slot.program(), "ty");
+        pool.shutdown().await;
     }
 
     /// A configured program that does not exist reaches the caller as `launch_failed`, and
