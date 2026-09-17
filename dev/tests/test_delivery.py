@@ -19,6 +19,7 @@ import yaml
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 WORKFLOWS = REPOSITORY / ".github/workflows"
+CODECOV_CONFIGURATION = REPOSITORY / "codecov.yml"
 NEXTEST_CONFIGURATION = REPOSITORY / ".config/nextest.toml"
 JUSTFILE = REPOSITORY / "justfile"
 
@@ -33,6 +34,15 @@ INTEGRATION_TEST = re.compile(
 
 # The action every Rust job restores its build directory with.
 RUST_CACHE = "Swatinem/rust-cache@"
+
+# The action every job reports to Codecov with. A step naming `report_type` sends
+# test results rather than coverage, and no coverage status waits for it.
+CODECOV_ACTION = "codecov/codecov-action@"
+
+# The workflow whose coverage uploads a pull request's Codecov status is computed
+# from. `integration` runs on main alone and adds to a commit Codecov already
+# reported on.
+COVERAGE_WORKFLOW = "ci.yml"
 
 # The nextest group that serializes the suites taking one machine-global
 # resource, and the resource itself: the loopback range an elected server binds.
@@ -216,6 +226,55 @@ class CacheOwnership(unittest.TestCase):
 
     def test_the_repository_declares_rust_cache_steps_to_check(self) -> None:
         self.assertTrue(cache_savers(), "no workflow step writes the Rust cache")
+
+
+def coverage_uploads() -> list[tuple[str, str]]:
+    """Every `ci` step that uploads coverage, as job and flag."""
+    document = workflow_documents()[COVERAGE_WORKFLOW]
+    uploads: list[tuple[str, str]] = []
+    for job_name, job in (document.get("jobs") or {}).items():
+        for step in job.get("steps") or []:
+            if not step.get("uses", "").startswith(CODECOV_ACTION):
+                continue
+            inputs = step.get("with") or {}
+            if inputs.get("report_type"):
+                continue
+            uploads.append((job_name, str(inputs.get("flags", ""))))
+    return uploads
+
+
+class CoverageNotifications(unittest.TestCase):
+    """Codecov reports once every coverage upload a pull request produces is in."""
+
+    def expected_builds(self) -> int:
+        codecov = yaml.safe_load(CODECOV_CONFIGURATION.read_text(encoding="utf-8"))
+        return int(codecov["codecov"]["notify"]["after_n_builds"])
+
+    def test_codecov_waits_for_every_coverage_upload(self) -> None:
+        uploads = coverage_uploads()
+        self.assertEqual(
+            self.expected_builds(),
+            len(uploads),
+            f"{COVERAGE_WORKFLOW} uploads coverage from {uploads}; "
+            "`codecov.notify.after_n_builds` names how many to wait for, or a "
+            "status is computed from a fraction of the run",
+        )
+
+    def test_the_comment_waits_for_the_same_uploads(self) -> None:
+        codecov = yaml.safe_load(CODECOV_CONFIGURATION.read_text(encoding="utf-8"))
+        self.assertEqual(
+            codecov["comment"]["after_n_builds"],
+            self.expected_builds(),
+            "the comment and the status describe one report",
+        )
+
+    def test_every_coverage_upload_carries_its_own_flag(self) -> None:
+        flags = [flag for _job, flag in coverage_uploads()]
+        self.assertEqual(
+            sorted(flags),
+            sorted(set(flags)),
+            f"two coverage uploads share one flag: {flags}",
+        )
 
 
 def jobs_with_step_limits() -> list[tuple[str, str, int, list[int]]]:

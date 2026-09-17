@@ -7,6 +7,16 @@ flag_management:
     - name: corpus
       carryforward: true
 
+# Two jobs upload coverage for one pull request: `rust` sends the unit report and
+# `live` sends the engine report. Each on its own describes a fraction of the run,
+# and the `live` job finishes minutes ahead of `rust`, so a status computed on its
+# arrival read the patch at 13% while the same commit's merged report read 99.5%.
+# Notifications wait for both. `dev/tests/test_delivery.py` refuses a count that
+# disagrees with the coverage uploads `ci` performs.
+codecov:
+  notify:
+    after_n_builds: 2
+
 coverage:
   precision: 2
   round: down
@@ -26,6 +36,7 @@ coverage:
 comment:
   layout: "reach, diff, flags, files"
   require_changes: false
+  after_n_builds: 2
 
 github_checks:
   annotations: true
