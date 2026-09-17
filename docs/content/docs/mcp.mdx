@@ -348,7 +348,8 @@ identity a `get_symbol` or `search` hit already carries.
 
 `traversal` stands alone as a pure graph walk or rides beside `query`; a symbol both lanes
 reach keeps its lexical `score` and gains the walk's `traversal_path`, and its `matched_by`
-carries both entries.
+carries both entries. It also rides beside `change`, where the walk starts at every changed
+declaration instead of at `seed` - see [Impact of a change](#search-change-impact).
 
 Three shapes cover most questions:
 
@@ -387,6 +388,9 @@ Each caller's `traversal_path` carries a relationship from the caller to `serve`
 `facets` narrows the walk to [`RelationshipFacet`](/docs/developer/protocol/reference#RelationshipFacet)
 values such as `calls`, `references`, and `imports`; an empty or omitted list follows every
 facet. `target: "file"` never carries a walked hit, since a traversal only reaches symbols.
+
+A `traversal` standing without `change` names the declaration its walk starts at, so a request
+carrying neither `seed` nor `change` refuses `invalid_request` naming `seed`.
 
 A workspace with the binding provider disabled, no successful engine reference answer, and no
 relationship data left from an earlier build refuses `capability_unavailable` naming
@@ -537,15 +541,102 @@ and its `results_truncated` warning. A changed file either revision cannot read 
 per-file byte bound, bytes that are not UTF-8, or a syntax tree the provider refuses -
 contributes no declaration, and the changed paths beside it still answer.
 
-`change` stands alone. The server refuses it beside `rev` with `invalid_request`, since `change`
-names its own revisions; beside `query` with `invalid_request`, since the two select different
-result sets; and beside `traversal` with `capability_unavailable`, since a walk seeded from a
-change is not served. A `scope` past `project` refuses with `invalid_request`, because the
-dependency index serves the current tree alone.
+`traversal` is the one block that rides beside `change`, extending the same result set rather
+than selecting another; [Impact of a change](#search-change-impact) states what it answers. The
+server refuses `change` beside `rev` with `invalid_request`, since `change` names its own
+revisions, and beside `query` with `invalid_request`, since the two select different result
+sets. A `scope` past `project` refuses with `invalid_request`, because the dependency index
+serves the current tree alone.
 [`[providers.history]`](/docs/developer/configuration#providers) owns the capability the way it owns
 [revision-addressed reads](#revision-reads): `enabled = false` refuses a comparison, a workspace
 with no git repository refuses `capability_unavailable`, and a revision neither side resolves
 refuses `resource_not_found`.
+
+### Impact of a change [#search-change-impact]
+
+<VersionBadge version="v0.0.36" languages={["Rust"]} />
+
+A `traversal` riding beside `change` starts its walk at every changed declaration instead of at
+one named `seed`. The block keeps its `direction`, `facets`, `depth`, and `to`; it names no
+`seed`, and the server refuses one beside `change` with `invalid_request` naming the field. A
+workspace whose binding provider never built a relationship graph refuses
+`capability_unavailable` naming `relationship traversal (providers.binding disabled)`, the same
+way it refuses a walk standing alone.
+
+Each declaration the walk reaches becomes a hit tagged `matched_by: ["relationship"]`, carrying
+`distance` and the `traversal_path` a seeded walk's hit carries. The changed declaration the
+walk started at is one end of the first `GraphHop`'s own relationship, so no field restates it.
+A declaration that is both changed and reached carries `matched_by: ["change", "relationship"]`,
+keeps its `change` block beside the walk's path, and is answered once.
+
+**Request:**
+
+```json
+{
+  "change": { "base": "main", "head": "HEAD" },
+  "traversal": { "direction": "incoming", "facets": ["calls"], "depth": 1 }
+}
+```
+
+**Search hit:**
+
+```json
+{
+  "hit": {
+    "target": "symbol",
+    "symbol": {
+      "id": "rift://symbol/rust/src/server.rs/serve",
+      "language": "rust",
+      "name": "serve",
+      "kind": "function",
+      "facets": ["value", "callable", "public"],
+      "visibility": "pub"
+    }
+  },
+  "matched_by": ["relationship"],
+  "distance": 1,
+  "traversal_path": [
+    {
+      "relationship": {
+        "from": "rift://symbol/rust/src/server.rs/serve",
+        "kind": "calls",
+        "facets": ["calls"],
+        "to": "rift://symbol/rust/src/config.rs/load_config",
+        "derivation": "resolution"
+      },
+      "direction": "incoming"
+    }
+  ],
+  "range": { "start": 210, "end": 402 },
+  "line": 12,
+  "path": "src/server.rs"
+}
+```
+
+The relationship graph covers the current tree, and the server holds no other: that is why
+`traversal` refuses `rev`. A comparison names two committed revisions, so the walk's edges are
+neither compared revision's. Every answer whose comparison carried a walk therefore attaches a
+`change_traversal_current_tree` entry to `warnings`, whether or not the walk reached anything.
+Its `unplaced` counts the changed declarations the current tree holds no node for, a
+declaration the head revision removed among them, since such a declaration starts no walk. The
+warning states which tree supplied the edges; it never states that the answer is incomplete for
+that tree.
+
+A `facets` list naming a facet no provider populates attaches a `relationship_coverage_missing`
+entry to `warnings`, as it does beside a `seed`. Its `facets` names the gap; its `language` stays
+absent, since a comparison seeds declarations in every language it found changed and no one
+language answers for them.
+
+One walk budget covers every starting declaration, so the symbols one comparison's walk
+discovers keep the same node bound a seeded walk keeps rather than that bound per changed
+declaration. A walk the server stops at that bound attaches one `traversal_truncated` entry to
+`warnings` however many declarations changed. The result set keeps its own bound and its
+`results_truncated` warning.
+
+`paths` narrows which changed paths are compared, never where the walk may reach: a caller
+outside that selection is still code the changed declaration affects. A comparison ranks
+nothing, so a walked hit carries no `score` either, and `relevance` orders every hit by path,
+then by name.
 
 ### Dependency scope [#search-scope]
 

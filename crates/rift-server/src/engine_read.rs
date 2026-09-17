@@ -19,7 +19,8 @@ use rift_syntax::SyntaxSymbol;
 use crate::engine::{EnginePool, EngineSlot};
 use crate::read::{ReadError, ReadFault, ReadService, symbol_id};
 use crate::traversal::{
-    TRAVERSAL_NODES_MAX, resolve_graph_symbol, validate_traversal, walk_traversal_with_references,
+    TRAVERSAL_NODES_MAX, TraversalSeeds, resolve_graph_symbol, validate_traversal,
+    walk_traversal_with_references,
 };
 
 /// References resolved from one published source revision.
@@ -83,11 +84,11 @@ pub fn uses_engine_references(
     params: &SearchParams,
 ) -> Result<bool, ReadError> {
     reads.validate_engine_search(params)?;
-    let Some(traversal) = reference_traversal(params) else {
+    let Some((traversal, seed)) = reference_traversal(params) else {
         return Ok(false);
     };
     validate_traversal(traversal)?;
-    let seed = CoreSymbolId::new(traversal.seed.0.clone())
+    let seed = CoreSymbolId::new(seed.0.clone())
         .map_err(|_| ReadFault::invalid("traversal.seed", "not a symbol identity"))?;
     Ok(reachable_reference_source(
         reads.relationships(),
@@ -113,7 +114,7 @@ fn reachable_reference_source(
     prior.depth -= 1;
     walk_traversal_with_references(
         store,
-        seed,
+        &TraversalSeeds::Named(seed.clone()),
         &prior,
         TRAVERSAL_NODES_MAX,
         &EngineReferences::default(),
@@ -123,21 +124,24 @@ fn reachable_reference_source(
     .any(|(identity, _)| has_source(&identity))
 }
 
-fn reference_traversal(params: &SearchParams) -> Option<&SearchTraversal> {
-    params.traversal.as_ref().filter(|traversal| {
-        let current = params.rev.is_none();
-        let symbols = matches!(
-            params.target,
-            SearchParamsTarget::All | SearchParamsTarget::Symbol
-        );
-        let incoming = matches!(
-            traversal.direction,
-            TraversalDirection::Incoming | TraversalDirection::Both
-        );
-        let references = traversal.facets.is_empty()
-            || traversal.facets.contains(&RelationshipFacet::References);
-        current && symbols && incoming && references
-    })
+/// The traversal a configured engine may answer references for, with the declaration it
+/// starts at. A walk riding beside `change` names no `seed` and reaches no engine: both
+/// compared sides are committed revisions, which no engine session serves.
+fn reference_traversal(params: &SearchParams) -> Option<(&SearchTraversal, &SymbolId)> {
+    let traversal = params.traversal.as_ref()?;
+    let seed = traversal.seed.as_ref()?;
+    let current = params.rev.is_none();
+    let symbols = matches!(
+        params.target,
+        SearchParamsTarget::All | SearchParamsTarget::Symbol
+    );
+    let incoming = matches!(
+        traversal.direction,
+        TraversalDirection::Incoming | TraversalDirection::Both
+    );
+    let references =
+        traversal.facets.is_empty() || traversal.facets.contains(&RelationshipFacet::References);
+    (current && symbols && incoming && references).then_some((traversal, seed))
 }
 
 fn reference_source<'source>(
@@ -179,11 +183,11 @@ pub async fn resolve_engine_references(
     if !uses_engine_references(reads, engines, params)? {
         return Ok(EngineReferences::default());
     }
-    let Some(traversal) = reference_traversal(params) else {
+    let Some((traversal, seed)) = reference_traversal(params) else {
         return Ok(EngineReferences::default());
     };
     validate_traversal(traversal)?;
-    let seed = CoreSymbolId::new(traversal.seed.0.clone())
+    let seed = CoreSymbolId::new(seed.0.clone())
         .map_err(|_| ReadFault::invalid("traversal.seed", "not a symbol identity"))?;
     let mut references = EngineReferences {
         revision: Some(reads.tree_revision().to_owned()),
@@ -200,7 +204,7 @@ pub async fn resolve_engine_references(
         step.depth = depth + 1;
         pending = walk_traversal_with_references(
             reads.relationships(),
-            &seed,
+            &TraversalSeeds::Named(seed.clone()),
             &step,
             TRAVERSAL_NODES_MAX,
             &references,
@@ -1065,7 +1069,12 @@ mod tests {
         engines.shutdown().await;
         let references = result?;
         assert!(references.is_empty());
-        assert!(references.resolved(&params.traversal.as_ref().expect("traversal").seed));
+        let seed = params
+            .traversal
+            .as_ref()
+            .and_then(|traversal| traversal.seed.as_ref())
+            .expect("the request names a seed");
+        assert!(references.resolved(seed));
         assert!(
             reads
                 .search_with_references(&params, &[], &references)?
@@ -1091,7 +1100,15 @@ mod tests {
             vec![rift_protocol::read::RelationshipFacet::Calls];
         let mut files = base;
         files.target = rift_protocol::read::SearchParamsTarget::File;
-        for params in [outgoing, calls, files] {
+        // A walk riding beside a comparison names no seed, so no engine answers it: both
+        // compared sides are committed revisions, which no engine session serves.
+        let arguments = json!({
+            "target": "symbol",
+            "change": {"base": "baseline"},
+            "traversal": {"direction": "incoming", "facets": ["references"]}
+        });
+        let compared: SearchParams = serde_json::from_value(arguments)?;
+        for params in [outgoing, calls, files, compared] {
             assert!(!super::uses_engine_references(&reads, &engines, &params)?);
         }
         assert_eq!(

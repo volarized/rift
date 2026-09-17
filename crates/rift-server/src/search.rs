@@ -18,7 +18,7 @@ use rift_protocol::read::{
     CHANGE_BASE_FIELD, CHANGE_HEAD_FIELD, MatchedField, PathPattern, PathSelector,
     ProjectPath as WireProjectPath, ReadWarning, ResultOrder, SearchChange, SearchHit,
     SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget, SearchResult, SearchScope,
-    SourceUnitId, Symbol, SymbolId,
+    SearchTraversal, SourceUnitId, Symbol, SymbolId,
 };
 use rift_search::{Declaration, DescribedUnit, RankedUnit};
 use rift_syntax::{ByteRange, SyntaxSymbol};
@@ -110,7 +110,10 @@ impl ReadService {
             )?;
         }
         let mut traversal_report = TraversalReport::default();
+        // `validate_search` refuses a `traversal` naming no `seed` unless `change` names
+        // the walk's starting declarations, and this path serves no comparison.
         if let Some(traversal) = params.traversal.as_ref()
+            && let Some(seed) = traversal.seed.as_ref()
             && matches!(
                 params.target,
                 SearchParamsTarget::All | SearchParamsTarget::Symbol
@@ -120,7 +123,7 @@ impl ReadService {
                 self,
                 selected.matcher.as_ref(),
                 self.index().root(),
-                traversal,
+                (traversal, seed),
                 references,
                 payloads,
                 &mut results,
@@ -386,6 +389,7 @@ pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
     }
     if let Some(traversal) = params.traversal.as_ref() {
         validate_traversal(traversal)?;
+        validate_traversal_seed(params, traversal)?;
         if params.rev.is_some() {
             return Err(ReadFault::unsupported("traversal at a revision"));
         }
@@ -401,13 +405,37 @@ pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
     Ok(())
 }
 
+/// Refuses a `traversal` whose `seed` disagrees with what the request seeds the walk from.
+///
+/// A walk standing without `change` has no other starting declaration, so `seed` names it.
+/// A walk riding beside `change` starts at every changed declaration, so a `seed` beside it
+/// names a second starting point the answer cannot honor. `schemars`' cross-field rules are
+/// advisory only, so this mirrors the rule `require_traversal_seed` advertises.
+fn validate_traversal_seed(
+    params: &SearchParams,
+    traversal: &SearchTraversal,
+) -> Result<(), ReadError> {
+    match (params.change.is_some(), traversal.seed.is_some()) {
+        (false, false) => Err(ReadFault::invalid(
+            "seed",
+            "a traversal without change starts at seed",
+        )),
+        (true, true) => Err(ReadFault::invalid(
+            "seed",
+            "a traversal beside change starts at every changed declaration",
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Refuses a `change` beside a field that selects another result set or another tree, and
 /// a revision spelling that breaks the charset [`RevisionId`] advertises.
 ///
 /// The `change` block names both sides of the comparison itself, so `rev` has nothing left
-/// to address; `query` and `traversal` each select a result set of their own. A `scope`
-/// past `project` follows the rule every revision-addressed read applies, since the
-/// dependency index serves the current tree alone.
+/// to address, and `query` selects a result set of its own. A `scope` past `project`
+/// follows the rule every revision-addressed read applies, since the dependency index
+/// serves the current tree alone. A `traversal` is the one block that rides beside a
+/// comparison: it extends the same result set rather than selecting another.
 fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), ReadError> {
     if params.rev.is_some() {
         return Err(ReadFault::invalid(
@@ -420,9 +448,6 @@ fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), R
             "change",
             "query and change select different result sets",
         ));
-    }
-    if params.traversal.is_some() {
-        return Err(ReadFault::unsupported("a traversal seeded from a change"));
     }
     if params.scope != SearchScope::Project {
         return Err(ReadFault::invalid(
@@ -976,12 +1001,18 @@ pub(crate) fn find_symbol_hit_mut<'a>(
         file.path().as_str(),
         &symbol.qualified_name,
     ));
-    results.iter_mut().find(|hit| {
-        matches!(
-            &hit.hit,
-            SearchHitTarget::Symbol { symbol } if symbol.id.as_ref() == Some(&identity)
-        )
-    })
+    results
+        .iter_mut()
+        .find(|hit| hit_symbol_id(hit) == Some(&identity))
+}
+
+/// One hit's declaration identity: absent for a node or file hit, and for a symbol hit
+/// whose identity no accepted evidence established.
+pub(crate) fn hit_symbol_id(hit: &SearchHit) -> Option<&SymbolId> {
+    match &hit.hit {
+        SearchHitTarget::Symbol { symbol } => symbol.id.as_ref(),
+        SearchHitTarget::Node { .. } | SearchHitTarget::File { .. } => None,
+    }
 }
 
 /// Merges one resolved ranked symbol unit: an identifier-matched hit for the same symbol
@@ -3795,6 +3826,48 @@ pub fn compute() -> i32 {
         );
         assert_eq!(error.descriptor().code(), "invalid_request");
         Ok(())
+    }
+
+    /// A walk names its starting declaration exactly once: through `seed` when it stands
+    /// without `change`, and through the changed declarations themselves beside one.
+    #[test]
+    fn validate_search_refuses_a_traversal_whose_seed_disagrees_with_its_request() {
+        let cases = [
+            json!({"traversal": {"direction": "incoming"}}),
+            json!({
+                "change": {"base": "baseline"},
+                "traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}
+            }),
+        ];
+        for arguments in cases {
+            let params: SearchParams =
+                serde_json::from_value(arguments.clone()).expect("the request parses");
+            let error = super::validate_search(&params).expect_err("the seed rule must refuse");
+            assert!(
+                matches!(error.fault(), ReadFault::Invalid { field: "seed", .. }),
+                "{arguments}: {error}"
+            );
+            assert_eq!(error.descriptor().code(), "invalid_request", "{arguments}");
+        }
+    }
+
+    /// A walk beside a comparison names no `seed`, and one standing without a comparison
+    /// names one: both pass the rule.
+    #[test]
+    fn validate_search_accepts_each_way_a_walk_names_its_starting_declaration() {
+        let cases = [
+            json!({"traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}}),
+            json!({
+                "change": {"base": "baseline"},
+                "traversal": {"direction": "incoming"}
+            }),
+        ];
+        for arguments in cases {
+            let params: SearchParams =
+                serde_json::from_value(arguments.clone()).expect("the request parses");
+            let accepted = super::validate_search(&params);
+            assert!(accepted.is_ok(), "{arguments} must pass the seed rule");
+        }
     }
 
     #[test]

@@ -978,6 +978,22 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
+    /// A relationship walk rode beside a comparison, and the graph it walked is the current
+    /// tree's, the only relationship graph the server holds. Its edges are the current
+    /// tree's edges, not those of either compared revision: a reached declaration is what
+    /// references the changed declaration today, and a reference either compared revision
+    /// held and the current tree does not is absent. The warning states which tree supplied
+    /// the edges; it never states that the answer is incomplete for that tree. Rides every
+    /// answer whose `change` carries a `traversal`.
+    ChangeTraversalCurrentTree {
+        /// Changed declarations the current tree holds no node for, so the walk started at
+        /// none of them. A declaration the head revision removed is counted here, as is one
+        /// the current tree no longer holds at the path the comparison found it in.
+        unplaced: u64,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
     /// Cataloged packages with a source root are still being indexed, so a `dependencies`
     /// or `all` answer holds their declarations only once the index reaches them. The
     /// answer is served from the packages indexed so far. Rides only an answer whose

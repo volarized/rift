@@ -63,7 +63,7 @@ pub(crate) struct TraversalReport {
     pub(crate) truncated: bool,
 }
 
-/// Fourth hit-collection lane: a bounded relationship walk from `traversal.seed`, merged into
+/// Fourth hit-collection lane: a bounded relationship walk from `seed`, merged into
 /// `results` alongside whatever the lexical and ranked lanes already placed there. Runs after
 /// them so a symbol also reached by the walk absorbs it instead of duplicating it.
 ///
@@ -76,28 +76,69 @@ pub(crate) fn collect_traversal_hits(
     reads: &ReadService,
     matcher: Option<&PathMatcher>,
     root: &Path,
-    traversal: &SearchTraversal,
+    (traversal, seed): (&SearchTraversal, &SymbolId),
     references: &EngineReferences,
     payloads: HitPayloads,
     results: &mut Vec<SearchHit>,
 ) -> Result<TraversalReport, ReadError> {
     let store = reads.relationships();
-    if store.is_empty() && !reads.index().binding_enabled() && !references.resolved(&traversal.seed)
-    {
+    if store.is_empty() && !reads.index().binding_enabled() && !references.resolved(seed) {
         return Err(ReadFault::unsupported(
             "relationship traversal (providers.binding disabled)",
         ));
     }
-    let seed = resolve_traversal_seed(reads, &traversal.seed)?;
+    let seed = resolve_traversal_seed(reads, seed)?;
     let coverage_missing = relationship_coverage_missing(reads, traversal, &seed);
-    let walk =
-        walk_traversal_with_references(store, &seed, traversal, TRAVERSAL_NODES_MAX, references);
-    for (identity, path) in walk.discovered {
-        if traversal
-            .to
-            .as_ref()
-            .is_some_and(|to| to.0 != identity.as_str())
-        {
+    let walk = walk_traversal_with_references(
+        store,
+        &TraversalSeeds::Named(seed),
+        traversal,
+        TRAVERSAL_NODES_MAX,
+        references,
+    );
+    let merge = WalkMerge {
+        matcher,
+        root,
+        to: traversal.to.as_ref(),
+        ranking: TraversalRanking::Distance,
+        payloads,
+    };
+    merge_walk_hits(reads, walk.discovered, merge, results)?;
+    Ok(TraversalReport {
+        coverage_missing,
+        truncated: walk.truncated,
+    })
+}
+
+/// What one walk's discoveries pass before they become hits: the files the request's
+/// `paths` selector reaches, the one symbol `to` keeps, and what the walk's own hits are
+/// scored by.
+#[derive(Clone, Copy)]
+pub(crate) struct WalkMerge<'merge> {
+    pub(crate) matcher: Option<&'merge PathMatcher>,
+    pub(crate) root: &'merge Path,
+    pub(crate) to: Option<&'merge SymbolId>,
+    pub(crate) ranking: TraversalRanking,
+    pub(crate) payloads: HitPayloads,
+}
+
+/// Merges every symbol one walk discovered into `results`, in the order the walk found
+/// them.
+///
+/// A discovery `results` already holds absorbs the walk; any other becomes a new hit
+/// tagged [`MatchedField::Relationship`].
+///
+/// # Errors
+///
+/// Returns [`ReadError`] when a reached declaration cannot be assembled into a hit.
+pub(crate) fn merge_walk_hits(
+    reads: &ReadService,
+    discovered: Vec<(CoreSymbolId, Vec<GraphHop>)>,
+    merge: WalkMerge<'_>,
+    results: &mut Vec<SearchHit>,
+) -> Result<(), ReadError> {
+    for (identity, path) in discovered {
+        if merge.to.is_some_and(|to| to.0 != identity.as_str()) {
             continue;
         }
         let Some((file, symbol)) = resolve_graph_symbol(reads.index(), &identity) else {
@@ -106,15 +147,22 @@ pub(crate) fn collect_traversal_hits(
             // makes for a ranked unit whose declaration is likewise gone.
             continue;
         };
-        if !includes(matcher, root, file.path()) {
+        if !includes(merge.matcher, merge.root, file.path()) {
             continue;
         }
-        merge_traversal_hit(reads.index(), results, file, symbol, path, payloads)?;
+        merge_traversal_hit(reads.index(), results, file, symbol, path, merge)?;
     }
-    Ok(TraversalReport {
-        coverage_missing,
-        truncated: walk.truncated,
-    })
+    Ok(())
+}
+
+/// Whether this snapshot can start a walk at `identity`: a relationship-store node, or a
+/// lexical declaration the store simply holds no edge for. A real, isolated declaration is
+/// walkable; its walk finds nothing.
+pub(crate) fn walkable(reads: &ReadService, identity: &CoreSymbolId) -> bool {
+    let store = reads.relationships();
+    !store.outgoing(identity).is_empty()
+        || !store.incoming(identity).is_empty()
+        || resolve_graph_symbol(reads.index(), identity).is_some()
 }
 
 /// The relationship coverage `traversal` asks for that no provider populates: the requested
@@ -143,7 +191,7 @@ fn relationship_coverage_missing(
 ///
 /// `validate_traversal` refuses a list longer than `SEARCH_TRAVERSAL_FACETS_MAX` before this
 /// runs, which bounds both the scan and the deduplication it carries.
-fn unproducible_facets(requested: &[RelationshipFacet]) -> Vec<RelationshipFacet> {
+pub(crate) fn unproducible_facets(requested: &[RelationshipFacet]) -> Vec<RelationshipFacet> {
     let produced = produced_relationship_facets();
     let mut missing: Vec<RelationshipFacet> = Vec::new();
     for facet in requested {
@@ -179,7 +227,7 @@ fn uncovered_language(
 
 /// The `relationship_coverage_missing` warning naming what has no provider, or `None` when
 /// neither `facets` nor `language` names a gap.
-fn relationship_coverage_warning(
+pub(crate) fn relationship_coverage_warning(
     facets: Vec<RelationshipFacet>,
     language: Option<Language>,
 ) -> Option<ReadWarning> {
@@ -222,15 +270,11 @@ fn language_gap_clause(language: &Language) -> String {
 }
 
 /// Resolves a traversal's `seed`, refusing `not_found` naming it when the identity exists
-/// neither as a relationship-store node nor as a lexical declaration. A real, isolated
-/// declaration with zero edges still resolves; its walk simply finds nothing.
+/// neither as a relationship-store node nor as a lexical declaration.
 fn resolve_traversal_seed(reads: &ReadService, seed: &SymbolId) -> Result<CoreSymbolId, ReadError> {
     let not_found = || ReadFault::not_found(seed.0.clone());
     let identity = CoreSymbolId::new(seed.0.clone()).map_err(|_error| not_found())?;
-    let store = reads.relationships();
-    let in_store = !store.outgoing(&identity).is_empty() || !store.incoming(&identity).is_empty();
-    let has_lexical_record = resolve_graph_symbol(reads.index(), &identity).is_some();
-    if in_store || has_lexical_record {
+    if walkable(reads, &identity) {
         Ok(identity)
     } else {
         Err(not_found())
@@ -252,7 +296,7 @@ pub(crate) fn resolve_graph_symbol<'a>(
 /// the node bound stopped the walk before the reachable graph was exhausted.
 pub(crate) struct TraversalWalk {
     pub(crate) discovered: Vec<(CoreSymbolId, Vec<GraphHop>)>,
-    truncated: bool,
+    pub(crate) truncated: bool,
 }
 
 /// The warning a truncated traversal walk attaches: the bound the walk hit, and the
@@ -268,39 +312,73 @@ pub(crate) fn traversal_truncation_warning() -> ReadWarning {
     }
 }
 
-/// Walks `store` breadth-first from `seed`, honoring `traversal`'s direction, facet filter,
-/// and depth bound. BFS visits each symbol at its shortest path first and never requeues a
-/// visited symbol, so every returned path is the shortest one `store` has to it. Bounded by
-/// `TRAVERSAL_NODES_MAX`.
+/// The declarations one walk starts at.
+pub(crate) enum TraversalSeeds {
+    /// The one declaration a `traversal` request names. The walk never reports it, since
+    /// `SearchTraversal.seed` states the seed is never a hit.
+    Named(CoreSymbolId),
+    /// Every declaration a comparison found changed. Each of them is already a hit of its
+    /// own, so a changed declaration another changed declaration reaches is reported like
+    /// any other discovery and absorbs the walk into the hit it already has.
+    Changed(Vec<CoreSymbolId>),
+}
+
+impl TraversalSeeds {
+    /// The declarations the queue begins with, each at an empty path.
+    fn queued(&self) -> Vec<CoreSymbolId> {
+        match self {
+            Self::Named(seed) => vec![seed.clone()],
+            Self::Changed(changed) => changed.clone(),
+        }
+    }
+
+    /// The declarations recorded before the first hop runs, so no hop reports them.
+    fn recorded(&self) -> BTreeSet<CoreSymbolId> {
+        match self {
+            Self::Named(seed) => BTreeSet::from([seed.clone()]),
+            Self::Changed(_) => BTreeSet::new(),
+        }
+    }
+}
+
 /// Traversal under an explicit node cap for deterministic truncation tests.
 #[cfg(test)]
 fn walk_traversal_capped(
     store: &RelationshipStore,
-    seed: &CoreSymbolId,
+    seeds: &TraversalSeeds,
     traversal: &SearchTraversal,
     nodes_max: usize,
 ) -> TraversalWalk {
     walk_traversal_with_references(
         store,
-        seed,
+        seeds,
         traversal,
         nodes_max,
         &EngineReferences::default(),
     )
 }
 
+/// Walks `store` breadth-first from every declaration in `seeds` at once, honoring
+/// `traversal`'s direction, facet filter, and depth bound. BFS visits each symbol at its
+/// shortest path first and never requeues a symbol already discovered, so every returned
+/// path is the shortest one `store` has to it from the nearest seed.
+///
+/// One `nodes_max` budget covers the whole walk however many declarations seed it, so the
+/// total symbols discovered keeps that bound rather than multiplying it by the seed count.
 pub(crate) fn walk_traversal_with_references(
     store: &RelationshipStore,
-    seed: &CoreSymbolId,
+    seeds: &TraversalSeeds,
     traversal: &SearchTraversal,
     nodes_max: usize,
     references: &EngineReferences,
 ) -> TraversalWalk {
-    let mut visited: BTreeSet<CoreSymbolId> = BTreeSet::from([seed.clone()]);
+    let queued = seeds.queued();
+    let mut enqueued: BTreeSet<CoreSymbolId> = queued.iter().cloned().collect();
+    let mut recorded = seeds.recorded();
     let mut budget = LoopBudget::new(nodes_max);
     let mut truncated = false;
     let mut queue: VecDeque<(CoreSymbolId, Vec<GraphHop>)> =
-        VecDeque::from([(seed.clone(), Vec::new())]);
+        queued.into_iter().map(|seed| (seed, Vec::new())).collect();
     let mut discovered = Vec::new();
     while let Some((current, path)) = queue.pop_front() {
         if path.len() as u64 >= traversal.depth {
@@ -313,18 +391,22 @@ pub(crate) fn walk_traversal_with_references(
             let Some(next) = edge.next() else {
                 continue;
             };
-            if visited.contains(&next) {
+            if recorded.contains(&next) {
                 continue;
             }
             if budget.consume().is_err() {
                 truncated = true;
                 continue;
             }
-            visited.insert(next.clone());
+            recorded.insert(next.clone());
             let mut next_path = path.clone();
             next_path.push(edge.hop());
-            queue.push_back((next.clone(), next_path.clone()));
-            discovered.push((next, next_path));
+            discovered.push((next.clone(), next_path.clone()));
+            // A seed reached by another seed is already queued at its own empty path, so
+            // it takes this discovery and keeps the walk it started.
+            if enqueued.insert(next.clone()) {
+                queue.push_back((next, next_path));
+            }
         }
     }
     TraversalWalk {
@@ -469,15 +551,29 @@ fn wire_symbol_id(identity: &CoreSymbolId) -> SymbolId {
     SymbolId(identity.as_str().to_owned())
 }
 
-/// A reached symbol's `relevance` score: a closer hit (`distance` 1) scores higher than a
-/// farther one (`distance` 2, `SearchTraversal`'s own bound). This is the whole ranking basis
-/// a traversal-only request has, so ordering by it reproduces the distance-ascending order
-/// `SearchTraversal`'s doc comment promises; a hit also matched lexically keeps its lexical
-/// score instead - `absorb_traversal_match` never touches `score`.
-fn traversal_hit_score(distance: u64) -> f64 {
-    match distance {
-        1 => 1.0,
-        _ => 0.5,
+/// What a walk's own hits are ranked by.
+#[derive(Clone, Copy)]
+pub(crate) enum TraversalRanking {
+    /// Score each reached hit from its `distance`: the walk is the whole ranking basis a
+    /// `traversal` request has.
+    Distance,
+    /// Leave every reached hit unscored: a comparison ranks nothing, so a walk riding
+    /// beside one adds no score its change hits could be compared against.
+    Unranked,
+}
+
+impl TraversalRanking {
+    /// A reached symbol's `relevance` score: a closer hit (`distance` 1) scores higher than
+    /// a farther one (`distance` 2, `SearchTraversal`'s own bound). Ordering by it
+    /// reproduces the distance-ascending order `SearchTraversal`'s doc comment promises; a
+    /// hit also matched lexically keeps its lexical score instead - `absorb_traversal_match`
+    /// never touches `score`.
+    fn score(self, distance: u64) -> Option<f64> {
+        match self {
+            Self::Distance if distance == 1 => Some(1.0),
+            Self::Distance => Some(0.5),
+            Self::Unranked => None,
+        }
     }
 }
 
@@ -489,7 +585,7 @@ fn merge_traversal_hit(
     file: &IndexedFile,
     symbol: &SyntaxSymbol,
     path: Vec<GraphHop>,
-    payloads: HitPayloads,
+    merge: WalkMerge<'_>,
 ) -> Result<(), ReadError> {
     let distance = u64::try_from(path.len()).unwrap_or(u64::MAX);
     if let Some(existing) = find_symbol_hit_mut(results, file, symbol) {
@@ -505,9 +601,9 @@ fn merge_traversal_hit(
     let mut hit = build_symbol_hit(
         index,
         matched,
-        Some(traversal_hit_score(distance)),
+        merge.ranking.score(distance),
         vec![MatchedField::Relationship],
-        payloads,
+        merge.payloads,
     )?;
     hit.traversal_path = Some(path);
     hit.distance = Some(distance);
@@ -516,8 +612,9 @@ fn merge_traversal_hit(
 }
 
 /// Records that `existing` was also reached by the walk: adds [`MatchedField::Relationship`]
-/// when absent, and attaches the walk's path and distance. `existing.score` stays untouched -
-/// a lexical or ranked match's score already means more than a graph distance would.
+/// when absent, and attaches the walk's path and distance. Every other payload stays
+/// untouched - a lexical or ranked match's score already means more than a graph distance
+/// would, and a changed declaration keeps the `change` block that named what differs.
 fn absorb_traversal_match(existing: &mut SearchHit, path: Vec<GraphHop>, distance: u64) {
     if !existing.matched_by.contains(&MatchedField::Relationship) {
         existing.matched_by.push(MatchedField::Relationship);
@@ -545,7 +642,7 @@ pub(crate) mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    use super::{CoreSymbolId, TRAVERSAL_NODES_MAX, walk_traversal_capped};
+    use super::{CoreSymbolId, TRAVERSAL_NODES_MAX, TraversalSeeds, walk_traversal_capped};
     use crate::read::ReadService;
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -732,7 +829,7 @@ pub(crate) mod tests {
         facets: Vec<RelationshipFacet>,
     ) -> SearchTraversal {
         SearchTraversal {
-            seed: rift_protocol::read::SymbolId(seed.as_str().to_owned()),
+            seed: Some(rift_protocol::read::SymbolId(seed.as_str().to_owned())),
             direction,
             facets,
             depth,
@@ -745,8 +842,13 @@ pub(crate) mod tests {
         let store = call_graph_store();
         let root = graph_symbol_id("rift://symbol/rust/lib.rs/root");
         let request = traversal_request(&root, TraversalDirection::Outgoing, 1, vec![]);
-        let discovered =
-            walk_traversal_capped(&store, &root, &request, TRAVERSAL_NODES_MAX).discovered;
+        let discovered = walk_traversal_capped(
+            &store,
+            &TraversalSeeds::Named(root.clone()),
+            &request,
+            TRAVERSAL_NODES_MAX,
+        )
+        .discovered;
         let reached: Vec<&str> = discovered.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(
             reached,
@@ -769,8 +871,13 @@ pub(crate) mod tests {
         let store = call_graph_store();
         let leaf = graph_symbol_id("rift://symbol/rust/lib.rs/leaf");
         let request = traversal_request(&leaf, TraversalDirection::Incoming, 1, vec![]);
-        let discovered =
-            walk_traversal_capped(&store, &leaf, &request, TRAVERSAL_NODES_MAX).discovered;
+        let discovered = walk_traversal_capped(
+            &store,
+            &TraversalSeeds::Named(leaf.clone()),
+            &request,
+            TRAVERSAL_NODES_MAX,
+        )
+        .discovered;
         let reached: Vec<&str> = discovered.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(
             reached,
@@ -794,8 +901,13 @@ pub(crate) mod tests {
         let store = call_graph_store();
         let branch_a = graph_symbol_id("rift://symbol/rust/lib.rs/branch_a");
         let request = traversal_request(&branch_a, TraversalDirection::Both, 1, vec![]);
-        let discovered =
-            walk_traversal_capped(&store, &branch_a, &request, TRAVERSAL_NODES_MAX).discovered;
+        let discovered = walk_traversal_capped(
+            &store,
+            &TraversalSeeds::Named(branch_a.clone()),
+            &request,
+            TRAVERSAL_NODES_MAX,
+        )
+        .discovered;
         let reached: Vec<(&str, super::HopDirection)> = discovered
             .iter()
             .map(|(id, path)| (id.as_str(), path[0].direction))
@@ -826,8 +938,13 @@ pub(crate) mod tests {
             1,
             vec![RelationshipFacet::Calls],
         );
-        let discovered =
-            walk_traversal_capped(&store, &root, &request, TRAVERSAL_NODES_MAX).discovered;
+        let discovered = walk_traversal_capped(
+            &store,
+            &TraversalSeeds::Named(root.clone()),
+            &request,
+            TRAVERSAL_NODES_MAX,
+        )
+        .discovered;
         let reached: Vec<&str> = discovered.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(
             reached,
@@ -846,8 +963,13 @@ pub(crate) mod tests {
         let store = call_graph_store();
         let root = graph_symbol_id("rift://symbol/rust/lib.rs/root");
         let request = traversal_request(&root, TraversalDirection::Outgoing, 2, vec![]);
-        let discovered =
-            walk_traversal_capped(&store, &root, &request, TRAVERSAL_NODES_MAX).discovered;
+        let discovered = walk_traversal_capped(
+            &store,
+            &TraversalSeeds::Named(root.clone()),
+            &request,
+            TRAVERSAL_NODES_MAX,
+        )
+        .discovered;
         let leaf_hits: Vec<_> = discovered
             .iter()
             .filter(|(id, _)| id.as_str() == "rift://symbol/rust/lib.rs/leaf")
@@ -874,7 +996,7 @@ pub(crate) mod tests {
         let store = call_graph_store();
         let root = graph_symbol_id("rift://symbol/rust/lib.rs/root");
         let request = traversal_request(&root, TraversalDirection::Outgoing, 2, vec![]);
-        let walk = walk_traversal_capped(&store, &root, &request, 2);
+        let walk = walk_traversal_capped(&store, &TraversalSeeds::Named(root.clone()), &request, 2);
         assert!(
             walk.truncated,
             "a walk stopped by its bound reports the truncation"
@@ -893,6 +1015,82 @@ pub(crate) mod tests {
                 "rift://symbol/rust/lib.rs/branch_b",
             ],
             "the store's own sorted order makes the first two discoveries deterministic"
+        );
+    }
+
+    /// A comparison seeds every changed declaration, so a seed another seed reaches is a
+    /// discovery of its own, carrying the path the walk found to it.
+    #[test]
+    fn walk_traversal_changed_reports_a_seed_another_seed_reaches() {
+        let store = call_graph_store();
+        let root = graph_symbol_id("rift://symbol/rust/lib.rs/root");
+        let branch_a = graph_symbol_id("rift://symbol/rust/lib.rs/branch_a");
+        let request = traversal_request(&root, TraversalDirection::Outgoing, 1, vec![]);
+        let seeds = TraversalSeeds::Changed(vec![root.clone(), branch_a.clone()]);
+        let discovered =
+            walk_traversal_capped(&store, &seeds, &request, TRAVERSAL_NODES_MAX).discovered;
+        let reached: Vec<&str> = discovered.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            reached,
+            [
+                "rift://symbol/rust/lib.rs/branch_a",
+                "rift://symbol/rust/lib.rs/branch_b",
+                "rift://symbol/rust/lib.rs/helper",
+                "rift://symbol/rust/lib.rs/leaf",
+            ],
+            "branch_a is both a seed and root's neighbor, and its own hop still runs"
+        );
+        let branch_a_path = &discovered[0].1;
+        assert_eq!(branch_a_path.len(), 1);
+        assert_eq!(branch_a_path[0].relationship.from.0, root.as_str());
+        let leaf_path = &discovered[3].1;
+        assert_eq!(
+            leaf_path[0].relationship.from.0,
+            branch_a.as_str(),
+            "leaf is one hop from the seed that reached it, not two from root"
+        );
+    }
+
+    /// One node budget covers every seed: two seeds under a cap of two discover two
+    /// symbols between them, not two each.
+    #[test]
+    fn walk_traversal_changed_seeds_share_one_node_budget() {
+        let store = call_graph_store();
+        let root = graph_symbol_id("rift://symbol/rust/lib.rs/root");
+        let branch_a = graph_symbol_id("rift://symbol/rust/lib.rs/branch_a");
+        let request = traversal_request(&root, TraversalDirection::Outgoing, 1, vec![]);
+        let seeds = TraversalSeeds::Changed(vec![root, branch_a]);
+
+        let walk = walk_traversal_capped(&store, &seeds, &request, 2);
+
+        assert!(walk.truncated, "the shared budget stopped the walk");
+        let reached: Vec<&str> = walk.discovered.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            reached,
+            [
+                "rift://symbol/rust/lib.rs/branch_a",
+                "rift://symbol/rust/lib.rs/branch_b",
+            ],
+            "a budget of its own per seed would have reached leaf as well: {reached:?}"
+        );
+    }
+
+    /// A `traversal` request names one seed, and that seed is never a hit however the walk
+    /// reaches it - here through the incoming edge of its own outgoing neighbor.
+    #[test]
+    fn walk_traversal_named_seed_is_never_reported_however_the_walk_reaches_it() {
+        let store = call_graph_store();
+        let branch_a = graph_symbol_id("rift://symbol/rust/lib.rs/branch_a");
+        let request = traversal_request(&branch_a, TraversalDirection::Both, 2, vec![]);
+        let seeds = TraversalSeeds::Named(branch_a.clone());
+
+        let discovered =
+            walk_traversal_capped(&store, &seeds, &request, TRAVERSAL_NODES_MAX).discovered;
+
+        let reached: Vec<&str> = discovered.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(
+            !reached.contains(&branch_a.as_str()),
+            "the named seed stays out of its own walk: {reached:?}"
         );
     }
 
@@ -1035,8 +1233,13 @@ pub(crate) mod tests {
         let helper = graph_symbol_id("rift://symbol/rust/lib.rs/helper");
         // `helper` has an incoming edge but no outgoing one.
         let request = traversal_request(&helper, TraversalDirection::Outgoing, 2, vec![]);
-        let discovered =
-            walk_traversal_capped(&store, &helper, &request, TRAVERSAL_NODES_MAX).discovered;
+        let discovered = walk_traversal_capped(
+            &store,
+            &TraversalSeeds::Named(helper.clone()),
+            &request,
+            TRAVERSAL_NODES_MAX,
+        )
+        .discovered;
         assert!(discovered.is_empty(), "{discovered:?}");
     }
 
@@ -1466,7 +1669,7 @@ pub(crate) mod tests {
         );
         let walk = super::walk_traversal_with_references(
             &store,
-            &target,
+            &TraversalSeeds::Named(target.clone()),
             &request,
             TRAVERSAL_NODES_MAX,
             &references,
