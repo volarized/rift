@@ -18,6 +18,10 @@ just test
 
 The unit suite runs without external language servers, model downloads, or corpus checkouts.
 The test selection keeps those dependencies in the integration suite.
+
+Some suites start a server that binds the loopback port range, which is machine-global. Nextest
+runs each test in its own process, so those suites share one `election` test group that admits a
+single test at a time.
 `just doctest` runs Rust documentation examples through `cargo test --doc`, because nextest
 does not support doctests on stable Rust.
 
@@ -58,6 +62,11 @@ just corpus-test nextjs
 Corpus suites use the optimized Cargo `corpus` profile with debug assertions, overflow checks,
 and line tables. Nextest runs one corpus test at a time. CI reuses one compiled archive across
 the corpus jobs.
+
+Each corpus case stops its own actions thirty seconds before the deadline nextest ends it at, so
+removing the served checkout and writing the JSON report land inside that same deadline. A case
+that crosses the bound fails naming the action it was running, rather than being killed with no
+evidence of where it stood.
 
 The cache lives under `~/.cache/rift-corpus`. Each suite creates a disposable checkout at the
 commit in `crates/rift/tests/corpus/pins.toml`. Fetches retain 50 commits of history; a separate

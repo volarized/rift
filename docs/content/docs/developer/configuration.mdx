@@ -197,6 +197,7 @@ command = ["rustup", "run", "1.98", "rust-analyzer"]
 environment = {}
 startup_timeout = "30s"
 request_timeout = "1m"
+settle_delay = "500ms"
 output_limit = "4kb"
 
 [lsp.rust.retry]
@@ -270,7 +271,8 @@ refused. A bare name resolves through the server's `PATH`, with `environment` ap
 `environment` defaults empty and holds at most 64 entries.
 
 `startup_timeout` defaults to `"30s"` and takes `"1s"` to `"10m"`. `request_timeout` defaults
-to `"1m"` and takes `"1s"` to `"10m"`. `output_limit` defaults to `"4kb"` and takes `"1kb"` to
+to `"1m"` and takes `"1s"` to `"10m"`. `settle_delay` defaults to `"500ms"` and takes `"10ms"` to
+`"1m"`. `output_limit` defaults to `"4kb"` and takes `"1kb"` to
 `"8mb"`; Rift still reports the full size, so you can tell a truncated log from a short one.
 
 `retry` bounds repeated requests while an answer stays unsettled. `attempts` includes the first
@@ -292,6 +294,14 @@ list holds at most 64 patterns.
 A language server may decline a request it's already serving, report that the file moved under
 it, or answer before it has loaded the declaration. Every such refusal gets the configured retry
 schedule. If every attempt refuses, Rift returns the language server's latest words.
+
+`settle_delay` decides when an answer stops being provisional. A language server reports what it
+is loading over work-done progress, and rust-analyzer ends and begins those reports in bursts:
+its outstanding work empties several times inside one project load, well before the phase that
+resolves references has run. So Rift calls a process loaded only once its work has stayed
+announced and empty for `settle_delay`, measured at the last output Rift read from it. Raise it
+for a process whose load falls silent for longer than half a second between phases; the retry
+schedule above is what carries a request across the wait.
 
 A capability the server never advertised is not a refusal and returns at once.
 
