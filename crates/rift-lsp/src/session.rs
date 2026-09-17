@@ -1933,6 +1933,13 @@ mod tests {
         let mut record = WorkProgress::default();
 
         record.began(fetching.clone(), at(0));
+        record.ended(&fetching, at(1));
+        assert_eq!(
+            record.readiness(TEST_SETTLE_DELAY),
+            EngineReadiness::Analyzing,
+            "a record the session has read nothing past states no quiet at all"
+        );
+        record.began(fetching.clone(), at(1));
         record.read(at(711));
         record.ended(&fetching, at(711));
         assert_eq!(

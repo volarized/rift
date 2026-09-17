@@ -1213,6 +1213,59 @@ mod tests {
         assert_eq!(shape.example(), Some(&json!({"query": "beacon"})));
     }
 
+    /// A refusal names the value it stopped at the way the wire spells it.
+    #[test]
+    fn a_named_member_joins_members_by_dot_and_writes_each_element() {
+        assert_eq!(named_member(&[]), None, "the whole document has no name");
+        assert_eq!(
+            named_member(&[DocumentStep::Member("paths")]),
+            Some("paths".to_owned())
+        );
+        assert_eq!(
+            named_member(&[
+                DocumentStep::Member("paths"),
+                DocumentStep::Member("include"),
+                DocumentStep::Element,
+            ]),
+            Some("paths.include[]".to_owned())
+        );
+    }
+
+    /// A path segment addressing neither a member nor an element ends the walk,
+    /// because a step the schema cannot follow would misalign every step after
+    /// it. serde reports an enum's variant as such a segment.
+    #[test]
+    fn a_segment_the_schema_cannot_follow_ends_the_path() {
+        #[derive(Debug, serde::Deserialize)]
+        enum Choice {
+            First {
+                #[expect(
+                    dead_code,
+                    reason = "the field exists so serde reports the variant it failed inside"
+                )]
+                count: u32,
+            },
+        }
+
+        let refused = serde_path_to_error::deserialize::<_, Choice>(json!({
+            "First": {"count": "seven"}
+        }))
+        .expect_err("a count that is not a number must refuse");
+        let segments: Vec<String> = refused
+            .path()
+            .iter()
+            .map(|segment| format!("{segment:?}"))
+            .collect();
+        assert!(
+            segments.iter().any(|segment| segment.starts_with("Enum")),
+            "serde reports the variant as an enum segment: {segments:?}"
+        );
+        assert!(
+            document_steps(refused.path()).is_empty(),
+            "the walk stops at the variant rather than following it"
+        );
+    }
+
     /// A model may refer to itself, and a caller reaches this walk by sending
     /// one value the schema refuses. The walk answers with what it reached
     /// rather than following the cycle.

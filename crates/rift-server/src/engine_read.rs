@@ -330,7 +330,24 @@ async fn resolve_symbol_references(
         }
         Err(error) => return Err(ReadFault::engine(error)),
     };
-    match map_references(reads, identity, report, slot.workspace_root()) {
+    symbol_references(
+        map_references(reads, identity, report, slot.workspace_root()),
+        language,
+    )
+}
+
+/// What one mapped engine answer contributes to the read.
+///
+/// An answer the served bytes cannot carry drops the engine's contribution and
+/// leaves the indexed relationships standing. Every other failure is the engine
+/// tier's own, and still refuses the read: a broken document URI or a workspace
+/// root the server cannot address says nothing about the engine's revision, and
+/// degrading it would hide a defect behind a warning.
+fn symbol_references(
+    mapped: Result<Vec<GraphHop>, ReadError>,
+    language: Language,
+) -> Result<SymbolReferences, ReadError> {
+    match mapped {
         Ok(edges) => Ok(SymbolReferences::Resolved { edges, language }),
         Err(error) if matches!(error.fault(), ReadFault::EngineAnswer { .. }) => {
             Ok(SymbolReferences::Unmapped {
@@ -761,6 +778,43 @@ mod tests {
         Ok(())
     }
 
+    /// An unmappable answer degrades; every other mapping failure still
+    /// refuses, because it says nothing about what revision the engine holds.
+    #[test]
+    fn only_an_unmappable_answer_degrades_the_engine_contribution() {
+        let language = super::Language {
+            name: "rust".to_owned(),
+            dialect: None,
+        };
+        assert!(matches!(
+            super::symbol_references(Ok(Vec::new()), language.clone()),
+            Ok(super::SymbolReferences::Resolved { edges, .. }) if edges.is_empty()
+        ));
+        let unmapped = super::symbol_references(
+            Err(super::ReadFault::engine_answer(
+                "engine references",
+                "character out of range",
+            )),
+            language.clone(),
+        );
+        assert!(matches!(
+            unmapped,
+            Ok(super::SymbolReferences::Unmapped { detail, .. })
+                if detail.contains("character out of range")
+        ));
+        let refused = super::symbol_references(
+            Err(super::ReadFault::task(
+                "reference URI conversion",
+                "scheme refused",
+            )),
+            language,
+        );
+        assert!(
+            refused.is_err(),
+            "a failure that is not the engine's revision still refuses the read"
+        );
+    }
+
     #[tokio::test]
     async fn reference_sources_require_indexed_declaration_name_ranges() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -809,7 +863,7 @@ mod tests {
         let engines = pool(directory.path(), "python", configuration);
         let mut params = request(&symbol(&reads, "beacon"));
         params.traversal.as_mut().expect("traversal").depth = 2;
-        let result = resolve_engine_references(&reads, &engines, &params).await;
+        let result = Box::pin(resolve_engine_references(&reads, &engines, &params)).await;
         engines.shutdown().await;
         let references = result?;
         let seed = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;
@@ -868,8 +922,12 @@ mod tests {
         command.truncate(1);
         command.push(script.to_string_lossy().into_owned());
         let engines = pool(directory.path(), "rust", fixture.configuration);
-        let result =
-            resolve_engine_references(&reads, &engines, &request(&symbol(&reads, "beacon"))).await;
+        let result = Box::pin(resolve_engine_references(
+            &reads,
+            &engines,
+            &request(&symbol(&reads, "beacon")),
+        ))
+        .await;
         std::io::Write::write_all(&mut release, b"done\n")?;
         engines.shutdown().await;
         let references = result?;
@@ -975,7 +1033,7 @@ mod tests {
         let params = request(&symbol(&reads, "beacon"));
         let engines = EnginePool::new(directory.path(), BTreeMap::new(), BTreeMap::new());
         assert!(!super::uses_engine_references(&reads, &engines, &params)?);
-        let references = resolve_engine_references(&reads, &engines, &params).await?;
+        let references = Box::pin(resolve_engine_references(&reads, &engines, &params)).await?;
         assert!(references.is_empty());
         assert_eq!(
             reads.search(&params, &[])?,
@@ -993,8 +1051,12 @@ mod tests {
             json!({"command":"/refused-engine","retry":{"attempts":1},"restart":{"attempts":0}}),
         )?;
         let engines = pool(directory.path(), "rust", configuration);
-        let result =
-            resolve_engine_references(&reads, &engines, &request(&symbol(&reads, "beacon"))).await;
+        let result = Box::pin(resolve_engine_references(
+            &reads,
+            &engines,
+            &request(&symbol(&reads, "beacon")),
+        ))
+        .await;
         engines.shutdown().await;
         let error = result.expect_err("absolute program is refused");
         assert!(matches!(error.fault(), crate::ReadFault::Engine(_)));
@@ -1015,7 +1077,7 @@ mod tests {
         )?;
         let engines = pool(directory.path(), "python", configuration);
         let params = request(&symbol(&reads, "beacon"));
-        let resolved = resolve_engine_references(&reads, &engines, &params).await;
+        let resolved = Box::pin(resolve_engine_references(&reads, &engines, &params)).await;
         engines.shutdown().await;
         let references = resolved?;
         assert!(
@@ -1061,7 +1123,7 @@ mod tests {
         command[2] = command[2].replace("referencesProvider\":true", "referencesProvider\":null");
         // true and null have identical byte lengths, so the fixture's frame stays valid.
         let engines = pool(directory.path(), "rust", fixture.configuration);
-        let result = resolve_engine_references(&reads, &engines, &params).await;
+        let result = Box::pin(resolve_engine_references(&reads, &engines, &params)).await;
         engines.shutdown().await;
         let references = result?;
         assert!(references.is_empty());
@@ -1082,8 +1144,12 @@ mod tests {
         let mut fixture = super::process_lifecycle::answers(&[response], &["rust"]);
         fixture.retry.attempts = 1;
         let engines = pool(directory.path(), "rust", fixture.configuration);
-        let result =
-            resolve_engine_references(&reads, &engines, &request(&symbol(&reads, "beacon"))).await;
+        let result = Box::pin(resolve_engine_references(
+            &reads,
+            &engines,
+            &request(&symbol(&reads, "beacon")),
+        ))
+        .await;
         engines.shutdown().await;
         let error = result.expect_err("engine refused references");
         assert!(matches!(error.fault(), crate::ReadFault::Engine(_)));
@@ -1115,7 +1181,7 @@ mod tests {
                 .extend(invalid.as_object().expect("overrides").clone());
             let params = serde_json::from_value(value)?;
             let expected = reads.search(&params, &[]).expect_err("invalid search");
-            let error = resolve_engine_references(&reads, &engines, &params)
+            let error = Box::pin(resolve_engine_references(&reads, &engines, &params))
                 .await
                 .expect_err("invalid search before engine");
             assert_eq!(error.descriptor().code(), expected.descriptor().code());
@@ -1151,7 +1217,7 @@ mod tests {
         )?;
         let engines = pool(directory.path(), "python", configuration);
         let params = request(&symbol(&reads, "beacon"));
-        let result = resolve_engine_references(&reads, &engines, &params).await;
+        let result = Box::pin(resolve_engine_references(&reads, &engines, &params)).await;
         engines.shutdown().await;
         let references = result?;
         assert!(references.is_empty());

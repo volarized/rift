@@ -3580,10 +3580,11 @@ mod tests {
                 "tool {} states no example request",
                 tool.name
             );
-            let Some(definitions) = schema.get("$defs").and_then(serde_json::Value::as_object)
-            else {
-                continue;
-            };
+            let definitions = schema
+                .get("$defs")
+                .and_then(serde_json::Value::as_object)
+                .into_iter()
+                .flatten();
             for (name, definition) in definitions {
                 if definition.get("properties").is_none() {
                     continue;
