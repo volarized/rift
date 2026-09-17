@@ -78,6 +78,10 @@ fn corpus() -> Vec<(&'static str, Value)> {
             "nodes",
             json!({ "path": "packages/@scope/name/package.json", "position": 4 }),
         ),
+        (
+            "nodes",
+            json!({ "path": "notes for café.json", "position": 4 }),
+        ),
     ];
     requests.extend(dependency_scope_search_corpus());
     requests.extend(revision_read_corpus());
@@ -545,6 +549,12 @@ async fn served_fixture() -> TestResult<(
         directory.path().join("packages/@scope/name/package.json"),
         "{\n  \"name\": \"@scope/name\"\n}\n",
     )?;
+    // A path carrying bytes `encode_path` escapes rather than keeps, so the corpus validates a
+    // percent-encoded identity against the served pattern beside the literal one above.
+    fs::write(
+        directory.path().join("notes for café.json"),
+        "{\n  \"beacon\": \"escaped\"\n}\n",
+    )?;
     // A committed baseline, so the corpus can prove revision-addressed reads:
     // `hidden.rs` stays gitignored and uncommitted, everything else lands in
     // the fixture's one commit on `main`.
@@ -594,6 +604,8 @@ struct CorpusArms {
 
     dependency_units: usize,
     search_dependency_units: usize,
+    literal_at_identities: usize,
+    escaped_identities: usize,
 }
 
 impl CorpusArms {
@@ -602,6 +614,14 @@ impl CorpusArms {
     fn observe(&mut self, structured: &Value) {
         self.dependency_units += dependency_unit_count(&structured["hits"]);
         self.search_dependency_units += dependency_unit_count(&structured["results"]);
+        for identity in node_identities(structured) {
+            if identity.contains('@') && !identity.contains("%40") {
+                self.literal_at_identities += 1;
+            }
+            if identity.contains('%') {
+                self.escaped_identities += 1;
+            }
+        }
     }
 
     /// Fails the walk unless every tracked arm was produced live.
@@ -623,7 +643,43 @@ impl CorpusArms {
             "the corpus must prove a search hit answered from the dependency index, \
              carrying unit in place of path"
         );
+        assert!(
+            self.literal_at_identities > 0 && self.escaped_identities > 0,
+            "the corpus must mint one identity whose path keeps `@` literal and one whose \
+             path carries a percent escape, and validate both against the served pattern: \
+             literal_at_identities={}, escaped_identities={}",
+            self.literal_at_identities,
+            self.escaped_identities
+        );
     }
+}
+
+/// Every node identity one answer carries, whatever tool produced it.
+///
+/// A `nodes` answer lists them under `id`; a search hit carries one under `node`.
+fn node_identities(structured: &Value) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut pending = vec![structured];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Object(members) => {
+                for (key, member) in members {
+                    match member {
+                        Value::String(identity)
+                            if matches!(key.as_str(), "id" | "node")
+                                && identity.starts_with("rift://node/") =>
+                        {
+                            found.push(identity.clone());
+                        }
+                        _ => pending.push(member),
+                    }
+                }
+            }
+            Value::Array(entries) => pending.extend(entries),
+            _ => {}
+        }
+    }
+    found
 }
 
 /// How many of `rows`, the hits of one paginated answer, carry `unit` in place of `path`.
