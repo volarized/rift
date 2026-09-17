@@ -435,6 +435,7 @@ mod tests {
             hubs: Vec::new(),
             entry_points: Vec::new(),
             docs: Vec::new(),
+            module_relationships: Vec::new(),
             packages: Vec::new(),
             pagination: Pagination {
                 page_index: 0,

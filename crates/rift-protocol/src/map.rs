@@ -21,6 +21,9 @@ pub const MAP_DOCS_MAX: usize = 100;
 /// [`WorkspaceMap::packages`] entries one map carries, at most.
 pub const MAP_PACKAGES_MAX: usize = 1_000;
 
+/// [`WorkspaceMap::module_relationships`] entries one map carries, at most.
+pub const MAP_MODULE_RELATIONSHIPS_MAX: usize = 100;
+
 /// Workspace orientation snapshot served by `rift://map`. Carries per-language totals, the
 /// directory tree indexed files sit under, the most-referenced symbols, entry points,
 /// documentation paths, and the packages the workspace's manifests declare directly.
@@ -55,6 +58,14 @@ pub struct WorkspaceMap {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 100))]
     pub docs: Vec<ProjectPath>,
+    /// Modules the workspace resolved a reference between, ranked by that count descending
+    /// with `from` then `to` breaking ties. A reference whose source or target is not
+    /// project-located contributes none, and a reference between two files of one module is
+    /// not a relationship. At most [`MAP_MODULE_RELATIONSHIPS_MAX`] entries. Absent when
+    /// empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 100))]
+    pub module_relationships: Vec<MapModuleRelationship>,
     /// Packages the workspace's manifests declare directly, as their package managers
     /// resolved them, in `manager`, `name`, `version` order. A transitive dependency is
     /// cataloged but not listed here. At most [`MAP_PACKAGES_MAX`] entries; a workspace
@@ -78,6 +89,19 @@ pub struct MapLanguage {
     /// Declarations this language's provider extracted from those files.
     #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
     pub symbols: u64,
+}
+
+/// Resolved references reaching from one listed module into another.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MapModuleRelationship {
+    /// Project-relative directory the references were written in.
+    pub from: ProjectPath,
+    /// Project-relative directory the referenced declarations belong to.
+    pub to: ProjectPath,
+    /// Resolved references behind this pair.
+    #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
+    pub references: u64,
 }
 
 /// One workspace directory holding indexed files, with counts inclusive of every descendant.
@@ -155,6 +179,11 @@ mod tests {
                 "rift://symbol/rust/crates/rift/src/main.rs/main".to_owned(),
             )],
             docs: vec![ProjectPath("README.md".to_owned())],
+            module_relationships: vec![MapModuleRelationship {
+                from: ProjectPath("crates/rift-server".to_owned()),
+                to: ProjectPath("crates/rift-protocol".to_owned()),
+                references: 87,
+            }],
             packages: vec![PackageIdentity {
                 manager: "cargo".to_owned(),
                 name: "tokio".to_owned(),
@@ -189,6 +218,14 @@ mod tests {
             json!("rift://symbol/rust/crates/rift/src/main.rs/main")
         );
         assert_eq!(value["docs"][0], json!("README.md"));
+        assert_eq!(
+            value["module_relationships"][0],
+            json!({
+                "from": "crates/rift-server",
+                "to": "crates/rift-protocol",
+                "references": 87
+            })
+        );
         assert_eq!(value["pagination"]["total_pages"], json!(1));
     }
 
@@ -200,6 +237,7 @@ mod tests {
         empty.hubs.clear();
         empty.entry_points.clear();
         empty.docs.clear();
+        empty.module_relationships.clear();
         let value = serde_json::to_value(&empty).expect("workspace map serializes");
 
         assert!(value.get("languages").is_none());
@@ -207,6 +245,7 @@ mod tests {
         assert!(value.get("hubs").is_none());
         assert!(value.get("entry_points").is_none());
         assert!(value.get("docs").is_none());
+        assert!(value.get("module_relationships").is_none());
 
         let deserialized: WorkspaceMap =
             serde_json::from_value(value).expect("omitted collections deserialize as empty");
@@ -244,6 +283,10 @@ mod tests {
             json!(MAP_ENTRY_POINTS_MAX)
         );
         assert_eq!(properties["docs"]["maxItems"], json!(MAP_DOCS_MAX));
+        assert_eq!(
+            properties["module_relationships"]["maxItems"],
+            json!(MAP_MODULE_RELATIONSHIPS_MAX)
+        );
         assert_eq!(properties["packages"]["maxItems"], json!(MAP_PACKAGES_MAX));
 
         let module = &schema["$defs"]["MapModule"]["properties"];
@@ -263,6 +306,7 @@ mod tests {
             "hubs",
             "entry_points",
             "docs",
+            "module_relationships",
             "packages",
         ] {
             assert_eq!(properties[name]["default"], json!([]), "field={name}");
