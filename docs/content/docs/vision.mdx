@@ -1,10 +1,10 @@
 ---
 title: Vision
 description: A new perspective to development lifecycle and codebase intelligence
-full: true
 ---
 
 import { CodebaseIntelligence, CodebaseLanguages } from "@/components/codebase-intelligence";
+import { VersionBadge } from "@/components/version-badge";
 
 ## Preface
 
@@ -18,80 +18,168 @@ these stages:
 - single-agent codebase reads and edits, with a high level of autonomous reasoning
 - multi-agent development, where one agent writes the code and another reviews it
 
-Model quality kept rising and the variety of agents grew with it. A lot of effort goes into
-harnesses - the methods and tools that bring determinism into agent output.
+The quality of LLMs is supposedly on a constant improvement track, and various LLM providers
+have entered the market. Yet, for the particularly complex task of software development (one
+that requires not just generating text, but showing actual, in-depth contextual understanding
+of the task and the available ways to resolve it), LLM knowledge alone wasn't enough. This led
+to the blooming popularity of various ways to bring more determinism into how code should be
+written, read, and understood by agents - specifically, harnesses and skills were the approaches
+used to improve the quality of the results.
 
-The integration between the agents and the facts of the codebase lagged behind. The closest we
-have are tools that read the codebase syntactically, such as tree-sitter based solutions, and
-some level of LSP integration. `AGENTS.md`, skills, and memory carry the perspective of the
-project, and for the code itself agents fall back to reading whole files or running grep, which
-burns context and misses what a parser already knows.
+Harnesses and skills seem to be a great idea in general to contextualize knowledge, yet the
+problem remains the same - agents working with a codebase quite frequently miss a lot of context
+that can be clearly and deterministically extracted from it. The closest the tooling comes to
+addressing this is through syntax facts (primarily tree-sitter-based), with some LSP additions
+used sporadically.
 
-That gap is what Rift fills: one composable system that collects codebase facts and serves them
-to any MCP agent.
+Memory layers (sometimes quite uncurated) become the place to persist partial bits of substantial
+knowledge, yet it's saved there without clearly contextualizing where the memory fact happens to
+be in the codebase. Agents themselves continue to frequently fall back to using grep-like
+utilities, which sometimes either burn the context window or miss important facts that can be
+structurally and deterministically extracted from the source code.
+
+So, after criticising every single available tool and approach, it's time to answer the question:
+"What does Rift do differently?"
+
+The main idea of Rift is to bring as much deterministic, fact-based (or fact-derived by a set of
+deterministic algorithms) introspection into source code as possible. We must therefore keep in
+mind that this information is split between the local index, which covers the project actively
+edited by agents, and the global index, which covers collected OSS packages. Both indexes use the
+same layers of intelligence outlined below.
 
 ## Concept
 
-Rift brings structure into the agentic development workflow by serving facts instead of file
-dumps. Low-level facts come from the parse: byte positions, syntax trees, declarations. Facts
-derived from them cover the rest: which declaration a reference names, how a symbol changed
-across revisions, which package owns a source root.
+On a surface level, Rift is an MCP server that follows the standard MCP specification. It comes
+in two modes:
 
-Both kinds answer from the same index over the same tree, so a read tells the agent what the
-code says rather than what a model recalls.
+1. <VersionBadge version="planned" inline /> Global server at volar.sh/rift/api/mcp. An agent can
+   connect to it directly to search and inspect symbols across collected OSS packages.
+2. Local server launched in place with your project. It provides the same layers of intelligence
+   for project source and can reach the global index for facts about the packages that project
+   uses. Yet it's also understandable that some facts might be in languages that are not yet
+   supported or covered by Rift's capabilities - for those, we use a textual approach as a
+   fallback.
 
-## Levels of intelligence
+The information provided by both of these servers is inherently deterministic because it is
+based on source code facts and derived from them by logically aligned algorithms.
 
-### Base facts
+## Layers of intelligence
 
-Rift starts from project-level facts, with the following assumptions in mind:
+The title of this chapter might sound a bit like marketing, but practically it represents a
+logical structure that we keep in mind when we're talking about efficient information retrieval
+from the codebase. We consider it a ladder that codebase information climbs through to deliver
+as much context as possible.
 
-- A codebase is a collection of files, and each file its syntax provider selects parses into a
-  syntax tree. Every bounded UTF-8 file also becomes lexical units, so a file no provider parses
-  stays searchable and contributes signal.
-- Files of the project have history, and reasoning about the codebase means reasoning about
-  changes to it.
-- A project may hold several languages, or several separate projects with their own dependency
-  sets, as a monorepo does.
-- Most projects have dependencies, and the packages a toolchain resolved are part of what the
-  agent reads.
+### Text
 
-None of this needs a constantly-running sidecar such as an LSP process: tree-sitter parses the
-bytes, and the source resolvers read manifests, lockfiles, and Git objects in place. These facts
-form the base that the levels below enrich.
+Text practically consists of raw, bare reads of the codebase itself. This is, in fact, how most
+LLMs perceive it. Yet LLMs are indeed trained to assume that certain text is more likely to be
+code than something else.
 
-### Engine facts
+However, we can still slightly improve this perception by simply putting a search around this
+information, which already increases the retrieval capabilities of the local server and avoids
+unnecessary context pollution. We primarily do this to ensure that if a language is not covered
+by Rift, it can still contribute (yet without any additional structural knowledge) to the signal
+that the agent might be looking for in the codebase.
 
-Where a [language engine](/docs/developer/configuration#languages-and-lsp) is configured, it
-resolves what the grammar alone cannot, such as a reference to a declaration in another file.
-The most widely supported way to reach those facts is LSP, which costs configuration and returns
-name and type resolution in exchange.
+### Syntax
 
-The embedded [ty](https://github.com/astral-sh/ty) engine serves Python over an in-memory
-transport through the same session contract, with its version shipped in the Rift binary. Rust
-takes the other route: the binding provider resolves names from the syntax facts alone, with no
-process to configure.
+The syntax level is one of the simplest, yet it brings a lot of useful information about the
+codebase without requiring a sidecar such as an LSP process. Syntax is quite an interesting
+representation because it introduces the logical construction of the codebase and specifics like
+"this is a class, this is a function," but brings no semantic meaning to it. Consider the following
+Pythonic example:
 
-### Derived knowledge
+```python
+task = spawn(some_function())
+```
 
-Base facts and engine facts combine into facts that neither level holds alone:
+The syntax facts will be that `task` is an assignment target whose value is the result of a call
+written as `spawn(some_function())`. The outer call has `spawn` as its callee, and its argument is
+another call whose callee is written `some_function`. This set of facts alone might be enough for
+some simpler cases, but it doesn't bring any of the necessary semantic meaning that might be so
+greatly required in the codebase. For instance, we won't be able to say what the expected type of
+`task` is, nor will we know where the `spawn` function comes from.
 
-- [Semantic graph](#semantic-graph) - connects a declaration to the declarations its references
-  name, so traversal follows callers and callees.
-- [Symbol history](#symbol-history) - compares one declaration's parsed state across revisions,
-  so a lookup shows when a body, a signature, or a decorator changed.
-- [Dependency source](#dependency-source) - the public declarations of resolved packages, parsed
-  by the same syntax providers as the project's own files.
-- Package documentation <VersionBadge version="planned" inline /> - declaration documentation
-  ranks in [`search`](/docs/mcp#tool-search) and the project's own Markdown is indexed, while a
-  package's documentation files are not: the dependency index selects `.rs`, `.pyi`, `.py`, and
-  `.d.ts` source alone.
+### Semantics
+
+Syntax tells us how code is constructed, but it doesn't tell us what names refer to or what a
+language engine concludes about them. That missing meaning belongs to semantics. In Rift today,
+semantic facts come through language engines.
+
+A [language engine](/docs/developer/configuration#languages-and-lsp) runs the language's own
+analysis and returns facts the parse does not contain. Rift currently asks language engines for
+references and diagnostics through LSP.
+
+For [incoming relationship traversal](/docs/mcp#search-engine-references), Rift asks the engine
+for references to the requested declaration and uses syntax to map the returned source locations
+back to indexed declarations. These engine facts belong to that read; they do not enter the index.
+
+In some cases, Rift embeds a language engine when it is available as a Rust library. Other
+configured language engines run as separate LSP processes.
+
+#### Relationship traversal [#relationship-graph]
+
+<VersionBadge version="v0.0.35" languages={["Rust", "TypeScript", "Python"]} />
+
+For reads over the local index, Rift supports incoming traversal within the current project. A
+language engine returns the source locations that reference the requested declaration, and syntax
+identifies the declaration containing each location. Together they establish a relationship from
+each caller to the requested declaration for that read.
+
+At the next depth, each caller becomes the declaration whose references Rift requests. This gives
+Rift bounded traversal within the project without indexing every relationship in advance. The
+current engine contract supplies incoming references; it does not identify the target of each
+reference for outgoing traversal.
+
+<VersionBadge version="planned" inline /> The global index will hold relationships within and
+between OSS packages, allowing similar traversal.
+
+### Documentation <VersionBadge version="planned" inline />
+
+Documentation is another layer derived from the same source. As Rift runs syntax and semantic
+analysis, it can extract doc comments and documentation files together with the code, then
+associate that text with the declarations and packages it describes.
+
+The documentation carries the same revision and origin as the source it accompanies. Search and
+symbol lookup can return it together with the code, while the global index can run the same
+extraction once for each published package version.
+
+## Revision and origin
+
+Rift records revision and source ownership alongside the intelligence it collects. This means a
+symbol found through syntax, semantics, or documentation can be traced back through its history
+and to the source it came from.
+
+### Revision
+
+Git supplies committed source along a file's first-parent history. Rift parses past revisions with
+the same syntax provider it uses for the working tree, allowing a declaration in the current code
+to be traced through its earlier states.
+
+#### Symbol history
+
+A [symbol lookup with history](/docs/mcp#tool-get_symbol) follows a declaration's current path and
+compares its state across adjacent revisions, stopping at the configured revision bound. It can
+show changes to the declaration's body, signature, or decorators, as well as its introduction or
+removal.
+
+For a comparison between two committed revisions, Rift parses the files on each side and matches
+their declarations. A [change comparison](/docs/mcp#search-change) names the declarations that
+changed, where `git diff` names changed lines. [History reads](/docs/developer/architecture#history)
+describe both operations in more detail.
+
+### Origin
+
+Rift also records whether source belongs to the current project or an OSS package version. This
+keeps each declaration attached to the source it came from, including when a repository contains
+several projects or languages. The [local and global indexes](#index) use the same origin model.
 
 ## Codebase intelligence
 
 Rift connects a declaration to the source that defines it, the references that use it, and its
 committed history. An agent reaches those facts through [search](/docs/mcp#tool-search) and
-[symbol lookup](/docs/mcp#tool-get_symbol), including public declarations from dependencies.
+[symbol lookup](/docs/mcp#tool-get_symbol), whether they come from the local or global index.
 
 <CodebaseIntelligence />
 
@@ -106,88 +194,29 @@ text each read returns. Language engines add references that require name or typ
 Engine selection belongs to each [language identity](/docs/developer/configuration#languages-and-lsp).
 Several identities can share one named process. Available facts depend on the syntax provider and
 engine selected for that language.
-Rift's own binding provider receives binding facts from Rust syntax. Python's embedded
-ty engine and configured LSP engines perform name resolution through the language-engine path.
 
-## Semantic graph
+## Index
 
-The binding provider resolves names using the scopes, definitions, references, and imports extracted
-from syntax. It follows module layout across files, with nearer scopes and explicit imports taking
-precedence. The resulting name bindings identify which declaration each resolved reference names.
+Rift uses two indexes: local and global. Both collect the same kinds of facts across the layers
+outlined above. They differ in which source they cover and where that analysis runs.
 
-Rift normalizes provider output into a shared symbol model across languages. From those name bindings,
-the semantic graph connects the declaration containing a reference to its target, so
-[relationship traversal](/docs/mcp#search-traversal) can follow referenced symbols outward or
-callers inward. Rust's binding provider supplies the indexed reference relationships today.
+### Local
 
-For current-tree incoming traversal, [language engines](/docs/mcp#search-engine-references) can
-add callers to the requested read. Rift maps the returned source locations to indexed declarations
-and combines them with stored relationships. These engine results belong to that read.
+The local server builds a local index for one project. It reads the project's text, syntax,
+semantics, documentation, and revision history without sending project source elsewhere.
 
-A shared model allows symbols from different languages to appear in the same result. A connection
-between them still requires a provider to resolve the reference; the language list alone does not
-establish cross-language relationships <VersionBadge version="planned" inline />. The
-[provider architecture](/docs/developer/architecture#providers) describes normalization and
-binding support.
+The server also reads the project's dependency list, or accepts one through configuration. It
+uses that list to identify which OSS packages are relevant, but it does not analyze their source
+locally. When a read needs facts about those packages, the local server requests them from the
+global index through an API, carrying the context of the current project
+<VersionBadge version="planned" inline />.
 
-## Symbol history
+### Global <VersionBadge version="planned" inline />
 
-Git supplies committed source along a file's first-parent history. Rift parses each revision with
-the same syntax provider and compares adjacent symbol states, so a
-[symbol lookup with history](/docs/mcp#tool-get_symbol) can show changes to a declaration's body,
-signature, or decorators, as well as its introduction or removal.
+The global index is a cached continuation of the local index. Rift populates it by applying the
+same layers of intelligence to collected OSS package versions. It holds facts about those packages
+and links between packages, so each local project does not have to reproduce the same analysis.
 
-[History reads](/docs/developer/architecture#history) follow the declaration's current path and stop
-at the configured revision bound, comparing one declaration along one file's history.
-
-Two committed revisions compare through the same parse. Rift reads the paths they hold differently,
-parses each side with the file's syntax provider, and matches declarations across them. A
-[change comparison](/docs/mcp#search-change) then names changed declarations, where `git diff` names
-changed lines.
-
-## Dependency source
-
-Source resolvers discover resolved packages through Cargo, uv, npm, and Bun. The
-[dependency index](/docs/developer/architecture#dependency-index) parses their available source
-with the same syntax providers and retains public declarations, so search and symbol lookup can
-reach beyond project files when their scope includes dependencies.
-
-Dependency discovery establishes which package owns the source. Reference resolution determines
-which declarations use it; indexing a package's public API does not establish those connections.
-
-The index builds a package's declarations once and never revalidates them, because the package
-manager resolved that source and nothing in the workspace moves it. Comparing one package across
-its versions is a separate walk <VersionBadge version="planned" inline />.
-
-## Composition
-
-One `rift server` can join a space <VersionBadge version="planned" inline /> - a set of Rift
-servers that answer together, each serving facts for different languages, projects, or
-dependency sets.
-
-The typical shape starts with the server that runs locally and serves the current project. A
-public Rift server in the cloud joins it and serves dependency facts. A company-specific server
-joins later and serves internal dependencies and repositories.
-
-Each server keeps the facts it owns, and an agent reaches project, dependency, and internal facts
-through one surface.
-
-## Memory
-
-Memory carries weight in agent workflows, and existing solutions are practically key-value stores
-with search. Write a memory such as "DON'T USE THIS FUNCTION - IT'S DEPRECATED", and enforcing it
-from that moment on leaves two choices:
-
-- load the whole memory set into the agent context, so the memory stays in front of the model
-- search the memory store before every read, which costs a lookup per read
-
-Rift's memory model <VersionBadge version="planned" inline /> answers that with structured reads.
-A memory is associated with a symbol, or a set of symbols, and rides the result of the `search`
-or `get_symbol` call that returns them, so the agent meets the memory where the code it
-constrains is returned.
-
-A memory is written at one of these levels:
-
-- local - the operator's own machine
-- project-wide - the workspace every contributor shares
-- company-wide - every workspace in the organization
+The global server exposes that index through two entrypoints. An agent connected directly over MCP
+can search and inspect the collected OSS packages. A local Rift server reaches it through an API,
+and the global server answers using the package context supplied by that project.
