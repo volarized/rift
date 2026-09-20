@@ -295,6 +295,34 @@ The registry itself assembles from one shipped definition list in `rift-syntax`:
 names a language's identity, the file extensions it claims, and the provider parsing it, so
 adding a language is one definition plus one list entry.
 
+## Package analysis
+
+<VersionBadge version="v0.0.39" />
+
+One package's source reaches the index through the package analyzer in `rift-index`, which
+holds no I/O: it takes bytes a caller already read, parses them with the shipped syntax
+providers, places each file under `rift://source/<manager>/<name>@<version>/<path>`, assembles
+the declarations, and renders one `PackagePublication`. That publication is the logical package
+index. The local package index consumes it, and a later global ingestion consumes the same
+shape, so one extraction serves both.
+
+Two publications are comparable by their own fields. `format_revision` states the shape;
+`analyzer_revision` is the digest of the analyzer manifest, which names each shipped grammar's
+version and checksum and the content digest of every source file that decides what a
+publication holds: the whole `rift-syntax` and `rift-provider` crates, the analyzer, the
+package walk, the lexical and semantic passes, and the identity module.
+Every record - a source unit, a declaration, a search document - carries a digest over its own
+content, and the whole document renders as
+[RFC 8785](https://www.rfc-editor.org/rfc/rfc8785) canonical JSON, so two runs over the same
+bytes under the same analyzer revision produce byte-identical output, and an adapter can compute
+added, replaced, and removed records by identity and digest alone. A publication addresses source
+by package-relative path and source unit, so no machine's directory layout reaches a consumer.
+
+The analyzer manifest is generated beside the served schemas and committed at
+`crates/rift-index/src/dependency/analyzer-manifest.json`, so a change to any of those files
+that ships without a regenerated manifest fails `just generate-check`. The publication's own schema is
+exported to [`package-index.schema.json`](https://volar.sh/rift/package-index.schema.json).
+
 ## Language engines
 
 The `rift-lsp` crate owns LSP sessions. A session opens source documents, requests references,

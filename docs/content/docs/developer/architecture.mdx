@@ -174,8 +174,8 @@ paths carrying its manifest file name. Selecting the top-level manifests compare
 pair, so that work grows with the square of the manifest count.
 
 A workspace holding more manifests catalogs the packages those 256 resolve, and the resolver
-reports the rest as a degradation. A read whose `scope` reaches dependencies carries it as a
-`dependency_resolver_degraded` warning: the next.js repository holds 876 `package.json` files,
+reports the rest as a degradation. A read whose `scope` reaches packages carries it as a
+`package_context_degraded` warning: the next.js repository holds 876 `package.json` files,
 so the warning reads `620 of 876 package.json manifests were not read: at most 256 are read
 per workspace`.
 
@@ -192,13 +192,39 @@ lockfiles, toolchains, installed packages, or generated-source metadata. Fact pr
 that catalog. A parser such as tree-sitter can describe syntax in a supplied file, but cannot infer
 which package owns it or which generator produced it.
 
-### Dependency index
+### Dependency context
 
-<VersionBadge version="v0.0.32" languages={["Rust", "Python", "TypeScript"]} />
+<VersionBadge version="v0.0.39" languages={["Rust", "Python", "TypeScript"]} />
 
-The catalog says where each package's source sits; the dependency index reads it. For every
-cataloged package with a source root, the index selects the files that spell the package's
-API and keeps the declarations a caller outside the package can use:
+Beside the catalog the resolvers build, each resolver reads a second, cheaper answer: the
+packages the workspace's manifests and lockfiles name. That pass reads those files alone.
+It runs no toolchain, inspects no package cache, and reads no environment value, because
+it reaches the workspace through a reader that offers a file read and nothing else. A
+workspace that never asks for a package read therefore never pays for one.
+
+Each entry carries the package manager, the name, and exactly one selector: the exact
+version a lockfile pins, or the version requirement a manifest declares. A manifest value
+is reported as a requirement unless its form pins one exact version - Cargo's `1.2.3` is a
+caret requirement and `=1.2.3` a pin - so a manifest-only project never invents a resolved
+version. An entry a public registry serves is `canonical`; a path, git, or
+custom-registry entry is `local_only`. Entries merge by manager, name, and selector, and
+a requirement is dropped where some input pins that package's version. The
+[`[dependencies]`](/docs/developer/configuration#dependencies) `packages` list merges with
+what the files state, under the same rules.
+
+`rift://map` lists this context, and its inputs are the manifests and lockfiles the
+resolvers read, so a change to any of them reads the context again on the next
+publication while every other file change leaves it untouched.
+
+### Package index
+
+<VersionBadge version="v0.0.39" languages={["Rust", "Python", "TypeScript"]} />
+
+No package is analyzed until a read asks for one. The first `global` or `all` read runs
+the resolvers once, keeps the cataloged packages the dependency context names, and
+analyzes each one's source into the package index; every later read answers from what
+that fill built. For each analyzed package the walk selects the files that spell the
+package's API and keeps the declarations a caller outside the package can use:
 
 - Rust - every `.rs` file below the root; `pub` declarations, and the items of a `pub` trait
 - Python - every `.pyi` stub when the package ships any, else every `.py` module; names
@@ -209,34 +235,21 @@ API and keeps the declarations a caller outside the package can use:
 Directories named `tests`, `benches`, `examples`, `target`, `node_modules`, `__pycache__`,
 and `.git`, and any whose name ends in `tests`, are left out of every walk, and so is every
 symlink. The same syntax providers that parse the project's files parse these, so a
-dependency declaration is a [`Symbol`](/docs/developer/protocol/reference#Symbol) like any other and
-answers a [`get_symbol`](/docs/mcp#get_symbol-scope) lookup whose `scope` reaches
-dependencies.
+package declaration is a [`Symbol`](/docs/developer/protocol/reference#Symbol) like any other and
+answers a [`get_symbol`](/docs/mcp#get_symbol-scope) lookup whose `scope` reaches packages.
 
-The index is bounded per package and in total: the `package_size`, `package_files`, and
-`index_size` keys of the [`[dependencies]`](/docs/developer/configuration#dependencies) table set the
-bounds, and the walk below one source root stops at a directory depth and an entry count of
-the index's own. A package that crosses a bound is skipped, and a lookup reports it as
-`dependency_package_skipped` naming the bound that refused it. The Rust standard library the
-Cargo resolver catalogs from the toolchain's `rust-src` holds more files than the default
-`package_files` allows, so it is skipped unless the bound is raised.
+The package index is bounded per package and in total: the `package_size`, `package_files`,
+and `index_size` keys of the [`[dependencies]`](/docs/developer/configuration#dependencies) table
+set the bounds, and the walk below one source root stops at a directory depth and an entry
+count of its own. A package that crosses a bound is skipped, and a read reports it as
+`package_skipped` naming the bound that refused it. Raising a bound in `rift.toml` analyzes
+the packages again on the next read, since every package the package index holds was read
+under the old bounds. `resolution = "static"` keeps the resolvers off the toolchains, so the
+catalog comes from the lockfiles and package caches alone, and `command_timeout` bounds each
+run `auto` makes.
 
-The same table selects which cataloged packages the index plans at all: `include` and
-`exclude` are globs over each package's `<manager>/<name>`, and a package they drop stays in
-the catalog and on the map without ever being pending or skipped. `enabled = false` turns the
-index off and refuses every dependency-scoped lookup. `resolution = "static"` keeps the
-resolvers off the toolchains, so a catalog comes from the lockfiles and package caches alone,
-and `command_timeout` bounds each run `auto` makes.
-
-Indexing runs behind the answers. Each publication hands its catalog to the dependency lane,
-which builds one package at a time on the worker pool: direct dependencies first, then the
-standard library, then transitive dependencies. A lookup issued meanwhile answers from the
-packages built so far and reports the rest as `dependency_index_pending`.
-
-A package's declarations are built once and never revalidated: its source is what the package
-manager resolved, and nothing in the workspace moves it. A lockfile change re-catalogs on the
-next publication and re-plans the index: packages the new catalog no longer lists leave it,
-arrivals queue, and a package still cataloged keeps its build, or its refusal.
+No global package index exists yet, so every package read carries a
+`global_index_unavailable` warning stating what the local fallback produced.
 
 ## Providers
 
