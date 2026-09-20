@@ -992,20 +992,16 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
-    /// No provider populates part of the relationship coverage the traversal asked for, so
-    /// the walk had nothing to follow there whatever the graph holds. The warning states
-    /// that a provider is absent; it never states that the seed has no such neighbor. An
-    /// empty answer carrying it means the walk could not run; an empty answer without it
-    /// means the walk ran and the seed has no neighbor under the request.
+    /// No lane populates part of the relationship coverage the traversal asked for, so the
+    /// walk had nothing to follow there whatever the graph holds. The warning states that a
+    /// lane is absent; it never states that the seed has no such neighbor. An empty answer
+    /// carrying it means the walk could not run; an empty answer without it means the walk
+    /// ran and the seed has no neighbor under the request.
     RelationshipCoverageMissing {
-        /// The requested facets no provider populates, in the request's own order,
-        /// deduplicated. Absent when every requested facet has a provider.
+        /// The requested facets no lane populates, in the request's own order,
+        /// deduplicated. Absent when every requested facet has a lane.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         facets: Vec<RelationshipFacet>,
-        /// The seed declaration's language, when the gap is the language rather than the
-        /// facet. Absent when the language has a provider.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        language: Option<Language>,
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
         detail: String,
@@ -1030,22 +1026,6 @@ pub enum ReadWarning {
     ChangeTruncated {
         /// Changed paths the comparison stopped at, equal to the bound it reached.
         paths_max: u64,
-        /// Why the warning was raised - prose for a reader; nothing keys on it.
-        #[schemars(length(max = 4096))]
-        detail: String,
-    },
-    /// A relationship walk rode beside a comparison, and the graph it walked is the current
-    /// tree's, the only relationship graph the server holds. Its edges are the current
-    /// tree's edges, not those of either compared revision: a reached declaration is what
-    /// references the changed declaration today, and a reference either compared revision
-    /// held and the current tree does not is absent. The warning states which tree supplied
-    /// the edges; it never states that the answer is incomplete for that tree. Rides every
-    /// answer whose `change` carries a `traversal`.
-    ChangeTraversalCurrentTree {
-        /// Changed declarations the current tree holds no node for, so the walk started at
-        /// none of them. A declaration the head revision removed is counted here, as is one
-        /// the current tree no longer holds at the path the comparison found it in.
-        unplaced: u64,
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
         detail: String,
@@ -2305,36 +2285,29 @@ mod tests {
         assert_eq!(parsed, warning);
     }
 
-    /// Both members are omitted when they carry no gap, so absence is the signal a caller
-    /// reads: a facet gap serializes without `language`, a language gap without `facets`.
+    /// An empty facet list is omitted, so absence is the signal a caller reads.
     #[test]
-    fn the_relationship_coverage_warning_omits_the_member_that_carries_no_gap() {
+    fn the_relationship_coverage_warning_omits_an_empty_facet_list() {
         let cases = [
             (
                 ReadWarning::RelationshipCoverageMissing {
                     facets: vec![RelationshipFacet::Implements],
-                    language: None,
-                    detail: "no provider populates the requested facet implements".to_owned(),
+                    detail: "no lane populates the requested facet implements".to_owned(),
                 },
                 json!({
                     "code": "relationship_coverage_missing",
                     "facets": ["implements"],
-                    "detail": "no provider populates the requested facet implements",
+                    "detail": "no lane populates the requested facet implements",
                 }),
             ),
             (
                 ReadWarning::RelationshipCoverageMissing {
                     facets: Vec::new(),
-                    language: Some(Language {
-                        name: "toml".to_owned(),
-                        dialect: None,
-                    }),
-                    detail: "no provider populates outgoing relationships for toml".to_owned(),
+                    detail: "no lane populates the requested coverage".to_owned(),
                 },
                 json!({
                     "code": "relationship_coverage_missing",
-                    "language": "toml",
-                    "detail": "no provider populates outgoing relationships for toml",
+                    "detail": "no lane populates the requested coverage",
                 }),
             ),
         ];

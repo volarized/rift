@@ -16,7 +16,7 @@ use super::failure::{
     PackageIndexError, PackageIndexFault, PackageIndexViolation, package_segment,
 };
 use super::walk::{PackageFiles, public_qualified_names};
-use crate::semantic::{BindingPolicy, PlacedDocument, WorkspaceSemantics};
+use crate::semantic::{PlacedDocument, WorkspaceSemantics};
 use crate::workspace::{
     IndexedFile, ReadableSymbol, SymbolMatch, TextSourceFile, indexed_file_from_catalog,
     symbol_matches_where,
@@ -84,16 +84,10 @@ impl PackageIndex {
                 placement: held.placement.clone(),
             })
             .collect();
-        let semantics = WorkspaceSemantics::build_placed(
-            &placed,
-            &[],
-            revision,
-            None,
-            &BindingPolicy::disabled(),
-        )
-        .map_err(|error| {
-            PackageIndexFault::new(PackageIndexViolation::Provider, package).caused_by(error)
-        })?;
+        let semantics =
+            WorkspaceSemantics::build_placed(&placed, revision, None).map_err(|error| {
+                PackageIndexFault::new(PackageIndexViolation::Provider, package).caused_by(error)
+            })?;
         let declaration_count = indexed
             .iter()
             .map(|held| held.file.syntax().symbols().len())

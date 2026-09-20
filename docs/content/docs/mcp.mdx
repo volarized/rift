@@ -341,22 +341,21 @@ answer.
 
 <VersionBadge version="v0.0.29" languages={["Rust"]} />
 
-`traversal` walks the relationship graph `[providers.binding]` builds: a bounded search from
-one `seed`, following `direction` and narrowed to `facets`, up to `depth` hops. `seed` and the
-optional `to` are declaration [`SymbolId`](/docs/developer/protocol/reference#SymbolId) values, the same
-identity a `get_symbol` or `search` hit already carries.
+`traversal` walks the references a configured
+[language engine](/docs/developer/configuration#languages-and-lsp) resolves: a bounded search
+from one `seed`, following `direction` and narrowed to `facets`, up to `depth` hops. `seed` and
+the optional `to` are declaration [`SymbolId`](/docs/developer/protocol/reference#SymbolId)
+values, the same identity a `get_symbol` or `search` hit already carries.
 
 `traversal` stands alone as a pure graph walk or rides beside `query`; a symbol both lanes
 reach keeps its lexical `score` and gains the walk's `traversal_path`, and its `matched_by`
-carries both entries. It also rides beside `change`, where the walk starts at every changed
-declaration instead of at `seed` - see [Impact of a change](#search-change-impact).
+carries both entries.
 
-Three shapes cover most questions:
+`direction` takes `incoming`, its default and its one value: the engine answers which
+declarations reference the seed, and no lane resolves what a declaration reaches outward. Two
+shapes cover most questions:
 
-- **Neighbors** - `seed` alone, `direction` and `depth` at their defaults (`outgoing`, 1): what
-  this symbol calls, imports, or otherwise references directly.
-- **Impact** - `direction: "incoming"`: what would change if this symbol did, read the other
-  way round.
+- **Impact** - `seed` alone, `depth` at its default: what would change if this symbol did.
 - **Path** - `to` set: whether, and by which shortest route, the walk reaches one named symbol.
 
 Each reached symbol becomes a hit tagged `matched_by: ["relationship"]`, carrying `distance` -
@@ -386,46 +385,44 @@ Each caller's `traversal_path` carries a relationship from the caller to `serve`
 `facets: ["references"]` and `derivation: "resolution"`. The hop's direction is `incoming`.
 
 `facets` narrows the walk to [`RelationshipFacet`](/docs/developer/protocol/reference#RelationshipFacet)
-values such as `calls`, `references`, and `imports`; an empty or omitted list follows every
-facet. `target: "file"` never carries a walked hit, since a traversal only reaches symbols.
+values; an empty or omitted list follows every facet a lane populates, which is `references`
+today. `target: "file"` never carries a walked hit, since a traversal only reaches symbols.
 
-A `traversal` standing without `change` names the declaration its walk starts at, so a request
-carrying neither `seed` nor `change` refuses `invalid_request` naming `seed`.
+A `traversal` names the declaration its walk starts at, so a request carrying no `seed`
+refuses `invalid_request` naming the field.
 
-A workspace with the binding provider disabled, no successful engine reference answer, and no
-relationship data left from an earlier build refuses `capability_unavailable` naming
-`relationship traversal (providers.binding disabled)`: the graph this walk needs was never built.
-With no indexed relationships, a successful engine answer with no callers returns an empty result set.
-`traversal` never combines with `rev` -
-the relationship graph serves the current tree alone - and refuses `capability_unavailable`
-the same way. A `seed` that resolves to neither a graph node nor a lexical declaration refuses
-`resource_not_found`; one that resolves but carries no edges answers an empty result set, since
-an isolated declaration is a legitimate answer.
+A walk whose seed no engine answers for refuses `capability_unavailable` naming
+`relationship traversal (no language engine serves the seed)`: nothing this workspace holds
+resolves a reference to that declaration, and a resend changes nothing. A `facets` list naming
+no facet a lane populates draws the same refusal. An engine session serves the current tree, so
+`traversal` combines with neither `rev` nor `change`, and refuses `capability_unavailable` for
+each. A `seed` that resolves to no declaration refuses `resource_not_found`; one the engine
+answers for with no callers returns an empty result set, since an isolated declaration is a
+legitimate answer.
 
 A walk the server stops at its node bound attaches a `traversal_truncated` entry to
 `warnings`, naming how many symbols it visited: hits reachable beyond the bound are missing,
 and a tighter `facets` list, a smaller `depth`, or a less-connected `seed` fits the walk under it.
 
-A walk no provider can answer attaches a `relationship_coverage_missing` entry to `warnings`.
-Its `facets` names the requested facets no provider populates, such as `implements`; its
-`language` names the seed declaration's language when an `outgoing` walk starts in a language
-no provider supplies relationships for. An empty result set carrying this warning means the
-walk could not run; an empty result set without it means the walk ran and the seed has no
-neighbor under the request.
+A walk asking for coverage no lane populates attaches a `relationship_coverage_missing` entry
+to `warnings`. Its `facets` names the requested facets no lane populates, such as `implements`
+beside the `references` the engine lane resolves. An answer carrying this warning covers the
+requested facets a lane does populate; an answer without it covers every facet the request
+named.
 
 ### Language-engine references [#search-engine-references]
 
 <VersionBadge version="v0.0.35" languages={["Rust", "TypeScript", "Python"]} />
 
 A current-tree symbol traversal consults the configured
-[language engine](/docs/developer/configuration#languages-and-lsp) when `direction` is `incoming`
-or `both` and `facets` contains `references` or is empty. The server adds engine-resolved
-references to the indexed relationships and applies the same traversal depth and result bounds.
+[language engine](/docs/developer/configuration#languages-and-lsp) when `facets` contains
+`references` or is empty. The engine's answer is what the walk follows, under the same
+traversal depth and result bounds.
 
 The server maps each reference location to the smallest indexed declaration containing it.
 Locations outside the workspace or without an indexed declaration contribute no hit. When no
-engine is configured, or the engine lacks reference support, the indexed relationships answer.
-A configured engine that fails to start returns its failure through
+engine is configured, or the engine lacks reference support, the walk refuses
+`capability_unavailable`. A configured engine that fails to start returns its failure through
 [`ErrorData`](/docs/developer/protocol/reference#ErrorData).
 
 The server captures source and configuration before and after the engine request. If either
@@ -541,102 +538,15 @@ and its `results_truncated` warning. A changed file either revision cannot read 
 per-file byte bound, bytes that are not UTF-8, or a syntax tree the provider refuses -
 contributes no declaration, and the changed paths beside it still answer.
 
-`traversal` is the one block that rides beside `change`, extending the same result set rather
-than selecting another; [Impact of a change](#search-change-impact) states what it answers. The
-server refuses `change` beside `rev` with `invalid_request`, since `change` names its own
+The server refuses `change` beside `rev` with `invalid_request`, since `change` names its own
 revisions, and beside `query` with `invalid_request`, since the two select different result
-sets. A `scope` past `project` refuses with `invalid_request`, because the dependency index
-serves the current tree alone.
+sets. A `traversal` beside it refuses `capability_unavailable`, since a language engine serves
+the current tree and a comparison names two committed revisions. A `scope` past `project`
+refuses with `invalid_request`, because the dependency index serves the current tree alone.
 [`[providers.history]`](/docs/developer/configuration#providers) owns the capability the way it owns
 [revision-addressed reads](#revision-reads): `enabled = false` refuses a comparison, a workspace
 with no git repository refuses `capability_unavailable`, and a revision neither side resolves
 refuses `resource_not_found`.
-
-### Impact of a change [#search-change-impact]
-
-<VersionBadge version="v0.0.36" languages={["Rust"]} />
-
-A `traversal` riding beside `change` starts its walk at every changed declaration instead of at
-one named `seed`. The block keeps its `direction`, `facets`, `depth`, and `to`; it names no
-`seed`, and the server refuses one beside `change` with `invalid_request` naming the field. A
-workspace whose binding provider never built a relationship graph refuses
-`capability_unavailable` naming `relationship traversal (providers.binding disabled)`, the same
-way it refuses a walk standing alone.
-
-Each declaration the walk reaches becomes a hit tagged `matched_by: ["relationship"]`, carrying
-`distance` and the `traversal_path` a seeded walk's hit carries. The changed declaration the
-walk started at is one end of the first `GraphHop`'s own relationship, so no field restates it.
-A declaration that is both changed and reached carries `matched_by: ["change", "relationship"]`,
-keeps its `change` block beside the walk's path, and is answered once.
-
-**Request:**
-
-```json
-{
-  "change": { "base": "main", "head": "HEAD" },
-  "traversal": { "direction": "incoming", "facets": ["calls"], "depth": 1 }
-}
-```
-
-**Search hit:**
-
-```json
-{
-  "hit": {
-    "target": "symbol",
-    "symbol": {
-      "id": "rift://symbol/rust/src/server.rs/serve",
-      "language": "rust",
-      "name": "serve",
-      "kind": "function",
-      "facets": ["value", "callable", "public"],
-      "visibility": "pub"
-    }
-  },
-  "matched_by": ["relationship"],
-  "distance": 1,
-  "traversal_path": [
-    {
-      "relationship": {
-        "from": "rift://symbol/rust/src/server.rs/serve",
-        "kind": "calls",
-        "facets": ["calls"],
-        "to": "rift://symbol/rust/src/config.rs/load_config",
-        "derivation": "resolution"
-      },
-      "direction": "incoming"
-    }
-  ],
-  "range": { "start": 210, "end": 402 },
-  "line": 12,
-  "path": "src/server.rs"
-}
-```
-
-The relationship graph covers the current tree, and the server holds no other: that is why
-`traversal` refuses `rev`. A comparison names two committed revisions, so the walk's edges are
-neither compared revision's. Every answer whose comparison carried a walk therefore attaches a
-`change_traversal_current_tree` entry to `warnings`, whether or not the walk reached anything.
-Its `unplaced` counts the changed declarations the current tree holds no node for, a
-declaration the head revision removed among them, since such a declaration starts no walk. The
-warning states which tree supplied the edges; it never states that the answer is incomplete for
-that tree.
-
-A `facets` list naming a facet no provider populates attaches a `relationship_coverage_missing`
-entry to `warnings`, as it does beside a `seed`. Its `facets` names the gap; its `language` stays
-absent, since a comparison seeds declarations in every language it found changed and no one
-language answers for them.
-
-One walk budget covers every starting declaration, so the symbols one comparison's walk
-discovers keep the same node bound a seeded walk keeps rather than that bound per changed
-declaration. A walk the server stops at that bound attaches one `traversal_truncated` entry to
-`warnings` however many declarations changed. The result set keeps its own bound and its
-`results_truncated` warning.
-
-`paths` narrows which changed paths are compared, never where the walk may reach: a caller
-outside that selection is still code the changed declaration affects. A comparison ranks
-nothing, so a walked hit carries no `score` either, and `relevance` orders every hit by path,
-then by name.
 
 ### Dependency scope [#search-scope]
 
@@ -786,20 +696,17 @@ costs a lookup. The answer carries:
 
 <VersionBadge version="v0.0.29" languages={["Rust"]} />
 
-`hubs`, `entry_points`, and `module_relationships` need facts only the Rust provider currently
-supplies. `hubs` ranks
-[`SymbolId`](/docs/developer/protocol/reference#SymbolId)s by the reference counts the
-[binding provider](/docs/developer/architecture#semantics) resolves; `entry_points` lists symbols
-carrying the `entrypoint` [`SymbolFacet`](/docs/developer/protocol/reference#SymbolFacet) - a file-scope
-`fn main`, not one nested in a module, an `impl` block, or another function. Each stays empty for
-a workspace with no such facts.
+`entry_points` lists symbols carrying the `entrypoint`
+[`SymbolFacet`](/docs/developer/protocol/reference#SymbolFacet) - a file-scope `fn main`, not one
+nested in a module, an `impl` block, or another function. It stays empty for a workspace with no
+such facts.
 
-`module_relationships` folds both ends of every resolved reference to the module `modules` lists
-them under, drops a pair whose two ends fold to one module, and counts what is left. A reference
-whose source or target is not project-located contributes none: a dependency declaration is
-reported by `packages` instead. The list carries at most 100 entries, ordered by `references`
-descending, then `from`, then `to`, so a workspace past that bound keeps the strongest pairs and
-two reads of one tree agree.
+`hubs` ranks [`SymbolId`](/docs/developer/protocol/reference#SymbolId)s by how often the index
+holds a resolved reference to them, and `module_relationships` folds both ends of every such
+reference to the module `modules` lists them under, drops a pair whose two ends fold to one
+module, and counts what is left. Both read the index alone: the language engine resolves a
+reference for one read and publishes none, so both lists stay empty until a provider publishes
+resolved references into the index.
 
 <VersionBadge version="v0.0.32" languages={["Rust", "Python", "TypeScript"]} />
 

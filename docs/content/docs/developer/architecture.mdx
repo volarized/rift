@@ -268,30 +268,12 @@ one named or inline process for an exact language identity: rust-analyzer for `r
 `typescript-language-server` for `typescript` and `typescript:tsx`. Several identities may
 select the same named process.
 
-[`search`](/docs/mcp#search-engine-references) uses the engine for incoming reference traversal
-and combines the returned callers with indexed relationships. Source and configuration must
-match the captured index before and after the engine request.
+[`search`](/docs/mcp#search-engine-references) uses the engine for incoming reference
+traversal: the engine is the one source of resolved references a walk follows. Source and
+configuration must match the captured index before and after the engine request.
 
 The embedded [ty](https://github.com/astral-sh/ty) engine serves Python over an in-memory
 transport through the same LSP session contract. Its version ships with the Rift binary.
-
-### Semantics
-
-<VersionBadge version="v0.0.27" languages={["Rust"]} />
-
-The fallback reaches further than the grammar alone. The **binding provider** resolves name
-binding - which declarations a name in the source can refer to - from the scopes, definitions,
-references, and imports each syntax provider extracts in its one parse. It joins files through
-the language's module layout and publishes the resolutions as Contributions under the provider
-id `binding`.
-
-Resolution keeps the language's own precedence: a definition in the nearest scope shadows an
-outer one, an explicit import shadows a wildcard one, and equally ranked candidates all stay in
-the answer. A reference the syntax facts cannot place stays unresolved.
-
-The provider runs inside the server during the index build, and the
-[`[providers.binding]`](/docs/developer/configuration#providers) table bounds every phase of its work. A breached bound never fails the build - the revision publishes with the syntax facts
-alone.
 
 ### History
 
@@ -449,8 +431,7 @@ It ranks symbol names, signatures, documentation, and file content from the inde
 What the index holds comes from normalized Contributions. Syntax providers contribute each
 declaration's name, signature, and documentation; the lexical tier adds file content - source
 and plain text alike - so a hit can land in a comment, a configuration key, or a README as well
-as a declaration. Binding facts join the same Symbol after normalization establishes their
-association.
+as a declaration.
 
 Matching serves two query shapes. An identifier-shaped query - `ReadService`,
 `num_workers` - matches the declaration names it resembles. A prose query - `visible source

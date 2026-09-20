@@ -17,12 +17,12 @@ use rift_core::constants::{
 };
 use rift_core::{LanguageFileSelections, SourceVisibility, TextFileInclusion};
 use rift_index::{
-    BindingPolicy, ChangeSet, FileDigest, LexicalChange, LexicalUnit, PathChanges,
-    WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy,
+    ChangeSet, FileDigest, LexicalChange, LexicalUnit, PathChanges, WorkspaceFingerprint,
+    WorkspaceIndexLimits, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::{
-    BindingConfiguration, HistoryConfiguration, LanguageLspConfiguration, LogsConfiguration,
-    LspConfiguration, SearchConfiguration, ServerConfiguration, WorkspaceConfiguration,
+    HistoryConfiguration, LanguageLspConfiguration, LogsConfiguration, LspConfiguration,
+    SearchConfiguration, ServerConfiguration, WorkspaceConfiguration,
 };
 use rift_protocol::dependencies::DependenciesConfiguration;
 use rift_protocol::error as wire;
@@ -438,15 +438,13 @@ impl ConfigurationState {
 
     /// Whether index-owned configuration differs from another acceptance.
     ///
-    /// The `[providers.binding]` table counts as index-owned: its switch and bounds
-    /// shape the publication set the index bakes at build time. So does the
-    /// `[dependencies]` table: the read service resolves its catalog under the table's
-    /// resolution policy and gates dependency-scoped lookups on its switch.
+    /// The `[dependencies]` table counts as index-owned: the read service resolves its
+    /// catalog under the table's resolution policy and gates dependency-scoped lookups on
+    /// its switch.
     fn index_configuration_differs(&self, other: &Self) -> bool {
         self.source_configuration() != other.source_configuration()
             || self.text_inclusion() != other.text_inclusion()
             || self.language_file_selections() != other.language_file_selections()
-            || self.binding_configuration() != other.binding_configuration()
             || self.dependencies_configuration() != other.dependencies_configuration()
     }
 
@@ -456,15 +454,6 @@ impl ConfigurationState {
         self.accepted
             .as_ref()
             .map(|configuration| configuration.providers.history.clone())
-            .unwrap_or_default()
-    }
-
-    /// The `[providers.binding]` table from the last acceptance, or the
-    /// default table while `rift.toml` is invalid.
-    pub(crate) fn binding_configuration(&self) -> BindingConfiguration {
-        self.accepted
-            .as_ref()
-            .map(|configuration| configuration.providers.binding.clone())
             .unwrap_or_default()
     }
 
@@ -1405,7 +1394,6 @@ fn whole_workspace_candidate(
     let limits = configuration.index_limits(limits)?;
     let text_inclusion = configuration.text_inclusion();
     let languages = configuration.language_file_selections();
-    let binding = BindingPolicy::from(&configuration.binding_configuration());
     let dependencies_configuration = configuration.dependencies_configuration();
     let dependency_plan = DependencyPlan::compile(&dependencies_configuration)?;
     let reads = ReadService::build_with_languages(
@@ -1414,7 +1402,6 @@ fn whole_workspace_candidate(
         &visibility,
         &text_inclusion,
         &languages,
-        binding,
         configuration.history_configuration(),
         dependencies_configuration,
     )?

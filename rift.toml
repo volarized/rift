@@ -14,11 +14,8 @@ exclude = [".claude/**", ".agents/**", "docs/public/**", "plugins/claude/skills/
 force_include = [".plans/**"]
 respect_gitignore = true
 
-# The name binding provider and the semantic ranking both run by default; the explicit
-# tables pin that intent so a future default change cannot silently drop either capability.
-[providers.binding]
-enabled = true
-
+# The semantic ranking runs by default; the explicit table pins that intent so a future
+# default change cannot silently drop the capability.
 [search.semantic]
 disabled = false
 

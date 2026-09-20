@@ -3,7 +3,6 @@
 mod adapter;
 mod assembly;
 mod fact;
-mod scip;
 
 pub use adapter::{
     AdapterError, AdapterPublication, AdapterViolation, ProviderInputMode, PublicationCoverage,
@@ -30,7 +29,6 @@ pub use publication::{
     ProviderPublication, PublicationError, PublicationFault, PublicationLimits, PublicationSet,
     PublicationStore, PublicationViolation,
 };
-pub use scip::{ScipAdapter, ScipAdapterError, ScipViolation};
 
 /// Compile-time marker for provider-layer ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

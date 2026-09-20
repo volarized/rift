@@ -2,7 +2,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rift_binding::UnitBindingFacts;
 use rift_core::{ProjectPath, is_portable_name};
 use rift_protocol::read::{Documentation, Language, Signature, SymbolFacet};
 
@@ -94,7 +93,6 @@ pub struct SyntaxDocument {
     symbols: Vec<SyntaxSymbol>,
     has_errors: bool,
     left_out_declarations: usize,
-    binding: Option<UnitBindingFacts>,
 }
 
 /// Suffixes every repeated qualified name apart, in source order.
@@ -209,21 +207,7 @@ impl SyntaxDocument {
             symbols,
             has_errors,
             left_out_declarations,
-            binding: None,
         }
-    }
-
-    /// Attaches the unit's extracted name-binding facts.
-    #[must_use]
-    pub(crate) fn with_binding(mut self, facts: UnitBindingFacts) -> Self {
-        self.binding = Some(facts);
-        self
-    }
-
-    /// Returns the unit's name-binding facts; `None` when the provider extracts none.
-    #[must_use]
-    pub const fn binding(&self) -> Option<&UnitBindingFacts> {
-        self.binding.as_ref()
     }
 
     /// Returns the language identity these facts are filed under.

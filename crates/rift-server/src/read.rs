@@ -12,9 +12,9 @@ use rift_core::{
 use rift_dependency::DependencyCatalog;
 use rift_history::{HistoryError, Repository};
 use rift_index::{
-    BindingPolicy, DependencyIndex, DependencySymbolMatch, FileDigest, IndexedFile,
-    PackageIndexError, PathChanges, ReadableSymbol, RelationshipStore, SkippedPackage, SymbolMatch,
-    SymbolMatchRank, WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError,
+    DependencyIndex, DependencySymbolMatch, FileDigest, IndexedFile, PackageIndexError,
+    PathChanges, ReadableSymbol, RelationshipStore, SkippedPackage, SymbolMatch, SymbolMatchRank,
+    WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError,
     WorkspaceIndexLimits, WorkspaceIndexWarning, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::HistoryConfiguration;
@@ -464,7 +464,6 @@ impl ReadService {
             visibility,
             text_inclusion,
             &LanguageFileSelections::default(),
-            BindingPolicy::default(),
             history,
             DependenciesConfiguration::default(),
         )
@@ -472,8 +471,6 @@ impl ReadService {
 
     /// Builds one current-tree snapshot with configured language entries.
     ///
-    /// `binding` reaches the workspace index unchanged: it decides whether the
-    /// binding provider publishes beside syntax, and under which bounds.
     /// `dependencies` decides how the catalog is resolved and whether a scope
     /// beyond `project` is served.
     ///
@@ -481,17 +478,12 @@ impl ReadService {
     ///
     /// Returns [`ReadError`] when configuration or root cannot be indexed
     /// within bounds.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one argument per accepted table the snapshot is built under"
-    )]
     pub fn build_with_languages(
         root: &Path,
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
         text_inclusion: &TextFileInclusion,
         languages: &LanguageFileSelections,
-        binding: BindingPolicy,
         history: HistoryConfiguration,
         dependencies: DependenciesConfiguration,
     ) -> Result<Self, ReadError> {
@@ -511,7 +503,6 @@ impl ReadService {
             visibility,
             text_inclusion,
             languages,
-            binding,
         )
         .map_err(|source| {
             span.record("outcome", "error");
@@ -1886,8 +1877,8 @@ pub(crate) mod tests {
     use tempfile::TempDir;
 
     use super::{
-        BindingPolicy, DependenciesConfiguration, DependencyStore, HistoryConfiguration, ReadFault,
-        ReadService, WorkspaceIndex, WorkspaceIndexLimits, accepted_limit, file_id,
+        DependenciesConfiguration, DependencyStore, HistoryConfiguration, ReadFault, ReadService,
+        WorkspaceIndex, WorkspaceIndexLimits, accepted_limit, file_id,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -1922,7 +1913,6 @@ pub(crate) mod tests {
             &SourceVisibility::default(),
             text_inclusion,
             languages,
-            BindingPolicy::default(),
             HistoryConfiguration::default(),
             DependenciesConfiguration::default(),
         )
@@ -2080,14 +2070,14 @@ pub(crate) mod tests {
 
         let beta = rift_core::SymbolId::new("rift://symbol/rust/src/lib.rs/beta")?;
         let alpha = rift_core::SymbolId::new("rift://symbol/rust/src/lib.rs/alpha")?;
-        let served = service.relationships().outgoing(&beta);
-        assert_eq!(served, independent_index.relationships().outgoing(&beta));
-        assert_eq!(served.len(), 1);
-        assert_eq!(served[0].from(), &beta);
-        assert_eq!(served[0].to(), &alpha);
         assert_eq!(
-            served[0].facet(),
-            rift_protocol::read::RelationshipFacet::Calls
+            service.relationships().is_empty(),
+            independent_index.relationships().is_empty(),
+            "no provider publishes a resolved reference, so both stores are empty"
+        );
+        assert_eq!(
+            service.relationships().outgoing(&beta),
+            independent_index.relationships().outgoing(&beta)
         );
         assert_eq!(
             service.relationships().incoming(&alpha),
@@ -3355,7 +3345,6 @@ pub fn compute() -> i32 {
             &SourceVisibility::default(),
             &rift_core::TextFileInclusion::default(),
             &LanguageFileSelections::default(),
-            BindingPolicy::default(),
             HistoryConfiguration::default(),
             disabled.clone(),
         )?

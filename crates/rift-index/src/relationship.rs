@@ -1,11 +1,11 @@
 //! Bidirectional symbol reference adjacency, derived once from one [`NormalizedGraph`].
 //!
 //! [`RelationshipStore::build`] walks [`NormalizedGraph::references`] once and emits one
-//! [`RelationshipEdge`] per reference target the binding provider resolved to an established
-//! symbol (`NormalizedTarget::Symbol`); a target the graph could not resolve
+//! [`RelationshipEdge`] per reference target a provider resolved to an established symbol
+//! (`NormalizedTarget::Symbol`); a target the graph could not resolve
 //! (`NormalizedTarget::Contribution`) contributes no edge. `NormalizedGraph::references`
-//! carries only resolution the binding provider produced, so every edge's derivation is
-//! resolution - that fact lives here rather than on a per-edge field.
+//! carries resolution alone, so every edge's derivation is resolution - that fact lives
+//! here rather than on a per-edge field.
 //!
 //! An edge's `from` is the enclosing definition: the definition record whose contribution
 //! range is the smallest range containing the reference occurrence in the same source unit.
@@ -17,8 +17,8 @@
 //! An edge's `facet` is [`role_facet`]'s mapping of the reference's [`ReferenceRole`].
 //!
 //! An edge's `occurrence` is the reference's own [`DeclarationBinding`]: unit, byte range, and
-//! an optional syntax node. The name-binding publisher and the SCIP adapter both construct
-//! reference bindings with `node: None`, so the node arm is populated by no production path.
+//! an optional syntax node. Every provider that publishes a reference today constructs its
+//! binding with `node: None`, so the node arm is populated by no production path.
 //!
 //! Building stops at [`RELATIONSHIP_EDGES_MAX`] edges; [`RelationshipStore::is_complete`] and
 //! [`RelationshipStore::dropped_edges`] report the truncation.
@@ -30,24 +30,17 @@ use std::sync::OnceLock;
 use rift_core::{
     DeclarationBinding, LoopBudget, ReferenceRole, SourceRange, SourceUnitId, SymbolId,
 };
-use rift_protocol::configuration::BINDING_GRAPH_LINKS_MAX;
 use rift_protocol::read::RelationshipFacet;
 use rift_provider::{NormalizedGraph, NormalizedReference, NormalizedTarget};
 use strum::VariantArray as _;
 
 /// Most edges one [`RelationshipStore`] holds across both directions combined.
 ///
-/// The source data is already bounded upstream by `[providers.binding]`'s configured
-/// limits: `max_graph_links` advertises [`BINDING_GRAPH_LINKS_MAX`] as its schema
-/// ceiling. This cap sits generously above that ceiling so an accepted configuration
-/// cannot truncate the store in practice, while still bounding the store's own
-/// construction work and memory against a value built outside acceptance.
+/// The publication set a build normalizes is already bounded by
+/// [`PublicationLimits`](rift_provider::PublicationLimits), so this cap sits above what any
+/// accepted publication can carry. It bounds the store's own construction work and memory
+/// against a graph built outside those limits.
 pub const RELATIONSHIP_EDGES_MAX: usize = 10_000_000;
-
-const _: () = assert!(
-    RELATIONSHIP_EDGES_MAX as u64 > BINDING_GRAPH_LINKS_MAX,
-    "RELATIONSHIP_EDGES_MAX must stay generously above the configured max_graph_links ceiling"
-);
 
 /// One resolved reference edge: the enclosing definition a reference occurred in, the
 /// established symbol it resolved to, and the reference's portable category.
@@ -653,10 +646,10 @@ mod tests {
         );
     }
 
-    /// A real syntax-and-binding fixture, proving the store end to end: `beta` calling
-    /// `alpha` produces one edge, both directions agree, and the store is complete.
+    /// A real workspace, proving the store end to end: no shipped provider resolves a
+    /// reference, so the store a build derives holds no edge and is complete.
     #[test]
-    fn a_real_workspace_fixture_yields_a_call_edge() -> Result<(), Box<dyn std::error::Error>> {
+    fn a_real_workspace_fixture_yields_no_edge() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         std::fs::create_dir(directory.path().join("src"))?;
         std::fs::write(
@@ -672,11 +665,9 @@ mod tests {
 
         let beta = symbol("rift://symbol/rust/src/lib.rs/beta");
         let alpha = symbol("rift://symbol/rust/src/lib.rs/alpha");
-        let outgoing = index.relationships().outgoing(&beta);
-        let incoming = index.relationships().incoming(&alpha);
-        assert_eq!(outgoing.len(), 1);
-        assert_eq!(outgoing, incoming);
-        assert_eq!(outgoing[0].facet(), RelationshipFacet::Calls);
+        assert!(index.relationships().is_empty());
+        assert!(index.relationships().outgoing(&beta).is_empty());
+        assert!(index.relationships().incoming(&alpha).is_empty());
         assert!(index.relationships().is_complete());
         Ok(())
     }

@@ -13,7 +13,6 @@ workspace = true
 [dependencies]
 ignore.workspace = true
 tokio = { workspace = true, features = ["sync"] }
-rift-binding.workspace = true
 rift-core.workspace = true
 rift-dependency.workspace = true
 rift-history.workspace = true

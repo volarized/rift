@@ -1395,7 +1395,6 @@ impl RiftMcp {
     ) -> Result<Json<SearchResult>, ErrorData> {
         let resolved = self.published_workspace(wire::ErrorPhase::Read).await?;
         let revision_read = self.revision_read(&resolved.published)?;
-        let reads = Arc::clone(&resolved.published.reads);
         let RevisionRead {
             root,
             limits,
@@ -1413,7 +1412,6 @@ impl RiftMcp {
                     limits,
                     &visibility,
                     (&text_inclusion, &languages),
-                    &reads,
                 )
             })
             .await
@@ -3703,15 +3701,12 @@ mod tests {
                 .is_none(),
             "moved source asks for a fresh publication, not an empty engine answer"
         );
-        for override_fields in [
-            json!({"direction": "outgoing", "facets": ["references"]}),
-            json!({"direction": "incoming", "facets": ["calls"]}),
-        ] {
+        for facets in [json!(["calls"]), json!(["implements"])] {
             let mut request = json!({"traversal": {
-                "seed": "rift://symbol/rust/lib.rs/beacon", "depth": 1
+                "seed": "rift://symbol/rust/lib.rs/beacon",
+                "direction": "incoming", "depth": 1
             }});
-            request["traversal"]["direction"] = override_fields["direction"].clone();
-            request["traversal"]["facets"] = override_fields["facets"].clone();
+            request["traversal"]["facets"] = facets;
             let indexed = serde_json::from_value(request)?;
             assert!(
                 server
@@ -3762,7 +3757,7 @@ mod tests {
         )?;
         super::hermetic_workspace(
             directory.path(),
-            "[providers.binding]\nenabled = false\n[languages.python.lsp]\nembedded = 'ty'\nretry = { attempts = 2, delay = '1ms', delay_limit = '1ms' }\n",
+            "[languages.python.lsp]\nembedded = 'ty'\nretry = { attempts = 2, delay = '1ms', delay_limit = '1ms' }\n",
         )?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         let resolved = server

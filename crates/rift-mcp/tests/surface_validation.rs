@@ -18,6 +18,11 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 /// Most pages one corpus request may walk before the gate fails.
 const FOLLOWED_PAGES_MAX: usize = 16;
 
+/// The engine that resolves this fixture's references, embedded in the binary.
+const ENGINE: &str = "\
+[languages.python.lsp]\nembedded = \"ty\"\n\
+retry = { attempts = 2, delay = \"1ms\", delay_limit = \"1ms\" }\n";
+
 /// Sample validation corpus with various scenarios: one request per
 /// advertised tool behavior worth proving.
 fn corpus() -> Vec<(&'static str, Value)> {
@@ -117,10 +122,9 @@ fn dependency_scope_search_corpus() -> Vec<(&'static str, Value)> {
 }
 
 /// `traversal` requests over the one real call edge the fixture already carries -
-/// `traversal_caller.rs`'s `calls_beacon_callee` calling `traversal_callee.rs`'s
-/// `beacon_callee` - so this corpus proves the new params without perturbing any other
-/// corpus entry's fixture source. `rev` combined
-/// with `traversal` is proven refused, not accepted, by
+/// `traversal_caller.py`'s `calls_callee` calling `traversal_callee.py`'s `callee` - so
+/// this corpus proves the params without perturbing any other corpus entry's fixture
+/// source. `rev` combined with `traversal` is proven refused, not accepted, by
 /// `search_traversal_with_rev_refuses_capability_unavailable` below; a runtime refusal has no
 /// structured content to validate against this corpus's output schema.
 fn traversal_search_corpus() -> Vec<(&'static str, Value)> {
@@ -128,16 +132,14 @@ fn traversal_search_corpus() -> Vec<(&'static str, Value)> {
         (
             "search",
             json!({
-                "traversal": {
-                    "seed": "rift://symbol/rust/traversal_caller.rs/calls_beacon_callee"
-                }
+                "traversal": { "seed": TRAVERSAL_CALLEE }
             }),
         ),
         (
             "search",
             json!({
                 "traversal": {
-                    "seed": "rift://symbol/rust/traversal_callee.rs/beacon_callee",
+                    "seed": TRAVERSAL_CALLEE,
                     "direction": "incoming",
                     "depth": 2
                 }
@@ -147,24 +149,30 @@ fn traversal_search_corpus() -> Vec<(&'static str, Value)> {
             "search",
             json!({
                 "traversal": {
-                    "seed": "rift://symbol/rust/traversal_caller.rs/calls_beacon_callee",
-                    "to": "rift://symbol/rust/traversal_callee.rs/beacon_callee"
+                    "seed": TRAVERSAL_CALLEE,
+                    "to": TRAVERSAL_CALLER
                 }
             }),
         ),
-        // `implements` reaches no reference role, so this answer carries the
-        // `relationship_coverage_missing` warning and validates the schema arm serving it.
+        // The engine lane resolves references alone, so `implements` beside them has no
+        // lane: this answer carries the `relationship_coverage_missing` warning and
+        // validates the schema arm serving it.
         (
             "search",
             json!({
                 "traversal": {
-                    "seed": "rift://symbol/rust/traversal_caller.rs/calls_beacon_callee",
-                    "facets": ["implements"]
+                    "seed": TRAVERSAL_CALLEE,
+                    "facets": ["implements", "references"]
                 }
             }),
         ),
     ]
 }
+
+/// The declaration every walk in this corpus starts at.
+const TRAVERSAL_CALLEE: &str = "rift://symbol/python/traversal_callee.py/callee";
+/// The one declaration referencing it.
+const TRAVERSAL_CALLER: &str = "rift://symbol/python/traversal_caller.py/calls_callee";
 
 /// Search requests only the lexical search-index tier can fully answer: a multi-word
 /// prose query merging in hits identifier search alone would not surface, and a query
@@ -194,27 +202,14 @@ fn revision_read_corpus() -> Vec<(&'static str, Value)> {
 /// `introduced` hits that file brought and validates the `change` arm of the served
 /// output schema against a real payload.
 ///
-/// The second request rides a `traversal` beside the same comparison. The walk starts at
-/// both changed declarations, reaches the caller from the callee, and that caller is
-/// itself a changed declaration, so one payload carries `change` beside `traversal_path`
-/// and the answer carries the disclosure every walked comparison rides with.
 fn change_search_corpus() -> Vec<(&'static str, Value)> {
-    vec![
-        (
-            "search",
-            json!({
-                "change": { "base": "baseline", "head": "HEAD" },
-                "include": ["source"]
-            }),
-        ),
-        (
-            "search",
-            json!({
-                "change": { "base": "baseline", "head": "HEAD" },
-                "traversal": { "direction": "incoming", "facets": ["calls"] }
-            }),
-        ),
-    ]
+    vec![(
+        "search",
+        json!({
+            "change": { "base": "baseline", "head": "HEAD" },
+            "include": ["source"]
+        }),
+    )]
 }
 
 fn arguments(value: &Value) -> TestResult<serde_json::Map<String, Value>> {
@@ -530,14 +525,16 @@ async fn served_fixture() -> TestResult<(
         directory.path().join("notes.txt"),
         "Beacon telemetry guidance covers rotating every legacy sensor unit safely.\n",
     )?;
-    // The one real call edge the traversal corpus walks.
+    // The one real call edge the traversal corpus walks. A configured language engine
+    // resolves the references a walk follows, and this fixture selects the embedded `ty`
+    // engine, so the pair is Python.
     fs::write(
-        directory.path().join("traversal_callee.rs"),
-        "pub fn beacon_callee() {}\n",
+        directory.path().join("traversal_callee.py"),
+        "def callee() -> int:\n    return 1\n",
     )?;
     fs::write(
-        directory.path().join("traversal_caller.rs"),
-        "pub fn calls_beacon_callee() {\n    beacon_callee();\n}\n",
+        directory.path().join("traversal_caller.py"),
+        "from traversal_callee import callee\n\n\ndef calls_callee() -> int:\n    return callee()\n",
     )?;
     // No syntax provider claims it; `nodes` names the missing extension.
     fs::write(directory.path().join("justfile"), "default:\n    echo hi\n")?;
@@ -559,7 +556,7 @@ async fn served_fixture() -> TestResult<(
     // `hidden.rs` stays gitignored and uncommitted, everything else lands in
     // the fixture's one commit on `main`.
     //
-    let configuration = hermetic_search::SEMANTIC_DISABLED.to_owned();
+    let configuration = format!("{}{ENGINE}", hermetic_search::SEMANTIC_DISABLED);
     fs::write(directory.path().join("rift.toml"), configuration)?;
     rift_history::fixture::init(directory.path());
     rift_history::fixture::commit_all(directory.path(), "fixture baseline");
@@ -567,8 +564,7 @@ async fn served_fixture() -> TestResult<(
     // committed revisions that really differ.
     rift_history::fixture::git(directory.path(), &["tag", "baseline"]);
     // Both the declaration and its caller arrive in this commit and live in one file, so
-    // the comparison answers two `introduced` hits and a walk beside it reaches the
-    // caller from the callee.
+    // the comparison answers two `introduced` hits.
     fs::write(
         directory.path().join("change_witness.rs"),
         "pub fn change_witness() {}\npub fn calls_change_witness() {\n    change_witness();\n}\n",
@@ -905,9 +901,7 @@ async fn search_traversal_with_rev_refuses_capability_unavailable() -> TestResul
         "search",
         &json!({
             "rev": "main",
-            "traversal": {
-                "seed": "rift://symbol/rust/traversal_caller.rs/calls_beacon_callee"
-            }
+            "traversal": { "seed": TRAVERSAL_CALLEE }
         }),
     )?;
     let error = client

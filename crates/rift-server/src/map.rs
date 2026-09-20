@@ -381,28 +381,60 @@ fn docs(index: &WorkspaceIndex) -> Vec<ProjectPath> {
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
-    use std::fmt::Write as _;
-    use std::fs;
-
     use std::collections::BTreeMap;
+    use std::error::Error;
+    use std::fs;
+    use std::sync::Arc;
 
-    use rift_core::SourceVisibility;
+    use rift_core::{
+        Contribution, ContributionKey, ContributionOrigin, ContributionReference,
+        DeclarationBinding, ExactKind, IndexRevision, Language, PortableSymbolFacts, ProviderId,
+        ProviderRevision, ProviderSymbolId, ReferenceRole, SemanticReference, SourceApplicability,
+        SourceKind, SourceLocation, SourcePath, SourceRange, SourceResolverId, SourceRevision,
+        SourceUnitId, SourceVisibility, SymbolId, TreeRevision,
+    };
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::configuration::HistoryConfiguration;
-    use rift_protocol::map::{MapModule, WorkspaceMap};
+    use rift_protocol::map::{MAP_HUBS_MAX, MapModuleRelationship, WorkspaceMap};
     use rift_protocol::read::ProjectPath;
+    use rift_provider::{
+        NormalizedGraph, NormalizedReference, NormalizedTarget, Normalizer, ProviderPublication,
+        PublicationLimits, PublicationSet,
+    };
     use tempfile::TempDir;
 
     use crate::read::ReadService;
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-    /// One function calling another, twice over, so two callees tie at one reference each -
-    /// the hub tie-break needs a genuine tie to prove it breaks by identity. A file-scope
-    /// `main` proves the entry-point listing; a symbol nested four directories deep proves
-    /// depth folding; `README.md` at the root and `docs/guide.md` prove the docs filter and
-    /// that a root-level file earns no module entry.
+    /// One hand-built declaration: its provider symbol, the wire identity it anchors, the unit
+    /// path it declares in, and its declaration range.
+    type Definition<'a> = (&'a str, &'a str, &'a str, (u64, u64));
+
+    /// One hand-built reference: its provider symbol, the unit path the occurrence sits in, the
+    /// occurrence range, and the provider symbol it names.
+    type Occurrence<'a> = (&'a str, &'a str, (u64, u64), &'a str);
+
+    /// The exact kind every hand-built declaration publishes, which a hub carries through.
+    const DECLARED_KIND: &str = "rust.function";
+
+    /// The identity a fact-less declaration anchors, so a reference resolves to a record the
+    /// hub ranking cannot assemble.
+    const GHOST_IDENTITY: &str = "rift://symbol/rust/src/lib.rs/ghost";
+
+    /// The two units a crossing reference joins: `src/lib.rs` declares `beacon`, and
+    /// `src/inner/mod.rs` declares the `helper` it names, so the two fold to different modules.
+    const CROSSING_UNITS: &[&str] = &["src/lib.rs", "src/inner/mod.rs"];
+
+    /// One occurrence in `src/lib.rs` naming the declaration `src/inner/mod.rs` makes.
+    const ONE_CROSSING_CALL: &[Occurrence<'_>] =
+        &[("beacon_calls_helper", "src/lib.rs", (10, 20), "helper")];
+
+    /// One function calling another, twice over. A file-scope `main` proves the entry-point
+    /// listing; a symbol nested four directories deep proves depth folding; `README.md` at the
+    /// root and `docs/guide.md` prove the docs filter and that a root-level file earns no module
+    /// entry. No provider publishes a resolved reference, so the calls in this source reach the
+    /// map as neither hub nor module relationship.
     fn fixture() -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
         fs::create_dir_all(directory.path().join("src"))?;
@@ -429,6 +461,271 @@ mod tests {
         )?;
         Ok((directory, service))
     }
+
+    /// The provider every hand-built contribution publishes under. The hub ranking selects
+    /// presentation facts by this identity, so facts published under another one assemble
+    /// nothing and rank nothing.
+    fn syntax_provider() -> TestResult<ProviderId> {
+        Ok(ProviderId::new(rift_syntax::SYNTAX_PROVIDER_ID)?)
+    }
+
+    /// One contribution key for `symbol` under the syntax provider's first revision.
+    fn contribution_key(symbol: &str) -> TestResult<ContributionKey> {
+        Ok(ContributionKey::new(
+            syntax_provider()?,
+            ProviderRevision::new(1)?,
+            ProviderSymbolId::new(symbol)?,
+        ))
+    }
+
+    /// The single revision pair every hand-built contribution applies to.
+    fn applicability() -> TestResult<SourceApplicability> {
+        Ok(SourceApplicability::Exact {
+            source_revision: SourceRevision::new(1)?,
+            tree_revision: TreeRevision::new(1)?,
+        })
+    }
+
+    /// Authored project origin, which is what a workspace provider publishes.
+    fn origin() -> TestResult<ContributionOrigin> {
+        Ok(ContributionOrigin::new(
+            Some(SourceLocation::Project { package: None }),
+            SourceKind::Authored,
+        )?)
+    }
+
+    /// The unit a project-resolved `path` mints, the same key `unit_paths` files it under.
+    fn source_unit(path: &str) -> TestResult<SourceUnitId> {
+        Ok(SourceUnitId::new(
+            SourceResolverId::new("project")?,
+            SourcePath::new(path)?,
+        )?)
+    }
+
+    /// One binding over `range` of `path`. Normalization joins two contributions that share one
+    /// source binding into a single record, so every declaration takes a range of its own.
+    fn binding(path: &str, range: (u64, u64)) -> TestResult<DeclarationBinding> {
+        Ok(DeclarationBinding::new(
+            source_unit(path)?,
+            SourceRange::new(range.0, range.1)?,
+            None,
+        ))
+    }
+
+    /// Declarations carrying portable facts, one contribution each.
+    fn declared_contributions(definitions: &[Definition<'_>]) -> TestResult<Vec<Contribution>> {
+        definitions
+            .iter()
+            .map(|(symbol, identity, path, range)| {
+                let language = Language {
+                    name: "rust".to_owned(),
+                    dialect: None,
+                };
+                let kind = ExactKind(DECLARED_KIND.to_owned());
+                let facts = PortableSymbolFacts::new(language, *identity, *identity, kind);
+                let key = contribution_key(symbol)?;
+                Ok(
+                    Contribution::builder(key, applicability()?, facts, origin()?)
+                        .source(binding(path, *range)?)
+                        .identity_anchor(SymbolId::new(*identity)?)
+                        .build()?,
+                )
+            })
+            .collect()
+    }
+
+    /// Declarations that anchor an identity and publish no portable facts: a reference resolving
+    /// to one names a record the hub ranking cannot assemble and must skip.
+    fn fact_less_contributions(definitions: &[Definition<'_>]) -> TestResult<Vec<Contribution>> {
+        definitions
+            .iter()
+            .map(|(symbol, identity, path, range)| {
+                let key = contribution_key(symbol)?;
+                Ok(Contribution::fact_builder(key, applicability()?, origin()?)
+                    .source(binding(path, *range)?)
+                    .identity_anchor(SymbolId::new(*identity)?)
+                    .build()?)
+            })
+            .collect()
+    }
+
+    /// Reference contributions, one occurrence each. A reference declares nothing, so it takes
+    /// no source binding of its own and joins no declaration's record.
+    fn reference_contributions(references: &[Occurrence<'_>]) -> TestResult<Vec<Contribution>> {
+        references
+            .iter()
+            .map(|(symbol, path, range, target)| {
+                let provider_symbol = ProviderSymbolId::new(*target)?;
+                let targets = vec![ContributionReference::new(
+                    syntax_provider()?,
+                    provider_symbol,
+                )];
+                let source = binding(path, *range)?;
+                let occurrence = SemanticReference::new(source, ReferenceRole::Call, targets)?;
+                let key = contribution_key(symbol)?;
+                Ok(Contribution::fact_builder(key, applicability()?, origin()?)
+                    .references(vec![occurrence])
+                    .build()?)
+            })
+            .collect()
+    }
+
+    /// Normalizes one hand-built publication into the graph `build_workspace_map` reads. No
+    /// shipped provider publishes a resolved reference, so a served workspace cannot supply the
+    /// graph the hub ranking and the module-relationship fold act on.
+    fn published_graph(
+        definitions: &[Definition<'_>],
+        fact_less: &[Definition<'_>],
+        references: &[Occurrence<'_>],
+    ) -> TestResult<NormalizedGraph> {
+        let mut contributions = declared_contributions(definitions)?;
+        contributions.extend(fact_less_contributions(fact_less)?);
+        contributions.extend(reference_contributions(references)?);
+        let publication = ProviderPublication::new(
+            syntax_provider()?,
+            ProviderRevision::new(1)?,
+            contributions,
+            PublicationLimits::default(),
+        )?;
+        let publications =
+            Arc::new(PublicationSet::empty(PublicationLimits::default()).replaced(publication)?);
+        Ok(Normalizer::normalize(
+            IndexRevision::new(1)?,
+            SourceRevision::new(1)?,
+            TreeRevision::new(1)?,
+            &publications,
+            None,
+        )?)
+    }
+
+    /// One graph whose every declaration carries portable facts.
+    fn resolved_graph(
+        definitions: &[Definition<'_>],
+        references: &[Occurrence<'_>],
+    ) -> TestResult<NormalizedGraph> {
+        published_graph(definitions, &[], references)
+    }
+
+    /// `src/lib.rs` declares `beacon`, `src/inner/mod.rs` declares `helper`, and `calls` names
+    /// `helper` from `src/lib.rs`, so every occurrence crosses the two modules.
+    fn crossing_graph(calls: &[Occurrence<'_>]) -> TestResult<NormalizedGraph> {
+        resolved_graph(
+            &[
+                (
+                    "beacon",
+                    "rift://symbol/rust/src/lib.rs/beacon",
+                    "src/lib.rs",
+                    (0, 30),
+                ),
+                (
+                    "helper",
+                    "rift://symbol/rust/src/inner/mod.rs/helper",
+                    "src/inner/mod.rs",
+                    (0, 20),
+                ),
+            ],
+            calls,
+        )
+    }
+
+    /// `holder` declares portable facts and references `ghost`, whose contribution anchors an
+    /// identity and carries none. The graph resolves `ghost` as a reference target.
+    fn fact_less_target_graph() -> TestResult<NormalizedGraph> {
+        published_graph(
+            &[(
+                "holder",
+                "rift://symbol/rust/src/lib.rs/holder",
+                "src/lib.rs",
+                (0, 40),
+            )],
+            &[("ghost", GHOST_IDENTITY, "src/lib.rs", (50, 60))],
+            &[("holder_ref_ghost", "src/lib.rs", (10, 15), "ghost")],
+        )
+    }
+
+    /// The unit-to-path map `module_relationships` folds a reference through, for the units a
+    /// hand-built graph declares in.
+    fn unit_paths(paths: &[&str]) -> TestResult<BTreeMap<SourceUnitId, rift_core::ProjectPath>> {
+        paths
+            .iter()
+            .map(|path| Ok((source_unit(path)?, rift_core::ProjectPath::new(*path)?)))
+            .collect()
+    }
+
+    /// Every identity a graph's references resolve to. A test expecting no relationship checks
+    /// this first: an empty answer over a graph that resolves nothing proves nothing.
+    fn resolved_targets(graph: &NormalizedGraph) -> Vec<SymbolId> {
+        graph
+            .references()
+            .iter()
+            .flat_map(NormalizedReference::targets)
+            .filter_map(|target| match target {
+                NormalizedTarget::Symbol(identity) => Some(identity.clone()),
+                NormalizedTarget::Contribution(_) => None,
+            })
+            .collect()
+    }
+
+    /// The module paths a workspace of `paths` lists, flattened, built by the same fold
+    /// `build_workspace_map` credits its directories with.
+    fn listed_modules(paths: &[&str]) -> TestResult<Vec<String>> {
+        let mut counts = BTreeMap::new();
+        for path in paths {
+            let path = rift_core::ProjectPath::new(*path)?;
+            super::credit_directories(&mut counts, &path, |credited| credited.files += 1);
+        }
+        let mut listed = Vec::new();
+        let mut pending = super::module_tree(&counts);
+        while let Some(module) = pending.pop() {
+            listed.push(module.path.0);
+            pending.extend(module.children);
+        }
+        Ok(listed)
+    }
+
+    /// The module pairs one relationship list names, with each pair's reference count.
+    fn pairs(relationships: &[MapModuleRelationship]) -> Vec<(&str, &str, u64)> {
+        relationships
+            .iter()
+            .map(|relationship| {
+                (
+                    relationship.from.0.as_str(),
+                    relationship.to.0.as_str(),
+                    relationship.references,
+                )
+            })
+            .collect()
+    }
+
+    /// One workspace of `files`, served, with its orientation snapshot.
+    fn served_map(files: &[(&str, &str)]) -> TestResult<(tempfile::TempDir, WorkspaceMap)> {
+        let directory = tempfile::tempdir()?;
+        for (path, contents) in files {
+            let path = directory.path().join(path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, contents)?;
+        }
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let map = service.workspace_map();
+        Ok((directory, map))
+    }
+
+    /// `src/lib.rs` calls a declaration `src/inner/mod.rs` defines, one module apart.
+    const CROSSING_FILES: &[(&str, &str)] = &[
+        (
+            "src/lib.rs",
+            "mod inner;\npub fn beacon() {\n    inner::helper();\n}\n",
+        ),
+        ("src/inner/mod.rs", "pub fn helper() {}\n"),
+    ];
 
     #[test]
     fn module_tree_folds_deep_directories_and_keeps_counts_inclusive() -> TestResult {
@@ -470,64 +767,113 @@ mod tests {
 
     #[test]
     fn hubs_rank_by_reference_count_then_break_ties_by_symbol_identity() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let map = service.workspace_map();
-
-        let ids: Vec<&str> = map.hubs.iter().map(|hub| hub.symbol.0.as_str()).collect();
-        assert_eq!(
-            ids,
-            [
-                "rift://symbol/rust/src/lib.rs/alpha",
-                "rift://symbol/rust/src/lib.rs/beta",
-                "rift://symbol/rust/src/lib.rs/use_alpha",
+        let graph = resolved_graph(
+            &[
+                (
+                    "alpha",
+                    "rift://symbol/rust/src/lib.rs/alpha",
+                    "src/lib.rs",
+                    (0, 10),
+                ),
+                (
+                    "beta",
+                    "rift://symbol/rust/src/lib.rs/beta",
+                    "src/lib.rs",
+                    (10, 20),
+                ),
+                (
+                    "use_alpha",
+                    "rift://symbol/rust/src/lib.rs/use_alpha",
+                    "src/lib.rs",
+                    (20, 40),
+                ),
             ],
-            "alpha and beta tie at one reference each and sort by identity; \
-             use_alpha is referenced once from main"
+            &[
+                ("call_alpha", "src/lib.rs", (100, 105), "alpha"),
+                ("call_beta", "src/lib.rs", (105, 110), "beta"),
+                (
+                    "first_call_use_alpha",
+                    "src/lib.rs",
+                    (110, 120),
+                    "use_alpha",
+                ),
+                (
+                    "second_call_use_alpha",
+                    "src/lib.rs",
+                    (120, 130),
+                    "use_alpha",
+                ),
+            ],
+        )?;
+        let hubs = super::hubs(&graph, &super::records_by_identity(&graph));
+
+        let ranked: Vec<(&str, u64)> = hubs
+            .iter()
+            .map(|hub| (hub.symbol.0.as_str(), hub.references))
+            .collect();
+        assert_eq!(
+            ranked,
+            [
+                ("rift://symbol/rust/src/lib.rs/use_alpha", 2),
+                ("rift://symbol/rust/src/lib.rs/alpha", 1),
+                ("rift://symbol/rust/src/lib.rs/beta", 1),
+            ],
+            "twice-referenced use_alpha ranks first; alpha and beta tie at one reference each \
+             and sort by identity"
         );
-        assert!(map.hubs.iter().all(|hub| hub.references == 1));
-        assert!(map.hubs.iter().all(|hub| hub.kind.0 == "function"));
+        assert!(hubs.iter().all(|hub| hub.kind.0 == DECLARED_KIND));
         Ok(())
     }
 
     #[test]
     fn hubs_stop_at_the_bound_and_skip_candidates_with_no_portable_facts() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::create_dir_all(directory.path().join("src"))?;
-        let mut source = String::new();
-        for index in 0..25 {
-            writeln!(source, "pub fn callee_{index:02}() {{}}")?;
-        }
-        source
-            .push_str("pub fn caller() {\n    let local = 1;\n    let doubled = local + local;\n");
-        for index in 0..25 {
-            writeln!(source, "    callee_{index:02}();")?;
-        }
-        source.push_str("    assert!(doubled > 0);\n}\n");
-        fs::write(directory.path().join("src/lib.rs"), source)?;
-        let service = ReadService::build(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::default(),
-            HistoryConfiguration::default(),
-        )?;
-        let map = service.workspace_map();
+        let callee_count = u64::try_from(MAP_HUBS_MAX)? + 2;
+        let callees: Vec<(String, String, String, (u64, u64))> = (0..callee_count)
+            .map(|index| {
+                (
+                    format!("callee_{index:02}"),
+                    format!("rift://symbol/rust/src/lib.rs/callee_{index:02}"),
+                    format!("call_callee_{index:02}"),
+                    (index * 10, index * 10 + 10),
+                )
+            })
+            .collect();
+        let definitions: Vec<Definition<'_>> = callees
+            .iter()
+            .map(|(symbol, identity, _, range)| {
+                (symbol.as_str(), identity.as_str(), "src/lib.rs", *range)
+            })
+            .collect();
+        let mut references: Vec<Occurrence<'_>> = callees
+            .iter()
+            .map(|(symbol, _, occurrence, range)| {
+                let occurrence_range = (range.0 + 1_000, range.1 + 1_000);
+                (
+                    occurrence.as_str(),
+                    "src/lib.rs",
+                    occurrence_range,
+                    symbol.as_str(),
+                )
+            })
+            .collect();
+        references.push(("first_call_ghost", "src/lib.rs", (10_000, 10_010), "ghost"));
+        references.push(("second_call_ghost", "src/lib.rs", (10_010, 10_020), "ghost"));
+        let ghost: &[Definition<'_>] = &[("ghost", GHOST_IDENTITY, "src/lib.rs", (20_000, 20_010))];
+        let graph = published_graph(&definitions, ghost, &references)?;
+        let hubs = super::hubs(&graph, &super::records_by_identity(&graph));
 
         assert_eq!(
-            map.hubs.len(),
-            rift_protocol::map::MAP_HUBS_MAX,
-            "twenty-five referenced callees and a twice-referenced local exceed the bound"
+            hubs.len(),
+            MAP_HUBS_MAX,
+            "{callee_count} referenced callees and a twice-referenced ghost exceed the bound"
         );
         assert!(
-            map.hubs
-                .iter()
-                .all(|hub| !hub.symbol.0.ends_with("/local") && !hub.symbol.0.ends_with("/doubled")),
-            "a local binding carries no portable facts and never ranks as a hub: hubs={:?}",
-            map.hubs
+            hubs.iter().all(|hub| !hub.symbol.0.ends_with("/ghost")),
+            "a record with no portable facts never ranks as a hub: hubs={hubs:?}"
         );
         assert_eq!(
-            map.hubs[0].symbol.0, "rift://symbol/rust/src/lib.rs/callee_00",
-            "the twice-referenced local would rank first were it assemblable; the ranked \
+            hubs[0].symbol.0, "rift://symbol/rust/src/lib.rs/callee_00",
+            "the twice-referenced ghost would rank first were it assemblable; the ranked \
              callees follow in identity order"
         );
         Ok(())
@@ -628,113 +974,12 @@ mod tests {
         Ok(())
     }
 
-    /// Builds one normalized graph by hand: `holder` declares portable facts and references
-    /// `ghost`, whose only contribution carries an identity anchor and no facts. The graph
-    /// then resolves `ghost` as a reference target the hub ranking must skip.
-    fn fact_less_target_graph() -> TestResult<rift_provider::NormalizedGraph> {
-        use std::sync::Arc;
-
-        use rift_core::{
-            Contribution, ContributionKey, ContributionOrigin, ContributionReference,
-            DeclarationBinding, ExactKind, IndexRevision, Language, PortableSymbolFacts,
-            ProviderId, ProviderRevision, ProviderSymbolId, ReferenceRole, SemanticReference,
-            SourceApplicability, SourceKind, SourceLocation, SourcePath, SourceRange,
-            SourceResolverId, SourceRevision, SourceUnitId, SymbolId, TreeRevision,
-        };
-        use rift_provider::{Normalizer, ProviderPublication, PublicationLimits, PublicationSet};
-
-        let provider = ProviderId::new("syntax")?;
-        let key = |symbol: &str| -> Result<ContributionKey, Box<dyn Error>> {
-            Ok(ContributionKey::new(
-                provider.clone(),
-                ProviderRevision::new(1)?,
-                ProviderSymbolId::new(symbol)?,
-            ))
-        };
-        let unit = SourceUnitId::new(
-            SourceResolverId::new("project")?,
-            SourcePath::new("src/lib.rs")?,
-        )?;
-        let applicability = SourceApplicability::Exact {
-            source_revision: SourceRevision::new(1)?,
-            tree_revision: TreeRevision::new(1)?,
-        };
-        let origin = ContributionOrigin::new(
-            Some(SourceLocation::Project { package: None }),
-            SourceKind::Authored,
-        )?;
-        let holder_identity = "rift://symbol/rust/src/lib.rs/holder";
-        let ghost_identity = SymbolId::new("rift://symbol/rust/src/lib.rs/ghost")?;
-        let holder = Contribution::builder(
-            key("holder")?,
-            applicability,
-            PortableSymbolFacts::new(
-                Language {
-                    name: "rust".to_owned(),
-                    dialect: None,
-                },
-                holder_identity,
-                holder_identity,
-                ExactKind("rust.function".to_owned()),
-            ),
-            origin.clone(),
-        )
-        .source(DeclarationBinding::new(
-            unit.clone(),
-            SourceRange::new(0, 40)?,
-            None,
-        ))
-        .identity_anchor(SymbolId::new(holder_identity)?)
-        .build()?;
-        let ghost = Contribution::fact_builder(key("ghost")?, applicability, origin.clone())
-            .source(DeclarationBinding::new(
-                unit.clone(),
-                SourceRange::new(50, 60)?,
-                None,
-            ))
-            .identity_anchor(ghost_identity.clone())
-            .build()?;
-        let reference = Contribution::fact_builder(key("holder_ref_ghost")?, applicability, origin)
-            .references(vec![SemanticReference::new(
-                DeclarationBinding::new(unit, SourceRange::new(10, 15)?, None),
-                ReferenceRole::Call,
-                vec![ContributionReference::new(
-                    provider.clone(),
-                    ProviderSymbolId::new("ghost")?,
-                )],
-            )?])
-            .build()?;
-        let publication = ProviderPublication::new(
-            provider,
-            ProviderRevision::new(1)?,
-            vec![holder, ghost, reference],
-            PublicationLimits::default(),
-        )?;
-        let publications =
-            Arc::new(PublicationSet::empty(PublicationLimits::default()).replaced(publication)?);
-        let graph = Normalizer::normalize(
-            IndexRevision::new(1)?,
-            SourceRevision::new(1)?,
-            TreeRevision::new(1)?,
-            &publications,
-            None,
-        )?;
-        Ok(graph)
-    }
-
     #[test]
     fn hubs_skip_a_resolved_target_whose_record_carries_no_portable_facts() -> TestResult {
-        use rift_provider::NormalizedTarget;
-
         let graph = fact_less_target_graph()?;
-        let ghost_identity = rift_core::SymbolId::new("rift://symbol/rust/src/lib.rs/ghost")?;
-        let ghost_resolved = graph.references().iter().any(|reference| {
-            reference.targets().iter().any(
-                |target| matches!(target, NormalizedTarget::Symbol(id) if id == &ghost_identity),
-            )
-        });
+        let ghost = SymbolId::new(GHOST_IDENTITY)?;
         assert!(
-            ghost_resolved,
+            resolved_targets(&graph).contains(&ghost),
             "the ghost target must resolve to an established identity so the skip arm runs"
         );
         let hubs = super::hubs(&graph, &super::records_by_identity(&graph));
@@ -743,50 +988,6 @@ mod tests {
             "a record with no portable facts never ranks as a hub: hubs={hubs:?}"
         );
         Ok(())
-    }
-
-    /// One workspace of `files`, served, with its orientation snapshot.
-    fn served_map(files: &[(&str, &str)]) -> TestResult<(tempfile::TempDir, WorkspaceMap)> {
-        let directory = tempfile::tempdir()?;
-        for (path, contents) in files {
-            let path = directory.path().join(path);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(path, contents)?;
-        }
-        let service = ReadService::build(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::default(),
-            HistoryConfiguration::default(),
-        )?;
-        let map = service.workspace_map();
-        Ok((directory, map))
-    }
-
-    /// `src/lib.rs` calls a declaration `src/inner/mod.rs` defines, so one resolved reference
-    /// crosses the two modules the tree lists.
-    const CROSSING_FILES: &[(&str, &str)] = &[
-        (
-            "src/lib.rs",
-            "mod inner;\npub fn beacon() {\n    inner::helper();\n}\n",
-        ),
-        ("src/inner/mod.rs", "pub fn helper() {}\n"),
-    ];
-
-    fn pairs(map: &WorkspaceMap) -> Vec<(&str, &str, u64)> {
-        map.module_relationships
-            .iter()
-            .map(|relationship| {
-                (
-                    relationship.from.0.as_str(),
-                    relationship.to.0.as_str(),
-                    relationship.references,
-                )
-            })
-            .collect()
     }
 
     #[test]
@@ -806,28 +1007,33 @@ mod tests {
 
     #[test]
     fn a_resolved_reference_crossing_two_modules_becomes_one_relationship() -> TestResult {
-        let (_directory, map) = served_map(CROSSING_FILES)?;
-        assert_eq!(pairs(&map), [("src", "src/inner", 1)]);
+        let graph = crossing_graph(ONE_CROSSING_CALL)?;
+        let records = super::records_by_identity(&graph);
+        let relationships =
+            super::module_relationships(&graph, &unit_paths(CROSSING_UNITS)?, &records);
+        assert_eq!(pairs(&relationships), [("src", "src/inner", 1)]);
         Ok(())
     }
 
     #[test]
     fn every_relationship_endpoint_names_a_listed_module() -> TestResult {
-        let (_directory, map) = served_map(CROSSING_FILES)?;
-        let mut listed: Vec<&str> = Vec::new();
-        let mut pending: Vec<&MapModule> = map.modules.iter().collect();
-        while let Some(module) = pending.pop() {
-            listed.push(module.path.0.as_str());
-            pending.extend(module.children.iter());
-        }
-        for relationship in &map.module_relationships {
+        let graph = crossing_graph(ONE_CROSSING_CALL)?;
+        let records = super::records_by_identity(&graph);
+        let relationships =
+            super::module_relationships(&graph, &unit_paths(CROSSING_UNITS)?, &records);
+        let listed = listed_modules(CROSSING_UNITS)?;
+        assert!(
+            !relationships.is_empty(),
+            "the crossing graph answers one relationship to check"
+        );
+        for relationship in &relationships {
             assert!(
-                listed.contains(&relationship.from.0.as_str()),
+                listed.contains(&relationship.from.0),
                 "from={} listed={listed:?}",
                 relationship.from.0
             );
             assert!(
-                listed.contains(&relationship.to.0.as_str()),
+                listed.contains(&relationship.to.0),
                 "to={} listed={listed:?}",
                 relationship.to.0
             );
@@ -837,53 +1043,101 @@ mod tests {
 
     #[test]
     fn several_references_over_one_pair_answer_as_one_relationship() -> TestResult {
-        let (_directory, map) = served_map(&[
-            (
-                "src/lib.rs",
-                "mod inner;\npub fn beacon() {\n    inner::helper();\n    inner::helper();\n}\n",
-            ),
-            ("src/inner/mod.rs", "pub fn helper() {}\n"),
+        let graph = crossing_graph(&[
+            ("first_call_helper", "src/lib.rs", (10, 20), "helper"),
+            ("second_call_helper", "src/lib.rs", (20, 30), "helper"),
         ])?;
-        assert_eq!(pairs(&map), [("src", "src/inner", 2)]);
+        let records = super::records_by_identity(&graph);
+        let relationships =
+            super::module_relationships(&graph, &unit_paths(CROSSING_UNITS)?, &records);
+        assert_eq!(pairs(&relationships), [("src", "src/inner", 2)]);
         Ok(())
     }
 
     #[test]
     fn a_reference_inside_one_module_is_no_relationship() -> TestResult {
-        let (_directory, map) = served_map(&[(
-            "src/lib.rs",
-            "pub fn helper() {}\npub fn beacon() {\n    helper();\n}\n",
-        )])?;
+        let graph = resolved_graph(
+            &[
+                (
+                    "helper",
+                    "rift://symbol/rust/src/lib.rs/helper",
+                    "src/lib.rs",
+                    (0, 20),
+                ),
+                (
+                    "beacon",
+                    "rift://symbol/rust/src/lib.rs/beacon",
+                    "src/lib.rs",
+                    (20, 50),
+                ),
+            ],
+            &[("beacon_calls_helper", "src/lib.rs", (30, 40), "helper")],
+        )?;
+        let records = super::records_by_identity(&graph);
+        let relationships =
+            super::module_relationships(&graph, &unit_paths(&["src/lib.rs"])?, &records);
         assert!(
-            map.module_relationships.is_empty(),
-            "a module referencing itself says nothing about structure: {:?}",
-            map.module_relationships
+            !resolved_targets(&graph).is_empty(),
+            "the reference must resolve, or an empty answer proves nothing"
+        );
+        assert!(
+            relationships.is_empty(),
+            "a module referencing itself says nothing about structure: {relationships:?}"
         );
         Ok(())
     }
 
     #[test]
     fn a_reference_from_a_root_file_contributes_no_endpoint() -> TestResult {
-        let (_directory, map) = served_map(&[
-            (
-                "lib.rs",
-                "mod inner;\npub fn beacon() {\n    inner::helper();\n}\n",
-            ),
-            ("inner/mod.rs", "pub fn helper() {}\n"),
-        ])?;
+        let graph = resolved_graph(
+            &[
+                (
+                    "beacon",
+                    "rift://symbol/rust/lib.rs/beacon",
+                    "lib.rs",
+                    (0, 30),
+                ),
+                (
+                    "helper",
+                    "rift://symbol/rust/inner/mod.rs/helper",
+                    "inner/mod.rs",
+                    (0, 20),
+                ),
+            ],
+            &[("beacon_calls_helper", "lib.rs", (10, 20), "helper")],
+        )?;
+        let records = super::records_by_identity(&graph);
+        let paths = unit_paths(&["lib.rs", "inner/mod.rs"])?;
+        let relationships = super::module_relationships(&graph, &paths, &records);
         assert!(
-            map.module_relationships.is_empty(),
-            "a file directly at the workspace root belongs to no listed module: {:?}",
-            map.module_relationships
+            !resolved_targets(&graph).is_empty(),
+            "the reference must resolve, or an empty answer proves nothing"
+        );
+        assert!(
+            relationships.is_empty(),
+            "a file directly at the workspace root belongs to no listed module: {relationships:?}"
         );
         Ok(())
     }
 
     #[test]
     fn module_relationships_are_stable_across_two_builds_of_one_tree() -> TestResult {
-        let (_first_directory, first) = served_map(CROSSING_FILES)?;
-        let (_second_directory, second) = served_map(CROSSING_FILES)?;
-        assert_eq!(first.module_relationships, second.module_relationships);
+        let first_graph = crossing_graph(ONE_CROSSING_CALL)?;
+        let second_graph = crossing_graph(ONE_CROSSING_CALL)?;
+        let first_records = super::records_by_identity(&first_graph);
+        let second_records = super::records_by_identity(&second_graph);
+        let first =
+            super::module_relationships(&first_graph, &unit_paths(CROSSING_UNITS)?, &first_records);
+        let second = super::module_relationships(
+            &second_graph,
+            &unit_paths(CROSSING_UNITS)?,
+            &second_records,
+        );
+        assert!(
+            !first.is_empty(),
+            "the crossing graph answers one relationship to compare"
+        );
+        assert_eq!(first, second);
         Ok(())
     }
 
@@ -895,6 +1149,26 @@ mod tests {
         assert!(
             super::module_relationships(&graph, &unit_paths, &records).is_empty(),
             "a reference whose source unit maps to no project path contributes nothing"
+        );
+        Ok(())
+    }
+
+    /// The shipped state, not an accident: no provider publishes a resolved reference into the
+    /// index, so both rankings that read the graph's references answer empty for a workspace
+    /// whose source plainly calls across two modules. The ranking and the fold themselves stay
+    /// proven over the hand-built graphs above.
+    #[test]
+    fn a_served_workspace_answers_no_hub_and_no_module_relationship() -> TestResult {
+        let (_directory, map) = served_map(CROSSING_FILES)?;
+        assert!(
+            map.hubs.is_empty(),
+            "no provider publishes a resolved reference, so no symbol ranks as a hub: {:?}",
+            map.hubs
+        );
+        assert!(
+            map.module_relationships.is_empty(),
+            "no provider publishes a resolved reference, so no module pair is joined: {:?}",
+            map.module_relationships
         );
         Ok(())
     }

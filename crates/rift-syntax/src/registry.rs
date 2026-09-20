@@ -311,17 +311,6 @@ mod tests {
     }
 
     #[test]
-    fn test_stub_provider_binding_layout_defaults_to_none() {
-        let stub = StubProvider {
-            language: ShippedLanguage::Json.language(),
-        };
-        assert!(
-            stub.binding_layout(&["Cargo.toml", "src/lib.rs"]).is_none(),
-            "a provider without module layout rules serves none by default"
-        );
-    }
-
-    #[test]
     #[should_panic(expected = "the syntax registry must ship at least one language definition")]
     fn test_assemble_refuses_an_empty_definition_set() {
         SyntaxRegistry::assemble(&[]);

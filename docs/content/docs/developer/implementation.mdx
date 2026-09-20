@@ -15,7 +15,7 @@ check the [main documentation](/docs).
       mcp -- "Streamable HTTP /api/mcp" --> server["rift server<br/>Axum on Tokio"]:::rift
       toml["rift.toml"]:::config -- "acceptance" --> server
       subgraph indexing["providers and index"]
-        providers["providers<br/>tree-sitter + binding"]:::provider
+        providers["providers<br/>tree-sitter"]:::provider
         normalization["normalization<br/>SymbolRecord graph"]:::rift
         memory["in-memory index<br/>symbols + nodes"]:::store
         db[".rift/db<br/>search index + server logs"]:::store
@@ -52,8 +52,7 @@ tool documents.
 The server is an [Axum](https://docs.rs/axum) application on the [Tokio](https://tokio.rs)
 runtime. MCP clients use its `/api/mcp` route, which serves Streamable HTTP through
 [rmcp](https://github.com/modelcontextprotocol/rust-sdk)'s service layer; `/api/stop` serves
-`rift server stop`, and the rest of the routes are reserved for other surfaces, the SCIP
-export for example.
+`rift server stop`.
 
 Startup runs one cycle:
 
@@ -292,22 +291,9 @@ Syntax providers wrap [tree-sitter](https://tree-sitter.github.io/tree-sitter/) 
 a Rift-owned adapter: grammar node kinds resolve to numeric ids once, and raw query and cursor
 APIs never leave the syntax crate.
 
-<VersionBadge version="v0.0.27" />
-
-The binding provider is the `rift-binding` crate, run in process by the index build. A syntax
-provider may extract binding facts - scopes, definitions, references, imports - in one walk
-over the tree its parse produced and attach them to its document. The Rust provider does, and
-supplies the `ModuleLayout` implementation the build resolves module paths through, fetched
-once per language from the provider registry. The registry itself assembles from one shipped
-definition list in `rift-syntax`: each entry names a language's identity, the file extensions
-it claims, and the provider parsing it, so adding a language is one definition plus one list
-entry.
-
-The build assembles every document's facts into one graph, links modules across units, resolves
-each reference on a bounded work queue with a per-step precedence rank, and publishes the
-resolutions beside the syntax publication. An item definition carries the same declaration
-binding as its syntax Contribution, the equivalence evidence normalization uses to join the
-two records.
+The registry itself assembles from one shipped definition list in `rift-syntax`: each entry
+names a language's identity, the file extensions it claims, and the provider parsing it, so
+adding a language is one definition plus one list entry.
 
 ## Language engines
 

@@ -876,9 +876,10 @@ pub fn require_search_selector(schema: &mut Schema) {
 }
 
 /// A [`SearchTraversal`](crate::search::SearchTraversal) names the declaration its walk
-/// starts at through `seed`, unless it rides beside `change`, which starts the walk at
-/// every changed declaration. The server enforces both halves, so the schema states them
-/// for a validating caller.
+/// starts at through `seed`, and no walk rides beside `change`: a comparison names two
+/// committed revisions, and the language engine lane that resolves references serves the
+/// current tree alone. The server enforces both halves, so the schema states them for a
+/// validating caller.
 pub fn require_traversal_seed(schema: &mut Schema) {
     use crate::search::{SearchParams, SearchTraversal};
     let change = property!(SearchParams, change);
@@ -887,21 +888,15 @@ pub fn require_traversal_seed(schema: &mut Schema) {
     append(
         schema,
         described(
-            "a traversal without change starts at seed",
-            otherwise(
-                requires(&[change]),
-                properties(vec![(traversal, requires(&[seed]))]),
-            ),
+            "a traversal starts at seed",
+            properties(vec![(traversal, requires(&[seed]))]),
         ),
     );
     append(
         schema,
         described(
-            "a traversal beside change starts at every changed declaration, never at seed",
-            when(
-                requires(&[change]),
-                properties(vec![(traversal, not(requires(&[seed])))]),
-            ),
+            "a traversal never rides beside change",
+            when(requires(&[change]), not(requires(&[traversal]))),
         ),
     );
 }

@@ -406,27 +406,28 @@ pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
     Ok(())
 }
 
-/// Refuses a `traversal` whose `seed` disagrees with what the request seeds the walk from.
+/// The capability a walk beside a comparison names.
 ///
-/// A walk standing without `change` has no other starting declaration, so `seed` names it.
-/// A walk riding beside `change` starts at every changed declaration, so a `seed` beside it
-/// names a second starting point the answer cannot honor. `schemars`' cross-field rules are
-/// advisory only, so this mirrors the rule `require_traversal_seed` advertises.
+/// The language engine lane resolves the references a walk follows, and an engine session
+/// serves the current tree; a comparison names two committed revisions instead. No resend
+/// of the same request clears that.
+pub(crate) const CHANGE_TRAVERSAL_CAPABILITY: &str = "relationship traversal beside a comparison";
+
+/// Refuses a `traversal` that names no `seed`, and one riding beside `change`.
+///
+/// A walk has one starting declaration, and `seed` names it. `schemars`' cross-field rules
+/// are advisory only, so this mirrors the rule `require_traversal_seed` advertises.
 fn validate_traversal_seed(
     params: &SearchParams,
     traversal: &SearchTraversal,
 ) -> Result<(), ReadError> {
-    match (params.change.is_some(), traversal.seed.is_some()) {
-        (false, false) => Err(ReadFault::invalid(
-            "seed",
-            "a traversal without change starts at seed",
-        )),
-        (true, true) => Err(ReadFault::invalid(
-            "seed",
-            "a traversal beside change starts at every changed declaration",
-        )),
-        _ => Ok(()),
+    if params.change.is_some() {
+        return Err(ReadFault::unsupported(CHANGE_TRAVERSAL_CAPABILITY));
     }
+    if traversal.seed.is_none() {
+        return Err(ReadFault::invalid("seed", "a traversal starts at seed"));
+    }
+    Ok(())
 }
 
 /// Refuses a `change` beside a field that selects another result set or another tree, and
@@ -3829,46 +3830,54 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    /// A walk names its starting declaration exactly once: through `seed` when it stands
-    /// without `change`, and through the changed declarations themselves beside one.
+    /// A walk names its starting declaration through `seed`, and a request that omits it
+    /// leaves the walk nowhere to start.
     #[test]
-    fn validate_search_refuses_a_traversal_whose_seed_disagrees_with_its_request() {
-        let cases = [
-            json!({"traversal": {"direction": "incoming"}}),
-            json!({
-                "change": {"base": "baseline"},
-                "traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}
-            }),
-        ];
-        for arguments in cases {
-            let params: SearchParams =
-                serde_json::from_value(arguments.clone()).expect("the request parses");
-            let error = super::validate_search(&params).expect_err("the seed rule must refuse");
-            assert!(
-                matches!(error.fault(), ReadFault::Invalid { field: "seed", .. }),
-                "{arguments}: {error}"
-            );
-            assert_eq!(error.descriptor().code(), "invalid_request", "{arguments}");
-        }
+    fn validate_search_refuses_a_traversal_that_names_no_seed() {
+        let arguments = json!({"traversal": {"direction": "incoming"}});
+        let params: SearchParams =
+            serde_json::from_value(arguments.clone()).expect("the request parses");
+
+        let error = super::validate_search(&params).expect_err("the seed rule must refuse");
+
+        assert!(
+            matches!(error.fault(), ReadFault::Invalid { field: "seed", .. }),
+            "{arguments}: {error}"
+        );
+        assert_eq!(error.descriptor().code(), "invalid_request", "{arguments}");
     }
 
-    /// A walk beside a comparison names no `seed`, and one standing without a comparison
-    /// names one: both pass the rule.
+    /// A configured language engine resolves the references a walk follows, and an engine
+    /// session serves the current tree; a comparison names two committed revisions.
     #[test]
-    fn validate_search_accepts_each_way_a_walk_names_its_starting_declaration() {
-        let cases = [
-            json!({"traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}}),
-            json!({
-                "change": {"base": "baseline"},
-                "traversal": {"direction": "incoming"}
-            }),
-        ];
-        for arguments in cases {
-            let params: SearchParams =
-                serde_json::from_value(arguments.clone()).expect("the request parses");
-            let accepted = super::validate_search(&params);
-            assert!(accepted.is_ok(), "{arguments} must pass the seed rule");
-        }
+    fn validate_search_refuses_a_traversal_riding_beside_a_comparison() {
+        let params: SearchParams = serde_json::from_value(json!({
+            "change": {"base": "baseline"},
+            "traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}
+        }))
+        .expect("the request parses");
+
+        let error = super::validate_search(&params).expect_err("the pairing must refuse");
+
+        assert_eq!(error.descriptor().code(), "capability_unavailable");
+        assert!(
+            error
+                .to_string()
+                .contains(super::CHANGE_TRAVERSAL_CAPABILITY),
+            "{error}"
+        );
+    }
+
+    /// A walk standing without a comparison and naming its seed passes the rule.
+    #[test]
+    fn validate_search_accepts_a_seeded_walk_standing_alone() {
+        let arguments = json!({"traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}});
+        let params: SearchParams =
+            serde_json::from_value(arguments.clone()).expect("the request parses");
+        assert!(
+            super::validate_search(&params).is_ok(),
+            "{arguments} must pass the seed rule"
+        );
     }
 
     #[test]
@@ -3908,7 +3917,6 @@ pub fn compute() -> i32 {
             &SourceVisibility::default(),
             &rift_core::TextFileInclusion::default(),
             &rift_core::LanguageFileSelections::default(),
-            rift_index::BindingPolicy::default(),
             HistoryConfiguration::default(),
             disabled,
         )?
