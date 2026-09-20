@@ -1018,7 +1018,9 @@ mod tests {
     /// count it dropped, and states that its source is not the whole declaration.
     #[test]
     fn test_a_declaration_past_the_source_bound_is_cut_and_reported() {
-        let filler = "x".repeat(bound(PACKAGE_SOURCE_BYTES_MAX) + 64);
+        // Two-byte characters, so the bound falls inside one and the cut walks back to
+        // the boundary rather than splitting it.
+        let filler = "e\u{0301}".repeat(bound(PACKAGE_SOURCE_BYTES_MAX));
         let source = format!("pub fn spawn() {{\n    // {filler}\n}}\n");
 
         let publication = analyzed(ShippedLanguage::Rust, vec![("src/lib.rs", &source)]);
@@ -1029,7 +1031,16 @@ mod tests {
             .find(|symbol| symbol.name == "spawn")
             .expect("the declaration is published");
         assert!(!symbol.source_complete, "{symbol:?}");
-        assert_eq!(symbol.source.len(), bound(PACKAGE_SOURCE_BYTES_MAX));
+        assert!(
+            symbol.source.len() <= bound(PACKAGE_SOURCE_BYTES_MAX),
+            "the retained source fits the bound: {}",
+            symbol.source.len()
+        );
+        assert!(
+            symbol.source.len() > bound(PACKAGE_SOURCE_BYTES_MAX) - 4,
+            "the cut walks back to a character boundary, not further: {}",
+            symbol.source.len()
+        );
         let dropped: Vec<&PackageAnalysisWarning> = publication
             .warnings
             .iter()

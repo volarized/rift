@@ -233,6 +233,27 @@ fn the_analyzer_manifest_writes_below_its_root_and_checks_clean() -> TestResult 
     Ok(())
 }
 
+/// A root whose manifest path is not a writable file: the render succeeds and the write
+/// refuses, naming the path it could not write.
+#[test]
+fn the_analyzer_manifest_names_a_path_it_cannot_write() -> TestResult {
+    let repository = repository_root()?;
+    let root = analyzer_root(&repository)?;
+    fs::create_dir_all(root.path().join(rift_index::analyzer_manifest_path()))?;
+    let request = schema::parse_arguments([
+        "--analyzer-manifest".to_owned(),
+        root.path().display().to_string(),
+    ])?;
+
+    let error = schema::run(&request).expect_err("a directory takes no document");
+
+    let ExportError::WriteFailed { path, .. } = error else {
+        panic!("expected WriteFailed, got {error:?}");
+    };
+    assert!(path.ends_with("analyzer-manifest.json"));
+    Ok(())
+}
+
 /// The analyzer manifest is rendered from the repository tree, so a root holding none of
 /// its inputs names the first missing one and the remedy rather than writing a manifest
 /// derived from nothing.
