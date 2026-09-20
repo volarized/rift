@@ -16,6 +16,7 @@
       "!public/schemas",
       "!public/rift.schema.json",
       "!public/mcp.json",
+      "!public/package-index.schema.json",
       "!public/cli-help.txt"
     ]
   },

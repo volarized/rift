@@ -380,7 +380,7 @@ pub enum SearchInclude {
     {
         "target": "symbol",
         "query": "spawn_blocking",
-        "scope": "dependencies",
+        "scope": "global",
         "limit": 10
     },
     {
@@ -407,11 +407,10 @@ pub struct SearchParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
     /// Which declarations `query` searches: the project tree, the public declarations of
-    /// the cataloged dependency packages, or both. Omitted, `project`. A package
-    /// contributes symbol hits alone. The server refuses a scope beyond `project`
-    /// together with `rev`, since dependencies are served for the current tree alone,
-    /// and `dependencies` together with `traversal`, since the relationship graph serves
-    /// the project alone.
+    /// the dependency packages, or both. Omitted, `local`. A package contributes symbol
+    /// hits alone. The server refuses a scope beyond `local` together with `rev`, since
+    /// package facts are served for the current tree alone, and `global` together with
+    /// `traversal`, since a walk runs over the project alone.
     #[serde(default)]
     pub scope: SearchScope,
     /// Files eligible for the search, selected by project-relative globs. Omitted selects
@@ -456,7 +455,7 @@ pub struct SearchParams {
     /// narrows which changed paths are compared. The server refuses `change` beside `rev`,
     /// since `change` names its own revisions; beside `query`, since the two select
     /// different result sets; beside `traversal`, since no lane resolves references for a
-    /// committed revision; and beside a `scope` past `project`.
+    /// committed revision; and beside a `scope` past `local`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change: Option<SearchChange>,
 }
@@ -722,12 +721,12 @@ mod tests {
     /// the advertised default to the `project` member that impl selects, the default
     /// `get_symbol` advertises for the same field.
     #[test]
-    fn search_params_schema_scope_default_is_project() {
+    fn search_params_schema_scope_default_is_local() {
         let schema = serde_json::to_value(schemars::schema_for!(SearchParams)).expect("schema");
-        assert_eq!(schema["properties"]["scope"]["default"], json!("project"));
+        assert_eq!(schema["properties"]["scope"]["default"], json!("local"));
         assert_eq!(
             serde_json::to_value(SearchScope::default()).expect("serialize"),
-            json!("project")
+            json!("local")
         );
     }
 

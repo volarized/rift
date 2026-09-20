@@ -1,6 +1,5 @@
 //! Model Context Protocol transport boundary.
 
-mod dependency;
 mod election;
 mod failure;
 mod http;

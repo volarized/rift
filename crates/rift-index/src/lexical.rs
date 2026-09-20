@@ -694,7 +694,7 @@ fn match_expression(query: &str, terms_max: usize) -> Result<Option<String>, Lex
 
 /// Splits an identifier into words on case boundaries and non-alphanumeric
 /// separators, preserving each word's original casing.
-fn split_identifier_words(name: &str) -> Vec<String> {
+pub(crate) fn split_identifier_words(name: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut previous_lowercase = false;

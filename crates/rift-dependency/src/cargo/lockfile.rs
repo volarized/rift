@@ -8,16 +8,16 @@ use serde::Deserialize;
 
 use super::{CARGO_LOCK_FILE_NAME, CARGO_MANAGER, rust_language};
 use crate::catalog::{CatalogEntry, package_identity};
-use crate::manifest::{LockfileFailure, ResolutionBuilder, read_lockfile};
+use crate::manifest::{ResolutionBuilder, StaticFileFailure, read_static_file};
 use crate::resolver::{DIRECTORY_ENTRIES_MAX, Inspector};
 
 /// The lockfile `source` prefix of a package fetched from a registry.
-const REGISTRY_SOURCE_PREFIX: &str = "registry+";
+pub(super) const REGISTRY_SOURCE_PREFIX: &str = "registry+";
 /// The lockfile `source` prefix of a package fetched from a registry over the sparse
 /// protocol; its source is unpacked to the same cache directory.
-const SPARSE_SOURCE_PREFIX: &str = "sparse+";
+pub(super) const SPARSE_SOURCE_PREFIX: &str = "sparse+";
 /// The lockfile `source` prefix of a package fetched from a git repository.
-const GIT_SOURCE_PREFIX: &str = "git+";
+pub(super) const GIT_SOURCE_PREFIX: &str = "git+";
 /// The environment variable naming Cargo's home directory.
 const CARGO_HOME_VARIABLE: &str = "CARGO_HOME";
 /// Cargo's home below the user's home when `CARGO_HOME` is unset.
@@ -31,23 +31,23 @@ const GIT_REPOSITORY_SUFFIX: &str = ".git";
 /// The leading characters of a git revision that name its checkout directory.
 const GIT_CHECKOUT_REVISION_CHARS: usize = 7;
 
-/// The `Cargo.lock` document, the fields this resolver reads.
+/// The `Cargo.lock` document, the fields the catalog and the static context read.
 #[derive(Deserialize)]
-struct Lockfile {
+pub(super) struct Lockfile {
     #[serde(default)]
-    package: Vec<LockedPackage>,
+    pub(super) package: Vec<LockedPackage>,
 }
 
 /// One `[[package]]` table of the lockfile.
 ///
 /// A package without `source` is a workspace member or a path dependency; the lockfile
-/// does not tell the two apart, so neither is cataloged. Its `dependencies` still decide
+/// does not tell the two apart, so neither is reported. Its `dependencies` still decide
 /// which packages the workspace declares directly.
 #[derive(Deserialize)]
-struct LockedPackage {
-    name: String,
-    version: String,
-    source: Option<String>,
+pub(super) struct LockedPackage {
+    pub(super) name: String,
+    pub(super) version: String,
+    pub(super) source: Option<String>,
     #[serde(default)]
     dependencies: Vec<String>,
 }
@@ -59,7 +59,7 @@ pub(super) fn resolve_lockfile(
     inspector: &mut dyn Inspector,
     answer: &mut ResolutionBuilder,
 ) {
-    let observed = read_lockfile(directory, CARGO_LOCK_FILE_NAME, inspector);
+    let observed = read_static_file(directory, CARGO_LOCK_FILE_NAME, inspector);
     match observed.and_then(|bytes| parse_lockfile(&bytes)) {
         Ok(lockfile) => {
             let cache = CargoCache::observe(inspector);
@@ -73,9 +73,9 @@ pub(super) fn resolve_lockfile(
 }
 
 /// Parses `Cargo.lock` bytes, naming the parser's message when they are not its document.
-fn parse_lockfile(bytes: &[u8]) -> Result<Lockfile, LockfileFailure> {
+pub(super) fn parse_lockfile(bytes: &[u8]) -> Result<Lockfile, StaticFileFailure> {
     toml::from_slice(bytes).map_err(|error| {
-        LockfileFailure::unparsable(CARGO_LOCK_FILE_NAME, error.message().to_owned())
+        StaticFileFailure::unparsable(CARGO_LOCK_FILE_NAME, error.message().to_owned())
     })
 }
 

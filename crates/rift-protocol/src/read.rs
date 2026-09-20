@@ -251,10 +251,9 @@ pub struct GetSymbolParams {
     /// Narrows the answer to one language. Omitted searches every served language.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<Language>,
-    /// Which declarations the lookup searches: the project tree, the cataloged
-    /// dependency packages, or both. Omitted, `project`. The server refuses a scope
-    /// beyond `project` together with `rev`, since dependencies are served for the
-    /// current tree alone.
+    /// Which declarations the lookup searches: the project tree, the dependency
+    /// packages, or both. Omitted, `local`. The server refuses a scope beyond `local`
+    /// together with `rev`, since package facts are served for the current tree alone.
     #[serde(default)]
     pub scope: SearchScope,
     /// Optional hit fields to attach: `source`, `history`. Omitted defaults to
@@ -879,9 +878,9 @@ pub struct ProjectPath(
     pub String,
 );
 
-/// Most `dependency_package_skipped` and `dependency_resolver_degraded` warnings one
-/// answer carries together: skipped packages first in identity order, then degraded
-/// resolvers in resolver order, cut here.
+/// Most `package_skipped` and `package_context_degraded` warnings one answer carries
+/// together: skipped packages first in identity order, then degraded resolvers in
+/// resolver order, cut here.
 pub const DEPENDENCY_WARNINGS_MAX: usize = 8;
 
 /// Most `source_unavailable` warnings one answer carries for the files the index left out,
@@ -1030,31 +1029,34 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
-    /// Cataloged packages with a source root are still being indexed, so a `dependencies`
-    /// or `all` answer holds their declarations only once the index reaches them. The
-    /// answer is served from the packages indexed so far. Rides only an answer whose
-    /// `scope` reaches dependencies.
-    DependencyIndexPending {
-        /// Packages cataloged with a source root and not yet indexed.
-        pending: u64,
+    /// No global package index answered this read, so the package facts came from the
+    /// packages this machine indexed. Rides every answer whose `scope` reaches packages,
+    /// and states what the local fallback produced.
+    GlobalIndexUnavailable {
+        /// Packages the local fallback indexed for this answer.
+        indexed: u64,
+        /// Why no global index answered, and what the fallback did instead - prose for a
+        /// reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
     },
-    /// The dependency index refused one cataloged package, so none of its declarations
-    /// answers. Rides only an answer whose `scope` reaches dependencies; at most
-    /// `DEPENDENCY_WARNINGS_MAX` of this warning and `dependency_resolver_degraded`
-    /// together ride one answer, this one first, in package identity order.
-    DependencyPackageSkipped {
+    /// The local package index refused one package, so none of its declarations answers.
+    /// Rides only an answer whose `scope` reaches packages; at most
+    /// `DEPENDENCY_WARNINGS_MAX` of this warning and `package_context_degraded` together
+    /// ride one answer, this one first, in package identity order.
+    PackageSkipped {
         /// The package the index refused.
         package: PackageIdentity,
         /// Why the index refused it - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
         reason: String,
     },
-    /// One dependency resolver answered less than its toolchain would have, so the
-    /// catalog may miss packages. Rides only an answer whose `scope` reaches
-    /// dependencies; at most `DEPENDENCY_WARNINGS_MAX` of this warning and
-    /// `dependency_package_skipped` together ride one answer, this one after every
+    /// One resolver read less than its manifests and lockfiles state, so the dependency
+    /// context may miss packages and the packages it misses answer nothing. Rides only an
+    /// answer whose `scope` reaches packages; at most `DEPENDENCY_WARNINGS_MAX` of this
+    /// warning and `package_skipped` together ride one answer, this one after every
     /// skipped package, in resolver order.
-    DependencyResolverDegraded {
+    PackageContextDegraded {
         /// The resolver that degraded, by its manager name: `cargo`, `uv`, `npm`, or `bun`.
         #[schemars(length(max = 128))]
         resolver: String,
@@ -1278,7 +1280,8 @@ fn revision_id_violation(value: &str) -> Option<RevisionIdViolation> {
     }
 }
 
-/// Which declarations a `get_symbol` lookup searches.
+/// Which corpus a read searches. The names identify logical corpora, not storage
+/// locations: `global` reaches dependency package facts wherever the server holds them.
 #[derive(
     Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
@@ -1286,12 +1289,10 @@ fn revision_id_violation(value: &str) -> Option<RevisionIdViolation> {
 pub enum SearchScope {
     /// The project tree the server serves.
     #[default]
-    Project,
-    /// The packages the dependency resolvers cataloged, answered from their public
-    /// declarations alone.
-    Dependencies,
-    /// Both: hits merge by rank; at equal rank a project hit orders before a dependency
-    /// hit.
+    Local,
+    /// The dependency packages, answered from their public declarations alone.
+    Global,
+    /// Both: hits merge by rank; at equal rank a project hit orders before a package hit.
     All,
 }
 
@@ -1893,12 +1894,12 @@ mod tests {
     /// `scope` takes serde's `default`, which reads the enum's own `Default`; this pins
     /// the advertised default to the `project` member that impl selects.
     #[test]
-    fn get_symbol_params_schema_scope_default_is_project() {
+    fn get_symbol_params_schema_scope_default_is_local() {
         let schema = serde_json::to_value(schema_for!(GetSymbolParams)).expect("schema");
-        assert_eq!(schema["properties"]["scope"]["default"], json!("project"));
+        assert_eq!(schema["properties"]["scope"]["default"], json!("local"));
         assert_eq!(
             serde_json::to_value(SearchScope::default()).expect("serialize"),
-            json!("project")
+            json!("local")
         );
     }
 
@@ -2222,28 +2223,43 @@ mod tests {
             (
                 ReadWarning::SymbolDisagreement {
                     symbol: SymbolId("rift://symbol/rust/src/lib.rs/Beacon".to_owned()),
-                    providers: vec!["binding".to_owned(), "syntax".to_owned()],
+                    providers: vec!["history".to_owned(), "syntax".to_owned()],
                     detail: "normalization selected one presentation for this symbol; \
-                             binding, syntax disagree on at least one field"
+                             history, syntax disagree on at least one field"
                         .to_owned(),
                 },
                 json!({
                     "code": "symbol_disagreement",
                     "symbol": "rift://symbol/rust/src/lib.rs/Beacon",
-                    "providers": ["binding", "syntax"],
+                    "providers": ["history", "syntax"],
                     "detail": "normalization selected one presentation for this symbol; \
-                               binding, syntax disagree on at least one field",
+                               history, syntax disagree on at least one field",
                 }),
             ),
+        ];
+        assert_round_trips(cases);
+    }
+
+    /// The package warnings a `global` or `all` answer rides with, pinned the same way.
+    #[test]
+    fn every_package_warning_round_trips_under_its_code_tag() {
+        let cases = [
             (
-                ReadWarning::DependencyIndexPending { pending: 3 },
+                ReadWarning::GlobalIndexUnavailable {
+                    indexed: 3,
+                    detail: "no global package index is configured; 3 packages were indexed \
+                             on this machine"
+                        .to_owned(),
+                },
                 json!({
-                    "code": "dependency_index_pending",
-                    "pending": 3,
+                    "code": "global_index_unavailable",
+                    "indexed": 3,
+                    "detail": "no global package index is configured; 3 packages were indexed \
+                               on this machine",
                 }),
             ),
             (
-                ReadWarning::DependencyPackageSkipped {
+                ReadWarning::PackageSkipped {
                     package: PackageIdentity {
                         manager: "cargo".to_owned(),
                         name: "helper".to_owned(),
@@ -2252,23 +2268,28 @@ mod tests {
                     reason: "cargo/helper@0.1.0 exceeds package_bytes_max".to_owned(),
                 },
                 json!({
-                    "code": "dependency_package_skipped",
+                    "code": "package_skipped",
                     "package": { "manager": "cargo", "name": "helper", "version": "0.1.0" },
                     "reason": "cargo/helper@0.1.0 exceeds package_bytes_max",
                 }),
             ),
             (
-                ReadWarning::DependencyResolverDegraded {
+                ReadWarning::PackageContextDegraded {
                     resolver: "cargo".to_owned(),
                     reason: "cargo is not on PATH; the lockfile alone was read".to_owned(),
                 },
                 json!({
-                    "code": "dependency_resolver_degraded",
+                    "code": "package_context_degraded",
                     "resolver": "cargo",
                     "reason": "cargo is not on PATH; the lockfile alone was read",
                 }),
             ),
         ];
+        assert_round_trips(cases);
+    }
+
+    /// Each warning serializes to the wire value beside it, and reads back equal.
+    fn assert_round_trips<const COUNT: usize>(cases: [(ReadWarning, serde_json::Value); COUNT]) {
         for (warning, wire) in cases {
             assert_eq!(serde_json::to_value(&warning).expect("serialize"), wire);
             let parsed: ReadWarning = serde_json::from_value(wire).expect("deserialize");
@@ -2344,9 +2365,9 @@ mod tests {
             "results_truncated",
             "source_unavailable",
             "symbol_disagreement",
-            "dependency_index_pending",
-            "dependency_package_skipped",
-            "dependency_resolver_degraded",
+            "global_index_unavailable",
+            "package_skipped",
+            "package_context_degraded",
             "relationship_coverage_missing",
         ] {
             assert!(

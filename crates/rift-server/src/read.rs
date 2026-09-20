@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::Path;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLockReadGuard};
 
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::constants::DIGEST_WIRE_CHARS;
@@ -9,12 +9,12 @@ use rift_core::{
     Error, ErrorCode, ErrorContext, ErrorName, Fault, LanguageFileSelections, LimitEvidence,
     SourceVisibility, TextFileInclusion, line,
 };
-use rift_dependency::DependencyCatalog;
+use rift_dependency::DependencyContext;
 use rift_history::{HistoryError, Repository};
 use rift_index::{
-    DependencyIndex, DependencySymbolMatch, FileDigest, IndexedFile, PackageIndexError,
-    PathChanges, ReadableSymbol, RelationshipStore, SkippedPackage, SymbolMatch, SymbolMatchRank,
-    WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError,
+    DependencyIndex, DependencyIndexLimits, DependencySymbolMatch, FileDigest, IndexedFile,
+    PackageIndexError, PathChanges, ReadableSymbol, RelationshipStore, SkippedPackage, SymbolMatch,
+    SymbolMatchRank, WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError,
     WorkspaceIndexLimits, WorkspaceIndexWarning, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::HistoryConfiguration;
@@ -32,6 +32,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::dependency::ResolutionPolicy;
 use crate::history::SymbolTimelines;
+use crate::packages::{PackageBranch, PackageFallback, PackageFill};
 
 /// One read-service failure: what was asked, and why it cannot be served.
 ///
@@ -374,48 +375,6 @@ impl ReadFault {
 /// Opaque read-service failure.
 pub type ReadError = Error<ReadFault>;
 
-/// The lock a poisoned dependency index names.
-const DEPENDENCY_INDEX_LOCK: &str = "dependency index";
-/// The capability a scope beyond `project` names while `[dependencies]` turns the
-/// index off.
-const DEPENDENCY_SCOPE_DISABLED: &str = "dependency scope ([dependencies] enabled = false)";
-
-/// The dependency index one lane builds and every read service answers from, behind
-/// one lock. The lane holds the write side for one package build at a time; a lookup
-/// holds the read side while it assembles its hits. No holder awaits with a side held.
-#[derive(Debug)]
-pub struct DependencyStore(RwLock<DependencyIndex>);
-
-impl DependencyStore {
-    /// Shares one index, planned or already holding packages.
-    #[must_use]
-    pub const fn new(index: DependencyIndex) -> Self {
-        Self(RwLock::new(index))
-    }
-
-    /// The read side of the lock.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReadError`] when a holder panicked with the lock held.
-    pub fn read(&self) -> Result<RwLockReadGuard<'_, DependencyIndex>, ReadError> {
-        self.0
-            .read()
-            .map_err(|_poisoned| ReadFault::lock_poisoned(DEPENDENCY_INDEX_LOCK))
-    }
-
-    /// The write side of the lock.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReadError`] when a holder panicked with the lock held.
-    pub fn write(&self) -> Result<RwLockWriteGuard<'_, DependencyIndex>, ReadError> {
-        self.0
-            .write()
-            .map_err(|_poisoned| ReadFault::lock_poisoned(DEPENDENCY_INDEX_LOCK))
-    }
-}
-
 /// Immutable direct-filesystem workspace read service.
 #[derive(Debug)]
 pub struct ReadService {
@@ -430,13 +389,13 @@ pub struct ReadService {
     /// tree, `None` for a revision snapshot, which has no filesystem tree to be
     /// visible in.
     source_policy: Option<Arc<WorkspaceSourcePolicy>>,
-    /// The packages the workspace's toolchains resolved, shared across incremental
-    /// rebuilds until a resolution input changes. Empty for a revision snapshot, which
-    /// has no toolchain to ask.
-    catalog: Arc<DependencyCatalog>,
-    /// The dependency index a `dependencies` or `all` lookup answers from. Absent,
-    /// those scopes answer as from an empty index with nothing pending.
-    dependencies: Option<Arc<DependencyStore>>,
+    /// The packages the workspace's manifests and lockfiles name, read from those files
+    /// alone and shared across incremental rebuilds until one of them changes. Empty for
+    /// a revision snapshot, which has no working tree to read.
+    context: Arc<DependencyContext>,
+    /// The packages a `global` or `all` read answers from. Absent, those scopes answer as
+    /// from an empty branch.
+    packages: Option<Arc<PackageBranch>>,
     /// The accepted `[dependencies]` table: whether a scope beyond `project` is
     /// served, and how the catalog is resolved.
     dependency_configuration: DependenciesConfiguration,
@@ -471,8 +430,8 @@ impl ReadService {
 
     /// Builds one current-tree snapshot with configured language entries.
     ///
-    /// `dependencies` decides how the catalog is resolved and whether a scope
-    /// beyond `project` is served.
+    /// `dependencies` decides how the catalog is resolved and how long one
+    /// resolver run may take.
     ///
     /// # Errors
     ///
@@ -520,8 +479,7 @@ impl ReadService {
             ReadFault::index(source)
         })?;
         let revisions = captured_revisions(&index);
-        let policy = ResolutionPolicy::from(&dependencies);
-        let catalog = Arc::new(resolved_catalog(root, &source_policy, policy)?);
+        let context = Arc::new(resolved_context(root, &source_policy, &dependencies)?);
         span.record("files_count", index.file_count());
         span.record("text_files_count", index.text_file_count());
         span.record("left_out_count", index.left_out_file_count());
@@ -533,8 +491,8 @@ impl ReadService {
             revision: None,
             history,
             source_policy: Some(Arc::new(source_policy)),
-            catalog,
-            dependencies: None,
+            context,
+            packages: None,
             dependency_configuration: dependencies,
         })
     }
@@ -555,7 +513,7 @@ impl ReadService {
     pub fn workspace_map(&self) -> WorkspaceMap {
         crate::map::build_workspace_map(
             &self.index,
-            &self.catalog,
+            &self.context,
             self.revisions.wire_index_tree_revision(),
         )
     }
@@ -648,7 +606,7 @@ impl ReadService {
             ReadFault::index(source)
         })?;
         let revisions = captured_revisions(&index);
-        let catalog = self.catalog_after(changes)?;
+        let context = self.context_after(changes)?;
         span.record("files_count", index.file_count());
         span.record("tree_revision", revisions.wire_tree_revision());
         span.record("outcome", "ok");
@@ -658,31 +616,33 @@ impl ReadService {
             revision: self.revision.clone(),
             history: self.history.clone(),
             source_policy: self.source_policy.clone(),
-            catalog,
-            dependencies: self.dependencies.clone(),
+            context,
+            packages: self.packages.clone(),
             dependency_configuration: self.dependency_configuration.clone(),
         })
     }
 
-    /// The catalog an incremental rebuild over `changes` carries: the standing one while
-    /// no changed path is a resolution input or a manifest a resolver claims, a fresh
-    /// resolution otherwise. A degraded catalog keeps its resolution too: resolving it on
-    /// every rebuild ran every resolver over every manifest for each edit of a workspace
-    /// whose degradation never clears, and the index fell behind the tree.
-    fn catalog_after(&self, changes: &PathChanges) -> Result<Arc<DependencyCatalog>, ReadError> {
+    /// The dependency context an incremental rebuild over `changes` carries: the standing
+    /// one while no changed path is one of its inputs or a manifest a resolver claims, a
+    /// fresh read otherwise. Reading it costs one pass over the workspace's manifests and
+    /// lockfiles, so a rebuild that touches none of them keeps what it holds.
+    fn context_after(&self, changes: &PathChanges) -> Result<Arc<DependencyContext>, ReadError> {
         let touches_input = changes.paths().any(|path| {
             let path = project_path(path);
-            self.catalog.depends_on(&path) || rift_dependency::is_claimed_manifest(&path)
+            self.context.depends_on(&path) || rift_dependency::is_claimed_manifest(&path)
         });
         if !touches_input {
-            return Ok(Arc::clone(&self.catalog));
+            return Ok(Arc::clone(&self.context));
         }
         let source_policy = self.source_policy.as_deref().unwrap_or_else(|| {
             unreachable!("a current-tree read service always compiles its source policy")
         });
-        let policy = ResolutionPolicy::from(&self.dependency_configuration);
-        let catalog = resolved_catalog(self.index.root(), source_policy, policy)?;
-        Ok(Arc::new(catalog))
+        let context = resolved_context(
+            self.index.root(),
+            source_policy,
+            &self.dependency_configuration,
+        )?;
+        Ok(Arc::new(context))
     }
 
     /// Builds one in-memory snapshot of the workspace at a version-control
@@ -750,8 +710,8 @@ impl ReadService {
             revision: Some(RevisionId(resolved.commit_id())),
             history,
             source_policy: None,
-            catalog: Arc::new(DependencyCatalog::default()),
-            dependencies: None,
+            context: Arc::new(DependencyContext::default()),
+            packages: None,
             dependency_configuration: DependenciesConfiguration::default(),
         })
     }
@@ -777,18 +737,19 @@ impl ReadService {
         self.source_policy.clone()
     }
 
-    /// Attaches the dependency index a `dependencies` or `all` lookup answers from.
-    /// An incremental rebuild carries the handle forward.
+    /// Attaches the package branch a `global` or `all` read answers from. An incremental
+    /// rebuild carries the handle forward.
     #[must_use]
-    pub fn with_dependencies(mut self, store: Arc<DependencyStore>) -> Self {
-        self.dependencies = Some(store);
+    pub fn with_packages(mut self, branch: Arc<PackageBranch>) -> Self {
+        self.packages = Some(branch);
         self
     }
 
-    /// The packages the workspace's toolchains resolved, as this snapshot holds them.
+    /// The packages the workspace's manifests and lockfiles name, as this snapshot read
+    /// them.
     #[must_use]
-    pub const fn dependency_catalog(&self) -> &Arc<DependencyCatalog> {
-        &self.catalog
+    pub const fn dependency_context(&self) -> &Arc<DependencyContext> {
+        &self.context
     }
 
     /// The accepted `[dependencies]` table this snapshot was built under.
@@ -797,10 +758,10 @@ impl ReadService {
         &self.dependency_configuration
     }
 
-    /// Replaces the resolved catalog, so a test can hand the service a degraded one.
+    /// Replaces the dependency context, so a test can hand the service a degraded one.
     #[cfg(test)]
-    fn with_catalog(mut self, catalog: DependencyCatalog) -> Self {
-        self.catalog = Arc::new(catalog);
+    fn with_context(mut self, context: DependencyContext) -> Self {
+        self.context = Arc::new(context);
         self
     }
 
@@ -975,8 +936,8 @@ impl ReadService {
 
     /// Finds declarations by name, with each hit's version-control timeline
     /// when the request asks for history. `scope` selects the project index, the
-    /// attached dependency index, or both with project hits first; a scope beyond
-    /// `project` refuses `rev`, since dependencies are served for the current tree
+    /// attached package branch, or both with project hits first; a scope beyond
+    /// `local` refuses `rev`, since package facts are served for the current tree
     /// alone.
     ///
     /// # Errors
@@ -988,11 +949,12 @@ impl ReadService {
         validate_common(params.rev.is_some())?;
         let limit = accepted_limit(params.limit)?;
         self.validate_dependency_scope(params.scope, params.rev.as_ref())?;
-        let reaches_dependencies = params.scope != SearchScope::Project;
+        let reaches_dependencies = params.scope != SearchScope::Local;
         // Each index's whole ranked match set is collected up to the project index's
         // own `results_max` bound, so `pagination.total_pages` counts the full result
         // set the pages divide.
         let results_max = self.index.results_max();
+        let fallback = self.fill_packages(params.scope)?;
         let dependencies = self.dependency_index(params.scope)?;
         let (mut candidates, bound_reached) =
             self.ranked_candidates(params, dependencies.as_deref(), results_max)?;
@@ -1032,7 +994,11 @@ impl ReadService {
             warnings.push(results_truncation_warning(results_max));
         }
         if reaches_dependencies {
-            warnings.extend(dependency_warnings(dependencies.as_deref(), &self.catalog));
+            warnings.extend(package_warnings(
+                dependencies.as_deref(),
+                &self.context,
+                fallback,
+            ));
         }
         Ok(GetSymbolResult {
             hits,
@@ -1052,7 +1018,7 @@ impl ReadService {
     ) -> Result<(Vec<RankedMatch<'a>>, bool), ReadError> {
         let mut candidates: Vec<RankedMatch<'a>> = Vec::new();
         let mut bound_reached = false;
-        if params.scope != SearchScope::Dependencies {
+        if params.scope != SearchScope::Global {
             let project = self
                 .index
                 .symbols(&params.name, results_max)
@@ -1068,39 +1034,64 @@ impl ReadService {
         Ok((candidates, bound_reached))
     }
 
-    /// Refuses a `scope` that reaches dependencies while the `[dependencies]` table
-    /// turns the index off, and on a revision read - one the request's `rev` names, or
-    /// the revision this snapshot already serves - since the dependency index serves
-    /// the current tree alone. `get_symbol` and `search` share both rules.
+    /// Refuses a `scope` that reaches packages on a revision read - one the request's
+    /// `rev` names, or the revision this snapshot already serves - since package facts
+    /// are served for the current tree alone. `get_symbol` and `search` share the rule.
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] as `capability_unavailable` for a scope beyond `project`
-    /// under `enabled = false`, and naming `scope` for one beside a revision.
+    /// Returns [`ReadError`] naming `scope` for a scope beyond `local` beside a
+    /// revision.
     pub(crate) fn validate_dependency_scope(
         &self,
         scope: SearchScope,
         rev: Option<&RevisionId>,
     ) -> Result<(), ReadError> {
-        if scope == SearchScope::Project {
+        if scope == SearchScope::Local {
             return Ok(());
-        }
-        if !self.dependency_configuration.enabled {
-            return Err(ReadFault::unsupported(DEPENDENCY_SCOPE_DISABLED));
         }
         if rev.is_some() || self.revision.is_some() {
             return Err(ReadFault::invalid(
                 "scope",
-                "dependencies are served for the current tree alone",
+                "package facts are served for the current tree alone",
             ));
         }
         Ok(())
     }
 
-    /// The dependency index an answer whose `scope` reaches dependencies reads, held on
-    /// the read side for the life of the answer. None for the project scope, and for a
-    /// service with no store attached, which answers as an empty index with nothing
-    /// pending.
+    /// Fills the package branch for an answer whose `scope` reaches packages, and reports
+    /// what the fill produced. A `local` read fills nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when a holder panicked with a branch lock held, or when the
+    /// workspace's visible paths cannot be read.
+    pub(crate) fn fill_packages(&self, scope: SearchScope) -> Result<PackageFallback, ReadError> {
+        let (Some(branch), Some(source_policy)) = (&self.packages, self.source_policy.as_deref())
+        else {
+            return Ok(PackageFallback::default());
+        };
+        if scope == SearchScope::Local {
+            return Ok(PackageFallback::default());
+        }
+        let visible: Vec<ProjectPath> = source_policy
+            .visible_paths()
+            .map_err(ReadFault::index)?
+            .iter()
+            .map(project_path)
+            .collect();
+        branch.fill(&PackageFill {
+            root: self.index.root(),
+            visible: &visible,
+            resolution: ResolutionPolicy::from(&self.dependency_configuration),
+            limits: DependencyIndexLimits::from(&self.dependency_configuration),
+            context: &self.context,
+        })
+    }
+
+    /// The package branch an answer whose `scope` reaches packages reads, held on the read
+    /// side for the life of the answer. None for the local scope, and for a service with
+    /// no branch attached, which answers as an empty branch.
     ///
     /// # Errors
     ///
@@ -1109,8 +1100,8 @@ impl ReadService {
         &self,
         scope: SearchScope,
     ) -> Result<Option<RwLockReadGuard<'_, DependencyIndex>>, ReadError> {
-        match &self.dependencies {
-            Some(store) if scope != SearchScope::Project => store.read().map(Some),
+        match &self.packages {
+            Some(branch) if scope != SearchScope::Local => branch.read().map(Some),
             _ => Ok(None),
         }
     }
@@ -1271,36 +1262,40 @@ fn identity_key(identity: &PackageIdentity) -> (&str, &str, &str) {
     (&identity.manager, &identity.name, &identity.version)
 }
 
-/// The warnings an answer whose `scope` reaches dependencies carries: one
-/// `dependency_index_pending` while cataloged packages await a build, then at most
-/// [`DEPENDENCY_WARNINGS_MAX`] of `dependency_package_skipped` in identity order and
-/// `dependency_resolver_degraded` in resolver order together, skipped packages first.
-/// No index answers as an empty one with nothing pending.
-pub(crate) fn dependency_warnings(
+/// The warnings an answer whose `scope` reaches packages carries: the
+/// `global_index_unavailable` entry every such answer rides with, then at most
+/// [`DEPENDENCY_WARNINGS_MAX`] of `package_skipped` in identity order and
+/// `package_context_degraded` in resolver order together, skipped packages first.
+///
+/// No global package index exists, so the first warning states what the local fallback
+/// produced rather than promising a service that is not there.
+pub(crate) fn package_warnings(
     index: Option<&DependencyIndex>,
-    catalog: &DependencyCatalog,
+    context: &DependencyContext,
+    fallback: PackageFallback,
 ) -> Vec<ReadWarning> {
-    let mut warnings = Vec::new();
-    let pending = index.map_or(0, DependencyIndex::pending_count);
-    if pending > 0 {
-        warnings.push(ReadWarning::DependencyIndexPending {
-            pending: u64::try_from(pending).unwrap_or(u64::MAX),
-        });
-    }
+    let mut warnings = vec![ReadWarning::GlobalIndexUnavailable {
+        indexed: fallback.indexed,
+        detail: format!(
+            "no global package index answered; {} of the workspace's packages were \
+             analyzed on this machine, and {} named no source this machine holds",
+            fallback.indexed, fallback.unresolved
+        ),
+    }];
     let skipped_packages: &[SkippedPackage] = index.map_or(&[], DependencyIndex::skipped);
     let mut skipped: Vec<&SkippedPackage> = skipped_packages.iter().collect();
     skipped.sort_by(|left, right| identity_key(&left.identity).cmp(&identity_key(&right.identity)));
     let skipped = skipped
         .into_iter()
-        .map(|skipped| ReadWarning::DependencyPackageSkipped {
+        .map(|skipped| ReadWarning::PackageSkipped {
             package: skipped.identity.clone(),
             reason: skipped.reason.clone(),
         });
     let degraded =
-        catalog
+        context
             .degradations()
             .iter()
-            .map(|degradation| ReadWarning::DependencyResolverDegraded {
+            .map(|degradation| ReadWarning::PackageContextDegraded {
                 resolver: degradation.resolver.as_str().to_owned(),
                 reason: degradation.reason.clone(),
             });
@@ -1708,24 +1703,27 @@ impl CapturedRevisions {
     }
 }
 
-/// Resolves the dependency catalog over every path `source_policy` makes visible,
-/// running toolchains under `policy`.
+/// Reads the dependency context over every path `source_policy` makes visible.
 ///
+/// The pass reads manifests and lockfiles alone: no toolchain runs and no package cache
+/// is inspected, so a workspace that never asks for a package read never pays for one.
 /// The walk is the policy's own, so a manifest the `[source]` policy or `.gitignore`
 /// hides reaches no resolver.
-fn resolved_catalog(
+fn resolved_context(
     root: &Path,
     source_policy: &WorkspaceSourcePolicy,
-    policy: ResolutionPolicy,
-) -> Result<DependencyCatalog, ReadError> {
+    configuration: &DependenciesConfiguration,
+) -> Result<DependencyContext, ReadError> {
     let visible: Vec<ProjectPath> = source_policy
         .visible_paths()
         .map_err(ReadFault::index)?
         .iter()
         .map(project_path)
         .collect();
-    Ok(crate::dependency::resolve_workspace_catalog(
-        root, &visible, policy,
+    Ok(crate::dependency::read_workspace_context(
+        root,
+        &visible,
+        &configuration.packages,
     ))
 }
 
@@ -1861,10 +1859,8 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     use rift_core::{LanguageFileSelections, SourceVisibility};
-    use rift_dependency::{CatalogEntry, DependencyCatalog, Resolution, ResolverName};
-    use rift_index::{
-        DependencyIndex, DependencyIndexLimits, PackageIndex, PackageSelection, package_files,
-    };
+    use rift_dependency::CatalogEntry;
+    use rift_index::{DependencyIndexLimits, PackageIndex, package_files};
     use rift_protocol::configuration::{LanguageConfiguration, WorkspaceConfiguration};
     use rift_protocol::read::{
         DEPENDENCY_WARNINGS_MAX, GetSymbolInclude, GetSymbolParams, Language, NodeFacet,
@@ -1877,7 +1873,7 @@ pub(crate) mod tests {
     use tempfile::TempDir;
 
     use super::{
-        DependenciesConfiguration, DependencyStore, HistoryConfiguration, ReadFault, ReadService,
+        DependenciesConfiguration, HistoryConfiguration, PackageBranch, ReadFault, ReadService,
         WorkspaceIndex, WorkspaceIndexLimits, accepted_limit, file_id,
     };
 
@@ -1938,7 +1934,7 @@ pub(crate) mod tests {
         Ok((directory, service))
     }
     #[test]
-    fn a_degraded_catalog_keeps_its_resolution_across_an_unrelated_change() -> TestResult {
+    fn the_context_is_reread_only_when_one_of_its_inputs_changes() -> TestResult {
         let directory = TempDir::new()?;
         fs::write(
             directory.path().join("Cargo.toml"),
@@ -1953,10 +1949,7 @@ pub(crate) mod tests {
             &rift_core::TextFileInclusion::default(),
             HistoryConfiguration::default(),
         )?;
-        assert!(
-            service.catalog.is_degraded(),
-            "a manifest with no lockfile degrades the Cargo resolver"
-        );
+
         let changed = |path: &str| {
             rift_index::PathChanges::between(
                 &rift_index::WorkspaceDigests::new([]),
@@ -1967,16 +1960,16 @@ pub(crate) mod tests {
             )
         };
 
-        let kept = service.catalog_after(&changed("src/lib.rs"))?;
-        let resolved = service.catalog_after(&changed("Cargo.toml"))?;
+        let kept = service.context_after(&changed("src/lib.rs"))?;
+        let reread = service.context_after(&changed("Cargo.toml"))?;
 
         assert!(
-            std::sync::Arc::ptr_eq(&kept, &service.catalog),
-            "a change outside the resolution inputs keeps the standing catalog"
+            std::sync::Arc::ptr_eq(&kept, &service.context),
+            "a change outside the context's inputs keeps the standing context"
         );
         assert!(
-            !std::sync::Arc::ptr_eq(&resolved, &service.catalog),
-            "a manifest change resolves the catalog again"
+            !std::sync::Arc::ptr_eq(&reread, &service.context),
+            "a manifest change reads the context again"
         );
         Ok(())
     }
@@ -3031,8 +3024,8 @@ pub fn compute() -> i32 {
     #[test]
     fn get_symbol_accepts_scope_values() -> TestResult {
         for (spelling, scope) in [
-            ("project", SearchScope::Project),
-            ("dependencies", SearchScope::Dependencies),
+            ("local", SearchScope::Local),
+            ("global", SearchScope::Global),
             ("all", SearchScope::All),
         ] {
             let params: GetSymbolParams =
@@ -3043,9 +3036,9 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn get_symbol_scope_defaults_to_project() -> TestResult {
+    fn get_symbol_scope_defaults_to_local() -> TestResult {
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
-        assert_eq!(params.scope, SearchScope::Project);
+        assert_eq!(params.scope, SearchScope::Local);
         Ok(())
     }
 
@@ -3088,23 +3081,35 @@ pub fn compute() -> i32 {
         Ok(PackageIndex::build(&entry, &files, 1)?)
     }
 
-    pub(crate) fn empty_dependency_index() -> DependencyIndex {
-        DependencyIndex::planned(
-            &DependencyCatalog::default(),
-            DependencyIndexLimits::default(),
-            PackageSelection::default(),
-        )
+    pub(crate) fn empty_package_branch() -> PackageBranch {
+        PackageBranch::new(DependencyIndexLimits::default())
     }
 
-    fn degraded_catalog(reasons: &[String]) -> DependencyCatalog {
-        DependencyCatalog::assemble(vec![(
-            ResolverName::Cargo,
-            Resolution {
-                entries: Vec::new(),
-                inputs: Vec::new(),
-                degradations: reasons.to_vec(),
-            },
-        )])
+    /// Inputs that refuse every read as over its bound, so a context read over them
+    /// degrades every resolver that claims a manifest.
+    struct RefusedInputs;
+
+    impl rift_dependency::StaticInputs for RefusedInputs {
+        fn read_file(
+            &mut self,
+            _path: &std::path::Path,
+            bytes_max: u64,
+        ) -> rift_dependency::FileObservation {
+            rift_dependency::FileObservation::OverBound {
+                bytes: bytes_max + 1,
+            }
+        }
+    }
+
+    /// A dependency context whose one claimed manifest could not be read.
+    fn degraded_context() -> rift_dependency::DependencyContext {
+        rift_dependency::resolve_context(
+            std::path::Path::new("/workspace"),
+            &[ProjectPath("Cargo.toml".to_owned())],
+            rift_dependency::resolvers(),
+            &mut RefusedInputs,
+            &[],
+        )
     }
 
     /// One project whose `src/lib.rs` holds `source` alone.
@@ -3127,16 +3132,16 @@ pub fn compute() -> i32 {
     }
 
     /// A store holding the built helper package alone.
-    pub(crate) fn helper_store() -> TestResult<Arc<DependencyStore>> {
-        let mut index = empty_dependency_index();
+    pub(crate) fn helper_store() -> TestResult<Arc<PackageBranch>> {
+        let mut index = rift_index::DependencyIndex::empty(DependencyIndexLimits::default());
         index.insert(helper_package()?)?;
-        Ok(Arc::new(DependencyStore::new(index)))
+        Ok(Arc::new(PackageBranch::from_index(index)))
     }
 
     /// The project `beacon` beside a store holding the built helper package.
     fn dependency_fixture() -> TestResult<(TempDir, ReadService)> {
         let (directory, service) = beacon_fixture()?;
-        let service = service.with_dependencies(helper_store()?);
+        let service = service.with_packages(helper_store()?);
         Ok((directory, service))
     }
 
@@ -3170,11 +3175,45 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
+    /// A `local` read resolves nothing: no resolver pass runs and the branch stays
+    /// unfilled, while the same service under `global` resolves once.
     #[test]
-    fn get_symbol_dependencies_scope_answers_the_helper_public_declaration() -> TestResult {
+    fn a_local_read_resolves_no_dependency_context() -> TestResult {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        use crate::packages::tests::{RESOLVE_SPAN, RecordedSpans, context_naming_one_package};
+
+        let (_directory, service) = beacon_fixture()?;
+        let branch = Arc::new(PackageBranch::new(DependencyIndexLimits::default()));
+        let service = service
+            .with_packages(Arc::clone(&branch))
+            .with_context(context_naming_one_package());
+
+        let local = RecordedSpans::default();
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(local.clone()),
+            );
+            service.fill_packages(SearchScope::Local)?;
+        }
+        assert_eq!(local.named(RESOLVE_SPAN), 0, "{local:?}");
+
+        let global = RecordedSpans::default();
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(global.clone()),
+            );
+            service.fill_packages(SearchScope::Global)?;
+        }
+        assert_eq!(global.named(RESOLVE_SPAN), 1, "{global:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn get_symbol_global_scope_answers_the_helper_public_declaration() -> TestResult {
         let (_directory, service) = dependency_fixture()?;
 
-        let result = service.get_symbol(&scoped("helper_beacon", "dependencies")?)?;
+        let result = service.get_symbol(&scoped("helper_beacon", "global")?)?;
 
         assert_eq!(result.hits.len(), 1);
         let hit = &result.hits[0];
@@ -3191,13 +3230,19 @@ pub fn compute() -> i32 {
         );
         assert_eq!(hit.symbol.origin.package, Some(helper_identity()));
         assert_eq!(hit.source.as_deref(), Some("pub fn helper_beacon() {}"));
-        assert!(
-            result.warnings.is_empty(),
-            "a fully built store warns of nothing: {:?}",
-            result.warnings
+        assert_eq!(
+            result.warnings,
+            [ReadWarning::GlobalIndexUnavailable {
+                indexed: 1,
+                detail: "no global package index answered; 1 of the workspace's packages \
+                         were analyzed on this machine, and 0 named no source this machine \
+                         holds"
+                    .to_owned(),
+            }],
+            "a fully built branch warns only that no global index answered"
         );
 
-        let request = json!({"name": "helper_beacon", "scope": "dependencies", "include": []});
+        let request = json!({"name": "helper_beacon", "scope": "global", "include": []});
         let params: GetSymbolParams = serde_json::from_value(request)?;
         let without_source = service.get_symbol(&params)?;
         assert_eq!(without_source.hits[0].source, None);
@@ -3207,11 +3252,11 @@ pub fn compute() -> i32 {
     /// The private declaration never answers; `beacon` answers the helper's exact `beacon`
     /// first, then `helper_beacon` as a qualified-name substring, both by unit.
     #[test]
-    fn get_symbol_dependencies_scope_hides_the_private_declaration_and_the_project() -> TestResult {
+    fn get_symbol_global_scope_hides_the_private_declaration_and_the_project() -> TestResult {
         let (_directory, service) = dependency_fixture()?;
 
-        let private = service.get_symbol(&scoped("helper_private", "dependencies")?)?;
-        let beacon = service.get_symbol(&scoped("beacon", "dependencies")?)?;
+        let private = service.get_symbol(&scoped("helper_private", "global")?)?;
+        let beacon = service.get_symbol(&scoped("beacon", "global")?)?;
 
         assert!(private.hits.is_empty(), "{:?}", private.hits);
         let names: Vec<&str> = beacon
@@ -3272,7 +3317,7 @@ pub fn compute() -> i32 {
     fn get_symbol_all_scope_ranks_a_helper_exact_match_above_a_project_prefix_match() -> TestResult
     {
         let (_directory, service) = project_fixture("pub fn beacon_tower() {}\n")?;
-        let service = service.with_dependencies(helper_store()?);
+        let service = service.with_packages(helper_store()?);
 
         let result = service.get_symbol(&scoped("beacon", "all")?)?;
 
@@ -3295,7 +3340,7 @@ pub fn compute() -> i32 {
     /// `language` narrows both sides of an `all` answer: `rust` keeps the helper's hits
     /// beside the project's, and a language neither side is filed under answers empty.
     #[test]
-    fn get_symbol_language_narrows_the_dependency_hits_too() -> TestResult {
+    fn get_symbol_language_narrows_the_package_hits_too() -> TestResult {
         let (_directory, service) = dependency_fixture()?;
         let rust = json!({"name": "beacon", "scope": "all", "language": "rust"});
         let python = json!({"name": "beacon", "scope": "all", "language": "python"});
@@ -3309,9 +3354,9 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn get_symbol_rev_with_a_dependency_scope_refuses_naming_scope() -> TestResult {
+    fn get_symbol_rev_with_a_global_scope_refuses_naming_scope() -> TestResult {
         let (_directory, service) = dependency_fixture()?;
-        for scope in ["dependencies", "all"] {
+        for scope in ["global", "all"] {
             let params: GetSymbolParams =
                 serde_json::from_value(json!({"name": "beacon", "scope": scope, "rev": "main"}))?;
 
@@ -3328,88 +3373,9 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    /// `[dependencies] enabled = false` refuses every scope beyond `project` as a
-    /// capability the operator can turn on; the project scope still answers.
     #[test]
-    fn get_symbol_dependency_scope_with_the_index_disabled_is_unsupported() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::create_dir(directory.path().join("src"))?;
-        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
-        let disabled = DependenciesConfiguration {
-            enabled: false,
-            ..DependenciesConfiguration::default()
-        };
-        let service = ReadService::build_with_languages(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::default(),
-            &LanguageFileSelections::default(),
-            HistoryConfiguration::default(),
-            disabled.clone(),
-        )?
-        .with_dependencies(helper_store()?);
-        assert_eq!(service.dependency_configuration(), &disabled);
-        for scope in ["dependencies", "all"] {
-            let params: GetSymbolParams =
-                serde_json::from_value(json!({"name": "beacon", "scope": scope}))?;
-
-            let error = service
-                .get_symbol(&params)
-                .expect_err("a disabled dependency index refuses the scope");
-
-            let ReadFault::Unsupported { capability } = error.fault() else {
-                panic!(
-                    "scope {scope}: expected Unsupported, got {:?}",
-                    error.fault()
-                );
-            };
-            assert_eq!(
-                capability,
-                "dependency scope ([dependencies] enabled = false)"
-            );
-            assert_eq!(error.descriptor().code(), "capability_unavailable");
-        }
-        let params: GetSymbolParams = serde_json::from_value(json!({"name": "beacon"}))?;
-        let answer = service.get_symbol(&params)?;
-        assert_eq!(answer.hits.len(), 1, "the project scope still answers");
-        Ok(())
-    }
-
-    /// A planned index over a rooted, unbuilt entry counts it pending; the project's own
-    /// hit still answers under `all`.
-    #[test]
-    fn get_symbol_dependency_scope_warns_pending_from_a_planned_index() -> TestResult {
-        let root = tempfile::tempdir()?;
-        let catalog = DependencyCatalog::assemble(vec![(
-            ResolverName::Cargo,
-            Resolution {
-                entries: vec![helper_entry(root.path())],
-                inputs: Vec::new(),
-                degradations: Vec::new(),
-            },
-        )]);
-        let index = DependencyIndex::planned(
-            &catalog,
-            DependencyIndexLimits::default(),
-            PackageSelection::default(),
-        );
-        let (_directory, service) = beacon_fixture()?;
-        let service = service.with_dependencies(Arc::new(DependencyStore::new(index)));
-
-        let result = service.get_symbol(&scoped("beacon", "all")?)?;
-
-        assert_eq!(result.hits.len(), 1, "the project beacon still answers");
-        assert_eq!(
-            result.warnings,
-            [ReadWarning::DependencyIndexPending { pending: 1 }]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn get_symbol_dependency_scope_warns_each_skipped_package_in_identity_order() -> TestResult {
-        let mut index = empty_dependency_index();
+    fn get_symbol_global_scope_warns_each_skipped_package_in_identity_order() -> TestResult {
+        let mut index = rift_index::DependencyIndex::empty(DependencyIndexLimits::default());
         index.skip(
             identity("cargo", "zeta", "1.0.0"),
             "zeta refused".to_owned(),
@@ -3419,79 +3385,89 @@ pub fn compute() -> i32 {
             "alpha refused".to_owned(),
         );
         let (_directory, service) = beacon_fixture()?;
-        let service = service.with_dependencies(Arc::new(DependencyStore::new(index)));
+        let service = service.with_packages(Arc::new(PackageBranch::from_index(index)));
 
-        let result = service.get_symbol(&scoped("beacon", "dependencies")?)?;
+        let result = service.get_symbol(&scoped("beacon", "global")?)?;
 
         assert!(result.hits.is_empty());
         assert_eq!(
-            result.warnings,
+            result.warnings[1..],
             [
-                ReadWarning::DependencyPackageSkipped {
+                ReadWarning::PackageSkipped {
                     package: identity("cargo", "alpha", "1.0.0"),
                     reason: "alpha refused".to_owned(),
                 },
-                ReadWarning::DependencyPackageSkipped {
+                ReadWarning::PackageSkipped {
                     package: identity("cargo", "zeta", "1.0.0"),
                     reason: "zeta refused".to_owned(),
                 },
-            ]
+            ],
+            "the global-index warning leads every package answer"
         );
         Ok(())
     }
 
-    /// A service with no store answers a dependency scope as an empty index with nothing
-    /// pending; the catalog's degradations still ride the answer.
+    /// A service with no branch answers a package scope as an empty branch; the
+    /// context's degradations still ride the answer, after the global-index warning.
     #[test]
-    fn get_symbol_dependency_scope_warns_a_degraded_catalog_without_a_store() -> TestResult {
+    fn get_symbol_global_scope_warns_a_degraded_context_without_a_branch() -> TestResult {
         let (_directory, service) = beacon_fixture()?;
-        let service = service.with_catalog(degraded_catalog(&["cargo is not on PATH".to_owned()]));
+        let service = service.with_context(degraded_context());
 
-        let result = service.get_symbol(&scoped("beacon", "dependencies")?)?;
+        let result = service.get_symbol(&scoped("beacon", "global")?)?;
 
         assert!(result.hits.is_empty());
-        assert_eq!(
-            result.warnings,
-            [ReadWarning::DependencyResolverDegraded {
-                resolver: "cargo".to_owned(),
-                reason: "cargo is not on PATH".to_owned(),
-            }]
+        assert!(
+            matches!(
+                result.warnings.first(),
+                Some(ReadWarning::GlobalIndexUnavailable { indexed: 0, .. })
+            ),
+            "{:?}",
+            result.warnings
         );
+        assert!(
+            result.warnings[1..].iter().all(|warning| matches!(
+                warning,
+                ReadWarning::PackageContextDegraded { resolver, .. } if resolver == "cargo"
+            )),
+            "{:?}",
+            result.warnings
+        );
+        assert!(result.warnings.len() > 1, "{:?}", result.warnings);
         Ok(())
     }
 
     /// Six skipped packages and four degradations cut to eight: every skipped package in
     /// identity order, then the first two degradations in resolver order.
     #[test]
-    fn get_symbol_dependency_scope_caps_skipped_and_degraded_warnings_together() -> TestResult {
-        let mut index = empty_dependency_index();
+    fn get_symbol_global_scope_caps_skipped_and_degraded_warnings_together() -> TestResult {
+        let mut index = rift_index::DependencyIndex::empty(DependencyIndexLimits::default());
         for name in ["f", "e", "d", "c", "b", "a"] {
             index.skip(identity("cargo", name, "1.0.0"), format!("{name} refused"));
         }
-        let reasons: Vec<String> = (0..4).map(|n| format!("degradation {n}")).collect();
         let (_directory, service) = beacon_fixture()?;
         let service = service
-            .with_dependencies(Arc::new(DependencyStore::new(index)))
-            .with_catalog(degraded_catalog(&reasons));
+            .with_packages(Arc::new(PackageBranch::from_index(index)))
+            .with_context(degraded_context());
 
-        let result = service.get_symbol(&scoped("beacon", "dependencies")?)?;
+        let result = service.get_symbol(&scoped("beacon", "global")?)?;
 
-        assert_eq!(result.warnings.len(), DEPENDENCY_WARNINGS_MAX);
-        let rendered: Vec<String> = result
-            .warnings
+        assert_eq!(result.warnings.len(), DEPENDENCY_WARNINGS_MAX + 1);
+        let rendered: Vec<String> = result.warnings[1..]
             .iter()
             .map(|warning| match warning {
-                ReadWarning::DependencyPackageSkipped { package, .. } => {
+                ReadWarning::PackageSkipped { package, .. } => {
                     format!("skipped {}", package.name)
                 }
-                ReadWarning::DependencyResolverDegraded { reason, .. } => {
-                    format!("degraded {reason}")
+                ReadWarning::PackageContextDegraded { resolver, .. } => {
+                    format!("degraded {resolver}")
                 }
                 other => format!("{other:?}"),
             })
             .collect();
+        assert_eq!(rendered.len(), DEPENDENCY_WARNINGS_MAX);
         assert_eq!(
-            rendered,
+            rendered[..6],
             [
                 "skipped a",
                 "skipped b",
@@ -3499,9 +3475,14 @@ pub fn compute() -> i32 {
                 "skipped d",
                 "skipped e",
                 "skipped f",
-                "degraded degradation 0",
-                "degraded degradation 1",
-            ]
+            ],
+            "every skipped package leads, in identity order"
+        );
+        assert!(
+            rendered[6..]
+                .iter()
+                .all(|entry| entry.starts_with("degraded")),
+            "the degraded resolvers fill what the bound leaves: {rendered:?}"
         );
         Ok(())
     }
@@ -3509,8 +3490,8 @@ pub fn compute() -> i32 {
     /// A holder that panics with the write side held poisons the store; the next reader
     /// gets a typed internal error naming the lock instead of a panic of its own.
     #[test]
-    fn a_poisoned_dependency_store_refuses_with_an_internal_error_naming_the_lock() {
-        let store = Arc::new(DependencyStore::new(empty_dependency_index()));
+    fn a_poisoned_package_branch_refuses_with_an_internal_error_naming_the_lock() {
+        let store = Arc::new(empty_package_branch());
         let holder = Arc::clone(&store);
         let panicked = std::thread::spawn(move || {
             let _held = holder.write().expect("the fresh lock is clean");
@@ -3530,7 +3511,7 @@ pub fn compute() -> i32 {
             matches!(
                 error.fault(),
                 ReadFault::LockPoisoned {
-                    lock: "dependency index"
+                    lock: "package index"
                 }
             ),
             "{error}"
@@ -3538,9 +3519,9 @@ pub fn compute() -> i32 {
         assert_eq!(error.descriptor().code(), "internal_error");
         let context = error.context();
         assert_eq!(context[0].key(), "lock");
-        assert_eq!(context[0].value(), "dependency index");
+        assert_eq!(context[0].value(), "package index");
         assert_eq!(context[1].key(), "detail");
-        assert_eq!(context[1].value(), "dependency index lock poisoned");
+        assert_eq!(context[1].value(), "package index lock poisoned");
         assert!(
             std::error::Error::source(&error).is_none(),
             "a poisoned lock carries no source"

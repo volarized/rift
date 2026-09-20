@@ -1,16 +1,14 @@
-//! The `[dependencies]` table of `rift.toml`: whether the dependency index runs, how the
-//! catalog is resolved, which cataloged packages are indexed, and the bounds the index
-//! reads and holds under.
+//! The `[dependencies]` table of `rift.toml`, and the static dependency context models.
+//!
+//! The table states how the catalog is resolved, which packages the operator names
+//! beside the ones the workspace's files state, and the bounds the package index reads
+//! and holds under. [`PackageContextEntry`] carries one package the workspace depends
+//! on, as an exact version a lockfile pins or as the requirement a manifest declares.
 
-use crate::configuration::{
-    ByteSize, CONFIGURATION_PATTERNS_MAX, ConfigurationViolation, Duration, first_out_of_range,
-};
-use crate::search::{PathPatternViolation, path_pattern_violation};
+use crate::configuration::{ByteSize, ConfigurationViolation, Duration, first_out_of_range};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Whether the dependency index runs, by default.
-pub const DEPENDENCIES_ENABLED_DEFAULT: bool = true;
 /// How the catalog is resolved, by default: through each toolchain.
 pub const DEPENDENCIES_RESOLUTION_DEFAULT: DependencyResolution = DependencyResolution::Auto;
 /// Bytes one indexed package's selected source may hold, by default: 4 MiB.
@@ -38,13 +36,8 @@ pub const DEPENDENCIES_COMMAND_TIMEOUT_MS_DEFAULT: u64 = 120_000;
 pub const DEPENDENCIES_COMMAND_TIMEOUT_MS_MIN: u64 = 1_000;
 /// Milliseconds one toolchain run may take before it is killed, at most: one hour.
 pub const DEPENDENCIES_COMMAND_TIMEOUT_MS_MAX: u64 = 3_600_000;
-/// Bytes one package name pattern may hold, at most.
-pub const PACKAGE_PATTERN_BYTES_MAX: usize = 256;
-
-/// The spelling a [`PackageNamePattern`] must match: the form `PathPattern` advertises,
-/// since a package name is matched the way a project path is.
-const PACKAGE_PATTERN_REGEX: &str =
-    r"^(?!/)(?!\.\.?(/|$))(?!.*(/\.\.?)(/|$))[^\\\u0000-\u001F\u007F]+$";
+/// Entries the configured package list may hold, at most.
+pub const DEPENDENCIES_PACKAGES_MAX: usize = 20_000;
 
 /// How the resolvers reach a package graph: through each toolchain, or from the
 /// static inputs alone.
@@ -59,68 +52,167 @@ pub enum DependencyResolution {
     Static,
 }
 
-/// One glob over a package's `<manager>/<name>`, such as `cargo/tokio`, `npm/@types/*`,
-/// or `stdlib/*`. Forward-slash separated and at most 256 bytes; `*` never crosses `/`
-/// and `**` does.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-#[schemars(transparent)]
-pub struct PackageNamePattern(
-    #[schemars(example = &"npm/@types/*")]
-    #[schemars(length(min = 1, max = 256))]
-    #[schemars(regex(pattern = PACKAGE_PATTERN_REGEX))]
-    pub String,
-);
+/// Whether a global package index can answer for one package.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageAvailability {
+    /// The entry names a package a public registry serves: crates.io, npm, or the
+    /// Python Package Index.
+    Canonical,
+    /// The entry names a path, git, or custom-registry package only this machine can
+    /// answer for.
+    LocalOnly,
+}
 
-impl PackageNamePattern {
-    /// Classifies this pattern against the contract [`PackageNamePattern`] advertises.
-    /// `schemars` constraints are declarative only, so acceptance calls this before the
-    /// pattern reaches a glob engine.
+/// One package the workspace depends on, as its manifests and lockfiles state it.
+///
+/// Entries order by manager, then name, then the selector they state: a declared
+/// requirement before an exact version.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+#[schemars(transform = crate::schema::require_one_package_context_selector)]
+pub struct PackageContextEntry {
+    /// Package manager or ecosystem name.
+    #[schemars(length(max = 128))]
+    pub manager: String,
+    /// Package name in that ecosystem.
+    #[schemars(length(max = 4096))]
+    pub name: String,
+    /// The exact version a lockfile pins. Absent when only a manifest names the package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 4096))]
+    pub version: Option<String>,
+    /// The version requirement a manifest declares. Absent when a lockfile pins the
+    /// version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 4096))]
+    pub requirement: Option<String>,
+    /// Whether a global package index can answer for this entry.
+    pub availability: PackageAvailability,
+}
+
+impl PackageContextEntry {
+    /// One entry stating exactly one selector, so the rule the schema advertises holds
+    /// by construction.
     #[must_use]
-    pub fn violation(&self) -> Option<PackagePatternViolation> {
-        match self.0.as_bytes() {
-            bytes if bytes.len() > PACKAGE_PATTERN_BYTES_MAX => {
-                Some(PackagePatternViolation::TooLong)
-            }
-            _ => path_pattern_violation(&self.0).map(PackagePatternViolation::Form),
+    pub fn new(
+        manager: &str,
+        name: &str,
+        selector: PackageSelector,
+        availability: PackageAvailability,
+    ) -> Self {
+        let (version, requirement) = match selector {
+            PackageSelector::Version(version) => (Some(version), None),
+            PackageSelector::Requirement(requirement) => (None, Some(requirement)),
+        };
+        Self {
+            manager: manager.to_owned(),
+            name: name.to_owned(),
+            version,
+            requirement,
+            availability,
+        }
+    }
+
+    /// Classifies this entry against the exactly-one selector rule the schema
+    /// advertises. `schemars` constraints are declarative only, so a deserialized entry
+    /// is classified before it reaches a reader.
+    #[must_use]
+    pub fn violation(&self) -> Option<PackageSelectorViolation> {
+        selector_violation(self.version.as_deref(), self.requirement.as_deref())
+    }
+}
+
+/// What one package entry states about a package's version.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum PackageSelector {
+    /// The exact version a lockfile pins.
+    Version(String),
+    /// The version requirement a manifest declares.
+    Requirement(String),
+}
+
+/// One package the `[dependencies]` `packages` list names.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+#[schemars(transform = crate::schema::require_one_configured_package_selector)]
+pub struct ConfiguredPackage {
+    /// Package manager or ecosystem name, as `cargo`, `npm`, or `pypi`.
+    #[schemars(length(max = 128))]
+    pub manager: String,
+    /// Package name in that ecosystem.
+    #[schemars(length(max = 4096))]
+    pub name: String,
+    /// The exact version this entry pins. Set this or `requirement`, never both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 4096))]
+    pub version: Option<String>,
+    /// The version requirement this entry declares. Set this or `version`, never both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 4096))]
+    pub requirement: Option<String>,
+}
+
+impl ConfiguredPackage {
+    /// Classifies this entry against the exactly-one selector rule the schema
+    /// advertises. Acceptance calls this before the entry reaches the context.
+    #[must_use]
+    pub fn violation(&self) -> Option<PackageSelectorViolation> {
+        selector_violation(self.version.as_deref(), self.requirement.as_deref())
+    }
+
+    /// The one selector this entry states. Absent when it states both or neither, the
+    /// case acceptance refuses.
+    #[must_use]
+    pub fn selector(&self) -> Option<PackageSelector> {
+        match (&self.version, &self.requirement) {
+            (Some(version), None) => Some(PackageSelector::Version(version.clone())),
+            (None, Some(requirement)) => Some(PackageSelector::Requirement(requirement.clone())),
+            _ => None,
         }
     }
 }
 
-/// Reason a package name pattern breaks its contract.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PackagePatternViolation {
-    /// The pattern holds more than [`PACKAGE_PATTERN_BYTES_MAX`] bytes.
-    TooLong,
-    /// The pattern breaks the forward-slash-only form a project path pattern takes.
-    Form(PathPatternViolation),
+/// Reason one package entry states no single version selector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageSelectorViolation {
+    /// The entry names `version` and `requirement` together.
+    SelectorConflict,
+    /// The entry names neither `version` nor `requirement`.
+    SelectorMissing,
 }
 
-/// The `[dependencies]` table. The dependency index reads the packages the resolvers
-/// catalog; this table turns the index off, selects how the catalog is resolved and
-/// which cataloged packages are indexed, and bounds what the index reads and holds.
-/// `include` and `exclude` are globs over `<manager>/<name>`: an empty `include` selects
-/// every cataloged package, and an `exclude` match drops a package `include` selected.
+/// The exactly-one rule both package entry models carry: a lockfile pins a `version`, a
+/// manifest declares a `requirement`, and no entry states both or neither.
+fn selector_violation(
+    version: Option<&str>,
+    requirement: Option<&str>,
+) -> Option<PackageSelectorViolation> {
+    match (version, requirement) {
+        (Some(_), Some(_)) => Some(PackageSelectorViolation::SelectorConflict),
+        (None, None) => Some(PackageSelectorViolation::SelectorMissing),
+        _ => None,
+    }
+}
+
+/// The `[dependencies]` table. It states how the catalog is resolved, which packages
+/// the operator names beside the ones the workspace's manifests and lockfiles state,
+/// and the bounds the package index reads and holds under.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_dependencies_ranges)]
 pub struct DependenciesConfiguration {
-    /// Whether the dependency index runs. `false` keeps the catalog resolved for
-    /// `rift://map` and refuses a `scope` beyond `project` as `capability_unavailable`.
-    #[serde(default = "default_dependencies_enabled")]
-    pub enabled: bool,
     /// How the catalog is resolved: `auto` runs each toolchain, `static` reads the
     /// lockfiles and package caches alone.
     #[serde(default = "default_dependencies_resolution")]
     pub resolution: DependencyResolution,
-    /// Globs over `<manager>/<name>` a cataloged package must match to be indexed.
-    /// Empty selects every cataloged package.
-    #[schemars(length(max = 64))]
-    pub include: Vec<PackageNamePattern>,
-    /// Globs over `<manager>/<name>` dropped from indexing. A match here is dropped
-    /// even when `include` also matches it.
-    #[schemars(length(max = 64))]
-    pub exclude: Vec<PackageNamePattern>,
+    /// Packages carried beside the ones the workspace's manifests and lockfiles state.
+    /// Each entry names exactly one of `version` and `requirement`.
+    #[schemars(length(max = 20_000))]
+    pub packages: Vec<ConfiguredPackage>,
     /// Bytes one package's selected source may hold, 64kb to 1gb. A package past it is
     /// skipped.
     #[serde(default = "default_dependencies_package_size")]
@@ -142,10 +234,8 @@ pub struct DependenciesConfiguration {
 impl Default for DependenciesConfiguration {
     fn default() -> Self {
         Self {
-            enabled: default_dependencies_enabled(),
             resolution: default_dependencies_resolution(),
-            include: Vec::new(),
-            exclude: Vec::new(),
+            packages: Vec::new(),
             package_size: default_dependencies_package_size(),
             index_size: default_dependencies_index_size(),
             package_files: default_dependencies_package_files(),
@@ -155,21 +245,15 @@ impl Default for DependenciesConfiguration {
 }
 
 impl DependenciesConfiguration {
-    /// The table's list-length and numeric bounds, then each pattern's contract, in key
-    /// then list order.
+    /// The table's list-length and numeric bounds, then each configured package's
+    /// selector, in key then list order.
     pub(crate) fn violation(&self) -> Option<ConfigurationViolation> {
         first_out_of_range([
             (
-                "dependencies.include",
-                self.include.len() as u64,
+                "dependencies.packages",
+                self.packages.len() as u64,
                 0,
-                CONFIGURATION_PATTERNS_MAX as u64,
-            ),
-            (
-                "dependencies.exclude",
-                self.exclude.len() as u64,
-                0,
-                CONFIGURATION_PATTERNS_MAX as u64,
+                DEPENDENCIES_PACKAGES_MAX as u64,
             ),
             (
                 "dependencies.package_size",
@@ -196,13 +280,8 @@ impl DependenciesConfiguration {
                 DEPENDENCIES_COMMAND_TIMEOUT_MS_MAX,
             ),
         ])
-        .or_else(|| pattern_list_violation("dependencies.include", &self.include))
-        .or_else(|| pattern_list_violation("dependencies.exclude", &self.exclude))
+        .or_else(|| configured_package_violation(&self.packages))
     }
-}
-
-fn default_dependencies_enabled() -> bool {
-    DEPENDENCIES_ENABLED_DEFAULT
 }
 
 fn default_dependencies_resolution() -> DependencyResolution {
@@ -225,18 +304,15 @@ fn default_dependencies_command_timeout() -> Duration {
     Duration::from_millis(DEPENDENCIES_COMMAND_TIMEOUT_MS_DEFAULT)
 }
 
-/// The first pattern in `patterns` breaking [`PackageNamePattern`]'s contract, patterns
-/// in list order.
-fn pattern_list_violation(
-    field: &'static str,
-    patterns: &[PackageNamePattern],
-) -> Option<ConfigurationViolation> {
-    patterns
+/// The first configured package stating no single version selector, entries in list
+/// order.
+fn configured_package_violation(packages: &[ConfiguredPackage]) -> Option<ConfigurationViolation> {
+    packages
         .iter()
-        .find(|pattern| pattern.violation().is_some())
-        .map(|pattern| ConfigurationViolation::PackagePatternInvalid {
-            field,
-            pattern: pattern.0.clone(),
+        .find(|package| package.violation().is_some())
+        .map(|package| ConfigurationViolation::PackageSelectorInvalid {
+            field: "dependencies.packages",
+            package: format!("{}/{}", package.manager, package.name),
         })
 }
 
@@ -244,23 +320,40 @@ fn pattern_list_violation(
 mod tests {
     use super::*;
     use crate::configuration::WorkspaceConfiguration;
-    use crate::read::PathPattern;
     use serde_json::json;
-
-    fn pattern(value: &str) -> PackageNamePattern {
-        PackageNamePattern(value.to_owned())
-    }
 
     /// Sets one numeric key of the table to a value in its base unit.
     type Setter = fn(&mut DependenciesConfiguration, u64);
 
+    fn configured(
+        manager: &str,
+        name: &str,
+        version: Option<&str>,
+        requirement: Option<&str>,
+    ) -> ConfiguredPackage {
+        ConfiguredPackage {
+            manager: manager.to_owned(),
+            name: name.to_owned(),
+            version: version.map(str::to_owned),
+            requirement: requirement.map(str::to_owned),
+        }
+    }
+
+    fn context_entry(version: Option<&str>, requirement: Option<&str>) -> PackageContextEntry {
+        PackageContextEntry {
+            manager: "cargo".to_owned(),
+            name: "serde".to_owned(),
+            version: version.map(str::to_owned),
+            requirement: requirement.map(str::to_owned),
+            availability: PackageAvailability::Canonical,
+        }
+    }
+
     #[test]
     fn test_dependencies_defaults_are_the_named_constants() {
         let table = DependenciesConfiguration::default();
-        assert_eq!(table.enabled, DEPENDENCIES_ENABLED_DEFAULT);
         assert_eq!(table.resolution, DependencyResolution::Auto);
-        assert!(table.include.is_empty());
-        assert!(table.exclude.is_empty());
+        assert!(table.packages.is_empty());
         assert_eq!(
             table.package_size,
             ByteSize::from_bytes(DEPENDENCIES_PACKAGE_BYTES_DEFAULT)
@@ -363,123 +456,135 @@ mod tests {
         table.index_size = ByteSize::from_bytes(DEPENDENCIES_INDEX_BYTES_MAX);
         table.package_files = DEPENDENCIES_PACKAGE_FILES_MAX;
         table.command_timeout = Duration::from_millis(DEPENDENCIES_COMMAND_TIMEOUT_MS_MIN);
-        table.include = vec![pattern("cargo/*"); CONFIGURATION_PATTERNS_MAX];
-        table.exclude = vec![pattern("x".repeat(PACKAGE_PATTERN_BYTES_MAX).as_str())];
+        table.packages =
+            vec![configured("cargo", "serde", Some("1.0.228"), None); DEPENDENCIES_PACKAGES_MAX];
         assert_eq!(configuration.validate(), Ok(()));
 
         configuration
             .dependencies
-            .include
-            .push(pattern("one-too-many"));
+            .packages
+            .push(configured("cargo", "tokio", None, Some("^1")));
         let violation = configuration
             .validate()
-            .expect_err("an include list past the cap must be refused");
+            .expect_err("a package list past the cap must be refused");
         assert!(matches!(
             violation,
             ConfigurationViolation::LimitOutOfRange {
-                field: "dependencies.include",
+                field: "dependencies.packages",
                 ..
             }
         ));
     }
 
     #[test]
-    fn test_package_pattern_classifies_every_contract_rule() {
-        let too_long = "x".repeat(PACKAGE_PATTERN_BYTES_MAX + 1);
-        let cases = [
-            (
-                "",
-                Some(PackagePatternViolation::Form(PathPatternViolation::Empty)),
-            ),
-            (too_long.as_str(), Some(PackagePatternViolation::TooLong)),
-            (
-                "/cargo/tokio",
-                Some(PackagePatternViolation::Form(
-                    PathPatternViolation::Absolute,
-                )),
-            ),
-            (
-                "cargo\\tokio",
-                Some(PackagePatternViolation::Form(
-                    PathPatternViolation::Backslash,
-                )),
-            ),
-            (
-                "cargo/to\u{0007}kio",
-                Some(PackagePatternViolation::Form(
-                    PathPatternViolation::ControlCharacter,
-                )),
-            ),
-            (
-                "cargo/../tokio",
-                Some(PackagePatternViolation::Form(
-                    PathPatternViolation::DotSegment,
-                )),
-            ),
-            ("cargo/tokio", None),
-            ("npm/@types/*", None),
-            ("stdlib/*", None),
-            ("**", None),
-        ];
-        for (value, expected) in cases {
-            assert_eq!(pattern(value).violation(), expected, "{value:?}");
+    fn test_package_selector_classifies_both_and_neither() {
+        assert_eq!(context_entry(Some("1.0.228"), None).violation(), None);
+        assert_eq!(context_entry(None, Some("^1.0")).violation(), None);
+        assert_eq!(
+            context_entry(Some("1.0.228"), Some("^1.0")).violation(),
+            Some(PackageSelectorViolation::SelectorConflict)
+        );
+        assert_eq!(
+            context_entry(None, None).violation(),
+            Some(PackageSelectorViolation::SelectorMissing)
+        );
+        assert_eq!(
+            configured("npm", "left-pad", Some("1.3.0"), Some("^1")).violation(),
+            Some(PackageSelectorViolation::SelectorConflict)
+        );
+        assert_eq!(
+            configured("npm", "left-pad", None, None).violation(),
+            Some(PackageSelectorViolation::SelectorMissing)
+        );
+    }
+
+    #[test]
+    fn test_one_selector_builds_an_entry_and_reads_back_from_a_configured_package() {
+        let pinned = PackageContextEntry::new(
+            "cargo",
+            "serde",
+            PackageSelector::Version("1.0.228".to_owned()),
+            PackageAvailability::Canonical,
+        );
+        assert_eq!(pinned, context_entry(Some("1.0.228"), None));
+        let declared = PackageContextEntry::new(
+            "cargo",
+            "serde",
+            PackageSelector::Requirement("^1.0".to_owned()),
+            PackageAvailability::Canonical,
+        );
+        assert_eq!(declared, context_entry(None, Some("^1.0")));
+
+        assert_eq!(
+            configured("cargo", "serde", Some("1.0.228"), None).selector(),
+            Some(PackageSelector::Version("1.0.228".to_owned()))
+        );
+        assert_eq!(
+            configured("cargo", "serde", None, Some("^1.0")).selector(),
+            Some(PackageSelector::Requirement("^1.0".to_owned()))
+        );
+        assert_eq!(
+            configured("cargo", "serde", Some("1.0.228"), Some("^1.0")).selector(),
+            None
+        );
+        assert_eq!(configured("cargo", "serde", None, None).selector(), None);
+    }
+
+    #[test]
+    fn test_a_configured_package_naming_both_or_neither_selector_is_refused() {
+        for package in [
+            configured("cargo", "serde", Some("1.0.228"), Some("^1.0")),
+            configured("cargo", "serde", None, None),
+        ] {
+            let mut configuration = WorkspaceConfiguration::default();
+            configuration.dependencies.packages =
+                vec![configured("cargo", "tokio", Some("1.53.1"), None), package];
+            let violation = configuration
+                .validate()
+                .expect_err("an entry stating no single selector must be refused");
+            assert_eq!(
+                violation,
+                ConfigurationViolation::PackageSelectorInvalid {
+                    field: "dependencies.packages",
+                    package: "cargo/serde".to_owned(),
+                }
+            );
         }
     }
 
     #[test]
-    fn test_pattern_refusals_name_the_list_and_the_pattern() {
-        let mut configuration = WorkspaceConfiguration::default();
-        configuration.dependencies.include = vec![pattern("cargo/*"), pattern("")];
-        let violation = configuration
-            .validate()
-            .expect_err("an empty include pattern must be refused");
-        assert_eq!(
-            violation,
-            ConfigurationViolation::PackagePatternInvalid {
-                field: "dependencies.include",
-                pattern: String::new(),
-            }
-        );
-
-        let mut configuration = WorkspaceConfiguration::default();
-        configuration.dependencies.exclude = vec![pattern("../tokio")];
-        let violation = configuration
-            .validate()
-            .expect_err("a dot-segment exclude pattern must be refused");
-        assert_eq!(
-            violation,
-            ConfigurationViolation::PackagePatternInvalid {
-                field: "dependencies.exclude",
-                pattern: "../tokio".to_owned(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_dependencies_table_parses_every_key_and_refuses_a_retired_one() {
+    fn test_dependencies_table_parses_every_key_and_refuses_a_removed_one() {
         let table: DependenciesConfiguration = serde_json::from_value(json!({
-            "enabled": false,
             "resolution": "static",
-            "include": ["cargo/*", "stdlib/*"],
-            "exclude": ["cargo/helper"],
+            "packages": [
+                { "manager": "cargo", "name": "serde", "version": "1.0.228" },
+                { "manager": "npm", "name": "typescript", "requirement": "^5.9.0" },
+            ],
             "package_size": "8mb",
             "index_size": "1gb",
             "package_files": 10,
             "command_timeout": "5m",
         }))
         .expect("every documented key parses");
-        assert!(!table.enabled);
         assert_eq!(table.resolution, DependencyResolution::Static);
-        assert_eq!(table.include, [pattern("cargo/*"), pattern("stdlib/*")]);
-        assert_eq!(table.exclude, [pattern("cargo/helper")]);
+        assert_eq!(
+            table.packages,
+            [
+                configured("cargo", "serde", Some("1.0.228"), None),
+                configured("npm", "typescript", None, Some("^5.9.0")),
+            ]
+        );
         assert_eq!(table.package_size, ByteSize::from_bytes(8 << 20));
         assert_eq!(table.index_size, ByteSize::from_bytes(1 << 30));
         assert_eq!(table.package_files, 10);
         assert_eq!(table.command_timeout, Duration::from_millis(300_000));
         assert_eq!(table.violation(), None);
-        let refused =
-            serde_json::from_value::<DependenciesConfiguration>(json!({ "package_bytes_max": 1 }));
-        assert!(refused.is_err(), "a retired key must be refused");
+        for removed in ["enabled", "include", "exclude", "package_bytes_max"] {
+            let refused = serde_json::from_value::<DependenciesConfiguration>(
+                json!({ removed: serde_json::Value::Null }),
+            );
+            assert!(refused.is_err(), "a removed key must be refused: {removed}");
+        }
     }
 
     #[test]
@@ -488,22 +593,16 @@ mod tests {
             serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
         let table = &schema["$defs"]["DependenciesConfiguration"]["properties"];
         let cases = [
-            ("enabled default", &table["enabled"]["default"], json!(true)),
             (
                 "resolution default",
                 &table["resolution"]["default"],
                 json!("auto"),
             ),
-            ("include default", &table["include"]["default"], json!([])),
+            ("packages default", &table["packages"]["default"], json!([])),
             (
-                "include max",
-                &table["include"]["maxItems"],
-                json!(CONFIGURATION_PATTERNS_MAX),
-            ),
-            (
-                "exclude max",
-                &table["exclude"]["maxItems"],
-                json!(CONFIGURATION_PATTERNS_MAX),
+                "packages max",
+                &table["packages"]["maxItems"],
+                json!(DEPENDENCIES_PACKAGES_MAX),
             ),
             (
                 "package size default",
@@ -578,16 +677,86 @@ mod tests {
         );
     }
 
+    /// The schema advertises the exactly-one selector rule both entry models enforce at
+    /// runtime, so a validating reader and the server refuse the same documents.
     #[test]
-    fn test_package_pattern_schema_states_the_path_pattern_form_and_its_length() {
-        let schema =
-            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
-        let package = &schema["$defs"]["PackageNamePattern"];
-        let path = serde_json::to_value(schemars::schema_for!(PathPattern)).expect("schema");
-        assert_eq!(package["pattern"], path["pattern"]);
-        assert_eq!(package["pattern"], json!(PACKAGE_PATTERN_REGEX));
-        assert_eq!(package["minLength"], json!(1));
-        assert_eq!(package["maxLength"], json!(PACKAGE_PATTERN_BYTES_MAX));
-        assert_eq!(package["examples"], json!(["npm/@types/*"]));
+    fn test_selector_schema_admits_exactly_what_the_classifier_accepts() {
+        let cases = [
+            (
+                "PackageContextEntry",
+                serde_json::to_value(schemars::schema_for!(PackageContextEntry)).expect("schema"),
+                json!({ "manager": "cargo", "name": "serde", "availability": "canonical" }),
+            ),
+            (
+                "ConfiguredPackage",
+                serde_json::to_value(schemars::schema_for!(ConfiguredPackage)).expect("schema"),
+                json!({ "manager": "cargo", "name": "serde" }),
+            ),
+        ];
+        for (model, schema, base) in cases {
+            let validator = jsonschema::validator_for(&schema).expect("a selector schema compiles");
+            let with = |selectors: serde_json::Value| {
+                let mut document = base.clone();
+                let object = document.as_object_mut().expect("an entry is an object");
+                for (key, value) in selectors.as_object().expect("selectors are an object") {
+                    object.insert(key.clone(), value.clone());
+                }
+                document
+            };
+            assert!(
+                validator.is_valid(&with(json!({ "version": "1.0.228" }))),
+                "{model} must admit an exact version"
+            );
+            assert!(
+                validator.is_valid(&with(json!({ "requirement": "^1.0" }))),
+                "{model} must admit a declared requirement"
+            );
+            assert!(
+                !validator.is_valid(&with(
+                    json!({ "version": "1.0.228", "requirement": "^1.0" })
+                )),
+                "{model} must refuse both selectors"
+            );
+            assert!(
+                !validator.is_valid(&base),
+                "{model} must refuse an entry stating neither selector"
+            );
+        }
+    }
+
+    /// Two entries sort by manager, then name, then the selector they state.
+    #[test]
+    fn test_context_entries_sort_by_manager_name_then_selector() {
+        let mut entries = [
+            PackageContextEntry {
+                manager: "npm".to_owned(),
+                name: "typescript".to_owned(),
+                version: None,
+                requirement: Some("^5.9.0".to_owned()),
+                availability: PackageAvailability::Canonical,
+            },
+            context_entry(None, Some("^1.0")),
+            context_entry(Some("1.0.228"), None),
+        ];
+        entries.sort();
+        let spelled: Vec<String> = entries
+            .iter()
+            .map(|entry| {
+                let selector = entry
+                    .version
+                    .as_deref()
+                    .or(entry.requirement.as_deref())
+                    .unwrap_or_default();
+                format!("{}/{}@{selector}", entry.manager, entry.name)
+            })
+            .collect();
+        assert_eq!(
+            spelled,
+            [
+                "cargo/serde@^1.0",
+                "cargo/serde@1.0.228",
+                "npm/typescript@^5.9.0"
+            ]
+        );
     }
 }

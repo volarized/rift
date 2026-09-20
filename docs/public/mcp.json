@@ -2,7 +2,7 @@
   "description": "Tools served by the Rift MCP server, with the JSON Schemas derived from the Rust wire models.",
   "tools": [
     {
-      "description": "Finds declarations and their source by exact symbol name. Each hit\ncarries the declaration and its source excerpt unless `include` omits\n`source`. `include: [\"history\"]` adds each hit's version-control timeline,\nwalked from the served revision. `rev` serves the lookup from a\nversion-control revision instead of the current tree. `scope` reaches\npast the project tree: `dependencies` answers from the public\ndeclarations of the cataloged packages alone, `all` from both, project\nhits first. Use `search` when the name is not exactly known.",
+      "description": "Finds declarations and their source by exact symbol name. Each hit\ncarries the declaration and its source excerpt unless `include` omits\n`source`. `include: [\"history\"]` adds each hit's version-control timeline,\nwalked from the served revision. `rev` serves the lookup from a\nversion-control revision instead of the current tree. `scope` reaches\npast the project tree: `global` answers from the public declarations of\nthe cataloged packages alone, `all` from both, project hits first. Use\n`search` when the name is not exactly known.",
       "input_schema": {
         "$defs": {
           "GetSymbolInclude": {
@@ -38,21 +38,21 @@
             "type": "string"
           },
           "SearchScope": {
-            "description": "Which declarations a `get_symbol` lookup searches.",
+            "description": "Which corpus a read searches. The names identify logical corpora, not storage\nlocations: `global` reaches dependency package facts wherever the server holds them.",
             "oneOf": [
               {
-                "const": "project",
+                "const": "local",
                 "description": "The project tree the server serves.",
                 "type": "string"
               },
               {
-                "const": "dependencies",
-                "description": "The packages the dependency resolvers cataloged, answered from their public\ndeclarations alone.",
+                "const": "global",
+                "description": "The dependency packages, answered from their public declarations alone.",
                 "type": "string"
               },
               {
                 "const": "all",
-                "description": "Both: hits merge by rank; at equal rank a project hit orders before a dependency\nhit.",
+                "description": "Both: hits merge by rank; at equal rank a project hit orders before a package hit.",
                 "type": "string"
               }
             ]
@@ -138,8 +138,8 @@
           },
           "scope": {
             "$ref": "#/$defs/SearchScope",
-            "default": "project",
-            "description": "Which declarations the lookup searches: the project tree, the cataloged\ndependency packages, or both. Omitted, `project`. The server refuses a scope\nbeyond `project` together with `rev`, since dependencies are served for the\ncurrent tree alone."
+            "default": "local",
+            "description": "Which declarations the lookup searches: the project tree, the dependency\npackages, or both. Omitted, `local`. The server refuses a scope beyond `local`\ntogether with `rev`, since package facts are served for the current tree alone."
           }
         },
         "required": [
@@ -806,14 +806,19 @@
               },
               {
                 "additionalProperties": false,
-                "description": "Cataloged packages with a source root are still being indexed, so a `dependencies`\nor `all` answer holds their declarations only once the index reaches them. The\nanswer is served from the packages indexed so far. Rides only an answer whose\n`scope` reaches dependencies.",
+                "description": "No global package index answered this read, so the package facts came from the\npackages this machine indexed. Rides every answer whose `scope` reaches packages,\nand states what the local fallback produced.",
                 "properties": {
                   "code": {
-                    "const": "dependency_index_pending",
+                    "const": "global_index_unavailable",
                     "type": "string"
                   },
-                  "pending": {
-                    "description": "Packages cataloged with a source root and not yet indexed.",
+                  "detail": {
+                    "description": "Why no global index answered, and what the fallback did instead - prose for a\nreader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "indexed": {
+                    "description": "Packages the local fallback indexed for this answer.",
                     "format": "uint64",
                     "minimum": 0,
                     "type": "integer"
@@ -821,16 +826,17 @@
                 },
                 "required": [
                   "code",
-                  "pending"
+                  "indexed",
+                  "detail"
                 ],
                 "type": "object"
               },
               {
                 "additionalProperties": false,
-                "description": "The dependency index refused one cataloged package, so none of its declarations\nanswers. Rides only an answer whose `scope` reaches dependencies; at most\n`DEPENDENCY_WARNINGS_MAX` of this warning and `dependency_resolver_degraded`\ntogether ride one answer, this one first, in package identity order.",
+                "description": "The local package index refused one package, so none of its declarations answers.\nRides only an answer whose `scope` reaches packages; at most\n`DEPENDENCY_WARNINGS_MAX` of this warning and `package_context_degraded` together\nride one answer, this one first, in package identity order.",
                 "properties": {
                   "code": {
-                    "const": "dependency_package_skipped",
+                    "const": "package_skipped",
                     "type": "string"
                   },
                   "package": {
@@ -852,10 +858,10 @@
               },
               {
                 "additionalProperties": false,
-                "description": "One dependency resolver answered less than its toolchain would have, so the\ncatalog may miss packages. Rides only an answer whose `scope` reaches\ndependencies; at most `DEPENDENCY_WARNINGS_MAX` of this warning and\n`dependency_package_skipped` together ride one answer, this one after every\nskipped package, in resolver order.",
+                "description": "One resolver read less than its manifests and lockfiles state, so the dependency\ncontext may miss packages and the packages it misses answer nothing. Rides only an\nanswer whose `scope` reaches packages; at most `DEPENDENCY_WARNINGS_MAX` of this\nwarning and `package_skipped` together ride one answer, this one after every\nskipped package, in resolver order.",
                 "properties": {
                   "code": {
-                    "const": "dependency_resolver_degraded",
+                    "const": "package_context_degraded",
                     "type": "string"
                   },
                   "reason": {
@@ -2605,14 +2611,19 @@
               },
               {
                 "additionalProperties": false,
-                "description": "Cataloged packages with a source root are still being indexed, so a `dependencies`\nor `all` answer holds their declarations only once the index reaches them. The\nanswer is served from the packages indexed so far. Rides only an answer whose\n`scope` reaches dependencies.",
+                "description": "No global package index answered this read, so the package facts came from the\npackages this machine indexed. Rides every answer whose `scope` reaches packages,\nand states what the local fallback produced.",
                 "properties": {
                   "code": {
-                    "const": "dependency_index_pending",
+                    "const": "global_index_unavailable",
                     "type": "string"
                   },
-                  "pending": {
-                    "description": "Packages cataloged with a source root and not yet indexed.",
+                  "detail": {
+                    "description": "Why no global index answered, and what the fallback did instead - prose for a\nreader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "indexed": {
+                    "description": "Packages the local fallback indexed for this answer.",
                     "format": "uint64",
                     "minimum": 0,
                     "type": "integer"
@@ -2620,16 +2631,17 @@
                 },
                 "required": [
                   "code",
-                  "pending"
+                  "indexed",
+                  "detail"
                 ],
                 "type": "object"
               },
               {
                 "additionalProperties": false,
-                "description": "The dependency index refused one cataloged package, so none of its declarations\nanswers. Rides only an answer whose `scope` reaches dependencies; at most\n`DEPENDENCY_WARNINGS_MAX` of this warning and `dependency_resolver_degraded`\ntogether ride one answer, this one first, in package identity order.",
+                "description": "The local package index refused one package, so none of its declarations answers.\nRides only an answer whose `scope` reaches packages; at most\n`DEPENDENCY_WARNINGS_MAX` of this warning and `package_context_degraded` together\nride one answer, this one first, in package identity order.",
                 "properties": {
                   "code": {
-                    "const": "dependency_package_skipped",
+                    "const": "package_skipped",
                     "type": "string"
                   },
                   "package": {
@@ -2651,10 +2663,10 @@
               },
               {
                 "additionalProperties": false,
-                "description": "One dependency resolver answered less than its toolchain would have, so the\ncatalog may miss packages. Rides only an answer whose `scope` reaches\ndependencies; at most `DEPENDENCY_WARNINGS_MAX` of this warning and\n`dependency_package_skipped` together ride one answer, this one after every\nskipped package, in resolver order.",
+                "description": "One resolver read less than its manifests and lockfiles state, so the dependency\ncontext may miss packages and the packages it misses answer nothing. Rides only an\nanswer whose `scope` reaches packages; at most `DEPENDENCY_WARNINGS_MAX` of this\nwarning and `package_skipped` together ride one answer, this one after every\nskipped package, in resolver order.",
                 "properties": {
                   "code": {
-                    "const": "dependency_resolver_degraded",
+                    "const": "package_context_degraded",
                     "type": "string"
                   },
                   "reason": {
@@ -3028,7 +3040,7 @@
       }
     },
     {
-      "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies, and by a\nbounded relationship `traversal` from one seed symbol. `change` answers the\ndeclarations two committed revisions hold differently, in place of `query` and\n`traversal`. `rev` searches a version-control revision instead of the current tree,\nand never combines with `traversal` or `change`. `scope` reaches past the project\ntree: `dependencies` answers `query` from the public declarations of the cataloged\npackages alone, `all` from both, ordered together. Use `get_symbol` when the\ndeclaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the search index's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate ranked units against one snapshot and merge them into\nresults computed from another.",
+      "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies, and by a\nbounded relationship `traversal` from one seed symbol. `change` answers the\ndeclarations two committed revisions hold differently, in place of `query` and\n`traversal`. `rev` searches a version-control revision instead of the current tree,\nand never combines with `traversal` or `change`. `scope` reaches past the project\ntree: `global` answers `query` from the public declarations of the cataloged\npackages alone, `all` from both, ordered together. Use `get_symbol` when the\ndeclaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the search index's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate ranked units against one snapshot and merge them into\nresults computed from another.",
       "input_schema": {
         "$defs": {
           "PathPattern": {
@@ -3319,21 +3331,21 @@
             ]
           },
           "SearchScope": {
-            "description": "Which declarations a `get_symbol` lookup searches.",
+            "description": "Which corpus a read searches. The names identify logical corpora, not storage\nlocations: `global` reaches dependency package facts wherever the server holds them.",
             "oneOf": [
               {
-                "const": "project",
+                "const": "local",
                 "description": "The project tree the server serves.",
                 "type": "string"
               },
               {
-                "const": "dependencies",
-                "description": "The packages the dependency resolvers cataloged, answered from their public\ndeclarations alone.",
+                "const": "global",
+                "description": "The dependency packages, answered from their public declarations alone.",
                 "type": "string"
               },
               {
                 "const": "all",
-                "description": "Both: hits merge by rank; at equal rank a project hit orders before a dependency\nhit.",
+                "description": "Both: hits merge by rank; at equal rank a project hit orders before a package hit.",
                 "type": "string"
               }
             ]
@@ -3504,7 +3516,7 @@
           {
             "limit": 10,
             "query": "spawn_blocking",
-            "scope": "dependencies",
+            "scope": "global",
             "target": "symbol"
           },
           {
@@ -3526,7 +3538,7 @@
                 "type": "null"
               }
             ],
-            "description": "Two committed revisions to compare, standing alone. Every declaration the two\nrevisions hold differently becomes a hit tagged `change`, carrying a `change` block\nthat names what differs and where the declaration lives on each side.\n`target: \"file\"` never carries a change hit, since the comparison reaches\ndeclarations alone, and `relevance` orders the hits by path, then name. `paths`\nnarrows which changed paths are compared. The server refuses `change` beside `rev`,\nsince `change` names its own revisions; beside `query`, since the two select\ndifferent result sets; beside `traversal`, since no lane resolves references for a\ncommitted revision; and beside a `scope` past `project`."
+            "description": "Two committed revisions to compare, standing alone. Every declaration the two\nrevisions hold differently becomes a hit tagged `change`, carrying a `change` block\nthat names what differs and where the declaration lives on each side.\n`target: \"file\"` never carries a change hit, since the comparison reaches\ndeclarations alone, and `relevance` orders the hits by path, then name. `paths`\nnarrows which changed paths are compared. The server refuses `change` beside `rev`,\nsince `change` names its own revisions; beside `query`, since the two select\ndifferent result sets; beside `traversal`, since no lane resolves references for a\ncommitted revision; and beside a `scope` past `local`."
           },
           "include": {
             "description": "Extra payload to attach to every hit. Every entry costs response bytes per hit, so\nthe caller requests only what it will read.",
@@ -3591,8 +3603,8 @@
           },
           "scope": {
             "$ref": "#/$defs/SearchScope",
-            "default": "project",
-            "description": "Which declarations `query` searches: the project tree, the public declarations of\nthe cataloged dependency packages, or both. Omitted, `project`. A package\ncontributes symbol hits alone. The server refuses a scope beyond `project`\ntogether with `rev`, since dependencies are served for the current tree alone,\nand `dependencies` together with `traversal`, since the relationship graph serves\nthe project alone."
+            "default": "local",
+            "description": "Which declarations `query` searches: the project tree, the public declarations of\nthe dependency packages, or both. Omitted, `local`. A package contributes symbol\nhits alone. The server refuses a scope beyond `local` together with `rev`, since\npackage facts are served for the current tree alone, and `global` together with\n`traversal`, since a walk runs over the project alone."
           },
           "target": {
             "$ref": "#/$defs/SearchParamsTarget",
@@ -4258,14 +4270,19 @@
               },
               {
                 "additionalProperties": false,
-                "description": "Cataloged packages with a source root are still being indexed, so a `dependencies`\nor `all` answer holds their declarations only once the index reaches them. The\nanswer is served from the packages indexed so far. Rides only an answer whose\n`scope` reaches dependencies.",
+                "description": "No global package index answered this read, so the package facts came from the\npackages this machine indexed. Rides every answer whose `scope` reaches packages,\nand states what the local fallback produced.",
                 "properties": {
                   "code": {
-                    "const": "dependency_index_pending",
+                    "const": "global_index_unavailable",
                     "type": "string"
                   },
-                  "pending": {
-                    "description": "Packages cataloged with a source root and not yet indexed.",
+                  "detail": {
+                    "description": "Why no global index answered, and what the fallback did instead - prose for a\nreader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "indexed": {
+                    "description": "Packages the local fallback indexed for this answer.",
                     "format": "uint64",
                     "minimum": 0,
                     "type": "integer"
@@ -4273,16 +4290,17 @@
                 },
                 "required": [
                   "code",
-                  "pending"
+                  "indexed",
+                  "detail"
                 ],
                 "type": "object"
               },
               {
                 "additionalProperties": false,
-                "description": "The dependency index refused one cataloged package, so none of its declarations\nanswers. Rides only an answer whose `scope` reaches dependencies; at most\n`DEPENDENCY_WARNINGS_MAX` of this warning and `dependency_resolver_degraded`\ntogether ride one answer, this one first, in package identity order.",
+                "description": "The local package index refused one package, so none of its declarations answers.\nRides only an answer whose `scope` reaches packages; at most\n`DEPENDENCY_WARNINGS_MAX` of this warning and `package_context_degraded` together\nride one answer, this one first, in package identity order.",
                 "properties": {
                   "code": {
-                    "const": "dependency_package_skipped",
+                    "const": "package_skipped",
                     "type": "string"
                   },
                   "package": {
@@ -4304,10 +4322,10 @@
               },
               {
                 "additionalProperties": false,
-                "description": "One dependency resolver answered less than its toolchain would have, so the\ncatalog may miss packages. Rides only an answer whose `scope` reaches\ndependencies; at most `DEPENDENCY_WARNINGS_MAX` of this warning and\n`dependency_package_skipped` together ride one answer, this one after every\nskipped package, in resolver order.",
+                "description": "One resolver read less than its manifests and lockfiles state, so the dependency\ncontext may miss packages and the packages it misses answer nothing. Rides only an\nanswer whose `scope` reaches packages; at most `DEPENDENCY_WARNINGS_MAX` of this\nwarning and `package_skipped` together ride one answer, this one after every\nskipped package, in resolver order.",
                 "properties": {
                   "code": {
-                    "const": "dependency_resolver_degraded",
+                    "const": "package_context_degraded",
                     "type": "string"
                   },
                   "reason": {

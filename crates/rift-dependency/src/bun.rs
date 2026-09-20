@@ -1,5 +1,7 @@
 //! The Bun resolver: npm packages as `bun.lock` pins them and `node_modules` holds them.
 
+mod context;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::str::Split;
@@ -9,11 +11,17 @@ use serde::Deserialize;
 use serde_json_lenient::Value;
 
 use crate::catalog::{CatalogEntry, Resolution};
+use crate::context::ContextAnswer;
 use crate::manifest::{
-    LockfileFailure, ResolutionBuilder, file_beside, manifest_directory_path, read_lockfile,
+    ResolutionBuilder, StaticFileFailure, file_beside, manifest_directory_path, read_static_file,
 };
-use crate::node::{self, NODE_MODULES_DIRECTORY_NAME, TYPESCRIPT_PACKAGE_NAME};
-use crate::resolver::{DependencyResolver, Inspector, ResolutionRequest, ResolverName};
+use crate::node::{
+    self, ALIAS_VERSION_PREFIX, NODE_MODULES_DIRECTORY_NAME, SCOPE_PREFIX, TYPESCRIPT_PACKAGE_NAME,
+    split_reference,
+};
+use crate::resolver::{
+    ContextRequest, DependencyResolver, Inspector, ResolutionRequest, ResolverName, StaticInputs,
+};
 
 /// The lockfile Bun keeps beside a workspace root manifest.
 const BUN_LOCK_FILE_NAME: &str = "bun.lock";
@@ -22,12 +30,6 @@ const BUN_LOCK_FILE_NAME: &str = "bun.lock";
 const LOCKFILE_VERSION_MAX: u64 = 1;
 /// The version prefix naming one of the workspace's own packages, never cataloged.
 const WORKSPACE_VERSION_PREFIX: &str = "workspace:";
-/// The version prefix of an alias: the real `<name>@<version>` follows it.
-const ALIAS_VERSION_PREFIX: &str = "npm:";
-/// The character opening a scoped package name, `@scope/name`.
-const SCOPE_PREFIX: char = '@';
-/// The character between a package name and its version in a lockfile reference.
-const NAME_VERSION_SEPARATOR: char = '@';
 /// The character between parent and child in a nested `packages` key, and between a
 /// scope and its name.
 const NESTING_SEPARATOR: char = '/';
@@ -92,6 +94,14 @@ impl DependencyResolver for BunResolver {
         }
         answer.build()
     }
+
+    fn context(
+        &self,
+        request: &ContextRequest<'_>,
+        inputs: &mut dyn StaticInputs,
+    ) -> ContextAnswer {
+        context::bun_context(request, inputs)
+    }
 }
 
 /// Catalogs the packages of the `bun.lock` beside one manifest; silent when none stands there.
@@ -102,7 +112,7 @@ fn resolve_manifest(
     answer: &mut ResolutionBuilder,
 ) {
     let directory = manifest_directory_path(root, manifest);
-    let observed = match read_lockfile(&directory, BUN_LOCK_FILE_NAME, inspector) {
+    let observed = match read_static_file(&directory, BUN_LOCK_FILE_NAME, inspector) {
         Err(failure) if failure.is_absent() => return,
         observed => observed,
     };
@@ -121,9 +131,9 @@ fn resolve_manifest(
 /// The document is read into a [`Value`] first. The lenient reader accepts a trailing comma
 /// only through a map or sequence visitor, and a field this resolver does not declare, such
 /// as `overrides`, is otherwise skipped by a reader that refuses the comma before its `}`.
-fn parse_lockfile(bytes: &[u8]) -> Result<BunLock, LockfileFailure> {
+fn parse_lockfile(bytes: &[u8]) -> Result<BunLock, StaticFileFailure> {
     let unparsable = |error: serde_json_lenient::Error| {
-        LockfileFailure::unparsable(BUN_LOCK_FILE_NAME, error.to_string())
+        StaticFileFailure::unparsable(BUN_LOCK_FILE_NAME, error.to_string())
     };
     let document: Value = serde_json_lenient::from_slice(bytes).map_err(unparsable)?;
     serde_json_lenient::from_value(document).map_err(unparsable)
@@ -239,21 +249,6 @@ fn pinned<'a>(spelled: &'a str, version: &'a str) -> Pin<'a> {
         },
         None => Pin::Malformed,
     }
-}
-
-/// Splits `<name>@<version>` at the first `@` past a scope's own.
-///
-/// A name carries no `@` but the scope's, so `@types/react@19.2.18` names `@types/react`,
-/// and a version spelled as a URL keeps every `@` it carries. Absent when either side
-/// is empty.
-fn split_reference(reference: &str) -> Option<(&str, &str)> {
-    let scope_bytes = usize::from(reference.starts_with(SCOPE_PREFIX));
-    let separator = reference[scope_bytes..].find(NAME_VERSION_SEPARATOR)? + scope_bytes;
-    let name = &reference[..separator];
-    let version = &reference[separator + NAME_VERSION_SEPARATOR.len_utf8()..];
-    let name_present = !name.is_empty();
-    let version_present = !version.is_empty();
-    (name_present && version_present).then_some((name, version))
 }
 
 /// Catalogs every package one parsed lockfile pins, rooted in the `node_modules` beside

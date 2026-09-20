@@ -1076,10 +1076,10 @@ mod tests {
     /// The dependency index serves the current tree alone, so a scope past
     /// `project` refuses beside a comparison of two committed revisions.
     #[test]
-    fn change_beside_a_scope_past_project_refuses_as_an_invalid_request() -> TestResult {
+    fn change_beside_a_scope_past_local_refuses_as_an_invalid_request() -> TestResult {
         let fixture = Fixture::baseline(&[("src/lib.rs", "pub fn kept() {}\n")])?;
 
-        for scope in ["dependencies", "all"] {
+        for scope in ["global", "all"] {
             let error = fixture
                 .search(&json!({"change": {"base": "baseline"}, "scope": scope}))
                 .expect_err("change beside a wider scope must refuse");
@@ -1090,7 +1090,7 @@ mod tests {
             assert!(
                 error
                     .to_string()
-                    .contains("dependencies are served for the current tree alone"),
+                    .contains("package facts are served for the current tree alone"),
                 "{error}"
             );
         }

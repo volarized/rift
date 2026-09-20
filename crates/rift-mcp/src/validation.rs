@@ -30,7 +30,7 @@ use rift_protocol::map::WorkspaceMap;
 use rift_protocol::source::SourceConfiguration;
 use rift_search::{Embedding, SearchError, SearchIndex, SemanticReadiness};
 use rift_server::{
-    CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, DependencyStore, LspProcessKey, ReadError,
+    CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, LspProcessKey, PackageBranch, ReadError,
     ReadFault, ReadService, load_configuration,
 };
 use rmcp::ErrorData;
@@ -42,7 +42,6 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
-use crate::dependency::{DependencyLane, DependencyPlan};
 use crate::failure::WireFailure;
 use crate::server::BlockingExecutor;
 
@@ -211,9 +210,6 @@ pub(crate) struct PublishedWorkspace {
     /// Workspace orientation snapshot served by `rift://map`, computed once for this
     /// publication and reused until the next one - a read costs a lookup, never a rebuild.
     pub(crate) map: Arc<WorkspaceMap>,
-    /// What the accepted `[dependencies]` table asks of the dependency index, compiled
-    /// once beside `reads` and handed to the dependency lane with the catalog.
-    pub(crate) dependency_plan: DependencyPlan,
     pub(crate) epoch: u64,
 }
 
@@ -230,7 +226,6 @@ impl PublishedWorkspace {
             fingerprint: self.fingerprint.clone(),
             source_policy: Arc::clone(&self.source_policy),
             map: Arc::clone(&self.map),
-            dependency_plan: self.dependency_plan.clone(),
             epoch,
         }
     }
@@ -331,10 +326,8 @@ pub(crate) struct IndexSupervisorContext {
     /// exactly when the population lane is: with no index open there is no store to
     /// commit to, and `search` reports the tier unavailable for the life of this server.
     pub(crate) lexical: Option<LexicalLane>,
-    /// The dependency index every candidate's read service answers from.
-    pub(crate) dependencies: Arc<DependencyStore>,
-    /// The dependency lane, handed each published catalog.
-    pub(crate) dependency_lane: DependencyLane,
+    /// The package branch every candidate's read service answers a package read from.
+    pub(crate) dependencies: Arc<PackageBranch>,
 }
 
 /// The last acceptance of the workspace's `rift.toml`, kept with the file
@@ -1119,7 +1112,7 @@ pub(crate) async fn initial_workspace(
     limits: WorkspaceIndexLimits,
     validation: &IndexValidation,
     blocking: &BlockingExecutor,
-    dependencies: &Arc<DependencyStore>,
+    dependencies: &Arc<PackageBranch>,
 ) -> Result<(Arc<PublishedWorkspace>, LexicalWrite), ReadError> {
     let capture = workspace_capture(dependencies);
     initial_workspace_with(root, limits, validation, blocking, capture).await
@@ -1139,7 +1132,7 @@ impl<Capture> CaptureWorkspace for Capture where
 
 /// The capture production runs: the whole-workspace scan over the dependency index.
 pub(crate) fn workspace_capture(
-    dependencies: &Arc<DependencyStore>,
+    dependencies: &Arc<PackageBranch>,
 ) -> impl CaptureWorkspace + Clone + Send + 'static {
     let dependencies = Arc::clone(dependencies);
     move |root: &Path, limits: WorkspaceIndexLimits, request: &RebuildRequest| {
@@ -1326,12 +1319,12 @@ pub(crate) enum WorkspaceCandidate {
 /// against; a full request scans the workspace. Either way the acceptance is verified
 /// against `rift.toml` after the read, so a candidate built under configuration that moved
 /// underneath it is reported as changed rather than published. Either way the candidate's
-/// read service answers dependency-scoped lookups from `dependencies`.
+/// read service answers a `global` or `all` lookup from `dependencies`, the package branch.
 pub(crate) fn build_workspace_candidate(
     root: &Path,
     limits: WorkspaceIndexLimits,
     request: &RebuildRequest,
-    dependencies: &Arc<DependencyStore>,
+    dependencies: &Arc<PackageBranch>,
 ) -> Result<WorkspaceCandidate, ReadError> {
     tracing::debug!(
         component = "index",
@@ -1388,14 +1381,13 @@ fn whole_workspace_candidate(
     limits: WorkspaceIndexLimits,
     configuration: ConfigurationState,
     epoch: u64,
-    dependencies: &Arc<DependencyStore>,
+    dependencies: &Arc<PackageBranch>,
 ) -> Result<PublishedWorkspace, ReadError> {
     let visibility = configuration.source_visibility();
     let limits = configuration.index_limits(limits)?;
     let text_inclusion = configuration.text_inclusion();
     let languages = configuration.language_file_selections();
     let dependencies_configuration = configuration.dependencies_configuration();
-    let dependency_plan = DependencyPlan::compile(&dependencies_configuration)?;
     let reads = ReadService::build_with_languages(
         root,
         limits,
@@ -1405,7 +1397,7 @@ fn whole_workspace_candidate(
         configuration.history_configuration(),
         dependencies_configuration,
     )?
-    .with_dependencies(Arc::clone(dependencies));
+    .with_packages(Arc::clone(dependencies));
     let source_policy = reads.source_policy_handle().unwrap_or_else(|| {
         unreachable!("a current-tree read service always compiles its source policy")
     });
@@ -1416,7 +1408,6 @@ fn whole_workspace_candidate(
         configuration,
         source_policy,
         map,
-        dependency_plan,
         epoch,
     })
 }
@@ -1444,7 +1435,6 @@ fn shared_workspace_candidate(
         configuration,
         source_policy: Arc::clone(&previous.source_policy),
         map,
-        dependency_plan: previous.dependency_plan.clone(),
         epoch,
     })
 }
@@ -2311,7 +2301,6 @@ pub(crate) async fn run_index_supervisor_with(
         match result {
             Ok(RebuildOutcome::Published) => {
                 let (current, _) = published.read().await.snapshot();
-                context.dependency_lane.request_for(&current);
                 if let Some(lane) = population.as_ref() {
                     lane.request(current);
                 }
@@ -3001,7 +2990,15 @@ impl ConfigurationState {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    /// A package branch holding nothing, for a test that publishes a workspace without
+    /// asking for a package read.
+    pub(crate) fn empty_package_branch() -> std::sync::Arc<rift_server::PackageBranch> {
+        std::sync::Arc::new(rift_server::PackageBranch::new(
+            rift_index::DependencyIndexLimits::default(),
+        ))
+    }
+
     use super::ConfigurationState;
     use rift_core::SourceVisibility;
     use rift_server::LspProcessKey;
@@ -3086,7 +3083,6 @@ mod tests {
         build_workspace_candidate, commit_deadline, publish_rebuild, publish_rebuild_after,
         record_rebuild_failure,
     };
-    use crate::dependency::{DependencyLane, empty_dependency_store};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -3103,7 +3099,7 @@ mod tests {
             root,
             limits,
             &RebuildRequest::initial(epoch),
-            &empty_dependency_store(),
+            &empty_package_branch(),
         )? {
             WorkspaceCandidate::Stable { published, .. } => Ok(published),
             WorkspaceCandidate::ConfigurationChanged => {
@@ -3720,7 +3716,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &super::RebuildRequest::initial(0),
-            &empty_dependency_store(),
+            &empty_package_branch(),
         )?;
         let WorkspaceCandidate::Stable { published, .. } = candidate else {
             return Err("the fixture capture must be stable".into());
@@ -3983,7 +3979,7 @@ mod tests {
             &state,
             &validation,
             request,
-            super::workspace_capture(&empty_dependency_store()),
+            super::workspace_capture(&empty_package_branch()),
         )?;
         assert!(matches!(outcome, super::CapturedRebuild::Superseded));
 
@@ -4013,7 +4009,7 @@ mod tests {
         };
 
         let limits = WorkspaceIndexLimits::default();
-        let store = empty_dependency_store();
+        let store = empty_package_branch();
         let WorkspaceCandidate::Stable {
             published: candidate,
             ..
@@ -4046,7 +4042,7 @@ mod tests {
         };
 
         let limits = WorkspaceIndexLimits::default();
-        let store = empty_dependency_store();
+        let store = empty_package_branch();
         let WorkspaceCandidate::Stable {
             published: candidate,
             ..
@@ -4087,7 +4083,7 @@ mod tests {
                 directory.path(),
                 WorkspaceIndexLimits::default(),
                 &request,
-                &empty_dependency_store(),
+                &empty_package_branch(),
             )?
             else {
                 return Err("a stable configuration change must build a candidate".into());
@@ -4135,7 +4131,7 @@ mod tests {
                 directory.path(),
                 WorkspaceIndexLimits::default(),
                 &request,
-                &empty_dependency_store(),
+                &empty_package_branch(),
             )?
             else {
                 return Err("a stable configuration change must build a candidate".into());
@@ -4274,7 +4270,7 @@ mod tests {
             &state,
             &validation,
             RebuildRequest::initial(7),
-            super::workspace_capture(&empty_dependency_store()),
+            super::workspace_capture(&empty_package_branch()),
         )?;
         assert!(matches!(outcome, super::CapturedRebuild::Superseded));
         assert!(
@@ -4331,7 +4327,7 @@ mod tests {
             .map_err(|error| format!("watcher must start: {error:?}"))?;
         let blocking = crate::server::BlockingExecutor::isolated(1, 60_000);
         blocking.operations.close();
-        let dependencies = empty_dependency_store();
+        let dependencies = empty_package_branch();
         let supervisor = tokio::spawn(super::run_index_supervisor(
             watcher,
             invalidations,
@@ -4345,7 +4341,6 @@ mod tests {
                 population: None,
                 lexical: None,
                 dependencies: Arc::clone(&dependencies),
-                dependency_lane: DependencyLane::spawn_isolated(&dependencies),
             },
         ));
         let notified = validation.changed.notified();
@@ -4393,7 +4388,7 @@ mod tests {
         }));
         let watcher = super::workspace_watcher(directory.path(), &validation)
             .map_err(|error| format!("watcher must start: {error:?}"))?;
-        let dependencies = empty_dependency_store();
+        let dependencies = empty_package_branch();
         let supervisor = tokio::spawn(super::run_index_supervisor(
             watcher,
             invalidations,
@@ -4407,7 +4402,6 @@ mod tests {
                 population: None,
                 lexical: None,
                 dependencies: Arc::clone(&dependencies),
-                dependency_lane: DependencyLane::spawn_isolated(&dependencies),
             },
         ));
         let notified = validation.changed.notified();
@@ -4454,7 +4448,7 @@ mod tests {
                 // Every capture observes one more filesystem event, so no attempt ever
                 // sees a stable epoch, and none of those events changes a byte.
                 moving.observe_whole_workspace()?;
-                super::build_workspace_candidate(root, limits, request, &empty_dependency_store())
+                super::build_workspace_candidate(root, limits, request, &empty_package_branch())
             },
         )
         .await?;
@@ -4501,7 +4495,7 @@ mod tests {
                     root,
                     limits,
                     request,
-                    &empty_dependency_store(),
+                    &empty_package_branch(),
                 )?;
                 let mut seen = seen.lock().expect("the fixture lock is clean");
                 if let WorkspaceCandidate::Stable { published, .. } = &candidate {
@@ -4588,7 +4582,7 @@ mod tests {
                     root,
                     limits,
                     request,
-                    &empty_dependency_store(),
+                    &empty_package_branch(),
                 )?;
                 // The next scan reads bytes this one never held.
                 fs::write(
@@ -4712,7 +4706,7 @@ mod tests {
         lexical: Option<LexicalLane>,
     ) -> Result<RebuildOutcome, rift_server::ReadError> {
         let request = validation.take_pending();
-        let dependencies = empty_dependency_store();
+        let dependencies = empty_package_branch();
         let context = super::IndexSupervisorContext {
             root: root.to_path_buf(),
             limits: WorkspaceIndexLimits::default(),
@@ -4723,7 +4717,6 @@ mod tests {
             population: None,
             lexical,
             dependencies: Arc::clone(&dependencies),
-            dependency_lane: DependencyLane::spawn_isolated(&dependencies),
         };
         let capture = super::workspace_capture(&dependencies);
         super::rebuild_workspace(&context, request, capture).await
@@ -5036,7 +5029,7 @@ mod tests {
             previous: Some(Arc::clone(&first)),
         };
         let limits = WorkspaceIndexLimits::default();
-        let store = empty_dependency_store();
+        let store = empty_package_branch();
         let WorkspaceCandidate::Stable {
             published: second,
             change_set,
@@ -6154,7 +6147,7 @@ mod tests {
             .await
             .expect("held placeholder must occupy the one blocking slot");
 
-        let dependencies = empty_dependency_store();
+        let dependencies = empty_package_branch();
         let supervisor = tokio::spawn(super::run_index_supervisor(
             watcher,
             invalidations,
@@ -6168,7 +6161,6 @@ mod tests {
                 population: None,
                 lexical: None,
                 dependencies: Arc::clone(&dependencies),
-                dependency_lane: DependencyLane::spawn_isolated(&dependencies),
             },
         ));
 
@@ -6223,7 +6215,7 @@ mod tests {
         validation: &Arc<IndexValidation>,
         published: &Arc<RwLock<IndexState>>,
         blocking: &BlockingExecutor,
-        dependencies: &Arc<super::DependencyStore>,
+        dependencies: &Arc<super::PackageBranch>,
     ) -> super::IndexSupervisorContext {
         super::IndexSupervisorContext {
             root: root.to_path_buf(),
@@ -6235,7 +6227,6 @@ mod tests {
             population: None,
             lexical: None,
             dependencies: Arc::clone(dependencies),
-            dependency_lane: DependencyLane::spawn_isolated(dependencies),
         }
     }
 
@@ -6245,7 +6236,7 @@ mod tests {
     /// The release is a rendezvous: it succeeds only while the capture still waits in
     /// it, so a successful release proves the capture was blocking at that moment.
     fn held_capture(
-        dependencies: &Arc<super::DependencyStore>,
+        dependencies: &Arc<super::PackageBranch>,
     ) -> (
         impl super::CaptureWorkspace + Clone + Send + 'static,
         tokio::sync::mpsc::UnboundedReceiver<()>,
@@ -6280,7 +6271,7 @@ mod tests {
             failure: None,
         }));
         let blocking = BlockingExecutor::isolated(1, 60_000);
-        let dependencies = empty_dependency_store();
+        let dependencies = empty_package_branch();
         let context = cancellation_context(
             directory.path(),
             &validation,
@@ -6342,7 +6333,7 @@ mod tests {
         let watcher = super::workspace_watcher(directory.path(), &validation)
             .map_err(|error| format!("watcher must start: {error:?}"))?;
         let blocking = BlockingExecutor::isolated(1, 60_000);
-        let dependencies = empty_dependency_store();
+        let dependencies = empty_package_branch();
         let context = cancellation_context(
             directory.path(),
             &validation,
@@ -6435,7 +6426,7 @@ mod tests {
             request,
             move |root, limits, request| {
                 cancelling.cancellation.cancel();
-                build_workspace_candidate(root, limits, request, &empty_dependency_store())
+                build_workspace_candidate(root, limits, request, &empty_package_branch())
             },
         )?;
         assert!(matches!(outcome, super::CapturedRebuild::Cancelled));

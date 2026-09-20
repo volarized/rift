@@ -90,7 +90,7 @@ struct EnclosingDefinitions {
 
 impl EnclosingDefinitions {
     /// Complexity is proportional to the graph's own record and contribution count, both
-    /// already bounded by `[providers.binding]`'s `max_graph_nodes`.
+    /// already bounded by [`PublicationLimits`](rift_provider::PublicationLimits).
     fn build(graph: &NormalizedGraph) -> Self {
         let mut by_unit: BTreeMap<SourceUnitId, Vec<(SourceRange, SymbolId)>> = BTreeMap::new();
         for record in graph.records() {

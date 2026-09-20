@@ -30,9 +30,62 @@
         }
       ]
     },
+    "ConfiguredPackage": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "version"
+              ]
+            },
+            {
+              "required": [
+                "requirement"
+              ]
+            }
+          ]
+        }
+      ],
+      "description": "One package the `[dependencies]` `packages` list names.",
+      "properties": {
+        "manager": {
+          "description": "Package manager or ecosystem name, as `cargo`, `npm`, or `pypi`.",
+          "maxLength": 128,
+          "type": "string"
+        },
+        "name": {
+          "description": "Package name in that ecosystem.",
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "requirement": {
+          "description": "The version requirement this entry declares. Set this or `version`, never both.",
+          "maxLength": 4096,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "description": "The exact version this entry pins. Set this or `requirement`, never both.",
+          "maxLength": 4096,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "manager",
+        "name"
+      ],
+      "type": "object"
+    },
     "DependenciesConfiguration": {
       "additionalProperties": false,
-      "description": "The `[dependencies]` table. The dependency index reads the packages the resolvers\ncatalog; this table turns the index off, selects how the catalog is resolved and\nwhich cataloged packages are indexed, and bounds what the index reads and holds.\n`include` and `exclude` are globs over `<manager>/<name>`: an empty `include` selects\nevery cataloged package, and an `exclude` match drops a package `include` selected.",
+      "description": "The `[dependencies]` table. It states how the catalog is resolved, which packages\nthe operator names beside the ones the workspace's manifests and lockfiles state,\nand the bounds the package index reads and holds under.",
       "properties": {
         "command_timeout": {
           "$ref": "#/$defs/Duration",
@@ -42,29 +95,6 @@
             "max": "1h",
             "min": "1s"
           }
-        },
-        "enabled": {
-          "default": true,
-          "description": "Whether the dependency index runs. `false` keeps the catalog resolved for\n`rift://map` and refuses a `scope` beyond `project` as `capability_unavailable`.",
-          "type": "boolean"
-        },
-        "exclude": {
-          "default": [],
-          "description": "Globs over `<manager>/<name>` dropped from indexing. A match here is dropped\neven when `include` also matches it.",
-          "items": {
-            "$ref": "#/$defs/PackageNamePattern"
-          },
-          "maxItems": 64,
-          "type": "array"
-        },
-        "include": {
-          "default": [],
-          "description": "Globs over `<manager>/<name>` a cataloged package must match to be indexed.\nEmpty selects every cataloged package.",
-          "items": {
-            "$ref": "#/$defs/PackageNamePattern"
-          },
-          "maxItems": 64,
-          "type": "array"
         },
         "index_size": {
           "$ref": "#/$defs/ByteSize",
@@ -91,6 +121,15 @@
             "max": "1gb",
             "min": "64kb"
           }
+        },
+        "packages": {
+          "default": [],
+          "description": "Packages carried beside the ones the workspace's manifests and lockfiles state.\nEach entry names exactly one of `version` and `requirement`.",
+          "items": {
+            "$ref": "#/$defs/ConfiguredPackage"
+          },
+          "maxItems": 20000,
+          "type": "array"
         },
         "resolution": {
           "$ref": "#/$defs/DependencyResolution",
@@ -416,16 +455,6 @@
         }
       },
       "type": "object"
-    },
-    "PackageNamePattern": {
-      "description": "One glob over a package's `<manager>/<name>`, such as `cargo/tokio`, `npm/@types/*`,\nor `stdlib/*`. Forward-slash separated and at most 256 bytes; `*` never crosses `/`\nand `**` does.",
-      "examples": [
-        "npm/@types/*"
-      ],
-      "maxLength": 256,
-      "minLength": 1,
-      "pattern": "^(?!/)(?!\\.\\.?(/|$))(?!.*(/\\.\\.?)(/|$))[^\\\\\\u0000-\\u001F\\u007F]+$",
-      "type": "string"
     },
     "PathPattern": {
       "description": "Project-relative glob using *, ?, **, and character classes. Forward-slash separated on\nevery platform, whatever separator the host OS uses natively.",
@@ -871,12 +900,10 @@
       "$ref": "#/$defs/DependenciesConfiguration",
       "default": {
         "command_timeout": "2m",
-        "enabled": true,
-        "exclude": [],
-        "include": [],
         "index_size": "256mb",
         "package_files": 2000,
         "package_size": "4mb",
+        "packages": [],
         "resolution": "auto"
       },
       "description": "Whether the dependency index runs, how the catalog is resolved, which\ncataloged packages it indexes, and the bounds it indexes under."

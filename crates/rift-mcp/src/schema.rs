@@ -40,6 +40,11 @@ const SCHEMA_DOCUMENT_PATH: &str = "public/mcp.json";
 /// site's own origin rather than the repository host.
 const CONFIGURATION_SCHEMA_PATH: &str = "public/rift.schema.json";
 
+/// Path of the exported package publication schema below the output
+/// directory. A consumer of a package index validates a publication against
+/// it, so it is served from the site's own origin like the other schemas.
+const PACKAGE_INDEX_SCHEMA_PATH: &str = "public/package-index.schema.json";
+
 /// Directory the plugin export lands in when no second argument names one:
 /// the repository's Claude Code plugin, listed by the marketplace manifest
 /// at `.claude-plugin/marketplace.json`.
@@ -55,10 +60,13 @@ const PLUGIN_SKILL_PATH: &str = "skills/rift/SKILL.md";
 const PLUGIN_TOOLS_PATH: &str = "skills/rift/references/tools.md";
 
 /// Usage line appended to argument errors.
-const USAGE: &str = "usage: rift-schema-export [--check] [OUTPUT_DIR] [PLUGIN_DIR]";
+const USAGE: &str =
+    "usage: rift-schema-export [--check] [--analyzer-manifest] [OUTPUT_DIR] [PLUGIN_DIR]";
 
-/// Command to run when the committed document is out of date.
-const REGENERATE_COMMAND: &str = "cargo run -p rift-mcp --bin rift-schema-export";
+/// Recipe to run when a generated document is out of date. It runs every
+/// exporter invocation, so one command covers the docs artifacts, the plugin
+/// skill, and the analyzer manifest.
+const REGENERATE_COMMAND: &str = "just generate";
 
 /// Renders the document the docs site publishes: one entry per served tool
 /// with its name, description, input schema, and output schema, sorted by
@@ -104,6 +112,22 @@ pub fn tool_listing() -> Vec<rmcp::model::Tool> {
     RiftMcp::tool_router().list_all()
 }
 
+/// Renders the JSON Schema of one package publication, derived from
+/// [`PackagePublication`](rift_protocol::index::PackagePublication), so a consumer of a
+/// package index can validate a publication before reading it.
+///
+/// Output is pretty-printed, ends with a trailing newline, and is byte-identical across
+/// calls because `serde_json` stores objects as sorted maps.
+#[must_use]
+pub fn package_index_schema_document() -> String {
+    let schema = schemars::schema_for!(rift_protocol::index::PackagePublication);
+    let document = serde_json::to_value(&schema)
+        .unwrap_or_else(|error| unreachable!("schemas serialize to JSON values: {error}"));
+    let mut rendered = format!("{document:#}");
+    rendered.push('\n');
+    rendered
+}
+
 /// Renders the JSON Schema of `rift.toml`, derived from
 /// [`WorkspaceConfiguration`](rift_protocol::configuration::WorkspaceConfiguration),
 /// so an editor can validate the file and refuse unknown keys before the
@@ -139,6 +163,11 @@ pub enum ExportError {
     TemplateToolMissing {
         /// The missing tool's name.
         name: &'static str,
+    },
+    /// The analyzer manifest could not be rendered from the repository tree.
+    AnalyzerManifest {
+        /// What the renderer said.
+        source: rift_index::ManifestError,
     },
     /// The document to check against could not be read.
     CheckUnreadable {
@@ -179,6 +208,7 @@ impl fmt::Display for ExportError {
                 "the skill decision table names `{name}` but the served surface does not \
                  carry it; align the table in the skill module with the tool router"
             ),
+            Self::AnalyzerManifest { source } => write!(formatter, "{source}"),
             Self::CheckUnreadable { path, source } => write!(
                 formatter,
                 "cannot read `{path}` to check it: {source}; generate the document first \
@@ -187,7 +217,7 @@ impl fmt::Display for ExportError {
             ),
             Self::CheckMismatch { path } => write!(
                 formatter,
-                "`{path}` does not match the served tool surface; regenerate it with \
+                "`{path}` does not match what this tree derives; regenerate it with \
                  `{REGENERATE_COMMAND}`",
                 path = path.display()
             ),
@@ -205,6 +235,7 @@ impl Error for ExportError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::CheckUnreadable { source, .. } | Self::WriteFailed { source, .. } => Some(source),
+            Self::AnalyzerManifest { source } => Some(source),
             Self::UnknownFlag { .. }
             | Self::ExtraArgument { .. }
             | Self::TemplateToolMissing { .. }
@@ -224,7 +255,9 @@ impl ExportError {
             Self::TemplateToolMissing { .. } => {
                 ErrorName::Cli(rift_core::CliCode::InstallTemplateMissingTool).descriptor()
             }
-            Self::CheckUnreadable { .. } | Self::WriteFailed { .. } => {
+            Self::CheckUnreadable { .. }
+            | Self::WriteFailed { .. }
+            | Self::AnalyzerManifest { .. } => {
                 ErrorName::Wire(ErrorCode::StorageFailure).descriptor()
             }
             Self::CheckMismatch { .. } => {
@@ -234,15 +267,29 @@ impl ExportError {
     }
 }
 
+/// What one invocation generates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExportTarget {
+    /// The served schemas and the plugin's generated files, below the output and plugin
+    /// directories.
+    Documents,
+    /// The analyzer manifest, read from and written below the repository root the first
+    /// positional argument names.
+    AnalyzerManifest,
+}
+
 /// One parsed export invocation.
 #[derive(Debug)]
 pub struct ExportRequest {
     /// Compare the existing document instead of writing it.
     check: bool,
-    /// Directory holding the schema document.
+    /// Directory holding the schema document, or the repository root under
+    /// [`ExportTarget::AnalyzerManifest`].
     output_dir: PathBuf,
     /// Directory holding the Claude Code plugin's generated files.
     plugin_dir: PathBuf,
+    /// What this invocation generates.
+    target: ExportTarget,
 }
 
 /// Parses `rift-schema-export` arguments, without the program name.
@@ -255,11 +302,14 @@ where
     Arguments: IntoIterator<Item = String>,
 {
     let mut check = false;
+    let mut target = ExportTarget::Documents;
     let mut output_dir: Option<PathBuf> = None;
     let mut plugin_dir: Option<PathBuf> = None;
     for argument in arguments {
         if argument == "--check" {
             check = true;
+        } else if argument == "--analyzer-manifest" {
+            target = ExportTarget::AnalyzerManifest;
         } else if argument.starts_with('-') {
             return Err(ExportError::UnknownFlag { argument });
         } else if output_dir.is_none() {
@@ -274,6 +324,7 @@ where
         check,
         output_dir: output_dir.unwrap_or_else(|| PathBuf::from(OUTPUT_DIR_DEFAULT)),
         plugin_dir: plugin_dir.unwrap_or_else(|| PathBuf::from(PLUGIN_DIR_DEFAULT)),
+        target,
     })
 }
 
@@ -286,6 +337,9 @@ where
 /// surface lacks, or a document cannot be read, differs, or cannot be
 /// written.
 pub fn run(request: &ExportRequest) -> Result<(), ExportError> {
+    if request.target == ExportTarget::AnalyzerManifest {
+        return run_analyzer_manifest(request);
+    }
     let tools = tool_listing();
     let generated = skill::generate(&tools, SkillForm::Plugin)
         .map_err(|missing| ExportError::TemplateToolMissing { name: missing.name })?;
@@ -297,6 +351,10 @@ pub fn run(request: &ExportRequest) -> Result<(), ExportError> {
         (
             request.output_dir.join(CONFIGURATION_SCHEMA_PATH),
             configuration_schema_document(),
+        ),
+        (
+            request.output_dir.join(PACKAGE_INDEX_SCHEMA_PATH),
+            package_index_schema_document(),
         ),
         (
             request.plugin_dir.join(PLUGIN_MANIFEST_PATH),
@@ -331,6 +389,33 @@ pub fn run(request: &ExportRequest) -> Result<(), ExportError> {
         })?;
         println!("wrote {}", document_path.display());
     }
+    Ok(())
+}
+
+/// Writes the analyzer manifest below the named repository root, or with `--check`
+/// proves the committed copy matches what the tree derives.
+///
+/// The manifest names the analysis a package publication was produced under, so a change
+/// to a shipped grammar or to the extraction, normalization, identity, or document-builder
+/// source must land beside a regenerated manifest.
+///
+/// # Errors
+///
+/// Returns [`ExportError`] when an input cannot be read, or when the committed manifest
+/// differs or cannot be written.
+fn run_analyzer_manifest(request: &ExportRequest) -> Result<(), ExportError> {
+    let root = request.output_dir.as_path();
+    let document = rift_index::render_analyzer_manifest(root)
+        .map_err(|source| ExportError::AnalyzerManifest { source })?;
+    let document_path = root.join(rift_index::analyzer_manifest_path());
+    if request.check {
+        return check_document(&document_path, &document);
+    }
+    fs::write(&document_path, &document).map_err(|source| ExportError::WriteFailed {
+        path: document_path.clone(),
+        source,
+    })?;
+    println!("wrote {}", document_path.display());
     Ok(())
 }
 

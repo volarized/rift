@@ -4,9 +4,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::read::{
-    Digest, ExactKind, Language, PackageIdentity, Pagination, ProjectPath, SymbolId,
-};
+use crate::dependencies::PackageContextEntry;
+use crate::read::{Digest, ExactKind, Language, Pagination, ProjectPath, SymbolId};
 use crate::schema;
 
 /// Directory depth a [`MapModule`] tree carries, at most. A directory deeper than this folds
@@ -26,9 +25,8 @@ pub const MAP_MODULE_RELATIONSHIPS_MAX: usize = 100;
 
 /// Workspace orientation snapshot served by `rift://map`. Carries per-language totals, the
 /// directory tree indexed files sit under, the most-referenced symbols, entry points,
-/// documentation paths, and the packages the workspace's manifests declare directly.
-/// Computed once when the index publishes and served from cache until
-/// the next publication.
+/// documentation paths, and the packages the workspace depends on. Computed once when the
+/// index publishes and served from cache until the next publication.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::declare_workspace_map_empty_defaults)]
@@ -66,13 +64,14 @@ pub struct WorkspaceMap {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 100))]
     pub module_relationships: Vec<MapModuleRelationship>,
-    /// Packages the workspace's manifests declare directly, as their package managers
-    /// resolved them, in `manager`, `name`, `version` order. A transitive dependency is
-    /// cataloged but not listed here. At most [`MAP_PACKAGES_MAX`] entries; a workspace
-    /// declaring more lists the first in that order. Absent when empty.
+    /// Packages the workspace depends on, as its manifests and lockfiles state them, in
+    /// `manager`, `name`, then selector order. Each entry carries the exact version a
+    /// lockfile pins or the requirement a manifest declares, so a manifest-only project
+    /// lists no resolved version. At most [`MAP_PACKAGES_MAX`] entries; a workspace
+    /// depending on more lists the first in that order. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 1_000))]
-    pub packages: Vec<PackageIdentity>,
+    pub packages: Vec<PackageContextEntry>,
     /// Always the whole map on one page.
     pub pagination: Pagination,
 }
@@ -144,6 +143,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::dependencies::PackageAvailability;
     use crate::workspace::{WORKSPACE_LANGUAGE_SUMMARIES_MAX, WORKSPACE_SOURCE_UNITS_MAX};
 
     fn map() -> WorkspaceMap {
@@ -184,10 +184,12 @@ mod tests {
                 to: ProjectPath("crates/rift-protocol".to_owned()),
                 references: 87,
             }],
-            packages: vec![PackageIdentity {
+            packages: vec![PackageContextEntry {
                 manager: "cargo".to_owned(),
                 name: "tokio".to_owned(),
-                version: "1.53.1".to_owned(),
+                version: Some("1.53.1".to_owned()),
+                requirement: None,
+                availability: PackageAvailability::Canonical,
             }],
             pagination: Pagination {
                 page_index: 0,
@@ -225,6 +227,16 @@ mod tests {
                 "to": "crates/rift-protocol",
                 "references": 87
             })
+        );
+        assert_eq!(
+            value["packages"][0],
+            json!({
+                "manager": "cargo",
+                "name": "tokio",
+                "version": "1.53.1",
+                "availability": "canonical"
+            }),
+            "a pinned entry omits the requirement it does not state"
         );
         assert_eq!(value["pagination"]["total_pages"], json!(1));
     }

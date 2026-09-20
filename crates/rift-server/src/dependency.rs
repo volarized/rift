@@ -6,10 +6,12 @@ use std::process::Command;
 use std::time::Duration;
 
 use rift_dependency::{
-    CommandFailure, CommandOutput, DependencyCatalog, FileObservation, Inspector,
-    TOOLCHAIN_OUTPUT_BYTES_MAX, ToolchainCommand,
+    CommandFailure, CommandOutput, DependencyCatalog, DependencyContext, FileObservation,
+    Inspector, StaticInputs, TOOLCHAIN_OUTPUT_BYTES_MAX, ToolchainCommand,
 };
-use rift_protocol::dependencies::{DependenciesConfiguration, DependencyResolution};
+use rift_protocol::dependencies::{
+    ConfiguredPackage, DependenciesConfiguration, DependencyResolution,
+};
 use rift_protocol::read::ProjectPath;
 
 use crate::process::{BoundedRun, run_bounded};
@@ -56,7 +58,7 @@ impl FilesystemInspector {
     }
 }
 
-impl Inspector for FilesystemInspector {
+impl StaticInputs for FilesystemInspector {
     /// The regular file at `path` when it fits `bytes_max`. A larger file
     /// answers its size, and anything else answers absent.
     fn read_file(&mut self, path: &Path, bytes_max: u64) -> FileObservation {
@@ -69,7 +71,9 @@ impl Inspector for FilesystemInspector {
             Err(_) => FileObservation::Absent,
         }
     }
+}
 
+impl Inspector for FilesystemInspector {
     fn directory_exists(&mut self, path: &Path) -> bool {
         fs::metadata(path).is_ok_and(|metadata| metadata.is_dir())
     }
@@ -210,6 +214,45 @@ pub(crate) fn resolve_workspace_catalog(
         );
     }
     catalog
+}
+
+/// Reads the static dependency context of one workspace through the shipped resolvers.
+///
+/// The pass reads manifests and lockfiles alone: the inspector reaches it as a
+/// [`StaticInputs`], which offers a file read and nothing else, so no toolchain runs and
+/// no package cache is inspected whatever the `[dependencies]` table says. The span
+/// records the entry count and whether an input went unread, and each degradation is
+/// logged once as a warning.
+pub(crate) fn read_workspace_context(
+    root: &Path,
+    visible: &[ProjectPath],
+    configured: &[ConfiguredPackage],
+) -> DependencyContext {
+    let span = tracing::info_span!(
+        "dependency.context",
+        component = "dependency",
+        entries = tracing::field::Empty,
+        degraded = tracing::field::Empty,
+    );
+    let _entered = span.enter();
+    let context = rift_dependency::resolve_context(
+        root,
+        visible,
+        rift_dependency::resolvers(),
+        &mut FilesystemInspector::new(ResolutionPolicy::default()),
+        configured,
+    );
+    span.record("entries", context.entries().len());
+    span.record("degraded", context.is_degraded());
+    for degradation in context.degradations() {
+        tracing::warn!(
+            component = "dependency",
+            resolver = %degradation.resolver,
+            reason = %degradation.reason,
+            "dependency context degraded"
+        );
+    }
+    context
 }
 
 #[cfg(all(test, unix))]

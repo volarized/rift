@@ -1,43 +1,33 @@
-//! One cataloged package's declarations, parsed with the shipped providers and assembled.
+//! The package index: what a caller reads out of one canonical package publication.
+//!
+//! [`PackageAnalyzer`] owns the one extraction pass; this module is the adapter over what
+//! that pass produced. The index keeps the publication as the artifact a consumer stores
+//! and compares, and answers reads from the same pass's parsed material, so no package is
+//! parsed twice.
 
-use std::collections::BTreeSet;
-use std::ffi::OsStr;
 use std::path::Path;
 
-use rift_core::{
-    ContributionOrigin, ErrorContext, ProjectPath, SourceKind, SourceLocation, SourceUnitId,
-    symbol_identity,
-};
-use rift_dependency::{CatalogEntry, PackageLocation};
+use rift_core::{ErrorContext, ProjectPath, SourceUnitId, symbol_identity};
+use rift_dependency::CatalogEntry;
+use rift_protocol::index::PackagePublication;
 use rift_protocol::read::PackageIdentity;
-use rift_syntax::{DocumentPlacement, SyntaxSymbol, registry};
+use rift_syntax::SyntaxSymbol;
 
-use super::failure::{
-    PackageIndexError, PackageIndexFault, PackageIndexViolation, package_segment,
-};
-use super::walk::{PackageFiles, public_qualified_names};
-use crate::semantic::{PlacedDocument, WorkspaceSemantics};
-use crate::workspace::{
-    IndexedFile, ReadableSymbol, SymbolMatch, TextSourceFile, indexed_file_from_catalog,
-    symbol_matches_where,
-};
+use super::analyzer::{AnalyzedFile, PackageAnalysis, PackageAnalyzer};
+use super::failure::{PackageIndexError, PackageIndexFault, PackageIndexViolation};
+use super::walk::PackageFiles;
+use crate::semantic::WorkspaceSemantics;
+use crate::workspace::{IndexedFile, ReadableSymbol, SymbolMatch, symbol_matches_where};
 
-/// One indexed package file, its placement, and the declarations it makes public.
-#[derive(Debug)]
-struct PackageFile {
-    file: IndexedFile,
-    placement: DocumentPlacement,
-    public: BTreeSet<String>,
-}
-
-/// One cataloged package's declarations, parsed and assembled; queries answer the public ones.
+/// One cataloged package's publication, and the reads it answers.
 ///
-/// The assembled graph holds every declaration, so container references stay
-/// whole; the public-declaration rule applies when [`Self::symbols`] answers.
+/// The assembled graph holds every declaration, so container references stay whole; the
+/// export rule applies when [`Self::symbols`] answers.
 #[derive(Debug)]
 pub struct PackageIndex {
     entry: CatalogEntry,
-    files: Vec<PackageFile>,
+    publication: PackagePublication,
+    files: Vec<AnalyzedFile>,
     declaration_count: usize,
     byte_count: u64,
     skipped_binary: usize,
@@ -45,61 +35,52 @@ pub struct PackageIndex {
 }
 
 impl PackageIndex {
-    /// Parses `files` with the shipped providers and assembles the package graph.
-    ///
-    /// Each file is placed under `rift://source/<manager>/<name>@<version>/<path>`
-    /// with the identity path `<manager>/<name>@<version>/<path>`, and its origin
-    /// is the entry's location: a dependency carrying the package identity, or
-    /// the standard library. Name binding does not run for a package.
+    /// Analyzes `files` and keeps what the run produced.
     ///
     /// # Errors
     ///
-    /// Returns [`PackageIndexError`] when the identity cannot spell a resolver
-    /// or unit, when no provider parses a file or its parse fails, or when
-    /// publication or normalization refuses the package graph.
+    /// Returns [`PackageIndexError`] when the identity cannot spell a resolver or unit,
+    /// when no provider parses a file or its parse fails, or when publication or
+    /// normalization refuses the package graph.
     pub fn build(
         entry: &CatalogEntry,
         files: &PackageFiles,
         revision: u64,
     ) -> Result<Self, PackageIndexError> {
-        let package = entry.identity();
-        let byte_count = files.byte_count();
-        let skipped_binary = files.skipped_binary();
-        let mut indexed = Vec::with_capacity(files.file_count());
-        for file in files.files() {
-            let parsed = parsed_file(file, package)?;
-            let placement = placement_of(entry, file.path())?;
-            let public = public_qualified_names(entry.language(), parsed.syntax());
-            indexed.push(PackageFile {
-                file: parsed,
-                placement,
-                public,
-            });
-        }
-        indexed.sort_by(|left, right| left.file.path().cmp(right.file.path()));
-        let placed: Vec<PlacedDocument<'_>> = indexed
-            .iter()
-            .map(|held| PlacedDocument {
-                document: held.file.syntax(),
-                placement: held.placement.clone(),
-            })
-            .collect();
-        let semantics =
-            WorkspaceSemantics::build_placed(&placed, revision, None).map_err(|error| {
-                PackageIndexFault::new(PackageIndexViolation::Provider, package).caused_by(error)
-            })?;
-        let declaration_count = indexed
-            .iter()
-            .map(|held| held.file.syntax().symbols().len())
-            .sum();
-        Ok(Self {
+        let analysis = PackageAnalyzer::analyze(entry, files, revision)?;
+        Ok(Self::from_analysis(
+            entry,
+            analysis,
+            files.byte_count(),
+            files.skipped_binary(),
+        ))
+    }
+
+    /// Holds one analyzer run as a readable package index.
+    #[must_use]
+    pub fn from_analysis(
+        entry: &CatalogEntry,
+        analysis: PackageAnalysis,
+        byte_count: u64,
+        skipped_binary: usize,
+    ) -> Self {
+        let (publication, files, semantics) = analysis.into_parts();
+        let declaration_count = publication.symbols.len();
+        Self {
             entry: entry.clone(),
-            files: indexed,
+            publication,
+            files,
             declaration_count,
             byte_count,
             skipped_binary,
             semantics,
-        })
+        }
+    }
+
+    /// The canonical publication this index was built from.
+    #[must_use]
+    pub const fn publication(&self) -> &PackagePublication {
+        &self.publication
     }
 
     /// The package as its manager identifies it.
@@ -111,7 +92,7 @@ impl PackageIndex {
     /// Every indexed file, in path order.
     #[must_use]
     pub fn files(&self) -> impl ExactSizeIterator<Item = &IndexedFile> {
-        self.files.iter().map(|held| &held.file)
+        self.files.iter().map(AnalyzedFile::file)
     }
 
     /// How many files the index holds.
@@ -141,13 +122,13 @@ impl PackageIndex {
     /// The source unit `file` is filed under; `None` for a file this index does not hold.
     #[must_use]
     pub fn unit_of(&self, file: &IndexedFile) -> Option<&SourceUnitId> {
-        self.held(file.path()).map(|held| held.placement.unit())
+        self.held(file.path()).map(|held| held.placement().unit())
     }
 
-    /// Public declarations matching `query`, ranked as the project index ranks.
+    /// Exported declarations matching `query`, ranked as the project index ranks.
     ///
-    /// The public-declaration rule runs before ranking and truncation, so the
-    /// answer fills `limit` from public declarations alone.
+    /// The export rule runs before ranking and truncation, so the answer fills `limit`
+    /// from public declarations alone.
     #[must_use]
     pub fn symbols(&self, query: &str, limit: usize) -> Vec<SymbolMatch<'_>> {
         symbol_matches_where(self.files(), query, limit, |file, symbol| {
@@ -173,7 +154,7 @@ impl PackageIndex {
         })?;
         let identity = symbol_identity(
             &matched.file.syntax().language().identity_segment(),
-            held.placement.identity_path(),
+            held.placement().identity_path(),
             &matched.symbol.qualified_name,
         );
         ReadableSymbol::assembled_by(&self.semantics, &identity).ok_or_else(|| {
@@ -185,65 +166,16 @@ impl PackageIndex {
         })
     }
 
-    fn held(&self, path: &ProjectPath) -> Option<&PackageFile> {
+    fn held(&self, path: &ProjectPath) -> Option<&AnalyzedFile> {
         self.files
-            .binary_search_by(|held| held.file.path().cmp(path))
+            .binary_search_by(|held| held.file().path().cmp(path))
             .ok()
             .map(|position| &self.files[position])
     }
 
     fn is_public(&self, path: &ProjectPath, symbol: &SyntaxSymbol) -> bool {
         self.held(path)
-            .is_some_and(|held| held.public.contains(&symbol.qualified_name))
-    }
-}
-
-/// One package file parsed by the provider its extension names.
-fn parsed_file(
-    file: &TextSourceFile,
-    package: &PackageIdentity,
-) -> Result<IndexedFile, PackageIndexError> {
-    let context = Path::new(file.path().as_str());
-    let extension = context
-        .extension()
-        .and_then(OsStr::to_str)
-        .unwrap_or_default();
-    let provider = registry::provider_for_extension(extension).ok_or_else(|| {
-        PackageIndexFault::new(PackageIndexViolation::Syntax, package).at(context)
-    })?;
-    indexed_file_from_catalog(file, context, provider).map_err(|error| {
-        PackageIndexFault::new(PackageIndexViolation::Syntax, package)
-            .at(context)
-            .caused_by(error)
-            .into()
-    })
-}
-
-/// The placement of one package file: its unit, identity path, and origin.
-fn placement_of(
-    entry: &CatalogEntry,
-    path: &ProjectPath,
-) -> Result<DocumentPlacement, PackageIndexError> {
-    let package = entry.identity();
-    let identity_fault = || PackageIndexFault::new(PackageIndexViolation::Identity, package);
-    let origin = ContributionOrigin::new(Some(source_location(entry)), SourceKind::Authored)
-        .map_err(|error| identity_fault().caused_by(error))?;
-    let unit = SourceUnitId::for_package(package, path).map_err(|error| {
-        identity_fault()
-            .at(Path::new(path.as_str()))
-            .caused_by(error)
-    })?;
-    let identity_path = format!("{}/{path}", package_segment(package));
-    Ok(DocumentPlacement::new(origin, unit, identity_path))
-}
-
-/// The source location an entry's declarations carry.
-fn source_location(entry: &CatalogEntry) -> SourceLocation {
-    match entry.location() {
-        PackageLocation::Dependency => SourceLocation::Dependency {
-            package: entry.identity().clone(),
-        },
-        PackageLocation::Stdlib => SourceLocation::Stdlib {},
+            .is_some_and(|held| held.is_public(&symbol.qualified_name))
     }
 }
 
@@ -313,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn test_package_index_keeps_an_exported_macro_and_drops_a_bare_one() {
+    fn test_package_index_keeps_a_public_macro_and_drops_a_bare_one() {
         let package = rust_package(
             "macros",
             "#[macro_export]\nmacro_rules! cfg_if { () => {}; }\nmacro_rules! helper { () => {}; }\n",

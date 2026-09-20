@@ -1687,14 +1687,13 @@ pub enum ConfigurationViolation {
         /// The rejected pattern.
         pattern: String,
     },
-    /// A `dependencies.include` or `dependencies.exclude` entry breaks the package name
-    /// pattern contract: it is empty, longer than 256 bytes, absolute, or carries a
-    /// backslash, a control character, or a `.` or `..` segment.
-    PackagePatternInvalid {
-        /// The key's path in the file: `dependencies.include` or `dependencies.exclude`.
+    /// A `dependencies.packages` entry names `version` and `requirement` together, or
+    /// neither, so it states no single version selector.
+    PackageSelectorInvalid {
+        /// The key's path in the file: `dependencies.packages`.
         field: &'static str,
-        /// The rejected pattern.
-        pattern: String,
+        /// The rejected entry, spelled `<manager>/<name>`.
+        package: String,
     },
     /// A `logs.capture` value is not a tracing filter directive.
     LogCaptureInvalid {
@@ -1783,9 +1782,11 @@ impl ConfigurationViolation {
             Self::LspEmbeddedExtras { lsp, field } => {
                 vec![("lsp", lsp.clone()), ("field", (*field).to_owned())]
             }
-            Self::PathPatternInvalid { field, pattern }
-            | Self::PackagePatternInvalid { field, pattern } => {
+            Self::PathPatternInvalid { field, pattern } => {
                 vec![("field", (*field).to_owned()), ("pattern", pattern.clone())]
+            }
+            Self::PackageSelectorInvalid { field, package } => {
+                vec![("field", (*field).to_owned()), ("package", package.clone())]
             }
             Self::LogCaptureInvalid { capture, detail } => vec![
                 ("field", "logs.capture".to_owned()),
@@ -2311,7 +2312,7 @@ mod tests {
         assert!(configuration.source.include.is_empty());
         assert!(configuration.source.exclude.is_empty());
         assert!(configuration.source.respect_gitignore);
-        assert!(configuration.dependencies.enabled);
+        assert!(configuration.dependencies.packages.is_empty());
         assert_eq!(configuration.dependencies.package_files, 2_000);
 
         assert!(configuration.languages.is_empty());
@@ -2335,6 +2336,9 @@ mod tests {
             json!({ "search": { "text": { "unknown": "x" } } }),
             json!({ "source": { "unknown": "x" } }),
             json!({ "dependencies": { "unknown": "x" } }),
+            json!({ "dependencies": { "enabled": true } }),
+            json!({ "dependencies": { "include": ["serde"] } }),
+            json!({ "dependencies": { "exclude": ["serde"] } }),
             json!({ "lsp": { "ty": {
                 "command": "ty", "unknown": 1,
             } } }),
@@ -3782,9 +3786,9 @@ mod tests {
                 field: "x",
                 pattern: text(),
             },
-            ConfigurationViolation::PackagePatternInvalid {
+            ConfigurationViolation::PackageSelectorInvalid {
                 field: "x",
-                pattern: text(),
+                package: text(),
             },
             ConfigurationViolation::LogCaptureInvalid {
                 capture: text(),

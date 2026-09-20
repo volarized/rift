@@ -34,7 +34,7 @@ fn corpus() -> Vec<(&'static str, Value)> {
         // the dependency index carries `unit` in place of `path`.
         (
             "get_symbol",
-            json!({ "name": "helper_beacon", "scope": "dependencies" }),
+            json!({ "name": "helper_beacon", "scope": "global" }),
         ),
         ("get_symbol", json!({ "name": "beacon", "scope": "all" })),
         // The fixture's committed baseline serves the timeline: one
@@ -104,7 +104,7 @@ fn dependency_scope_search_corpus() -> Vec<(&'static str, Value)> {
     vec![
         (
             "search",
-            json!({ "query": "helper_beacon", "scope": "dependencies" }),
+            json!({ "query": "helper_beacon", "scope": "global" }),
         ),
         (
             "search",
@@ -114,7 +114,7 @@ fn dependency_scope_search_corpus() -> Vec<(&'static str, Value)> {
             "search",
             json!({
                 "query": "beacon",
-                "scope": "dependencies",
+                "scope": "global",
                 "target": "file"
             }),
         ),
@@ -293,7 +293,7 @@ fn assert_no_bare_sha256_digest(value: &Value, context: &str) {
 /// other.
 fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
     let context = format!("{name} result");
-    let reaches_dependencies = matches!(request["scope"].as_str(), Some("dependencies" | "all"));
+    let reaches_dependencies = matches!(request["scope"].as_str(), Some("global" | "all"));
     assert_no_bare_sha256_digest(structured, &context);
     assert_source_unit_ids_use_served_resolvers(structured, &context, reaches_dependencies);
     if reaches_dependencies {
@@ -394,20 +394,16 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
     }
 }
 
-/// Every warning on a dependency-scoped answer is one of the dependency warnings, and
-/// none reports the fixture's helper skipped.
+/// Every warning on a package-scoped answer is one of the package warnings, and none
+/// reports the fixture's helper skipped.
 fn assert_dependency_warnings_only(structured: &Value) {
     for warning in structured["warnings"].as_array().into_iter().flatten() {
         assert!(
             matches!(
                 warning["code"].as_str(),
-                Some(
-                    "dependency_index_pending"
-                        | "dependency_package_skipped"
-                        | "dependency_resolver_degraded"
-                )
+                Some("global_index_unavailable" | "package_skipped" | "package_context_degraded")
             ),
-            "a dependency-scoped answer warns of the dependency index alone: {warning:#}"
+            "a package-scoped answer warns of the package branch alone: {warning:#}"
         );
         assert_ne!(
             warning["package"]["name"],
@@ -745,7 +741,7 @@ const INDEX_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 async fn helper_indexed(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
 ) -> TestResult {
-    let request = json!({ "name": "helper_beacon", "scope": "dependencies" });
+    let request = json!({ "name": "helper_beacon", "scope": "global" });
     for _attempt in 0..INDEX_ATTEMPTS_MAX {
         let result = call_tool_retrying_acceptance(
             client,

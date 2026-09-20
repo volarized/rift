@@ -1,12 +1,12 @@
 //! What every lockfile-driven resolver shares about manifests and answers.
 //!
 //! A resolver receives its manifests as project paths. From each it derives the
-//! directory the manifest stands in, the lockfile beside it, and whether a listed
-//! manifest in an ancestor directory covers it; reads that lockfile within
-//! [`LOCKFILE_BYTES_MAX`]; and assembles its answer through a [`ResolutionBuilder`]
-//! that stops at [`PACKAGES_MAX`]. The lockfile's model and parse step stay with the
-//! resolver that owns the format: each maps its parser's error to
-//! [`LockfileFailure::unparsable`].
+//! directory the manifest stands in, the files beside it, and whether a listed
+//! manifest in an ancestor directory covers it; reads each of those files within
+//! [`LOCKFILE_BYTES_MAX`]; and assembles its catalog answer through a
+//! [`ResolutionBuilder`] that stops at [`PACKAGES_MAX`]. Each format's model and parse
+//! step stay with the resolver that owns the format: each maps its parser's error to
+//! [`StaticFileFailure::unparsable`].
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use rift_protocol::read::{PackageIdentity, ProjectPath};
 
 use crate::catalog::{CatalogEntry, Resolution};
-use crate::resolver::{FileObservation, Inspector, LOCKFILE_BYTES_MAX, PACKAGES_MAX};
+use crate::resolver::{
+    FileObservation, LOCKFILE_BYTES_MAX, MANIFESTS_MAX, PACKAGES_MAX, StaticInputs,
+};
 
 /// The separator between the segments of a project path.
 const PATH_SEPARATOR: char = '/';
@@ -76,6 +78,40 @@ fn identity_order(identity: &PackageIdentity) -> (&str, &str, &str) {
     (&identity.manager, &identity.name, &identity.version)
 }
 
+/// The manifests one resolver reads, and what the manifest bound left out.
+pub(crate) struct ClaimedManifests {
+    /// The visible paths carrying the resolver's manifest file name, at most
+    /// [`MANIFESTS_MAX`] of them in path order.
+    pub(crate) manifests: Vec<ProjectPath>,
+    /// What the bound dropped, absent when every claimed manifest is read.
+    pub(crate) dropped: Option<String>,
+}
+
+/// The visible paths carrying `manifest_file_name`, cut to [`MANIFESTS_MAX`].
+///
+/// Every pass over a workspace claims manifests the same way, so the catalog and the
+/// static context read one list and report one drop.
+pub(crate) fn claimed_manifests(
+    visible: &[ProjectPath],
+    manifest_file_name: &str,
+) -> ClaimedManifests {
+    let mut manifests: Vec<ProjectPath> = visible
+        .iter()
+        .filter(|path| crate::catalog::file_name(path) == manifest_file_name)
+        .cloned()
+        .collect();
+    let claimed_count = manifests.len();
+    manifests.truncate(MANIFESTS_MAX);
+    let dropped = (claimed_count > MANIFESTS_MAX).then(|| {
+        format!(
+            "{} of {claimed_count} {manifest_file_name} manifests were not read: at most \
+             {MANIFESTS_MAX} are read per workspace",
+            claimed_count - MANIFESTS_MAX
+        )
+    });
+    ClaimedManifests { manifests, dropped }
+}
+
 /// The manifests with no other listed manifest in an ancestor directory, in path order.
 ///
 /// Every manifest pair is compared, so the work is quadratic in the manifest count,
@@ -131,70 +167,71 @@ pub(crate) fn file_beside(manifest: &ProjectPath, file_name: &str) -> ProjectPat
     }
 }
 
-/// Why the lockfile beside a manifest answered nothing: which file, and what went wrong.
+/// Why one static file beside a manifest answered nothing: which file, and what went
+/// wrong.
 #[derive(Debug)]
-pub(crate) struct LockfileFailure {
+pub(crate) struct StaticFileFailure {
     file_name: &'static str,
-    cause: LockfileFailureCause,
+    cause: StaticFileFailureCause,
 }
 
-/// What stopped one lockfile from answering.
+/// What stopped one static file from answering.
 #[derive(Debug)]
-enum LockfileFailureCause {
-    /// No lockfile stands beside the manifest.
+enum StaticFileFailureCause {
+    /// No such file stands beside the manifest.
     Absent,
-    /// The lockfile holds more bytes than `LOCKFILE_BYTES_MAX`.
+    /// The file holds more bytes than `LOCKFILE_BYTES_MAX`.
     OverBound { bytes: u64 },
-    /// The lockfile is not the document its tool writes; carries the parser's message.
+    /// The file is not the document its tool writes; carries the parser's message.
     Unparsable(String),
 }
 
-impl LockfileFailure {
-    /// A lockfile that is not the document its tool writes; carries the parser's message.
+impl StaticFileFailure {
+    /// A file that is not the document its tool writes; carries the parser's message.
     #[must_use]
     pub(crate) const fn unparsable(file_name: &'static str, message: String) -> Self {
         Self {
             file_name,
-            cause: LockfileFailureCause::Unparsable(message),
+            cause: StaticFileFailureCause::Unparsable(message),
         }
     }
 
-    /// Whether no lockfile stood beside the manifest at all.
+    /// Whether no such file stood beside the manifest at all.
     #[must_use]
     pub(crate) const fn is_absent(&self) -> bool {
-        matches!(self.cause, LockfileFailureCause::Absent)
+        matches!(self.cause, StaticFileFailureCause::Absent)
     }
 }
 
-impl fmt::Display for LockfileFailure {
+impl fmt::Display for StaticFileFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let file_name = self.file_name;
         match &self.cause {
-            LockfileFailureCause::Absent => write!(formatter, "no {file_name} beside it"),
-            LockfileFailureCause::OverBound { bytes } => write!(
+            StaticFileFailureCause::Absent => write!(formatter, "no {file_name} beside it"),
+            StaticFileFailureCause::OverBound { bytes } => write!(
                 formatter,
                 "{file_name} holds {bytes} bytes, past the {LOCKFILE_BYTES_MAX} byte bound"
             ),
-            LockfileFailureCause::Unparsable(message) => {
+            StaticFileFailureCause::Unparsable(message) => {
                 write!(formatter, "{file_name} could not be parsed: {message}")
             }
         }
     }
 }
 
-/// Reads the lockfile named `file_name` in `directory`, within `LOCKFILE_BYTES_MAX`.
-pub(crate) fn read_lockfile(
+/// Reads the file named `file_name` in `directory`, within `LOCKFILE_BYTES_MAX`.
+pub(crate) fn read_static_file(
     directory: &Path,
     file_name: &'static str,
-    inspector: &mut dyn Inspector,
-) -> Result<Vec<u8>, LockfileFailure> {
+    inputs: &mut dyn StaticInputs,
+) -> Result<Vec<u8>, StaticFileFailure> {
     let path = directory.join(file_name);
-    let cause = match inspector.read_file(&path, LOCKFILE_BYTES_MAX) {
+    let cause = match inputs.read_file(&path, LOCKFILE_BYTES_MAX) {
         FileObservation::Bytes(bytes) => return Ok(bytes),
-        FileObservation::Absent => LockfileFailureCause::Absent,
-        FileObservation::OverBound { bytes } => LockfileFailureCause::OverBound { bytes },
+        FileObservation::Absent => StaticFileFailureCause::Absent,
+        FileObservation::OverBound { bytes } => StaticFileFailureCause::OverBound { bytes },
     };
-    Err(LockfileFailure { file_name, cause })
+    Err(StaticFileFailure { file_name, cause })
 }
 
 #[cfg(test)]
@@ -313,19 +350,19 @@ mod tests {
     }
 
     #[test]
-    fn test_read_lockfile_names_the_file_in_every_failure() {
+    fn test_read_static_file_names_the_file_in_every_failure() {
         let oversized = vec![b'#'; usize::try_from(LOCKFILE_BYTES_MAX).expect("bound fits") + 1];
         let mut inspector = RecordedInspector::default()
             .with_directory("/workspace/absent")
             .with_file("/workspace/large/uv.lock", oversized)
             .with_file("/workspace/small/uv.lock", "version = 1\n");
 
-        let absent = read_lockfile(Path::new("/workspace/absent"), "uv.lock", &mut inspector)
+        let absent = read_static_file(Path::new("/workspace/absent"), "uv.lock", &mut inspector)
             .expect_err("no lockfile stands there");
         assert!(absent.is_absent());
         assert_eq!(absent.to_string(), "no uv.lock beside it");
 
-        let large = read_lockfile(Path::new("/workspace/large"), "uv.lock", &mut inspector)
+        let large = read_static_file(Path::new("/workspace/large"), "uv.lock", &mut inspector)
             .expect_err("the lockfile is past the bound");
         assert!(!large.is_absent());
         assert_eq!(
@@ -336,11 +373,11 @@ mod tests {
             )
         );
 
-        let bytes = read_lockfile(Path::new("/workspace/small"), "uv.lock", &mut inspector)
+        let bytes = read_static_file(Path::new("/workspace/small"), "uv.lock", &mut inspector)
             .expect("a lockfile within the bound reads whole");
         assert_eq!(bytes, b"version = 1\n");
 
-        let unparsable = LockfileFailure::unparsable("uv.lock", "expected `=`".to_owned());
+        let unparsable = StaticFileFailure::unparsable("uv.lock", "expected `=`".to_owned());
         assert!(!unparsable.is_absent());
         assert_eq!(
             unparsable.to_string(),

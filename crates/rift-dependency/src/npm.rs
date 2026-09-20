@@ -1,5 +1,7 @@
 //! The npm resolver: npm packages as `package-lock.json` pins them and `node_modules` holds them.
 
+mod context;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -7,13 +9,15 @@ use rift_protocol::read::{Language, ProjectPath};
 use serde::Deserialize;
 
 use crate::catalog::Resolution;
+use crate::context::ContextAnswer;
 use crate::manifest::{
-    LockfileFailure, ResolutionBuilder, file_beside, is_ancestor_directory, manifest_directory,
-    manifest_directory_path, read_lockfile,
+    ResolutionBuilder, StaticFileFailure, file_beside, is_ancestor_directory, manifest_directory,
+    manifest_directory_path, read_static_file,
 };
 use crate::node::{self, NPM_MANAGER, PACKAGE_MANIFEST_FILE_NAME, TYPESCRIPT_PACKAGE_NAME};
 use crate::resolver::{
-    DependencyResolver, FileObservation, Inspector, ResolutionRequest, ResolverName,
+    ContextRequest, DependencyResolver, FileObservation, Inspector, ResolutionRequest,
+    ResolverName, StaticInputs,
 };
 
 /// The lockfile npm keeps beside the manifest it resolved.
@@ -83,7 +87,7 @@ impl DependencyResolver for NpmResolver {
         for manifest in request.manifests {
             answer.input(manifest.clone());
             let directory = manifest_directory_path(request.root, manifest);
-            match read_lockfile(&directory, PACKAGE_LOCK_FILE_NAME, inspector) {
+            match read_static_file(&directory, PACKAGE_LOCK_FILE_NAME, inspector) {
                 Err(failure) if failure.is_absent() => uncovered.push(manifest),
                 observed => {
                     lockfile_roots.push(manifest_directory(manifest));
@@ -107,6 +111,14 @@ impl DependencyResolver for NpmResolver {
         }
         answer.build()
     }
+
+    fn context(
+        &self,
+        request: &ContextRequest<'_>,
+        inputs: &mut dyn StaticInputs,
+    ) -> ContextAnswer {
+        context::npm_context(request, inputs)
+    }
 }
 
 /// The `package-lock.json` document, the fields this resolver reads.
@@ -127,6 +139,9 @@ struct Lockfile {
 struct LockedPackage {
     version: Option<String>,
     link: Option<bool>,
+    /// The locator the package was fetched from. Absent for one the default registry
+    /// served and for a package bundled inside another.
+    resolved: Option<String>,
     #[serde(default)]
     dependencies: BTreeMap<String, String>,
     #[serde(default, rename = "devDependencies")]
@@ -136,9 +151,9 @@ struct LockedPackage {
 }
 
 /// Parses one lockfile document, naming the parser's message when it is not npm's.
-fn parse_lockfile(bytes: &[u8]) -> Result<Lockfile, LockfileFailure> {
+fn parse_lockfile(bytes: &[u8]) -> Result<Lockfile, StaticFileFailure> {
     serde_json::from_slice(bytes)
-        .map_err(|error| LockfileFailure::unparsable(PACKAGE_LOCK_FILE_NAME, error.to_string()))
+        .map_err(|error| StaticFileFailure::unparsable(PACKAGE_LOCK_FILE_NAME, error.to_string()))
 }
 
 /// Catalogs one lockfile root's packages, or reports why the lockfile answered nothing.
@@ -146,7 +161,7 @@ fn parse_lockfile(bytes: &[u8]) -> Result<Lockfile, LockfileFailure> {
 /// A lockfile whose `lockfileVersion` predates the `packages` map answers nothing: npm 7
 /// or later rewrites it on the next install.
 fn resolve_lockfile(
-    observed: Result<Vec<u8>, LockfileFailure>,
+    observed: Result<Vec<u8>, StaticFileFailure>,
     manifest_directory: &Path,
     manifest: &ProjectPath,
     inspector: &mut dyn Inspector,
@@ -795,6 +810,7 @@ mod tests {
         let pinned = LockedPackage {
             version: Some("1.0.0".to_owned()),
             link: None,
+            resolved: None,
             dependencies: BTreeMap::new(),
             dev_dependencies: BTreeMap::new(),
             optional_dependencies: BTreeMap::new(),

@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use rift_core::ProjectPath;
-use rift_dependency::{CatalogEntry, DependencyCatalog, Resolution, ResolverName};
+use rift_dependency::CatalogEntry;
 use rift_protocol::read::{Language, PackageIdentity};
 use rift_syntax::ShippedLanguage;
 
@@ -62,17 +62,6 @@ pub(super) fn names<'a>(matches: &[SymbolMatch<'a>]) -> Vec<&'a str> {
         .iter()
         .map(|matched| matched.symbol.qualified_name.as_str())
         .collect()
-}
-
-pub(super) fn catalog(entries: Vec<CatalogEntry>) -> DependencyCatalog {
-    DependencyCatalog::assemble(vec![(
-        ResolverName::Cargo,
-        Resolution {
-            entries,
-            inputs: Vec::new(),
-            degradations: Vec::new(),
-        },
-    )])
 }
 
 pub(super) fn rust_package(name: &str, source: &str) -> PackageIndex {

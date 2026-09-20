@@ -11,7 +11,7 @@ use serde_json::Value;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-const REGENERATE_COMMAND: &str = "cargo run -p rift-mcp --bin rift-schema-export";
+const REGENERATE_COMMAND: &str = "just generate";
 
 /// A write request keeping both export roots inside `directory`, so no test
 /// touches the checkout's own committed artifacts through the defaults.
@@ -128,6 +128,52 @@ fn configuration_schema_document_is_deterministic() -> TestResult {
     assert_eq!(first, schema::configuration_schema_document());
     let document: Value = serde_json::from_str(&first)?;
     assert_eq!(document["title"], "WorkspaceConfiguration");
+    Ok(())
+}
+
+#[test]
+fn package_index_schema_document_is_deterministic() -> TestResult {
+    let first = schema::package_index_schema_document();
+    assert_eq!(first, schema::package_index_schema_document());
+    let document: Value = serde_json::from_str(&first)?;
+    assert_eq!(document["title"], "PackagePublication");
+    Ok(())
+}
+
+#[test]
+fn check_fails_when_the_package_index_schema_is_stale() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    schema::run(&write_request(&directory)?)?;
+    fs::write(
+        directory.path().join("public/package-index.schema.json"),
+        "{}",
+    )?;
+
+    let error =
+        schema::run(&check_request(&directory)?).expect_err("a stale package index schema fails");
+    let ExportError::CheckMismatch { path } = error else {
+        panic!("expected CheckMismatch, got {error:?}");
+    };
+    assert!(path.ends_with("package-index.schema.json"));
+    Ok(())
+}
+
+/// The analyzer manifest is rendered from the repository tree, so a root holding none of
+/// its inputs names the first missing one and the remedy rather than writing a manifest
+/// derived from nothing.
+#[test]
+fn the_analyzer_manifest_over_a_root_without_inputs_names_the_missing_path() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let request = schema::parse_arguments([
+        "--analyzer-manifest".to_owned(),
+        directory.path().display().to_string(),
+    ])?;
+
+    let error = schema::run(&request).expect_err("a root holding no inputs renders no manifest");
+    let ExportError::AnalyzerManifest { .. } = error else {
+        panic!("expected AnalyzerManifest, got {error:?}");
+    };
+    assert!(error.to_string().contains("Cargo.lock"), "{error}");
     Ok(())
 }
 

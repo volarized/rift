@@ -2,10 +2,9 @@
 //! names a path dependency, and the lookups that reach that package's public
 //! declarations.
 //!
-//! The dependency lane indexes the package behind the answers, so a lookup issued before
-//! its pass ends answers empty and carries `dependency_index_pending`; every suite here
-//! polls under a bound until the hit appears, then proves the scopes against the indexed
-//! package.
+//! The first read whose `scope` reaches packages analyzes the workspace's packages on
+//! this machine and answers from what it built, so every suite here reads once and
+//! proves the scopes against the analyzed package.
 
 mod hermetic_search;
 // `workspace_client` carries the shared served-workspace scaffolding; this binary drives
@@ -14,17 +13,11 @@ mod hermetic_search;
 mod workspace_client;
 
 use std::fs;
-use std::time::Duration;
 
 use serde_json::{Value, json};
 use workspace_client::{
     ServedWorkspace, TestResult, call_retrying_acceptance, served_workspace, tool_request,
 };
-
-/// Most lookups one suite issues while the lane still indexes the helper.
-const INDEX_ATTEMPTS_MAX: usize = 60;
-/// Pause between two lookups.
-const INDEX_POLL: Duration = Duration::from_millis(250);
 
 /// The unit every helper declaration is served under.
 const HELPER_UNIT: &str = "rift://source/cargo/helper@0.1.0/src/lib.rs";
@@ -153,50 +146,25 @@ fn located_names(answer: &Value) -> Vec<(String, bool)> {
         .collect()
 }
 
-/// The `code` of every warning the answer carries.
-fn warning_codes(answer: &Value) -> Vec<&str> {
-    answer["warnings"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|warning| warning["code"].as_str())
-        .collect()
-}
-
-/// Polls the helper lookup until the lane has indexed the package, and returns that
-/// answer.
+/// The helper lookup, which analyzes the workspace's packages on its first call.
 ///
-/// An empty answer carries `dependency_index_pending` while the pass runs. One that names
-/// a skipped package or a degraded resolver, or warns of nothing at all, fails the poll at
-/// once: waiting longer would change nothing.
+/// An empty answer means the package could not be analyzed, and the warnings say why;
+/// reading again would change nothing, so this fails at once rather than retrying.
 async fn helper_indexed(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
 ) -> TestResult<Value> {
-    for _attempt in 0..INDEX_ATTEMPTS_MAX {
-        let answer = get_symbol(
-            client,
-            json!({ "name": "helper_beacon", "scope": "dependencies" }),
-        )
-        .await?;
-        if answer["hits"]
-            .as_array()
-            .is_some_and(|hits| !hits.is_empty())
-        {
-            return Ok(answer);
-        }
-        let codes = warning_codes(&answer);
-        if codes.contains(&"dependency_package_skipped")
-            || codes.contains(&"dependency_resolver_degraded")
-        {
-            return Err(format!("the helper cannot be indexed: {answer:#}").into());
-        }
-        assert!(
-            codes.contains(&"dependency_index_pending"),
-            "an empty answer while the lane runs names the pending packages: {answer:#}"
-        );
-        tokio::time::sleep(INDEX_POLL).await;
+    let answer = get_symbol(
+        client,
+        json!({ "name": "helper_beacon", "scope": "global" }),
+    )
+    .await?;
+    if answer["hits"]
+        .as_array()
+        .is_some_and(|hits| !hits.is_empty())
+    {
+        return Ok(answer);
     }
-    Err("the dependency lane never indexed the helper within the poll bound".into())
+    Err(format!("the helper was not analyzed: {answer:#}").into())
 }
 
 /// Every hit names exactly one of `path` and `unit`.
@@ -209,7 +177,7 @@ fn assert_one_location(hit: &Value) {
 }
 
 #[tokio::test]
-async fn a_dependency_scoped_lookup_answers_the_package_declaration() -> TestResult {
+async fn a_global_lookup_answers_the_package_declaration() -> TestResult {
     let workspace = served_dependent_workspace(None).await?;
     let (_directory, client, server_task) = workspace.served;
 
@@ -253,6 +221,29 @@ async fn a_dependency_scoped_lookup_answers_the_package_declaration() -> TestRes
     Ok(())
 }
 
+/// The catalog resolves the served project itself beside the package it depends on, and
+/// the fill analyzes what the dependency context names. The project is not one of them,
+/// so `beacon`, declared in both trees, answers a `global` read from the package alone.
+#[tokio::test]
+async fn a_global_lookup_leaves_the_served_project_out_of_the_packages() -> TestResult {
+    let workspace = served_dependent_workspace(None).await?;
+    let (_directory, client, server_task) = workspace.served;
+    helper_indexed(&client).await?;
+
+    let answer = get_symbol(&client, json!({ "name": "beacon", "scope": "global" })).await?;
+
+    let hits = answer["hits"].as_array().ok_or("hits are an array")?;
+    assert!(!hits.is_empty(), "{answer:#}");
+    assert!(
+        hits.iter().all(|hit| hit["unit"] == json!(HELPER_UNIT)),
+        "every package hit comes from the analyzed dependency: {answer:#}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_private_declaration_is_not_served() -> TestResult {
     let workspace = served_dependent_workspace(None).await?;
@@ -261,7 +252,7 @@ async fn a_private_declaration_is_not_served() -> TestResult {
 
     let answer = get_symbol(
         &client,
-        json!({ "name": "helper_private", "scope": "dependencies" }),
+        json!({ "name": "helper_private", "scope": "global" }),
     )
     .await?;
     assert_eq!(answer["hits"], json!([]), "{answer:#}");
@@ -273,20 +264,20 @@ async fn a_private_declaration_is_not_served() -> TestResult {
 }
 
 #[tokio::test]
-async fn the_project_scope_leaves_the_package_out() -> TestResult {
+async fn the_local_scope_leaves_the_package_out() -> TestResult {
     let workspace = served_dependent_workspace(None).await?;
     let (_directory, client, server_task) = workspace.served;
     helper_indexed(&client).await?;
 
     for arguments in [
         json!({ "name": "helper_beacon" }),
-        json!({ "name": "helper_beacon", "scope": "project" }),
+        json!({ "name": "helper_beacon", "scope": "local" }),
     ] {
         let answer = get_symbol(&client, arguments.clone()).await?;
         assert_eq!(answer["hits"], json!([]), "{arguments} {answer:#}");
         assert!(
             answer.get("warnings").is_none(),
-            "a dependency warning rides only an answer whose scope reaches dependencies: \
+            "a package warning rides only an answer whose scope reaches packages: \
              {arguments} {answer:#}"
         );
     }
@@ -297,7 +288,7 @@ async fn the_project_scope_leaves_the_package_out() -> TestResult {
 }
 
 #[tokio::test]
-async fn the_all_scope_lists_the_project_hit_before_the_package_hit() -> TestResult {
+async fn the_all_scope_lists_the_local_hit_before_the_package_hit() -> TestResult {
     let workspace = served_dependent_workspace(None).await?;
     let (_directory, client, server_task) = workspace.served;
     helper_indexed(&client).await?;
@@ -323,14 +314,14 @@ async fn the_all_scope_lists_the_project_hit_before_the_package_hit() -> TestRes
 }
 
 #[tokio::test]
-async fn a_dependency_scoped_search_answers_the_package_declaration_by_unit() -> TestResult {
+async fn a_global_search_answers_the_package_declaration_by_unit() -> TestResult {
     let workspace = served_dependent_workspace(None).await?;
     let (_directory, client, server_task) = workspace.served;
     helper_indexed(&client).await?;
 
     let answer = search(
         &client,
-        json!({ "query": "helper_beacon", "scope": "dependencies" }),
+        json!({ "query": "helper_beacon", "scope": "global" }),
     )
     .await?;
 
@@ -375,7 +366,7 @@ async fn a_dependency_scoped_search_answers_the_package_declaration_by_unit() ->
 }
 
 #[tokio::test]
-async fn the_all_scope_search_answers_project_and_package_hits() -> TestResult {
+async fn the_all_scope_search_answers_local_and_package_hits() -> TestResult {
     let workspace = served_dependent_workspace(None).await?;
     let (_directory, client, server_task) = workspace.served;
     helper_indexed(&client).await?;
@@ -417,7 +408,7 @@ async fn the_all_scope_search_answers_project_and_package_hits() -> TestResult {
 }
 
 #[tokio::test]
-async fn a_dependency_scoped_search_with_traversal_refuses_invalid_request() -> TestResult {
+async fn a_global_search_with_traversal_refuses_invalid_request() -> TestResult {
     let workspace = served_dependent_workspace(None).await?;
     let (_directory, client, server_task) = workspace.served;
     search(&client, json!({ "query": "beacon" })).await?;
@@ -426,7 +417,7 @@ async fn a_dependency_scoped_search_with_traversal_refuses_invalid_request() -> 
         &client,
         json!({
             "query": "beacon",
-            "scope": "dependencies",
+            "scope": "global",
             "traversal": { "seed": "rift://symbol/rust/src/lib.rs/beacon" }
         }),
     )
@@ -446,7 +437,7 @@ async fn a_dependency_scoped_search_with_traversal_refuses_invalid_request() -> 
 }
 
 #[tokio::test]
-async fn a_revision_search_with_a_dependency_scope_refuses_invalid_request() -> TestResult {
+async fn a_revision_search_with_a_global_scope_refuses_invalid_request() -> TestResult {
     let workspace = served_dependent_workspace(None).await?;
     let (directory, client, server_task) = workspace.served;
     // A committed baseline, so `main` resolves and the scope rule is what refuses; the
@@ -475,144 +466,35 @@ async fn a_revision_search_with_a_dependency_scope_refuses_invalid_request() -> 
     Ok(())
 }
 
-/// Polls the helper lookup until the store has settled: no package is pending. The
-/// answer is whatever the settled store says, hits or warnings.
-async fn dependency_index_settled(
-    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
-) -> TestResult<Value> {
-    for _attempt in 0..INDEX_ATTEMPTS_MAX {
-        let answer = get_symbol(
-            client,
-            json!({ "name": "helper_beacon", "scope": "dependencies" }),
-        )
-        .await?;
-        if !warning_codes(&answer).contains(&"dependency_index_pending") {
-            return Ok(answer);
-        }
-        tokio::time::sleep(INDEX_POLL).await;
-    }
-    Err("the dependency lane never settled within the poll bound".into())
-}
-
-/// Polls the helper lookup until the helper is indexed, tolerating the refusal an
-/// earlier bound recorded: the lane replans once the raised bound publishes.
-async fn helper_reindexed(
-    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
-) -> TestResult<Value> {
-    for _attempt in 0..INDEX_ATTEMPTS_MAX {
-        let answer = get_symbol(
-            client,
-            json!({ "name": "helper_beacon", "scope": "dependencies" }),
-        )
-        .await?;
-        if answer["hits"]
-            .as_array()
-            .is_some_and(|hits| !hits.is_empty())
-        {
-            return Ok(answer);
-        }
-        tokio::time::sleep(INDEX_POLL).await;
-    }
-    Err("the dependency lane never indexed the helper again within the poll bound".into())
-}
-
-/// The `dependency_package_skipped` warning naming the helper, once the lane recorded it.
+/// The `package_skipped` warning naming the helper, which the first package read
+/// records when its bounds refuse the package.
 async fn helper_skipped(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
 ) -> TestResult<Value> {
-    for _attempt in 0..INDEX_ATTEMPTS_MAX {
-        let answer = get_symbol(
-            client,
-            json!({ "name": "helper_beacon", "scope": "dependencies" }),
-        )
-        .await?;
-        let skipped = answer["warnings"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|warning| {
-                warning["code"] == json!("dependency_package_skipped")
-                    && warning["package"]["name"] == json!("helper")
-            })
-            .cloned();
-        if let Some(skipped) = skipped {
-            return Ok(skipped);
-        }
-        assert!(
-            answer["hits"].as_array().is_some_and(Vec::is_empty),
-            "a refused package answers no hit: {answer:#}"
-        );
-        tokio::time::sleep(INDEX_POLL).await;
-    }
-    Err("the dependency lane never refused the helper within the poll bound".into())
-}
-
-/// A package `[dependencies] exclude` drops is never planned: the lookup answers empty
-/// once the store settles, and no warning names it.
-#[tokio::test]
-async fn an_excluded_package_is_left_out_without_a_warning() -> TestResult {
-    let workspace =
-        served_dependent_workspace(Some("[dependencies]\nexclude = [\"cargo/helper\"]\n")).await?;
-    let (_directory, client, server_task) = workspace.served;
-
-    let answer = dependency_index_settled(&client).await?;
-
-    assert_eq!(answer["hits"], json!([]), "{answer:#}");
+    let answer = get_symbol(
+        client,
+        json!({ "name": "helper_beacon", "scope": "global" }),
+    )
+    .await?;
     assert!(
-        answer["warnings"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .all(|warning| warning["package"]["name"] != json!("helper")),
-        "an excluded package is neither pending nor skipped: {answer:#}"
+        answer["hits"].as_array().is_some_and(Vec::is_empty),
+        "a refused package answers no hit: {answer:#}"
     );
-
-    client.cancel().await?;
-    server_task.await?;
-    Ok(())
-}
-
-/// `[dependencies] enabled = false` refuses every scope beyond `project` on both tools
-/// as `capability_unavailable` naming the switch; the project scope still answers.
-#[tokio::test]
-async fn a_disabled_index_refuses_a_dependency_scope_typed() -> TestResult {
-    let workspace = served_dependent_workspace(Some("[dependencies]\nenabled = false\n")).await?;
-    let (_directory, client, server_task) = workspace.served;
-    let project = search(&client, json!({ "query": "beacon" })).await?;
-    assert_eq!(located_names(&project), [("beacon".to_owned(), false)]);
-
-    for scope in ["dependencies", "all"] {
-        for (tool, arguments) in [
-            ("get_symbol", json!({ "name": "beacon", "scope": scope })),
-            ("search", json!({ "query": "beacon", "scope": scope })),
-        ] {
-            let wire = refused_call(&client, tool, arguments).await?;
-            assert_eq!(
-                wire["code"],
-                json!("capability_unavailable"),
-                "{tool} {scope}: {wire:#}"
-            );
-            assert_eq!(
-                wire["retry"],
-                json!("operator_action"),
-                "{tool} {scope}: {wire:#}"
-            );
-            assert!(
-                wire["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains("[dependencies] enabled = false")),
-                "the refusal names the switch: {tool} {scope}: {wire:#}"
-            );
-        }
-    }
-
-    client.cancel().await?;
-    server_task.await?;
-    Ok(())
+    answer["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|warning| {
+            warning["code"] == json!("package_skipped")
+                && warning["package"]["name"] == json!("helper")
+        })
+        .cloned()
+        .ok_or_else(|| format!("the refusal names the helper: {answer:#}").into())
 }
 
 /// A `package_files` bound the helper crosses records a refusal; raising the bound in
-/// `rift.toml` replans the index on the next publication, and the helper is indexed.
+/// `rift.toml` analyzes the package again on the next read, since every package the
+/// branch holds was read under the old bounds.
 #[tokio::test]
 async fn raising_package_files_after_a_refusal_reindexes_on_the_next_request() -> TestResult {
     let workspace = served_dependent_workspace(Some("[dependencies]\npackage_files = 1\n")).await?;
@@ -632,7 +514,14 @@ async fn raising_package_files_after_a_refusal_reindexes_on_the_next_request() -
             hermetic_search::SEMANTIC_DISABLED
         ),
     )?;
-    let answer = helper_reindexed(&client).await?;
+    let answer = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "get_symbol",
+            &json!({ "name": "helper_beacon", "scope": "global" }),
+        ),
+    )
+    .await?;
 
     let hits = answer["hits"].as_array().ok_or("hits are an array")?;
     assert_eq!(hits.len(), 1, "{answer:#}");

@@ -1164,7 +1164,7 @@ mod tests {
         let engines = pool(directory.path(), "rust", configuration);
         let base = request(&symbol(&reads, "beacon"));
         for invalid in [
-            json!({"scope":"dependencies"}),
+            json!({"scope":"global"}),
             json!({"query":""}),
             json!({"limit":0}),
             json!({"paths":{"include":["["]}}),
