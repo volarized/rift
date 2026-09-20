@@ -244,6 +244,25 @@ mod tests {
         assert_eq!(names(&matches), ["alpha_shown"]);
     }
 
+    /// The index holds the publication the analyzer produced, so a consumer reading the
+    /// canonical records reads the same analysis the served hits come from.
+    #[test]
+    fn test_package_index_carries_the_publication_it_was_built_from() {
+        let package = rust_package("alpha", "pub fn alpha_shown() {}\n");
+
+        let publication = package.publication();
+
+        assert_eq!(&publication.package, package.identity());
+        assert_eq!(
+            publication
+                .symbols
+                .iter()
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<&str>>(),
+            ["alpha_shown"]
+        );
+    }
+
     #[test]
     fn test_package_index_keeps_a_public_macro_and_drops_a_bare_one() {
         let package = rust_package(

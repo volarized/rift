@@ -172,6 +172,8 @@ fn analyzed_files(
                     examined: *examined,
                 });
             }
+            // A name this machine cannot spell as UTF-8 names no analyzed source. APFS
+            // refuses to create one, so the arm is unreachable on macOS.
             let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
                 continue;
             };
@@ -427,8 +429,8 @@ checksum = \"def\"\n";
         std::fs::write(
             root.path().join("Cargo.lock"),
             format!(
-                "[[package]]\nname = \"tree-sitter\"\nversion = \"{grammar_version}\"\n\
-                 checksum = \"abc\"\n"
+                "version = 4\n\n[[package]]\nname = \"tree-sitter\"\n\
+                 version = \"{grammar_version}\"\nchecksum = \"abc\"\n"
             ),
         )
         .expect("the lockfile is written");
@@ -493,6 +495,70 @@ checksum = \"def\"\n";
             after.contains("crates/rift-syntax/src/another.rs"),
             "{after}"
         );
+    }
+
+    /// A named root's directories are walked to their bound, so a grammar rule set filed
+    /// one directory below the crate root is pinned like any other source.
+    #[test]
+    fn test_the_walk_descends_into_a_directory_below_a_named_root() {
+        let root = manifest_root("0.25.10");
+        let nested = root.path().join("crates/rift-syntax/src/rust");
+        std::fs::create_dir_all(&nested).expect("the nested directory is created");
+        std::fs::write(nested.join("attachment.rs"), "// attachment\n")
+            .expect("the source is written");
+
+        let rendered = super::render_analyzer_manifest(root.path()).expect("the manifest renders");
+
+        assert!(
+            rendered.contains("crates/rift-syntax/src/rust/attachment.rs"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_the_manifest_is_committed_below_the_analyzer_it_states() {
+        let path = super::analyzer_manifest_path();
+
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("crates/rift-index/src/dependency/analyzer-manifest.json")
+        );
+    }
+
+    /// A lockfile's own header stands before the first package table, and the pins read
+    /// past it rather than reading it as one.
+    #[test]
+    fn test_grammar_pins_read_past_a_lockfile_header() {
+        let lockfile = "\
+version = 4\n\
+name = \"not-a-package\"\n\
+\n\
+[[package]]\n\
+name = \"tree-sitter\"\n\
+version = \"0.25.10\"\n";
+
+        let pins = grammar_pins(lockfile);
+
+        let named: Vec<&str> = pins.iter().map(|pin| pin.name.as_str()).collect();
+        assert_eq!(named, ["tree-sitter"]);
+        assert_eq!(pins[0].checksum, None);
+    }
+
+    /// A refusal the renderer raised itself names no underlying failure: nothing below it
+    /// failed, the tree simply does not hold what the manifest states.
+    #[test]
+    fn test_a_renderer_refusal_names_no_underlying_failure() {
+        let empty = ManifestError::RootEmpty {
+            path: std::path::PathBuf::from("/workspace/crates/rift-syntax/src"),
+        };
+        let exhausted = ManifestError::WalkExhausted {
+            path: std::path::PathBuf::from("/workspace/crates/rift-syntax/src"),
+            examined: super::SOURCE_ENTRIES_MAX + 1,
+        };
+
+        for error in [empty, exhausted] {
+            assert!(std::error::Error::source(&error).is_none(), "{error}");
+        }
     }
 
     #[test]

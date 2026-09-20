@@ -370,6 +370,7 @@ dependencies = [
   "tool @ https://example.test/tool-1.0.tar.gz",
   "requests",
   "pinned === 1.2.3",
+  "== 1.0",
 ]
 
 [dependency-groups]
@@ -392,7 +393,7 @@ lint = ["ruff>=0.14"]
                 "pytest: version 8.4.2",
                 "ruff: requirement >=0.14"
             ],
-            "a requirement stating no specifier names no version and is not reported"
+            "a requirement stating no specifier, and one stating no name, are not reported"
         );
         let local_only: Vec<&str> = answer
             .entries

@@ -158,6 +158,81 @@ fn check_fails_when_the_package_index_schema_is_stale() -> TestResult {
     Ok(())
 }
 
+/// A tree holding every input the analyzer manifest names, taken from the committed
+/// manifest itself: it lists each pinned source path, and the lockfile is copied from the
+/// repository so the grammar pins are the shipped ones.
+fn analyzer_root(repository: &std::path::Path) -> TestResult<tempfile::TempDir> {
+    let committed: Value = serde_json::from_str(&fs::read_to_string(
+        repository.join(rift_index::analyzer_manifest_path()),
+    )?)?;
+    let root = tempfile::tempdir()?;
+    fs::copy(
+        repository.join("Cargo.lock"),
+        root.path().join("Cargo.lock"),
+    )?;
+    for source in committed["sources"]
+        .as_array()
+        .ok_or("the manifest lists sources")?
+    {
+        let relative = source["path"].as_str().ok_or("a source states its path")?;
+        let path = root.path().join(relative);
+        fs::create_dir_all(path.parent().ok_or("a source has a directory")?)?;
+        fs::copy(repository.join(relative), path)?;
+    }
+    Ok(root)
+}
+
+/// The repository root this test binary was built from.
+fn repository_root() -> TestResult<std::path::PathBuf> {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR")?;
+    Ok(std::path::Path::new(&manifest)
+        .ancestors()
+        .nth(2)
+        .ok_or("the crate sits two directories below the repository root")?
+        .to_path_buf())
+}
+
+/// Writing the analyzer manifest below a root, then checking it, is the pair
+/// `just generate` and `just generate-check` run: the write lands at the committed path
+/// and the check over the same tree accepts it.
+#[test]
+fn the_analyzer_manifest_writes_below_its_root_and_checks_clean() -> TestResult {
+    let repository = repository_root()?;
+    let root = analyzer_root(&repository)?;
+    let written = schema::parse_arguments([
+        "--analyzer-manifest".to_owned(),
+        root.path().display().to_string(),
+    ])?;
+
+    schema::run(&written)?;
+
+    let path = root.path().join(rift_index::analyzer_manifest_path());
+    let rendered = fs::read_to_string(&path)?;
+    assert!(rendered.ends_with('\n'), "{rendered}");
+    let document: Value = serde_json::from_str(&rendered)?;
+    assert!(
+        document["sources"]
+            .as_array()
+            .is_some_and(|sources| !sources.is_empty()),
+        "{document}"
+    );
+
+    let checked = schema::parse_arguments([
+        "--check".to_owned(),
+        "--analyzer-manifest".to_owned(),
+        root.path().display().to_string(),
+    ])?;
+    schema::run(&checked)?;
+
+    fs::write(&path, "{}\n")?;
+    let error = schema::run(&checked).expect_err("a stale manifest fails the check");
+    let ExportError::CheckMismatch { path: named } = error else {
+        panic!("expected CheckMismatch, got {error:?}");
+    };
+    assert!(named.ends_with("analyzer-manifest.json"));
+    Ok(())
+}
+
 /// The analyzer manifest is rendered from the repository tree, so a root holding none of
 /// its inputs names the first missing one and the remedy rather than writing a manifest
 /// derived from nothing.
@@ -174,6 +249,7 @@ fn the_analyzer_manifest_over_a_root_without_inputs_names_the_missing_path() -> 
         panic!("expected AnalyzerManifest, got {error:?}");
     };
     assert!(error.to_string().contains("Cargo.lock"), "{error}");
+    assert!(std::error::Error::source(&error).is_some(), "{error}");
     Ok(())
 }
 

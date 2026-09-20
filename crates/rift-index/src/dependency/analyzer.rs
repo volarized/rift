@@ -663,12 +663,15 @@ fn source_location(entry: &CatalogEntry) -> SourceLocation {
 mod tests {
     use rift_dependency::CatalogEntry;
     use rift_protocol::canonical::canonical_json;
-    use rift_protocol::index::{PACKAGE_PUBLICATION_FORMAT_REVISION, PackageDocumentKind};
+    use rift_protocol::index::{
+        PACKAGE_IDENTIFIER_TERMS_MAX, PACKAGE_PUBLICATION_FORMAT_REVISION,
+        PACKAGE_SOURCE_BYTES_MAX, PackageAnalysisWarning, PackageDocumentKind,
+    };
     use rift_syntax::ShippedLanguage;
 
     use super::super::fixture::{identity, language, text};
     use super::super::walk::PackageFiles;
-    use super::PackageAnalyzer;
+    use super::{PackageAnalyzer, bound};
 
     /// One package of `files` in `shipped`, analyzed.
     fn analyzed(
@@ -692,6 +695,24 @@ mod tests {
             .expect("the package analyzes")
             .publication()
             .clone()
+    }
+
+    /// One package of `files` in `shipped`, analyzed, keeping every part of the analysis.
+    fn analysis(shipped: ShippedLanguage, files: Vec<(&str, &str)>) -> super::PackageAnalysis {
+        let entry = CatalogEntry::dependency(
+            identity("cargo", "beacon", "1.0.0"),
+            language(shipped),
+            None,
+            true,
+        );
+        let files = PackageFiles::new(
+            files
+                .into_iter()
+                .map(|(path, source)| text(path, source))
+                .collect(),
+            0,
+        );
+        PackageAnalyzer::analyze(&entry, &files, 1).expect("the package analyzes")
     }
 
     /// The `identity` of every document of one kind, in publication order.
@@ -974,5 +995,62 @@ mod tests {
         assert!(!rendered.contains("/Users/"), "{rendered}");
         assert!(!rendered.contains("\\\\"), "{rendered}");
         assert!(rendered.contains("src/lib.rs"));
+    }
+
+    /// The analysis hands back the parsed files beside the publication, so the local
+    /// package index reads what the publication was built from rather than parsing again.
+    #[test]
+    fn test_analysis_carries_the_parsed_files_beside_the_publication() {
+        let analysis = analysis(
+            ShippedLanguage::Rust,
+            vec![("src/lib.rs", "pub fn spawn() {}\n")],
+        );
+
+        let files = analysis.files();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file().path().as_str(), "src/lib.rs");
+        assert!(files[0].is_public("spawn"));
+        assert_eq!(analysis.publication().symbols.len(), 1);
+    }
+
+    /// A declaration past the retained-source bound keeps the bytes that fit, reports the
+    /// count it dropped, and states that its source is not the whole declaration.
+    #[test]
+    fn test_a_declaration_past_the_source_bound_is_cut_and_reported() {
+        let filler = "x".repeat(bound(PACKAGE_SOURCE_BYTES_MAX) + 64);
+        let source = format!("pub fn spawn() {{\n    // {filler}\n}}\n");
+
+        let publication = analyzed(ShippedLanguage::Rust, vec![("src/lib.rs", &source)]);
+
+        let symbol = publication
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "spawn")
+            .expect("the declaration is published");
+        assert!(!symbol.source_complete, "{symbol:?}");
+        assert_eq!(symbol.source.len(), bound(PACKAGE_SOURCE_BYTES_MAX));
+        let dropped: Vec<&PackageAnalysisWarning> = publication
+            .warnings
+            .iter()
+            .filter(|warning| matches!(warning, PackageAnalysisWarning::SourceTruncated { .. }))
+            .collect();
+        assert!(!dropped.is_empty(), "{:?}", publication.warnings);
+    }
+
+    /// The ranking terms stop at their bound: a name splitting into more words than a
+    /// document may carry ranks on the ones that fit.
+    #[test]
+    fn test_identifier_terms_stop_at_their_bound() {
+        let terms_max = bound(PACKAGE_IDENTIFIER_TERMS_MAX);
+        let name: String = (0..=terms_max)
+            .map(|index| format!("w{index}"))
+            .collect::<Vec<String>>()
+            .join("_");
+
+        let terms = super::identifier_terms(&[&name]);
+
+        assert_eq!(terms.len(), terms_max);
+        assert_eq!(terms[0], "w0");
     }
 }

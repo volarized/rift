@@ -244,6 +244,60 @@ async fn a_global_lookup_leaves_the_served_project_out_of_the_packages() -> Test
     Ok(())
 }
 
+/// A lockfile naming a registry package no cache on this machine holds: the fill counts
+/// it as unresolved, analyzes nothing for it, and the fallback warning states the count
+/// beside the packages it did analyze.
+#[tokio::test]
+async fn a_package_with_no_source_on_this_machine_is_counted_unresolved() -> TestResult {
+    let helper = tempfile::tempdir()?;
+    fs::create_dir_all(helper.path().join("src"))?;
+    fs::write(
+        helper.path().join("Cargo.toml"),
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )?;
+    fs::write(helper.path().join("src/lib.rs"), HELPER_SOURCE)?;
+    let manifest = format!(
+        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [dependencies]\nhelper = {{ path = '{}' }}\nabsent-probe = \"9.9.9\"\n",
+        helper.path().display()
+    );
+    let lockfile = format!(
+        "{LOCK_WITH_HELPER}\n[[package]]\nname = \"absent-probe\"\nversion = \"9.9.9\"\n\
+         source = \"registry+https://github.com/rust-lang/crates.io-index\"\n"
+    );
+    let (_directory, client, server_task) = served_workspace(
+        &[
+            ("Cargo.toml", manifest.as_str()),
+            ("Cargo.lock", lockfile.as_str()),
+            ("src/lib.rs", "pub fn beacon() {}\n"),
+        ],
+        None,
+    )
+    .await?;
+
+    let answer = get_symbol(
+        &client,
+        json!({ "name": "helper_beacon", "scope": "global" }),
+    )
+    .await?;
+
+    let detail = answer["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|warning| warning["code"] == json!("global_index_unavailable"))
+        .and_then(|warning| warning["detail"].as_str())
+        .ok_or_else(|| format!("a package read states its fallback: {answer:#}"))?;
+    assert!(
+        detail.contains("1 named no source this machine holds"),
+        "{detail}"
+    );
+
+    client.cancel().await?;
+    server_task.abort();
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_private_declaration_is_not_served() -> TestResult {
     let workspace = served_dependent_workspace(None).await?;
