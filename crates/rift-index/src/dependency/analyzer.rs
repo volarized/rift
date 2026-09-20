@@ -1018,10 +1018,18 @@ mod tests {
     /// count it dropped, and states that its source is not the whole declaration.
     #[test]
     fn test_a_declaration_past_the_source_bound_is_cut_and_reported() {
-        // Two-byte characters, so the bound falls inside one and the cut walks back to
-        // the boundary rather than splitting it.
-        let filler = "e\u{0301}".repeat(bound(PACKAGE_SOURCE_BYTES_MAX));
-        let source = format!("pub fn spawn() {{\n    // {filler}\n}}\n");
+        // Three-byte characters, padded so the bound falls inside one: the cut then walks
+        // back to the boundary rather than splitting the character.
+        let mut prefix = String::from("pub fn spawn() {\n    // ");
+        while (bound(PACKAGE_SOURCE_BYTES_MAX) - prefix.len()).is_multiple_of("\u{4e16}".len()) {
+            prefix.push(' ');
+        }
+        let filler = "\u{4e16}".repeat(bound(PACKAGE_SOURCE_BYTES_MAX));
+        let source = format!("{prefix}{filler}\n}}\n");
+        assert!(
+            !source.is_char_boundary(bound(PACKAGE_SOURCE_BYTES_MAX)),
+            "the bound falls inside a character"
+        );
 
         let publication = analyzed(ShippedLanguage::Rust, vec![("src/lib.rs", &source)]);
 
