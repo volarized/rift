@@ -3909,7 +3909,7 @@ dependencies = [
 
 [[package]]
 name = "rift"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "axum",
  "clap",
@@ -3947,7 +3947,7 @@ dependencies = [
 
 [[package]]
 name = "rift-core"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "percent-encoding",
  "rift-protocol",
@@ -3959,7 +3959,7 @@ dependencies = [
 
 [[package]]
 name = "rift-dependency"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "rift-core",
  "rift-protocol",
@@ -3972,7 +3972,7 @@ dependencies = [
 
 [[package]]
 name = "rift-history"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "gix",
  "rift-core",
@@ -3983,7 +3983,7 @@ dependencies = [
 
 [[package]]
 name = "rift-index"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "ignore",
  "rift-core",
@@ -3993,6 +3993,7 @@ dependencies = [
  "rift-provider",
  "rift-syntax",
  "serde",
+ "serde_json",
  "sha2",
  "strum",
  "tempfile",
@@ -4005,7 +4006,7 @@ dependencies = [
 
 [[package]]
 name = "rift-lsp"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "globset",
  "lsp-types",
@@ -4020,7 +4021,7 @@ dependencies = [
 
 [[package]]
 name = "rift-mcp"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "axum",
  "data-encoding",
@@ -4050,19 +4051,20 @@ dependencies = [
 
 [[package]]
 name = "rift-protocol"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "jsonschema",
  "schemars",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
  "serde_path_to_error",
  "strum",
 ]
 
 [[package]]
 name = "rift-provider"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "rift-core",
  "serde",
@@ -4071,7 +4073,7 @@ dependencies = [
 
 [[package]]
 name = "rift-search"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -4092,7 +4094,7 @@ dependencies = [
 
 [[package]]
 name = "rift-server"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "lsp-types",
  "percent-encoding",
@@ -4123,7 +4125,7 @@ dependencies = [
 
 [[package]]
 name = "rift-syntax"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "rift-core",
  "rift-protocol",
@@ -4520,6 +4522,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "ryu-js"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
+
+[[package]]
 name = "safetensors"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4720,6 +4728,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_json_canonicalizer"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe52319a927259afbfa5180c5157cd8167edfd3e8c254f9558c7fef44c5649f2"
+dependencies = [
+ "ryu-js",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
