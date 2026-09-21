@@ -12,12 +12,13 @@
 //! directory can never reach a rank. And the stored corpus and an in-memory adapter over
 //! one publication answer the same documents, first hit included.
 //!
-//! The in-memory adapter reimplements FTS5's own `bm25`, and the two agree on which
-//! documents answer and on which answers first, but not yet on the order of the tail: over
-//! this corpus two cases place a pair of near-scoring candidates the other way round. That
-//! is a measured gap in the reimplementation, not in the stored corpus, and it is why this
-//! gate compares the answered documents rather than the whole sequence. A reader that must
-//! reproduce the stored order exactly runs the stored corpus.
+//! The in-memory adapter reimplements FTS5's own `bm25`, and over a corpus whose fields
+//! tokenize one way on both sides the two compute the same value to the last bits, which
+//! `the_two_adapters_compute_one_value_over_a_plain_corpus` pins. Over this corpus they
+//! still order two pairs of near-scoring candidates the other way round, so some document
+//! here tokenizes differently on the two sides. That difference is unlocated, which is why
+//! this gate compares the answered documents and the first hit rather than the whole
+//! sequence. A reader that must reproduce the stored order exactly runs the stored corpus.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -26,8 +27,8 @@ use std::time::Instant;
 
 use rift_core::{LanguageFileSelections, SourceVisibility, TextFileInclusion};
 use rift_index::{
-    DatabasePool, LexicalIndexLimits, LexicalSearchIndex, PublishedIndex, WorkspaceDatabase,
-    WorkspaceIndex, WorkspaceIndexLimits,
+    DatabasePool, LexicalIndexLimits, LexicalSearchIndex, PublishedIndex, RevisionScoped,
+    WorkspaceDatabase, WorkspaceIndex, WorkspaceIndexLimits,
 };
 use rift_ranking::{
     DocumentIdentity, DocumentKind, DocumentLocation, IndexDocument, IndexReader, MemoryIndex,
@@ -554,6 +555,61 @@ fn every_named_result_class_is_covered_once() -> TestResult {
             declared.contains(&class),
             "the query set must cover the {class} class"
         );
+    }
+    Ok(())
+}
+#[tokio::test]
+async fn the_two_adapters_compute_one_value_over_a_plain_corpus() -> TestResult {
+    use rift_core::ProjectPath;
+    use rift_ranking::{DocumentFields, DocumentIdentity, DocumentLocation, SearchableField};
+
+    let directory = TempDir::new()?;
+    let built =
+        |identity: &str, path: &str, name: &str, source: &str| -> TestResult<IndexDocument> {
+            let fields = DocumentFields::empty()
+                .with(SearchableField::Name, name)
+                .with(SearchableField::DeclarationSource, source);
+            let digest = fields.digest();
+            Ok(IndexDocument::new(
+                DocumentIdentity::new(identity)?,
+                DocumentLocation::Project(ProjectPath::new(path)?),
+                DocumentKind::Symbol,
+                digest,
+                fields,
+            )?)
+        };
+    let documents = vec![
+        built("a", "src/a.rs", "alpha", "alpha carries pipeline once")?,
+        built("b", "src/b.rs", "beta", "beta carries pipeline once too")?,
+        built("c", "src/c.rs", "gamma", "gamma carries listener once")?,
+    ];
+    let store = stored(&documents, directory.path()).await?;
+    let memory = MemoryIndex::new(documents, "plain-corpus");
+
+    for text in ["pipeline", "listener", "carries"] {
+        let parsed = ParsedQuery::parse(text)?;
+        let ranking = match store
+            .search("corpus", &parsed, QueryPhase::Precise, 20)
+            .await?
+        {
+            RevisionScoped::Matched(ranking) => ranking,
+            other => return Err(format!("the store must hold the corpus: {other:?}").into()),
+        };
+        let scored = memory.scored(&parsed, QueryPhase::Precise);
+        assert_eq!(
+            ranking.matches().len(),
+            scored.len(),
+            "{text}: both adapters answer the same documents"
+        );
+        for (matched, (identity, score)) in ranking.matches().iter().zip(&scored) {
+            assert_eq!(matched.identity(), identity, "{text}: one order");
+            assert!(
+                (matched.rank().abs() - score).abs() < 1e-9,
+                "{text}: the two adapters must compute one value for {identity}, \
+                 store {} and memory {score}",
+                matched.rank().abs()
+            );
+        }
     }
     Ok(())
 }

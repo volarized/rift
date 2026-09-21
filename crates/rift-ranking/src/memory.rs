@@ -596,6 +596,29 @@ mod tests {
     }
 
     #[test]
+    fn test_a_rarer_term_outscores_a_common_one_in_the_same_document() {
+        // "alpha" sits in every document; "beta" sits in one. Both reach the same
+        // document through the same field at the same frequency, so the only thing
+        // that can separate them is the inverse document frequency.
+        let documents: Vec<IndexDocument> = (0..4)
+            .map(|index| {
+                let content = if index == 0 { "alpha beta" } else { "alpha" };
+                text_file(&format!("docs/{index}.md"), content)
+            })
+            .collect();
+        let held = MemoryIndex::new(documents, "idf-fixture");
+        let common = ParsedQuery::parse("alpha").expect("query must parse");
+        let rare = ParsedQuery::parse("beta").expect("query must parse");
+        let common_score = held.scored(&common, QueryPhase::Precise)[0].1;
+        let rare_score = held.scored(&rare, QueryPhase::Precise)[0].1;
+        assert!(
+            rare_score > common_score,
+            "a term three documents do not carry must outweigh one every document \
+             carries: rare={rare_score}, common={common_score}"
+        );
+    }
+
+    #[test]
     fn test_cosine_refuses_a_width_mismatch_and_a_zero_vector() {
         assert!(cosine(&[1.0, 0.0], &[1.0]).abs() < 1e-12);
         assert!(cosine(&[0.0, 0.0], &[1.0, 0.0]).abs() < 1e-12);
