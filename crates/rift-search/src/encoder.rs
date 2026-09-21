@@ -388,7 +388,7 @@ impl Encoder {
     #[must_use]
     pub const fn query_transformation(&self) -> QueryTransformation {
         match self.model {
-            Model::Bert(_) => QueryTransformation::Instructed,
+            Model::Bert(_) => QueryTransformation::Instructed(QUERY_PREFIX),
             Model::Static(_) => QueryTransformation::Symmetric,
         }
     }

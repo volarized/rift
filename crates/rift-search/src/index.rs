@@ -1271,13 +1271,13 @@ mod tests {
             &repository,
             &ModelFiles::in_snapshot(&directory, "dd0a482")?,
             384,
-            QueryTransformation::Instructed,
+            QueryTransformation::Instructed("probe-instruction"),
         );
         let other = local_embedding_space(
             &repository,
             &ModelFiles::in_snapshot(&directory, "9f21c3b")?,
             384,
-            QueryTransformation::Instructed,
+            QueryTransformation::Instructed("probe-instruction"),
         );
         assert_ne!(
             one.identity(),
@@ -1288,7 +1288,7 @@ mod tests {
             &repository,
             &ModelFiles::in_snapshot(&directory, "dd0a482")?,
             768,
-            QueryTransformation::Instructed,
+            QueryTransformation::Instructed("probe-instruction"),
         );
         assert_ne!(
             one.identity(),
@@ -1310,7 +1310,7 @@ mod tests {
             &ModelSource::Directory(directory.clone()),
             &files,
             384,
-            QueryTransformation::Instructed,
+            QueryTransformation::Instructed("probe-instruction"),
         );
         assert_ne!(one.identity(), held.identity());
         assert_eq!(held.dimensions(), 384);
@@ -1333,7 +1333,7 @@ mod tests {
                 &ModelSource::Directory(directory.to_path_buf()),
                 &files,
                 384,
-                QueryTransformation::Instructed,
+                QueryTransformation::Instructed("probe-instruction"),
             )
             .identity())
         };

@@ -67,16 +67,21 @@ const SERVER_FAILURE_STATUS_MAX: u16 = 599;
 pub enum QueryTransformation {
     /// The query text reaches the model unchanged.
     Symmetric,
-    /// The encoder prefixes the query with its retrieval instruction.
-    Instructed,
+    /// The encoder prefixes the query with the retrieval instruction it
+    /// carries.
+    Instructed(&'static str),
 }
 
 impl QueryTransformation {
     /// The transformation as the space identity records it.
-    const fn as_str(self) -> &'static str {
+    ///
+    /// An instructed model records the instruction itself, not the fact that
+    /// there is one: a checkpoint whose prefix changes asks a different
+    /// question of the same vectors, so it embeds into another space.
+    fn as_str(self) -> String {
         match self {
-            Self::Symmetric => "query",
-            Self::Instructed => "query-instruction",
+            Self::Symmetric => "query".to_owned(),
+            Self::Instructed(prefix) => format!("query-instruction:{prefix}"),
         }
     }
 }
@@ -98,7 +103,7 @@ pub struct EmbeddingSpace {
     revision: String,
     dimensions: usize,
     document_transformation: String,
-    query_transformation: &'static str,
+    query_transformation: String,
 }
 
 impl EmbeddingSpace {
@@ -161,7 +166,7 @@ impl EmbeddingSpace {
             self.model.as_str(),
             self.revision.as_str(),
             self.document_transformation.as_str(),
-            self.query_transformation,
+            self.query_transformation.as_str(),
         ] {
             hasher.update(part.as_bytes());
             hasher.update([0]);
@@ -991,6 +996,28 @@ mod tests {
     }
 
     #[test]
+    fn test_two_instructions_are_two_spaces() {
+        // A checkpoint whose retrieval instruction changes asks a different
+        // question of the same vectors, so the corpus embedded under the old
+        // one must be dropped rather than scored against.
+        let one = EmbeddingSpace::local(
+            "hf",
+            "model",
+            "main",
+            256,
+            super::QueryTransformation::Instructed("first instruction: "),
+        );
+        let other = EmbeddingSpace::local(
+            "hf",
+            "model",
+            "main",
+            256,
+            super::QueryTransformation::Instructed("second instruction: "),
+        );
+        assert_ne!(one.identity(), other.identity());
+    }
+
+    #[test]
     fn test_a_local_space_records_its_query_transformation() {
         let symmetric = EmbeddingSpace::local(
             "hf",
@@ -1004,7 +1031,7 @@ mod tests {
             "model",
             "main",
             256,
-            super::QueryTransformation::Instructed,
+            super::QueryTransformation::Instructed("probe-instruction"),
         );
         assert_ne!(
             symmetric.identity(),

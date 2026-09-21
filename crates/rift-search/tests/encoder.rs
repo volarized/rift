@@ -407,7 +407,7 @@ mod through_the_embedding_contract {
             "fixture",
             "fixture",
             HIDDEN,
-            QueryTransformation::Instructed,
+            QueryTransformation::Instructed("probe-instruction"),
         );
         Ok(EmbeddingModels::Local(RetrievalModels::new(
             held.documents(),

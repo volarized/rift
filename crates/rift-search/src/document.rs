@@ -169,24 +169,33 @@ const COMPOSITION_REVISION_CHARS: usize = 16;
 /// carries this value, so changing what a document is made of mints another
 /// space and the previous vectors are dropped rather than ranked against a
 /// query composed differently. The digest is taken over the text the builder
-/// actually produces for two probes, one on each path it has, so a changed
-/// order, separator, or fallback changes it without anyone remembering to
-/// restate it here.
+/// actually produces, and over the bytes it says it dropped, for one probe per
+/// branch it has: source present, source absent with both metadata fields,
+/// with each alone, with neither, and a source past
+/// [`DOCUMENT_SOURCE_BYTES_MAX`]. A changed order, separator, fallback, or cut
+/// therefore changes it without anyone remembering to restate it here.
 #[must_use]
 pub fn composition_revision() -> String {
-    let with_source = Declaration::new("kind", "qualified::name")
-        .signature("signature")
-        .documentation("documentation")
-        .source("source");
-    let without_source = Declaration::new("kind", "qualified::name")
-        .signature("signature")
-        .documentation("documentation");
+    let named = Declaration::new("kind", "qualified::name");
+    let cut = "\u{1f600}".repeat(DOCUMENT_SOURCE_BYTES_MAX);
+    let probes = [
+        named
+            .signature("signature")
+            .documentation("documentation")
+            .source("source"),
+        named.signature("signature").documentation("documentation"),
+        named.documentation("documentation"),
+        named.signature("signature"),
+        named,
+        named.source(&cut),
+    ];
     let mut hasher = Sha256::new();
-    for probe in [&with_source, &without_source] {
-        hasher.update(document(probe).text().as_bytes());
+    for probe in &probes {
+        let built = document(probe);
+        hasher.update(built.text().as_bytes());
         hasher.update([0]);
+        hasher.update(built.source_bytes_dropped().to_le_bytes());
     }
-    hasher.update(DOCUMENT_SOURCE_BYTES_MAX.to_le_bytes());
     HEXLOWER.encode(&hasher.finalize())[..COMPOSITION_REVISION_CHARS].to_owned()
 }
 
@@ -323,12 +332,13 @@ mod tests {
     }
 
     #[test]
-    fn test_the_composition_revision_pins_what_the_builder_produces() {
-        // The revision is derived from the builder's own output, so a changed
-        // order, separator, bound, or fallback moves it. Pinning the value is
-        // what makes that visible: an edit to the composition fails here, and
-        // the author reads why the held vectors are about to be dropped.
-        assert_eq!(composition_revision(), "3aa4825a04c76561");
+    fn test_the_composition_revision_pins_every_branch_the_builder_has() {
+        // The revision is derived from the builder's own output on every branch
+        // it has, so a changed order, separator, bound, fallback, or cut moves
+        // it. Pinning the value is what makes that visible: an edit to the
+        // composition fails here, and the author reads why the held vectors are
+        // about to be dropped.
+        assert_eq!(composition_revision(), "4ed59558f34a4166");
     }
 
     #[test]
