@@ -100,12 +100,6 @@ impl RankingInputSet {
         Self(self.0 | Self::of(kind).0)
     }
 
-    /// The union of two sets.
-    #[must_use]
-    pub const fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-
     /// The inputs in this set, in declaration order.
     pub fn kinds(self) -> impl Iterator<Item = RankingInputKind> {
         RankingInputKind::ALL
@@ -771,6 +765,40 @@ mod tests {
         );
         assert_eq!(identities(&without), ["a", "b", "c"]);
         assert_eq!(identities(&answered), ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn test_a_later_phase_that_was_cut_says_so_even_when_the_join_fits() {
+        // The joined answer is inside `keep_max`, so the join cut nothing. What
+        // the broad phase cut is still gone, and a caller that reads only the
+        // joined answer would otherwise never learn it.
+        let mut precise = fuse(
+            &[RankingInput::new(
+                RankingInputKind::Lexical,
+                order(&["a"], SearchableField::Name),
+            )],
+            weights(),
+            QueryPhase::Precise,
+            10,
+        );
+        assert!(precise.truncated_at().is_none());
+        let later = fuse(
+            &[RankingInput::new(
+                RankingInputKind::Lexical,
+                order(&["b", "c", "d"], SearchableField::Name),
+            )],
+            weights(),
+            QueryPhase::Broad,
+            1,
+        );
+        assert_eq!(later.truncated_at(), Some(1));
+        precise.append_phase(later, 10);
+        assert_eq!(identities(&precise), ["a", "b"]);
+        assert_eq!(
+            precise.truncated_at(),
+            Some(1),
+            "what the broad phase cut is still cut"
+        );
     }
 
     #[test]

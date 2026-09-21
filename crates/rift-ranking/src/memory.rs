@@ -384,12 +384,9 @@ impl MemoryIndex {
 
 /// The BM25 term-frequency saturation for one field occurrence count.
 fn saturation(frequency: f64, entry: &HeldDocument, average_length: f64) -> f64 {
-    let length = as_float(entry.tokens.length);
-    let normalized = if average_length > 0.0 {
-        length / average_length
-    } else {
-        1.0
-    };
+    // The caller reaches this only once a member matched a column, which means the
+    // corpus holds at least one token, which means the average is above zero.
+    let normalized = as_float(entry.tokens.length) / average_length;
     (frequency * (BM25_K1 + 1.0)) / (frequency + BM25_K1 * (1.0 - BM25_B + BM25_B * normalized))
 }
 
@@ -523,6 +520,70 @@ mod tests {
 
     fn identity(value: &str) -> DocumentIdentity {
         DocumentIdentity::new(value).expect("identity must be accepted")
+    }
+
+    #[test]
+    fn test_a_package_document_is_addressed_by_its_unit_and_no_project_path() {
+        // A package file has no project path, so the read path resolves its unit
+        // instead. A document answering a path here would send that resolution
+        // to the project index, which does not hold it.
+        let unit = rift_core::SourceUnitId::parse("rift://source/cargo/helper@0.1.0/src/lib.rs")
+            .expect("the unit must parse");
+        let held = IndexDocument::new(
+            identity("rift://source/cargo/helper@0.1.0/src/lib.rs#spawn"),
+            DocumentLocation::Unit(unit),
+            DocumentKind::Symbol,
+            "0f1e2d3c",
+            DocumentFields::empty().with(SearchableField::Name, "spawn"),
+        )
+        .expect("document must be accepted");
+        assert!(held.project_path().is_none());
+        assert!(
+            symbol("spawn", "task::spawn", "pub fn spawn() {}")
+                .project_path()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_a_term_too_short_to_widen_matches_a_whole_token_alone() {
+        // A term under the prefix bound is matched whole: widening it would let
+        // two characters reach every identifier that starts with them.
+        let index = MemoryIndex::new(
+            vec![
+                symbol("io", "std::io", "pub mod io {}"),
+                symbol("ioctl", "sys::ioctl", "pub fn ioctl() {}"),
+            ],
+            "analyzer-0",
+        );
+        let answered = |query: &str| -> Vec<String> {
+            let parsed = ParsedQuery::parse(query).expect("the query must be accepted");
+            index
+                .scored(&parsed, QueryPhase::Precise)
+                .into_iter()
+                .map(|(identity, _)| identity.as_str().to_owned())
+                .collect()
+        };
+        assert_eq!(answered("io"), ["symbol:std::io"], "a short term is whole");
+        assert_eq!(
+            answered("ioc").len(),
+            1,
+            "a term at the bound widens to a prefix"
+        );
+    }
+
+    #[test]
+    fn test_a_query_with_no_member_and_a_corpus_with_no_document_score_nothing() {
+        let index = MemoryIndex::new(
+            vec![symbol("spawn", "task::spawn", "pub fn spawn() {}")],
+            "analyzer-0",
+        );
+        let empty_query = ParsedQuery::parse("...").expect("punctuation alone is accepted");
+        assert!(empty_query.is_empty());
+        assert!(index.scored(&empty_query, QueryPhase::Precise).is_empty());
+        let spawn = ParsedQuery::parse("spawn").expect("the query must be accepted");
+        let empty_index = MemoryIndex::new(Vec::new(), "analyzer-0");
+        assert!(empty_index.scored(&spawn, QueryPhase::Precise).is_empty());
     }
 
     fn symbol(name: &str, qualified_name: &str, source: &str) -> IndexDocument {

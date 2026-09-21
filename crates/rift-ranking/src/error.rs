@@ -163,3 +163,111 @@ pub(crate) fn refuse_over_limit(
 pub(crate) fn count(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{RankingFault, RankingViolation, count, refuse, refuse_over_limit};
+    use rift_core::{Error, ErrorCode, ErrorName, Fault as _};
+
+    /// Every violation this crate can raise, so a new one has to name its code
+    /// here before it can reach a caller.
+    const EVERY_VIOLATION: [RankingViolation; 11] = [
+        RankingViolation::QueryEmpty,
+        RankingViolation::QueryLength,
+        RankingViolation::QueryTermLength,
+        RankingViolation::QueryQuoteUnterminated,
+        RankingViolation::QueryPhraseLimit,
+        RankingViolation::DocumentIdentityEmpty,
+        RankingViolation::DocumentFieldLength,
+        RankingViolation::RankingWeightsInvalid,
+        RankingViolation::FusionConstantInvalid,
+        RankingViolation::CapabilitiesIncompatible,
+        RankingViolation::ReaderFailed,
+    ];
+
+    #[test]
+    fn test_every_violation_classifies_as_the_code_its_caller_acts_on() {
+        for violation in EVERY_VIOLATION {
+            let name = RankingFault::new(violation).name();
+            let expected = match violation {
+                RankingViolation::QueryEmpty
+                | RankingViolation::QueryLength
+                | RankingViolation::QueryTermLength
+                | RankingViolation::QueryQuoteUnterminated
+                | RankingViolation::QueryPhraseLimit => ErrorCode::InvalidRequest,
+                RankingViolation::DocumentIdentityEmpty
+                | RankingViolation::DocumentFieldLength
+                | RankingViolation::CapabilitiesIncompatible => ErrorCode::InternalError,
+                RankingViolation::RankingWeightsInvalid
+                | RankingViolation::FusionConstantInvalid => ErrorCode::ConfigurationInvalid,
+                RankingViolation::ReaderFailed => ErrorCode::StorageFailure,
+            };
+            assert_eq!(
+                name,
+                ErrorName::Wire(expected),
+                "{violation:?} must classify as {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_store_failure_rides_the_source_chain_rather_than_the_subject() {
+        // The contract is storage-independent, so it cannot restate a store's own
+        // violation. Carrying the failure itself is what keeps the driver text
+        // reachable from the refusal a caller reads.
+        let store = std::io::Error::other("the database is locked");
+        let fault = RankingFault::new(RankingViolation::ReaderFailed)
+            .about("lexical")
+            .caused_by(store);
+        assert_eq!(fault.violation(), RankingViolation::ReaderFailed);
+        let carried = fault.source().expect("the store failure rides along");
+        assert!(
+            carried.to_string().contains("the database is locked"),
+            "the driver text stays reachable: {carried}"
+        );
+        let context: Vec<(String, String)> = fault
+            .context()
+            .into_iter()
+            .map(|held| (held.key().to_owned(), held.value().to_owned()))
+            .collect();
+        assert!(context.contains(&("violation".to_owned(), "reader_failed".to_owned())));
+        assert!(context.contains(&("subject".to_owned(), "lexical".to_owned())));
+        assert!(
+            fault.limit_evidence().is_none(),
+            "a store failure carries no bound"
+        );
+        let rendered = Error::new(fault).to_string();
+        assert!(!rendered.is_empty());
+    }
+
+    #[test]
+    fn test_a_bounded_refusal_carries_the_limit_and_what_was_needed() {
+        let refused = refuse_over_limit(
+            RankingViolation::QueryLength,
+            "query",
+            "query",
+            4_096,
+            5_000,
+        );
+        let evidence = refused
+            .fault()
+            .limit_evidence()
+            .expect("an over-limit refusal carries its bound");
+        assert_eq!(evidence.field, "query");
+        assert_eq!(evidence.limit, 4_096);
+        assert_eq!(evidence.required, 5_000);
+        assert!(
+            refuse(RankingViolation::QueryEmpty, "query")
+                .fault()
+                .limit_evidence()
+                .is_none(),
+            "an empty query meets no bound, so it reports none"
+        );
+    }
+
+    #[test]
+    fn test_a_count_widens_into_the_domain_the_evidence_carries() {
+        assert_eq!(count(0), 0);
+        assert_eq!(count(4_096), 4_096);
+    }
+}

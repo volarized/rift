@@ -665,7 +665,11 @@ impl RiftOpenAiEmbeddingModel {
     /// # Errors
     ///
     /// Returns `model_source_invalid` when the HTTP client cannot be built or
-    /// the endpoint cannot be used as a base URL.
+    /// the endpoint cannot be used as a base URL. Neither arm is reachable from
+    /// a test: `reqwest`'s builder fails only when its TLS backend cannot start,
+    /// and Rig 0.42.0 never constructs `ClientBuilderError::InvalidProperty`, so
+    /// its builder carries no validation of its own. Acceptance refuses a
+    /// malformed endpoint before it reaches here.
     pub fn new(settings: &RemoteEmbeddingSettings) -> Result<Self, SearchError> {
         let http = reqwest::Client::builder()
             .timeout(settings.request_timeout)

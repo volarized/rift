@@ -86,6 +86,26 @@ impl PackageIndex {
         }
     }
 
+    /// One exported declaration as an index document, or nothing when its address
+    /// or one of its fields runs past the document shape.
+    fn package_document(
+        unit: &SourceUnitId,
+        file: &IndexedFile,
+        symbol: &SyntaxSymbol,
+    ) -> Option<IndexDocument> {
+        let identity = DocumentIdentity::for_unit(unit, &symbol.qualified_name).ok()?;
+        let fields = declaration_fields(file, symbol);
+        let digest = fields.digest();
+        IndexDocument::new(
+            identity,
+            DocumentLocation::Unit(unit.clone()),
+            DocumentKind::Symbol,
+            digest,
+            fields,
+        )
+        .ok()
+    }
+
     /// The reader this package answers ranking through.
     ///
     /// Every index in this workspace derives its document fields with the same
@@ -165,30 +185,33 @@ impl PackageIndex {
     pub fn index_documents(&self) -> Vec<IndexDocument> {
         let package = self.identity().clone();
         let mut documents = Vec::with_capacity(self.declaration_count);
-        for file in self.files() {
-            let Some(unit) = self.unit_of(file) else {
-                continue;
-            };
+        let mut left_out = 0_usize;
+        // The analyzed files carry their own placement, so the unit a document is
+        // addressed by comes from the file rather than from a lookup that could
+        // answer nothing.
+        for held in &self.files {
+            let file = held.file();
+            let unit = held.placement().unit();
             for symbol in file.syntax().symbols() {
-                if !self.is_public(file.path(), symbol) {
+                if !held.is_public(&symbol.qualified_name) {
                     continue;
                 }
-                let Ok(identity) = DocumentIdentity::for_unit(unit, &symbol.qualified_name) else {
-                    continue;
-                };
-                let fields = declaration_fields(file, symbol);
-                let digest = fields.digest();
-                let Ok(document) = IndexDocument::new(
-                    identity,
-                    DocumentLocation::Unit(unit.clone()),
-                    DocumentKind::Symbol,
-                    digest,
-                    fields,
-                ) else {
-                    continue;
-                };
-                documents.push(document.in_package(package.clone()));
+                match Self::package_document(unit, file, symbol) {
+                    Some(document) => documents.push(document.in_package(package.clone())),
+                    None => left_out += 1,
+                }
             }
+        }
+        if left_out > 0 {
+            tracing::warn!(
+                component = "index",
+                operation = "index.package",
+                package = package.name.as_str(),
+                left_out,
+                "declarations left out of the package corpus: an address or a field runs \
+                 past the document shape; the package still answers get_symbol and \
+                 identifier search"
+            );
         }
         documents
     }

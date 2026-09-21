@@ -1059,6 +1059,25 @@ mod tests {
     }
 
     #[test]
+    fn test_the_acquired_files_name_the_directory_they_were_placed_in() {
+        // An acquisition answers paths, and a caller copying or inspecting the
+        // model needs the one directory the three sit in.
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let held = root.path().join("model");
+        std::fs::create_dir_all(&held).expect("the directory is created");
+        for name in [
+            super::CONFIGURATION_FILE,
+            super::TOKENIZER_FILE,
+            super::WEIGHTS_FILE,
+        ] {
+            std::fs::write(held.join(name), "{}").expect("the file is written");
+        }
+        let files = ModelFiles::in_snapshot(&held, "dd0a482").expect("the three files are there");
+        assert_eq!(files.directory(), Some(held.as_path()));
+        assert_eq!(files.revision(), "dd0a482");
+    }
+
+    #[test]
     fn test_limits_report_what_they_were_built_with() {
         let limits = EncoderLimits::new(32, 256, 4096);
         assert_eq!(limits.batch_declarations(), 32);

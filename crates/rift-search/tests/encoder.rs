@@ -393,7 +393,8 @@ mod through_the_embedding_contract {
     use super::{HIDDEN, TestResult, loaded, write_model};
     use rift_search::{
         BatchSchedule, EmbeddingModels, EmbeddingSpace, LOCAL_INPUTS_MAX, LocalEncoder,
-        QueryTransformation, RetrievalModels,
+        QueryTransformation, RetrievalModels, RiftLocalDocumentModel, RiftLocalQueryModel,
+        RiftOpenAiEmbeddingModel,
     };
     use rig_core::embeddings::EmbeddingModel as _;
     use std::sync::Arc;
@@ -414,6 +415,57 @@ mod through_the_embedding_contract {
             held.query(),
             space,
         )))
+    }
+
+    #[tokio::test]
+    async fn rig_builds_each_handle_from_the_encoder_it_was_handed() -> TestResult {
+        // Rift never calls `make`; the trait requires it, and a handle built from
+        // the wrong side of the encoder would be invisible until a Rig client of
+        // these models' own type existed.
+        let directory = tempfile::tempdir()?;
+        write_model(directory.path())?;
+        let held = LocalEncoder::new(Arc::new(loaded(directory.path())?));
+        let documents = RiftLocalDocumentModel::make(&held, "fixture", None);
+        let query = RiftLocalQueryModel::make(&held, "fixture", None);
+        assert_eq!(documents.ndims(), HIDDEN);
+        assert_eq!(query.ndims(), HIDDEN);
+        let asked = query.embed_texts(vec!["load config".to_owned()]).await?;
+        let built = held
+            .query()
+            .embed_texts(vec!["load config".to_owned()])
+            .await?;
+        assert_eq!(
+            asked[0].vec, built[0].vec,
+            "the handle Rig builds is the handle the encoder answers"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_pair_answers_the_space_both_of_its_handles_embed_into() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let models = pair(directory.path())?;
+        assert_eq!(models.space().dimensions(), HIDDEN);
+        let remote = EmbeddingModels::OpenAi(RetrievalModels::new(
+            RiftOpenAiEmbeddingModel::new(&remote_settings())?,
+            RiftOpenAiEmbeddingModel::new(&remote_settings())?,
+            EmbeddingSpace::remote("https://api.openai.com/v1", "model", "2024-01-25", 1_536),
+        ));
+        assert_eq!(remote.space().dimensions(), 1_536);
+        assert_ne!(models.space().identity(), remote.space().identity());
+        Ok(())
+    }
+
+    fn remote_settings() -> rift_search::RemoteEmbeddingSettings {
+        rift_search::RemoteEmbeddingSettings {
+            endpoint: "https://api.openai.com/v1".to_owned(),
+            model: "text-embedding-3-small".to_owned(),
+            revision: "2024-01-25".to_owned(),
+            dimensions: 1_536,
+            api_key: "test-key".to_owned(),
+            request_timeout: std::time::Duration::from_secs(5),
+            attempts: 1,
+        }
     }
 
     #[tokio::test]
