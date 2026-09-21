@@ -197,7 +197,9 @@ pub fn split_identifier_words(name: &str) -> Vec<String> {
             }
             continue;
         }
-        if !current.is_empty() && starts_word(&characters, index) {
+        if let Some(previous) = current.chars().next_back()
+            && starts_word(previous, character, characters.get(index + 1).copied())
+        {
             words.push(std::mem::take(&mut current));
         }
         current.push(character);
@@ -208,36 +210,25 @@ pub fn split_identifier_words(name: &str) -> Vec<String> {
     words
 }
 
-/// Whether the character at `index` opens a new word inside a run of
-/// alphanumerics.
-fn starts_word(characters: &[char], index: usize) -> bool {
-    let character = characters[index];
-    if !character.is_uppercase() {
-        return false;
-    }
-    let Some(previous) = index
-        .checked_sub(1)
-        .and_then(|before| characters.get(before))
-    else {
-        return false;
-    };
-    if !previous.is_alphanumeric() {
-        return false;
-    }
-    if previous.is_lowercase() || previous.is_numeric() {
-        return true;
-    }
-    characters
-        .get(index + 1)
-        .is_some_and(|next| next.is_lowercase())
+/// Whether `character` opens a new word after `previous`, with `next` the
+/// character that follows it.
+///
+/// `previous` is the last character the word already holds, so the caller has
+/// already established that the run of alphanumerics continues here.
+fn starts_word(previous: char, character: char, next: Option<char>) -> bool {
+    character.is_uppercase()
+        && (previous.is_lowercase()
+            || previous.is_numeric()
+            || next.is_some_and(char::is_lowercase))
 }
 
 /// Derives the `identifier_terms` field from the names a document carries.
 ///
-/// Each source splits into words, every word lowercases, duplicates drop, and
-/// a word equal to its own whole source drops as well: that spelling already
-/// sits in `name` or `qualified_name`, and repeating it there and here would
-/// count one term twice in the same document's length.
+/// Each source splits into words, every word lowercases, and duplicates drop.
+/// A word equal to any of the sources drops too, not merely the one it came
+/// from: `search` split out of `read::search` is the word `name` already
+/// holds, and a term sitting in `name`, in `qualified_name`, and here would be
+/// counted three times over in one document's frequency.
 ///
 /// The result is bounded by `bytes_max`, cut at a word boundary so a partial
 /// word never enters the corpus.
@@ -246,12 +237,16 @@ pub fn identifier_terms<'a>(
     sources: impl IntoIterator<Item = &'a str>,
     bytes_max: usize,
 ) -> String {
+    let sources: Vec<&str> = sources.into_iter().collect();
+    // The comparison is against every source's own whole spelling, not just the
+    // one a word came from. Splitting still reads the original casing, because
+    // the case boundary is what produces the word.
+    let spelled: Vec<String> = sources.iter().map(|source| source.to_lowercase()).collect();
     let mut terms: Vec<String> = Vec::new();
-    for source in sources {
-        let whole = source.to_lowercase();
+    for source in &sources {
         for word in split_identifier_words(source) {
             let word = word.to_lowercase();
-            if word == whole || terms.contains(&word) {
+            if spelled.contains(&word) || terms.contains(&word) {
                 continue;
             }
             terms.push(word);
@@ -470,8 +465,22 @@ mod tests {
     fn test_derived_terms_deduplicate_across_sources() {
         assert_eq!(
             identifier_terms(["SearchHit", "search::SearchHit"], 128),
-            "search hit"
+            "search hit",
+            "the case boundary still produces the words; only a word another source \
+             already spells whole is dropped"
         );
+    }
+
+    #[test]
+    fn test_a_word_another_source_already_spells_whole_is_dropped() {
+        assert_eq!(
+            identifier_terms(["search", "read::search"], 128),
+            "read",
+            "the short name already sits in its own field; repeating it here would \
+             count one term twice in the document's frequency"
+        );
+        assert_eq!(identifier_terms(["beacon", "crate::beacon"], 128), "crate");
+        assert_eq!(identifier_terms(["run", "a::b::c::run"], 128), "a b c");
     }
 
     #[test]

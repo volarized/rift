@@ -100,13 +100,16 @@ impl ParsedQuery {
     ///
     /// # Errors
     ///
-    /// Returns [`RankingError`] naming `query` when the text is empty or past
-    /// [`QUERY_BYTES_MAX`], when a quote opens and never closes, when one
+    /// Returns [`RankingError`] naming `query` when the text is empty, when it
+    /// runs past [`QUERY_BYTES_MAX`], when a quote opens and never closes, when one
     /// member runs past [`QUERY_TERM_BYTES_MAX`], or when the text carries
     /// more quoted phrases than [`PARSED_QUERY_MEMBERS_MAX`]: phrases cannot
     /// be dropped without changing what the caller asked for.
     pub fn parse(query: &str) -> Result<Self, RankingError> {
-        if query.len() < QUERY_BYTES_MIN || query.len() > QUERY_BYTES_MAX {
+        if query.len() < QUERY_BYTES_MIN {
+            return Err(refuse(RankingViolation::QueryEmpty, "query"));
+        }
+        if query.len() > QUERY_BYTES_MAX {
             return Err(refuse_over_limit(
                 RankingViolation::QueryLength,
                 "query",
@@ -240,11 +243,11 @@ fn render_member(member: &QueryMember) -> String {
 }
 
 /// Whether an unquoted term is long enough to widen to a prefix.
+///
+/// [`push_terms`] already split on every non-alphanumeric boundary, so a
+/// term's own length is its alphanumeric count.
 fn takes_prefix(term: &str) -> bool {
-    term.chars()
-        .filter(|character| character.is_alphanumeric())
-        .count()
-        >= QUERY_PREFIX_ALPHANUMERIC_MIN
+    term.chars().count() >= QUERY_PREFIX_ALPHANUMERIC_MIN
 }
 
 /// One FTS5 string literal: the value in double quotes, with an embedded
@@ -283,8 +286,14 @@ fn scan(query: &str) -> Result<Vec<QueryMember>, RankingError> {
     Ok(members)
 }
 
-/// Splits one unquoted span on non-alphanumeric boundaries, matching how the
-/// stored text was tokenized, and appends every non-empty term.
+/// Splits one unquoted span on non-alphanumeric boundaries and appends every
+/// term it yields.
+///
+/// The boundary matches [`CORPUS_TOKENIZER`]: `unicode61` keeps the Unicode
+/// letter and number categories inside a token and separates on everything
+/// else, which is what `char::is_alphanumeric` answers.
+///
+/// [`CORPUS_TOKENIZER`]: crate::document::CORPUS_TOKENIZER
 fn push_terms(members: &mut Vec<QueryMember>, span: &str) -> Result<(), RankingError> {
     for term in span.split(|character: char| !character.is_alphanumeric()) {
         if term.is_empty() {
@@ -417,7 +426,7 @@ mod tests {
 
     #[test]
     fn test_an_empty_query_is_refused_for_its_length() {
-        assert_eq!(violation(""), RankingViolation::QueryLength);
+        assert_eq!(violation(""), RankingViolation::QueryEmpty);
     }
 
     #[test]
@@ -485,6 +494,26 @@ mod tests {
         assert_eq!(query.members().len(), 2);
         assert!(query.members()[0].is_phrase());
         assert!(!query.members()[1].is_phrase());
+    }
+
+    #[test]
+    fn test_the_term_boundary_keeps_every_character_the_tokenizer_keeps() {
+        // The split boundary and `unicode61` have to agree on what belongs inside a
+        // token: a character kept here but separated there renders a literal that
+        // matches nothing, and a character separated here but kept there splits one
+        // indexed token into members that match nothing either. `unicode61` keeps the
+        // whole Unicode letter and number categories, the vulgar fraction and the
+        // Roman numeral among them, which is what `is_alphanumeric` answers.
+        assert_eq!(
+            texts(&parsed("scale \u{bd} inch")),
+            ["scale", "\u{bd}", "inch"]
+        );
+        assert_eq!(texts(&parsed("chapter \u{2168}")), ["chapter", "\u{2168}"]);
+        assert_eq!(texts(&parsed("x \u{b2}")), ["x", "\u{b2}"]);
+        assert_eq!(
+            texts(&parsed("\u{434}\u{43e}\u{43c} 42")),
+            ["\u{434}\u{43e}\u{43c}", "42"]
+        );
     }
 
     #[test]

@@ -399,11 +399,13 @@ impl RankedCandidates {
 
 /// Fuses `inputs` by weighted reciprocal rank.
 ///
-/// Only inputs that answered take part, and the shares of the kinds that
-/// answered normalize against each other, so an unavailable input changes no
-/// order. Several selected indexes may each contribute a list of one kind;
-/// that kind's share then splits evenly among them, so adding a second index
-/// does not double what full-text matching is worth. Every candidate is
+/// Only inputs that answered take part, so an unavailable input contributes
+/// nothing and leaves the order the remaining inputs state. An input that
+/// placed nothing has not answered, so an index reaching for a kind and
+/// finding none of it takes no share from the index that did find some.
+/// Several selected indexes may each place a list of one kind; that kind's
+/// share then splits evenly among them, so adding a second index does not
+/// double what full-text matching is worth. Every candidate is
 /// stamped with `phase` and with the fields and inputs that placed it. The
 /// order is descending fused value, ties broken by identity ascending, cut to
 /// `keep_max`.
@@ -425,11 +427,7 @@ pub fn fuse(
         .iter()
         .filter(|input| input.answered() && weights.share(input.kind()) > 0.0)
         .collect();
-    let mut kinds: Vec<RankingInputKind> = answering.iter().map(|input| input.kind()).collect();
-    kinds.sort_unstable();
-    kinds.dedup();
-    let shares: f64 = kinds.iter().map(|kind| weights.share(*kind)).sum();
-    if answering.is_empty() || shares <= 0.0 {
+    if answering.is_empty() {
         return RankedCandidates::empty();
     }
     let mut accumulated: BTreeMap<&DocumentIdentity, Accumulated> = BTreeMap::new();
@@ -443,16 +441,15 @@ pub fn fuse(
         accumulate(
             &mut accumulated,
             input,
-            weights.share(input.kind()) / shares / lists,
+            weights.share(input.kind()) / lists,
             weights.fusion_k(),
         );
     }
-    let ceiling = reciprocal(weights.fusion_k(), 1);
     let mut candidates: Vec<FusedCandidate> = accumulated
         .into_iter()
         .map(|(identity, held)| FusedCandidate {
             identity: identity.clone(),
-            fused: held.value / ceiling,
+            fused: held.value,
             score: 0.0,
             inputs: held.inputs,
             fields: held.fields,
@@ -486,7 +483,8 @@ struct Accumulated {
 ///
 /// A duplicate identity inside one input keeps its best position: the first
 /// occurrence is the rank the formula reads, and a later repeat adds only its
-/// fields.
+/// fields. The rank counts the distinct identities seen so far, so a repeat
+/// does not push the identities after it down a place.
 fn accumulate<'a>(
     accumulated: &mut BTreeMap<&'a DocumentIdentity, Accumulated>,
     input: &'a RankingInput,
@@ -494,7 +492,7 @@ fn accumulate<'a>(
     fusion_k: u64,
 ) {
     let mut ranked: Vec<&DocumentIdentity> = Vec::new();
-    for (position, entry) in input.order().iter().enumerate() {
+    for entry in input.order() {
         let held = accumulated.entry(entry.identity()).or_default();
         held.inputs = held.inputs.with(input.kind());
         held.fields = held.fields.union(entry.fields());
@@ -502,20 +500,26 @@ fn accumulate<'a>(
             continue;
         }
         ranked.push(entry.identity());
-        held.value += share * reciprocal(fusion_k, position + 1);
+        held.value += share * reciprocal(fusion_k, ranked.len());
     }
 }
 
 /// The reciprocal-rank contribution of a 1-based position.
 fn reciprocal(fusion_k: u64, rank: usize) -> f64 {
-    let rank = u32::try_from(rank).unwrap_or(u32::MAX);
-    1.0 / (as_float(fusion_k) + f64::from(rank))
+    1.0 / (as_float(fusion_k) + as_count(rank))
 }
 
 /// Widens the rank constant into the floating-point domain fusion works in.
-/// `fusion_k` is bounded at [`FUSION_K_MAX`], so the value is exact.
+///
+/// [`RankingWeights::new`] refuses a `fusion_k` above [`FUSION_K_MAX`], so
+/// the value is far below the exact-integer range and the conversion is
+/// lossless.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "fusion_k is bounded at FUSION_K_MAX"
+)]
 fn as_float(fusion_k: u64) -> f64 {
-    f64::from(u32::try_from(fusion_k).unwrap_or(u32::MAX))
+    fusion_k as f64
 }
 
 /// Derives every candidate's score from its place in the final order.
@@ -536,15 +540,19 @@ fn score_by_order(candidates: &mut [FusedCandidate]) {
 
 /// Widens a bounded count into the floating-point domain a score is computed
 /// in. Every count here is already bounded by the caller's `keep_max`.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "every count here is a position the readers already bounded"
+)]
 fn as_count(value: usize) -> f64 {
-    f64::from(u32::try_from(value).unwrap_or(u32::MAX))
+    value as f64
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        FUSION_K_MAX, RankedCandidates, RankedIdentity, RankingInput, RankingInputKind,
-        RankingInputSet, RankingWeights, fuse,
+        FUSION_K_MAX, FusedCandidate, RankedCandidates, RankedIdentity, RankingInput,
+        RankingInputKind, RankingInputSet, RankingWeights, fuse,
     };
     use crate::document::{DocumentIdentity, FieldSet, SearchableField};
     use crate::error::RankingViolation;
@@ -568,6 +576,10 @@ mod tests {
     /// Whether two scores agree within the last bits a literal can carry.
     fn close(computed: f64, expected: f64) -> bool {
         (computed - expected).abs() < 1e-12
+    }
+
+    fn score(candidate: &FusedCandidate) -> f64 {
+        candidate.score()
     }
 
     fn identities(ranked: &RankedCandidates) -> Vec<&str> {
@@ -717,6 +729,79 @@ mod tests {
         );
         assert_eq!(identities(&without), identities(&with_empty));
         assert_eq!(identities(&without), ["a", "b", "c"]);
+        assert_eq!(
+            without.candidates().iter().map(score).collect::<Vec<f64>>(),
+            with_empty
+                .candidates()
+                .iter()
+                .map(score)
+                .collect::<Vec<f64>>()
+        );
+    }
+
+    #[test]
+    fn test_an_input_that_answers_does_move_the_order() {
+        // The negative space of the case above: the vector input is the only
+        // difference between the two calls, so an order that stays the same
+        // when it answers would mean fusion ignored it either way.
+        let identifier = RankingInput::new(
+            RankingInputKind::Identifier,
+            order(&["a", "b", "c"], SearchableField::Name),
+        );
+        let lexical = RankingInput::new(
+            RankingInputKind::Lexical,
+            order(&["b", "a"], SearchableField::QualifiedName),
+        );
+        let vector = RankingInput::new(
+            RankingInputKind::Vector,
+            order(&["c"], SearchableField::DeclarationSource),
+        );
+        let weights = RankingWeights::new(0.1, 0.1, 0.8, 1).expect("weights must be accepted");
+        let without = fuse(
+            &[identifier.clone(), lexical.clone()],
+            weights,
+            QueryPhase::Precise,
+            10,
+        );
+        let answered = fuse(
+            &[identifier, lexical, vector],
+            weights,
+            QueryPhase::Precise,
+            10,
+        );
+        assert_eq!(identities(&without), ["a", "b", "c"]);
+        assert_eq!(identities(&answered), ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn test_a_repeat_does_not_push_the_identities_after_it_down() {
+        // The rank the formula reads counts distinct identities, so the repeat
+        // of `a` must leave `b` at rank two. Reading the raw position instead
+        // would rank `b` third and lose it to a competitor ranked second by
+        // another input.
+        let repeated = fuse(
+            &[RankingInput::new(
+                RankingInputKind::Lexical,
+                order(&["a", "a", "b"], SearchableField::Name),
+            )],
+            weights(),
+            QueryPhase::Precise,
+            10,
+        );
+        let distinct = fuse(
+            &[RankingInput::new(
+                RankingInputKind::Lexical,
+                order(&["a", "b"], SearchableField::Name),
+            )],
+            weights(),
+            QueryPhase::Precise,
+            10,
+        );
+        assert_eq!(identities(&repeated), ["a", "b"]);
+        assert!(close(
+            repeated.candidates()[1].fused,
+            distinct.candidates()[1].fused
+        ));
     }
 
     #[test]

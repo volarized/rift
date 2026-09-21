@@ -7,7 +7,9 @@ use serde::Serialize;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RankingViolation {
-    /// A query is empty or runs past the accepted byte bound.
+    /// A query carries no text at all.
+    QueryEmpty,
+    /// A query runs past the accepted byte bound.
     QueryLength,
     /// One term or quoted phrase runs past the accepted byte bound.
     QueryTermLength,
@@ -27,19 +29,24 @@ pub enum RankingViolation {
     FusionConstantInvalid,
     /// Two publications state index capabilities that cannot rank together.
     CapabilitiesIncompatible,
+    /// The store behind one reader refused, and its own failure rides as the
+    /// cause.
+    ReaderFailed,
 }
 
 impl RankingViolation {
     /// The registry identity this violation classifies as.
     const fn name(self) -> ErrorName {
         match self {
-            Self::QueryLength
+            Self::QueryEmpty
+            | Self::QueryLength
             | Self::QueryTermLength
             | Self::QueryQuoteUnterminated
             | Self::QueryPhraseLimit => ErrorName::Wire(ErrorCode::InvalidRequest),
             Self::DocumentIdentityEmpty
             | Self::DocumentFieldLength
             | Self::CapabilitiesIncompatible => ErrorName::Wire(ErrorCode::InternalError),
+            Self::ReaderFailed => ErrorName::Wire(ErrorCode::StorageFailure),
             Self::RankingWeightsInvalid | Self::FusionConstantInvalid => {
                 ErrorName::Wire(ErrorCode::ConfigurationInvalid)
             }
@@ -53,6 +60,7 @@ pub struct RankingFault {
     violation: RankingViolation,
     subject: Option<String>,
     limit: Option<LimitEvidence>,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
 impl RankingFault {
@@ -63,6 +71,7 @@ impl RankingFault {
             violation,
             subject: None,
             limit: None,
+            source: None,
         }
     }
 
@@ -81,6 +90,15 @@ impl RankingFault {
             limit: count(limit),
             required: count(required),
         });
+        self
+    }
+
+    /// Carries the failure a store answered with, so its own classification and
+    /// driver text stay on the source chain rather than being flattened into a
+    /// rendered subject.
+    #[must_use]
+    pub fn caused_by(mut self, source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        self.source = Some(Box::new(source));
         self
     }
 
@@ -106,6 +124,12 @@ impl Fault for RankingFault {
 
     fn limit_evidence(&self) -> Option<LimitEvidence> {
         self.limit.clone()
+    }
+
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
     }
 }
 

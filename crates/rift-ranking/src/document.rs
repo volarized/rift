@@ -17,7 +17,11 @@ use sha2::{Digest as _, Sha256};
 use crate::error::{RankingError, RankingViolation, refuse, refuse_over_limit};
 
 /// Bytes one document identity may hold.
-pub const IDENTITY_BYTES_MAX: usize = 512;
+///
+/// The wire bounds a declaration address and a source unit address at the same
+/// ceiling, so an address a caller can be handed is one this shape can publish.
+/// A shorter ceiling here would refuse a document for a legal path.
+pub const IDENTITY_BYTES_MAX: usize = 8_192;
 /// Bytes the `name` and `qualified_name` fields may hold, matching the wire's
 /// symbol-name maximum.
 pub const NAME_BYTES_MAX: usize = 4_096;
