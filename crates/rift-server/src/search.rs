@@ -6,21 +6,27 @@
 use std::cmp::Ordering;
 use std::path::Path;
 
-use rift_core::ProjectPath;
-use rift_core::constants::{FORCE_INCLUDE_FILES_MAX, SEARCH_RESULTS_DEFAULT};
+use rift_core::constants::{
+    FORCE_INCLUDE_FILES_MAX, SEARCH_RESULTS_DEFAULT, SOURCE_UNIT_URI_PREFIX, SYMBOL_URI_PREFIX,
+};
 use rift_core::line;
+use rift_core::{ProjectPath, SourceUnitId};
 use rift_index::{
-    DependencyIndex, DependencySymbolMatch, IndexedFile, LexicalChange, LexicalUnit,
-    LexicalUnitKind, PathChanges, PathMatcher, SymbolMatch, SymbolMatchRank, TextSourceFile,
-    WorkspaceIndex,
+    DependencyIndex, DependencySymbolMatch, IndexedFile, LexicalChange, PathChanges, PathMatcher,
+    SymbolMatch, TextSourceFile, WorkspaceIndex,
 };
 use rift_protocol::read::{
     CHANGE_BASE_FIELD, CHANGE_HEAD_FIELD, MatchedField, PathPattern, PathSelector,
     ProjectPath as WireProjectPath, ReadWarning, ResultOrder, SearchChange, SearchHit,
     SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget, SearchResult, SearchScope,
-    SearchTraversal, SourceUnitId, Symbol, SymbolId,
+    SearchTraversal, SourceUnitId as WireSourceUnitId, Symbol, SymbolId,
 };
-use rift_search::{Declaration, DescribedUnit, RankedUnit};
+use rift_ranking::{
+    DocumentIdentity, DocumentKind, DocumentLocation, FusedCandidate, IdentifierMatchClass,
+    IdentifierRanking, IndexDocument, ParsedQuery, QueryPhase, RankedCandidates, RankingInput,
+    RankingWeights, SearchableField, fuse,
+};
+use rift_search::{Declaration, DescribedUnit};
 use rift_syntax::{ByteRange, SyntaxSymbol};
 
 use crate::engine_read::EngineReferences;
@@ -35,26 +41,104 @@ use crate::traversal::{
     TraversalReport, collect_traversal_hits, traversal_truncation_warning, validate_traversal,
 };
 
+/// What the search store answered for one request, and the shares the three ranking
+/// inputs fuse under.
+///
+/// Both phases arrive together because the reader that runs them sits above this layer
+/// and cannot know, before fusion, whether the precise answer filled the pool. Running
+/// the broad phase costs one more full-text query; letting its results appear when the
+/// precise phase already filled the pool would cost correctness, so the decision stays
+/// here and the extra query is the price.
+#[derive(Clone, Debug)]
+pub struct StoreAnswer {
+    precise: Vec<RankingInput>,
+    broad: Vec<RankingInput>,
+    weights: RankingWeights,
+}
+
+impl StoreAnswer {
+    /// Names what the store answered for each phase, and the configured shares.
+    #[must_use]
+    pub const fn new(
+        precise: Vec<RankingInput>,
+        broad: Vec<RankingInput>,
+        weights: RankingWeights,
+    ) -> Self {
+        Self {
+            precise,
+            broad,
+            weights,
+        }
+    }
+
+    /// No store answer at all: the identifier ranking is the only input, so it carries
+    /// the whole share whatever the operator configured.
+    #[must_use]
+    pub fn identifier_only() -> Self {
+        Self {
+            precise: Vec::new(),
+            broad: Vec::new(),
+            weights: RankingWeights::identifier_only(),
+        }
+    }
+
+    /// The inputs the precise phase produced.
+    #[must_use]
+    pub fn precise(&self) -> &[RankingInput] {
+        &self.precise
+    }
+
+    /// The inputs the broad phase produced, empty when the query has no broad phase.
+    #[must_use]
+    pub fn broad(&self) -> &[RankingInput] {
+        &self.broad
+    }
+
+    /// The shares the three inputs fuse under.
+    #[must_use]
+    pub const fn weights(&self) -> RankingWeights {
+        self.weights
+    }
+}
+
+impl Default for StoreAnswer {
+    fn default() -> Self {
+        Self::identifier_only()
+    }
+}
+
+/// Parses one caller query through the shared bounded parser.
+///
+/// Every reader parses the same text the same way, so the terms the full-text ranking
+/// matches, the identifiers the identifier ranking extracts, and the excerpt a hit points
+/// at all come from one value.
+fn parsed_query(query: &str) -> Result<ParsedQuery, ReadError> {
+    ParsedQuery::parse(query).map_err(|error| ReadFault::invalid("query", error.detail()))
+}
+
 impl ReadService {
-    /// Searches indexed declarations and source lines, optionally narrowed or extended by
-    /// `params.paths`, merged with `ranked` from the caller's search index - the lexical
-    /// and vector rankings already fused into one score. `ranked` is empty when that
-    /// index is unavailable or its stamped revision no longer matches what is published -
-    /// the caller decides that, this method only merges what it is handed. `params.scope`
-    /// selects what the lexical `query` runs over: the project lanes, the attached
-    /// dependency index, or both, ordered together by `params.order`.
+    /// Searches one publication, fusing the caller's identifiers with what the search
+    /// store answered.
+    ///
+    /// `store` carries the full-text and vector inputs for both query phases; this method
+    /// builds the identifier input over every selected index, fuses the three under one
+    /// set of shares, and resolves the ordered identities into hits. A store that is
+    /// unavailable, or whose stamped revision no longer matches what is published,
+    /// contributes no input and the identifier ranking answers alone. `params.scope`
+    /// selects which indexes take part: the project's own, the attached package indexes,
+    /// or both, ordered together by `params.order`.
     ///
     /// # Errors
     ///
     /// Returns [`ReadError`] for an invalid `paths` glob, a `force_include` bound crossed,
-    /// a scope beyond `local` beside a revision, `global` beside `traversal`, and a
-    /// poisoned package branch.
+    /// a scope beyond `local` beside a revision, `global` beside `traversal`, a query the
+    /// bounded parser refuses, and a poisoned package branch.
     pub fn search(
         &self,
         params: &SearchParams,
-        ranked: &[RankedUnit],
+        store: &StoreAnswer,
     ) -> Result<SearchResult, ReadError> {
-        self.search_with_references(params, ranked, &EngineReferences::default())
+        self.search_with_references(params, store, &EngineReferences::default())
     }
 
     /// Searches one publication with references resolved by its configured engines.
@@ -65,7 +149,7 @@ impl ReadService {
     pub fn search_with_references(
         &self,
         params: &SearchParams,
-        ranked: &[RankedUnit],
+        store: &StoreAnswer,
         references: &EngineReferences,
     ) -> Result<SearchResult, ReadError> {
         references.validate_revision(self)?;
@@ -98,6 +182,7 @@ impl ReadService {
         warnings.extend(selected.warnings());
         warnings.extend(references.analysis_unavailable().cloned());
         if let Some(query) = query {
+            let parsed = parsed_query(query)?;
             let criteria = SearchCriteria {
                 query,
                 target: params.target,
@@ -107,7 +192,7 @@ impl ReadService {
                 criteria,
                 params.scope,
                 &selected,
-                ranked,
+                (&parsed, store),
                 dependencies.as_deref(),
                 &mut results,
             )?;
@@ -227,16 +312,18 @@ impl ReadService {
         })
     }
 
-    /// The lexical passes one `query` runs, in merge order: the indexed declarations
-    /// and lines, the `force_include` files while the pool has room for them, the ranked
-    /// units, then the cataloged packages when `scope` reaches dependencies. Every pass
-    /// appends to `results` up to the index's `results_max` bound.
+    /// Fuses the three ranking inputs for one `query` and resolves what they ordered.
+    ///
+    /// The precise phase runs first, over the identifier ranking this method builds and
+    /// whatever the store answered. The broad phase joins it only when the precise
+    /// answer left the candidate pool short, and its identities append after the precise
+    /// ones, so one index's widened hit can never displace another index's exact hit.
     fn collect_query_hits(
         &self,
         criteria: SearchCriteria<'_>,
         scope: SearchScope,
         selected: &SelectedPaths,
-        ranked: &[RankedUnit],
+        (query, store): (&ParsedQuery, &StoreAnswer),
         dependencies: Option<&DependencyIndex>,
         results: &mut Vec<SearchHit>,
     ) -> Result<(), ReadError> {
@@ -244,16 +331,37 @@ impl ReadService {
         let root = index.root();
         let matcher = selected.matcher.as_ref();
         let fetch_limit = index.results_max();
-        if scope != SearchScope::Global {
-            collect_indexed_hits(index, matcher, root, criteria, fetch_limit, results)?;
-            if results.len() < fetch_limit
-                && let Some(extra) = selected.force_include.as_ref()
-            {
-                collect_force_include_hits(extra, criteria, fetch_limit, results)?;
-            }
-            collect_ranked_hits(index, matcher, root, criteria, ranked, results)?;
+        let sources = IdentifierSources {
+            project: scope != SearchScope::Global,
+            force_include: (scope != SearchScope::Global)
+                .then_some(selected.force_include.as_ref())
+                .flatten(),
+            packages: dependencies,
+        };
+        let mut inputs = vec![identifier_input(
+            index,
+            matcher,
+            root,
+            query,
+            sources,
+            fetch_limit,
+        )?];
+        inputs.extend(store.precise().iter().cloned());
+        let mut ranked = fuse(&inputs, store.weights(), QueryPhase::Precise, fetch_limit);
+        if ranked.len() < fetch_limit && !store.broad().is_empty() {
+            let widened = fuse(
+                store.broad(),
+                store.weights(),
+                QueryPhase::Broad,
+                fetch_limit,
+            );
+            ranked.append_phase(widened, fetch_limit);
         }
-        collect_dependency_hits(dependencies, criteria, fetch_limit, results)
+        let resolution = Resolution {
+            force_include: sources.force_include,
+            packages: dependencies,
+        };
+        resolve_ranked_hits(index, matcher, root, criteria, resolution, &ranked, results)
     }
 
     /// Derives the lexical write one change set owes: the paths whose stored units go, and
@@ -267,30 +375,30 @@ impl ReadService {
     pub fn lexical_change(&self, changes: &PathChanges) -> LexicalChange {
         LexicalChange::new(
             changes.paths().cloned().collect(),
-            self.index().lexical_units_for(changes.indexed()),
+            self.index().index_documents_for(changes.indexed()),
         )
     }
 
     /// Pairs each symbol unit in `units` with the declaration the vector ranking embeds for
     /// it.
     ///
-    /// Only a symbol unit carries a declaration: a text file's chunk describes none, so it
-    /// has no entry and the two slices are never parallel. Each pair is built from one
-    /// unit's own resolution, so a unit can never pick up another unit's declaration.
+    /// Only a symbol document carries a declaration: a text file's chunk describes none, so
+    /// it has no entry and the two slices are never parallel. Each pair is built from one
+    /// document's own resolution, so a document can never pick up another's declaration.
     ///
-    /// The declaration's own source is the whole document: [`LexicalUnit::content`] already
-    /// holds the bytes the symbol was indexed from, and the text builder prefers source
-    /// over any metadata line.
+    /// The declaration's signature, its attached documentation, and its own source all
+    /// travel with the pair, because the published document already holds each of them in
+    /// its own field and the embedding text reads all three.
     ///
-    /// The walk runs over `units`, whose length this snapshot's own file and symbol bounds
-    /// already fixed, and each symbol unit costs one scan of the file it names, which is
-    /// how `resolve_symbol` narrows the lookup.
+    /// The walk runs over `documents`, whose length this snapshot's own file and symbol
+    /// bounds already fixed, and each symbol document costs one scan of the file it names,
+    /// which is how `resolve_symbol` narrows the lookup.
     #[must_use]
-    pub fn described_units<'a>(&'a self, units: &'a [LexicalUnit]) -> Vec<DescribedUnit<'a>> {
-        units
+    pub fn described_units<'a>(&'a self, documents: &'a [IndexDocument]) -> Vec<DescribedUnit<'a>> {
+        documents
             .iter()
-            .filter(|unit| unit.kind() == LexicalUnitKind::Symbol)
-            .filter_map(|unit| self.described_unit(unit))
+            .filter(|document| document.kind() == DocumentKind::Symbol)
+            .filter_map(|document| self.described_unit(document))
             .collect()
     }
 
@@ -305,10 +413,24 @@ impl ReadService {
 
     /// One symbol unit paired with its declaration, or nothing when this snapshot no longer
     /// holds the symbol the unit names.
-    fn described_unit<'a>(&'a self, unit: &'a LexicalUnit) -> Option<DescribedUnit<'a>> {
-        let (_, symbol) = resolve_symbol(self.index(), unit.path(), unit.identity())?;
-        let declaration =
-            Declaration::new(symbol.kind, &symbol.qualified_name).source(unit.content());
+    fn described_unit<'a>(&'a self, unit: &'a IndexDocument) -> Option<DescribedUnit<'a>> {
+        let DocumentLocation::Project(path) = unit.location() else {
+            return None;
+        };
+        let (_, symbol) = resolve_symbol(self.index(), path, unit.identity().as_str())?;
+        let fields = unit.fields();
+        let declaration = Declaration::new(symbol.kind, &symbol.qualified_name)
+            .signature(fields.get(SearchableField::Signature).unwrap_or_default())
+            .documentation(
+                fields
+                    .get(SearchableField::Documentation)
+                    .unwrap_or_default(),
+            )
+            .source(
+                fields
+                    .get(SearchableField::DeclarationSource)
+                    .unwrap_or_default(),
+            );
         Some(DescribedUnit::new(unit, declaration))
     }
 }
@@ -538,150 +660,332 @@ pub(crate) fn includes(matcher: Option<&PathMatcher>, root: &Path, path: &Projec
     matcher.is_none_or(|matcher| matcher.includes(&root.join(path.as_str())))
 }
 
-/// Symbol and content-line hits from the index, filtered by `matcher` and collected up to
-/// `fetch_limit` - the index's `results_max` bound, never the smaller page size - because
-/// [`order_hits`] orders this whole pool before one page is cut out of it: stopping
-/// collection at the page size could drop a later, higher-scoring candidate, and the page
-/// count states the full result set.
-fn collect_indexed_hits(
+/// The identifiers a caller's query carried, matched against every selected index.
+///
+/// One input, whichever indexes answered it: the project's own declarations, the
+/// `force_include` files this request pulled in, and the cataloged packages when `scope`
+/// reaches them. Each extracted candidate is matched separately and an identity keeps its
+/// best class, so a question naming two identifiers ranks a declaration by the stronger
+/// of the two rather than by whichever was written first.
+///
+/// Work is bounded twice over: the query contributes at most
+/// `IDENTIFIER_CANDIDATES_MAX` candidates, and each index answers at most `bound` of
+/// them.
+fn identifier_input(
+    index: &WorkspaceIndex,
+    matcher: Option<&PathMatcher>,
+    root: &Path,
+    query: &ParsedQuery,
+    sources: IdentifierSources<'_>,
+    bound: usize,
+) -> Result<RankingInput, ReadError> {
+    let mut ranking = IdentifierRanking::new();
+    if sources.project {
+        index
+            .observe_identifiers(
+                query,
+                bound,
+                |file| includes(matcher, root, file.path()),
+                &mut ranking,
+            )
+            .map_err(ReadFault::index)?;
+    }
+    if let Some(extra) = sources.force_include {
+        // A force-included file is reached by a glob the request named, so the
+        // selector's `exclude` does not take it back.
+        extra
+            .observe_identifiers(query, bound, |_| true, &mut ranking)
+            .map_err(ReadFault::index)?;
+    }
+    if let Some(packages) = sources.packages {
+        for candidate in query.candidates() {
+            for found in packages.symbols(candidate.text(), bound) {
+                let Some(identity) = package_symbol_identity(&found) else {
+                    continue;
+                };
+                ranking.observe(identity, found.matched.rank, &candidate);
+            }
+        }
+    }
+    Ok(ranking.into_input(bound))
+}
+
+/// Which indexes the identifier ranking reads.
+#[derive(Clone, Copy)]
+struct IdentifierSources<'a> {
+    project: bool,
+    force_include: Option<&'a WorkspaceIndex>,
+    packages: Option<&'a DependencyIndex>,
+}
+
+/// One package declaration's ranking identity: its source unit and its qualified name,
+/// which is what addresses it, since a package file carries no project path.
+fn package_symbol_identity(found: &DependencySymbolMatch<'_>) -> Option<DocumentIdentity> {
+    let unit = found.package.unit_of(found.matched.file)?;
+    DocumentIdentity::new(format!(
+        "{unit}{PACKAGE_IDENTITY_SEPARATOR}{}",
+        found.matched.symbol.qualified_name
+    ))
+    .ok()
+}
+
+/// Separates a package document's source unit from the qualified name inside it.
+const PACKAGE_IDENTITY_SEPARATOR: char = '#';
+
+/// Resolves every fused identity into a hit, in the order fusion produced.
+///
+/// Resolution reads the identity alone: a `rift://symbol/` address names a project or
+/// `force_include` declaration, a `rift://source/` address names a package declaration,
+/// and anything else is a project path, optionally carrying the chunk index a large text
+/// file was split at. An identity nothing resolves is skipped: the store ranked a
+/// publication this snapshot has already moved past.
+fn resolve_ranked_hits(
     index: &WorkspaceIndex,
     matcher: Option<&PathMatcher>,
     root: &Path,
     criteria: SearchCriteria<'_>,
-    fetch_limit: usize,
+    resolution: Resolution<'_>,
+    ranked: &RankedCandidates,
     results: &mut Vec<SearchHit>,
 ) -> Result<(), ReadError> {
-    let SearchCriteria {
-        query,
-        target,
-        payloads,
-    } = criteria;
-    if matches!(target, SearchParamsTarget::All | SearchParamsTarget::Symbol) {
-        for matched in index
-            .symbols(query, fetch_limit)
-            .map_err(ReadFault::index)?
-        {
-            if !includes(matcher, root, matched.file.path()) {
-                continue;
-            }
-            results.push(symbol_search_hit(index, matched, payloads)?);
-            if results.len() >= fetch_limit {
-                return Ok(());
-            }
-        }
-    }
-    if results.len() < fetch_limit
-        && matches!(target, SearchParamsTarget::All | SearchParamsTarget::File)
-    {
-        collect_indexed_content_hits(index, matcher, root, query, fetch_limit, payloads, results)?;
-    }
-    Ok(())
-}
-
-/// Content-line hits from baseline catalog, filtered by `matcher` and appended to
-/// `results` up to `fetch_limit`. A path with syntax facts answers through its
-/// provider-backed file; every other path answers through baseline text file.
-fn collect_indexed_content_hits(
-    index: &WorkspaceIndex,
-    matcher: Option<&PathMatcher>,
-    root: &Path,
-    query: &str,
-    fetch_limit: usize,
-    payloads: HitPayloads,
-    results: &mut Vec<SearchHit>,
-) -> Result<(), ReadError> {
-    for (file, line, text) in index
-        .text_matches(query, fetch_limit)
-        .map_err(ReadFault::index)?
-    {
-        if !includes(matcher, root, file.path()) {
+    let mut answered: Vec<ProjectPath> = Vec::new();
+    for candidate in ranked.candidates() {
+        let Some(resolved) = resolve_candidate(index, resolution, candidate.identity()) else {
+            continue;
+        };
+        if !resolved.reaches(index, matcher, root) {
             continue;
         }
-        if let Some(provider_file) = index.file(file.path()) {
-            results.push(file_search_hit(provider_file, line, text, payloads));
-        } else {
-            results.push(text_search_hit(file, line, text, payloads));
+        if !resolved.answers(criteria.target) {
+            continue;
         }
-        if results.len() >= fetch_limit {
-            break;
+        // A text file past the chunk bound publishes one document per chunk, and each
+        // carries its own identity through fusion. The answer names files, not chunks,
+        // so the best-ranked chunk is the one that becomes the hit and the rest of that
+        // file's chunks are already answered.
+        if let Some(path) = resolved.answered_path() {
+            if answered.contains(path) {
+                continue;
+            }
+            answered.push(path.clone());
         }
+        results.push(resolved.into_hit(criteria, candidate)?);
     }
     Ok(())
 }
 
-/// Hits from `extra` - the index [`SelectedPaths`] built over the request's
-/// `force_include` files - appended to `results` up to `fetch_limit`. The file bound was
-/// checked when that index was built, on the request rather than on the hits: this pass
-/// runs only while the pool has room, so a check here would depend on the query.
-fn collect_force_include_hits(
-    extra: &WorkspaceIndex,
-    criteria: SearchCriteria<'_>,
-    fetch_limit: usize,
-    results: &mut Vec<SearchHit>,
-) -> Result<(), ReadError> {
-    let SearchCriteria {
-        query,
-        target,
-        payloads,
-    } = criteria;
-    if matches!(target, SearchParamsTarget::All | SearchParamsTarget::Symbol) {
-        for matched in extra
-            .symbols(query, fetch_limit - results.len())
-            .map_err(ReadFault::index)?
-        {
-            results.push(symbol_search_hit(extra, matched, payloads)?);
-        }
-    }
-    if results.len() < fetch_limit
-        && matches!(target, SearchParamsTarget::All | SearchParamsTarget::File)
-    {
-        for (file, line, text) in
-            rift_index::source_line_matches(extra.files(), query, fetch_limit - results.len())
-        {
-            results.push(file_search_hit(file, line, text, payloads));
-        }
-    }
-    if results.len() < fetch_limit
-        && matches!(target, SearchParamsTarget::All | SearchParamsTarget::File)
-    {
-        for (file, line, text) in extra
-            .text_matches(query, fetch_limit - results.len())
-            .map_err(ReadFault::index)?
-        {
-            if extra.file(file.path()).is_none() {
-                results.push(text_search_hit(file, line, text, payloads));
+/// The indexes one resolution may read.
+#[derive(Clone, Copy)]
+struct Resolution<'a> {
+    force_include: Option<&'a WorkspaceIndex>,
+    packages: Option<&'a DependencyIndex>,
+}
+
+/// What one fused identity turned out to name.
+enum ResolvedCandidate<'a> {
+    /// A declaration, and the index that holds it: the served project's own,
+    /// or the one this request built over its `force_include` files. The
+    /// index travels with the declaration because assembling its wire symbol
+    /// reads the graph the declaration was indexed into, and the two indexes
+    /// hold different graphs.
+    Declaration(&'a WorkspaceIndex, SymbolMatch<'a>),
+    /// A declaration in a cataloged package.
+    Package(DependencySymbolMatch<'a>),
+    /// A syntax-indexed file this request matched whole.
+    SourceFile(&'a IndexedFile),
+    /// A baseline text file this request matched whole.
+    TextFile(&'a TextSourceFile),
+}
+
+impl ResolvedCandidate<'_> {
+    /// Whether the request's `target` asks for this kind of hit.
+    const fn answers(&self, target: SearchParamsTarget) -> bool {
+        match self {
+            Self::Declaration(..) | Self::Package(_) => {
+                matches!(target, SearchParamsTarget::All | SearchParamsTarget::Symbol)
+            }
+            Self::SourceFile(_) | Self::TextFile(_) => {
+                matches!(target, SearchParamsTarget::All | SearchParamsTarget::File)
             }
         }
     }
-    Ok(())
+
+    /// Whether the request's path selector reaches this candidate. A package declaration
+    /// carries no project path, so a project glob never excludes one.
+    fn reaches(
+        &self,
+        project: &WorkspaceIndex,
+        matcher: Option<&PathMatcher>,
+        root: &Path,
+    ) -> bool {
+        match self {
+            Self::Declaration(held, found) => {
+                // A force-included file is reached by a glob the selector's
+                // `exclude` cannot then take back: the request named it.
+                !std::ptr::eq(*held, project) || includes(matcher, root, found.file.path())
+            }
+            Self::SourceFile(file) => includes(matcher, root, file.path()),
+            Self::TextFile(file) => includes(matcher, root, file.path()),
+            Self::Package(_) => true,
+        }
+    }
+
+    /// The path this candidate answers whole, for a candidate that answers a file
+    /// rather than a declaration. A declaration has its own identity, so two of them
+    /// never collapse.
+    const fn answered_path(&self) -> Option<&ProjectPath> {
+        match self {
+            Self::SourceFile(file) => Some(file.path()),
+            Self::TextFile(file) => Some(file.path()),
+            Self::Declaration(..) | Self::Package(_) => None,
+        }
+    }
+
+    /// The wire hit this candidate becomes, scored by its place in the fused order.
+    fn into_hit(
+        self,
+        criteria: SearchCriteria<'_>,
+        candidate: &FusedCandidate,
+    ) -> Result<SearchHit, ReadError> {
+        let score = Some(candidate.score());
+        let matched_by = matched_fields(candidate);
+        match self {
+            Self::Declaration(held, found) => {
+                build_symbol_hit(held, found, score, matched_by, criteria.payloads)
+            }
+            Self::Package(found) => {
+                dependency_symbol_hit(found, score, matched_by, criteria.payloads)
+            }
+            Self::SourceFile(file) => {
+                let (line, range, text) = locate_query_line(file.source(), criteria.query);
+                Ok(source_file_hit(
+                    file,
+                    (line, range, text),
+                    (score, matched_by),
+                    criteria.payloads,
+                ))
+            }
+            Self::TextFile(file) => {
+                let (line, range, text) = locate_query_line(file.content(), criteria.query);
+                Ok(text_file_hit(
+                    file,
+                    (line, range, text),
+                    (score, matched_by),
+                    criteria.payloads,
+                ))
+            }
+        }
+    }
 }
 
-/// Public declarations from the cataloged packages: `index` answers `query` up to
-/// `fetch_limit`, ranked as the project index ranks, and each match becomes a symbol hit
-/// addressed by `unit`. A `file` target answers nothing here, since a package contributes
-/// declarations alone. No index - the scope stays at the project, or no store is
-/// attached - contributes nothing.
-fn collect_dependency_hits(
-    index: Option<&DependencyIndex>,
-    criteria: SearchCriteria<'_>,
-    fetch_limit: usize,
-    results: &mut Vec<SearchHit>,
-) -> Result<(), ReadError> {
-    let Some(index) = index else {
-        return Ok(());
+/// The wire fields one fused candidate matched through.
+///
+/// A candidate the full-text ranking placed names the columns that carried the term. A
+/// candidate only the vector ranking placed names no column at all, because no literal
+/// byte of the query appears in it, and answers [`MatchedField::Ranked`] instead.
+fn matched_fields(candidate: &FusedCandidate) -> Vec<MatchedField> {
+    let mut fields: Vec<MatchedField> = Vec::new();
+    for field in candidate.fields().fields() {
+        let wire = match field {
+            SearchableField::Name
+            | SearchableField::QualifiedName
+            | SearchableField::IdentifierTerms => MatchedField::Name,
+            SearchableField::Signature => MatchedField::Signature,
+            SearchableField::Documentation => MatchedField::Documentation,
+            SearchableField::DeclarationSource | SearchableField::FileContent => {
+                MatchedField::Content
+            }
+        };
+        if !fields.contains(&wire) {
+            fields.push(wire);
+        }
+    }
+    if fields.is_empty() {
+        fields.push(MatchedField::Ranked);
+    }
+    fields
+}
+
+/// What one fused identity names, or `None` when no selected index holds it.
+fn resolve_candidate<'a>(
+    index: &'a WorkspaceIndex,
+    resolution: Resolution<'a>,
+    identity: &DocumentIdentity,
+) -> Option<ResolvedCandidate<'a>> {
+    let value = identity.as_str();
+    if value.starts_with(SYMBOL_URI_PREFIX) {
+        return resolve_declaration(index, resolution.force_include, value);
+    }
+    if value.starts_with(SOURCE_UNIT_URI_PREFIX) {
+        return resolve_package_declaration(resolution.packages, value);
+    }
+    resolve_file(index, value)
+}
+
+/// The declaration one `rift://symbol/` identity names, in the project index or in the
+/// `force_include` index this request built.
+fn resolve_declaration<'a>(
+    index: &'a WorkspaceIndex,
+    force_include: Option<&'a WorkspaceIndex>,
+    identity: &str,
+) -> Option<ResolvedCandidate<'a>> {
+    let address = parse_symbol_address(identity).ok()?;
+    if let Some((file, symbol)) = resolve_symbol(index, &address.path, identity) {
+        return Some(ResolvedCandidate::Declaration(
+            index,
+            declared(file, symbol),
+        ));
+    }
+    let extra = force_include?;
+    let (file, symbol) = resolve_symbol(extra, &address.path, identity)?;
+    Some(ResolvedCandidate::Declaration(
+        extra,
+        declared(file, symbol),
+    ))
+}
+
+/// One resolved declaration as a match. The class is the strongest one, because
+/// resolution answers the identity fusion already placed rather than classing a
+/// name again.
+const fn declared<'a>(file: &'a IndexedFile, symbol: &'a SyntaxSymbol) -> SymbolMatch<'a> {
+    SymbolMatch {
+        file,
+        symbol,
+        rank: IdentifierMatchClass::QualifiedExact,
+    }
+}
+
+/// The package declaration one `rift://source/` identity names.
+fn resolve_package_declaration<'a>(
+    packages: Option<&'a DependencyIndex>,
+    identity: &str,
+) -> Option<ResolvedCandidate<'a>> {
+    let (unit, qualified_name) = identity.split_once(PACKAGE_IDENTITY_SEPARATOR)?;
+    let unit = SourceUnitId::parse(unit).ok()?;
+    packages?
+        .symbol_at(&unit, qualified_name)
+        .map(ResolvedCandidate::Package)
+}
+
+/// The file one path identity names, with the chunk suffix a split text file carries
+/// stripped: every chunk of one file resolves to that file.
+///
+/// The suffix is the separator followed by the chunk's index and nothing else, so a path
+/// that carries the separator as one of its own characters is read whole.
+fn resolve_file<'a>(index: &'a WorkspaceIndex, identity: &str) -> Option<ResolvedCandidate<'a>> {
+    let path = match identity.rsplit_once(PACKAGE_IDENTITY_SEPARATOR) {
+        Some((path, chunk))
+            if !chunk.is_empty() && chunk.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            path
+        }
+        _ => identity,
     };
-    let SearchCriteria {
-        query,
-        target,
-        payloads,
-    } = criteria;
-    if target == SearchParamsTarget::File {
-        return Ok(());
+    let path = ProjectPath::new(path.to_owned()).ok()?;
+    if let Some(file) = index.file(&path) {
+        return Some(ResolvedCandidate::SourceFile(file));
     }
-    for found in index.symbols(query, fetch_limit) {
-        results.push(dependency_symbol_hit(found, payloads)?);
-    }
-    Ok(())
+    index.text_file(&path).map(ResolvedCandidate::TextFile)
 }
 
 /// Builds one dependency symbol hit's wire shape: the assembly [`build_symbol_hit`] gives
@@ -689,6 +993,8 @@ fn collect_dependency_hits(
 /// rank's score.
 fn dependency_symbol_hit(
     found: DependencySymbolMatch<'_>,
+    score: Option<f64>,
+    matched_by: Vec<MatchedField>,
     payloads: HitPayloads,
 ) -> Result<SearchHit, ReadError> {
     let matched = found.matched;
@@ -697,25 +1003,10 @@ fn dependency_symbol_hit(
         symbol,
         matched,
         (None, Some(unit)),
-        Some(symbol_match_score(matched.rank)),
-        vec![MatchedField::Name],
+        score,
+        matched_by,
         payloads,
     ))
-}
-
-fn symbol_search_hit(
-    index: &WorkspaceIndex,
-    matched: SymbolMatch<'_>,
-    payloads: HitPayloads,
-) -> Result<SearchHit, ReadError> {
-    let score = symbol_match_score(matched.rank);
-    build_symbol_hit(
-        index,
-        matched,
-        Some(score),
-        vec![MatchedField::Name],
-        payloads,
-    )
 }
 
 /// Builds one symbol hit's wire shape. `symbol_search_hit` and `merge_symbol_hit` share
@@ -751,7 +1042,7 @@ pub(crate) fn build_symbol_hit(
 fn assembled_symbol_hit(
     symbol: Symbol,
     matched: SymbolMatch<'_>,
-    (path, unit): (Option<WireProjectPath>, Option<SourceUnitId>),
+    (path, unit): (Option<WireProjectPath>, Option<WireSourceUnitId>),
     score: Option<f64>,
     matched_by: Vec<MatchedField>,
     payloads: HitPayloads,
@@ -807,26 +1098,24 @@ fn populate_symbol_lines(
     Ok(())
 }
 
-/// Builds one file hit wire value.
-fn file_search_hit(
+/// Builds one syntax-indexed file's hit: the whole file as the target, positioned at the
+/// first line carrying a query term.
+fn source_file_hit(
     file: &IndexedFile,
-    line_index: usize,
-    text: String,
+    (line, range, text): (u64, ByteRange, String),
+    (score, matched_by): (Option<f64>, Vec<MatchedField>),
     payloads: HitPayloads,
 ) -> SearchHit {
-    let start = line::line_start_offset(file.source(), line_index);
-    let end = start.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
-    let range = ByteRange { start, end };
     SearchHit {
         hit: SearchHitTarget::File {
             size: u64::try_from(file.source().len()).unwrap_or(u64::MAX),
             languages: vec![file.syntax().language().clone()],
         },
-        score: Some(1.0),
-        matched_by: vec![MatchedField::Content],
+        score,
+        matched_by,
         source: payloads.source.then_some(text),
         range: Some(text_range(range)),
-        line: Some(u64::try_from(line_index).unwrap_or(u64::MAX)),
+        line: Some(line),
         path: Some(project_path(file.path())),
         unit: None,
         traversal_path: None,
@@ -844,93 +1133,27 @@ fn text_file_hit_target(file: &TextSourceFile) -> SearchHitTarget {
     }
 }
 
-/// Builds one text-lane content-line hit's wire shape, the same shape [`file_search_hit`]
-/// builds for a syntax-indexed file, over a `[search.text]` file instead.
-fn text_search_hit(
+/// Builds one `[search.text]` file's hit, the same shape [`source_file_hit`] builds for a
+/// syntax-indexed file.
+fn text_file_hit(
     file: &TextSourceFile,
-    line_index: usize,
-    text: String,
+    (line, range, text): (u64, ByteRange, String),
+    (score, matched_by): (Option<f64>, Vec<MatchedField>),
     payloads: HitPayloads,
 ) -> SearchHit {
-    let start = line::line_start_offset(file.content(), line_index);
-    let end = start.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
-    let range = ByteRange { start, end };
     SearchHit {
         hit: text_file_hit_target(file),
-        score: Some(1.0),
-        matched_by: vec![MatchedField::Content],
+        score,
+        matched_by,
         source: payloads.source.then_some(text),
         range: Some(text_range(range)),
-        line: Some(u64::try_from(line_index).unwrap_or(u64::MAX)),
+        line: Some(line),
         path: Some(project_path(file.path())),
         unit: None,
         traversal_path: None,
         distance: None,
         change: None,
     }
-}
-
-const fn symbol_match_score(rank: SymbolMatchRank) -> f64 {
-    match rank {
-        SymbolMatchRank::QualifiedExact => 1.0,
-        SymbolMatchRank::NameExact => 0.9,
-        SymbolMatchRank::NamePrefix => 0.8,
-        SymbolMatchRank::Substring => 0.7,
-    }
-}
-
-/// Merges the search index's ranked units into `results`: a resolved symbol becomes a hit
-/// at its fused score, and a text file's best-scoring chunk becomes a file hit whose line is
-/// the first line containing a query term. Each merges against an identifier-matched hit
-/// already in `results` by identity, rather than duplicating it. `matcher` and `root` drop
-/// a ranked hit at an excluded path exactly as the indexed lanes already do.
-///
-/// The score arrives already fused into 0 to 1, so nothing here converts a rank: two
-/// requests' scores mean the same thing because one fusion produced both.
-fn collect_ranked_hits(
-    index: &WorkspaceIndex,
-    matcher: Option<&PathMatcher>,
-    root: &Path,
-    criteria: SearchCriteria<'_>,
-    ranked: &[RankedUnit],
-    results: &mut Vec<SearchHit>,
-) -> Result<(), ReadError> {
-    let SearchCriteria {
-        query,
-        target,
-        payloads,
-    } = criteria;
-    if matches!(target, SearchParamsTarget::All | SearchParamsTarget::Symbol) {
-        for matched in ranked
-            .iter()
-            .filter(|matched| matched.kind() == LexicalUnitKind::Symbol)
-        {
-            let Some((file, symbol)) = resolve_symbol(index, matched.path(), matched.identity())
-            else {
-                // The search index held this symbol at a tree revision the request's
-                // revision guard already proved current, but a symbol it named can still be
-                // gone from this exact index; skipping it silently is correct.
-                continue;
-            };
-            if !includes(matcher, root, file.path()) {
-                continue;
-            }
-            merge_symbol_hit(index, results, file, symbol, matched.score(), payloads)?;
-        }
-    }
-    if matches!(target, SearchParamsTarget::All | SearchParamsTarget::File) {
-        for (path, score) in best_score_per_text_file(ranked) {
-            let Some(file) = index.text_file(&path) else {
-                continue;
-            };
-            if !includes(matcher, root, file.path()) {
-                continue;
-            }
-            let (line_number, range, text) = locate_query_line(file.content(), query);
-            merge_file_hit(results, file, line_number, range, text, score, payloads);
-        }
-    }
-    Ok(())
 }
 
 /// Resolves one ranked symbol unit's identity back to its declaration in `index`. `path`
@@ -954,23 +1177,6 @@ pub(crate) fn resolve_symbol<'a>(
         .iter()
         .find(|symbol| symbol.qualified_name == address.qualified_name)?;
     (address.wire_symbol().0 == identity).then_some((file, symbol))
-}
-
-/// Collapses ranked text-file units to one entry per path, keeping the best - the highest -
-/// fused score when a file contributed more than one chunk.
-fn best_score_per_text_file(ranked: &[RankedUnit]) -> Vec<(ProjectPath, f64)> {
-    let mut best: Vec<(ProjectPath, f64)> = Vec::new();
-    for matched in ranked
-        .iter()
-        .filter(|matched| matched.kind() == LexicalUnitKind::TextFile)
-    {
-        if let Some(entry) = best.iter_mut().find(|(path, _)| path == matched.path()) {
-            entry.1 = entry.1.max(matched.score());
-        } else {
-            best.push((matched.path().clone(), matched.score()));
-        }
-    }
-    best
 }
 
 /// Finds the first line of `content` containing any of `query`'s whitespace-split terms,
@@ -1021,100 +1227,6 @@ pub(crate) fn hit_symbol_id(hit: &SearchHit) -> Option<&SymbolId> {
     match &hit.hit {
         SearchHitTarget::Symbol { symbol } => symbol.id.as_ref(),
         SearchHitTarget::Node { .. } | SearchHitTarget::File { .. } => None,
-    }
-}
-
-/// Merges one resolved ranked symbol unit: an identifier-matched hit for the same symbol
-/// keeps its place and absorbs `score`; otherwise the ranked hit joins `results` new.
-fn merge_symbol_hit(
-    index: &WorkspaceIndex,
-    results: &mut Vec<SearchHit>,
-    file: &IndexedFile,
-    symbol: &SyntaxSymbol,
-    score: f64,
-    payloads: HitPayloads,
-) -> Result<(), ReadError> {
-    if let Some(existing) = find_symbol_hit_mut(results, file, symbol) {
-        absorb_ranked_match(existing, score);
-        return Ok(());
-    }
-    let matched = SymbolMatch {
-        file,
-        symbol,
-        // This caller supplies `score` directly and never reads identifier rank.
-        rank: SymbolMatchRank::Substring,
-    };
-    results.push(build_symbol_hit(
-        index,
-        matched,
-        Some(score),
-        vec![MatchedField::Ranked],
-        payloads,
-    )?);
-    Ok(())
-}
-
-/// Merges one ranked text-file unit: an identifier-matched hit at the same path
-/// keeps its place and absorbs `score`; otherwise the ranked hit joins `results` new.
-fn merge_file_hit(
-    results: &mut Vec<SearchHit>,
-    file: &TextSourceFile,
-    line_number: u64,
-    range: ByteRange,
-    text: String,
-    score: f64,
-    payloads: HitPayloads,
-) {
-    let path = project_path(file.path());
-    let existing = results.iter_mut().find(|hit| {
-        matches!(&hit.hit, SearchHitTarget::File { .. }) && hit.path.as_ref() == Some(&path)
-    });
-    if let Some(existing) = existing {
-        absorb_ranked_match(existing, score);
-        return;
-    }
-    results.push(ranked_file_hit(
-        file,
-        line_number,
-        range,
-        text,
-        score,
-        payloads,
-    ));
-}
-
-/// Records that `existing` also matched through the ranked lane: adds
-/// [`MatchedField::Ranked`] when absent, and raises its score to the better of the two. The
-/// ranked lane fuses a lexical and a vector ranking into one score with no per-hit record of
-/// which tier placed it, so it can never claim [`MatchedField::Content`] - that member stays
-/// a claim the identifier or line matcher proved against literal bytes.
-fn absorb_ranked_match(existing: &mut SearchHit, score: f64) {
-    if !existing.matched_by.contains(&MatchedField::Ranked) {
-        existing.matched_by.push(MatchedField::Ranked);
-    }
-    existing.score = Some(existing.score.map_or(score, |current| current.max(score)));
-}
-
-fn ranked_file_hit(
-    file: &TextSourceFile,
-    line_number: u64,
-    range: ByteRange,
-    text: String,
-    score: f64,
-    payloads: HitPayloads,
-) -> SearchHit {
-    SearchHit {
-        hit: text_file_hit_target(file),
-        score: Some(score),
-        matched_by: vec![MatchedField::Ranked],
-        source: payloads.source.then_some(text),
-        range: Some(text_range(range)),
-        line: Some(line_number),
-        path: Some(project_path(file.path())),
-        unit: None,
-        traversal_path: None,
-        distance: None,
-        change: None,
     }
 }
 
@@ -1186,27 +1298,189 @@ fn hit_identity(hit: &SearchHit) -> &str {
 mod tests {
     use std::error::Error;
     use std::fs;
+    use std::path::Path;
     use std::sync::Arc;
 
     use rift_core::{Fault as _, SourceVisibility};
-    use rift_index::{LexicalIndexLimits, LexicalUnitKind, WorkspaceIndexLimits};
-    use rift_protocol::configuration::HistoryConfiguration;
+    use rift_index::{LexicalIndexLimits, WorkspaceIndexLimits};
+    use rift_protocol::configuration::{HistoryConfiguration, RankingConfiguration};
     use rift_protocol::read::{
         MatchedField, NodeId, PackageIdentity, ReadWarning, ResultOrder, SearchParams,
-        SearchParamsTarget, SourceLocationKind, SourceUnitId,
+        SearchParamsTarget, SearchResult, SearchScope, SourceLocationKind, SourceUnitId,
     };
-    use rift_search::{RankedUnit, SearchIndex, SearchIndexLimits};
+    use rift_ranking::{
+        DocumentIdentity, DocumentKind, FieldSet, ParsedQuery, QueryPhase, RankedIdentity,
+        RankingInput, RankingInputKind, RankingWeights, SearchableField, fuse,
+    };
+    use rift_search::{RevisionScoped, SearchIndex, SearchIndexLimits};
     use serde_json::json;
     use tempfile::TempDir;
 
     use super::{
-        ByteRange, ReadFault, ReadService, SearchHit, SearchHitTarget, SymbolMatchRank,
-        symbol_match_score,
+        ByteRange, HitPayloads, IdentifierSources, ReadFault, ReadService, Resolution,
+        SearchCriteria, SearchHit, SearchHitTarget, StoreAnswer,
     };
     use crate::packages::PackageBranch;
     use crate::read::tests::{helper_store, helper_unit, project_fixture};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+    /// The shares `[search.ranking]` fuses under when an operator sets none.
+    fn configured_weights() -> RankingWeights {
+        let ranking = RankingConfiguration::default();
+        RankingWeights::new(
+            ranking.identifier_weight,
+            ranking.lexical_weight,
+            ranking.vector_weight,
+            ranking.fusion_k,
+        )
+        .expect("the configured shares must fuse")
+    }
+
+    /// One search store over `database`, vector ranking off, holding `service`'s own index
+    /// documents. A [`RankingInput`] the store produces has no constructor a test can
+    /// reach, so publishing to a real store is the only way to obtain one.
+    async fn published_store(database: &Path, service: &ReadService) -> TestResult<SearchIndex> {
+        let limits = SearchIndexLimits::builder(LexicalIndexLimits::default())
+            .disable_vector()
+            .build();
+        let store = SearchIndex::open(database, limits).await?;
+        let documents = service.index_documents();
+        store
+            .replace_lexical(&documents, service.tree_revision())
+            .await?;
+        Ok(store)
+    }
+
+    /// What `store` answered for both phases of `query`, under the configured shares.
+    async fn store_answer(
+        store: &SearchIndex,
+        revision: &str,
+        query: &str,
+    ) -> TestResult<StoreAnswer> {
+        let parsed = ParsedQuery::parse(query)?;
+        let precise = phase_inputs(store, revision, &parsed, QueryPhase::Precise).await?;
+        let broad = if parsed.has_broad_phase() {
+            phase_inputs(store, revision, &parsed, QueryPhase::Broad).await?
+        } else {
+            Vec::new()
+        };
+        Ok(StoreAnswer::new(precise, broad, configured_weights()))
+    }
+
+    /// The inputs one phase produced, refusing a store stamped with another revision.
+    async fn phase_inputs(
+        store: &SearchIndex,
+        revision: &str,
+        query: &ParsedQuery,
+        phase: QueryPhase,
+    ) -> TestResult<Vec<RankingInput>> {
+        let ranked = store.rank(revision, query, phase, 32).await?;
+        let RevisionScoped::Matched(ranking) = ranked else {
+            return Err("the store must hold the revision it was just stamped with".into());
+        };
+        Ok(ranking.into_inputs())
+    }
+
+    /// One store publication of `service`, asked for `query`: the shape almost every
+    /// store-backed case here needs.
+    async fn answered(
+        database: &Path,
+        service: &ReadService,
+        query: &str,
+    ) -> TestResult<StoreAnswer> {
+        let store = published_store(database, service).await?;
+        store_answer(&store, service.tree_revision(), query).await
+    }
+
+    /// The identities `inputs` fuse to, resolved against `service`'s own index the way
+    /// `collect_query_hits` resolves them.
+    fn resolved_hits(
+        service: &ReadService,
+        inputs: &[RankingInput],
+        criteria: SearchCriteria<'_>,
+        resolution: Resolution<'_>,
+    ) -> TestResult<Vec<SearchHit>> {
+        let index = service.index();
+        let ranked = fuse(inputs, configured_weights(), QueryPhase::Precise, 32);
+        let mut results = Vec::new();
+        super::resolve_ranked_hits(
+            index,
+            None,
+            index.root(),
+            criteria,
+            resolution,
+            &ranked,
+            &mut results,
+        )?;
+        Ok(results)
+    }
+
+    /// The hits the identifier ranking alone places for `query`, fused and resolved the
+    /// way a request with no store answer runs them.
+    fn identifier_hits(
+        service: &ReadService,
+        query: &str,
+        target: SearchParamsTarget,
+        payloads: HitPayloads,
+    ) -> TestResult<Vec<SearchHit>> {
+        let index = service.index();
+        let parsed = ParsedQuery::parse(query)?;
+        let sources = IdentifierSources {
+            project: true,
+            force_include: None,
+            packages: None,
+        };
+        let input = super::identifier_input(index, None, index.root(), &parsed, sources, 32)?;
+        let criteria = SearchCriteria {
+            query,
+            target,
+            payloads,
+        };
+        let resolution = Resolution {
+            force_include: None,
+            packages: None,
+        };
+        resolved_hits(service, &[input], criteria, resolution)
+    }
+
+    /// One ordered full-text input, as the store would have answered it.
+    fn lexical_input(order: Vec<(DocumentIdentity, FieldSet)>) -> RankingInput {
+        ranked_input(RankingInputKind::Lexical, order)
+    }
+
+    /// One ordered input of `kind`.
+    fn ranked_input(
+        kind: RankingInputKind,
+        order: Vec<(DocumentIdentity, FieldSet)>,
+    ) -> RankingInput {
+        RankingInput::new(
+            kind,
+            order
+                .into_iter()
+                .map(|(identity, fields)| RankedIdentity::new(identity, fields))
+                .collect(),
+        )
+    }
+
+    /// One project declaration's ranking identity, the address `get_symbol` answers with.
+    fn declaration_identity(path: &str, qualified_name: &str) -> TestResult<DocumentIdentity> {
+        Ok(DocumentIdentity::new(rift_core::symbol_identity(
+            "rust",
+            path,
+            qualified_name,
+        ))?)
+    }
+
+    /// Each hit's own wire identity, in answer order: a declaration's address, or a file
+    /// hit's project path.
+    fn hit_identities(result: &SearchResult) -> Vec<String> {
+        result
+            .results
+            .iter()
+            .map(|hit| super::hit_identity(hit).to_owned())
+            .collect()
+    }
 
     fn fixture() -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
@@ -1262,6 +1536,35 @@ pub fn compute() -> i32 {
         let directory = tempfile::tempdir()?;
         fs::create_dir(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), RICH_SOURCE)?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        Ok((directory, service))
+    }
+
+    /// One declaration at each identifier match class for the candidate `beacon`:
+    /// `beacon` equals the qualified name, `Tower::beacon` equals the short name,
+    /// `beacon_relay` starts with it, and `Tower::relay_to_beacon` carries it elsewhere.
+    const MATCH_CLASS_SOURCE: &str = r"pub fn beacon() {}
+
+pub fn beacon_relay() {}
+
+pub struct Tower;
+
+impl Tower {
+    pub fn beacon() {}
+    pub fn relay_to_beacon() {}
+}
+";
+
+    fn match_class_fixture() -> TestResult<(TempDir, ReadService)> {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), MATCH_CLASS_SOURCE)?;
         let service = ReadService::build(
             directory.path(),
             WorkspaceIndexLimits::default(),
@@ -1346,19 +1649,8 @@ pub fn compute() -> i32 {
             HistoryConfiguration::default(),
         )?;
         let params: SearchParams = serde_json::from_value(json!({"query": "page"}))?;
-        let mut hits = Vec::new();
-        super::collect_indexed_hits(
-            service.index(),
-            None,
-            directory.path(),
-            super::SearchCriteria {
-                query: "page",
-                target: SearchParamsTarget::Symbol,
-                payloads: super::HitPayloads::requested(&params),
-            },
-            10,
-            &mut hits,
-        )?;
+        let payloads = HitPayloads::requested(&params);
+        let mut hits = identifier_hits(&service, "page", SearchParamsTarget::Symbol, payloads)?;
         assert_eq!(hits.len(), 2);
         assert!(
             hits.iter().all(|hit| hit.line.is_none()),
@@ -1396,14 +1688,15 @@ pub fn compute() -> i32 {
             &rift_core::TextFileInclusion::default(),
             HistoryConfiguration::default(),
         )?;
-        let ranked = ranked_units(&directory.path().join("search.db"), &service, "page").await?;
+        let database = directory.path().join("search.db");
+        let store = answered(&database, &service, "page").await?;
         for order in ["relevance", "identity", "path"] {
             let mut request = json!({
                 "query": "page", "target": "symbol", "limit": 10,
                 "order": order, "include": ["source", "score"],
                 "paths": {"force_include": ["forced.rs"]}
             });
-            let full = service.search(&serde_json::from_value(request.clone())?, &ranked)?;
+            let full = service.search(&serde_json::from_value(request.clone())?, &store)?;
             assert_eq!(full.results.len(), 4);
             for hit in &full.results {
                 let SearchHitTarget::Symbol { symbol } = &hit.hit else {
@@ -1422,7 +1715,7 @@ pub fn compute() -> i32 {
             let mut pages = Vec::new();
             for page_index in 0..4 {
                 request["page_index"] = json!(page_index);
-                let page = service.search(&serde_json::from_value(request.clone())?, &ranked)?;
+                let page = service.search(&serde_json::from_value(request.clone())?, &store)?;
                 assert_eq!(page.warnings, full.warnings);
                 pages.extend(page.results);
             }
@@ -1455,7 +1748,8 @@ pub fn compute() -> i32 {
             "target": "symbol",
             "limit": 5
         }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let answer = service.search(&params, &StoreAnswer::identifier_only())?;
+        let value = serde_json::to_value(answer)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert!(!results.is_empty());
         let symbol = &results[0]["hit"]["symbol"];
@@ -1468,26 +1762,29 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    /// Symbol hits from a markdown file carry the `markdown` language, the
-    /// composed wire kind, and an id escaping the heading text.
-    #[test]
-    fn search_symbol_hits_carry_the_markdown_language() -> TestResult {
+    /// Symbol hits from a markdown file carry the `markdown` language, the composed wire
+    /// kind, and an id escaping the heading text. The heading is two plain words, which
+    /// the identifier ranking never extracts, so the store's full-text input places it.
+    #[tokio::test]
+    async fn search_symbol_hits_carry_the_markdown_language() -> TestResult {
         let directory = tempfile::tempdir()?;
         let notes_md = "# Beacon Notes\n\nCalibration steps.\n";
         fs::write(directory.path().join("notes.md"), notes_md)?;
-        let limits = WorkspaceIndexLimits::default();
-        let visibility = SourceVisibility::default();
-        let inclusion = rift_core::TextFileInclusion::default();
-        let history = HistoryConfiguration::default();
-        let service =
-            ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
-        let request = json!({
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let database = directory.path().join("search.db");
+        let store = answered(&database, &service, "Beacon Notes").await?;
+        let params: SearchParams = serde_json::from_value(json!({
             "query": "Beacon Notes",
             "target": "symbol",
             "limit": 5
-        });
-        let params: SearchParams = serde_json::from_value(request)?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        }))?;
+        let value = serde_json::to_value(service.search(&params, &store)?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert!(!results.is_empty());
         let symbol = &results[0]["hit"]["symbol"];
@@ -1502,20 +1799,22 @@ pub fn compute() -> i32 {
 
     /// Symbol hits from JSON and YAML files carry their languages, the
     /// composed wire kinds, and ids escaping the key path.
-    #[test]
-    fn search_symbol_hits_carry_the_json_and_yaml_languages() -> TestResult {
+    #[tokio::test]
+    async fn search_symbol_hits_carry_the_json_and_yaml_languages() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(
             directory.path().join("config.json"),
             "{\"beacon port\": 8080}\n",
         )?;
         fs::write(directory.path().join("deploy.yaml"), "beacon retries: 3\n")?;
-        let limits = WorkspaceIndexLimits::default();
-        let visibility = SourceVisibility::default();
-        let inclusion = rift_core::TextFileInclusion::default();
-        let history = HistoryConfiguration::default();
-        let service =
-            ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let store = published_store(&directory.path().join("search.db"), &service).await?;
         let expectations = [
             (
                 "beacon port",
@@ -1531,13 +1830,14 @@ pub fn compute() -> i32 {
             ),
         ];
         for (query, language, kind, id) in expectations {
+            let answer = store_answer(&store, service.tree_revision(), query).await?;
             let request = json!({
                 "query": query,
                 "target": "symbol",
                 "limit": 5
             });
             let params: SearchParams = serde_json::from_value(request)?;
-            let value = serde_json::to_value(service.search(&params, &[])?)?;
+            let value = serde_json::to_value(service.search(&params, &answer)?)?;
             let results = value["results"].as_array().ok_or("results must be array")?;
             assert!(!results.is_empty(), "{query} must return a hit");
             let symbol = &results[0]["hit"]["symbol"];
@@ -1548,116 +1848,89 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    #[test]
-    fn search_combines_symbol_and_source_matches_with_limit() -> TestResult {
-        let (_directory, service) = fixture()?;
+    /// One answer carries the declarations and the whole files one query reached: the
+    /// two declarations of `src/lib.rs`, that file itself, and the `README.txt` the
+    /// store's full-text input placed. Scores fall strictly with position, so the answer
+    /// states its own order.
+    #[tokio::test]
+    async fn search_combines_symbol_and_file_hits_on_one_page() -> TestResult {
+        let (directory, service) = fixture()?;
+        let store = answered(&directory.path().join("search.db"), &service, "Beacon").await?;
         let params: SearchParams = serde_json::from_value(json!({
             "query": "Beacon",
-            "limit": 4
+            "limit": 4,
+            "include": ["score"]
         }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
-        let results = value["results"].as_array().ok_or("results must be array")?;
-
-        assert_eq!(results.len(), 4);
-        // The pool holds five candidates, all but one tied at score 1.0: two matching source
-        // lines in `src/lib.rs`, the text-lane `README.txt`'s one matching content line, and
-        // the struct symbol. A file hit's own identity is its plain `path`; a symbol hit's is
-        // its `rift://symbol/...` id. The tie-break sorts `README.txt` first (`R` < `r`), the
-        // `Beacon` struct symbol second (`rift://symbol/...` < `src/lib.rs`), then the two
-        // `src/lib.rs` file hits, in the order they were matched; the `signal` method's
-        // substring match on the qualified name `Beacon::signal` scores lower and lands on
-        // the next page.
+        let result = service.search(&params, &store)?;
+        let mut identities = hit_identities(&result);
+        identities.sort();
         assert_eq!(
-            value["pagination"],
-            json!({ "page_index": 0, "total_pages": 2 })
+            identities,
+            [
+                "README.txt",
+                "rift://symbol/rust/src/lib.rs/Beacon",
+                "rift://symbol/rust/src/lib.rs/Beacon::signal",
+                "src/lib.rs",
+            ],
+            "{result:#?}"
         );
-        assert_eq!(results[0]["hit"]["target"], "file");
-        assert_eq!(results[0]["path"], json!("README.txt"));
-        assert_eq!(results[1]["hit"]["target"], "symbol");
-        assert_eq!(results[1]["path"], json!("src/lib.rs"));
-        assert_eq!(results[2]["hit"]["target"], "file");
-        assert_eq!(results[2]["path"], json!("src/lib.rs"));
-        assert_eq!(results[3]["hit"]["target"], "file");
-        assert_eq!(results[3]["path"], json!("src/lib.rs"));
+        assert_eq!(
+            serde_json::to_value(&result.pagination)?,
+            json!({ "page_index": 0, "total_pages": 1 })
+        );
+        let scores: Vec<f64> = result.results.iter().filter_map(|hit| hit.score).collect();
+        assert_eq!(scores.len(), 4, "{result:#?}");
         assert!(
-            results[1]["path"]
-                .as_str()
-                .is_some_and(|path| !path.is_empty()),
-            "every hit must carry a non-empty project-relative path: {:#?}",
-            results[1]
+            scores.windows(2).all(|pair| pair[0] > pair[1]),
+            "a fused score falls strictly with position: {scores:?}"
+        );
+        assert!(
+            result
+                .results
+                .iter()
+                .all(|hit| hit.path.as_ref().is_some_and(|path| !path.0.is_empty())),
+            "every hit must carry a non-empty project-relative path: {result:#?}"
         );
         Ok(())
     }
 
-    /// Baseline catalog stops once `results_max` is reached.
+    /// The candidate pool stops at `results_max` whatever the page size asked for: the
+    /// third matching declaration never enters it, and the answer warns the bound.
     #[test]
-    fn search_baseline_catalog_stops_at_fetch_limit() -> TestResult {
+    fn search_pool_stops_at_the_result_bound_and_leaves_a_later_candidate_out() -> TestResult {
         let directory = tempfile::tempdir()?;
-        fs::create_dir(directory.path().join("src"))?;
-        let source = "// Beacon marker\npub fn foo() {}\n";
-        fs::write(directory.path().join("src/lib.rs"), source)?;
-        fs::write(directory.path().join("README.txt"), "Beacon docs\n")?;
-        let limits = WorkspaceIndexLimits::new(10, 4_096, 8_192, 8, 1).expect("positive limits");
-        let visibility = SourceVisibility::default();
-        let inclusion = rift_core::TextFileInclusion::default();
-        let history = HistoryConfiguration::default();
-        let service =
-            ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
-        let request = json!({
-            "query": "Beacon",
-            "target": "file",
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn beacon_alpha() {}\npub fn beacon_beta() {}\npub fn beacon_gamma() {}\n",
+        )?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::new(10, 4_096, 8_192, 8, 2)?,
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "beacon",
+            "target": "symbol",
             "limit": 10
-        });
-        let params: SearchParams = serde_json::from_value(request)?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
-        let results = value["results"].as_array().ok_or("results must be array")?;
+        }))?;
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
         assert_eq!(
-            results.len(),
-            1,
-            "baseline catalog fills results_max with one candidate: \
-             {results:#?}"
+            hit_identities(&result),
+            [
+                "rift://symbol/rust/lib.rs/beacon_alpha",
+                "rift://symbol/rust/lib.rs/beacon_beta",
+            ],
+            "{result:#?}"
         );
-        assert_eq!(results[0]["path"], json!("README.txt"));
-        Ok(())
-    }
-
-    /// Baseline catalog breaks the moment `results_max` is reached, leaving a later matching
-    /// candidate out of the pool - the pool never overshoots `results_max` even though
-    /// `text_matches` itself is called with the full bound rather than the room left.
-    #[test]
-    fn search_baseline_catalog_leaves_later_candidate_out() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::create_dir(directory.path().join("src"))?;
-        let source = "// Beacon marker\npub fn foo() {}\n";
-        fs::write(directory.path().join("src/lib.rs"), source)?;
-        fs::write(directory.path().join("README.txt"), "Beacon docs\n")?;
-        fs::write(directory.path().join("notes.txt"), "Beacon notes\n")?;
-        let limits = WorkspaceIndexLimits::new(10, 4_096, 8_192, 8, 2).expect("positive limits");
-        let visibility = SourceVisibility::default();
-        let inclusion = rift_core::TextFileInclusion::default();
-        let history = HistoryConfiguration::default();
-        let service =
-            ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
-        let request = json!({
-            "query": "Beacon",
-            "target": "file",
-            "limit": 10
-        });
-        let params: SearchParams = serde_json::from_value(request)?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
-        let results = value["results"].as_array().ok_or("results must be array")?;
-        assert_eq!(
-            results.len(),
-            2,
-            "baseline catalog stops the moment results_max is reached: {results:#?}"
-        );
-        let paths: Vec<_> = results.iter().map(|hit| hit["path"].clone()).collect();
-        assert!(paths.contains(&json!("README.txt")));
-        assert!(paths.contains(&json!("notes.txt")));
         assert!(
-            !paths.contains(&json!("src/lib.rs")),
-            "baseline catalog never reaches src/lib.rs once results_max is already spent: \
-             {results:#?}"
+            result
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::ResultsTruncated { results_max } if *results_max == 2)),
+            "{:?}",
+            result.warnings
         );
         Ok(())
     }
@@ -1672,7 +1945,8 @@ pub fn compute() -> i32 {
             "target": "symbol",
             "limit": 10
         }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let answer = service.search(&params, &StoreAnswer::identifier_only())?;
+        let value = serde_json::to_value(answer)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert!(!results.is_empty());
         assert!(
@@ -1701,7 +1975,8 @@ pub fn compute() -> i32 {
             "include": ["source"],
             "limit": 1
         }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let answer = service.search(&params, &StoreAnswer::identifier_only())?;
+        let value = serde_json::to_value(answer)?;
         let hit = &value["results"][0];
         assert!(
             hit["source"].is_string(),
@@ -1714,12 +1989,14 @@ pub fn compute() -> i32 {
 
     /// An omitted `include` never pays the `source` lookup: every hit still carries its
     /// symbol or file, `path`, `range`, and `line`, and none carries `source`.
-    #[test]
-    fn search_without_include_omits_source_but_keeps_symbol_path_span_and_line() -> TestResult {
-        let (_directory, service) = fixture()?;
+    #[tokio::test]
+    async fn search_without_include_omits_source_but_keeps_symbol_path_span_and_line() -> TestResult
+    {
+        let (directory, service) = fixture()?;
+        let store = answered(&directory.path().join("search.db"), &service, "Beacon").await?;
         let request = json!({ "query": "Beacon", "limit": 10 });
         let params: SearchParams = serde_json::from_value(request)?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let value = serde_json::to_value(service.search(&params, &store)?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert!(!results.is_empty());
         assert!(
@@ -1737,15 +2014,119 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
+    /// The identifier ranking orders by match class: the qualified-name match, then the
+    /// short-name match, then the prefix, then the declaration that carries the candidate
+    /// somewhere else.
     #[test]
-    fn symbol_scores_preserve_semantic_rank() {
-        let scores = [
-            symbol_match_score(SymbolMatchRank::QualifiedExact),
-            symbol_match_score(SymbolMatchRank::NameExact),
-            symbol_match_score(SymbolMatchRank::NamePrefix),
-            symbol_match_score(SymbolMatchRank::Substring),
-        ];
-        assert!(scores.windows(2).all(|pair| pair[0] > pair[1]));
+    fn search_orders_identifier_matches_by_class_strongest_first() -> TestResult {
+        let (_directory, service) = match_class_fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "beacon",
+            "target": "symbol",
+            "limit": 10
+        }))?;
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
+        assert_eq!(
+            hit_identities(&result),
+            [
+                declaration_identity("src/lib.rs", "beacon")?.as_str(),
+                declaration_identity("src/lib.rs", "Tower::beacon")?.as_str(),
+                declaration_identity("src/lib.rs", "beacon_relay")?.as_str(),
+                declaration_identity("src/lib.rs", "Tower::relay_to_beacon")?.as_str(),
+            ],
+            "{result:#?}"
+        );
+        Ok(())
+    }
+
+    /// With a store that answered nothing the identifier ranking is the whole answer, and
+    /// each hit's score is its place in the fused order: the best scores 1.0 and every
+    /// later one scores strictly less.
+    #[test]
+    fn search_without_a_store_answer_scores_every_hit_by_its_fused_position() -> TestResult {
+        let (_directory, service) = match_class_fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "beacon",
+            "target": "symbol",
+            "limit": 10,
+            "include": ["score"]
+        }))?;
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
+        let scores: Vec<Option<f64>> = result.results.iter().map(|hit| hit.score).collect();
+        assert_eq!(
+            scores,
+            [Some(1.0), Some(0.75), Some(0.5), Some(0.25)],
+            "{result:#?}"
+        );
+        Ok(())
+    }
+
+    /// Two declarations reaching one match class at one candidate position tie, and the
+    /// tie breaks on the declaration's own identity rather than on declaration order.
+    #[test]
+    fn search_ties_at_one_match_class_order_by_the_declarations_identity() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn beacon_beta() {}\npub fn beacon_alpha() {}\n",
+        )?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "beacon",
+            "target": "symbol",
+            "limit": 10
+        }))?;
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
+        assert_eq!(
+            hit_identities(&result),
+            [
+                "rift://symbol/rust/lib.rs/beacon_alpha",
+                "rift://symbol/rust/lib.rs/beacon_beta",
+            ],
+            "{result:#?}"
+        );
+        Ok(())
+    }
+
+    /// An input that did not answer carries no share, so adding an unanswered vector
+    /// ranking beside the identifier and full-text inputs changes neither the order nor
+    /// the scores.
+    #[test]
+    fn an_unanswered_vector_input_leaves_the_fused_order_unchanged() -> TestResult {
+        let alpha = DocumentIdentity::new("alpha")?;
+        let beta = DocumentIdentity::new("beta")?;
+        let gamma = DocumentIdentity::new("gamma")?;
+        let identifier = ranked_input(
+            RankingInputKind::Identifier,
+            vec![
+                (alpha.clone(), FieldSet::of(SearchableField::Name)),
+                (beta.clone(), FieldSet::of(SearchableField::QualifiedName)),
+            ],
+        );
+        let lexical = lexical_input(vec![
+            (gamma, FieldSet::of(SearchableField::FileContent)),
+            (alpha, FieldSet::of(SearchableField::Documentation)),
+            (beta, FieldSet::of(SearchableField::Signature)),
+        ]);
+        let answered = vec![identifier, lexical];
+        let mut with_vector = answered.clone();
+        with_vector.push(RankingInput::unanswered(RankingInputKind::Vector));
+
+        let without = fuse(&answered, configured_weights(), QueryPhase::Precise, 32);
+        let with = fuse(&with_vector, configured_weights(), QueryPhase::Precise, 32);
+
+        assert_eq!(
+            with.candidates(),
+            without.candidates(),
+            "an unanswered input must not move a candidate"
+        );
+        Ok(())
     }
 
     /// `target: "node"` left `SearchParamsTarget`'s served variants; a request naming it is
@@ -1766,7 +2147,7 @@ pub fn compute() -> i32 {
         let missing_query: SearchParams = serde_json::from_value(json!({}))?;
         assert!(matches!(
             service
-                .search(&missing_query, &[])
+                .search(&missing_query, &StoreAnswer::identifier_only())
                 .expect_err("missing query must fail")
                 .fault(),
             ReadFault::Invalid { .. }
@@ -1775,7 +2156,7 @@ pub fn compute() -> i32 {
         let empty_query: SearchParams = serde_json::from_value(json!({"query": ""}))?;
         assert!(matches!(
             service
-                .search(&empty_query, &[])
+                .search(&empty_query, &StoreAnswer::identifier_only())
                 .expect_err("empty query must fail")
                 .fault(),
             ReadFault::Invalid { .. }
@@ -1784,7 +2165,7 @@ pub fn compute() -> i32 {
         let zero_limit: SearchParams =
             serde_json::from_value(json!({"query": "Beacon", "limit": 0}))?;
         let error = service
-            .search(&zero_limit, &[])
+            .search(&zero_limit, &StoreAnswer::identifier_only())
             .expect_err("zero limit must fail");
         assert!(matches!(error.fault(), ReadFault::Invalid { .. }));
         assert_eq!(
@@ -1804,7 +2185,7 @@ pub fn compute() -> i32 {
             serde_json::from_value(json!({"change": {"base": "main", "head": "HEAD"}}))?;
 
         let error = service
-            .search(&params, &[])
+            .search(&params, &StoreAnswer::identifier_only())
             .expect_err("a comparison on one snapshot must refuse");
 
         assert!(matches!(error.fault(), ReadFault::Unsupported { .. }));
@@ -1823,13 +2204,10 @@ pub fn compute() -> i32 {
     #[test]
     fn search_limit_above_the_result_bound_serves_the_whole_set_on_one_page() -> TestResult {
         let directory = tempfile::tempdir()?;
-        fs::create_dir(directory.path().join("src"))?;
         fs::write(
-            directory.path().join("src/lib.rs"),
-            "// Beacon marker\npub fn foo() {}\n",
+            directory.path().join("lib.rs"),
+            "pub fn beacon_alpha() {}\npub fn beacon_beta() {}\n",
         )?;
-        fs::write(directory.path().join("README.txt"), "Beacon docs\n")?;
-        fs::write(directory.path().join("notes.txt"), "Beacon notes\n")?;
         let service = ReadService::build(
             directory.path(),
             WorkspaceIndexLimits::new(10, 4_096, 8_192, 8, 1)?,
@@ -1838,11 +2216,12 @@ pub fn compute() -> i32 {
             HistoryConfiguration::default(),
         )?;
         let params: SearchParams = serde_json::from_value(json!({
-            "query": "Beacon",
-            "target": "file",
+            "query": "beacon",
+            "target": "symbol",
             "limit": 2
         }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let value =
+            serde_json::to_value(service.search(&params, &StoreAnswer::identifier_only())?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert_eq!(results.len(), 1, "{results:#?}");
         assert_eq!(
@@ -1863,7 +2242,7 @@ pub fn compute() -> i32 {
     fn search_under_the_result_bound_carries_no_results_truncated_warning() -> TestResult {
         let (_directory, service) = fixture()?;
         let params: SearchParams = serde_json::from_value(json!({ "query": "Beacon" }))?;
-        let result = service.search(&params, &[])?;
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
         assert!(
             !result
                 .warnings
@@ -1875,43 +2254,68 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    #[test]
-    fn search_target_symbol_excludes_file_hits() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let params: SearchParams = serde_json::from_value(json!({
+    /// The store ranks the `README.txt` document beside the two declarations; a
+    /// `symbol` target leaves the file candidate out of the answer, and a `file` target
+    /// proves it was there to leave out.
+    #[tokio::test]
+    async fn search_target_symbol_excludes_file_hits() -> TestResult {
+        let (directory, service) = fixture()?;
+        let store = answered(&directory.path().join("search.db"), &service, "Beacon").await?;
+        let declarations: SearchParams = serde_json::from_value(json!({
             "query": "Beacon",
             "target": "symbol",
             "limit": 5
         }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
-        let results = value["results"].as_array().ok_or("results must be array")?;
-        assert!(!results.is_empty());
-        assert!(results.iter().all(|hit| hit["hit"]["target"] == "symbol"));
+        let result = service.search(&declarations, &store)?;
+        assert!(!result.results.is_empty());
+        assert!(
+            result
+                .results
+                .iter()
+                .all(|hit| matches!(hit.hit, SearchHitTarget::Symbol { .. })),
+            "{result:#?}"
+        );
+        let files: SearchParams = serde_json::from_value(json!({
+            "query": "Beacon",
+            "target": "file",
+            "limit": 5
+        }))?;
+        let files = service.search(&files, &store)?;
+        assert!(
+            hit_identities(&files).contains(&"README.txt".to_owned()),
+            "the file candidate the symbol target drops must exist: {files:#?}"
+        );
         Ok(())
     }
 
-    #[test]
-    fn search_reports_multi_line_file_match_position() -> TestResult {
-        let (_directory, service) = rich_fixture()?;
+    #[tokio::test]
+    async fn search_reports_multi_line_file_match_position() -> TestResult {
+        let (directory, service) = rich_fixture()?;
+        let store = answered(
+            &directory.path().join("search.db"),
+            &service,
+            "lookout marker",
+        )
+        .await?;
         let params: SearchParams = serde_json::from_value(json!({
             "query": "lookout marker",
             "target": "file",
             "include": ["source"]
         }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let value = serde_json::to_value(service.search(&params, &store)?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
-        assert_eq!(results.len(), 1);
+        assert_eq!(results.len(), 1, "{results:#?}");
         assert!(results[0]["line"].as_u64().is_some_and(|line| line > 1));
         assert_eq!(results[0]["source"], "    // lookout marker");
         Ok(())
     }
 
     /// A sentence present in both a provider-claimed file (markdown, syntax index) and a
-    /// `.mdx` file (`[search.text]`, no provider claims it) returns both hits: the text-lane
-    /// lexical lane used to reach a text file only through the vector ranking, so this
-    /// sentence never reached the mdx file's hit before the lexical lane searched it too.
-    #[test]
-    fn search_returns_a_text_lane_hit_alongside_a_provider_claimed_hit_for_the_same_sentence()
+    /// `.mdx` file (`[search.text]`, no provider claims it) returns both hits: each file
+    /// contributes its own text document to the store, and the two resolve to the two
+    /// file shapes the answer distinguishes by language.
+    #[tokio::test]
+    async fn search_returns_a_text_file_hit_alongside_a_provider_claimed_hit_for_one_sentence()
     -> TestResult {
         let directory = tempfile::tempdir()?;
         let sentence = "agentic development toolkit";
@@ -1930,12 +2334,13 @@ pub fn compute() -> i32 {
             &rift_core::TextFileInclusion::default(),
             HistoryConfiguration::default(),
         )?;
+        let store = answered(&directory.path().join("search.db"), &service, sentence).await?;
         let params: SearchParams = serde_json::from_value(json!({
             "query": sentence,
             "target": "file",
             "limit": 10
         }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let value = serde_json::to_value(service.search(&params, &store)?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
         let readme = results
             .iter()
@@ -1949,7 +2354,7 @@ pub fn compute() -> i32 {
         let mdx = results
             .iter()
             .find(|hit| hit["path"] == json!("guide.mdx"))
-            .ok_or("the text-lane file must return a hit through the lexical lane")?;
+            .ok_or("the text-lane file must return a hit through the store")?;
         assert_eq!(
             mdx["hit"]["languages"],
             serde_json::Value::Null,
@@ -1960,8 +2365,8 @@ pub fn compute() -> i32 {
 
     /// An explicit `[search.text]` path rule reaches an extensionless `justfile`, and a
     /// query for content only it holds returns it.
-    #[test]
-    fn search_returns_an_explicitly_included_justfile_hit() -> TestResult {
+    #[tokio::test]
+    async fn search_returns_an_explicitly_included_justfile_hit() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(
             directory.path().join("justfile"),
@@ -1974,12 +2379,18 @@ pub fn compute() -> i32 {
             &rift_core::TextFileInclusion::new(vec!["**".to_owned()], 1 << 20),
             HistoryConfiguration::default(),
         )?;
+        let store = answered(
+            &directory.path().join("search.db"),
+            &service,
+            "cargo test --workspace",
+        )
+        .await?;
         let params: SearchParams = serde_json::from_value(json!({
             "query": "cargo test --workspace",
             "target": "file",
             "limit": 5
         }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let value = serde_json::to_value(service.search(&params, &store)?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert_eq!(
             results.len(),
@@ -2015,7 +2426,8 @@ pub fn compute() -> i32 {
                 "target": "symbol",
                 "limit": 1
             }))?;
-            let value = serde_json::to_value(service.search(&params, &[])?)?;
+            let answer = service.search(&params, &StoreAnswer::identifier_only())?;
+            let value = serde_json::to_value(answer)?;
             let hit = &value["results"][0]["hit"]["symbol"];
             assert_eq!(hit["kind"], kind, "unexpected kind for {name}");
             if let Some(expected_visibility) = visibility {
@@ -2076,7 +2488,7 @@ pub fn compute() -> i32 {
             "query": "Beacon",
             "paths": {"include": ["src/lib.rs"]}
         }))?;
-        let result = service.search(&params, &[])?;
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
         assert!(!result.results.is_empty());
         Ok(())
     }
@@ -2088,15 +2500,14 @@ pub fn compute() -> i32 {
             "query": "beacon",
             "paths": {"include": ["other.rs"]}
         }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
-        let results = value["results"].as_array().ok_or("results must be array")?;
-        assert!(!results.is_empty());
-        assert!(results.iter().all(|hit| {
-            hit["hit"]["symbol"]["id"]
-                .as_str()
-                .or_else(|| hit["path"].as_str())
-                .is_some_and(|id| id.contains("other.rs"))
-        }));
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
+        assert!(!result.results.is_empty());
+        assert!(
+            hit_identities(&result)
+                .iter()
+                .all(|identity| identity.contains("other.rs")),
+            "{result:#?}"
+        );
         Ok(())
     }
 
@@ -2109,15 +2520,14 @@ pub fn compute() -> i32 {
             "limit": 10,
             "paths": {"exclude": ["other.rs"]}
         }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
-        let results = value["results"].as_array().ok_or("results must be array")?;
-        assert!(!results.is_empty());
-        assert!(results.iter().all(|hit| {
-            !hit["hit"]["symbol"]["id"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("other.rs")
-        }));
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
+        assert!(!result.results.is_empty());
+        assert!(
+            hit_identities(&result)
+                .iter()
+                .all(|identity| !identity.contains("other.rs")),
+            "{result:#?}"
+        );
         Ok(())
     }
 
@@ -2130,13 +2540,11 @@ pub fn compute() -> i32 {
             "limit": 10,
             "paths": {"include": ["src/**"], "exclude": ["src/nested/**"]}
         }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
-        let results = value["results"].as_array().ok_or("results must be array")?;
-        assert_eq!(results.len(), 1);
-        assert!(
-            results[0]["hit"]["symbol"]["id"]
-                .as_str()
-                .is_some_and(|id| id.contains("src/lib.rs"))
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
+        assert_eq!(
+            hit_identities(&result),
+            ["rift://symbol/rust/src/lib.rs/beacon_top"],
+            "{result:#?}"
         );
         Ok(())
     }
@@ -2150,13 +2558,11 @@ pub fn compute() -> i32 {
             "limit": 10,
             "paths": {"include": ["src/*.rs"]}
         }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
-        let results = value["results"].as_array().ok_or("results must be array")?;
-        assert_eq!(results.len(), 1);
-        assert!(
-            results[0]["hit"]["symbol"]["id"]
-                .as_str()
-                .is_some_and(|id| id.contains("src/lib.rs"))
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
+        assert_eq!(
+            hit_identities(&result),
+            ["rift://symbol/rust/src/lib.rs/beacon_top"],
+            "{result:#?}"
         );
         Ok(())
     }
@@ -2170,21 +2576,21 @@ pub fn compute() -> i32 {
             "limit": 10,
             "paths": {"include": ["src/**"]}
         }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
-        let results = value["results"].as_array().ok_or("results must be array")?;
-        assert_eq!(results.len(), 2);
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
+        assert_eq!(result.results.len(), 2, "{result:#?}");
         Ok(())
     }
 
-    #[test]
-    fn search_paths_target_file_returns_only_matching_tree_entries() -> TestResult {
-        let (_directory, service) = multi_file_fixture()?;
+    #[tokio::test]
+    async fn search_paths_target_file_returns_only_matching_tree_entries() -> TestResult {
+        let (directory, service) = multi_file_fixture()?;
+        let store = answered(&directory.path().join("search.db"), &service, "beacon").await?;
         let params: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
             "target": "file",
             "paths": {"include": ["src/lib.rs"]}
         }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let value = serde_json::to_value(service.search(&params, &store)?)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert!(!results.is_empty());
         assert!(results.iter().all(|hit| hit["hit"]["target"] == "file"));
@@ -2201,7 +2607,7 @@ pub fn compute() -> i32 {
         }))?;
         assert!(matches!(
             service
-                .search(&params, &[])
+                .search(&params, &StoreAnswer::identifier_only())
                 .expect_err("an invalid include glob must refuse")
                 .fault(),
             ReadFault::Index(_)
@@ -2218,7 +2624,7 @@ pub fn compute() -> i32 {
         }))?;
         assert!(matches!(
             service
-                .search(&params, &[])
+                .search(&params, &StoreAnswer::identifier_only())
                 .expect_err("a backslash pattern must be refused")
                 .fault(),
             ReadFault::Invalid { field: "paths", .. }
@@ -2241,9 +2647,9 @@ pub fn compute() -> i32 {
             "paths": {"include": ["**/*.rs"]},
             "limit": 3
         }))?;
-        let narrow_value = serde_json::to_value(service.search(&narrow, &[])?)?;
-        let wide_value = serde_json::to_value(service.search(&wide, &[])?)?;
-        assert_eq!(narrow_value["results"][0], wide_value["results"][0]);
+        let narrow_result = service.search(&narrow, &StoreAnswer::identifier_only())?;
+        let wide_result = service.search(&wide, &StoreAnswer::identifier_only())?;
+        assert_eq!(narrow_result.results[0], wide_result.results[0]);
         Ok(())
     }
 
@@ -2259,7 +2665,8 @@ pub fn compute() -> i32 {
                 "page_index": page_index
             });
             let params: SearchParams = serde_json::from_value(request)?;
-            let value = serde_json::to_value(service.search(&params, &[])?)?;
+            let answer = service.search(&params, &StoreAnswer::identifier_only())?;
+            let value = serde_json::to_value(answer)?;
             assert_eq!(
                 value["pagination"],
                 json!({ "page_index": page_index, "total_pages": 3 })
@@ -2284,7 +2691,8 @@ pub fn compute() -> i32 {
             "page_index": 30
         });
         let params: SearchParams = serde_json::from_value(request)?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let answer = service.search(&params, &StoreAnswer::identifier_only())?;
+        let value = serde_json::to_value(answer)?;
         assert_eq!(value["results"], json!([]));
         assert_eq!(
             value["pagination"],
@@ -2302,12 +2710,16 @@ pub fn compute() -> i32 {
             "order": "path",
             "limit": 10
         }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
-        let paths: Vec<String> = value["results"]
-            .as_array()
-            .ok_or("results must be array")?
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
+        let paths: Vec<String> = result
+            .results
             .iter()
-            .map(|hit| hit["path"].as_str().unwrap_or_default().to_owned())
+            .map(|hit| {
+                hit.path
+                    .as_ref()
+                    .map(|path| path.0.clone())
+                    .unwrap_or_default()
+            })
             .collect();
         assert_eq!(paths, ["other.rs", "src/lib.rs", "src/nested/deep.rs"]);
         Ok(())
@@ -2322,18 +2734,8 @@ pub fn compute() -> i32 {
             "order": "identity",
             "limit": 10
         }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
-        let ids: Vec<String> = value["results"]
-            .as_array()
-            .ok_or("results must be array")?
-            .iter()
-            .map(|hit| {
-                hit["hit"]["symbol"]["id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned()
-            })
-            .collect();
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
+        let ids = hit_identities(&result);
         let mut sorted = ids.clone();
         sorted.sort();
         assert_eq!(
@@ -2371,13 +2773,8 @@ pub fn compute() -> i32 {
                 "page_index": page_index
             });
             let params: SearchParams = serde_json::from_value(request)?;
-            let value = serde_json::to_value(service.search(&params, &[])?)?;
-            narrow_ids.push(
-                value["results"][0]["hit"]["symbol"]["id"]
-                    .as_str()
-                    .ok_or("each narrow page must carry one hit")?
-                    .to_owned(),
-            );
+            let result = service.search(&params, &StoreAnswer::identifier_only())?;
+            narrow_ids.extend(hit_identities(&result));
         }
         let wide: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
@@ -2385,18 +2782,7 @@ pub fn compute() -> i32 {
             "order": "path",
             "limit": 2
         }))?;
-        let wide_value = serde_json::to_value(service.search(&wide, &[])?)?;
-        let wide_ids: Vec<String> = wide_value["results"]
-            .as_array()
-            .ok_or("results must be array")?
-            .iter()
-            .map(|hit| {
-                hit["hit"]["symbol"]["id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned()
-            })
-            .collect();
+        let wide_ids = hit_identities(&service.search(&wide, &StoreAnswer::identifier_only())?);
         assert_eq!(
             narrow_ids, wide_ids,
             "tied hits must keep their relative order across page sizes"
@@ -2419,7 +2805,8 @@ pub fn compute() -> i32 {
             "target": "symbol",
             "paths": {"force_include": ["gitignored.rs", "configured_out.rs"]}
         }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let answer = service.search(&params, &StoreAnswer::identifier_only())?;
+        let value = serde_json::to_value(answer)?;
         let results = value["results"].as_array().ok_or("results must be array")?;
         assert_eq!(results.len(), 2);
         for hit in results {
@@ -2433,32 +2820,6 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn search_force_include_matches_file_content_lines() -> TestResult {
-        let (_directory, service) = force_include_fixture()?;
-        let params: SearchParams = serde_json::from_value(json!({
-            "query": "phantom_gitignored",
-            "target": "file",
-            "paths": {"force_include": ["gitignored.rs"]},
-            "include": ["source"]
-        }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
-        let results = value["results"].as_array().ok_or("results must be array")?;
-        assert_eq!(results.len(), 1);
-        let hit = &results[0];
-        assert_eq!(hit["matched_by"][0], "content");
-        let path = hit["path"]
-            .as_str()
-            .ok_or("content hit must carry a path")?;
-        assert!(path.contains("gitignored.rs"));
-        let text = hit["source"]
-            .as_str()
-            .ok_or("content hit must carry the matched line")?;
-        assert!(text.contains("phantom_gitignored"));
-        assert!(hit["line"].is_u64());
-        Ok(())
-    }
-
-    #[test]
     fn search_force_include_of_indexed_file_does_not_duplicate_hits() -> TestResult {
         let (_directory, service) = force_include_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
@@ -2466,12 +2827,11 @@ pub fn compute() -> i32 {
             "target": "symbol",
             "paths": {"force_include": ["visible.rs"]}
         }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
-        let results = value["results"].as_array().ok_or("results must be array")?;
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
         assert_eq!(
-            results.len(),
+            result.results.len(),
             1,
-            "force_include of an already-indexed file must not duplicate its hit"
+            "one declaration matched through two indexes stays one identity: {result:#?}"
         );
         Ok(())
     }
@@ -2483,10 +2843,9 @@ pub fn compute() -> i32 {
             "query": "floor",
             "paths": {"force_include": [".git/**"]}
         }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
-        let results = value["results"].as_array().ok_or("results must be array")?;
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
         assert!(
-            results.is_empty(),
+            result.results.is_empty(),
             "the hard floor must stay unreachable via force_include"
         );
         Ok(())
@@ -2515,7 +2874,8 @@ pub fn compute() -> i32 {
             HistoryConfiguration::default(),
         )?;
         let plain: SearchParams = serde_json::from_value(json!({"query": "kept"}))?;
-        let plain_value = serde_json::to_value(service.search(&plain, &[])?)?;
+        let plain_answer = service.search(&plain, &StoreAnswer::identifier_only())?;
+        let plain_value = serde_json::to_value(plain_answer)?;
         let names_nothing = plain_value["warnings"].as_array().is_none_or(|warnings| {
             warnings
                 .iter()
@@ -2529,7 +2889,8 @@ pub fn compute() -> i32 {
             "query": "kept",
             "paths": {"force_include": ["wide.rs"]}
         }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let answer = service.search(&params, &StoreAnswer::identifier_only())?;
+        let value = serde_json::to_value(answer)?;
         assert!(
             value["results"]
                 .as_array()
@@ -2574,7 +2935,7 @@ pub fn compute() -> i32 {
             "paths": {"force_include": ["extra_*.rs"]}
         }))?;
         let error = service
-            .search(&params, &[])
+            .search(&params, &StoreAnswer::identifier_only())
             .expect_err("a force_include match count above the bound must refuse");
         assert!(matches!(error.fault(), ReadFault::Index(_)));
         assert_eq!(
@@ -2620,8 +2981,8 @@ pub fn compute() -> i32 {
             "query": "visible",
             "paths": {"force_include": ["gitignored.rs"]}
         }))?;
-        let without = service.search(&plain, &[])?;
-        let with = service.search(&reaching, &[])?;
+        let without = service.search(&plain, &StoreAnswer::identifier_only())?;
+        let with = service.search(&reaching, &StoreAnswer::identifier_only())?;
         assert_eq!(with.results.len(), 1, "{:#?}", with.results);
         assert_eq!(with.results[0].path, without.results[0].path);
         assert_eq!(with.warnings, without.warnings);
@@ -2637,7 +2998,7 @@ pub fn compute() -> i32 {
         }))?;
         assert!(matches!(
             service
-                .search(&params, &[])
+                .search(&params, &StoreAnswer::identifier_only())
                 .expect_err("an invalid force_include glob must refuse")
                 .fault(),
             ReadFault::Index(_)
@@ -2673,7 +3034,8 @@ pub fn compute() -> i32 {
     fn search_at_a_revision_serves_committed_matches_only() -> TestResult {
         let (_directory, service) = committed_fixture()?;
         let committed: SearchParams = serde_json::from_value(json!({"query": "committed_probe"}))?;
-        let value = serde_json::to_value(service.search(&committed, &[])?)?;
+        let answer = service.search(&committed, &StoreAnswer::identifier_only())?;
+        let value = serde_json::to_value(answer)?;
         let results = value["results"].as_array().ok_or("results array")?;
         assert!(!results.is_empty(), "the committed declaration matches");
         assert!(
@@ -2681,7 +3043,8 @@ pub fn compute() -> i32 {
             "a search served from one index warns nothing, so warnings is omitted"
         );
         let drifted: SearchParams = serde_json::from_value(json!({"query": "drifted_probe"}))?;
-        let drifted_value = serde_json::to_value(service.search(&drifted, &[])?)?;
+        let drifted_answer = service.search(&drifted, &StoreAnswer::identifier_only())?;
+        let drifted_value = serde_json::to_value(drifted_answer)?;
         assert_eq!(
             drifted_value["results"].as_array().map(Vec::len),
             Some(0),
@@ -2717,7 +3080,8 @@ pub fn compute() -> i32 {
         let service = ReadService::at_revision(root, &revision, limits, &visibility, history)?;
         let committed: SearchParams =
             serde_json::from_value(json!({"query": "committed_probe", "rev": "HEAD"}))?;
-        let value = serde_json::to_value(service.search(&committed, &[])?)?;
+        let answer = service.search(&committed, &StoreAnswer::identifier_only())?;
+        let value = serde_json::to_value(answer)?;
         assert!(
             value["results"]
                 .as_array()
@@ -2732,7 +3096,8 @@ pub fn compute() -> i32 {
         assert!(names_deep, "{value:#}");
         let refused: SearchParams =
             serde_json::from_value(json!({"query": "deep_probe", "rev": "HEAD"}))?;
-        let refused_value = serde_json::to_value(service.search(&refused, &[])?)?;
+        let refused_answer = service.search(&refused, &StoreAnswer::identifier_only())?;
+        let refused_value = serde_json::to_value(refused_answer)?;
         assert_eq!(
             refused_value["results"].as_array().map(Vec::len),
             Some(0),
@@ -2741,8 +3106,8 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    #[test]
-    fn search_finds_every_explicitly_included_utf8_file() -> TestResult {
+    #[tokio::test]
+    async fn search_finds_every_explicitly_included_utf8_file() -> TestResult {
         let directory = tempfile::tempdir()?;
         let files = [
             ("history.lua", "lua_catalog_marker"),
@@ -2760,15 +3125,17 @@ pub fn compute() -> i32 {
             &rift_core::TextFileInclusion::new(vec!["**".to_owned()], 1 << 20),
             HistoryConfiguration::default(),
         )?;
+        let store = published_store(&directory.path().join("search.db"), &service).await?;
 
         for (path, marker) in files {
+            let answer = store_answer(&store, service.tree_revision(), marker).await?;
             let params: SearchParams = serde_json::from_value(json!({
                 "query": marker,
                 "target": "file",
                 "paths": { "include": [path] },
                 "limit": 10
             }))?;
-            let value = serde_json::to_value(service.search(&params, &[])?)?;
+            let value = serde_json::to_value(service.search(&params, &answer)?)?;
             assert_eq!(
                 value["results"].as_array().map(Vec::len),
                 Some(1),
@@ -2779,8 +3146,10 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
+    /// A provider-claimed file contributes one text document beside its declarations, so
+    /// its content answers one file hit rather than one per declaration.
     #[tokio::test]
-    async fn ranked_search_indexes_provider_file_content_once() -> TestResult {
+    async fn search_indexes_provider_file_content_once() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(
             directory.path().join("calls.rs"),
@@ -2794,13 +3163,13 @@ pub fn compute() -> i32 {
             HistoryConfiguration::default(),
         )?;
         let database = directory.path().join("search.db");
-        let ranked = ranked_units(&database, &service, "wire symbol beta").await?;
+        let store = answered(&database, &service, "wire symbol beta").await?;
         let params: SearchParams = serde_json::from_value(json!({
             "query": "wire symbol beta",
             "target": "file",
             "limit": 10
         }))?;
-        let value = serde_json::to_value(service.search(&params, &ranked)?)?;
+        let value = serde_json::to_value(service.search(&params, &store)?)?;
         let results = value["results"].as_array().ok_or("results array")?;
         assert_eq!(
             results.len(),
@@ -2808,17 +3177,21 @@ pub fn compute() -> i32 {
             "provider content must have one file identity: {results:#?}"
         );
         assert_eq!(results[0]["path"], json!("calls.rs"));
-        assert!(
-            ranked.iter().any(|unit| {
-                unit.kind() == LexicalUnitKind::TextFile && unit.path().as_str() == "calls.rs"
-            }),
-            "provider content must join the baseline lexical units: {ranked:#?}"
+        let documents = service.index_documents();
+        assert_eq!(
+            documents
+                .iter()
+                .filter(|document| document.kind() == DocumentKind::TextFile
+                    && document.identity().as_str() == "calls.rs")
+                .count(),
+            1,
+            "provider content must join the index documents once: {documents:#?}"
         );
         Ok(())
     }
 
-    #[test]
-    fn revision_search_finds_visible_text_without_a_provider() -> TestResult {
+    #[tokio::test]
+    async fn revision_search_finds_visible_text_without_a_provider() -> TestResult {
         let directory = tempfile::tempdir()?;
         rift_history::fixture::init(directory.path());
         fs::write(
@@ -2835,47 +3208,25 @@ pub fn compute() -> i32 {
             &rift_core::LanguageFileSelections::default(),
             HistoryConfiguration::default(),
         )?;
+        let store = answered(
+            &directory.path().join("search.db"),
+            &service,
+            "RIFT_HISTORY_PYTHON_MARKER",
+        )
+        .await?;
         let params: SearchParams = serde_json::from_value(json!({
             "query": "RIFT_HISTORY_PYTHON_MARKER",
             "target": "file",
             "paths": { "include": ["rift_history.py"] }
         }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let value = serde_json::to_value(service.search(&params, &store)?)?;
         assert_eq!(value["results"].as_array().map(Vec::len), Some(1));
         assert_eq!(value["results"][0]["path"], json!("rift_history.py"));
         Ok(())
     }
 
-    #[test]
-    fn force_include_reaches_excluded_visible_text_without_a_provider() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join(".gitignore"), "hidden.py\n")?;
-        fs::write(directory.path().join("hidden.py"), "FORCED_PYTHON_MARKER\n")?;
-        fs::write(directory.path().join("visible.go"), "VISIBLE_GO_MARKER\n")?;
-        let service = ReadService::build(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::default(),
-            HistoryConfiguration::default(),
-        )?;
-        let params: SearchParams = serde_json::from_value(json!({
-            "query": "FORCED_PYTHON_MARKER",
-            "target": "file",
-            "paths": {
-                "include": ["*.py"],
-                "exclude": ["visible.go"],
-                "force_include": ["hidden.py"]
-            }
-        }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
-        assert_eq!(value["results"].as_array().map(Vec::len), Some(1));
-        assert_eq!(value["results"][0]["path"], json!("hidden.py"));
-        Ok(())
-    }
-
-    #[test]
-    fn binary_invalid_and_oversized_unknown_files_do_not_hide_valid_text() -> TestResult {
+    #[tokio::test]
+    async fn binary_invalid_and_oversized_unknown_files_do_not_hide_valid_text() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("visible.py"), "VISIBLE_TEXT_MARKER\n")?;
         fs::write(directory.path().join("binary.unknown"), b"binary\0payload")?;
@@ -2889,11 +3240,17 @@ pub fn compute() -> i32 {
             &rift_core::TextFileInclusion::new(vec!["**".to_owned()], 1 << 20),
             HistoryConfiguration::default(),
         )?;
+        let store = answered(
+            &directory.path().join("search.db"),
+            &service,
+            "VISIBLE_TEXT_MARKER",
+        )
+        .await?;
         let params: SearchParams = serde_json::from_value(json!({
             "query": "VISIBLE_TEXT_MARKER",
             "target": "file"
         }))?;
-        let value = serde_json::to_value(service.search(&params, &[])?)?;
+        let value = serde_json::to_value(service.search(&params, &store)?)?;
         assert_eq!(value["results"].as_array().map(Vec::len), Some(1));
         assert_eq!(value["results"][0]["path"], json!("visible.py"));
         Ok(())
@@ -2906,113 +3263,17 @@ pub fn compute() -> i32 {
             "query": "committed_probe",
             "paths": {"force_include": ["lib.rs"]}
         }))?;
-        let error = service.search(&params, &[]).expect_err(
-            "force_include walks the working tree, which a revision search has none of",
-        );
+        let error = service
+            .search(&params, &StoreAnswer::identifier_only())
+            .expect_err(
+                "force_include walks the working tree, which a revision search has none of",
+            );
         assert!(matches!(
             error.fault(),
             ReadFault::Unsupported { capability }
             if capability == "force_include at a revision"
         ));
         Ok(())
-    }
-
-    fn indexed_symbol<'a>(
-        service: &'a ReadService,
-        path: &str,
-        name: &str,
-    ) -> TestResult<(&'a rift_index::IndexedFile, &'a rift_syntax::SyntaxSymbol)> {
-        let file = service
-            .index()
-            .file(&rift_core::ProjectPath::new(path)?)
-            .ok_or("fixture file must be indexed")?;
-        let symbol = file
-            .syntax()
-            .symbols()
-            .iter()
-            .find(|symbol| symbol.name == name)
-            .ok_or("fixture must declare the named symbol")?;
-        Ok((file, symbol))
-    }
-
-    #[test]
-    fn merge_symbol_hit_unions_matched_by_and_keeps_the_higher_score() -> TestResult {
-        let (_directory, service) = fixture()?;
-        let (file, symbol) = indexed_symbol(&service, "src/lib.rs", "Beacon")?;
-        let existing = super::build_symbol_hit(
-            service.index(),
-            super::SymbolMatch {
-                file,
-                symbol,
-                rank: SymbolMatchRank::NameExact,
-            },
-            Some(0.5),
-            vec![MatchedField::Name],
-            super::HitPayloads::default(),
-        )?;
-        let mut results = vec![existing];
-
-        super::merge_symbol_hit(
-            service.index(),
-            &mut results,
-            file,
-            symbol,
-            0.9,
-            super::HitPayloads::default(),
-        )?;
-        assert_eq!(results.len(), 1, "the same symbol must not duplicate");
-        assert_eq!(results[0].score, Some(0.9), "the higher score must win");
-        assert_eq!(
-            results[0].matched_by,
-            vec![MatchedField::Name, MatchedField::Ranked]
-        );
-
-        // A second merge at a lower score keeps the existing higher score and does not
-        // duplicate the already-present Ranked field.
-        super::merge_symbol_hit(
-            service.index(),
-            &mut results,
-            file,
-            symbol,
-            0.1,
-            super::HitPayloads::default(),
-        )?;
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].score, Some(0.9));
-        assert_eq!(
-            results[0].matched_by,
-            vec![MatchedField::Name, MatchedField::Ranked]
-        );
-        Ok(())
-    }
-
-    /// One search index over `database`, vector ranking off, holding `service`'s own units,
-    /// searched for `query`. A [`RankedUnit`] carries no constructor of its own, so the tier
-    /// that produces them is the only way a test obtains one.
-    async fn ranked_units(
-        database: &std::path::Path,
-        service: &ReadService,
-        query: &str,
-    ) -> TestResult<Vec<RankedUnit>> {
-        let limits = SearchIndexLimits::builder(LexicalIndexLimits::default())
-            .disable_vector()
-            .build();
-        let index = SearchIndex::open(database, limits).await?;
-        let units = service.lexical_units();
-        let described = service.described_units(&units);
-        let revision = service.tree_revision();
-        index.replace_lexical(&units, revision).await?;
-        index
-            .embed_described(&described, rift_search::Embedding::Every, revision)
-            .await?;
-        let rift_search::RevisionScoped::Matched(ranked) =
-            index.search(revision, query, 32).await?
-        else {
-            return Err("the store must hold the revision it was just stamped with".into());
-        };
-        let ranked = ranked.into_units();
-        assert!(!ranked.is_empty(), "the fixture query must rank something");
-        Ok(ranked)
     }
 
     /// One workspace holding neither the fixture's declarations nor its text file, so every
@@ -3032,33 +3293,36 @@ pub fn compute() -> i32 {
     #[test]
     fn described_units_pair_every_symbol_and_no_text_file_with_its_own_declaration() -> TestResult {
         let (_directory, service) = fixture()?;
-        let units = service.lexical_units();
-        let described = service.described_units(&units);
-        let symbols: Vec<_> = units
+        let documents = service.index_documents();
+        let described = service.described_units(&documents);
+        let symbols = documents
             .iter()
-            .filter(|unit| unit.kind() == LexicalUnitKind::Symbol)
-            .collect();
-        let texts = units
-            .iter()
-            .filter(|unit| unit.kind() == LexicalUnitKind::TextFile)
+            .filter(|document| document.kind() == DocumentKind::Symbol)
             .count();
-        assert!(texts > 0, "the fixture must contribute a text-file unit");
+        let texts = documents
+            .iter()
+            .filter(|document| document.kind() == DocumentKind::TextFile)
+            .count();
+        assert!(
+            texts > 0,
+            "the fixture must contribute a text-file document"
+        );
         assert_eq!(
             described.len(),
-            symbols.len(),
-            "every symbol unit is described and no text-file unit is"
+            symbols,
+            "every symbol document is described and no text-file document is"
         );
         for one in &described {
             assert_eq!(
                 one.unit().kind(),
-                LexicalUnitKind::Symbol,
-                "a text-file unit must never be described"
+                DocumentKind::Symbol,
+                "a text-file document must never be described"
             );
             let identity = one.unit().identity();
             let text = rift_search::document(one.declaration()).into_text();
             assert!(
                 text.contains(one.unit().content()),
-                "each description must carry its own unit's declaration: {identity} {text}"
+                "each description must carry its own document's declaration: {identity} {text}"
             );
         }
         Ok(())
@@ -3126,78 +3390,260 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn collect_ranked_hits_skips_a_symbol_identity_the_index_no_longer_carries() -> TestResult
-    {
-        let (directory, service) = fixture()?;
-        let database = directory.path().join("search.db");
-        let ranked = ranked_units(&database, &service, "Beacon").await?;
-        assert!(
-            ranked
-                .iter()
-                .any(|unit| unit.kind() == LexicalUnitKind::Symbol),
-            "the fixture query must rank a symbol unit: {ranked:#?}"
-        );
+    /// A fused identity naming a declaration this snapshot has moved past is skipped, so
+    /// the request answers instead of failing.
+    #[test]
+    fn resolve_ranked_hits_skips_a_declaration_identity_no_selected_index_holds() -> TestResult {
         let (_other, unrelated) = unrelated_workspace()?;
-        let mut results = Vec::new();
-        super::collect_ranked_hits(
-            unrelated.index(),
-            None,
-            unrelated.index().root(),
-            super::SearchCriteria {
-                query: "Beacon",
-                target: SearchParamsTarget::Symbol,
-                payloads: super::HitPayloads::default(),
-            },
-            &ranked,
-            &mut results,
-        )?;
+        let input = lexical_input(vec![(
+            declaration_identity("src/lib.rs", "Beacon")?,
+            FieldSet::of(SearchableField::Name),
+        )]);
+        let criteria = SearchCriteria {
+            query: "Beacon",
+            target: SearchParamsTarget::Symbol,
+            payloads: HitPayloads::default(),
+        };
+        let resolution = Resolution {
+            force_include: None,
+            packages: None,
+        };
+        let results = resolved_hits(&unrelated, &[input], criteria, resolution)?;
         assert!(
             results.is_empty(),
-            "a symbol identity absent from the index must be skipped silently: {results:#?}"
+            "a declaration identity absent from the index must be skipped silently: {results:#?}"
         );
         Ok(())
     }
 
-    #[tokio::test]
-    async fn collect_ranked_hits_skips_a_text_file_path_the_index_no_longer_carries() -> TestResult
-    {
-        let (directory, service) = fixture()?;
-        let database = directory.path().join("search.db");
-        let ranked = ranked_units(&database, &service, "Beacon").await?;
-        assert!(
-            ranked
-                .iter()
-                .any(|unit| unit.kind() == LexicalUnitKind::TextFile),
-            "the fixture query must rank the text file: {ranked:#?}"
-        );
+    /// The same skip for a file path: the store ranked a publication this snapshot has
+    /// already moved past.
+    #[test]
+    fn resolve_ranked_hits_skips_a_file_path_no_selected_index_holds() -> TestResult {
         let (_other, unrelated) = unrelated_workspace()?;
-        let mut results = Vec::new();
-        super::collect_ranked_hits(
-            unrelated.index(),
-            None,
-            unrelated.index().root(),
-            super::SearchCriteria {
-                query: "Beacon",
-                target: SearchParamsTarget::File,
-                payloads: super::HitPayloads::default(),
-            },
-            &ranked,
-            &mut results,
-        )?;
+        let input = lexical_input(vec![(
+            DocumentIdentity::new("README.txt")?,
+            FieldSet::of(SearchableField::FileContent),
+        )]);
+        let criteria = SearchCriteria {
+            query: "Beacon",
+            target: SearchParamsTarget::File,
+            payloads: HitPayloads::default(),
+        };
+        let resolution = Resolution {
+            force_include: None,
+            packages: None,
+        };
+        let results = resolved_hits(&unrelated, &[input], criteria, resolution)?;
         assert!(
             results.is_empty(),
-            "a text-file path absent from the index must be skipped silently: {results:#?}"
+            "a file path absent from the index must be skipped silently: {results:#?}"
         );
         Ok(())
     }
 
+    /// A package declaration resolves back through its source unit and qualified name; a
+    /// project declaration resolves through its `rift://symbol/` address.
+    #[test]
+    fn resolve_ranked_hits_resolves_a_package_unit_and_a_project_declaration() -> TestResult {
+        let (_directory, service) = dependency_fixture()?;
+        let packages = service
+            .dependency_index(SearchScope::Global)?
+            .ok_or("the fixture must attach a package index")?;
+        let input = lexical_input(vec![
+            (
+                declaration_identity("src/lib.rs", "beacon")?,
+                FieldSet::of(SearchableField::Name),
+            ),
+            (
+                DocumentIdentity::new(format!("{}#helper_beacon", helper_unit().0))?,
+                FieldSet::of(SearchableField::QualifiedName),
+            ),
+        ]);
+        let criteria = SearchCriteria {
+            query: "beacon",
+            target: SearchParamsTarget::Symbol,
+            payloads: HitPayloads::default(),
+        };
+        let resolution = Resolution {
+            force_include: None,
+            packages: Some(&packages),
+        };
+        let results = resolved_hits(&service, &[input], criteria, resolution)?;
+        assert_eq!(results.len(), 2, "{results:#?}");
+        assert_eq!(
+            results[0].path,
+            Some(rift_protocol::read::ProjectPath("src/lib.rs".to_owned()))
+        );
+        assert_eq!(results[0].unit, None);
+        assert_eq!(results[1].unit, Some(helper_unit()));
+        assert_eq!(results[1].path, None);
+        Ok(())
+    }
+
+    /// `matched_by` names the columns that placed a candidate: the three name columns
+    /// collapse to one member, the two content columns to another, and a candidate no
+    /// column placed - one the vector ranking alone reached - answers `ranked`.
+    #[test]
+    fn matched_by_names_the_columns_that_placed_a_candidate() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let resolution = Resolution {
+            force_include: None,
+            packages: None,
+        };
+        let every_column = lexical_input(vec![(
+            declaration_identity("src/lib.rs", "Beacon")?,
+            FieldSet::EMPTY
+                .with(SearchableField::Name)
+                .with(SearchableField::QualifiedName)
+                .with(SearchableField::IdentifierTerms)
+                .with(SearchableField::Signature)
+                .with(SearchableField::Documentation)
+                .with(SearchableField::DeclarationSource),
+        )]);
+        let declarations = SearchCriteria {
+            query: "Beacon",
+            target: SearchParamsTarget::Symbol,
+            payloads: HitPayloads::default(),
+        };
+        let placed = resolved_hits(&service, &[every_column], declarations, resolution)?;
+        assert_eq!(
+            placed.first().map(|hit| hit.matched_by.clone()),
+            Some(vec![
+                MatchedField::Name,
+                MatchedField::Signature,
+                MatchedField::Documentation,
+                MatchedField::Content,
+            ]),
+            "{placed:#?}"
+        );
+
+        let files = SearchCriteria {
+            query: "Beacon",
+            target: SearchParamsTarget::File,
+            payloads: HitPayloads::default(),
+        };
+        let content = lexical_input(vec![(
+            DocumentIdentity::new("README.txt")?,
+            FieldSet::of(SearchableField::FileContent),
+        )]);
+        let by_content = resolved_hits(&service, &[content], files, resolution)?;
+        assert_eq!(
+            by_content.first().map(|hit| hit.matched_by.clone()),
+            Some(vec![MatchedField::Content]),
+            "{by_content:#?}"
+        );
+
+        let ranked_alone = ranked_input(
+            RankingInputKind::Vector,
+            vec![(DocumentIdentity::new("README.txt")?, FieldSet::EMPTY)],
+        );
+        let by_vector = resolved_hits(&service, &[ranked_alone], files, resolution)?;
+        assert_eq!(
+            by_vector.first().map(|hit| hit.matched_by.clone()),
+            Some(vec![MatchedField::Ranked]),
+            "a candidate no column placed answers ranked: {by_vector:#?}"
+        );
+        Ok(())
+    }
+
+    /// One declaration both the identifier ranking and the store's full-text ranking
+    /// placed answers once, carrying every column that placed it.
     #[tokio::test]
-    async fn text_file_chunk_units_collapse_to_one_hit_at_the_best_score() -> TestResult {
+    async fn search_matched_by_carries_the_identifier_and_the_full_text_columns() -> TestResult {
+        let (directory, service) = fixture()?;
+        let store = answered(&directory.path().join("search.db"), &service, "Beacon").await?;
+        let params: SearchParams = serde_json::from_value(json!({"query": "Beacon", "limit": 50}))?;
+        let answer = service.search(&params, &store)?;
+
+        let declarations: Vec<&SearchHit> = answer
+            .results
+            .iter()
+            .filter(|hit| {
+                matches!(&hit.hit, SearchHitTarget::Symbol { symbol } if symbol.name == "Beacon")
+            })
+            .collect();
+        assert_eq!(
+            declarations.len(),
+            1,
+            "two inputs placing one identity answer once: {answer:#?}"
+        );
+        let beacon = declarations[0];
+        assert!(
+            beacon.matched_by.contains(&MatchedField::Name)
+                && beacon.matched_by.contains(&MatchedField::Content),
+            "the identifier ranking's name column and the store's source column both \
+             placed it: {beacon:#?}"
+        );
+
+        let readme = answer
+            .results
+            .iter()
+            .find(|hit| {
+                hit.path
+                    .as_ref()
+                    .is_some_and(|path| path.0.as_str() == "README.txt")
+            })
+            .ok_or("the text file must reach the answer")?;
+        assert_eq!(
+            readme.matched_by,
+            [MatchedField::Content],
+            "the file content column alone placed it: {readme:#?}"
+        );
+        Ok(())
+    }
+
+    /// The broad phase joins only what the precise phase left out, and its identities
+    /// append after every precise one: `both.txt` carries all the query's terms, and the
+    /// two files carrying one term each follow it.
+    #[tokio::test]
+    async fn search_appends_the_broad_phase_after_every_precise_identity() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("alpha.txt"), "alpha lantern\n")?;
+        fs::write(directory.path().join("beta.txt"), "beta lantern\n")?;
+        fs::write(directory.path().join("both.txt"), "alpha beta\n")?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let store = answered(&directory.path().join("search.db"), &service, "alpha beta").await?;
+        assert!(
+            !store.broad().is_empty(),
+            "a two-term query has a broad phase"
+        );
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "alpha beta",
+            "target": "file",
+            "limit": 10
+        }))?;
+        let result = service.search(&params, &store)?;
+        let mut identities = hit_identities(&result);
+        assert_eq!(
+            identities.first().map(String::as_str),
+            Some("both.txt"),
+            "the precise identity leads: {result:#?}"
+        );
+        identities.sort();
+        assert_eq!(
+            identities,
+            ["alpha.txt", "beta.txt", "both.txt"],
+            "the broad phase appends what the precise phase left out, once: {result:#?}"
+        );
+        Ok(())
+    }
+
+    /// A text file past `[search.text].max_chunk` contributes one document per chunk, and
+    /// every chunk identity resolves to the same file, so the answer carries one hit for
+    /// it rather than one per chunk.
+    #[tokio::test]
+    async fn text_file_chunks_collapse_to_one_hit() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("guide.txt"), "word ".repeat(1000))?;
-        // The smallest accepted chunk bound against a several-kilobyte guide forces the file
-        // into more than one lexical unit, each of which the query matches.
+        // The smallest accepted chunk bound against a several-kilobyte guide forces the
+        // file into more than one document, each of which the query matches.
         let text_inclusion = rift_core::TextFileInclusion::new(vec!["**".to_owned()], 1_024);
         let service = ReadService::build(
             directory.path(),
@@ -3206,64 +3652,50 @@ pub fn compute() -> i32 {
             &text_inclusion,
             HistoryConfiguration::default(),
         )?;
-        let database = directory.path().join("search.db");
-        let ranked = ranked_units(&database, &service, "word").await?;
-        let chunks = ranked
+        let documents = service.index_documents();
+        let chunks = documents
             .iter()
-            .filter(|unit| unit.kind() == LexicalUnitKind::TextFile)
+            .filter(|document| document.kind() == DocumentKind::TextFile)
             .count();
         assert!(
             chunks > 1,
-            "the oversized guide must rank more than one chunk: {ranked:#?}"
+            "the oversized guide must split into more than one document: {chunks}"
         );
-        let best = ranked
-            .iter()
-            .filter(|unit| unit.kind() == LexicalUnitKind::TextFile)
-            .map(rift_search::RankedUnit::score)
-            .fold(f64::MIN, f64::max);
-        let mut results = Vec::new();
-        super::collect_ranked_hits(
-            service.index(),
-            None,
-            service.index().root(),
-            super::SearchCriteria {
-                query: "word",
-                target: SearchParamsTarget::File,
-                payloads: super::HitPayloads::default(),
-            },
-            &ranked,
-            &mut results,
-        )?;
+        let store = answered(&directory.path().join("search.db"), &service, "word").await?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "word",
+            "target": "file",
+            "limit": 50
+        }))?;
+        let result = service.search(&params, &store)?;
         assert_eq!(
-            results.len(),
-            1,
-            "chunk units for the same file must collapse to one hit: {results:#?}"
-        );
-        assert_eq!(
-            results[0].score,
-            Some(best),
-            "the best fused score must survive"
+            hit_identities(&result),
+            ["guide.txt"],
+            "the chunk documents of one file must collapse to one hit: {result:#?}"
         );
         Ok(())
     }
 
+    /// Every identity the store ranked reaches the answer, each carrying the score its
+    /// place in the fused order derived.
     #[tokio::test]
-    async fn search_merges_every_ranked_unit_while_the_vector_ranking_is_off() -> TestResult {
+    async fn search_answers_every_identity_the_store_ranked() -> TestResult {
         let (directory, service) = fixture()?;
-        let database = directory.path().join("search.db");
-        let ranked = ranked_units(&database, &service, "Beacon").await?;
+        let store = answered(&directory.path().join("search.db"), &service, "Beacon").await?;
         let params: SearchParams =
-            serde_json::from_value(json!({"query": "Beacon", "include": ["score"]}))?;
-        let answer = service.search(&params, &ranked)?;
-        for unit in &ranked {
-            let path = unit.path().as_str();
-            assert!(
-                answer
-                    .results
-                    .iter()
-                    .any(|hit| hit.path.as_ref().map(|found| found.0.as_str()) == Some(path)),
-                "every ranked unit must reach the answer: path={path} answer={answer:#?}"
-            );
+            serde_json::from_value(json!({"query": "Beacon", "include": ["score"], "limit": 50}))?;
+        let answer = service.search(&params, &store)?;
+        let identities = hit_identities(&answer);
+        for input in store.precise() {
+            for entry in input.order() {
+                assert!(
+                    identities
+                        .iter()
+                        .any(|held| held == entry.identity().as_str()),
+                    "every ranked identity must reach the answer: identity={}, answer={answer:#?}",
+                    entry.identity()
+                );
+            }
         }
         assert!(
             answer
@@ -3272,69 +3704,14 @@ pub fn compute() -> i32 {
                 .all(|hit| hit.score.is_some_and(|score| score > 0.0 && score <= 1.0)),
             "a fused score reaches the wire when requested, inside 0 to 1: {answer:#?}"
         );
-        assert!(
-            answer
-                .results
-                .iter()
-                .any(|hit| hit.matched_by.contains(&MatchedField::Ranked)),
-            "a ranked unit merges as a ranked match: {answer:#?}"
-        );
-        Ok(())
-    }
-
-    /// The lexical lane now searches a text-lane file's content directly, so `README.txt`
-    /// reaches the answer through both the lexical lane (a literal `Beacon` in its content)
-    /// and the ranked lane, and its hit carries both members - exactly as the exact `Beacon`
-    /// struct match, reached through both the identifier matcher and the ranked lane, already
-    /// does. [`merge_symbol_hit`] and [`merge_file_hit`]'s own tests prove the absorb behavior
-    /// for a hit only one lane finds.
-    #[tokio::test]
-    async fn search_matched_by_carries_both_members_once_the_lexical_lane_covers_text_files()
-    -> TestResult {
-        let (directory, service) = fixture()?;
-        let database = directory.path().join("search.db");
-        let ranked = ranked_units(&database, &service, "Beacon").await?;
-        let params: SearchParams = serde_json::from_value(json!({"query": "Beacon", "limit": 50}))?;
-        let answer = service.search(&params, &ranked)?;
-
-        let beacon = answer
-            .results
-            .iter()
-            .find(|hit| {
-                matches!(&hit.hit, SearchHitTarget::Symbol { symbol } if symbol.name == "Beacon")
-            })
-            .ok_or("the exact struct match must reach the answer")?;
-        assert!(
-            beacon.matched_by.contains(&MatchedField::Name)
-                && beacon.matched_by.contains(&MatchedField::Ranked),
-            "a hit both lanes found carries both members: {beacon:#?}"
-        );
-
-        let readme = answer
-            .results
-            .iter()
-            .find(|hit| {
-                matches!(&hit.hit, SearchHitTarget::File { .. })
-                    && hit
-                        .path
-                        .as_ref()
-                        .is_some_and(|path| path.0.contains("README"))
-            })
-            .ok_or("the text-lane file must reach the answer")?;
-        assert!(
-            readme.matched_by.contains(&MatchedField::Content)
-                && readme.matched_by.contains(&MatchedField::Ranked),
-            "the lexical lane finds README.txt's literal content and the ranked lane finds \
-             it too, so the hit carries both members: {readme:#?}"
-        );
         Ok(())
     }
 
     /// The only file holding the query's content sits at an excluded path; `paths.exclude`
-    /// narrows the ranked lane exactly as it already narrows the indexed lanes, so the
-    /// answer is empty rather than leaking the excluded text file's hit.
+    /// narrows the store's order exactly as it narrows the identifier ranking, so the
+    /// answer is empty rather than leaking the excluded file's hit.
     #[tokio::test]
-    async fn search_paths_exclude_narrows_the_ranked_lane_to_nothing() -> TestResult {
+    async fn search_paths_exclude_narrows_the_store_order_to_nothing() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("secret.txt"), "lighthouse guidance")?;
         let service = ReadService::build(
@@ -3344,88 +3721,16 @@ pub fn compute() -> i32 {
             &rift_core::TextFileInclusion::default(),
             HistoryConfiguration::default(),
         )?;
-        let database = directory.path().join("search.db");
-        let ranked = ranked_units(&database, &service, "lighthouse").await?;
+        let store = answered(&directory.path().join("search.db"), &service, "lighthouse").await?;
         let params: SearchParams = serde_json::from_value(json!({
             "query": "lighthouse",
             "paths": {"exclude": ["secret.txt"]}
         }))?;
-        let answer = service.search(&params, &ranked)?;
+        let answer = service.search(&params, &store)?;
         assert!(
             answer.results.is_empty(),
             "an excluded path's only ranked match must not reach the answer: {answer:#?}"
         );
-        Ok(())
-    }
-
-    #[test]
-    fn merge_file_hit_absorbs_a_second_match_at_the_same_path_and_line() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("guide.txt"), "alpha units beta\n")?;
-        let limits = WorkspaceIndexLimits::default();
-        let visibility = SourceVisibility::default();
-        let text_inclusion = rift_core::TextFileInclusion::default();
-        let service = ReadService::build(
-            directory.path(),
-            limits,
-            &visibility,
-            &text_inclusion,
-            HistoryConfiguration::default(),
-        )?;
-        let file = service
-            .index()
-            .text_files()
-            .next()
-            .ok_or("fixture text file must be indexed")?;
-        let range = ByteRange { start: 0, end: 17 };
-        let mut results = Vec::new();
-
-        super::merge_file_hit(
-            &mut results,
-            file,
-            1,
-            range,
-            "alpha units beta".to_owned(),
-            0.4,
-            super::HitPayloads::default(),
-        );
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].score, Some(0.4));
-        assert_eq!(results[0].matched_by, vec![MatchedField::Ranked]);
-
-        super::merge_file_hit(
-            &mut results,
-            file,
-            1,
-            range,
-            "alpha units beta".to_owned(),
-            0.9,
-            super::HitPayloads::default(),
-        );
-        assert_eq!(
-            results.len(),
-            1,
-            "a second match at the same path and line must not duplicate the hit"
-        );
-        assert_eq!(results[0].score, Some(0.9), "the higher score must win");
-        assert_eq!(
-            results[0].matched_by,
-            vec![MatchedField::Ranked],
-            "matched_by must union without duplicating an already-present field"
-        );
-
-        // A lower-scoring third match must not pull the absorbed score back down.
-        super::merge_file_hit(
-            &mut results,
-            file,
-            1,
-            range,
-            "alpha units beta".to_owned(),
-            0.1,
-            super::HitPayloads::default(),
-        );
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].score, Some(0.9));
         Ok(())
     }
 
@@ -3645,7 +3950,7 @@ pub fn compute() -> i32 {
     }
 
     /// Each hit's declaration name and whether it is addressed by `unit`, in answer order.
-    fn located_names(result: &rift_protocol::read::SearchResult) -> Vec<(String, bool)> {
+    fn located_names(result: &SearchResult) -> Vec<(String, bool)> {
         result
             .results
             .iter()
@@ -3658,19 +3963,19 @@ pub fn compute() -> i32 {
             .collect()
     }
 
-    /// An omitted `scope` runs the project lanes alone: the helper's declaration does not
+    /// An omitted `scope` runs the project index alone: the helper's declaration does not
     /// answer, the project `beacon` answers by path, and no dependency warning rides.
     #[test]
     fn search_default_scope_answers_the_project_alone() -> TestResult {
         let (_directory, service) = dependency_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({"query": "helper_beacon"}))?;
-        let result = service.search(&params, &[])?;
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
         assert!(result.results.is_empty(), "{:?}", result.results);
         assert!(result.warnings.is_empty(), "{:?}", result.warnings);
 
         let params: SearchParams =
             serde_json::from_value(json!({"query": "beacon", "target": "symbol"}))?;
-        let result = service.search(&params, &[])?;
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
         assert_eq!(located_names(&result), [("beacon".to_owned(), false)]);
         assert_eq!(
             result.results[0].path,
@@ -3688,7 +3993,7 @@ pub fn compute() -> i32 {
             "include": ["source", "score"]
         }))?;
 
-        let result = service.search(&params, &[])?;
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
 
         assert_eq!(result.results.len(), 1, "{:?}", result.results);
         let hit = &result.results[0];
@@ -3697,7 +4002,8 @@ pub fn compute() -> i32 {
         assert_eq!(hit.matched_by, [MatchedField::Name]);
         assert_eq!(
             hit.score,
-            Some(symbol_match_score(SymbolMatchRank::QualifiedExact))
+            Some(1.0),
+            "the only candidate leads the fused order"
         );
         assert_eq!(hit.line, Some(1));
         assert!(
@@ -3723,11 +4029,12 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    /// `global` skips every project lane: the project's own `beacon` never answers,
-    /// the helper's exact `beacon` orders above its substring `helper_beacon`, and a
-    /// `file` target answers empty since a package contributes declarations alone.
+    /// `global` skips the project index: the project's own `beacon` never answers, the
+    /// helper's exact `beacon` orders above its substring `helper_beacon`, the two scores
+    /// fall with position, and a `file` target answers empty since a package contributes
+    /// declarations alone.
     #[test]
-    fn search_global_scope_skips_the_project_lanes() -> TestResult {
+    fn search_global_scope_skips_the_project_index() -> TestResult {
         let (_directory, service) = dependency_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
@@ -3735,7 +4042,7 @@ pub fn compute() -> i32 {
             "include": ["score"]
         }))?;
 
-        let result = service.search(&params, &[])?;
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
 
         assert_eq!(
             located_names(&result),
@@ -3746,28 +4053,22 @@ pub fn compute() -> i32 {
         );
         assert!(result.results.iter().all(|hit| hit.path.is_none()));
         let scores: Vec<Option<f64>> = result.results.iter().map(|hit| hit.score).collect();
-        assert_eq!(
-            scores,
-            [
-                Some(symbol_match_score(SymbolMatchRank::QualifiedExact)),
-                Some(symbol_match_score(SymbolMatchRank::Substring)),
-            ]
-        );
+        assert_eq!(scores, [Some(1.0), Some(0.5)]);
 
         let params: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
             "scope": "global",
             "target": "file"
         }))?;
-        let result = service.search(&params, &[])?;
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
         assert!(result.results.is_empty(), "{:?}", result.results);
         assert_eq!(result.pagination.total_pages, 0);
         Ok(())
     }
 
-    /// Under `all`, relevance orders both sides by score: the helper's exact `beacon`
-    /// above the project's prefix match `beacon_tower`, above the helper's substring
-    /// match `helper_beacon`.
+    /// Under `all`, relevance orders both sides by match class: the helper's exact
+    /// `beacon` above the project's prefix match `beacon_tower`, above the helper's
+    /// substring match `helper_beacon`.
     #[test]
     fn search_all_scope_orders_project_and_package_hits_by_score() -> TestResult {
         let (_directory, service) = project_fixture("pub fn beacon_tower() {}\n")?;
@@ -3778,7 +4079,7 @@ pub fn compute() -> i32 {
             "target": "symbol"
         }))?;
 
-        let result = service.search(&params, &[])?;
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
 
         assert_eq!(
             located_names(&result),
@@ -3804,7 +4105,7 @@ pub fn compute() -> i32 {
             "order": "path"
         }))?;
 
-        let result = service.search(&params, &[])?;
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
 
         assert_eq!(
             located_names(&result),
@@ -3827,7 +4128,7 @@ pub fn compute() -> i32 {
         }))?;
 
         let error = service
-            .search(&params, &[])
+            .search(&params, &StoreAnswer::identifier_only())
             .expect_err("the relationship graph serves the project alone");
 
         assert!(
@@ -3902,7 +4203,7 @@ pub fn compute() -> i32 {
                 serde_json::from_value(json!({"query": "beacon", "scope": scope, "rev": "main"}))?;
 
             let error = service
-                .search(&params, &[])
+                .search(&params, &StoreAnswer::identifier_only())
                 .expect_err("rev pairs with the project scope alone");
 
             assert!(
@@ -3932,7 +4233,7 @@ pub fn compute() -> i32 {
         for scope in ["global", "all"] {
             let params: SearchParams =
                 serde_json::from_value(json!({"query": "beacon", "scope": scope}))?;
-            let result = service.search(&params, &[])?;
+            let result = service.search(&params, &StoreAnswer::identifier_only())?;
             assert!(
                 matches!(
                     result.warnings.first(),
@@ -3951,7 +4252,7 @@ pub fn compute() -> i32 {
             );
         }
         let params: SearchParams = serde_json::from_value(json!({"query": "beacon"}))?;
-        let result = service.search(&params, &[])?;
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
         assert!(result.warnings.is_empty(), "{:?}", result.warnings);
         Ok(())
     }

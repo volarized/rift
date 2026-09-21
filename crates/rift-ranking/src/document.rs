@@ -27,8 +27,6 @@ pub const IDENTIFIER_TERMS_BYTES_MAX: usize = 8_192;
 pub const SIGNATURE_BYTES_MAX: usize = 8_192;
 /// Bytes the `documentation` field may hold.
 pub const DOCUMENTATION_BYTES_MAX: usize = 16_384;
-/// Bytes the `declaration_source` and `file_content` fields may hold (1 MiB).
-pub const CONTENT_BYTES_MAX: usize = 1_048_576;
 
 /// The FTS tokenizer every Rift corpus is built with.
 ///
@@ -41,6 +39,11 @@ pub const CONTENT_BYTES_MAX: usize = 1_048_576;
 /// A reader that folded on one side and not the other would rank the same
 /// publication two ways.
 pub const CORPUS_TOKENIZER: &str = "unicode61 remove_diacritics 0";
+
+/// Separates one field's column name from its value in digest material.
+const FIELD_NAME_SEPARATOR: u8 = 0;
+/// Separates adjacent fields in digest material.
+const FIELD_SEPARATOR: u8 = 0xff;
 
 /// How the derived identifier terms are split.
 ///
@@ -115,15 +118,23 @@ impl SearchableField {
         }
     }
 
-    /// The byte bound this field's value may reach.
+    /// The byte bound this field's value may reach, or `None` for a field the
+    /// shape does not bound.
+    ///
+    /// A name, a derived term list, a signature, and a doc comment have a
+    /// ceiling no source reasonably reaches, and a value past it is a defect
+    /// in whatever produced it. The two content fields have none here: the
+    /// store the document is published into carries the operator's own byte
+    /// bound, and restating it as a second ceiling would mean neither could
+    /// ever trip.
     #[must_use]
-    pub const fn bytes_max(self) -> usize {
+    pub const fn bytes_max(self) -> Option<usize> {
         match self {
-            Self::Name | Self::QualifiedName => NAME_BYTES_MAX,
-            Self::IdentifierTerms => IDENTIFIER_TERMS_BYTES_MAX,
-            Self::Signature => SIGNATURE_BYTES_MAX,
-            Self::Documentation => DOCUMENTATION_BYTES_MAX,
-            Self::DeclarationSource | Self::FileContent => CONTENT_BYTES_MAX,
+            Self::Name | Self::QualifiedName => Some(NAME_BYTES_MAX),
+            Self::IdentifierTerms => Some(IDENTIFIER_TERMS_BYTES_MAX),
+            Self::Signature => Some(SIGNATURE_BYTES_MAX),
+            Self::Documentation => Some(DOCUMENTATION_BYTES_MAX),
+            Self::DeclarationSource | Self::FileContent => None,
         }
     }
 
@@ -236,6 +247,18 @@ impl DocumentKind {
         match self {
             Self::Symbol => "symbol",
             Self::TextFile => "text_file",
+        }
+    }
+
+    /// The one field a document of this kind carries content in.
+    ///
+    /// Only this field can reach a megabyte, so it is the one an operator's byte bound
+    /// applies to and the one a reader excerpts from.
+    #[must_use]
+    pub const fn content_field(self) -> SearchableField {
+        match self {
+            Self::Symbol => SearchableField::DeclarationSource,
+            Self::TextFile => SearchableField::FileContent,
         }
     }
 
@@ -394,11 +417,32 @@ impl DocumentFields {
             .collect()
     }
 
+    /// The digest of the fields this document filled, in declared column
+    /// order.
+    ///
+    /// Two publications of the same declaration produce one digest, whichever
+    /// adapter built them, so a comparison across adapters tells an unchanged
+    /// document from a rewritten one without reading every field back. The
+    /// column name is folded in beside its value, so moving a value from one
+    /// field to another changes the digest.
+    #[must_use]
+    pub fn digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        for field in SearchableField::ALL {
+            hasher.update(field.column().as_bytes());
+            hasher.update([FIELD_NAME_SEPARATOR]);
+            hasher.update(self.get(field).unwrap_or_default().as_bytes());
+            hasher.update([FIELD_SEPARATOR]);
+        }
+        HEXLOWER.encode(&hasher.finalize())[..DIGEST_WIRE_CHARS].to_owned()
+    }
+
     /// Refuses a field whose value runs past its own byte bound.
-    fn violation(&self) -> Option<(SearchableField, usize)> {
+    fn violation(&self) -> Option<(SearchableField, usize, usize)> {
         SearchableField::ALL.into_iter().find_map(|field| {
+            let bound = field.bytes_max()?;
             let observed = self.get(field)?.len();
-            (observed > field.bytes_max()).then_some((field, observed))
+            (observed > bound).then_some((field, bound, observed))
         })
     }
 }
@@ -432,12 +476,12 @@ impl IndexDocument {
         digest: impl Into<String>,
         fields: DocumentFields,
     ) -> Result<Self, RankingError> {
-        if let Some((field, observed)) = fields.violation() {
+        if let Some((field, bound, observed)) = fields.violation() {
             return Err(refuse_over_limit(
                 RankingViolation::DocumentFieldLength,
                 field.column(),
                 "document.field",
-                field.bytes_max(),
+                bound,
                 observed,
             ));
         }
@@ -507,6 +551,24 @@ impl IndexDocument {
     pub const fn fields(&self) -> &DocumentFields {
         &self.fields
     }
+
+    /// The content this document's kind carries, empty when it carries none.
+    #[must_use]
+    pub fn content(&self) -> &str {
+        self.fields
+            .get(self.kind.content_field())
+            .unwrap_or_default()
+    }
+
+    /// The project path this document is addressed by, or `None` for a package
+    /// document, which a source unit addresses instead.
+    #[must_use]
+    pub const fn project_path(&self) -> Option<&ProjectPath> {
+        match &self.location {
+            DocumentLocation::Project(path) => Some(path),
+            DocumentLocation::Unit(_) => None,
+        }
+    }
 }
 
 /// What the stored corpus means.
@@ -560,9 +622,8 @@ impl std::fmt::Display for CorpusRevision {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTENT_BYTES_MAX, CorpusRevision, DocumentFields, DocumentIdentity, DocumentKind,
-        DocumentLocation, FieldSet, IDENTITY_BYTES_MAX, IndexDocument, NAME_BYTES_MAX,
-        SearchableField,
+        CorpusRevision, DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, FieldSet,
+        IDENTITY_BYTES_MAX, IndexDocument, NAME_BYTES_MAX, SearchableField,
     };
     use crate::error::RankingViolation;
     use rift_core::constants::DIGEST_WIRE_CHARS;
@@ -758,10 +819,17 @@ mod tests {
     }
 
     #[test]
-    fn test_a_content_field_at_its_byte_bound_is_accepted() {
+    fn test_a_content_field_carries_what_the_store_will_bound() {
         let fields = DocumentFields::empty()
-            .with(SearchableField::FileContent, "c".repeat(CONTENT_BYTES_MAX));
-        assert!(document(fields).is_ok());
+            .with(SearchableField::FileContent, "c".repeat(2 * NAME_BYTES_MAX));
+        assert!(
+            document(fields).is_ok(),
+            "the shape states no content ceiling: the store the document lands in \
+             carries the operator's own byte bound, and two ceilings would leave \
+             neither able to trip"
+        );
+        assert_eq!(SearchableField::FileContent.bytes_max(), None);
+        assert_eq!(SearchableField::DeclarationSource.bytes_max(), None);
     }
 
     #[test]

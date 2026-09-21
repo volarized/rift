@@ -172,28 +172,38 @@ server log; the next publication's transaction replaces the whole unit set.
 
 The database tables:
 
-- `lexical_units` - one row per indexed unit: a code symbol, or a text file split into chunks
-  past the [`[search.text]`](/docs/developer/configuration#search) chunk bound.
-- `lexical_index_state` - stamps the set with the tree revision that published it. One read
-  transaction reads that stamp and runs the query, so a commit landing between the two cannot
-  slip another tree's rows into an answer. A store holding another tree returns no rows at all:
-  either the lane has not committed the captured publication yet, and `search` warns naming that
-  revision, or the publication has since been superseded, and the request recaptures rather than
-  ranking rows it cannot place.
-- `lexical_units_fts` - the [FTS5](https://www.sqlite.org/fts5.html) virtual table over `name`
-  and `content`, with `identity` riding unindexed as the join key; ranking is FTS5's `bm25`
-  with per-column weights, comparable only within one search.
-- `semantic_vectors` - one row per model and declaration digest.
+- `lexical_documents` - one row per indexed document: a code symbol, or a text file split into
+  chunks past the [`[search.text]`](/docs/developer/configuration#search) chunk bound. The row
+  carries the document's identity, path, kind, and content digest beside the seven searchable
+  fields.
+- `lexical_index_state` - stamps the set with the tree revision that published it and the
+  corpus revision it was built under. One read transaction reads that stamp and runs the query,
+  so a commit landing between the two cannot slip another tree's rows into an answer. A store
+  holding another tree returns no rows at all: either the lane has not committed the captured
+  publication yet, and `search` warns naming that revision, or the publication has since been
+  superseded, and the request recaptures rather than ranking rows it cannot place. A store
+  holding another corpus revision returns no rows either: its columns, derivation, tokenizer,
+  or weights are not this build's.
+- `lexical_documents_fts` - the [FTS5](https://www.sqlite.org/fts5.html) virtual table over the
+  seven searchable columns, with `identity` riding unindexed as the join key. Ranking is FTS5's
+  `bm25` with the per-column weights the
+  [architecture page](/docs/developer/architecture#search) lists, comparable only within one
+  search. The same statement asks `bm25` once per column with every other weight zeroed, which
+  is how an answer states that a term landed in documentation rather than in a name. The
+  tokenizer is `unicode61 remove_diacritics 0`: keeping diacritics is what lets an in-memory
+  adapter tokenize the same text the same way without carrying a folding table of its own.
+- `semantic_vectors` - one row per embedding space and declaration digest.
 - `log_records` - bounded server diagnostics read through `rift://logs` and `rift server logs`.
 
 A rebuild that named its files deletes and reinserts exactly those paths, which is why
-`lexical_units` carries an index on `path`. Every named path is replaced, added ones included:
-two rebuilds captured from one publication both write what they read, and the second leaves what
-the first left.
+`lexical_documents` carries an index on `path`. Every named path is replaced, added ones
+included: two rebuilds captured from one publication both write what they read, and the second
+leaves what the first left.
 
-Search is a layered configuration: the default is this full-text store alone, and
-[`[search.vector]`](/docs/developer/configuration#search) adds the vector store below, whose ranking
-the server fuses with this one by reciprocal rank.
+Search is a layered configuration: the default is this full-text store beside identifier
+matching, and [`[search.vector]`](/docs/developer/configuration#search) adds the vector store
+below. All three fuse by weighted reciprocal rank, under the shares
+[`[search.ranking]`](/docs/developer/configuration#search) sets.
 
 ## Server logs
 
@@ -215,6 +225,22 @@ The flags narrow what prints:
 Agents read these records through [`rift://logs`](/docs/mcp#resource-logs).
 The [`[logs]`](/docs/developer/configuration#logs) table bounds how many the server keeps.
 
+## Shared ranking
+
+`rift-ranking` states the retrieval decisions every index makes: the document shape and its
+seven searchable fields, the corpus revision that says what those fields mean, bounded query
+construction with its precise and broad renderers, identifier splitting and match classing, and
+weighted reciprocal rank fusion over ordered identities. It also carries an index that holds its
+documents in memory and ranks them by the same BM25 weights, which is the peer a test compares
+the stored corpus against.
+
+Nothing in it opens a database, loads a model, or resolves a project path. The architecture
+check refuses `SQLite`, candle, tokenizers, `reqwest`, `rig-core`, and Toasty in that crate's
+dependency closure, and an example builds the whole surface the way an external adapter would.
+A `PostgreSQL` or REST adapter therefore consumes the same decisions and the same ordered
+identities rather than copying the algorithms; resolving an identity to a declaration needs the
+store that published it, and deciding which identities win does not.
+
 ## Vector search
 
 <VersionBadge
@@ -222,8 +248,38 @@ The [`[logs]`](/docs/developer/configuration#logs) table bounds how many the ser
   languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
 />
 
-`rift-search` owns the tier. It runs the encoder in the server's own process, so answering
-a query touches neither the network nor a subprocess.
+`rift-search` owns the tier. The default runs the encoder in the server's own process, so
+answering a query touches neither the network nor a subprocess.
+
+Every model reaches the tier through one contract:
+[`rig-core`](https://crates.io/crates/rig-core)'s `EmbeddingModel`, pinned at `=0.42.0`. One
+enum holds the concrete pairs the server can run, and each method matches once and hands the
+concrete model to a generic helper, so no boxed model callback and no untyped provider map
+exists. Adding a family changes the loader and its adapter tests; search, fusion, `SQLite`,
+and MCP keep calling the same method.
+
+A local model is two handles over one loaded encoder: documents embed through one and queries
+through the other. A BERT retrieval checkpoint prefixes the query with its own instruction and
+leaves documents alone, while a static model treats the two alike, so the difference lives in
+the handles rather than in a flag every caller has to remember. Acquiring the files, reading
+them, and detecting the family all finish before a handle exists, because the contract's own
+constructor cannot fail.
+
+The `openai_compatible` arm builds on the same contract. Rig's client carries the credential
+the `api_key_env` variable named, the configured base URL, and an HTTP client holding the
+configured request timeout; Rift issues the `/embeddings` request and decodes the response
+itself. Rig 0.42.0 parses each response `index` and then zips the response array with the
+input array by position, so a service answering out of order would attach every vector to the
+wrong declaration. Rift's contract makes array order meaningless: the declared `index` decides,
+and a duplicate index, a missing one, or one past the request's own length is refused rather
+than mis-associated. The mock-endpoint suite serves reversed and malformed responses to prove
+it, and makes no external request.
+
+Batching is Rift's, not the library's. Rig's own batch builder fixes its chunk size to the
+model's `MAX_DOCUMENTS` and derives its own concurrency, so it cannot honor both `batch_inputs`
+and `max_in_flight`. The scheduler here cuts each batch to the lower of `batch_inputs` and what
+the model accepts, runs one local batch at a time, allows at most `max_in_flight` remote
+requests, and returns every completed batch to the input slots it came from.
 
 The model's own `config.json` decides which of two encoders reads it. A `model_type` of
 `model2vec` is a static model: the weights are one table of vectors, and the encoder embeds
@@ -249,9 +305,17 @@ attention memory grows with the square of the token window, and candle's kernels
 spread one pass across the thread pool, so running several at once buys nothing and costs the
 machine its memory.
 
-The vectors go in `semantic_vectors`, in the same `.rift/db`. A row is addressed by the model
-that produced it and the digest of the text it came from, so a declaration that moves or is
-renamed resolves to the row already stored and a refresh embeds only what changed.
+The vectors go in `semantic_vectors`, in the same `.rift/db`. A row is addressed by the
+embedding space that produced it and the digest of the text it came from, so a declaration that
+moves or is renamed resolves to the row already stored and a refresh embeds only what changed.
+The space folds in the source kind, the endpoint origin for a remote service, the model and its
+resolved revision, the width, and the document and query transformations, and nothing else: a
+credential never reaches it. Changing any of those mints another identity, and the rows the
+previous one wrote are dropped rather than scored against.
+
+Rig returns double-precision coordinates. The stored format stays single precision, which is
+what the local index already holds and what a later global store would carry, so the conversion
+happens once at the boundary and a coordinate the narrower format cannot hold is refused there.
 
 A pass publishes its vectors, the map that places each of them on a unit, and the tree revision
 they were described for as one value. A query reads all three or none: a corpus described for a

@@ -1,0 +1,7 @@
+search:
+  ranking:
+    identifier_weight: 0.35
+    lexical_weight: 0.35
+    vector_weight: 0.30
+  vector:
+    disabled: true

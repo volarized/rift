@@ -24,13 +24,15 @@ use rift_protocol::workspace::{
     WORKSPACE_SOURCE_UNITS_MAX, WorkspaceLanguageSummary, WorkspaceLspSummary,
     WorkspaceResourcePage, WorkspaceSourceUnit,
 };
+use rift_ranking::{ParsedQuery, QueryPhase, RankingInput, RankingWeights};
 use rift_search::{
-    AcquisitionLimits, FusedRanking, ModelSource, RankedUnit, RevisionScoped, SearchIndex,
-    SearchIndexLimits, VectorReadiness,
+    AcquisitionLimits, EmbeddingModels, EmbeddingSpace, ModelSource, RemoteEmbeddingSettings,
+    RetrievalModels, RevisionScoped, RiftOpenAiEmbeddingModel, SearchIndex, SearchIndexLimits,
+    StoreRanking, VectorReadiness,
 };
 use rift_server::{
     EnginePool, EngineReferences, LspProcessKey, PackageBranch, ReadError, ReadFault, ReadService,
-    resolve_engine_references, uses_engine_references, wire_digest,
+    StoreAnswer, resolve_engine_references, uses_engine_references, wire_digest,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{
@@ -210,19 +212,34 @@ fn lexical_index_limits(search: &SearchConfiguration) -> LexicalIndexLimits {
     LexicalIndexLimits::new(
         LexicalIndexLimits::accepted_units_max(search.lexical.units_max),
         defaults.unit_bytes_max(),
-        defaults.query_terms_max(),
         defaults.matches_max(),
         pool_slots,
         busy_timeout_ms,
     )
 }
 
-/// Where one `[search.vector.embedding]` table's weights come from, and what fetching them
-/// may spend.
+/// Which embedding one `[search.vector.embedding]` table selects, and what it needs
+/// before the vector ranking can answer.
+///
+/// A local model is acquired: its weights are fetched or read, then loaded. A remote
+/// service is not: its endpoint, model, width, and credential are all the configuration
+/// states, so the model handle is built at once.
 #[derive(Clone, Debug)]
-struct ModelAcquisition {
-    source: ModelSource,
-    limits: AcquisitionLimits,
+enum EmbeddingSelection {
+    /// An encoder this process loads and runs.
+    Local {
+        /// Where the weights come from.
+        source: ModelSource,
+        /// What fetching them may spend.
+        limits: AcquisitionLimits,
+    },
+    /// A service answering the `OpenAI` embedding shape.
+    Remote {
+        /// What the client is built from, credential included.
+        settings: Box<RemoteEmbeddingSettings>,
+        /// The space the service embeds into.
+        space: EmbeddingSpace,
+    },
 }
 
 /// The acquisition bound a `directory` embedding runs under. Acquisition reads the files
@@ -243,7 +260,10 @@ const DIRECTORY_ACQUISITION: AcquisitionLimits = AcquisitionLimits::new(
 /// enforces the narrower rule. A value that passes the first and fails the second is a
 /// warning and a disabled vector ranking, never a startup failure: the workspace still has
 /// a full-text tier.
-fn model_acquisition(vector: &VectorSearchConfiguration, root: &Path) -> Option<ModelAcquisition> {
+fn model_acquisition(
+    vector: &VectorSearchConfiguration,
+    root: &Path,
+) -> Option<EmbeddingSelection> {
     if vector.disabled {
         return None;
     }
@@ -253,29 +273,43 @@ fn model_acquisition(vector: &VectorSearchConfiguration, root: &Path) -> Option<
             download_timeout,
             download_attempts,
             ..
-        } => ModelSource::repository(model).map(|source| ModelAcquisition {
+        } => ModelSource::repository(model).map(|source| EmbeddingSelection::Local {
             source,
             limits: acquisition_limits(download_timeout.milliseconds(), *download_attempts),
         }),
         EmbeddingConfiguration::Directory { model, .. } => {
-            ModelSource::directory(model, root).map(|source| ModelAcquisition {
+            ModelSource::directory(model, root).map(|source| EmbeddingSelection::Local {
                 source,
                 limits: DIRECTORY_ACQUISITION,
             })
         }
-        EmbeddingConfiguration::OpenaiCompatible { endpoint, .. } => {
-            tracing::warn!(
-                component = "search",
-                operation = "search.prepare",
-                endpoint = endpoint.as_str(),
-                "this release runs local embedding models alone; the workspace serves the \
-                 full-text tier alone"
+        EmbeddingConfiguration::OpenaiCompatible {
+            endpoint,
+            model,
+            revision,
+            dimensions,
+            api_key_env,
+            request_timeout,
+            attempts,
+            ..
+        } => {
+            let held = std::env::var(api_key_env).ok();
+            return remote_selection(
+                &RemoteEmbedding {
+                    endpoint,
+                    model,
+                    revision,
+                    dimensions: *dimensions,
+                    api_key_env,
+                    request_timeout: Duration::from_millis(request_timeout.milliseconds()),
+                    attempts: *attempts,
+                },
+                held.as_deref(),
             );
-            return None;
         }
     };
     match resolved {
-        Ok(acquisition) => Some(acquisition),
+        Ok(selection) => Some(selection),
         Err(error) => {
             tracing::warn!(
                 component = "search",
@@ -288,6 +322,60 @@ fn model_acquisition(vector: &VectorSearchConfiguration, root: &Path) -> Option<
             None
         }
     }
+}
+
+/// The `openai_compatible` keys one selection reads, gathered so the factory takes one
+/// argument rather than seven.
+struct RemoteEmbedding<'a> {
+    endpoint: &'a str,
+    model: &'a str,
+    revision: &'a str,
+    dimensions: u64,
+    api_key_env: &'a str,
+    request_timeout: Duration,
+    attempts: u64,
+}
+
+/// The remote selection one `openai_compatible` table describes, or nothing when the
+/// named environment variable held no credential.
+///
+/// `api_key` is the value that variable held, read by the caller: keeping the read out of
+/// here is what lets this be driven without a process-wide environment change. An absent
+/// credential leaves the vector ranking off and says so; it is not a startup failure,
+/// because the workspace still has a full-text tier.
+fn remote_selection(
+    embedding: &RemoteEmbedding<'_>,
+    api_key: Option<&str>,
+) -> Option<EmbeddingSelection> {
+    let Some(api_key) = api_key else {
+        tracing::warn!(
+            component = "search",
+            operation = "search.prepare",
+            api_key_env = embedding.api_key_env,
+            endpoint = embedding.endpoint,
+            "the environment variable naming the embedding credential is unset; the \
+             workspace serves the full-text tier alone"
+        );
+        return None;
+    };
+    let dimensions = usize::try_from(embedding.dimensions).unwrap_or(usize::MAX);
+    Some(EmbeddingSelection::Remote {
+        settings: Box::new(RemoteEmbeddingSettings {
+            endpoint: embedding.endpoint.to_owned(),
+            model: embedding.model.to_owned(),
+            revision: embedding.revision.to_owned(),
+            dimensions,
+            api_key: api_key.to_owned(),
+            request_timeout: embedding.request_timeout,
+            attempts: u32::try_from(embedding.attempts).unwrap_or(1).max(1),
+        }),
+        space: EmbeddingSpace::remote(
+            embedding.endpoint,
+            embedding.model,
+            embedding.revision,
+            dimensions,
+        ),
+    })
 }
 
 /// The model value one `[search.vector.embedding]` table names.
@@ -340,11 +428,9 @@ const fn local_embedding_batch(embedding: &EmbeddingConfiguration) -> Option<(u6
 /// than a preparation that never runs.
 fn search_index_limits(
     search: &SearchConfiguration,
-    acquisition: Option<&ModelAcquisition>,
+    acquisition: Option<&EmbeddingSelection>,
 ) -> SearchIndexLimits {
     let mut builder = SearchIndexLimits::builder(lexical_index_limits(search))
-        .weights(search.ranking.lexical_weight, search.ranking.vector_weight)
-        .fusion_k(search.ranking.fusion_k)
         .candidates(search.vector.candidates)
         .max_vectors(search.vector.max_vectors)
         .per_file_max(VECTOR_PER_FILE_MAX);
@@ -353,11 +439,37 @@ fn search_index_limits(
             .batch_declarations(batch_inputs)
             .max_tokens(max_tokens);
     }
+    if let EmbeddingConfiguration::OpenaiCompatible {
+        batch_inputs,
+        max_in_flight,
+        ..
+    } = &search.vector.embedding
+    {
+        builder = builder
+            .batch_declarations(*batch_inputs)
+            .max_in_flight(*max_in_flight);
+    }
     if acquisition.is_some() {
         builder.build()
     } else {
         builder.disable_vector().build()
     }
+}
+
+/// The shares the three ranking inputs fuse under, as `[search.ranking]` set them.
+///
+/// Acceptance already refused a share outside its range, a triple of zeroes, and a rank
+/// constant outside 1 to 1000, so the refusal arm here is a programmer invariant rather
+/// than an operating failure.
+fn ranking_weights(search: &SearchConfiguration) -> RankingWeights {
+    let ranking = &search.ranking;
+    RankingWeights::new(
+        ranking.identifier_weight,
+        ranking.lexical_weight,
+        ranking.vector_weight,
+        ranking.fusion_k,
+    )
+    .unwrap_or_else(|error| unreachable!("accepted ranking shares must fuse: error={error}"))
 }
 
 /// Attaches the search tiers to the process's one workspace database.
@@ -395,7 +507,7 @@ fn open_search_index(
 /// supervisor runs under, which the last server clone's drop guard cancels.
 fn spawn_vector_preparation(
     index: Arc<SearchIndex>,
-    acquisition: ModelAcquisition,
+    selection: EmbeddingSelection,
     published: Arc<RwLock<IndexState>>,
     population: PopulationLane,
     cancellation: CancellationToken,
@@ -403,7 +515,7 @@ fn spawn_vector_preparation(
     tokio::spawn(async move {
         let prepared = tokio::select! {
             () = cancellation.cancelled() => return,
-            prepared = index.prepare(&acquisition.source, acquisition.limits) => prepared,
+            prepared = held_model(&index, &selection) => prepared,
         };
         match prepared {
             Ok(()) => embed_prepared(&published, &population).await,
@@ -416,6 +528,23 @@ fn spawn_vector_preparation(
             ),
         }
     });
+}
+
+/// Puts the selected model behind the index: a local encoder is acquired and loaded, a
+/// remote service's client is built from the configuration it already carries.
+async fn held_model(
+    index: &SearchIndex,
+    selection: &EmbeddingSelection,
+) -> Result<(), rift_search::SearchError> {
+    match selection {
+        EmbeddingSelection::Local { source, limits } => index.prepare(source, *limits).await,
+        EmbeddingSelection::Remote { settings, space } => {
+            let model = RiftOpenAiEmbeddingModel::new(settings)?;
+            let models =
+                EmbeddingModels::OpenAi(RetrievalModels::new(model.clone(), model, space.clone()));
+            index.hold_models(models, space.clone()).await
+        }
+    }
 }
 
 /// Asks the population lane for the pass that embeds the published set, once the model is
@@ -793,6 +922,14 @@ fn bounded_detail(mut detail: String, bytes_max: usize) -> String {
     detail
 }
 
+/// What the search store answered for both query phases of one request.
+#[derive(Debug, Default)]
+struct PhasedRanking {
+    precise: Vec<RankingInput>,
+    broad: Vec<RankingInput>,
+    lexical_truncated_at: Option<u32>,
+}
+
 /// The ranking one search request merges, and what the search index's own state adds to
 /// that answer's warnings.
 ///
@@ -804,15 +941,16 @@ fn bounded_detail(mut detail: String, bytes_max: usize) -> String {
 /// all until an operator acts carries the same warning with that reason.
 #[derive(Debug, Default)]
 struct SearchRanking {
-    units: Vec<RankedUnit>,
+    answer: StoreAnswer,
     warnings: Vec<ReadWarning>,
 }
 
 impl SearchRanking {
-    /// No ranking at all, for the reason `detail` states.
+    /// No ranking at all, for the reason `detail` states. The identifier ranking then
+    /// answers alone.
     fn unavailable(detail: &str) -> Self {
         Self {
-            units: Vec::new(),
+            answer: StoreAnswer::identifier_only(),
             warnings: vec![ReadWarning::LexicalRankingUnavailable {
                 detail: detail.to_owned(),
             }],
@@ -830,18 +968,19 @@ impl SearchRanking {
 /// the lexical store cut at its bound carries that cut as a warning, since hits past the
 /// bound never reach a page.
 fn ranking_of(
-    searched: RevisionScoped<FusedRanking>,
+    searched: RevisionScoped<PhasedRanking>,
     readiness: VectorReadiness,
     files: u64,
     tree_revision: &str,
     commit_state: LexicalCommitState,
+    weights: RankingWeights,
 ) -> Option<SearchRanking> {
     match (searched, commit_state) {
-        (RevisionScoped::Matched(ranking), _) => {
+        (RevisionScoped::Matched(phased), _) => {
             let mut warnings = readiness_warnings(readiness, files);
-            warnings.extend(ranking.lexical_truncated_at().map(lexical_truncated));
+            warnings.extend(phased.lexical_truncated_at.map(lexical_truncated));
             Some(SearchRanking {
-                units: ranking.into_units(),
+                answer: StoreAnswer::new(phased.precise, phased.broad, weights),
                 warnings,
             })
         }
@@ -1037,6 +1176,9 @@ pub struct RiftMcp {
     /// startup; `search` then serves identifier matching alone and says so in
     /// every answer's warnings.
     search_index: Option<Arc<SearchIndex>>,
+    /// The shares the identifier, full-text, and vector rankings fuse under, as
+    /// `[search.ranking]` set them.
+    ranking_weights: RankingWeights,
     /// The lexical lane, absent exactly when [`Self::search_index`] is. A rebuild commits
     /// through it before its snapshot becomes current.
     lexical: Option<LexicalLane>,
@@ -1061,8 +1203,9 @@ pub struct RiftMcp {
 /// model acquisition the vector ranking waits on. Every part is absent when the index
 /// could not be opened.
 struct SearchTier {
-    acquisition: Option<ModelAcquisition>,
+    acquisition: Option<EmbeddingSelection>,
     search_index: Option<Arc<SearchIndex>>,
+    ranking_weights: RankingWeights,
     lexical: Option<LexicalLane>,
     population: Option<PopulationLane>,
 }
@@ -1178,6 +1321,7 @@ impl RiftMcp {
         let SearchTier {
             acquisition,
             search_index,
+            ranking_weights,
             lexical,
             population,
         } = Self::open_search_tier(
@@ -1230,6 +1374,7 @@ impl RiftMcp {
             supervisor_cancellation,
             blocking,
             search_index,
+            ranking_weights,
             lexical,
             #[cfg(test)]
             dependencies: packages,
@@ -1311,6 +1456,7 @@ impl RiftMcp {
         SearchTier {
             acquisition,
             search_index,
+            ranking_weights: ranking_weights(&search_configuration),
             lexical,
             population,
         }
@@ -1386,8 +1532,10 @@ impl RiftMcp {
         };
         // The search index only ever holds the current tree, so a revision-addressed
         // search never consults it.
-        self.read_at(Some(rev), move |reads| reads.search(&params, &[]))
-            .await
+        self.read_at(Some(rev), move |reads| {
+            reads.search(&params, &StoreAnswer::identifier_only())
+        })
+        .await
     }
 
     /// Compares the two committed revisions `change` names and answers the declarations
@@ -1474,7 +1622,7 @@ impl RiftMcp {
             ReadFault::unavailable("engine references", "request deadline exceeded")
                 .tool_error(wire::ErrorPhase::Read)
         })??;
-        let SearchRanking { units, warnings } = ranking.unwrap_or_else(|| {
+        let SearchRanking { answer, warnings } = ranking.unwrap_or_else(|| {
             SearchRanking::unavailable(
                 "the lexical index is stamped for a publication newer than the one this \
                  request captured, and the workspace kept publishing across the bounded \
@@ -1485,7 +1633,7 @@ impl RiftMcp {
         let executed = params;
         let mut answer = self
             .current_tree_read(&resolved, move |reads| {
-                reads.search_with_references(&executed, &units, &references)
+                reads.search_with_references(&executed, &answer, &references)
             })
             .await?;
         answer.0.warnings.extend(warnings);
@@ -1597,9 +1745,14 @@ impl RiftMcp {
         let Some(query) = params.query.as_deref().filter(|query| !query.is_empty()) else {
             return Ok(Some(SearchRanking::default()));
         };
+        // A query the bounded parser refuses is this request's own `invalid_request`,
+        // raised where the read path raises it rather than degraded to no ranking.
+        let Ok(parsed) = ParsedQuery::parse(query) else {
+            return Ok(Some(SearchRanking::default()));
+        };
         let tree_revision = published.reads.tree_revision();
         let (searched, commit_state) = self
-            .store_answer(index, tree_revision, query, budget)
+            .store_answer(index, tree_revision, &parsed, budget)
             .await?;
         Ok(ranking_of(
             searched,
@@ -1607,18 +1760,60 @@ impl RiftMcp {
             published.reads.file_count(),
             tree_revision,
             commit_state,
+            self.ranking_weights,
         ))
     }
 
-    /// The store's answer for `tree_revision`, read as deep as [`Self::fetch_limit`].
+    /// The store's answer for `tree_revision` in both query phases, read as deep as
+    /// [`Self::fetch_limit`].
+    ///
+    /// The broad phase runs whenever the query has one, before anything knows whether
+    /// the precise answer will fill the candidate pool. The read layer fuses first and
+    /// uses these only when it comes up short, so a broad hit never displaces a precise
+    /// one; what the eager run costs is one more full-text query.
     async fn read_store(
         &self,
         index: &SearchIndex,
         tree_revision: &str,
-        query: &str,
-    ) -> Result<RevisionScoped<FusedRanking>, ErrorData> {
+        query: &ParsedQuery,
+    ) -> Result<RevisionScoped<PhasedRanking>, ErrorData> {
+        let precise = self
+            .run_phase(index, tree_revision, query, QueryPhase::Precise)
+            .await?;
+        let RevisionScoped::Matched(precise) = precise else {
+            return Ok(match precise {
+                RevisionScoped::OtherRevision(stored) => RevisionScoped::OtherRevision(stored),
+                _ => RevisionScoped::NoRevision,
+            });
+        };
+        let broad = if query.has_broad_phase() {
+            match self
+                .run_phase(index, tree_revision, query, QueryPhase::Broad)
+                .await?
+            {
+                RevisionScoped::Matched(broad) => broad.into_inputs(),
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        Ok(RevisionScoped::Matched(PhasedRanking {
+            lexical_truncated_at: precise.lexical_truncated_at(),
+            precise: precise.into_inputs(),
+            broad,
+        }))
+    }
+
+    /// One phase of the store's ranking for `tree_revision`.
+    async fn run_phase(
+        &self,
+        index: &SearchIndex,
+        tree_revision: &str,
+        query: &ParsedQuery,
+        phase: QueryPhase,
+    ) -> Result<RevisionScoped<StoreRanking>, ErrorData> {
         index
-            .search(tree_revision, query, self.fetch_limit())
+            .rank(tree_revision, query, phase, self.fetch_limit())
             .await
             .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
     }
@@ -1640,9 +1835,9 @@ impl RiftMcp {
         &self,
         index: &SearchIndex,
         tree_revision: &str,
-        query: &str,
+        query: &ParsedQuery,
         budget: Duration,
-    ) -> Result<(RevisionScoped<FusedRanking>, LexicalCommitState), ErrorData> {
+    ) -> Result<(RevisionScoped<PhasedRanking>, LexicalCommitState), ErrorData> {
         let searched = self.read_store(index, tree_revision, query).await?;
         let Some(lane) = self.lexical.as_ref() else {
             return Ok((searched, LexicalCommitState::Settled));
@@ -2669,8 +2864,9 @@ mod tests {
     };
     use rift_protocol::lock::ProductIdentity;
     use rift_protocol::read::{GetSymbolResult, ReadWarning, SearchParams, SearchResult};
-    use rift_search::{FusedRanking, ModelSource, RevisionScoped, VectorReadiness};
-    use rift_server::{LspProcessKey, ReadError, ReadFault};
+    use rift_ranking::{RankingInputKind, RankingWeights};
+    use rift_search::{ModelSource, RevisionScoped, VectorReadiness};
+    use rift_server::{LspProcessKey, ReadError, ReadFault, StoreAnswer};
 
     use rmcp::ServiceError;
     use rmcp::ServiceExt as _;
@@ -3296,12 +3492,18 @@ mod tests {
         Ok(())
     }
 
-    /// A multi-word prose query neither identifier search path can serve: no line contains
-    /// the literal phrase, and no declaration name contains it either. `scale_value`'s doc
-    /// comment supplies just the word "units" and `guide.txt` supplies "replace" and "all",
-    /// so only the lexical search-index tier's per-term matching can produce either hit.
+    /// `matched_by` names the columns that placed each hit: a documentation hit on the
+    /// declaration whose doc comment carried a term, a content hit on the text file whose
+    /// bytes carried the others, and a name hit on the declaration the caller named.
+    ///
+    /// "replace all units" is also a query the precise phase cannot answer - no document
+    /// carries all three terms, `scale_value`'s doc comment supplies "units" alone and
+    /// `guide.txt` supplies "replace" and "all" - so the widened phase is what places
+    /// either hit. Neither reaches the answer through the identifier ranking: the query
+    /// is not identifier-shaped and none of its tokens splits into words, so that
+    /// ranking extracts no candidate at all.
     #[tokio::test]
-    async fn client_search_merges_lexical_symbol_and_text_file_hits() -> TestResult {
+    async fn client_search_matched_by_names_the_column_that_placed_each_hit() -> TestResult {
         let directory = tempfile::tempdir()?;
         let lib_rs = "/// Converts a raw measurement into base units.\npub fn scale_value(value: f64) -> f64 {\n    value * 2.0\n}\n";
         fs::write(directory.path().join("lib.rs"), lib_rs)?;
@@ -3327,27 +3529,44 @@ mod tests {
             .as_array()
             .ok_or("results must be an array")?;
 
-        // Neither hit is found through the identifier or line matcher - `guide.txt` never
-        // joins `index.files()`, and no source line spells the query's exact phrase - so
-        // both reach the answer through the ranked lane alone, tagged `ranked`, never the
-        // literal-content claim `content` makes.
+        // `guide.txt` carries the terms in its own bytes and declares nothing, so the
+        // file-content column is the only one that could have placed it.
         let file_hit = results
             .iter()
             .find(|hit| hit["hit"]["target"] == "file" && hit["path"] == json!("guide.txt"))
             .ok_or_else(|| format!("guide.txt text-file hit missing: {structured:#}"))?;
-        assert_eq!(file_hit["matched_by"], json!(["ranked"]));
+        assert_eq!(file_hit["matched_by"], json!(["content"]));
 
+        // "units" appears in `scale_value`'s doc comment and in no name of its own, so the
+        // documentation column is what carried the query into this declaration. The
+        // declaration's own span is extended over its attached doc comment, so the
+        // declaration-source column holds the same bytes and rides along as `content`.
         let symbol_hit = results
             .iter()
             .find(|hit| {
                 hit["hit"]["target"] == "symbol" && hit["hit"]["symbol"]["name"] == "scale_value"
             })
             .ok_or_else(|| format!("scale_value doc-comment hit missing: {structured:#}"))?;
-        assert!(
-            symbol_hit["matched_by"]
-                .as_array()
-                .is_some_and(|fields| fields.contains(&json!("ranked"))),
-            "the symbol hit must name ranked as a matched field: {symbol_hit:#}"
+        assert_eq!(
+            symbol_hit["matched_by"],
+            json!(["documentation", "content"])
+        );
+
+        // The declaration's own name places the same declaration under a name hit.
+        let named = search_until_hit(client.peer(), "scale_value", "lib.rs").await?;
+        let name_hit = named["results"]
+            .as_array()
+            .ok_or("results must be an array")?
+            .iter()
+            .find(|hit| {
+                hit["hit"]["target"] == "symbol" && hit["hit"]["symbol"]["name"] == "scale_value"
+            })
+            .ok_or_else(|| format!("scale_value name hit missing: {named:#}"))?;
+        assert_eq!(
+            name_hit["matched_by"][0],
+            json!("name"),
+            "the declaration's own name places it first among the matched columns: \
+             {name_hit:#}"
         );
 
         client.cancel().await?;
@@ -3445,10 +3664,10 @@ mod tests {
     /// Calls one tool expecting a Rift wire error and returns the JSON-RPC
     /// error object.
     ///
-    /// The population lane's first pass is waited for before the call, because a refusal
-    /// the search index itself raises - the query-term limit - is only reached once the
-    /// revision guard trusts the store. Nothing writes into the fixture, so the store stays
-    /// stamped for the call that follows.
+    /// The population lane's first pass is waited for before the call, so a refusal is
+    /// read from a server whose store already holds the served tree rather than from one
+    /// still committing it. Nothing writes into the fixture, so the store stays stamped
+    /// for the call that follows.
     async fn failing_call(
         arguments_value: &serde_json::Value,
         tool: &'static str,
@@ -3612,23 +3831,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[tokio::test]
-    async fn client_search_query_term_limit_carries_typed_limit_evidence() -> TestResult {
-        // One more distinct term than the lexical adapter's default `query_terms_max`.
-        let terms: Vec<String> = (0..33).map(|index| format!("term{index}")).collect();
-        let query = terms.join(" ");
-        let data = failing_call(&json!({ "query": query }), "search").await?;
-        assert_eq!(data.code, ErrorCode(-32000));
-        let wire = data.data.ok_or("wire error data must be present")?;
-        assert_eq!(wire["code"], json!("limit_exceeded"));
-        assert_eq!(
-            wire["limit"],
-            json!({ "field": "query_terms_max", "limit": 32, "required": 33 }),
-            "the query-term-limit refusal must carry typed wire evidence: {wire:#}"
-        );
-        Ok(())
     }
 
     #[tokio::test]
@@ -3803,10 +4005,11 @@ mod tests {
             current.published.fingerprint, before,
             "the loop captures the changed publication"
         );
-        let answer = current
-            .published
-            .reads
-            .search_with_references(&params, &[], &references)?;
+        let answer = current.published.reads.search_with_references(
+            &params,
+            &StoreAnswer::identifier_only(),
+            &references,
+        )?;
         let rendered = serde_json::to_value(answer)?;
         assert_eq!(
             rendered["results"][0]["hit"]["symbol"]["name"], "caller",
@@ -5250,7 +5453,6 @@ mod tests {
         };
         assert!(!limits.is_vector_disabled());
         assert_eq!(limits.lexical(), super::lexical_index_limits(&search));
-        assert_eq!(limits.fusion_k(), search.ranking.fusion_k);
         assert_eq!(limits.candidates(), search.vector.candidates);
         assert_eq!(limits.max_vectors(), search.vector.max_vectors);
         assert_eq!(limits.batch_declarations(), batch_inputs);
@@ -5260,14 +5462,34 @@ mod tests {
             3,
             "no key sets the per-file candidate bound yet"
         );
-        assert!((limits.lexical_weight() - search.ranking.lexical_weight).abs() < f64::EPSILON);
-        assert!((limits.vector_weight() - search.ranking.vector_weight).abs() < f64::EPSILON);
-        assert_eq!(acquisition.limits.attempts(), 3);
+        let super::EmbeddingSelection::Local { limits, .. } = acquisition else {
+            return Err("the shipped embedding is acquired locally".into());
+        };
+        assert_eq!(limits.attempts(), 3);
         assert_eq!(
-            acquisition.limits.timeout(),
+            limits.timeout(),
             Duration::from_millis(download_timeout.milliseconds())
         );
         Ok(())
+    }
+
+    #[test]
+    fn ranking_weights_carry_every_accepted_ranking_key() {
+        let search = shipped_search_configuration();
+        let weights = super::ranking_weights(&search);
+        assert!(
+            (weights.share(RankingInputKind::Identifier) - search.ranking.identifier_weight).abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (weights.share(RankingInputKind::Lexical) - search.ranking.lexical_weight).abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (weights.share(RankingInputKind::Vector) - search.ranking.vector_weight).abs()
+                < f64::EPSILON
+        );
+        assert_eq!(weights.fusion_k(), search.ranking.fusion_k);
     }
 
     #[test]
@@ -5304,7 +5526,7 @@ mod tests {
         let acquired =
             super::model_acquisition(&hub, root).ok_or("a hub repository must resolve")?;
         assert_eq!(
-            acquired.source,
+            local_source(&acquired)?,
             ModelSource::Repository {
                 repository: "BAAI/bge-small-en-v1.5".to_owned(),
                 revision: "dd0a482".to_owned(),
@@ -5318,36 +5540,65 @@ mod tests {
         let acquired =
             super::model_acquisition(&held, root).ok_or("a held directory must resolve")?;
         assert_eq!(
-            acquired.source,
+            local_source(&acquired)?,
             ModelSource::Directory(root.join("models/bge")),
             "a directory model resolves against the workspace root"
         );
         Ok(())
     }
 
+    /// The model source one local selection names, refusing a remote one.
+    fn local_source(selection: &super::EmbeddingSelection) -> Result<ModelSource, String> {
+        match selection {
+            super::EmbeddingSelection::Local { source, .. } => Ok(source.clone()),
+            super::EmbeddingSelection::Remote { .. } => {
+                Err("this selection is a remote service".to_owned())
+            }
+        }
+    }
+
+    /// One `openai_compatible` table naming `api_key_env`.
+    fn remote_embedding() -> super::RemoteEmbedding<'static> {
+        super::RemoteEmbedding {
+            endpoint: "https://api.openai.com/v1",
+            model: "text-embedding-3-small",
+            revision: "2024-01-25",
+            dimensions: 1_536,
+            api_key_env: "OPENAI_API_KEY",
+            request_timeout: Duration::from_secs(30),
+            attempts: 3,
+        }
+    }
+
     #[test]
-    fn an_openai_compatible_embedding_resolves_no_local_acquisition() {
+    fn an_openai_compatible_embedding_without_its_credential_leaves_the_tier_off() {
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
             .with_writer(std::io::sink)
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
-        let remote = vector_with(EmbeddingConfiguration::OpenaiCompatible {
-            endpoint: "https://api.openai.com/v1".to_owned(),
-            model: "text-embedding-3-small".to_owned(),
-            revision: "2024-01-25".to_owned(),
-            dimensions: 1_536,
-            api_key_env: "OPENAI_API_KEY".to_owned(),
-            request_timeout: WireDuration::from_millis(30_000),
-            attempts: 3,
-            batch_inputs: 64,
-            max_in_flight: 4,
-        });
-        let root = std::path::Path::new("/workspace");
         assert!(
-            super::model_acquisition(&remote, root).is_none(),
-            "this release runs local embedding models alone"
+            super::remote_selection(&remote_embedding(), None).is_none(),
+            "an unset credential variable leaves the vector ranking off"
         );
+    }
+
+    #[test]
+    fn an_openai_compatible_embedding_resolves_its_endpoint_width_and_space() -> TestResult {
+        let selection = super::remote_selection(&remote_embedding(), Some("test-key"))
+            .ok_or("a credential must resolve the remote selection")?;
+        let super::EmbeddingSelection::Remote { settings, space } = selection else {
+            return Err("an openai_compatible table selects a remote service".into());
+        };
+        assert_eq!(settings.endpoint, "https://api.openai.com/v1");
+        assert_eq!(settings.dimensions, 1_536);
+        assert_eq!(settings.attempts, 3);
+        assert_eq!(space.dimensions(), 1_536);
+        assert!(
+            !format!("{settings:?}").contains("test-key"),
+            "the credential must never reach a rendered value"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -5463,6 +5714,18 @@ mod tests {
         Err("a model directory without weights never ended preparation".into())
     }
 
+    /// The shares `[search.ranking]` ships, for the ranking cases that fuse a store
+    /// answer.
+    fn shipped_weights() -> RankingWeights {
+        super::ranking_weights(&shipped_search_configuration())
+    }
+
+    /// Whether the store contributed no input at all, so the identifier ranking answers
+    /// alone.
+    fn ranks_by_identifier_alone(ranking: &super::SearchRanking) -> bool {
+        ranking.answer.precise().is_empty() && ranking.answer.broad().is_empty()
+    }
+
     /// The one `lexical_ranking_unavailable` detail a ranking carries, or nothing when it
     /// carries none.
     fn unavailable_detail(ranking: &super::SearchRanking) -> Option<&str> {
@@ -5481,6 +5744,7 @@ mod tests {
                 10,
                 "bbbbbbbb",
                 LexicalCommitState::Settled,
+                shipped_weights(),
             )
             .is_none(),
             "rows from another tree are never merged into this answer, and no warning \
@@ -5496,9 +5760,10 @@ mod tests {
             10,
             "bbbbbbbb",
             LexicalCommitState::Settled,
+            shipped_weights(),
         )
         .ok_or("a store holding no tree still ranks, by identifier matching alone")?;
-        assert!(ranking.units.is_empty());
+        assert!(ranks_by_identifier_alone(&ranking));
         let detail = unavailable_detail(&ranking).ok_or("the tier warns")?;
         assert!(detail.contains("holds no indexed tree"), "{detail}");
         assert!(detail.contains("bbbbbbbb"), "{detail}");
@@ -5518,9 +5783,10 @@ mod tests {
                 10,
                 "bbbbbbbb",
                 LexicalCommitState::Committing,
+                shipped_weights(),
             )
             .ok_or("a tree still committing ranks by identifier matching alone")?;
-            assert!(ranking.units.is_empty());
+            assert!(ranks_by_identifier_alone(&ranking));
             let detail = unavailable_detail(&ranking).ok_or("the tier warns")?;
             assert!(
                 detail.contains("still committing tree revision bbbbbbbb"),
@@ -5541,6 +5807,7 @@ mod tests {
             LexicalCommitState::Owed {
                 cause: "field units_max, observed 1101, maximum 1000".to_owned(),
             },
+            shipped_weights(),
         )
         .ok_or("a store that missed a commit ranks by identifier matching alone")?;
         let detail = unavailable_detail(&ranking).ok_or("the tier warns")?;
@@ -5556,7 +5823,7 @@ mod tests {
     #[test]
     fn a_matched_store_ranks_its_units_and_carries_the_readiness_warning() -> TestResult {
         let ranking = super::ranking_of(
-            RevisionScoped::Matched(FusedRanking::new(Vec::new(), None)),
+            RevisionScoped::Matched(super::PhasedRanking::default()),
             VectorReadiness::Preparing {
                 prepared: 1,
                 total: 4,
@@ -5564,9 +5831,15 @@ mod tests {
             10,
             "bbbbbbbb",
             LexicalCommitState::Committing,
+            shipped_weights(),
         )
         .ok_or("a matched store ranks")?;
-        assert!(ranking.units.is_empty());
+        assert!(ranks_by_identifier_alone(&ranking));
+        assert_eq!(
+            ranking.answer.weights(),
+            shipped_weights(),
+            "a matched store fuses under the shares [search.ranking] set"
+        );
         let warnings = serde_json::to_value(&ranking.warnings)?;
         assert_eq!(warnings[0]["code"], json!("vector_index_preparing"));
         assert_eq!(
@@ -5580,11 +5853,15 @@ mod tests {
     #[test]
     fn a_matched_store_cut_at_its_bound_carries_the_truncation_warning() -> TestResult {
         let ranking = super::ranking_of(
-            RevisionScoped::Matched(FusedRanking::new(Vec::new(), Some(1_000))),
+            RevisionScoped::Matched(super::PhasedRanking {
+                lexical_truncated_at: Some(1_000),
+                ..super::PhasedRanking::default()
+            }),
             VectorReadiness::Ready,
             10,
             "bbbbbbbb",
             LexicalCommitState::Settled,
+            shipped_weights(),
         )
         .ok_or("a matched store ranks")?;
         let warnings = serde_json::to_value(&ranking.warnings)?;
@@ -5829,6 +6106,96 @@ mod tests {
             answer.warnings
         )
         .into())
+    }
+
+    /// Three text files for the query-phase cases: one carrying both terms, one carrying
+    /// each on its own. Every word is a plain lowercase token, so the query is not
+    /// identifier-shaped and no token splits into words - the identifier ranking extracts
+    /// no candidate and the store's full-text ranking alone decides the order.
+    async fn phased_workspace() -> TestResult<(tempfile::TempDir, RiftMcp)> {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("both.md"),
+            "The harbor lighthouse guides every ship home.\n",
+        )?;
+        fs::write(
+            directory.path().join("harbor.md"),
+            "The harbor fills with fog before dawn.\n",
+        )?;
+        fs::write(
+            directory.path().join("lighthouse.md"),
+            "The lighthouse keeper trims the lamp.\n",
+        )?;
+        super::hermetic_workspace(directory.path(), "")?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        Ok((directory, server))
+    }
+
+    /// A multi-term query the precise phase answers: the document carrying every term is
+    /// placed first, and the widened phase appends the single-term documents behind it
+    /// rather than displacing it.
+    #[tokio::test]
+    async fn search_places_the_precise_phase_ahead_of_the_widened_one() -> TestResult {
+        let (_directory, server) = phased_workspace().await?;
+        let answer =
+            serde_json::to_value(search_after_population(&server, "harbor lighthouse").await?)?;
+        let paths = hit_paths(&answer);
+        assert_eq!(
+            paths.first(),
+            Some(&"both.md"),
+            "the document carrying every term is placed first: {answer:#}"
+        );
+        assert!(
+            paths.contains(&"harbor.md") && paths.contains(&"lighthouse.md"),
+            "the widened phase appends the single-term documents: {answer:#}"
+        );
+        Ok(())
+    }
+
+    /// A multi-term query no document answers in full: the precise phase places nothing,
+    /// and the widened phase answers with the documents carrying one term each.
+    #[tokio::test]
+    async fn search_answers_through_the_widened_phase_what_the_precise_one_cannot() -> TestResult {
+        let (_directory, server) = phased_workspace().await?;
+        let answer = serde_json::to_value(search_after_population(&server, "harbor lamp").await?)?;
+        let paths = hit_paths(&answer);
+        assert!(
+            paths.contains(&"harbor.md") && paths.contains(&"lighthouse.md"),
+            "no document carries both terms, so only the widened phase can answer: \
+             {answer:#}"
+        );
+        Ok(())
+    }
+
+    /// A quoted phrase stays one phrase: it matches where the words sit together and
+    /// nowhere else, and it widens into nothing, so the document holding the two words
+    /// apart never reaches the answer.
+    #[tokio::test]
+    async fn a_quoted_phrase_matches_only_where_its_words_sit_together() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("adjacent.md"),
+            "The harbor lighthouse guides every ship home.\n",
+        )?;
+        fs::write(
+            directory.path().join("apart.md"),
+            "The harbor is far from the lighthouse.\n",
+        )?;
+        super::hermetic_workspace(directory.path(), "")?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+
+        let answer =
+            serde_json::to_value(search_after_population(&server, "\"harbor lighthouse\"").await?)?;
+        let paths = hit_paths(&answer);
+        assert!(
+            paths.contains(&"adjacent.md"),
+            "the phrase matches where its words sit together: {answer:#}"
+        );
+        assert!(
+            !paths.contains(&"apart.md"),
+            "a quoted phrase never splits into its own terms: {answer:#}"
+        );
+        Ok(())
     }
 
     /// The lexical store ranks at most `matches_max` units for one request. A workspace

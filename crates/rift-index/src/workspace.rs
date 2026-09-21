@@ -24,6 +24,11 @@ use rift_protocol::source::{SOURCE_FILES_FIELD, SOURCE_WORKSPACE_SIZE_FIELD};
 use rift_provider::{
     AssembledSymbol, Component, CompositionBuilder, NormalizedGraph, ProviderComposition,
 };
+use rift_ranking::{
+    DOCUMENTATION_BYTES_MAX, DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation,
+    IDENTIFIER_TERMS_BYTES_MAX, IdentifierMatchClass, IdentifierRanking, IndexDocument,
+    ParsedQuery, RankingInput, SIGNATURE_BYTES_MAX, SearchableField, identifier_terms, match_class,
+};
 use rift_syntax::{
     SyntaxDocument, SyntaxError, SyntaxNode, SyntaxProvider, SyntaxSource, SyntaxSymbol,
     SyntaxViolation, registry,
@@ -35,7 +40,7 @@ use crate::change_set::{FileDigest, PathChanges, WorkspaceDigests, tree_revision
 use crate::chunk::text_chunks;
 use crate::glob::{ForceIncludeReach, PathMatcher, PathVerdict};
 use crate::language::{ClassifiedPath, LanguagePolicyError, WorkspaceLanguagePolicy};
-use crate::lexical::{LexicalUnit, LexicalUnitKind, LimitBreach};
+use crate::lexical::LimitBreach;
 use crate::relationship::RelationshipStore;
 use crate::semantic::{WorkspaceSemanticError, WorkspaceSemantics};
 
@@ -517,7 +522,7 @@ pub struct SymbolMatch<'a> {
     /// Matched declaration.
     pub symbol: &'a SyntaxSymbol,
     /// Stable semantic match priority.
-    pub rank: SymbolMatchRank,
+    pub rank: IdentifierMatchClass,
 }
 
 /// Normalized symbol fields required by read results.
@@ -573,19 +578,6 @@ impl std::fmt::Display for ReadableSymbolMissing {
 }
 
 impl std::error::Error for ReadableSymbolMissing {}
-
-/// Stable semantic priority for symbol-name matches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum SymbolMatchRank {
-    /// Query equals complete qualified name.
-    QualifiedExact,
-    /// Query equals short declaration name.
-    NameExact,
-    /// Short declaration name starts with query.
-    NamePrefix,
-    /// Complete qualified name contains query elsewhere.
-    Substring,
-}
 
 /// Exact identity of visible workspace source paths and bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1506,47 +1498,99 @@ impl WorkspaceIndex {
         holds_path_below(&self.text_files, &prefix) || holds_path_below(&self.left_out, &prefix)
     }
 
-    /// Derives lexical search units from this index: one unit per indexed symbol, carrying
-    /// its declaration source, and one or more units per baseline text file - one whole unit
-    /// when the file is within `[search.text].max_chunk`, one unit per chunk otherwise. A
-    /// chunked file's units share its real path and share an identity built from that path
-    /// plus the chunk index, so a hit still maps back to the file it came from.
+    /// Derives index documents from this index: one document per indexed symbol, carrying
+    /// its name, qualified name, derived identifier terms, signature, attached
+    /// documentation, and declaration source, and one or more documents per baseline text
+    /// file - one whole document when the file is within `[search.text].max_chunk`, one per
+    /// chunk otherwise. A chunked file's documents share its real path and share an
+    /// identity built from that path plus the chunk index, so a hit still maps back to the
+    /// file it came from.
+    ///
+    /// A fact no provider published stays absent. Nothing substitutes declaration source
+    /// into the signature or documentation field, because a reader weighs those fields
+    /// apart and would then be weighing the same bytes twice.
     ///
     /// `force_include` files stay outside this derivation: that on-demand walk's contract
     /// covers source units read for one request, not the persistent lexical index.
     #[must_use]
-    pub fn lexical_units(&self) -> Vec<LexicalUnit> {
-        let mut units = Vec::with_capacity(self.files.len() + self.text_files.len());
+    pub fn index_documents(&self) -> Vec<IndexDocument> {
+        let mut documents = Vec::with_capacity(self.files.len() + self.text_files.len());
         for file in self.files() {
             for symbol in file.syntax().symbols() {
-                units.push(symbol_lexical_unit(file, symbol));
+                documents.push(symbol_document(file, symbol));
             }
         }
         for file in self.text_files() {
-            push_text_lexical_units(&mut units, file, self.text_chunk_bytes_max());
+            push_text_documents(&mut documents, file, self.text_chunk_bytes_max());
         }
-        units
+        documents
     }
 
-    /// Derives lexical units for the named paths alone, in the same shapes
-    /// [`Self::lexical_units`] derives for the whole index.
+    /// Records this index's declarations against every identifier `query` carried.
+    ///
+    /// Each extracted candidate is matched separately and an identity keeps its best class,
+    /// so a question naming two identifiers ranks a declaration by the stronger of the two
+    /// rather than by whichever was written first. `included` is the caller's own path
+    /// selector; a declaration it excludes contributes nothing.
+    ///
+    /// Work is bounded twice over: the query contributes at most a fixed number of
+    /// candidates, and each of them answers at most `bound` declarations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] when a matched declaration cannot be read.
+    pub fn observe_identifiers(
+        &self,
+        query: &ParsedQuery,
+        bound: usize,
+        included: impl Fn(&IndexedFile) -> bool,
+        ranking: &mut IdentifierRanking,
+    ) -> Result<(), WorkspaceIndexError> {
+        for candidate in query.candidates() {
+            for matched in self.symbols(candidate.text(), bound)? {
+                if !included(matched.file) {
+                    continue;
+                }
+                ranking.observe(declaration_identity(matched), matched.rank, &candidate);
+            }
+        }
+        Ok(())
+    }
+
+    /// This index's declarations as one identifier ranking input, best first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] when a matched declaration cannot be read.
+    pub fn identifier_input(
+        &self,
+        query: &ParsedQuery,
+        bound: usize,
+    ) -> Result<RankingInput, WorkspaceIndexError> {
+        let mut ranking = IdentifierRanking::new();
+        self.observe_identifiers(query, bound, |_| true, &mut ranking)?;
+        Ok(ranking.into_input(bound))
+    }
+
+    /// Derives index documents for the named paths alone, in the same shapes
+    /// [`Self::index_documents`] derives for the whole index.
     ///
     /// A path this index no longer holds contributes nothing, which is what a removed file
-    /// owes: its stored units are deleted by path rather than replaced.
+    /// owes: its stored documents are deleted by path rather than replaced.
     #[must_use]
-    pub fn lexical_units_for<'a>(
+    pub fn index_documents_for<'a>(
         &self,
         paths: impl IntoIterator<Item = &'a ProjectPath>,
-    ) -> Vec<LexicalUnit> {
+    ) -> Vec<IndexDocument> {
         let mut units = Vec::new();
         for path in paths {
             if let Some(file) = self.files.get(path) {
                 for symbol in file.syntax().symbols() {
-                    units.push(symbol_lexical_unit(file, symbol));
+                    units.push(symbol_document(file, symbol));
                 }
             }
             if let Some(file) = self.text_files.get(path) {
-                push_text_lexical_units(&mut units, file, self.text_chunk_bytes_max());
+                push_text_documents(&mut units, file, self.text_chunk_bytes_max());
             }
         }
         units
@@ -1915,13 +1959,13 @@ pub(crate) fn symbol_matches_where<'a>(
                 .iter()
                 .map(move |symbol| (file, symbol))
         })
-        .filter(|(file, symbol)| {
-            included(file, symbol) && symbol.qualified_name.to_lowercase().contains(&query)
-        })
-        .map(|(file, symbol)| SymbolMatch {
-            file,
-            symbol,
-            rank: symbol_rank(symbol, &query),
+        .filter(|(file, symbol)| included(file, symbol))
+        .filter_map(|(file, symbol)| {
+            Some(SymbolMatch {
+                file,
+                symbol,
+                rank: symbol_rank(symbol, &query)?,
+            })
         })
         .collect::<Vec<_>>();
     matches.sort_by_key(|matched| (matched.rank, matched.symbol.qualified_name.as_str()));
@@ -2867,18 +2911,16 @@ pub(crate) fn relative_path(path: &Path) -> Result<ProjectPath, WorkspaceIndexEr
     })
 }
 
-fn symbol_rank(symbol: &SyntaxSymbol, query: &str) -> SymbolMatchRank {
-    let qualified = symbol.qualified_name.to_lowercase();
-    let name = symbol.name.to_lowercase();
-    if qualified == query {
-        SymbolMatchRank::QualifiedExact
-    } else if name == query {
-        SymbolMatchRank::NameExact
-    } else if name.starts_with(query) {
-        SymbolMatchRank::NamePrefix
-    } else {
-        SymbolMatchRank::Substring
-    }
+/// The class one declaration's names reach against a lowercase query.
+///
+/// The classing itself lives in `rift-ranking`, so a package index, an
+/// in-memory fixture, and this index all order a declaration the same way.
+fn symbol_rank(symbol: &SyntaxSymbol, query: &str) -> Option<IdentifierMatchClass> {
+    match_class(
+        query,
+        &symbol.name.to_lowercase(),
+        &symbol.qualified_name.to_lowercase(),
+    )
 }
 
 /// The declaration's exact source text, clamped to `file`'s bounds the same way the read
@@ -2894,32 +2936,137 @@ fn declaration_source(file: &IndexedFile, range: rift_syntax::ByteRange) -> &str
     source.get(start..end).unwrap_or_default()
 }
 
-/// One lexical unit for a symbol declaration. `identity` is minted by the same
+/// One declaration's ranking identity: the same `SymbolId` a read answers with, so a
+/// ranked identity and a read address are one value.
+#[must_use]
+pub fn declaration_identity(matched: SymbolMatch<'_>) -> DocumentIdentity {
+    let identity = symbol_identity(
+        &matched.file.syntax().language().identity_segment(),
+        matched.file.path().as_str(),
+        &matched.symbol.qualified_name,
+    );
+    DocumentIdentity::new(identity).unwrap_or_else(|error| {
+        unreachable!("a declaration's rift identity must be non-empty: error={error}")
+    })
+}
+
+/// One index document for a symbol declaration. `identity` is minted by the same
 /// [`rift_core::symbol_identity`] the read service uses for that declaration's wire
 /// `SymbolId`, so a lexical hit's identity equals the id `get_symbol` returns for it.
-fn symbol_lexical_unit(file: &IndexedFile, symbol: &SyntaxSymbol) -> LexicalUnit {
+///
+/// Every field a provider published lands in its own column. A provider that publishes
+/// no signature leaves that field absent rather than filling it with the declaration's
+/// source, so the two are weighed apart.
+fn symbol_document(file: &IndexedFile, symbol: &SyntaxSymbol) -> IndexDocument {
     let identity = rift_core::symbol_identity(
         &file.syntax().language().identity_segment(),
         file.path().as_str(),
         &symbol.qualified_name,
     );
-    let content = declaration_source(file, symbol.range).to_owned();
-    LexicalUnit::new(
+    let source = declaration_source(file, symbol.range);
+    let containers = symbol.container.iter().map(String::as_str);
+    let terms = identifier_terms(
+        [symbol.name.as_str(), symbol.qualified_name.as_str()]
+            .into_iter()
+            .chain(containers),
+        IDENTIFIER_TERMS_BYTES_MAX,
+    );
+    let fields = DocumentFields::empty()
+        .with(SearchableField::Name, symbol.name.clone())
+        .with(
+            SearchableField::QualifiedName,
+            symbol.qualified_name.clone(),
+        )
+        .with(SearchableField::IdentifierTerms, terms)
+        .with(SearchableField::Signature, rendered_signatures(symbol))
+        .with(
+            SearchableField::Documentation,
+            attached_documentation(symbol),
+        )
+        .with(SearchableField::DeclarationSource, source);
+    document(identity, file.path(), DocumentKind::Symbol, fields)
+}
+
+/// The declaration's rendered signatures, one per line.
+///
+/// A declaration the grammar marks callable in several forms renders each of them, so a
+/// caller searching for a parameter name reaches the form that declares it.
+fn rendered_signatures(symbol: &SyntaxSymbol) -> String {
+    bounded_field(
+        &symbol
+            .signatures
+            .iter()
+            .map(|signature| signature.display.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        SIGNATURE_BYTES_MAX,
+    )
+}
+
+/// The doc comments the grammar attached, one per line, comment syntax already stripped.
+fn attached_documentation(symbol: &SyntaxSymbol) -> String {
+    bounded_field(
+        &symbol
+            .documentation
+            .iter()
+            .map(|documentation| documentation.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        DOCUMENTATION_BYTES_MAX,
+    )
+}
+
+/// Cuts one short field to its byte bound at a character boundary, so a truncated field is
+/// still text and never a broken code point.
+///
+/// Only the fields the document shape bounds go through this. A declaration's source and
+/// a text file's content do not: the store carries the operator's own byte bound over
+/// those, and a document past it is left out of the index and recorded rather than
+/// silently shortened.
+fn bounded_field(value: &str, bytes_max: usize) -> String {
+    if value.len() <= bytes_max {
+        return value.to_owned();
+    }
+    let mut end = bytes_max;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+/// Assembles one project document, naming the failure mode this crate guarantees never
+/// fires: every identity built here is non-empty, and every field was already cut to its
+/// own bound.
+fn document(
+    identity: String,
+    path: &ProjectPath,
+    kind: DocumentKind,
+    fields: DocumentFields,
+) -> IndexDocument {
+    let identity = DocumentIdentity::new(identity).unwrap_or_else(|error| {
+        unreachable!("an index document's identity must be non-empty: error={error}")
+    });
+    let digest = fields.digest();
+    IndexDocument::new(
         identity,
-        file.path().clone(),
-        LexicalUnitKind::Symbol,
-        Some(symbol.name.clone()),
-        content,
+        DocumentLocation::Project(path.clone()),
+        kind,
+        digest,
+        fields,
     )
     .unwrap_or_else(|error| {
-        unreachable!("a symbol's rift identity must be non-empty: error={error}")
+        unreachable!("every document field must be within its own bound: error={error}")
     })
 }
 
-/// The file stem of `path`'s final segment, when it has one.
-fn file_stem(path: &ProjectPath) -> Option<String> {
+/// The final segment of `path`, including its extension, when it has one.
+///
+/// A file document's `name` is the file name a caller would type, extension and all, so
+/// `vision.mdx` reaches its file. The host-absolute root never enters it: two clones of
+/// one tree publish the same name.
+fn file_name(path: &ProjectPath) -> Option<String> {
     Path::new(path.as_str())
-        .file_stem()
+        .file_name()
         .and_then(OsStr::to_str)
         .map(str::to_owned)
 }
@@ -2942,21 +3089,21 @@ fn checked_chunk_bytes_max(chunk_bytes_max: u64) -> usize {
     })
 }
 
-/// Appends one text file's lexical units to `units`: one whole unit within `chunk_bytes_max`,
-/// one unit per chunk otherwise, every chunk sharing the file's real path and file-stem name
-/// so a hit still maps back to the file it came from.
-fn push_text_lexical_units(
-    units: &mut Vec<LexicalUnit>,
+/// Appends one text file's documents to `documents`: one whole document within
+/// `chunk_bytes_max`, one per chunk otherwise, every chunk sharing the file's real path
+/// and its file name so a hit still maps back to the file it came from.
+fn push_text_documents(
+    documents: &mut Vec<IndexDocument>,
     file: &TextSourceFile,
     chunk_bytes_max: u64,
 ) {
-    let name = file_stem(file.path());
+    let name = file_name(file.path());
     if !exceeds_chunk_bound(file.content().len(), chunk_bytes_max) {
-        units.push(new_text_lexical_unit(
+        documents.push(text_document(
             file.path().as_str().to_owned(),
             file,
-            name,
-            file.content().to_owned(),
+            name.as_deref(),
+            file.content(),
         ));
         return;
     }
@@ -2973,39 +3120,49 @@ fn push_text_lexical_units(
         }
         previous_offset = Some(chunk.byte_offset());
         let identity = format!("{}#{index}", file.path().as_str());
-        units.push(new_text_lexical_unit(
+        documents.push(text_document(
             identity,
             file,
-            name.clone(),
-            chunk.content().to_owned(),
+            name.as_deref(),
+            chunk.content(),
         ));
     }
 }
 
-/// Constructs one text-file lexical unit, naming the failure mode this crate guarantees
-/// never fires: every identity built here is a non-empty path or path-plus-chunk-index.
-fn new_text_lexical_unit(
+/// Constructs one text-file document: its file name in `name`, its derived terms beside
+/// it, and its text in `file_content`. A text file declares nothing, so the declaration
+/// fields stay absent.
+fn text_document(
     identity: String,
     file: &TextSourceFile,
-    name: Option<String>,
-    content: String,
-) -> LexicalUnit {
-    LexicalUnit::new(
-        identity,
-        file.path().clone(),
-        LexicalUnitKind::TextFile,
-        name,
-        content,
-    )
-    .unwrap_or_else(|error| {
-        unreachable!("a text file's lexical identity must be non-empty: error={error}")
-    })
+    name: Option<&str>,
+    content: &str,
+) -> IndexDocument {
+    let terms = name.map_or_else(String::new, |name| {
+        identifier_terms([name], IDENTIFIER_TERMS_BYTES_MAX)
+    });
+    let fields = DocumentFields::empty()
+        .with_optional(SearchableField::Name, name)
+        .with(SearchableField::IdentifierTerms, terms)
+        .with(SearchableField::FileContent, content);
+    document(identity, file.path(), DocumentKind::TextFile, fields)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rift_syntax::{RustSyntaxProvider, SyntaxLimits};
+
+    /// The project path one derived document is addressed by. Every document this
+    /// index derives is a project document, so the package arm is unreachable here.
+    fn document_path(document: &IndexDocument) -> &ProjectPath {
+        match document.location() {
+            DocumentLocation::Project(path) => path,
+            DocumentLocation::Unit(unit) => {
+                unreachable!("this index derives project documents alone: unit={unit}")
+            }
+        }
+    }
     #[cfg(unix)]
     use std::os::unix::fs as unix_fs;
 
@@ -4352,18 +4509,18 @@ mod tests {
 
         let exact = index.symbols("Rift::update", 5).expect("qualified match");
         assert_eq!(exact[0].symbol.qualified_name, "Rift::update");
-        assert_eq!(exact[0].rank, SymbolMatchRank::QualifiedExact);
+        assert_eq!(exact[0].rank, IdentifierMatchClass::QualifiedExact);
         assert_eq!(
             index.symbols("update", 5).expect("name match")[0].rank,
-            SymbolMatchRank::NameExact
+            IdentifierMatchClass::NameExact
         );
         assert_eq!(
             index.symbols("upd", 5).expect("prefix match")[0].rank,
-            SymbolMatchRank::NamePrefix
+            IdentifierMatchClass::NamePrefix
         );
         assert_eq!(
             index.symbols("pda", 5).expect("substring match")[0].rank,
-            SymbolMatchRank::Substring
+            IdentifierMatchClass::Substring
         );
         assert_eq!(
             index
@@ -5164,11 +5321,11 @@ mod tests {
             1,
             "the baseline catalog must hold the same file once"
         );
-        let units = index.lexical_units();
+        let units = index.index_documents();
         assert_eq!(
             units
                 .iter()
-                .filter(|unit| unit.kind() == LexicalUnitKind::TextFile)
+                .filter(|unit| unit.kind() == DocumentKind::TextFile)
                 .count(),
             1,
             "provider content must produce one whole-file unit: {units:#?}"
@@ -5176,13 +5333,15 @@ mod tests {
         assert_eq!(
             units
                 .iter()
-                .filter(|unit| unit.kind() == LexicalUnitKind::Symbol)
+                .filter(|unit| unit.kind() == DocumentKind::Symbol)
                 .count(),
             1,
             "the heading remains a syntax fact: {units:#?}"
         );
         assert!(
-            units.iter().all(|unit| unit.path().as_str() == "README.md"),
+            units
+                .iter()
+                .all(|unit| document_path(unit).as_str() == "README.md"),
             "syntax and content facts must share one file path: {units:#?}"
         );
     }
@@ -5212,14 +5371,17 @@ mod tests {
         let source_paths: Vec<&str> = index.files().map(|file| file.path().as_str()).collect();
         assert_eq!(source_paths, ["config.json", "deploy.yml"]);
         assert_eq!(index.text_file_count(), 2);
-        let units = index.lexical_units();
-        let identities: Vec<&str> = units.iter().map(LexicalUnit::identity).collect();
+        let units = index.index_documents();
+        let identities: Vec<&str> = units
+            .iter()
+            .map(|document| document.identity().as_str())
+            .collect();
         assert!(identities.contains(&"rift://symbol/json/config.json/server"));
         assert!(identities.contains(&"rift://symbol/yaml/deploy.yml/retries"));
         assert_eq!(
             units
                 .iter()
-                .filter(|unit| unit.kind() == LexicalUnitKind::TextFile)
+                .filter(|unit| unit.kind() == DocumentKind::TextFile)
                 .count(),
             2
         );
@@ -5873,17 +6035,23 @@ mod tests {
             &TextFileInclusion::default(),
         )
         .expect("workspace index");
-        let units = index.lexical_units();
+        let units = index.index_documents();
         let update = units
             .iter()
-            .find(|unit| unit.kind() == LexicalUnitKind::Symbol && unit.name() == Some("update"))
+            .find(|unit| {
+                unit.kind() == DocumentKind::Symbol
+                    && unit.fields().get(SearchableField::Name) == Some("update")
+            })
             .expect("the update symbol must produce a lexical unit");
         assert_eq!(
-            update.identity(),
+            update.identity().as_str(),
             "rift://symbol/rust/src/lib.rs/Rift::update"
         );
-        assert_eq!(update.path().as_str(), "src/lib.rs");
-        assert_eq!(update.content(), "pub fn update() {}");
+        assert_eq!(document_path(update).as_str(), "src/lib.rs");
+        assert_eq!(
+            update.fields().get(SearchableField::DeclarationSource),
+            Some("pub fn update() {}")
+        );
     }
 
     #[test]
@@ -5897,14 +6065,20 @@ mod tests {
             &TextFileInclusion::default(),
         )
         .expect("workspace index");
-        let units = index.lexical_units();
+        let units = index.index_documents();
         let text_unit = units
             .iter()
-            .find(|unit| unit.kind() == LexicalUnitKind::TextFile)
+            .find(|unit| unit.kind() == DocumentKind::TextFile)
             .expect("the text file must produce a lexical unit");
-        assert_eq!(text_unit.identity(), "guide.txt");
-        assert_eq!(text_unit.name(), Some("guide"));
-        assert_eq!(text_unit.content(), "guide body");
+        assert_eq!(text_unit.identity().as_str(), "guide.txt");
+        assert_eq!(
+            text_unit.fields().get(SearchableField::Name),
+            Some("guide.txt")
+        );
+        assert_eq!(
+            text_unit.fields().get(SearchableField::FileContent),
+            Some("guide body")
+        );
         assert!(
             index.chunked_text_files().is_empty(),
             "a file within the chunk bound must not be reported as chunked"
@@ -5928,28 +6102,39 @@ mod tests {
         .expect("workspace index");
 
         let units: Vec<_> = index
-            .lexical_units()
+            .index_documents()
             .into_iter()
-            .filter(|unit| unit.kind() == LexicalUnitKind::TextFile)
+            .filter(|unit| unit.kind() == DocumentKind::TextFile)
             .collect();
         assert_eq!(
             units.len(),
             4,
             "an 8-line file chunked two lines at a time yields 4 units"
         );
-        let identities: Vec<&str> = units.iter().map(LexicalUnit::identity).collect();
+        let identities: Vec<&str> = units
+            .iter()
+            .map(|document| document.identity().as_str())
+            .collect();
         assert_eq!(
             identities,
             ["big.txt#0", "big.txt#1", "big.txt#2", "big.txt#3"]
         );
-        let rejoined: String = units.iter().map(LexicalUnit::content).collect();
+        let rejoined: String = units
+            .iter()
+            .map(|document| {
+                document
+                    .fields()
+                    .get(SearchableField::FileContent)
+                    .unwrap_or_default()
+            })
+            .collect();
         assert_eq!(
             rejoined, content,
             "chunk content must reconstruct the file exactly"
         );
         for unit in &units {
-            assert_eq!(unit.name(), Some("big"));
-            assert_eq!(unit.path().as_str(), "big.txt");
+            assert_eq!(unit.fields().get(SearchableField::Name), Some("big.txt"));
+            assert_eq!(document_path(unit).as_str(), "big.txt");
         }
 
         let chunked = index.chunked_text_files();
@@ -6191,8 +6376,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a text file's lexical identity must be non-empty")]
-    fn test_push_text_lexical_units_of_root_path_panics_on_empty_identity() {
+    #[should_panic(expected = "an index document's identity must be non-empty")]
+    fn test_push_text_documents_of_root_path_panics_on_empty_identity() {
         // `ProjectPath::new("")` is valid and names the workspace root, so a whole-file text
         // unit for it builds its identity from that empty path, which `LexicalUnit::new`
         // refuses: this invariant must never fire for a real discovered path.
@@ -6203,7 +6388,7 @@ mod tests {
             executable: false,
         };
         let mut units = Vec::new();
-        push_text_lexical_units(&mut units, &file, 1_024);
+        push_text_documents(&mut units, &file, 1_024);
     }
 
     /// A workspace whose `src/lib.rs` calls a function `src/run.rs` defines.

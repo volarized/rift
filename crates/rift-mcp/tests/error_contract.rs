@@ -223,3 +223,26 @@ async fn revision_read_with_history_disabled_is_refused() -> TestResult {
     );
     Ok(())
 }
+
+/// The bounded query parser refuses a quote that opens and never closes, and the refusal
+/// reaches the caller as this request's own `invalid_request` naming `query` - never a
+/// degraded ranking that answers as though the query had parsed.
+#[tokio::test]
+async fn an_unterminated_quote_refuses_the_search_naming_query() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+    fs::write(
+        directory.path().join("rift.toml"),
+        hermetic_search::VECTOR_DISABLED,
+    )?;
+    let wire =
+        failing_wire_error(directory.path(), "search", json!({ "query": "\"beacon" })).await?;
+    assert_eq!(wire["code"], json!("invalid_request"));
+    assert_eq!(wire["retry"], json!("never"));
+    let message = wire["message"].as_str().ok_or("message must be a string")?;
+    assert!(
+        message.contains("field query"),
+        "the refusal must name the parameter at fault: {message}"
+    );
+    Ok(())
+}

@@ -24,23 +24,27 @@ use std::sync::{Arc, Mutex, PoisonError};
 use rift_core::ProjectPath;
 use rift_index::{DatabasePool, WorkspaceDatabase};
 use rift_index::{
-    LexicalChange, LexicalIndexError, LexicalIndexLimits, LexicalMatch, LexicalSearchIndex,
-    LexicalUnit, LexicalUnitKind, RevisionScoped, StoredVector, VectorStore,
+    LexicalChange, LexicalIndexError, LexicalIndexLimits, LexicalSearchIndex, RevisionScoped,
+    StoredVector, VectorStore,
+};
+use rift_ranking::{
+    DocumentIdentity, DocumentLocation, FieldSet, IndexDocument, ParsedQuery, QueryPhase,
+    RankedIdentity, RankingInput, RankingInputKind, SearchableField,
 };
 
 use crate::acquisition::{AcquisitionLimits, ModelSource, acquire};
 use crate::document::{Declaration, digests, document};
+use crate::embedding::{
+    BatchSchedule, EmbeddingModels, EmbeddingSpace, LocalEncoder, RetrievalModels,
+};
 use crate::encoder::{Encoder, EncoderLimits};
 use crate::error::{SearchError, SearchFault, SearchViolation};
-use crate::fusion::{DeclarationMatch, FusedRank, Ranking, fuse, spread_per_file};
+use crate::fusion::{DeclarationMatch, spread_per_file};
 use crate::similarity::{VectorMatch, nearest};
 
-/// The lexical ranking's share of a fused score when the caller sets none.
-const LEXICAL_WEIGHT_DEFAULT: f64 = 0.35;
-/// The vector ranking's share of a fused score when the caller sets none.
-const VECTOR_WEIGHT_DEFAULT: f64 = 0.30;
-/// The reciprocal-rank constant when the caller sets none.
-const FUSION_K_DEFAULT: u64 = 60;
+/// Embedding requests open at once when the caller sets none. A locally run
+/// encoder holds a blocking thread, so it runs one whatever this says.
+const MAX_IN_FLIGHT_DEFAULT: u64 = 1;
 /// Declarations the vector ranking returns when the caller sets none.
 const CANDIDATES_DEFAULT: u64 = 200;
 /// Vectors the workspace may hold when the caller sets none.
@@ -80,76 +84,43 @@ impl VectorReadiness {
     }
 }
 
-/// One unit both tiers can return, and the fused score that ranked it.
-#[derive(Clone, Debug, PartialEq)]
-pub struct RankedUnit {
-    identity: String,
-    path: ProjectPath,
-    kind: LexicalUnitKind,
-    score: f64,
-}
-
-impl RankedUnit {
-    /// The ranked unit's stable identity.
-    #[must_use]
-    pub fn identity(&self) -> &str {
-        &self.identity
-    }
-
-    /// The project-relative path the unit lives at.
-    #[must_use]
-    pub const fn path(&self) -> &ProjectPath {
-        &self.path
-    }
-
-    /// The unit's granularity.
-    #[must_use]
-    pub const fn kind(&self) -> LexicalUnitKind {
-        self.kind
-    }
-
-    /// The fused score, `1.0` for a unit both tiers put first.
-    #[must_use]
-    pub const fn score(&self) -> f64 {
-        self.score
-    }
-}
-
-/// Both tiers' fused ranking, and the bound the lexical tier stopped at when its store
-/// held a match past it.
-#[derive(Clone, Debug, PartialEq)]
-pub struct FusedRanking {
-    units: Vec<RankedUnit>,
+/// What one store read answered for one query phase.
+///
+///
+/// The store contributes ordered identities, never a fused score: the caller
+/// fuses them with the identifier ranking it built itself, so all three
+/// inputs meet in one place under one set of weights.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StoreRanking {
+    inputs: Vec<RankingInput>,
     lexical_truncated_at: Option<u32>,
 }
 
-impl FusedRanking {
-    /// Constructs one fused ranking directly. Production code only ever builds these from
-    /// a live [`SearchIndex::search`]; this constructor exists for callers that consume a
-    /// ranking they already hold - most notably tests exercising that consumption without
-    /// a live database.
+impl StoreRanking {
+    /// Names the inputs one phase produced and the bound the full-text
+    /// ranking stopped at.
     #[must_use]
-    pub const fn new(units: Vec<RankedUnit>, lexical_truncated_at: Option<u32>) -> Self {
+    pub const fn new(inputs: Vec<RankingInput>, lexical_truncated_at: Option<u32>) -> Self {
         Self {
-            units,
+            inputs,
             lexical_truncated_at,
         }
     }
 
-    /// The fused units, best first.
+    /// The inputs, in the order the store ran them.
     #[must_use]
-    pub fn units(&self) -> &[RankedUnit] {
-        &self.units
+    pub fn inputs(&self) -> &[RankingInput] {
+        &self.inputs
     }
 
-    /// The fused units, best first, owned.
+    /// The inputs, owned.
     #[must_use]
-    pub fn into_units(self) -> Vec<RankedUnit> {
-        self.units
+    pub fn into_inputs(self) -> Vec<RankingInput> {
+        self.inputs
     }
 
-    /// The bound the lexical tier stopped at while its store held a match past it, or
-    /// `None` when it ranked every match.
+    /// The bound the full-text ranking stopped at while its store held a
+    /// match past it, or `None` when it ranked every match.
     #[must_use]
     pub const fn lexical_truncated_at(&self) -> Option<u32> {
         self.lexical_truncated_at
@@ -164,12 +135,10 @@ impl FusedRanking {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SearchIndexLimits {
     lexical: LexicalIndexLimits,
-    lexical_weight: f64,
-    vector_weight: f64,
-    fusion_k: u64,
     candidates: u64,
     max_vectors: u64,
     batch_declarations: u64,
+    max_in_flight: u64,
     max_tokens: u64,
     per_file_max: u64,
     vector_disabled: bool,
@@ -181,12 +150,10 @@ impl SearchIndexLimits {
         SearchIndexLimitsBuilder {
             limits: Self {
                 lexical,
-                lexical_weight: LEXICAL_WEIGHT_DEFAULT,
-                vector_weight: VECTOR_WEIGHT_DEFAULT,
-                fusion_k: FUSION_K_DEFAULT,
                 candidates: CANDIDATES_DEFAULT,
                 max_vectors: MAX_VECTORS_DEFAULT,
                 batch_declarations: BATCH_DECLARATIONS_DEFAULT,
+                max_in_flight: MAX_IN_FLIGHT_DEFAULT,
                 max_tokens: MAX_TOKENS_DEFAULT,
                 per_file_max: PER_FILE_MAX_DEFAULT,
                 vector_disabled: false,
@@ -198,24 +165,6 @@ impl SearchIndexLimits {
     #[must_use]
     pub const fn lexical(self) -> LexicalIndexLimits {
         self.lexical
-    }
-
-    /// The lexical ranking's share of a fused score.
-    #[must_use]
-    pub const fn lexical_weight(self) -> f64 {
-        self.lexical_weight
-    }
-
-    /// The vector ranking's share of a fused score.
-    #[must_use]
-    pub const fn vector_weight(self) -> f64 {
-        self.vector_weight
-    }
-
-    /// The reciprocal-rank constant fusion flattens each ranking's head with.
-    #[must_use]
-    pub const fn fusion_k(self) -> u64 {
-        self.fusion_k
     }
 
     /// Declarations the vector ranking returns before the two are fused.
@@ -234,6 +183,13 @@ impl SearchIndexLimits {
     #[must_use]
     pub const fn batch_declarations(self) -> u64 {
         self.batch_declarations
+    }
+
+    /// Embedding requests that may be open at once. A locally run encoder
+    /// runs one whatever this says.
+    #[must_use]
+    pub const fn max_in_flight(self) -> u64 {
+        self.max_in_flight
     }
 
     /// Tokens the encoder reads from one declaration.
@@ -287,9 +243,10 @@ impl SearchIndexLimits {
 }
 
 impl Default for SearchIndexLimits {
-    /// The shipped bounds: the lexical defaults, a 0.35 and 0.30 weight pair,
-    /// a rank constant of 60, 200 vector candidates spread 3 per file, and
-    /// 200,000 vectors embedded 32 at a time over 256 tokens each.
+    /// The shipped bounds: the lexical defaults, 200 vector candidates spread
+    /// 3 per file, and 200,000 vectors embedded 32 at a time over 256 tokens
+    /// each. The shares each ranking carries live with fusion, which this
+    /// crate no longer runs.
     fn default() -> Self {
         Self::builder(LexicalIndexLimits::default()).build()
     }
@@ -303,23 +260,6 @@ pub struct SearchIndexLimitsBuilder {
 }
 
 impl SearchIndexLimitsBuilder {
-    /// Sets the share each ranking carries of a fused score.
-    ///
-    /// The pair is set together because it is one decision: the two trade
-    /// against each other, and fusion refuses a pair that cannot carry a
-    /// score.
-    pub const fn weights(mut self, lexical: f64, vector: f64) -> Self {
-        self.limits.lexical_weight = lexical;
-        self.limits.vector_weight = vector;
-        self
-    }
-
-    /// Sets the reciprocal-rank constant.
-    pub const fn fusion_k(mut self, fusion_k: u64) -> Self {
-        self.limits.fusion_k = fusion_k;
-        self
-    }
-
     /// Sets how many declarations the vector ranking returns.
     pub const fn candidates(mut self, candidates: u64) -> Self {
         self.limits.candidates = candidates;
@@ -335,6 +275,12 @@ impl SearchIndexLimitsBuilder {
     /// Sets how many declarations one embedding pass takes.
     pub const fn batch_declarations(mut self, batch_declarations: u64) -> Self {
         self.limits.batch_declarations = batch_declarations;
+        self
+    }
+
+    /// Sets how many embedding requests may be open at once.
+    pub const fn max_in_flight(mut self, max_in_flight: u64) -> Self {
+        self.limits.max_in_flight = max_in_flight;
         self
     }
 
@@ -359,9 +305,9 @@ impl SearchIndexLimitsBuilder {
 
     /// The finished bounds.
     ///
-    /// Nothing is validated here. The weights and the rank constant are
-    /// refused by [`fuse`] itself, which is the one place that reads them,
-    /// and a second check would be a second representation of that rule.
+    /// Nothing is validated here. Acceptance already refused a value outside
+    /// its range, and a second check would be a second representation of the
+    /// same rule.
     #[must_use]
     pub const fn build(self) -> SearchIndexLimits {
         self.limits
@@ -371,53 +317,65 @@ impl SearchIndexLimitsBuilder {
 /// The loaded encoder and the identity its vectors are addressed under.
 #[derive(Debug)]
 struct LoadedModel {
-    identity: String,
-    encoder: Encoder,
+    /// The space this model embeds into. Its identity is what the stored
+    /// vectors are filed under, so a changed endpoint, model, revision,
+    /// width, or transformation drops them rather than scoring a query
+    /// against coordinates from another space.
+    space: EmbeddingSpace,
+    /// The document and query handles Rig's `EmbeddingModel` contract is
+    /// called through.
+    models: EmbeddingModels,
 }
 
-/// Where one ranked unit lives, without the content either store holds.
+/// Where one ranked document lives, without the content either store holds.
+///
+/// The path is here for the per-file spread bound alone: it decides how many
+/// of one file's declarations may reach the candidate list. Nothing past that
+/// bound reads it, and no path leaves this crate in a ranking.
 #[derive(Clone, Debug)]
 struct UnitAddress {
-    identity: String,
+    identity: DocumentIdentity,
     path: ProjectPath,
-    kind: LexicalUnitKind,
 }
 
 impl UnitAddress {
-    /// The address of one indexed unit.
-    fn of(unit: &LexicalUnit) -> Self {
-        Self {
-            identity: unit.identity().to_owned(),
-            path: unit.path().clone(),
-            kind: unit.kind(),
+    /// The address of one indexed document, or `None` for a package document:
+    /// the vector lane runs over the project store alone.
+    fn of(document: &IndexDocument) -> Option<Self> {
+        match document.location() {
+            DocumentLocation::Project(path) => Some(Self {
+                identity: document.identity().clone(),
+                path: path.clone(),
+            }),
+            DocumentLocation::Unit(_) => None,
         }
     }
 }
 
-/// One lexical unit together with the declaration whose text the vector
+/// One index document together with the declaration whose text the vector
 /// ranking embeds for it.
 ///
-/// A unit no declaration describes - a text file chunk - has no entry, so the
-/// unit set and the described set are never parallel and never need to be.
-/// Pairing at construction is what makes that safe: a caller cannot hand the
-/// two over in different orders, and a unit that carries no declaration cannot
-/// pick up a vector computed from another unit's text.
+/// A document no declaration describes - a text file chunk - has no entry, so
+/// the document set and the described set are never parallel and never need
+/// to be. Pairing at construction is what makes that safe: a caller cannot
+/// hand the two over in different orders, and a document that carries no
+/// declaration cannot pick up a vector computed from another one's text.
 #[derive(Clone, Copy, Debug)]
 pub struct DescribedUnit<'a> {
-    unit: &'a LexicalUnit,
+    unit: &'a IndexDocument,
     declaration: Declaration<'a>,
 }
 
 impl<'a> DescribedUnit<'a> {
-    /// Pairs one indexed unit with the declaration embedded for it.
+    /// Pairs one indexed document with the declaration embedded for it.
     #[must_use]
-    pub const fn new(unit: &'a LexicalUnit, declaration: Declaration<'a>) -> Self {
+    pub const fn new(unit: &'a IndexDocument, declaration: Declaration<'a>) -> Self {
         Self { unit, declaration }
     }
 
-    /// The unit this declaration was read from.
+    /// The document this declaration was read from.
     #[must_use]
-    pub const fn unit(&self) -> &LexicalUnit {
+    pub const fn unit(&self) -> &IndexDocument {
         self.unit
     }
 
@@ -582,6 +540,30 @@ impl SearchIndex {
         }
     }
 
+    /// Holds a model pair the caller already built, so the vector ranking can
+    /// answer through it.
+    ///
+    /// A service answering the embedding shape needs no acquisition: the
+    /// configuration states its endpoint, its model, and the width every
+    /// vector carries, and the client is built from those. Vectors another
+    /// space wrote are dropped here exactly as they are after an acquisition,
+    /// because two spaces are two coordinate systems.
+    ///
+    /// # Errors
+    ///
+    /// Returns `store_failed` when the vector store refuses to drop the
+    /// previous space's rows.
+    pub async fn hold_models(
+        &self,
+        models: EmbeddingModels,
+        space: EmbeddingSpace,
+    ) -> Result<(), SearchError> {
+        if self.readiness() == VectorReadiness::Disabled {
+            return Ok(());
+        }
+        self.hold(LoadedModel { space, models }).await
+    }
+
     /// The bounds the lexical tier enforces on what it is handed.
     #[must_use]
     pub const fn lexical_limits(&self) -> LexicalIndexLimits {
@@ -607,11 +589,11 @@ impl SearchIndex {
     /// Cancellation before the commit leaves the previous unit set and stamp intact.
     pub async fn replace_lexical(
         &self,
-        units: &[LexicalUnit],
+        documents: &[IndexDocument],
         tree_revision: &str,
     ) -> Result<(), SearchError> {
         self.lexical
-            .replace_all(units, tree_revision)
+            .replace_all(documents, tree_revision)
             .await
             .map_err(store_failed)
     }
@@ -674,36 +656,41 @@ impl SearchIndex {
             .await
     }
 
-    /// Runs both tiers and fuses them.
+    /// Runs the store's ranking inputs for one query phase, best first.
     ///
-    /// The lexical tier always runs. The vector ranking runs when its readiness
-    /// says it answers and a pass has published a corpus to scan.
-    /// Both rankings go to [`fuse`]: a tier that returned nothing contributes
-    /// no ranking, and one ranking fused alone is still the fused score, so
-    /// two queries' scores mean the same thing. The fused ranking carries the
-    /// bound the lexical tier stopped at, when its store held a match past it.
+    /// The full-text ranking always runs. The vector ranking runs in the
+    /// precise phase alone, and only when its readiness says it answers and a
+    /// pass has published a corpus to scan: an embedding reads the whole
+    /// question, so widening the unquoted terms produces the same vector
+    /// order the precise phase already contributed, and the caller's own
+    /// deduplication would drop every one of them.
     ///
-    /// An empty query returns nothing. The lexical tier has no term to match,
-    /// and the vector ranking would rank the retrieval prefix alone.
+    /// Neither input carries a score across this boundary. The caller fuses
+    /// the two returned here with the identifier ranking it built itself, so
+    /// all three meet under one set of weights.
+    ///
+    /// A query carrying no member returns no input: the full-text ranking has
+    /// no term to match, and the vector ranking would rank the retrieval
+    /// prefix alone.
     ///
     /// # Errors
     ///
-    /// Returns `store_failed` when either store refuses, the encoder's own
-    /// refusal when the query cannot be embedded, and fusion's refusal when
-    /// the configured weights or rank constant cannot carry a score.
+    /// Returns `store_failed` when either store refuses, and the encoder's
+    /// own refusal when the query cannot be embedded.
     ///
     /// # Cancel safety
     ///
-    /// Cancellation performs no writes; both tiers issue read-only queries.
-    pub async fn search(
+    /// Cancellation performs no writes; both stores issue read-only queries.
+    pub async fn rank(
         &self,
         tree_revision: &str,
-        query: &str,
+        query: &ParsedQuery,
+        phase: QueryPhase,
         limit: u32,
-    ) -> Result<RevisionScoped<FusedRanking>, SearchError> {
+    ) -> Result<RevisionScoped<StoreRanking>, SearchError> {
         let lexical = match self
             .lexical
-            .search(tree_revision, query, limit)
+            .search(tree_revision, query, phase, limit)
             .await
             .map_err(store_failed)?
         {
@@ -713,17 +700,17 @@ impl SearchIndex {
             }
             RevisionScoped::NoRevision => return Ok(RevisionScoped::NoRevision),
         };
-        if query.trim().is_empty() {
-            return Ok(RevisionScoped::Matched(FusedRanking {
-                units: Vec::new(),
-                lexical_truncated_at: None,
-            }));
+        if query.is_empty() {
+            return Ok(RevisionScoped::Matched(StoreRanking::default()));
         }
-        let vector = self.vector(query, tree_revision).await?;
-        let fused = self.fused(lexical.matches(), &vector, limit)?;
-        Ok(RevisionScoped::Matched(FusedRanking {
-            units: ranked(&fused, &directory(lexical.matches(), &vector)),
-            lexical_truncated_at: lexical.truncated_at(),
+        let lexical_truncated_at = lexical.truncated_at();
+        let mut inputs = vec![lexical.into_input()];
+        if phase == QueryPhase::Precise {
+            inputs.push(self.vector_input(query.source(), tree_revision).await?);
+        }
+        Ok(RevisionScoped::Matched(StoreRanking {
+            inputs,
+            lexical_truncated_at,
         }))
     }
 
@@ -757,9 +744,15 @@ impl SearchIndex {
     ) -> Result<LoadedModel, SearchError> {
         let files = acquire(source, limits).await?;
         let encoder = Encoder::load(&files, self.limits.encoder_limits())?;
+        let space = local_embedding_space(source, encoder.dimension());
+        let held = LocalEncoder::new(Arc::new(encoder));
         Ok(LoadedModel {
-            identity: model_identity(source),
-            encoder,
+            models: EmbeddingModels::Local(RetrievalModels::new(
+                held.documents(),
+                held.query(),
+                space.clone(),
+            )),
+            space,
         })
     }
 
@@ -775,7 +768,7 @@ impl SearchIndex {
     async fn hold(&self, model: LoadedModel) -> Result<(), SearchError> {
         let _dropped = self
             .vectors
-            .prune_other_models(&model.identity)
+            .prune_other_models(&model.space.identity())
             .await
             .map_err(store_failed)?;
         self.publish_held(None);
@@ -808,7 +801,7 @@ impl SearchIndex {
         let documents = documents(described, as_usize(total.min(self.limits.max_vectors)));
         let stored = self
             .vectors
-            .digests(&model.identity)
+            .digests(&model.space.identity())
             .await
             .map_err(store_failed)?;
         self.embed_batches(model, &selected(&documents, &stored, embedding))
@@ -816,7 +809,7 @@ impl SearchIndex {
         let live: BTreeSet<String> = documents.iter().map(|one| one.digest.clone()).collect();
         let _pruned = self
             .vectors
-            .prune_absent(&model.identity, &live)
+            .prune_absent(&model.space.identity(), &live)
             .await
             .map_err(store_failed)?;
         let corpus = self.read_corpus(model).await?;
@@ -837,8 +830,8 @@ impl SearchIndex {
     async fn read_corpus(&self, model: &LoadedModel) -> Result<Corpus, SearchError> {
         self.vectors
             .vectors(
-                &model.identity,
-                model.encoder.dimension(),
+                &model.space.identity(),
+                model.space.dimensions(),
                 as_usize(self.limits.max_vectors),
             )
             .await
@@ -852,27 +845,31 @@ impl SearchIndex {
     /// to `max_vectors` before the pairing that produced it. Storing per pass
     /// is what makes a cancelled build keep the work it already paid for.
     ///
-    /// The pass hands each batch to the encoder through
-    /// `tokio::task::spawn_blocking`, because candle's forward pass would
-    /// otherwise hold a runtime worker for the length of the batch. Dropping
-    /// this future does not cancel a batch already handed over: it finishes
-    /// unread, its vectors are never stored, and the next pass embeds it
-    /// again.
+    /// Every batch goes through Rig's `EmbeddingModel` contract, whichever
+    /// family serves it. A local encoder runs on a blocking thread, because
+    /// candle's forward pass would otherwise hold a runtime worker for the
+    /// length of the batch; a remote endpoint runs at most `max_in_flight`
+    /// requests at once. Dropping this future does not cancel a batch already
+    /// handed over: it finishes unread, its vectors are never stored, and the
+    /// next pass embeds it again.
     async fn embed_batches(
         &self,
         model: &Arc<LoadedModel>,
         wanted: &[&UnitDocument],
     ) -> Result<(), SearchError> {
+        let batch = batch_size(self.limits.batch_declarations);
+        let schedule = BatchSchedule::new(
+            batch,
+            model
+                .models
+                .requests_in_flight_max(as_usize(self.limits.max_in_flight)),
+        );
         for chunk in wanted.chunks(batch_size(self.limits.batch_declarations)) {
             let texts: Vec<String> = chunk.iter().map(|one| one.text.clone()).collect();
-            let held = Arc::clone(model);
-            let embedded =
-                tokio::task::spawn_blocking(move || held.encoder.embed_documents(&texts))
-                    .await
-                    .map_err(task_failed)??;
+            let embedded = model.models.embed_documents(texts, schedule).await?;
             let vectors = paired(chunk, embedded);
             self.vectors
-                .store(&model.identity, model.encoder.dimension(), &vectors)
+                .store(&model.space.identity(), model.space.dimensions(), &vectors)
                 .await
                 .map_err(store_failed)?;
         }
@@ -898,58 +895,46 @@ impl SearchIndex {
     /// one call schedules the work once rather than twice. The corpus travels
     /// into that call as the `Arc` this index holds, so the scan borrows the
     /// vectors rather than copying them.
-    async fn vector(
+    async fn vector_input(
         &self,
         query: &str,
         tree_revision: &str,
-    ) -> Result<Vec<UnitAddress>, SearchError> {
+    ) -> Result<RankingInput, SearchError> {
+        let unanswered = RankingInput::unanswered(RankingInputKind::Vector);
         let Some(model) = self.serving_model() else {
-            return Ok(Vec::new());
+            return Ok(unanswered);
         };
         let Some(held) = self
             .held()
             .filter(|held| held.tree_revision == tree_revision)
         else {
-            return Ok(Vec::new());
+            return Ok(unanswered);
         };
         if held.vectors.is_empty() {
-            return Ok(Vec::new());
+            return Ok(unanswered);
         }
         let depth = self.limits.depth();
-        let asked = query.to_owned();
+        let embedded = model.models.embed_query(query).await?;
         let scanned = Arc::clone(&held);
-        let matched = tokio::task::spawn_blocking(move || {
-            let embedded = model.encoder.embed_query(&asked)?;
-            nearest(&embedded, &scanned.vectors, depth)
-        })
-        .await
-        .map_err(task_failed)??;
+        let matched =
+            tokio::task::spawn_blocking(move || nearest(&embedded, &scanned.vectors, depth))
+                .await
+                .map_err(task_failed)??;
         let placed = placed(&matched, &held.addresses);
         let spread = spread_per_file(&placed, as_usize(self.limits.per_file_max));
-        Ok(resolved(
-            &spread,
-            &held.addresses,
-            as_usize(self.limits.candidates),
+        let resolved = resolved(&spread, &held.addresses, as_usize(self.limits.candidates));
+        Ok(RankingInput::new(
+            RankingInputKind::Vector,
+            resolved
+                .into_iter()
+                .map(|address| {
+                    RankedIdentity::new(
+                        address.identity,
+                        FieldSet::of(SearchableField::DeclarationSource),
+                    )
+                })
+                .collect(),
         ))
-    }
-
-    /// The two rankings fused, kept to what the caller asked for.
-    fn fused(
-        &self,
-        lexical: &[LexicalMatch],
-        vector: &[UnitAddress],
-        limit: u32,
-    ) -> Result<Vec<FusedRank>, SearchError> {
-        let lexical_order: Vec<&str> = lexical.iter().map(LexicalMatch::identity).collect();
-        let vector_order: Vec<&str> = vector
-            .iter()
-            .map(|address| address.identity.as_str())
-            .collect();
-        let rankings = [
-            Ranking::new(self.limits.lexical_weight, &lexical_order),
-            Ranking::new(self.limits.vector_weight, &vector_order),
-        ];
-        fuse(&rankings, self.limits.fusion_k, as_usize(u64::from(limit)))
     }
 
     /// The model this index ranks through, when its readiness lets it answer.
@@ -1019,7 +1004,10 @@ impl SearchIndex {
 /// capped by the described count, is where the workspace's vector ceiling is
 /// applied; every loop below this one runs over what it returns.
 fn documents(described: &[DescribedUnit<'_>], bound: usize) -> Vec<UnitDocument> {
-    let kept = &described[..bound.min(described.len())];
+    let kept: Vec<&DescribedUnit<'_>> = described[..bound.min(described.len())]
+        .iter()
+        .filter(|one| UnitAddress::of(one.unit()).is_some())
+        .collect();
     let texts: Vec<String> = kept
         .iter()
         .map(|one| document(one.declaration()).into_text())
@@ -1028,10 +1016,12 @@ fn documents(described: &[DescribedUnit<'_>], bound: usize) -> Vec<UnitDocument>
     kept.iter()
         .zip(texts)
         .zip(keys)
-        .map(|((one, text), key)| UnitDocument {
-            address: UnitAddress::of(one.unit()),
-            digest: key.to_hex(),
-            text,
+        .filter_map(|((one, text), key)| {
+            Some(UnitDocument {
+                address: UnitAddress::of(one.unit())?,
+                digest: key.to_hex(),
+                text,
+            })
         })
         .collect()
 }
@@ -1093,43 +1083,6 @@ fn resolved(
         .collect()
 }
 
-/// Where every unit either ranking named lives.
-///
-/// A fused identity always came from one of the two rankings, so this map
-/// names every identity fusion can return.
-fn directory<'a>(
-    lexical: &'a [LexicalMatch],
-    vector: &'a [UnitAddress],
-) -> BTreeMap<&'a str, (&'a ProjectPath, LexicalUnitKind)> {
-    let from_lexical = lexical
-        .iter()
-        .map(|one| (one.identity(), (one.path(), one.kind())));
-    let from_vector = vector
-        .iter()
-        .map(|one| (one.identity.as_str(), (&one.path, one.kind)));
-    from_lexical.chain(from_vector).collect()
-}
-
-/// The fused ranks as units, in the order fusion produced.
-fn ranked(
-    fused: &[FusedRank],
-    directory: &BTreeMap<&str, (&ProjectPath, LexicalUnitKind)>,
-) -> Vec<RankedUnit> {
-    fused
-        .iter()
-        .filter_map(|rank| {
-            directory
-                .get(rank.identity())
-                .map(|(path, kind)| RankedUnit {
-                    identity: rank.identity().to_owned(),
-                    path: (*path).clone(),
-                    kind: *kind,
-                    score: rank.score(),
-                })
-        })
-        .collect()
-}
-
 /// The readiness a pass that embedded `prepared` of `total` reaches.
 const fn reached(prepared: u64, total: u64) -> VectorReadiness {
     if prepared == total {
@@ -1139,18 +1092,29 @@ const fn reached(prepared: u64, total: u64) -> VectorReadiness {
     }
 }
 
-/// The identity one model's vectors are addressed under.
+/// The space one locally acquired model embeds into.
+///
+/// Public because the stored vectors are filed under this space's identity: a
+/// caller inspecting the store, or a test writing rows into it, needs the same
+/// value the index derives rather than a second spelling of it.
+#[must_use]
 ///
 /// A repository carries its revision: two revisions are two checkpoints, and
 /// their vectors share no space. A directory carries the path it was read
-/// from.
-fn model_identity(source: &ModelSource) -> String {
+/// from, which is the only revision a workspace-held model has.
+pub fn local_embedding_space(source: &ModelSource, dimensions: usize) -> EmbeddingSpace {
     match source {
         ModelSource::Repository {
             repository,
             revision,
-        } => format!("{repository}@{revision}"),
-        ModelSource::Directory(directory) => directory.display().to_string(),
+        } => EmbeddingSpace::local("hf", repository, revision, dimensions, false),
+        ModelSource::Directory(directory) => EmbeddingSpace::local(
+            "directory",
+            directory.display().to_string(),
+            directory.display().to_string(),
+            dimensions,
+            false,
+        ),
     }
 }
 
@@ -1191,12 +1155,13 @@ fn as_count(count: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Embedding, LEXICAL_WEIGHT_DEFAULT, SearchIndexLimits, UnitAddress, UnitDocument,
-        VectorReadiness, as_count, as_usize, batch_size, model_identity, reached, selected,
+        Embedding, SearchIndexLimits, UnitAddress, UnitDocument, VectorReadiness, as_count,
+        as_usize, batch_size, local_embedding_space, reached, selected,
     };
     use crate::acquisition::ModelSource;
     use rift_core::ProjectPath;
-    use rift_index::{LexicalIndexLimits, LexicalUnitKind};
+    use rift_index::LexicalIndexLimits;
+    use rift_ranking::DocumentIdentity;
     use std::collections::BTreeSet;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1204,9 +1169,8 @@ mod tests {
     fn documented(digest: &str) -> Result<UnitDocument, Box<dyn std::error::Error>> {
         Ok(UnitDocument {
             address: UnitAddress {
-                identity: digest.to_owned(),
+                identity: DocumentIdentity::new(digest)?,
                 path: ProjectPath::new("src/lib.rs".to_owned())?,
-                kind: LexicalUnitKind::Symbol,
             },
             digest: digest.to_owned(),
             text: format!("fn {digest}"),
@@ -1274,25 +1238,37 @@ mod tests {
     }
 
     #[test]
-    fn test_a_model_identity_carries_the_revision_or_the_directory() -> TestResult {
-        let repository = ModelSource::repository("BAAI/bge-small-en-v1.5")?;
-        assert_eq!(model_identity(&repository), "BAAI/bge-small-en-v1.5@main");
-        let pinned = ModelSource::repository("BAAI/bge-small-en-v1.5@dd0a482")?;
-        assert_eq!(
-            model_identity(&pinned),
-            "BAAI/bge-small-en-v1.5@dd0a482",
+    fn test_a_local_space_separates_revisions_widths_and_directories() -> TestResult {
+        let repository =
+            local_embedding_space(&ModelSource::repository("BAAI/bge-small-en-v1.5")?, 384);
+        let pinned = local_embedding_space(
+            &ModelSource::repository("BAAI/bge-small-en-v1.5@dd0a482")?,
+            384,
+        );
+        assert_ne!(
+            repository.identity(),
+            pinned.identity(),
             "a pinned revision addresses its own space"
         );
-        let directory = ModelSource::Directory(std::path::PathBuf::from("models/bge"));
-        assert!(model_identity(&directory).contains("models/bge"));
+        let widened =
+            local_embedding_space(&ModelSource::repository("BAAI/bge-small-en-v1.5")?, 768);
+        assert_ne!(
+            repository.identity(),
+            widened.identity(),
+            "two widths are two spaces"
+        );
+        let directory = local_embedding_space(
+            &ModelSource::Directory(std::path::PathBuf::from("models/bge")),
+            384,
+        );
+        assert_ne!(repository.identity(), directory.identity());
+        assert_eq!(directory.dimensions(), 384);
         Ok(())
     }
 
     #[test]
     fn test_the_builder_carries_every_bound_it_was_given() {
         let limits = SearchIndexLimits::builder(LexicalIndexLimits::default())
-            .weights(0.5, 0.5)
-            .fusion_k(7)
             .candidates(9)
             .max_vectors(11)
             .batch_declarations(13)
@@ -1300,9 +1276,6 @@ mod tests {
             .per_file_max(2)
             .disable_vector()
             .build();
-        assert!((limits.lexical_weight() - 0.5).abs() < f64::EPSILON);
-        assert!((limits.vector_weight() - 0.5).abs() < f64::EPSILON);
-        assert_eq!(limits.fusion_k(), 7);
         assert_eq!(limits.candidates(), 9);
         assert_eq!(limits.max_vectors(), 11);
         assert_eq!(limits.batch_declarations(), 13);
@@ -1320,7 +1293,6 @@ mod tests {
     #[test]
     fn test_the_shipped_bounds_start_preparing_with_nothing_embedded() {
         let limits = SearchIndexLimits::default();
-        assert!((limits.lexical_weight() - LEXICAL_WEIGHT_DEFAULT).abs() < f64::EPSILON);
         assert!(!limits.is_vector_disabled());
         assert_eq!(
             limits.initial_readiness(),
@@ -1337,16 +1309,37 @@ mod tests {
 mod store_failure_tests {
     use super::store_failed;
     use rift_core::ProjectPath;
-    use rift_index::{
-        DatabasePool, LexicalIndexLimits, LexicalSearchIndex, LexicalUnit, LexicalUnitKind,
-        WorkspaceDatabase,
+    use rift_index::{DatabasePool, LexicalIndexLimits, LexicalSearchIndex, WorkspaceDatabase};
+    use rift_ranking::{
+        DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, IndexDocument,
+        SearchableField,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    /// The bound one unit crosses, so the refusal carries limit evidence.
+    /// The bound one document crosses, so the refusal carries limit evidence.
     fn one_unit_limits() -> LexicalIndexLimits {
-        LexicalIndexLimits::new(1, 1 << 20, 32, 64, 4, 1_000)
+        LexicalIndexLimits::new(1, 1 << 20, 32, 4, 1_000)
+    }
+
+    /// One symbol document, named and carrying its own declaration source.
+    fn symbol(
+        identity: &str,
+        path: &str,
+        name: &str,
+        declaration_source: &str,
+    ) -> Result<IndexDocument, Box<dyn std::error::Error>> {
+        let fields = DocumentFields::empty()
+            .with(SearchableField::Name, name)
+            .with(SearchableField::DeclarationSource, declaration_source);
+        let digest = fields.digest();
+        Ok(IndexDocument::new(
+            DocumentIdentity::new(identity)?,
+            DocumentLocation::Project(ProjectPath::new(path.to_owned())?),
+            DocumentKind::Symbol,
+            digest,
+            fields,
+        )?)
     }
 
     async fn refusal() -> Result<String, Box<dyn std::error::Error>> {
@@ -1355,26 +1348,24 @@ mod store_failure_tests {
             WorkspaceDatabase::open(&directory.path().join("db"), DatabasePool::new(4, 1_000))
                 .await?;
         let index = LexicalSearchIndex::attached(database, one_unit_limits());
-        let units = [
-            LexicalUnit::new(
+        let documents = [
+            symbol(
                 "rift://symbol/rust/a.rs/first",
-                ProjectPath::new("a.rs")?,
-                LexicalUnitKind::Symbol,
-                Some("first".to_owned()),
+                "a.rs",
+                "first",
                 "fn first() {}",
             )?,
-            LexicalUnit::new(
+            symbol(
                 "rift://symbol/rust/a.rs/second",
-                ProjectPath::new("a.rs")?,
-                LexicalUnitKind::Symbol,
-                Some("second".to_owned()),
+                "a.rs",
+                "second",
                 "fn second() {}",
             )?,
         ];
         let refused = index
-            .replace_all(&units, "revision")
+            .replace_all(&documents, "revision")
             .await
-            .expect_err("two units must cross a units_max of one");
+            .expect_err("two documents must cross a units_max of one");
         Ok(store_failed(refused).to_string())
     }
 

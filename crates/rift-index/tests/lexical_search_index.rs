@@ -4,11 +4,16 @@
 
 use std::path::{Path, PathBuf};
 
-use rift_core::{ErrorCode, ErrorName, ProjectPath};
+use rift_core::{ErrorCode, ErrorName, ProjectPath, SourceUnitId};
 use rift_index::{DatabasePool, WorkspaceDatabase};
 use rift_index::{
     LexicalChange, LexicalIndexLimits, LexicalIndexViolation, LexicalMatch, LexicalRanking,
-    LexicalSearchIndex, LexicalUnit, LexicalUnitKind, RevisionScoped,
+    LexicalSearchIndex, RevisionScoped,
+};
+use rift_ranking::{
+    DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, FieldSet,
+    IDENTIFIER_TERMS_BYTES_MAX, IndexDocument, ParsedQuery, QueryPhase, SearchableField,
+    identifier_terms,
 };
 use tempfile::TempDir;
 use toasty::Db;
@@ -16,21 +21,49 @@ use toasty::stmt::Type;
 use toasty_core::driver::operation::TransactionMode;
 use toasty_driver_sqlite::Sqlite;
 
-/// The ranking one revision-qualified search returned, refusing any answer the store could
-/// not place under `tree_revision`.
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+/// The ranking one revision-qualified search returned under `phase`, refusing any answer
+/// the store could not place under `tree_revision`.
+async fn phase_ranking(
+    index: &LexicalSearchIndex,
+    tree_revision: &str,
+    query: &str,
+    phase: QueryPhase,
+    limit: u32,
+) -> Result<LexicalRanking, Box<dyn std::error::Error>> {
+    let parsed = ParsedQuery::parse(query)?;
+    match index.search(tree_revision, &parsed, phase, limit).await? {
+        RevisionScoped::Matched(ranking) => Ok(ranking),
+        other => Err(format!("the store must hold {tree_revision}: {other:?}").into()),
+    }
+}
+
+/// The matches one revision-qualified search returned under `phase`, best first.
+async fn phase_matches(
+    index: &LexicalSearchIndex,
+    tree_revision: &str,
+    query: &str,
+    phase: QueryPhase,
+    limit: u32,
+) -> Result<Vec<LexicalMatch>, Box<dyn std::error::Error>> {
+    Ok(phase_ranking(index, tree_revision, query, phase, limit)
+        .await?
+        .into_matches())
+}
+
+/// The ranking the precise phase returned: every member required, which is the phase
+/// every reader runs first.
 async fn search_ranking(
     index: &LexicalSearchIndex,
     tree_revision: &str,
     query: &str,
     limit: u32,
 ) -> Result<LexicalRanking, Box<dyn std::error::Error>> {
-    match index.search(tree_revision, query, limit).await? {
-        RevisionScoped::Matched(ranking) => Ok(ranking),
-        other => Err(format!("the store must hold {tree_revision}: {other:?}").into()),
-    }
+    phase_ranking(index, tree_revision, query, QueryPhase::Precise, limit).await
 }
 
-/// The matches one revision-qualified search returned, best first.
+/// The matches the precise phase returned, best first.
 async fn search_matches(
     index: &LexicalSearchIndex,
     tree_revision: &str,
@@ -42,34 +75,69 @@ async fn search_matches(
         .into_matches())
 }
 
-/// Builds one text-file unit; its identity is its own path, per convention.
-fn text_unit(path: &str, content: &str) -> Result<LexicalUnit, Box<dyn std::error::Error>> {
-    let project_path = ProjectPath::new(path)?;
-    Ok(LexicalUnit::new(
-        path,
-        project_path,
-        LexicalUnitKind::TextFile,
-        None,
-        content,
+/// One document identity, refusing a spelling the shape would not accept.
+fn identity(value: &str) -> Result<DocumentIdentity, Box<dyn std::error::Error>> {
+    Ok(DocumentIdentity::new(value)?)
+}
+
+/// Builds one project document from an explicit field set, so a suite can state which
+/// column carries the term it searches for.
+fn document(
+    identity: &str,
+    path: &str,
+    kind: DocumentKind,
+    fields: DocumentFields,
+) -> Result<IndexDocument, Box<dyn std::error::Error>> {
+    let digest = fields.digest();
+    Ok(IndexDocument::new(
+        DocumentIdentity::new(identity)?,
+        DocumentLocation::Project(ProjectPath::new(path)?),
+        kind,
+        digest,
+        fields,
     )?)
 }
 
-/// Builds one symbol unit with an explicit declaration name.
-fn symbol_unit(
+/// Builds one text-file document under an explicit identity: the final path segment with
+/// its extension in `name`, that name's split words beside it, and the text in
+/// `file_content`. A text file declares nothing, so every declaration field stays absent.
+fn text_chunk(
+    identity: &str,
+    path: &str,
+    content: &str,
+) -> Result<IndexDocument, Box<dyn std::error::Error>> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let fields = DocumentFields::empty()
+        .with(SearchableField::Name, name)
+        .with(
+            SearchableField::IdentifierTerms,
+            identifier_terms([name], IDENTIFIER_TERMS_BYTES_MAX),
+        )
+        .with(SearchableField::FileContent, content);
+    document(identity, path, DocumentKind::TextFile, fields)
+}
+
+/// Builds one whole text-file document; its identity is its own path, per convention.
+fn text_document(path: &str, content: &str) -> Result<IndexDocument, Box<dyn std::error::Error>> {
+    text_chunk(path, path, content)
+}
+
+/// Builds one symbol document carrying a declaration name, that name's split words, and
+/// its declaration source.
+fn symbol_document(
     identity: &str,
     path: &str,
     name: &str,
-    content: &str,
-) -> Result<LexicalUnit, Box<dyn std::error::Error>> {
-    let project_path = ProjectPath::new(path)?;
-    let kind = LexicalUnitKind::Symbol;
-    Ok(LexicalUnit::new(
-        identity,
-        project_path,
-        kind,
-        Some(name.to_owned()),
-        content,
-    )?)
+    declaration_source: &str,
+) -> Result<IndexDocument, Box<dyn std::error::Error>> {
+    let fields = DocumentFields::empty()
+        .with(SearchableField::Name, name)
+        .with(
+            SearchableField::IdentifierTerms,
+            identifier_terms([name], IDENTIFIER_TERMS_BYTES_MAX),
+        )
+        .with(SearchableField::DeclarationSource, declaration_source);
+    document(identity, path, DocumentKind::Symbol, fields)
 }
 
 /// The pooled-connection bounds every suite here opens the database with.
@@ -82,8 +150,8 @@ fn database_path(directory: &TempDir) -> PathBuf {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_replace_all_and_search_multi_word_query_hits()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_precise_requires_every_term_and_broad_widens_them() -> TestResult
+{
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
@@ -91,27 +159,49 @@ async fn test_lexical_search_index_replace_all_and_search_multi_word_query_hits(
         LexicalIndexLimits::default(),
     );
 
-    let units = [
-        text_unit("docs/guide.md", "alpha configuration guide")?,
-        text_unit("docs/other.md", "some other release notes")?,
+    let documents = [
+        text_document("docs/guide.md", "alpha configuration guide")?,
+        text_document("docs/other.md", "some other release notes")?,
     ];
-    index.replace_all(&units, "revision-1").await?;
+    index.replace_all(&documents, "revision-1").await?;
 
-    let hits = search_matches(&index, "revision-1", "alpha other", 10).await?;
-    let identities: Vec<&str> = hits.iter().map(LexicalMatch::identity).collect();
+    let precise =
+        phase_matches(&index, "revision-1", "alpha other", QueryPhase::Precise, 10).await?;
+    assert_eq!(
+        precise,
+        Vec::new(),
+        "the precise phase requires every term, and no document carries both"
+    );
+
+    let broad = phase_matches(&index, "revision-1", "alpha other", QueryPhase::Broad, 10).await?;
+    let identities: Vec<&str> = broad.iter().map(|hit| hit.identity().as_str()).collect();
     assert_eq!(
         identities.len(),
         2,
-        "OR-joined terms must match either unit"
+        "the broad phase widens the unquoted terms and reaches either document"
     );
     assert!(identities.contains(&"docs/guide.md"));
     assert!(identities.contains(&"docs/other.md"));
+
+    let carried = phase_matches(
+        &index,
+        "revision-1",
+        "alpha configuration",
+        QueryPhase::Precise,
+        10,
+    )
+    .await?;
+    assert_eq!(
+        carried.len(),
+        1,
+        "the precise phase answers the document carrying every term"
+    );
+    assert_eq!(carried[0].identity().as_str(), "docs/guide.md");
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_search_orders_better_match_first()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_a_quoted_phrase_stays_one_phrase_in_both_phases() -> TestResult {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
@@ -119,16 +209,176 @@ async fn test_lexical_search_index_search_orders_better_match_first()
         LexicalIndexLimits::default(),
     );
 
-    let units = [
-        text_unit("docs/light.md", "beacon mentioned once")?,
-        text_unit("docs/heavy.md", "beacon beacon beacon beacon beacon")?,
+    let documents = [
+        text_document("docs/adjacent.md", "the alpha beacon reports nightly")?,
+        text_document("docs/apart.md", "beacon first and alpha second")?,
     ];
-    index.replace_all(&units, "revision-1").await?;
+    index.replace_all(&documents, "revision-1").await?;
+
+    for phase in [QueryPhase::Precise, QueryPhase::Broad] {
+        let hits = phase_matches(&index, "revision-1", "\"alpha beacon\"", phase, 10).await?;
+        let label = phase.label();
+        assert_eq!(
+            hits.len(),
+            1,
+            "a quoted phrase reaches adjacent words alone: phase={label}"
+        );
+        assert_eq!(hits[0].identity().as_str(), "docs/adjacent.md");
+        assert_eq!(hits[0].fields(), FieldSet::of(SearchableField::FileContent));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_search_names_the_column_that_carried_the_term() -> TestResult {
+    let directory = TempDir::new()?;
+    let path = database_path(&directory);
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
+
+    let named = document(
+        "crate::beacon",
+        "src/beacon.rs",
+        DocumentKind::Symbol,
+        DocumentFields::empty()
+            .with(SearchableField::Name, "beacon")
+            .with(SearchableField::DeclarationSource, "pub fn declare() {}"),
+    )?;
+    let documented = document(
+        "crate::relay",
+        "src/relay.rs",
+        DocumentKind::Symbol,
+        DocumentFields::empty()
+            .with(SearchableField::Name, "relay")
+            .with(
+                SearchableField::Documentation,
+                "forwards every beacon it receives",
+            )
+            .with(SearchableField::DeclarationSource, "pub fn relay() {}"),
+    )?;
+    index
+        .replace_all(&[named, documented], "revision-1")
+        .await?;
+
+    let hits = search_matches(&index, "revision-1", "beacon", 10).await?;
+    assert_eq!(hits.len(), 2, "both documents carry the term somewhere");
+    let name_hit = hits
+        .iter()
+        .find(|hit| hit.identity().as_str() == "crate::beacon")
+        .ok_or("the name hit must be ranked")?;
+    let documentation_hit = hits
+        .iter()
+        .find(|hit| hit.identity().as_str() == "crate::relay")
+        .ok_or("the documentation hit must be ranked")?;
+    assert_eq!(name_hit.fields(), FieldSet::of(SearchableField::Name));
+    assert_eq!(
+        documentation_hit.fields(),
+        FieldSet::of(SearchableField::Documentation)
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_search_reaches_a_document_through_any_one_field() -> TestResult {
+    let directory = TempDir::new()?;
+    let path = database_path(&directory);
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
+
+    let documents = [
+        document(
+            "crate::dispatch",
+            "src/dispatch.rs",
+            DocumentKind::Symbol,
+            DocumentFields::empty()
+                .with(SearchableField::Name, "dispatch")
+                .with(
+                    SearchableField::Signature,
+                    "fn dispatch(payload: Envelope) -> Receipt",
+                )
+                .with(SearchableField::DeclarationSource, "pub fn dispatch() {}"),
+        )?,
+        document(
+            "crate::collect",
+            "src/collect.rs",
+            DocumentKind::Symbol,
+            DocumentFields::empty()
+                .with(SearchableField::Name, "collect")
+                .with(
+                    SearchableField::Documentation,
+                    "drains the mailbox before it returns",
+                )
+                .with(SearchableField::DeclarationSource, "pub fn collect() {}"),
+        )?,
+        document(
+            "crate::render",
+            "src/render.rs",
+            DocumentKind::Symbol,
+            DocumentFields::empty()
+                .with(SearchableField::Name, "render")
+                .with(
+                    SearchableField::DeclarationSource,
+                    "pub fn render() { paint_surface() }",
+                ),
+        )?,
+        text_document("docs/notes.md", "the quarterly retrospective lives here")?,
+    ];
+    index.replace_all(&documents, "revision-1").await?;
+
+    for (query, expected, field) in [
+        ("envelope", "crate::dispatch", SearchableField::Signature),
+        ("mailbox", "crate::collect", SearchableField::Documentation),
+        (
+            "paint_surface",
+            "crate::render",
+            SearchableField::DeclarationSource,
+        ),
+        (
+            "retrospective",
+            "docs/notes.md",
+            SearchableField::FileContent,
+        ),
+    ] {
+        let hits = search_matches(&index, "revision-1", query, 10).await?;
+        assert_eq!(
+            hits.len(),
+            1,
+            "one field alone must reach its document: query={query}"
+        );
+        assert_eq!(hits[0].identity().as_str(), expected);
+        let column = field.column();
+        assert_eq!(
+            hits[0].fields(),
+            FieldSet::of(field),
+            "only {column} carried the term: query={query}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_search_orders_better_match_first() -> TestResult {
+    let directory = TempDir::new()?;
+    let path = database_path(&directory);
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
+
+    let documents = [
+        text_document("docs/light.md", "beacon mentioned once")?,
+        text_document("docs/heavy.md", "beacon beacon beacon beacon beacon")?,
+    ];
+    index.replace_all(&documents, "revision-1").await?;
 
     let hits = search_matches(&index, "revision-1", "beacon", 10).await?;
     assert_eq!(hits.len(), 2);
     assert_eq!(
-        hits[0].identity(),
+        hits[0].identity().as_str(),
         "docs/heavy.md",
         "denser match must rank first"
     );
@@ -140,21 +390,23 @@ async fn test_lexical_search_index_search_orders_better_match_first()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_search_limit_and_matches_max_cap_results()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_search_limit_and_matches_max_cap_results() -> TestResult {
     let directory = TempDir::new()?;
-    let limits = LexicalIndexLimits::new(100, 1_048_576, 32, 2, 4, 1_000);
+    let limits = LexicalIndexLimits::new(100, 1_048_576, 2, 4, 1_000);
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
         WorkspaceDatabase::open(&path, database_pool()).await?,
         limits,
     );
 
-    let mut units = Vec::new();
-    for identifier in 0..5 {
-        units.push(text_unit(&format!("docs/{identifier}.md"), "shared token")?);
+    let mut documents = Vec::new();
+    for counter in 0..5 {
+        documents.push(text_document(
+            &format!("docs/{counter}.md"),
+            "shared token",
+        )?);
     }
-    index.replace_all(&units, "revision-1").await?;
+    index.replace_all(&documents, "revision-1").await?;
 
     let capped_by_matches_max = search_matches(&index, "revision-1", "shared", 10).await?;
     assert_eq!(
@@ -169,10 +421,9 @@ async fn test_lexical_search_index_search_limit_and_matches_max_cap_results()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_search_names_the_bound_a_match_lies_past()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_search_names_the_bound_a_match_lies_past() -> TestResult {
     let directory = TempDir::new()?;
-    let limits = LexicalIndexLimits::new(100, 1_048_576, 32, 2, 4, 1_000);
+    let limits = LexicalIndexLimits::new(100, 1_048_576, 2, 4, 1_000);
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
         WorkspaceDatabase::open(&path, database_pool()).await?,
@@ -180,8 +431,8 @@ async fn test_lexical_search_index_search_names_the_bound_a_match_lies_past()
     );
 
     let at_the_bound = [
-        text_unit("docs/0.md", "shared token")?,
-        text_unit("docs/1.md", "shared token")?,
+        text_document("docs/0.md", "shared token")?,
+        text_document("docs/1.md", "shared token")?,
     ];
     index.replace_all(&at_the_bound, "revision-1").await?;
     let whole = search_ranking(&index, "revision-1", "shared", 10).await?;
@@ -193,9 +444,9 @@ async fn test_lexical_search_index_search_names_the_bound_a_match_lies_past()
     );
 
     let past_the_bound = [
-        text_unit("docs/0.md", "shared token")?,
-        text_unit("docs/1.md", "shared token")?,
-        text_unit("docs/2.md", "shared token")?,
+        text_document("docs/0.md", "shared token")?,
+        text_document("docs/1.md", "shared token")?,
+        text_document("docs/2.md", "shared token")?,
     ];
     index.replace_all(&past_the_bound, "revision-2").await?;
     let cut = search_ranking(&index, "revision-2", "shared", 10).await?;
@@ -217,8 +468,7 @@ async fn test_lexical_search_index_search_names_the_bound_a_match_lies_past()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_search_empty_query_returns_empty()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_search_empty_query_returns_empty() -> TestResult {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
@@ -226,8 +476,8 @@ async fn test_lexical_search_index_search_empty_query_returns_empty()
         LexicalIndexLimits::default(),
     );
 
-    let units = [text_unit("docs/a.md", "content")?];
-    index.replace_all(&units, "revision-1").await?;
+    let documents = [text_document("docs/a.md", "content")?];
+    index.replace_all(&documents, "revision-1").await?;
 
     let hits = search_matches(&index, "revision-1", "   ", 10).await?;
     assert_eq!(hits, Vec::new());
@@ -235,18 +485,17 @@ async fn test_lexical_search_index_search_empty_query_returns_empty()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_open_with_single_pool_slot_still_serves_search()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_open_with_single_pool_slot_still_serves_search() -> TestResult {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
-    let limits = LexicalIndexLimits::new(100, 1_048_576, 32, 100, 1, 1_000);
+    let limits = LexicalIndexLimits::new(100, 1_048_576, 100, 1, 1_000);
     let index = LexicalSearchIndex::attached(
         WorkspaceDatabase::open(&path, database_pool()).await?,
         limits,
     );
 
-    let units = [text_unit("docs/a.md", "single slot content")?];
-    index.replace_all(&units, "revision-1").await?;
+    let documents = [text_document("docs/a.md", "single slot content")?];
+    index.replace_all(&documents, "revision-1").await?;
 
     let hits = search_matches(&index, "revision-1", "single", 10).await?;
     assert_eq!(
@@ -259,21 +508,21 @@ async fn test_lexical_search_index_open_with_single_pool_slot_still_serves_searc
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_lexical_search_index_replace_all_over_units_max_refuses_and_prior_state_still_served()
--> Result<(), Box<dyn std::error::Error>> {
+-> TestResult {
     let directory = TempDir::new()?;
-    let limits = LexicalIndexLimits::new(1, 1_048_576, 32, 100, 4, 1_000);
+    let limits = LexicalIndexLimits::new(1, 1_048_576, 100, 4, 1_000);
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
         WorkspaceDatabase::open(&path, database_pool()).await?,
         limits,
     );
 
-    let first_batch = [text_unit("docs/kept.md", "kept content survives")?];
+    let first_batch = [text_document("docs/kept.md", "kept content survives")?];
     index.replace_all(&first_batch, "revision-1").await?;
 
     let oversized_batch = [
-        text_unit("docs/one.md", "one")?,
-        text_unit("docs/two.md", "two")?,
+        text_document("docs/one.md", "one")?,
+        text_document("docs/two.md", "two")?,
     ];
     let outcome = index.replace_all(&oversized_batch, "revision-2").await;
     let error = outcome.expect_err("batch bound violation must refuse");
@@ -290,17 +539,17 @@ async fn test_lexical_search_index_replace_all_over_units_max_refuses_and_prior_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_replace_all_unit_over_bytes_max_refuses_naming_path()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_replace_all_content_over_bytes_max_refuses_naming_path()
+-> TestResult {
     let directory = TempDir::new()?;
-    let limits = LexicalIndexLimits::new(100, 8, 32, 100, 4, 1_000);
+    let limits = LexicalIndexLimits::new(100, 8, 100, 4, 1_000);
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
         WorkspaceDatabase::open(&path, database_pool()).await?,
         limits,
     );
 
-    let oversized = [text_unit("docs/big.md", "too many bytes here")?];
+    let oversized = [text_document("docs/big.md", "too many bytes here")?];
     let outcome = index.replace_all(&oversized, "revision-1").await;
     let error = outcome.expect_err("batch bound violation must refuse");
     assert_eq!(
@@ -312,8 +561,54 @@ async fn test_lexical_search_index_replace_all_unit_over_bytes_max_refuses_namin
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_replace_all_duplicate_identity_refuses_atomically()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_replace_all_refuses_a_document_addressed_by_a_source_unit()
+-> TestResult {
+    let directory = TempDir::new()?;
+    let path = database_path(&directory);
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
+    index
+        .replace_all(
+            &[text_document("docs/kept.md", "kept content")?],
+            "revision-1",
+        )
+        .await?;
+
+    // This store holds project documents. A document addressed by a source unit belongs
+    // to a package index, and filing its unit URI in the path column would make the
+    // stored row unreadable as a project path.
+    let unit = SourceUnitId::parse("rift://source/cargo/helper@0.1.0/src/lib.rs")?;
+    let fields = DocumentFields::empty().with(SearchableField::Name, "helper");
+    let digest = fields.digest();
+    let packaged = IndexDocument::new(
+        identity("rift://source/cargo/helper@0.1.0/src/lib.rs")?,
+        DocumentLocation::Unit(unit),
+        DocumentKind::Symbol,
+        digest,
+        fields,
+    )?;
+
+    let error = index
+        .replace_all(&[packaged], "revision-2")
+        .await
+        .expect_err("a document addressed by a source unit must refuse");
+    assert_eq!(
+        error.fault().violation(),
+        LexicalIndexViolation::DocumentLocationUnsupported
+    );
+    assert_eq!(
+        index.tree_revision().await?,
+        Some("revision-1".to_owned()),
+        "the refusal lands before any transaction opens"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_replace_all_duplicate_identity_refuses_atomically() -> TestResult
+{
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
@@ -321,15 +616,12 @@ async fn test_lexical_search_index_replace_all_duplicate_identity_refuses_atomic
         LexicalIndexLimits::default(),
     );
 
-    let baseline = [text_unit("docs/kept.md", "baseline content")?];
+    let baseline = [text_document("docs/kept.md", "baseline content")?];
     index.replace_all(&baseline, "revision-1").await?;
 
-    let first_copy = ProjectPath::new("docs/dup.md")?;
-    let second_copy = ProjectPath::new("docs/dup-again.md")?;
-    let kind = LexicalUnitKind::TextFile;
-    let first_unit = LexicalUnit::new("docs/dup.md", first_copy, kind, None, "first")?;
-    let second_unit = LexicalUnit::new("docs/dup.md", second_copy, kind, None, "second")?;
-    let duplicated = [first_unit, second_unit];
+    let first_copy = text_chunk("docs/dup.md", "docs/dup.md", "first")?;
+    let second_copy = text_chunk("docs/dup.md", "docs/dup-again.md", "second")?;
+    let duplicated = [first_copy, second_copy];
     let outcome = index.replace_all(&duplicated, "revision-2").await;
     let error = outcome.expect_err("batch bound violation must refuse");
     assert_eq!(
@@ -338,7 +630,7 @@ async fn test_lexical_search_index_replace_all_duplicate_identity_refuses_atomic
     );
 
     assert_eq!(
-        index.content("docs/kept.md").await?,
+        index.content(&identity("docs/kept.md")?).await?,
         Some("baseline content".to_owned())
     );
     assert_eq!(index.tree_revision().await?, Some("revision-1".to_owned()));
@@ -346,8 +638,7 @@ async fn test_lexical_search_index_replace_all_duplicate_identity_refuses_atomic
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_second_replace_all_fully_supersedes_first()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_second_replace_all_fully_supersedes_first() -> TestResult {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
@@ -355,10 +646,10 @@ async fn test_lexical_search_index_second_replace_all_fully_supersedes_first()
         LexicalIndexLimits::default(),
     );
 
-    let first = [text_unit("docs/a.md", "firstwordonly content")?];
+    let first = [text_document("docs/a.md", "firstwordonly content")?];
     index.replace_all(&first, "revision-1").await?;
 
-    let second = [text_unit("docs/b.md", "secondwordonly content")?];
+    let second = [text_document("docs/b.md", "secondwordonly content")?];
     index.replace_all(&second, "revision-2").await?;
 
     let stale_hits = search_matches(&index, "revision-2", "firstwordonly", 10).await?;
@@ -370,8 +661,7 @@ async fn test_lexical_search_index_second_replace_all_fully_supersedes_first()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_tree_revision_none_then_some_after_replace_all()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_tree_revision_none_then_some_after_replace_all() -> TestResult {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
@@ -381,15 +671,14 @@ async fn test_lexical_search_index_tree_revision_none_then_some_after_replace_al
 
     assert_eq!(index.tree_revision().await?, None);
 
-    let units = [text_unit("docs/a.md", "content")?];
-    index.replace_all(&units, "revision-1").await?;
+    let documents = [text_document("docs/a.md", "content")?];
+    index.replace_all(&documents, "revision-1").await?;
     assert_eq!(index.tree_revision().await?, Some("revision-1".to_owned()));
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_content_returns_some_and_none()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_content_returns_each_kind_s_own_field_and_none() -> TestResult {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
@@ -397,20 +686,33 @@ async fn test_lexical_search_index_content_returns_some_and_none()
         LexicalIndexLimits::default(),
     );
 
-    let units = [text_unit("docs/a.md", "found content")?];
-    index.replace_all(&units, "revision-1").await?;
+    let documents = [
+        text_document("docs/a.md", "found content")?,
+        symbol_document(
+            "crate::beacon",
+            "src/beacon.rs",
+            "beacon",
+            "pub fn beacon() {}",
+        )?,
+    ];
+    index.replace_all(&documents, "revision-1").await?;
 
     assert_eq!(
-        index.content("docs/a.md").await?,
-        Some("found content".to_owned())
+        index.content(&identity("docs/a.md")?).await?,
+        Some("found content".to_owned()),
+        "a text-file document answers with its file content"
     );
-    assert_eq!(index.content("docs/missing.md").await?, None);
+    assert_eq!(
+        index.content(&identity("crate::beacon")?).await?,
+        Some("pub fn beacon() {}".to_owned()),
+        "a symbol document answers with its declaration source"
+    );
+    assert_eq!(index.content(&identity("docs/missing.md")?).await?, None);
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_reopen_from_file_serves_persisted_rows()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_reopen_from_file_serves_persisted_rows() -> TestResult {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
 
@@ -418,8 +720,8 @@ async fn test_lexical_search_index_reopen_from_file_serves_persisted_rows()
         WorkspaceDatabase::open(&path, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
-    let units = [text_unit("docs/a.md", "persisted content")?];
-    index.replace_all(&units, "revision-1").await?;
+    let documents = [text_document("docs/a.md", "persisted content")?];
+    index.replace_all(&documents, "revision-1").await?;
     drop(index);
 
     let reopened = LexicalSearchIndex::attached(
@@ -427,7 +729,7 @@ async fn test_lexical_search_index_reopen_from_file_serves_persisted_rows()
         LexicalIndexLimits::default(),
     );
     assert_eq!(
-        reopened.content("docs/a.md").await?,
+        reopened.content(&identity("docs/a.md")?).await?,
         Some("persisted content".to_owned())
     );
     assert_eq!(
@@ -444,8 +746,7 @@ async fn test_lexical_search_index_reopen_from_file_serves_persisted_rows()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_symbol_and_text_file_units_coexist()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_symbol_and_text_file_documents_coexist() -> TestResult {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
@@ -453,32 +754,45 @@ async fn test_lexical_search_index_symbol_and_text_file_units_coexist()
         LexicalIndexLimits::default(),
     );
 
-    let symbol = symbol_unit(
+    let symbol = symbol_document(
         "crate::widgets::render",
         "src/widgets.rs",
         "render",
         "fn render() { paint_surface() }",
     )?;
-    let text = text_unit("docs/widgets.md", "widget documentation prose")?;
+    let text = text_document("docs/widgets.md", "widget documentation prose")?;
     index.replace_all(&[symbol, text], "revision-1").await?;
 
     let symbol_hits = search_matches(&index, "revision-1", "paint_surface", 10).await?;
     assert_eq!(symbol_hits.len(), 1);
-    assert_eq!(symbol_hits[0].kind(), LexicalUnitKind::Symbol);
+    assert_eq!(symbol_hits[0].kind(), DocumentKind::Symbol);
     assert_eq!(symbol_hits[0].path().as_str(), "src/widgets.rs");
-    assert_eq!(symbol_hits[0].name(), Some("render"));
+    assert_eq!(
+        symbol_hits[0].fields(),
+        FieldSet::of(SearchableField::DeclarationSource)
+    );
 
     let text_hits = search_matches(&index, "revision-1", "prose", 10).await?;
     assert_eq!(text_hits.len(), 1);
-    assert_eq!(text_hits[0].kind(), LexicalUnitKind::TextFile);
+    assert_eq!(text_hits[0].kind(), DocumentKind::TextFile);
     assert_eq!(text_hits[0].path().as_str(), "docs/widgets.md");
-    assert_eq!(text_hits[0].name(), None);
+    assert_eq!(
+        text_hits[0].fields(),
+        FieldSet::of(SearchableField::FileContent)
+    );
+
+    // A text file's `name` is its final path segment with the extension, so the file is
+    // reachable by its own name and not only by what it contains.
+    let by_name = search_matches(&index, "revision-1", "widgets.md", 10).await?;
+    assert_eq!(by_name.len(), 1);
+    assert_eq!(by_name[0].identity().as_str(), "docs/widgets.md");
+    assert!(by_name[0].fields().holds(SearchableField::Name));
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_search_name_match_outranks_body_only_match()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_search_ranks_a_name_hit_above_a_declaration_source_hit()
+-> TestResult {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
@@ -486,33 +800,55 @@ async fn test_lexical_search_index_search_name_match_outranks_body_only_match()
         LexicalIndexLimits::default(),
     );
 
-    let named = symbol_unit(
+    let named = document(
         "crate::index::SearchHit",
         "src/index.rs",
-        "SearchHit",
-        "fn locate() { finds nothing relevant here }",
+        DocumentKind::Symbol,
+        DocumentFields::empty()
+            .with(SearchableField::Name, "SearchHit")
+            .with(
+                SearchableField::DeclarationSource,
+                "fn locate() { finds nothing relevant here }",
+            ),
     )?;
-    let bodied = symbol_unit(
+    let bodied = document(
         "crate::index::Unrelated",
         "src/index.rs",
-        "Unrelated",
-        "this function will search the entire tree",
+        DocumentKind::Symbol,
+        DocumentFields::empty()
+            .with(SearchableField::Name, "Unrelated")
+            .with(
+                SearchableField::DeclarationSource,
+                "this function will search the entire tree",
+            ),
     )?;
     index.replace_all(&[named, bodied], "revision-1").await?;
 
     let hits = search_matches(&index, "revision-1", "search", 10).await?;
-    assert_eq!(hits.len(), 2, "both name and body matches must be found");
     assert_eq!(
-        hits[0].identity(),
+        hits.len(),
+        2,
+        "both the name hit and the declaration-source hit must be found"
+    );
+    assert_eq!(
+        hits[0].identity().as_str(),
         "crate::index::SearchHit",
-        "name match must outrank body-only match"
+        "the declared bm25 weights rank a name hit above a declaration-source hit"
+    );
+    assert_eq!(hits[0].fields(), FieldSet::of(SearchableField::Name));
+    assert_eq!(
+        hits[1].fields(),
+        FieldSet::of(SearchableField::DeclarationSource)
+    );
+    assert!(
+        hits[0].rank() < hits[1].rank(),
+        "rank is ascending, so the name hit carries the lower value"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_search_finds_camel_case_name_by_expanded_words()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_search_finds_camel_case_name_by_expanded_words() -> TestResult {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
@@ -520,13 +856,13 @@ async fn test_lexical_search_index_search_finds_camel_case_name_by_expanded_word
         LexicalIndexLimits::default(),
     );
 
-    let unit = symbol_unit(
+    let declaration = symbol_document(
         "crate::account::getUserName",
         "src/account.rs",
         "getUserName",
         "returns account holder identifier",
     )?;
-    index.replace_all(&[unit], "revision-1").await?;
+    index.replace_all(&[declaration], "revision-1").await?;
 
     let hits = search_matches(&index, "revision-1", "user name", 10).await?;
     assert_eq!(
@@ -534,20 +870,31 @@ async fn test_lexical_search_index_search_finds_camel_case_name_by_expanded_word
         1,
         "camelCase expansion must make the name discoverable by its split words"
     );
-    assert_eq!(hits[0].identity(), "crate::account::getUserName");
+    assert_eq!(hits[0].identity().as_str(), "crate::account::getUserName");
+    assert_eq!(
+        hits[0].fields(),
+        FieldSet::of(SearchableField::IdentifierTerms),
+        "the derived terms column is what the split words matched"
+    );
     Ok(())
 }
 
 #[derive(Debug, toasty::Model)]
-#[table = "lexical_units"]
-struct ConcurrentUnitRecord {
+#[table = "lexical_documents"]
+struct ConcurrentDocumentRecord {
     #[key]
     identity: String,
     path: String,
     kind: String,
-    name: Option<String>,
+    digest: String,
     byte_length: i64,
-    content: String,
+    name: Option<String>,
+    qualified_name: Option<String>,
+    identifier_terms: Option<String>,
+    signature: Option<String>,
+    documentation: Option<String>,
+    declaration_source: Option<String>,
+    file_content: Option<String>,
 }
 
 #[derive(Debug, toasty::Model)]
@@ -556,18 +903,19 @@ struct ConcurrentLexicalIndexStateRecord {
     #[key]
     id: i64,
     tree_revision: String,
+    corpus_revision: String,
 }
 
 async fn open_concurrent_probe(path: &Path) -> toasty::Result<Db> {
     let mut builder = Db::builder();
-    let models = toasty::models!(ConcurrentUnitRecord, ConcurrentLexicalIndexStateRecord);
+    let models = toasty::models!(ConcurrentDocumentRecord, ConcurrentLexicalIndexStateRecord);
     builder.models(models).max_pool_size(1);
     builder.build(Sqlite::open(path)).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_lexical_search_index_content_sees_only_committed_writes_during_concurrent_transaction()
--> Result<(), Box<dyn std::error::Error>> {
+-> TestResult {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
@@ -575,31 +923,37 @@ async fn test_lexical_search_index_content_sees_only_committed_writes_during_con
         LexicalIndexLimits::default(),
     );
 
-    let committed = [text_unit("docs/a.md", "alpha content")?];
+    let committed = [text_document("docs/a.md", "alpha content")?];
     index.replace_all(&committed, "revision-1").await?;
 
     let probe_database = open_concurrent_probe(&path).await?;
     let mut probe_connection = probe_database.connection().await?;
     let mut probe_transaction = probe_connection.transaction().await?;
-    toasty::create!(ConcurrentUnitRecord {
+    toasty::create!(ConcurrentDocumentRecord {
         identity: "docs/b.md",
         path: "docs/b.md",
         kind: "text_file",
-        name: None,
+        digest: "0f1e2d3c",
         byte_length: 5,
-        content: "bravo",
+        name: Some("b.md".to_owned()),
+        qualified_name: None,
+        identifier_terms: None,
+        signature: None,
+        documentation: None,
+        declaration_source: None,
+        file_content: Some("bravo".to_owned()),
     })
     .exec(&mut probe_transaction)
     .await?;
 
-    let uncommitted_read = index.content("docs/b.md").await?;
+    let uncommitted_read = index.content(&identity("docs/b.md")?).await?;
     assert_eq!(
         uncommitted_read, None,
         "reader must not see an uncommitted write"
     );
 
     probe_transaction.commit().await?;
-    let committed_read = index.content("docs/b.md").await?;
+    let committed_read = index.content(&identity("docs/b.md")?).await?;
     assert_eq!(
         committed_read,
         Some("bravo".to_owned()),
@@ -614,32 +968,44 @@ async fn insert_corrupt_lexical_row(
     path: &str,
     kind: &str,
     content: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> TestResult {
     let mut probe_connection = probe_database.connection().await?;
-    toasty::create!(ConcurrentUnitRecord {
+    toasty::create!(ConcurrentDocumentRecord {
         identity: identity.to_owned(),
         path: path.to_owned(),
         kind: kind.to_owned(),
-        name: None,
+        digest: "0f1e2d3c".to_owned(),
         byte_length: i64::try_from(content.len())?,
-        content: content.to_owned(),
+        name: None,
+        qualified_name: None,
+        identifier_terms: None,
+        signature: None,
+        documentation: None,
+        declaration_source: None,
+        file_content: Some(content.to_owned()),
     })
     .exec(&mut probe_connection)
     .await?;
-    toasty::sql::statement(
-        "INSERT INTO lexical_units_fts(identity, name, content) VALUES (?1, ?2, ?3)",
+    let mut insert = toasty::sql::statement(
+        "INSERT INTO lexical_documents_fts(identity, name, qualified_name, identifier_terms, \
+         signature, documentation, declaration_source, file_content) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )
-    .bind(identity.to_owned())
-    .bind(String::new())
-    .bind(content.to_owned())
-    .exec(&mut probe_connection)
-    .await?;
+    .bind(identity.to_owned());
+    for field in SearchableField::ALL {
+        let value = if field == SearchableField::FileContent {
+            content.to_owned()
+        } else {
+            String::new()
+        };
+        insert = insert.bind(value);
+    }
+    insert.exec(&mut probe_connection).await?;
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_search_stored_invalid_path_refuses()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_search_stored_invalid_path_refuses() -> TestResult {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
@@ -660,7 +1026,10 @@ async fn test_lexical_search_index_search_stored_invalid_path_refuses()
     )
     .await?;
 
-    let outcome = index.search("revision-1", "corrupt", 10).await;
+    let query = ParsedQuery::parse("corrupt")?;
+    let outcome = index
+        .search("revision-1", &query, QueryPhase::Precise, 10)
+        .await;
     let error = outcome.expect_err("a stored row with an invalid path must refuse");
     assert_eq!(
         error.fault().violation(),
@@ -670,8 +1039,7 @@ async fn test_lexical_search_index_search_stored_invalid_path_refuses()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_search_stored_invalid_kind_refuses()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_search_stored_invalid_kind_refuses() -> TestResult {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
@@ -690,7 +1058,10 @@ async fn test_lexical_search_index_search_stored_invalid_kind_refuses()
     )
     .await?;
 
-    let outcome = index.search("revision-1", "corrupt", 10).await;
+    let query = ParsedQuery::parse("corrupt")?;
+    let outcome = index
+        .search("revision-1", &query, QueryPhase::Precise, 10)
+        .await;
     let error = outcome.expect_err("a stored row with an unknown kind must refuse");
     assert_eq!(
         error.fault().violation(),
@@ -700,8 +1071,8 @@ async fn test_lexical_search_index_search_stored_invalid_kind_refuses()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_open_at_unusable_path_refuses_with_storage_failure()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_open_at_unusable_path_refuses_with_storage_failure() -> TestResult
+{
     let directory = TempDir::new()?;
     let path = directory.path().join("missing-parent").join("lexical.db");
 
@@ -712,8 +1083,8 @@ async fn test_lexical_search_index_open_at_unusable_path_refuses_with_storage_fa
     Ok(())
 }
 
-/// Table shape mirroring `lexical_units` so a raw connection can create a
-/// conflicting table before the adapter ever opens the path: same table name,
+/// Table shape mirroring the first migration's `lexical_units` so a raw connection can
+/// create a conflicting table before the adapter ever opens the path: same table name,
 /// incompatible columns.
 #[derive(Debug, toasty::Model)]
 #[table = "lexical_units"]
@@ -732,15 +1103,16 @@ async fn open_conflicting_schema_probe(path: &Path) -> toasty::Result<Db> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_lexical_search_index_open_migration_apply_conflict_refuses_distinct_from_build_failure()
--> Result<(), Box<dyn std::error::Error>> {
+-> TestResult {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
 
     // Pre-create a `lexical_units` table with the wrong shape through a raw
     // connection, bypassing the adapter's own migrations entirely. `open`'s
     // own build step succeeds (the file and a connection are perfectly
-    // usable); only the later `MIGRATIONS.apply` call fails, since its
-    // `CREATE TABLE lexical_units` collides with the one already present.
+    // usable); only the later `MIGRATIONS.apply` call fails, since the first
+    // migration's `CREATE TABLE lexical_units` collides with the one already
+    // present.
     let probe_database = open_conflicting_schema_probe(&path).await?;
     let mut probe_connection = probe_database.connection().await?;
     toasty::sql::statement("CREATE TABLE lexical_units(id INTEGER PRIMARY KEY)")
@@ -764,7 +1136,7 @@ async fn test_lexical_search_index_open_migration_apply_conflict_refuses_distinc
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_lexical_search_index_replace_all_against_external_writer_surfaces_storage_failure()
--> Result<(), Box<dyn std::error::Error>> {
+-> TestResult {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
@@ -785,7 +1157,7 @@ async fn test_lexical_search_index_replace_all_against_external_writer_surfaces_
         .begin()
         .await?;
     let outcome = index
-        .replace_all(&[text_unit("docs/a.md", "content")?], "revision-1")
+        .replace_all(&[text_document("docs/a.md", "content")?], "revision-1")
         .await;
     blocker.rollback().await?;
 
@@ -800,32 +1172,29 @@ async fn test_lexical_search_index_replace_all_against_external_writer_surfaces_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_apply_replaces_one_path_and_keeps_the_rest()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_apply_replaces_one_path_and_keeps_the_rest() -> TestResult {
     let directory = TempDir::new()?;
     let index = LexicalSearchIndex::attached(
         WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
         LexicalIndexLimits::default(),
     );
-    let units = [
-        symbol_unit(
+    let documents = [
+        symbol_document(
             "rift://symbol/rust/kept.rs/keptalpha",
             "kept.rs",
             "keptalpha",
             "pub fn keptalpha() {}",
-        ),
-        symbol_unit(
+        )?,
+        symbol_document(
             "rift://symbol/rust/moved.rs/firstbeta",
             "moved.rs",
             "firstbeta",
             "pub fn firstbeta() {}",
-        ),
+        )?,
     ];
-    let units: Result<Vec<_>, _> = units.into_iter().collect();
-    let units = units?;
-    index.replace_all(&units, "revision-one").await?;
+    index.replace_all(&documents, "revision-one").await?;
 
-    let replacement = symbol_unit(
+    let replacement = symbol_document(
         "rift://symbol/rust/moved.rs/secondgamma",
         "moved.rs",
         "secondgamma",
@@ -859,8 +1228,7 @@ async fn test_lexical_search_index_apply_replaces_one_path_and_keeps_the_rest()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_apply_deletes_every_chunk_filed_under_one_path()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_apply_deletes_every_chunk_filed_under_one_path() -> TestResult {
     let directory = TempDir::new()?;
     let index = LexicalSearchIndex::attached(
         WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
@@ -868,20 +1236,8 @@ async fn test_lexical_search_index_apply_deletes_every_chunk_filed_under_one_pat
     );
     // A chunked text file files every chunk under its own path, so one delete by path has
     // to reach all of them.
-    let first = LexicalUnit::new(
-        "docs/guide.md#0",
-        ProjectPath::new("docs/guide.md")?,
-        LexicalUnitKind::TextFile,
-        None,
-        "chapter alphaone",
-    )?;
-    let second = LexicalUnit::new(
-        "docs/guide.md#1",
-        ProjectPath::new("docs/guide.md")?,
-        LexicalUnitKind::TextFile,
-        None,
-        "chapter betatwo",
-    )?;
+    let first = text_chunk("docs/guide.md#0", "docs/guide.md", "chapter alphaone")?;
+    let second = text_chunk("docs/guide.md#1", "docs/guide.md", "chapter betatwo")?;
     index.replace_all(&[first, second], "revision-one").await?;
     assert_eq!(
         search_matches(&index, "revision-one", "chapter", 8)
@@ -905,10 +1261,9 @@ async fn test_lexical_search_index_apply_deletes_every_chunk_filed_under_one_pat
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_apply_refuses_a_resulting_set_past_units_max()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_apply_refuses_a_resulting_set_past_units_max() -> TestResult {
     let directory = TempDir::new()?;
-    let limits = LexicalIndexLimits::new(2, 65_536, 32, 64, 4, 1_000);
+    let limits = LexicalIndexLimits::new(2, 65_536, 64, 4, 1_000);
     let index = LexicalSearchIndex::attached(
         WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
         limits,
@@ -916,16 +1271,16 @@ async fn test_lexical_search_index_apply_refuses_a_resulting_set_past_units_max(
     index
         .replace_all(
             &[
-                text_unit("docs/a.md", "alphaone")?,
-                text_unit("docs/b.md", "betatwo")?,
+                text_document("docs/a.md", "alphaone")?,
+                text_document("docs/b.md", "betatwo")?,
             ],
             "revision-one",
         )
         .await?;
 
-    // Nothing is dropped, so the two stored units plus one insert cross the bound the
+    // Nothing is dropped, so the two stored documents plus one insert cross the bound the
     // stored set is measured against, not the batch.
-    let change = LexicalChange::new(Vec::new(), vec![text_unit("docs/c.md", "gammathree")?]);
+    let change = LexicalChange::new(Vec::new(), vec![text_document("docs/c.md", "gammathree")?]);
     let error = index
         .apply(&change, "revision-two")
         .await
@@ -946,28 +1301,28 @@ async fn test_lexical_search_index_apply_refuses_a_resulting_set_past_units_max(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_apply_refuses_two_units_sharing_one_identity()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_apply_refuses_two_documents_sharing_one_identity() -> TestResult
+{
     let directory = TempDir::new()?;
     let index = LexicalSearchIndex::attached(
         WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
         LexicalIndexLimits::default(),
     );
     index
-        .replace_all(&[text_unit("docs/a.md", "alphaone")?], "revision-one")
+        .replace_all(&[text_document("docs/a.md", "alphaone")?], "revision-one")
         .await?;
 
     let change = LexicalChange::new(
         Vec::new(),
         vec![
-            text_unit("docs/b.md", "betatwo")?,
-            text_unit("docs/b.md", "betatwo")?,
+            text_document("docs/b.md", "betatwo")?,
+            text_document("docs/b.md", "betatwo")?,
         ],
     );
     let error = index
         .apply(&change, "revision-two")
         .await
-        .expect_err("two units sharing one identity must refuse");
+        .expect_err("two documents sharing one identity must refuse");
     assert_eq!(
         error.fault().violation(),
         LexicalIndexViolation::DuplicateIdentity
@@ -981,8 +1336,7 @@ async fn test_lexical_search_index_apply_refuses_two_units_sharing_one_identity(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_apply_survives_a_reopen_of_the_same_database()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_apply_survives_a_reopen_of_the_same_database() -> TestResult {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
@@ -990,11 +1344,11 @@ async fn test_lexical_search_index_apply_survives_a_reopen_of_the_same_database(
         LexicalIndexLimits::default(),
     );
     index
-        .replace_all(&[text_unit("docs/a.md", "alphaone")?], "revision-one")
+        .replace_all(&[text_document("docs/a.md", "alphaone")?], "revision-one")
         .await?;
     let change = LexicalChange::new(
         vec![ProjectPath::new("docs/a.md")?],
-        vec![text_unit("docs/a.md", "betatwo")?],
+        vec![text_document("docs/a.md", "betatwo")?],
     );
     index.apply(&change, "revision-two").await?;
     drop(index);
@@ -1022,8 +1376,7 @@ async fn test_lexical_search_index_apply_survives_a_reopen_of_the_same_database(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_deletes_one_path_through_its_own_index()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_deletes_one_path_through_its_own_index() -> TestResult {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
@@ -1033,64 +1386,70 @@ async fn test_lexical_search_index_deletes_one_path_through_its_own_index()
     drop(index);
 
     // `apply` deletes by path on every incremental publication, so the planner
-    // has to reach those rows through `lexical_units_path` rather than scanning
-    // every unit the workspace indexed.
+    // has to reach those rows through `lexical_documents_path` rather than
+    // scanning every document the workspace indexed.
     let probe_database = open_concurrent_probe(&path).await?;
     let mut probe_connection = probe_database.connection().await?;
-    let rows = toasty::sql::query("EXPLAIN QUERY PLAN DELETE FROM lexical_units WHERE path = ?1")
-        .bind("src/lib.rs".to_owned())
-        .column_types([Type::I64, Type::I64, Type::I64, Type::String])
-        .exec(&mut probe_connection)
-        .await?;
+    let rows =
+        toasty::sql::query("EXPLAIN QUERY PLAN DELETE FROM lexical_documents WHERE path = ?1")
+            .bind("src/lib.rs".to_owned())
+            .column_types([Type::I64, Type::I64, Type::I64, Type::String])
+            .exec(&mut probe_connection)
+            .await?;
     let plan = format!("{rows:?}");
     assert!(
-        plan.contains("lexical_units_path"),
+        plan.contains("lexical_documents_path"),
         "a per-path delete must use the path index: plan={plan}"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_search_under_another_revision_names_the_stored_one()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_search_under_another_revision_names_the_stored_one() -> TestResult
+{
     let directory = TempDir::new()?;
     let index = LexicalSearchIndex::attached(
         WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
         LexicalIndexLimits::default(),
     );
     index
-        .replace_all(&[text_unit("docs/a.md", "alphaone")?], "revision-two")
+        .replace_all(&[text_document("docs/a.md", "alphaone")?], "revision-two")
         .await?;
 
     // A caller holding the previous publication asks for a tree the store has moved past.
     // Naming what it holds is what lets that caller recapture instead of ranking rows it
     // cannot place.
+    let query = ParsedQuery::parse("alphaone")?;
     assert_eq!(
-        index.search("revision-one", "alphaone", 8).await?,
+        index
+            .search("revision-one", &query, QueryPhase::Precise, 8)
+            .await?,
         RevisionScoped::OtherRevision("revision-two".to_owned())
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_search_before_any_population_reports_no_revision()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_search_before_any_population_reports_no_revision() -> TestResult
+{
     let directory = TempDir::new()?;
     let index = LexicalSearchIndex::attached(
         WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
         LexicalIndexLimits::default(),
     );
 
+    let query = ParsedQuery::parse("alphaone")?;
     assert_eq!(
-        index.search("revision-one", "alphaone", 8).await?,
+        index
+            .search("revision-one", &query, QueryPhase::Precise, 8)
+            .await?,
         RevisionScoped::NoRevision
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_search_qualifies_an_empty_query_by_revision_too()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_search_qualifies_an_empty_query_by_revision_too() -> TestResult {
     let directory = TempDir::new()?;
     let index = LexicalSearchIndex::attached(
         WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
@@ -1099,12 +1458,18 @@ async fn test_lexical_search_index_search_qualifies_an_empty_query_by_revision_t
 
     // A query with no term matches nothing, but the store still has to be the one the
     // caller asked for: an empty answer from another tree is not the same answer.
+    let query = ParsedQuery::parse("   ")?;
     assert_eq!(
-        index.search("revision-one", "   ", 8).await?,
+        index
+            .search("revision-one", &query, QueryPhase::Precise, 8)
+            .await?,
         RevisionScoped::NoRevision
     );
     index.replace_all(&[], "revision-one").await?;
-    let RevisionScoped::Matched(ranking) = index.search("revision-one", "   ", 8).await? else {
+    let matched = index
+        .search("revision-one", &query, QueryPhase::Precise, 8)
+        .await?;
+    let RevisionScoped::Matched(ranking) = matched else {
         return Err("the store holds the tree that was just stamped".into());
     };
     assert!(ranking.matches().is_empty());
@@ -1113,8 +1478,8 @@ async fn test_lexical_search_index_search_qualifies_an_empty_query_by_revision_t
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_apply_of_one_change_twice_leaves_one_unit_set()
--> Result<(), Box<dyn std::error::Error>> {
+async fn test_lexical_search_index_apply_of_one_change_twice_leaves_one_document_set() -> TestResult
+{
     let directory = TempDir::new()?;
     let index = LexicalSearchIndex::attached(
         WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
@@ -1128,7 +1493,7 @@ async fn test_lexical_search_index_apply_of_one_change_twice_leaves_one_unit_set
     // identity.
     let change = LexicalChange::new(
         vec![ProjectPath::new("docs/added.md")?],
-        vec![text_unit("docs/added.md", "alphaone content")?],
+        vec![text_document("docs/added.md", "alphaone content")?],
     );
     index.apply(&change, "revision-two").await?;
     index.apply(&change, "revision-two").await?;
@@ -1138,7 +1503,7 @@ async fn test_lexical_search_index_apply_of_one_change_twice_leaves_one_unit_set
             .await?
             .len(),
         1,
-        "the repeated commit leaves one unit, not two rows under one identity"
+        "the repeated commit leaves one document, not two rows under one identity"
     );
     Ok(())
 }

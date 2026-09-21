@@ -127,6 +127,16 @@ impl ParsedQuery {
         })
     }
 
+    /// The caller's own text, unchanged.
+    ///
+    /// The vector ranking embeds this rather than the rendered members: an
+    /// embedding reads the question as written, and the members are what
+    /// full-text matching needs.
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
     /// The members this query kept, in source order.
     #[must_use]
     pub fn members(&self) -> &[QueryMember] {

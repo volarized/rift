@@ -1,0 +1,105 @@
+# The retrieval gate's query set.
+#
+# Each case names the class it covers, the query as a caller would type it, and
+# the declarations or files that must come back. `expect` lists the answers in
+# the order the gate requires; `contains` lists answers whose order is free.
+# An empty `expect` and `contains` means the query must answer nothing.
+#
+# A target is `<path>` for a file answer and `<path>#<qualified name>` for a
+# declaration.
+
+[[case]]
+name = "exact declaration name"
+class = "name_exact"
+query = "SearchHit"
+expect = ["src/lib.rs#SearchHit"]
+
+[[case]]
+name = "exact qualified name"
+class = "qualified_exact"
+query = "HTTPServer::listen"
+contains = ["src/http.rs#HTTPServer::listen"]
+
+[[case]]
+name = "an identifier embedded in prose"
+class = "identifier_in_prose"
+query = "where does impact_radius get its depth"
+contains = ["src/http.rs#impact_radius"]
+
+[[case]]
+name = "an inner camel case term"
+class = "inner_camel_case"
+query = "request"
+contains = ["src/http.rs#REQUEST_TIMEOUT_MS", "web/client.js#sendSearchRequest"]
+
+[[case]]
+name = "an acronym run inside a name"
+class = "inner_acronym"
+query = "json"
+contains = ["src/http.rs#parseJSONValue", "config/catalog.json"]
+
+[[case]]
+name = "a snake case term"
+class = "inner_snake_case"
+query = "declared"
+contains = ["src/lib.rs#split_declared_name"]
+
+[[case]]
+name = "a prefix of a declaration name"
+class = "name_prefix"
+query = "dedup"
+contains = ["web/client.js#dedupeHits"]
+
+[[case]]
+name = "a file name and nothing else"
+class = "file_name_only"
+query = "panel.tsx"
+contains = ["web/panel.tsx"]
+
+[[case]]
+name = "a term only a signature carries"
+class = "signature_only"
+query = "corpus_revision"
+contains = ["service/pipeline.py#DocumentPipeline.__init__"]
+
+[[case]]
+name = "a term only attached documentation carries"
+class = "documentation_only"
+query = "truncated"
+contains = ["src/http.rs#parseJSONValue"]
+
+[[case]]
+name = "a term only declaration source carries"
+class = "declaration_source_only"
+query = "saturating_mul"
+contains = ["src/http.rs#impact_radius"]
+
+[[case]]
+name = "a term only file content carries"
+class = "file_content_only"
+query = "grep"
+contains = ["guide/vision.md"]
+
+[[case]]
+name = "a quoted phrase stays one phrase"
+class = "quoted_phrase"
+query = "\"impact radius\""
+contains = ["guide/vision.md", "src/http.rs#impact_radius"]
+
+[[case]]
+name = "the precise phase answers a multi-term question"
+class = "precise"
+query = "ranking weights"
+contains = ["web/session.ts#readRankingWeights", "config/settings.yaml"]
+
+[[case]]
+name = "the broad phase answers what the precise phase could not"
+class = "broad"
+query = "pipeline listener"
+contains = ["service/pipeline.py#DocumentPipeline", "src/http.rs#HTTPServer::listen"]
+
+[[case]]
+name = "a term the corpus does not carry"
+class = "no_hit"
+query = "quaternion"
+expect = []

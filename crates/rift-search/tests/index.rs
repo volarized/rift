@@ -8,12 +8,14 @@ use std::time::Duration;
 use candle_core::{DType, Device, Tensor};
 use rift_core::ProjectPath;
 use rift_index::{DatabasePool, WorkspaceDatabase};
-use rift_index::{
-    LexicalIndexLimits, LexicalSearchIndex, LexicalUnit, LexicalUnitKind, StoredVector, VectorStore,
+use rift_index::{LexicalIndexLimits, LexicalSearchIndex, StoredVector, VectorStore};
+use rift_ranking::{
+    DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, FieldSet, IndexDocument,
+    ParsedQuery, QueryPhase, RankingInput, RankingInputKind, SearchableField,
 };
 use rift_search::{
     AcquisitionLimits, Declaration, DescribedUnit, DocumentDigest, Embedding, ModelSource,
-    RankedUnit, RevisionScoped, SearchError, SearchIndex, SearchIndexLimits, SearchViolation,
+    RevisionScoped, SearchError, SearchIndex, SearchIndexLimits, SearchViolation, StoreRanking,
     VectorReadiness, document,
 };
 use tokenizers::models::wordpiece::WordPiece;
@@ -54,7 +56,6 @@ const EVERY: usize = usize::MAX;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 type Fallible<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
 /// Writes one loadable model into `directory`.
 fn write_model(directory: &Path) -> TestResult {
     std::fs::create_dir_all(directory)?;
@@ -210,7 +211,7 @@ fn workspace() -> Fallible<tempfile::TempDir> {
 }
 
 fn lexical_limits() -> LexicalIndexLimits {
-    LexicalIndexLimits::new(64, 1 << 20, 32, 64, 4, 1_000)
+    LexicalIndexLimits::new(64, 1 << 20, 32, 4, 1_000)
 }
 
 /// Bounds small enough that every pass and every batch is visible.
@@ -218,6 +219,14 @@ fn limits() -> SearchIndexLimits {
     SearchIndexLimits::builder(lexical_limits())
         .batch_declarations(2)
         .max_tokens(16)
+        .build()
+}
+
+/// The same bounds with the vector ranking turned off, for suites that ask
+/// only what the full-text input answered.
+fn lexical_only_limits() -> SearchIndexLimits {
+    SearchIndexLimits::builder(lexical_limits())
+        .disable_vector()
         .build()
 }
 
@@ -229,9 +238,11 @@ fn model_source(root: &Path, name: &str) -> Fallible<ModelSource> {
     Ok(ModelSource::directory(name, root)?)
 }
 
-/// The identity a directory model's vectors are addressed under.
+/// The identity a directory model's vectors are addressed under: the same
+/// value the index derives, asked of the crate rather than spelled twice.
 fn model_identity(root: &Path, name: &str) -> String {
-    root.join(name).display().to_string()
+    let source = ModelSource::Directory(root.join(name));
+    rift_search::local_embedding_space(&source, HIDDEN).identity()
 }
 
 /// An acquisition that spends no wall clock: a directory model reads no
@@ -258,14 +269,51 @@ async fn prepared(root: &Path, limits: SearchIndexLimits) -> Fallible<SearchInde
     Ok(index)
 }
 
-fn unit(identity: &str, path: &str, name: &str, content: &str) -> Fallible<LexicalUnit> {
-    Ok(LexicalUnit::new(
-        identity,
-        ProjectPath::new(path.to_owned())?,
-        LexicalUnitKind::Symbol,
-        Some(name.to_owned()),
-        content,
+/// Builds one project document from an explicit field set, so a suite can
+/// state which column carries the term it searches for.
+fn project_document(
+    identity: &str,
+    path: &str,
+    kind: DocumentKind,
+    fields: DocumentFields,
+) -> Fallible<IndexDocument> {
+    let digest = fields.digest();
+    Ok(IndexDocument::new(
+        DocumentIdentity::new(identity)?,
+        DocumentLocation::Project(ProjectPath::new(path)?),
+        kind,
+        digest,
+        fields,
     )?)
+}
+
+/// One symbol document carrying a declaration name and its own source.
+fn symbol(
+    identity: &str,
+    path: &str,
+    name: &str,
+    declaration_source: &str,
+) -> Fallible<IndexDocument> {
+    let fields = DocumentFields::empty()
+        .with(SearchableField::Name, name)
+        .with(SearchableField::DeclarationSource, declaration_source);
+    project_document(identity, path, DocumentKind::Symbol, fields)
+}
+
+/// One text-file document under an explicit identity: the final path segment
+/// with its extension in `name`, the text in `file_content`. A text file
+/// declares nothing, so every declaration field stays absent.
+fn text_chunk(identity: &str, path: &str, content: &str) -> Fallible<IndexDocument> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let fields = DocumentFields::empty()
+        .with(SearchableField::Name, name)
+        .with(SearchableField::FileContent, content);
+    project_document(identity, path, DocumentKind::TextFile, fields)
+}
+
+/// One whole text-file document; its identity is its own path, per convention.
+fn text_document(path: &str, content: &str) -> Fallible<IndexDocument> {
+    text_chunk(path, path, content)
 }
 
 /// The digest one declaration's document is addressed by.
@@ -319,55 +367,116 @@ async fn drop_stored_vectors(root: &Path, name: &str) -> TestResult {
     Ok(())
 }
 
-/// The order the lexical tier alone puts a query in.
+/// The order the full-text tier alone puts a query in, read through a second
+/// handle on the same database.
 async fn lexical_order(root: &Path, query: &str, limit: u32) -> Fallible<Vec<String>> {
     let index = LexicalSearchIndex::attached(
         WorkspaceDatabase::open(&database(root), database_pool()).await?,
         LexicalIndexLimits::default(),
     );
-    let RevisionScoped::Matched(ranking) = index.search(REVISION, query, limit).await? else {
+    let parsed = ParsedQuery::parse(query)?;
+    let RevisionScoped::Matched(ranking) = index
+        .search(REVISION, &parsed, QueryPhase::Precise, limit)
+        .await?
+    else {
         return Err("the lexical store must hold the fixture revision".into());
     };
     Ok(ranking
         .matches()
         .iter()
-        .map(|matched| matched.identity().to_owned())
+        .map(|matched| matched.identity().as_str().to_owned())
         .collect())
 }
 
-/// The units one search ranked, refusing an answer the store could not place under
-/// `REVISION`.
-async fn ranked_units(index: &SearchIndex, query: &str, limit: u32) -> Fallible<Vec<RankedUnit>> {
-    match index.search(REVISION, query, limit).await? {
-        RevisionScoped::Matched(ranked) => Ok(ranked.into_units()),
-        other => Err(format!("the store must hold {REVISION}: {other:?}").into()),
+/// The ranking one phase produced for `tree_revision`, refusing an answer the
+/// store could not place under it.
+async fn revision_ranking(
+    index: &SearchIndex,
+    tree_revision: &str,
+    query: &str,
+    phase: QueryPhase,
+    limit: u32,
+) -> Fallible<StoreRanking> {
+    let parsed = ParsedQuery::parse(query)?;
+    match index.rank(tree_revision, &parsed, phase, limit).await? {
+        RevisionScoped::Matched(ranking) => Ok(ranking),
+        other => Err(format!("the store must hold {tree_revision}: {other:?}").into()),
     }
 }
 
-fn identities(ranked: &[RankedUnit]) -> Vec<&str> {
-    ranked.iter().map(RankedUnit::identity).collect()
+/// The ranking one phase produced under the fixture revision.
+async fn phase_ranking(
+    index: &SearchIndex,
+    query: &str,
+    phase: QueryPhase,
+    limit: u32,
+) -> Fallible<StoreRanking> {
+    revision_ranking(index, REVISION, query, phase, limit).await
 }
 
-fn paths(ranked: &[RankedUnit]) -> Vec<&str> {
-    ranked.iter().map(|unit| unit.path().as_str()).collect()
+/// The precise-phase ranking, which is the phase every reader runs first.
+async fn ranked(index: &SearchIndex, query: &str, limit: u32) -> Fallible<StoreRanking> {
+    phase_ranking(index, query, QueryPhase::Precise, limit).await
 }
 
-/// Each ranked unit as the pair a vector had to land on, in identity order, so
-/// an assertion pins the pairing rather than the similarity order.
-fn placed(ranked: &[RankedUnit]) -> Vec<(&str, &str)> {
-    let mut placed: Vec<(&str, &str)> = ranked
+/// The input `kind` contributed, refusing a ranking that ran without it.
+fn input(ranking: &StoreRanking, kind: RankingInputKind) -> Fallible<&RankingInput> {
+    let found = ranking.inputs().iter().find(|input| input.kind() == kind);
+    Ok(found.ok_or_else(|| format!("the {} input must be present: {ranking:?}", kind.label()))?)
+}
+
+/// What produced each input, in the order the store ran them.
+fn kinds(ranking: &StoreRanking) -> Vec<RankingInputKind> {
+    ranking.inputs().iter().map(RankingInput::kind).collect()
+}
+
+/// The identities one input ranked, best first.
+fn identities(input: &RankingInput) -> Vec<&str> {
+    input
+        .order()
         .iter()
-        .map(|unit| (unit.identity(), unit.path().as_str()))
-        .collect();
-    placed.sort_unstable();
-    placed
+        .map(|ranked| ranked.identity().as_str())
+        .collect()
 }
 
-/// Two units in two files, one word apart.
-fn two_units() -> Fallible<Vec<LexicalUnit>> {
+/// The identities one input ranked, in identity order, so an assertion pins
+/// the set a tier reached rather than the order it reached them in.
+fn reached(input: &RankingInput) -> Vec<&str> {
+    let mut reached = identities(input);
+    reached.sort_unstable();
+    reached
+}
+
+/// The identities the full-text input ranked for `query`, best first.
+async fn lexical_identities(index: &SearchIndex, query: &str, limit: u32) -> Fallible<Vec<String>> {
+    let ranking = ranked(index, query, limit).await?;
+    let carried = input(&ranking, RankingInputKind::Lexical)?;
+    Ok(identities(carried).into_iter().map(str::to_owned).collect())
+}
+
+/// The identities the vector input ranked for `query`, in identity order.
+async fn vector_reached(index: &SearchIndex, query: &str, limit: u32) -> Fallible<Vec<String>> {
+    let ranking = ranked(index, query, limit).await?;
+    let carried = input(&ranking, RankingInputKind::Vector)?;
+    Ok(reached(carried).into_iter().map(str::to_owned).collect())
+}
+
+/// The columns that placed one identity in an input.
+fn fields_of(carried: &RankingInput, identity: &str) -> Fallible<FieldSet> {
+    let found = carried
+        .order()
+        .iter()
+        .find(|ranked| ranked.identity().as_str() == identity);
+    Ok(found
+        .ok_or_else(|| format!("{identity} must be ranked: {carried:?}"))?
+        .fields())
+}
+
+/// Two symbol documents in two files, one word apart.
+fn two_documents() -> Fallible<Vec<IndexDocument>> {
     Ok(vec![
-        unit("one", "src/one.rs", "load_config", "fn load config")?,
-        unit("two", "src/two.rs", "read_index", "fn read index")?,
+        symbol("one", "src/one.rs", "load_config", "fn load config")?,
+        symbol("two", "src/two.rs", "read_index", "fn read index")?,
     ])
 }
 
@@ -378,62 +487,51 @@ fn two_declarations() -> Vec<Declaration<'static>> {
     ]
 }
 
-/// Each unit paired with the declaration at the same position, for suites
-/// whose unit set is symbols alone.
+/// Each document paired with the declaration at the same position, for suites
+/// whose document set is symbols alone.
 fn described<'a>(
-    units: &'a [LexicalUnit],
+    documents: &'a [IndexDocument],
     declarations: &'a [Declaration<'a>],
 ) -> Vec<DescribedUnit<'a>> {
-    units
+    documents
         .iter()
         .zip(declarations)
-        .map(|(unit, declaration)| DescribedUnit::new(unit, *declaration))
+        .map(|(document, declaration)| DescribedUnit::new(document, *declaration))
         .collect()
 }
 
-/// The two-unit fixture, holding what a pass borrows from.
+/// The two-document fixture, holding what a pass borrows from.
 struct Fixture {
-    units: Vec<LexicalUnit>,
+    documents: Vec<IndexDocument>,
     declarations: Vec<Declaration<'static>>,
 }
 
 impl Fixture {
-    fn units(&self) -> &[LexicalUnit] {
-        &self.units
+    fn documents(&self) -> &[IndexDocument] {
+        &self.documents
     }
 
     fn described(&self) -> Vec<DescribedUnit<'_>> {
-        described(&self.units, &self.declarations)
+        described(&self.documents, &self.declarations)
     }
 }
 
 fn two() -> Fallible<Fixture> {
     Ok(Fixture {
-        units: two_units()?,
+        documents: two_documents()?,
         declarations: two_declarations(),
     })
-}
-
-/// One text file unit, which no declaration describes.
-fn text_unit(identity: &str, path: &str, name: &str, content: &str) -> Fallible<LexicalUnit> {
-    Ok(LexicalUnit::new(
-        identity,
-        ProjectPath::new(path.to_owned())?,
-        LexicalUnitKind::TextFile,
-        Some(name.to_owned()),
-        content,
-    )?)
 }
 
 /// Runs one whole build pass the way the server's population path does: the lexical set is
 /// replaced and stamped, then every described declaration is embedded.
 async fn whole_pass(
     index: &SearchIndex,
-    units: &[LexicalUnit],
+    documents: &[IndexDocument],
     described: &[DescribedUnit<'_>],
     tree_revision: &str,
 ) -> Result<(), SearchError> {
-    index.replace_lexical(units, tree_revision).await?;
+    index.replace_lexical(documents, tree_revision).await?;
     index
         .embed_described(described, Embedding::Every, tree_revision)
         .await
@@ -442,11 +540,11 @@ async fn whole_pass(
 /// The same pass incrementally: only declarations the store has no vector for are embedded.
 async fn incremental_pass(
     index: &SearchIndex,
-    units: &[LexicalUnit],
+    documents: &[IndexDocument],
     described: &[DescribedUnit<'_>],
     tree_revision: &str,
 ) -> Result<(), SearchError> {
-    index.replace_lexical(units, tree_revision).await?;
+    index.replace_lexical(documents, tree_revision).await?;
     index
         .embed_described(described, Embedding::Missing, tree_revision)
         .await
@@ -465,15 +563,15 @@ async fn a_fresh_path_starts_preparing_and_reopening_reads_what_was_left() -> Te
     );
     assert_eq!(index.tree_revision().await?, None, "nothing has been built");
     let fixture = two()?;
-    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
     drop(index);
 
     let reopened = opened(root.path(), limits()).await?;
     assert_eq!(reopened.tree_revision().await?, Some(REVISION.to_owned()));
     assert_eq!(
-        identities(&ranked_units(&reopened, "load config", 10).await?),
+        lexical_identities(&reopened, "load config", 10).await?,
         ["one"],
-        "the units the first index wrote are still there"
+        "the documents the first index wrote are still there"
     );
     Ok(())
 }
@@ -490,9 +588,14 @@ async fn a_build_with_no_declarations_leaves_the_vector_ranking_ready() -> TestR
     );
     assert_eq!(index.tree_revision().await?, Some(REVISION.to_owned()));
     assert!(stored(root.path(), "model").await?.is_empty());
+    let ranking = ranked(&index, "load config", 10).await?;
     assert!(
-        ranked_units(&index, "load config", 10).await?.is_empty(),
-        "a tier holding no vector ranks nothing, and neither tier refuses"
+        identities(input(&ranking, RankingInputKind::Lexical)?).is_empty(),
+        "a tier holding no document ranks nothing, and neither tier refuses"
+    );
+    assert!(
+        identities(input(&ranking, RankingInputKind::Vector)?).is_empty(),
+        "a tier holding no vector ranks nothing either"
     );
     Ok(())
 }
@@ -501,9 +604,15 @@ async fn a_build_with_no_declarations_leaves_the_vector_ranking_ready() -> TestR
 async fn a_build_gives_every_declaration_a_vector_and_stamps_the_tree_revision() -> TestResult {
     let root = workspace()?;
     let index = prepared(root.path(), limits()).await?;
-    let units = two_units()?;
+    let documents = two_documents()?;
     let declarations = two_declarations();
-    whole_pass(&index, &units, &described(&units, &declarations), REVISION).await?;
+    whole_pass(
+        &index,
+        &documents,
+        &described(&documents, &declarations),
+        REVISION,
+    )
+    .await?;
 
     assert_eq!(index.readiness(), VectorReadiness::Ready);
     assert_eq!(index.tree_revision().await?, Some(REVISION.to_owned()));
@@ -524,15 +633,21 @@ async fn a_build_gives_every_declaration_a_vector_and_stamps_the_tree_revision()
 async fn a_refresh_leaves_a_moved_declaration_the_vector_it_already_had() -> TestResult {
     let root = workspace()?;
     let index = prepared(root.path(), limits()).await?;
-    let units = two_units()?;
+    let documents = two_documents()?;
     let declarations = two_declarations();
-    whole_pass(&index, &units, &described(&units, &declarations), REVISION).await?;
+    whole_pass(
+        &index,
+        &documents,
+        &described(&documents, &declarations),
+        REVISION,
+    )
+    .await?;
     let carried = digest_of(&declarations[0]);
     mark(root.path(), &carried).await?;
 
     let moved = vec![
-        unit("moved", "src/moved.rs", "load_config", "fn load config")?,
-        unit("two", "src/two.rs", "read_index", "fn read index")?,
+        symbol("moved", "src/moved.rs", "load_config", "fn load config")?,
+        symbol("two", "src/two.rs", "read_index", "fn read index")?,
     ];
     incremental_pass(&index, &moved, &described(&moved, &declarations), "rev-two").await?;
 
@@ -551,20 +666,26 @@ async fn a_refresh_leaves_a_moved_declaration_the_vector_it_already_had() -> Tes
 async fn a_refresh_prunes_what_left_and_embeds_what_arrived() -> TestResult {
     let root = workspace()?;
     let index = prepared(root.path(), limits()).await?;
-    let built = two_units()?;
+    let built = two_documents()?;
     let declarations = two_declarations();
     whole_pass(&index, &built, &described(&built, &declarations), REVISION).await?;
     let kept = digest_of(&declarations[0]);
     let removed = digest_of(&declarations[1]);
     mark(root.path(), &kept).await?;
 
-    let units = vec![
-        unit("one", "src/one.rs", "load_config", "fn load config")?,
-        unit("three", "src/three.rs", "search_index", "fn search index")?,
+    let documents = vec![
+        symbol("one", "src/one.rs", "load_config", "fn load config")?,
+        symbol("three", "src/three.rs", "search_index", "fn search index")?,
     ];
     let arrived = Declaration::new("fn", "search_index").source("fn search index");
     let declarations = vec![declarations[0], arrived];
-    incremental_pass(&index, &units, &described(&units, &declarations), REVISION).await?;
+    incremental_pass(
+        &index,
+        &documents,
+        &described(&documents, &declarations),
+        REVISION,
+    )
+    .await?;
 
     let vectors = stored(root.path(), "model").await?;
     let held: Vec<&str> = vectors.iter().map(StoredVector::digest).collect();
@@ -587,14 +708,14 @@ async fn a_refresh_prunes_what_left_and_embeds_what_arrived() -> TestResult {
 async fn a_full_pass_embeds_a_declaration_the_store_already_holds() -> TestResult {
     let root = workspace()?;
     let index = prepared(root.path(), limits()).await?;
-    let units = two_units()?;
+    let documents = two_documents()?;
     let declarations = two_declarations();
-    let described = described(&units, &declarations);
-    whole_pass(&index, &units, &described, REVISION).await?;
+    let described = described(&documents, &declarations);
+    whole_pass(&index, &documents, &described, REVISION).await?;
     let carried = digest_of(&declarations[0]);
     mark(root.path(), &carried).await?;
 
-    whole_pass(&index, &units, &described, REVISION).await?;
+    whole_pass(&index, &documents, &described, REVISION).await?;
     assert!(
         !is_marked(&stored(root.path(), "model").await?, &carried),
         "a build does not trust what is stored, so the mark is overwritten"
@@ -612,7 +733,7 @@ async fn a_build_stopping_at_the_vector_bound_reports_preparing() -> TestResult 
         .build();
     let index = prepared(root.path(), bounded).await?;
     let fixture = two()?;
-    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
     assert_eq!(
         index.readiness(),
         VectorReadiness::Preparing {
@@ -626,12 +747,9 @@ async fn a_build_stopping_at_the_vector_bound_reports_preparing() -> TestResult 
 }
 
 #[tokio::test]
-async fn a_disabled_tier_answers_in_the_lexical_order_alone() -> TestResult {
+async fn a_disabled_tier_answers_in_the_full_text_order_alone() -> TestResult {
     let root = workspace()?;
-    let disabled = SearchIndexLimits::builder(lexical_limits())
-        .disable_vector()
-        .build();
-    let index = opened(root.path(), disabled).await?;
+    let index = opened(root.path(), lexical_only_limits()).await?;
     assert_eq!(index.readiness(), VectorReadiness::Disabled);
     index
         .prepare(&model_source(root.path(), "model")?, acquisition_limits())
@@ -642,118 +760,125 @@ async fn a_disabled_tier_answers_in_the_lexical_order_alone() -> TestResult {
         "a disabled tier acquires nothing"
     );
     let fixture = two()?;
-    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
     assert_eq!(index.readiness(), VectorReadiness::Disabled);
     assert!(
         stored(root.path(), "model").await?.is_empty(),
         "a disabled tier embeds nothing"
     );
 
-    let ranked = ranked_units(&index, "load config read index", 10).await?;
+    let ranking = ranked(&index, "fn", 10).await?;
+    let carried = input(&ranking, RankingInputKind::Lexical)?;
     assert_eq!(
-        identities(&ranked),
-        lexical_order(root.path(), "load config read index", 10).await?,
-        "with one ranking the fused order is the lexical order"
+        identities(carried),
+        lexical_order(root.path(), "fn", 10).await?,
+        "the full-text input is what the store alone ranked"
     );
-    assert_eq!(ranked[0].kind(), LexicalUnitKind::Symbol);
-    assert!(ranked[0].score() > 0.0);
+    assert_eq!(
+        fields_of(carried, "one")?,
+        FieldSet::of(SearchableField::DeclarationSource)
+    );
+    assert!(
+        !input(&ranking, RankingInputKind::Vector)?.answered(),
+        "a disabled tier contributes an input that answered nothing"
+    );
     Ok(())
 }
 
 /// The fixture model's vectors carry no trained meaning: its two layers hold
 /// values this suite wrote, so nothing here measures relevance. What it proves
-/// is that the vector ranking reaches the fused result at all, for a query
-/// the lexical tier cannot answer.
+/// is that the vector ranking reaches the store's answer at all, for a query
+/// the full-text tier cannot answer.
 #[tokio::test]
-async fn a_query_the_lexical_tier_cannot_answer_is_still_ranked_through_the_vector_ranking()
+async fn a_query_the_full_text_tier_cannot_answer_is_still_ranked_through_the_vector_ranking()
 -> TestResult {
     let root = workspace()?;
     let index = prepared(root.path(), limits()).await?;
     let fixture = two()?;
-    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
 
     assert!(
         lexical_order(root.path(), "search", 10).await?.is_empty(),
-        "the query shares no token with either unit"
+        "the query shares no token with either document"
     );
-    let ranked = ranked_units(&index, "search", 10).await?;
-    let reached = identities(&ranked);
-    assert!(
-        reached.contains(&"one") && reached.contains(&"two"),
-        "the vector ranking reaches units the lexical tier cannot: {reached:?}"
+    assert_eq!(
+        vector_reached(&index, "search", 10).await?,
+        ["one", "two"],
+        "the vector ranking reaches documents the full-text tier cannot"
     );
-    assert_eq!(paths(&ranked).len(), 2);
     Ok(())
 }
 
 #[tokio::test]
-async fn a_vector_lands_on_the_unit_whose_declaration_produced_it() -> TestResult {
+async fn a_vector_lands_on_the_document_whose_declaration_produced_it() -> TestResult {
     let root = workspace()?;
     let index = prepared(root.path(), limits()).await?;
-    let units = vec![
-        text_unit("doc-one", "docs/one.md", "one", "notes about loading")?,
-        unit("sym-one", "src/one.rs", "load_config", "fn load config")?,
-        text_unit("doc-two", "docs/two.md", "two", "notes about reading")?,
-        unit("sym-two", "src/two.rs", "read_index", "fn read index")?,
+    let documents = vec![
+        text_chunk("doc-one", "docs/one.md", "notes about loading")?,
+        symbol("sym-one", "src/one.rs", "load_config", "fn load config")?,
+        text_chunk("doc-two", "docs/two.md", "notes about reading")?,
+        symbol("sym-two", "src/two.rs", "read_index", "fn read index")?,
     ];
     let declarations = two_declarations();
     let described = vec![
-        DescribedUnit::new(&units[1], declarations[0]),
-        DescribedUnit::new(&units[3], declarations[1]),
+        DescribedUnit::new(&documents[1], declarations[0]),
+        DescribedUnit::new(&documents[3], declarations[1]),
     ];
-    whole_pass(&index, &units, &described, REVISION).await?;
+    whole_pass(&index, &documents, &described, REVISION).await?;
 
     assert_eq!(stored(root.path(), "model").await?.len(), 2);
     assert!(lexical_order(root.path(), "search", 10).await?.is_empty());
-    let ranked = ranked_units(&index, "search", 10).await?;
-    let reached = placed(&ranked);
+    let reached = vector_reached(&index, "search", 10).await?;
     assert_eq!(
         reached,
-        [("sym-one", "src/one.rs"), ("sym-two", "src/two.rs")],
+        ["sym-one", "sym-two"],
         "pairing by position would have put these vectors on doc-one and sym-one: {reached:?}"
     );
-    for one in &ranked {
-        assert_eq!(one.kind(), LexicalUnitKind::Symbol);
-    }
     Ok(())
 }
 
 #[tokio::test]
-async fn more_units_than_described_entries_leave_the_undescribed_ones_without_a_vector()
+async fn more_documents_than_described_entries_leave_the_undescribed_ones_without_a_vector()
 -> TestResult {
     let root = workspace()?;
     let index = prepared(root.path(), limits()).await?;
-    let units = vec![
-        unit("sym-one", "src/one.rs", "load_config", "fn load config")?,
-        text_unit("doc-one", "docs/one.md", "one", "notes about loading")?,
-        text_unit("doc-two", "docs/two.md", "two", "notes about reading")?,
+    let documents = vec![
+        symbol("sym-one", "src/one.rs", "load_config", "fn load config")?,
+        text_chunk("doc-one", "docs/one.md", "notes about loading")?,
+        text_chunk("doc-two", "docs/two.md", "notes about reading")?,
     ];
     let declarations = two_declarations();
-    let described = vec![DescribedUnit::new(&units[0], declarations[0])];
-    whole_pass(&index, &units, &described, REVISION).await?;
+    let described = vec![DescribedUnit::new(&documents[0], declarations[0])];
+    whole_pass(&index, &documents, &described, REVISION).await?;
 
     let vectors = stored(root.path(), "model").await?;
     assert_eq!(
         vectors.len(),
         1,
-        "a unit no declaration describes is not embedded"
+        "a document no declaration describes is not embedded"
     );
     assert_eq!(vectors[0].digest(), digest_of(&declarations[0]));
     assert_eq!(
-        identities(&ranked_units(&index, "search", 10).await?),
+        vector_reached(&index, "search", 10).await?,
         ["sym-one"],
-        "the only vector resolves to the only described unit"
+        "the only vector resolves to the only described document"
     );
     assert_eq!(index.readiness(), VectorReadiness::Ready);
     Ok(())
 }
 
 #[tokio::test]
-async fn more_described_entries_than_units_still_land_each_vector_on_its_own_unit() -> TestResult {
+async fn more_described_entries_than_documents_still_land_each_vector_on_its_own_document()
+-> TestResult {
     let root = workspace()?;
     let index = prepared(root.path(), limits()).await?;
-    let indexed = vec![unit("one", "src/one.rs", "load_config", "fn load config")?];
-    let apart = unit("two", "src/two.rs", "read_index", "fn read index")?;
+    let indexed = vec![symbol(
+        "one",
+        "src/one.rs",
+        "load_config",
+        "fn load config",
+    )?];
+    let apart = symbol("two", "src/two.rs", "read_index", "fn read index")?;
     let declarations = two_declarations();
     let described = vec![
         DescribedUnit::new(&indexed[0], declarations[0]),
@@ -763,22 +888,25 @@ async fn more_described_entries_than_units_still_land_each_vector_on_its_own_uni
 
     let vectors = stored(root.path(), "model").await?;
     let held: Vec<&str> = vectors.iter().map(StoredVector::digest).collect();
-    assert_eq!(held.len(), 2, "every described unit is embedded: {held:?}");
-    let ranked = ranked_units(&index, "search", 10).await?;
     assert_eq!(
-        placed(&ranked),
-        [("one", "src/one.rs"), ("two", "src/two.rs")],
-        "a described unit the lexical set never held still ranks under its own address"
+        held.len(),
+        2,
+        "every described document is embedded: {held:?}"
+    );
+    assert_eq!(
+        vector_reached(&index, "search", 10).await?,
+        ["one", "two"],
+        "a described document the lexical set never held still ranks under its own address"
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn a_tier_that_will_not_load_leaves_the_lexical_ranking_serving() -> TestResult {
+async fn a_tier_that_will_not_load_leaves_the_full_text_ranking_serving() -> TestResult {
     let root = workspace()?;
     let index = opened(root.path(), limits()).await?;
     let fixture = two()?;
-    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
     assert_eq!(
         index.readiness(),
         VectorReadiness::Preparing {
@@ -796,15 +924,15 @@ async fn a_tier_that_will_not_load_leaves_the_lexical_ranking_serving() -> TestR
     assert_eq!(index.readiness(), VectorReadiness::Unavailable);
 
     assert_eq!(
-        identities(&ranked_units(&index, "load config", 10).await?),
+        lexical_identities(&index, "load config", 10).await?,
         ["one"],
-        "the lexical tier keeps answering"
+        "the full-text tier keeps answering"
     );
     assert!(
         stored(root.path(), "model").await?.is_empty(),
         "an unavailable tier embeds nothing"
     );
-    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
     assert_eq!(
         index.readiness(),
         VectorReadiness::Unavailable,
@@ -814,18 +942,23 @@ async fn a_tier_that_will_not_load_leaves_the_lexical_ranking_serving() -> TestR
 }
 
 #[tokio::test]
-async fn an_empty_query_answers_nothing_and_a_limit_of_one_answers_once() -> TestResult {
+async fn a_query_carrying_no_member_answers_nothing_and_a_limit_of_one_answers_once() -> TestResult
+{
     let root = workspace()?;
     let index = prepared(root.path(), limits()).await?;
     let fixture = two()?;
-    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
 
-    assert!(ranked_units(&index, "", 10).await?.is_empty());
+    let blank = ranked(&index, "   ", 10).await?;
     assert!(
-        ranked_units(&index, "   ", 10).await?.is_empty(),
-        "a query of blanks has no term either"
+        blank.inputs().is_empty(),
+        "a query of blanks carries no member, so no input ran: {blank:?}"
     );
-    assert_eq!(ranked_units(&index, "load config", 1).await?.len(), 1);
+    assert_eq!(blank.lexical_truncated_at(), None);
+    let punctuation = ranked(&index, "-- ...", 10).await?;
+    assert!(punctuation.inputs().is_empty(), "{punctuation:?}");
+
+    assert_eq!(lexical_identities(&index, "load config", 1).await?.len(), 1);
     Ok(())
 }
 
@@ -839,11 +972,11 @@ async fn one_files_declarations_cannot_fill_the_candidate_list() -> TestResult {
         .per_file_max(1)
         .build();
     let index = prepared(root.path(), spread).await?;
-    let units = vec![
-        unit("crowd-one", "src/crowd.rs", "load", "fn load")?,
-        unit("crowd-two", "src/crowd.rs", "config", "fn config")?,
-        unit("crowd-three", "src/crowd.rs", "read", "fn read")?,
-        unit("lone", "src/lone.rs", "index", "fn index")?,
+    let documents = vec![
+        symbol("crowd-one", "src/crowd.rs", "load", "fn load")?,
+        symbol("crowd-two", "src/crowd.rs", "config", "fn config")?,
+        symbol("crowd-three", "src/crowd.rs", "read", "fn read")?,
+        symbol("lone", "src/lone.rs", "index", "fn index")?,
     ];
     let declarations = vec![
         Declaration::new("fn", "load").source("fn load"),
@@ -851,18 +984,23 @@ async fn one_files_declarations_cannot_fill_the_candidate_list() -> TestResult {
         Declaration::new("fn", "read").source("fn read"),
         Declaration::new("fn", "index").source("fn index"),
     ];
-    whole_pass(&index, &units, &described(&units, &declarations), REVISION).await?;
+    whole_pass(
+        &index,
+        &documents,
+        &described(&documents, &declarations),
+        REVISION,
+    )
+    .await?;
 
     assert!(lexical_order(root.path(), "search", 10).await?.is_empty());
-    let ranked = ranked_units(&index, "search", 10).await?;
-    let reached = paths(&ranked);
+    let reached = vector_reached(&index, "search", 10).await?;
     assert_eq!(
         reached.len(),
         2,
         "one file contributes one candidate: {reached:?}"
     );
     assert!(
-        reached.contains(&"src/lone.rs"),
+        reached.contains(&"lone".to_owned()),
         "the crowded file cannot push the other one out: {reached:?}"
     );
     Ok(())
@@ -880,7 +1018,7 @@ async fn readiness_walks_from_preparing_to_ready() -> TestResult {
         }
     );
     let fixture = two()?;
-    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
     assert_eq!(
         index.readiness(),
         VectorReadiness::Preparing {
@@ -891,17 +1029,18 @@ async fn readiness_walks_from_preparing_to_ready() -> TestResult {
     index
         .prepare(&model_source(root.path(), "model")?, acquisition_limits())
         .await?;
-    incremental_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
+    incremental_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
     assert_eq!(index.readiness(), VectorReadiness::Ready);
     Ok(())
 }
 
 #[tokio::test]
-async fn vectors_with_no_unit_to_rank_them_as_leave_the_lexical_ranking_alone() -> TestResult {
+async fn vectors_with_no_document_to_rank_them_as_leave_the_full_text_ranking_alone() -> TestResult
+{
     let root = workspace()?;
     let index = prepared(root.path(), limits()).await?;
     let fixture = two()?;
-    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
     drop(index);
 
     let reopened = prepared(root.path(), limits()).await?;
@@ -911,13 +1050,13 @@ async fn vectors_with_no_unit_to_rank_them_as_leave_the_lexical_ranking_alone() 
         "the vectors the first index wrote are still stored"
     );
     assert!(
-        ranked_units(&reopened, "search", 10).await?.is_empty(),
-        "no pass has said which unit each digest belongs to"
+        vector_reached(&reopened, "search", 10).await?.is_empty(),
+        "no pass has said which document each digest belongs to"
     );
     assert_eq!(
-        identities(&ranked_units(&reopened, "load config", 10).await?),
+        lexical_identities(&reopened, "load config", 10).await?,
         ["one"],
-        "the lexical tier answers on its own"
+        "the full-text tier answers on its own"
     );
     Ok(())
 }
@@ -928,7 +1067,7 @@ async fn a_model_change_drops_the_vectors_the_previous_model_wrote() -> TestResu
     write_model(&root.path().join("other"))?;
     let index = prepared(root.path(), limits()).await?;
     let fixture = two()?;
-    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
     assert_eq!(stored(root.path(), "model").await?.len(), 2);
     drop(index);
 
@@ -940,27 +1079,33 @@ async fn a_model_change_drops_the_vectors_the_previous_model_wrote() -> TestResu
         stored(root.path(), "model").await?.is_empty(),
         "two models address different spaces, so the previous rows can never be read"
     );
-    whole_pass(&changed, fixture.units(), &fixture.described(), REVISION).await?;
+    whole_pass(
+        &changed,
+        fixture.documents(),
+        &fixture.described(),
+        REVISION,
+    )
+    .await?;
     assert_eq!(stored(root.path(), "other").await?.len(), 2);
     Ok(())
 }
 
 /// A query reads no vector row. What proves it is the store: the rows one pass
 /// wrote are deleted underneath the index, and the same query answers with the
-/// same units afterwards, so what it ranked was the corpus that pass published.
+/// same documents afterwards, so what it ranked was the corpus that pass
+/// published.
 #[tokio::test]
 async fn a_query_ranks_from_the_held_corpus_after_the_stored_rows_are_gone() -> TestResult {
     let root = workspace()?;
     let index = prepared(root.path(), limits()).await?;
     let fixture = two()?;
-    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
     assert!(
         lexical_order(root.path(), "search", 10).await?.is_empty(),
-        "the query shares no token with either unit, so only the vector ranking can answer it"
+        "the query shares no token with either document, so only the vector ranking can answer it"
     );
-    let answered = ranked_units(&index, "search", 10).await?;
-    let ranked = placed(&answered);
-    assert_eq!(ranked, [("one", "src/one.rs"), ("two", "src/two.rs")]);
+    let answered = vector_reached(&index, "search", 10).await?;
+    assert_eq!(answered, ["one", "two"]);
 
     drop_stored_vectors(root.path(), "model").await?;
     assert!(
@@ -968,8 +1113,8 @@ async fn a_query_ranks_from_the_held_corpus_after_the_stored_rows_are_gone() -> 
         "no vector row is left for a query to read"
     );
     assert_eq!(
-        placed(&ranked_units(&index, "search", 10).await?),
-        ranked,
+        vector_reached(&index, "search", 10).await?,
+        answered,
         "the ranking still answers, so the query path never read the vector table"
     );
     Ok(())
@@ -981,19 +1126,24 @@ async fn a_query_ranks_from_the_held_corpus_after_the_stored_rows_are_gone() -> 
 async fn a_refresh_publishes_what_it_embedded_beside_what_the_build_left() -> TestResult {
     let root = workspace()?;
     let index = prepared(root.path(), limits()).await?;
-    let built = vec![unit("one", "src/one.rs", "load_config", "fn load config")?];
+    let built = vec![symbol(
+        "one",
+        "src/one.rs",
+        "load_config",
+        "fn load config",
+    )?];
     let carried = Declaration::new("fn", "load_config").source("fn load config");
     whole_pass(&index, &built, &described(&built, &[carried]), REVISION).await?;
 
-    let units = vec![
-        unit("one", "src/one.rs", "load_config", "fn load config")?,
-        unit("three", "src/three.rs", "read_index", "fn read index")?,
+    let documents = vec![
+        symbol("one", "src/one.rs", "load_config", "fn load config")?,
+        symbol("three", "src/three.rs", "read_index", "fn read index")?,
     ];
     let arrived = Declaration::new("fn", "read_index").source("fn read index");
     incremental_pass(
         &index,
-        &units,
-        &described(&units, &[carried, arrived]),
+        &documents,
+        &described(&documents, &[carried, arrived]),
         REVISION,
     )
     .await?;
@@ -1006,8 +1156,8 @@ async fn a_refresh_publishes_what_it_embedded_beside_what_the_build_left() -> Te
     drop_stored_vectors(root.path(), "model").await?;
     assert!(lexical_order(root.path(), "search", 10).await?.is_empty());
     assert_eq!(
-        placed(&ranked_units(&index, "search", 10).await?),
-        [("one", "src/one.rs"), ("three", "src/three.rs")],
+        vector_reached(&index, "search", 10).await?,
+        ["one", "three"],
         "the corpus the refresh published holds the vector it never embedded itself"
     );
     Ok(())
@@ -1021,29 +1171,26 @@ async fn a_model_change_leaves_none_of_the_previous_models_vectors_held() -> Tes
     write_model(&root.path().join("other"))?;
     let index = prepared(root.path(), limits()).await?;
     let fixture = two()?;
-    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
-    assert_eq!(
-        placed(&ranked_units(&index, "search", 10).await?),
-        [("one", "src/one.rs"), ("two", "src/two.rs")]
-    );
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
+    assert_eq!(vector_reached(&index, "search", 10).await?, ["one", "two"]);
 
     index
         .prepare(&model_source(root.path(), "other")?, acquisition_limits())
         .await?;
     assert!(
-        ranked_units(&index, "search", 10).await?.is_empty(),
-        "the corpus the previous model filled is held nowhere, and the lexical tier cannot answer this query"
+        vector_reached(&index, "search", 10).await?.is_empty(),
+        "the corpus the previous model filled is held nowhere"
     );
     assert_eq!(
-        identities(&ranked_units(&index, "load config", 10).await?),
+        lexical_identities(&index, "load config", 10).await?,
         ["one"],
-        "the lexical tier keeps answering"
+        "the full-text tier keeps answering"
     );
 
-    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
     assert_eq!(
-        placed(&ranked_units(&index, "search", 10).await?),
-        [("one", "src/one.rs"), ("two", "src/two.rs")],
+        vector_reached(&index, "search", 10).await?,
+        ["one", "two"],
         "a pass under the model now held publishes a corpus of its own"
     );
     Ok(())
@@ -1062,13 +1209,13 @@ async fn the_held_corpus_stops_at_the_vector_bound() -> TestResult {
         .build();
     let index = prepared(root.path(), bounded).await?;
     let fixture = two()?;
-    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
     assert_eq!(stored(root.path(), "model").await?.len(), 1);
 
     drop_stored_vectors(root.path(), "model").await?;
     assert!(lexical_order(root.path(), "search", 10).await?.is_empty());
     assert_eq!(
-        identities(&ranked_units(&index, "search", 10).await?),
+        vector_reached(&index, "search", 10).await?,
         ["one"],
         "the corpus carries the one vector the bound left room for, and no more"
     );
@@ -1078,14 +1225,14 @@ async fn the_held_corpus_stops_at_the_vector_bound() -> TestResult {
 #[tokio::test]
 async fn a_store_refusal_carries_the_stores_own_violation() -> TestResult {
     let root = workspace()?;
-    let narrow = SearchIndexLimits::builder(LexicalIndexLimits::new(1, 1 << 20, 32, 64, 4, 1_000))
+    let narrow = SearchIndexLimits::builder(LexicalIndexLimits::new(1, 1 << 20, 32, 4, 1_000))
         .disable_vector()
         .build();
     let index = opened(root.path(), narrow).await?;
     let fixture = two()?;
-    let error = whole_pass(&index, fixture.units(), &fixture.described(), REVISION)
+    let error = whole_pass(&index, fixture.documents(), &fixture.described(), REVISION)
         .await
-        .expect_err("two units pass the one-unit bound");
+        .expect_err("two documents pass the one-document bound");
     assert_eq!(error.fault().violation(), SearchViolation::StoreFailed);
     let rendered = error.to_string();
     assert!(rendered.contains("store_failed"), "{rendered}");
@@ -1100,20 +1247,20 @@ async fn a_store_refusal_carries_the_stores_own_violation() -> TestResult {
 /// A bound the store enforced reaches the caller as that bound.
 ///
 /// Flattening every store refusal into this tier's own violation told a caller
-/// sending too many query terms that the server had failed, when the caller
-/// could have shortened the query. The registry identity and the limit
-/// evidence travel with the failure so the answer stays actionable.
+/// publishing too many documents that the server had failed, when the caller
+/// could have published fewer. The registry identity and the limit evidence
+/// travel with the failure so the answer stays actionable.
 #[tokio::test]
 async fn a_store_bound_keeps_its_registry_identity_and_its_limit_evidence() -> TestResult {
     let root = workspace()?;
-    let narrow = SearchIndexLimits::builder(LexicalIndexLimits::new(1, 1 << 20, 32, 64, 4, 1_000))
+    let narrow = SearchIndexLimits::builder(LexicalIndexLimits::new(1, 1 << 20, 32, 4, 1_000))
         .disable_vector()
         .build();
     let index = opened(root.path(), narrow).await?;
     let fixture = two()?;
-    let error = whole_pass(&index, fixture.units(), &fixture.described(), REVISION)
+    let error = whole_pass(&index, fixture.documents(), &fixture.described(), REVISION)
         .await
-        .expect_err("two units pass the one-unit bound");
+        .expect_err("two documents pass the one-document bound");
 
     let descriptor = error.descriptor();
     assert_eq!(
@@ -1142,68 +1289,234 @@ async fn opening_a_store_that_cannot_be_created_is_refused() -> TestResult {
 /// A query for a tree the store has moved past reads no row: the caller's publication was
 /// superseded, and the answer it asked for is under a publication it has yet to capture.
 #[tokio::test]
-async fn a_search_for_a_tree_the_store_moved_past_names_the_stored_revision() -> TestResult {
+async fn a_rank_for_a_tree_the_store_moved_past_names_the_stored_revision() -> TestResult {
     let root = workspace()?;
     let index = prepared(root.path(), limits()).await?;
     let fixture = two()?;
-    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
 
-    assert_eq!(
-        index.search("another-revision", "load config", 10).await?,
-        RevisionScoped::OtherRevision(REVISION.to_owned())
-    );
+    let parsed = ParsedQuery::parse("load config")?;
+    let answered = index
+        .rank("another-revision", &parsed, QueryPhase::Precise, 10)
+        .await?;
+    assert_eq!(answered, RevisionScoped::OtherRevision(REVISION.to_owned()));
     Ok(())
 }
 
 /// A store no pass has ever stamped answers for no tree at all, which is not the same as a
 /// store holding another one: nothing has landed in it yet.
 #[tokio::test]
-async fn a_search_before_any_population_reports_no_revision() -> TestResult {
+async fn a_rank_before_any_population_reports_no_revision() -> TestResult {
     let root = workspace()?;
     let index = prepared(root.path(), limits()).await?;
 
-    assert_eq!(
-        index.search(REVISION, "load config", 10).await?,
-        RevisionScoped::NoRevision
-    );
+    let parsed = ParsedQuery::parse("load config")?;
+    let answered = index
+        .rank(REVISION, &parsed, QueryPhase::Precise, 10)
+        .await?;
+    assert_eq!(answered, RevisionScoped::NoRevision);
     Ok(())
 }
 
 /// Embedding runs after publication, so a newly published tree meets a corpus described
-/// for the previous one. That corpus ranks nothing: the lexical tier answers alone until
+/// for the previous one. That corpus ranks nothing: the full-text tier answers alone until
 /// the pass for this tree lands.
 #[tokio::test]
 async fn a_corpus_described_for_the_previous_tree_ranks_nothing() -> TestResult {
     let root = workspace()?;
     let index = prepared(root.path(), limits()).await?;
     let fixture = two()?;
-    whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
     assert!(
         lexical_order(root.path(), "search", 10).await?.is_empty(),
-        "the query shares no token with either unit, so only the vector ranking can answer it"
+        "the query shares no token with either document, so only the vector ranking can answer it"
     );
-    assert_eq!(ranked_units(&index, "search", 10).await?.len(), 2);
+    assert_eq!(vector_reached(&index, "search", 10).await?.len(), 2);
 
     // The lexical half of the next publication lands first, as the publication path runs it.
-    index.replace_lexical(fixture.units(), "rev-two").await?;
-    let RevisionScoped::Matched(ranked) = index.search("rev-two", "search", 10).await? else {
-        return Err("the store holds the tree that was just stamped".into());
-    };
+    index
+        .replace_lexical(fixture.documents(), "rev-two")
+        .await?;
+    let ranking = revision_ranking(&index, "rev-two", "search", QueryPhase::Precise, 10).await?;
     assert!(
-        ranked.units().is_empty(),
+        identities(input(&ranking, RankingInputKind::Vector)?).is_empty(),
         "the previous tree's vectors must not rank a tree they were not described for"
     );
 
     index
         .embed_described(&fixture.described(), Embedding::Missing, "rev-two")
         .await?;
-    let RevisionScoped::Matched(ranked) = index.search("rev-two", "search", 10).await? else {
-        return Err("the store still holds the tree that was stamped".into());
-    };
+    let ranking = revision_ranking(&index, "rev-two", "search", QueryPhase::Precise, 10).await?;
     assert_eq!(
-        ranked.units().len(),
+        identities(input(&ranking, RankingInputKind::Vector)?).len(),
         2,
         "the pass for this tree publishes a corpus that ranks it"
+    );
+    Ok(())
+}
+
+/// One published set, both phases: the precise phase answers the document
+/// carrying every term, and the broad phase widens the unquoted terms until
+/// either document answers.
+#[tokio::test]
+async fn the_precise_phase_requires_every_term_and_the_broad_phase_widens_them() -> TestResult {
+    let root = workspace()?;
+    let index = opened(root.path(), lexical_only_limits()).await?;
+    let documents = [
+        text_document("docs/guide.md", "alpha configuration guide")?,
+        text_document("docs/other.md", "some other release notes")?,
+    ];
+    index.replace_lexical(&documents, REVISION).await?;
+
+    let precise = phase_ranking(&index, "alpha other", QueryPhase::Precise, 10).await?;
+    assert!(
+        identities(input(&precise, RankingInputKind::Lexical)?).is_empty(),
+        "the precise phase requires every term, and no document carries both"
+    );
+
+    let broad = phase_ranking(&index, "alpha other", QueryPhase::Broad, 10).await?;
+    assert_eq!(
+        reached(input(&broad, RankingInputKind::Lexical)?),
+        ["docs/guide.md", "docs/other.md"],
+        "the broad phase widens the unquoted terms and reaches either document"
+    );
+
+    let carried = phase_ranking(&index, "alpha configuration", QueryPhase::Precise, 10).await?;
+    assert_eq!(
+        identities(input(&carried, RankingInputKind::Lexical)?),
+        ["docs/guide.md"],
+        "the precise phase answers the document carrying every term"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_quoted_phrase_stays_one_phrase_in_both_phases() -> TestResult {
+    let root = workspace()?;
+    let index = opened(root.path(), lexical_only_limits()).await?;
+    let documents = [
+        text_document("docs/adjacent.md", "the alpha beacon reports nightly")?,
+        text_document("docs/apart.md", "beacon first and alpha second")?,
+    ];
+    index.replace_lexical(&documents, REVISION).await?;
+
+    for phase in [QueryPhase::Precise, QueryPhase::Broad] {
+        let ranking = phase_ranking(&index, "\"alpha beacon\"", phase, 10).await?;
+        let label = phase.label();
+        assert_eq!(
+            identities(input(&ranking, RankingInputKind::Lexical)?),
+            ["docs/adjacent.md"],
+            "a quoted phrase reaches adjacent words alone: phase={label}"
+        );
+    }
+    Ok(())
+}
+
+/// An embedding reads the whole question, so widening the unquoted terms would
+/// produce the vector order the precise phase already contributed.
+#[tokio::test]
+async fn the_broad_phase_runs_the_full_text_input_alone() -> TestResult {
+    let root = workspace()?;
+    let index = prepared(root.path(), limits()).await?;
+    let fixture = two()?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
+
+    let broad = phase_ranking(&index, "load config", QueryPhase::Broad, 10).await?;
+    assert_eq!(kinds(&broad), [RankingInputKind::Lexical]);
+
+    let precise = ranked(&index, "load config", 10).await?;
+    assert_eq!(
+        kinds(&precise),
+        [RankingInputKind::Lexical, RankingInputKind::Vector]
+    );
+    assert!(
+        input(&precise, RankingInputKind::Vector)?.answered(),
+        "a published corpus answers beside the full-text input: {precise:?}"
+    );
+    Ok(())
+}
+
+/// The full-text input carries the columns that placed each identity, so a
+/// name hit, a documentation hit, and a file-content hit stay apart.
+#[tokio::test]
+async fn the_full_text_input_names_the_column_that_carried_the_term() -> TestResult {
+    let root = workspace()?;
+    let index = opened(root.path(), lexical_only_limits()).await?;
+    let named = symbol(
+        "crate::beacon",
+        "src/beacon.rs",
+        "beacon",
+        "pub fn declare() {}",
+    )?;
+    let documented = project_document(
+        "crate::relay",
+        "src/relay.rs",
+        DocumentKind::Symbol,
+        DocumentFields::empty()
+            .with(SearchableField::Name, "relay")
+            .with(
+                SearchableField::Documentation,
+                "forwards every beacon it receives",
+            )
+            .with(SearchableField::DeclarationSource, "pub fn relay() {}"),
+    )?;
+    let noted = text_document("docs/notes.md", "the beacon reports nightly")?;
+    index
+        .replace_lexical(&[named, documented, noted], REVISION)
+        .await?;
+
+    let ranking = ranked(&index, "beacon", 10).await?;
+    let carried = input(&ranking, RankingInputKind::Lexical)?;
+    assert_eq!(
+        reached(carried),
+        ["crate::beacon", "crate::relay", "docs/notes.md"],
+        "all three documents carry the term somewhere"
+    );
+    assert_eq!(
+        fields_of(carried, "crate::beacon")?,
+        FieldSet::of(SearchableField::Name)
+    );
+    assert_eq!(
+        fields_of(carried, "crate::relay")?,
+        FieldSet::of(SearchableField::Documentation)
+    );
+    assert_eq!(
+        fields_of(carried, "docs/notes.md")?,
+        FieldSet::of(SearchableField::FileContent)
+    );
+    Ok(())
+}
+
+/// The bound the full-text ranking stopped at travels with the answer, so a
+/// caller tells a full answer from a cut one without knowing the bound.
+#[tokio::test]
+async fn the_full_text_ranking_reports_the_bound_it_stopped_at() -> TestResult {
+    let root = workspace()?;
+    let index = opened(root.path(), lexical_only_limits()).await?;
+    let fixture = two()?;
+    index.replace_lexical(fixture.documents(), REVISION).await?;
+
+    let cut = ranked(&index, "fn", 1).await?;
+    assert_eq!(
+        identities(input(&cut, RankingInputKind::Lexical)?).len(),
+        1,
+        "the bound keeps one match: {cut:?}"
+    );
+    assert_eq!(
+        cut.lexical_truncated_at(),
+        Some(1),
+        "the store held a match past the bound"
+    );
+
+    let whole = ranked(&index, "fn", 10).await?;
+    assert_eq!(
+        identities(input(&whole, RankingInputKind::Lexical)?).len(),
+        2
+    );
+    assert_eq!(
+        whole.lexical_truncated_at(),
+        None,
+        "every match was ranked, so nothing was cut"
     );
     Ok(())
 }

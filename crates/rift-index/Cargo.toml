@@ -22,6 +22,7 @@ sha2.workspace = true
 strum.workspace = true
 rift-protocol.workspace = true
 rift-provider.workspace = true
+rift-ranking.workspace = true
 rift-syntax.workspace = true
 toasty.workspace = true
 toasty-core.workspace = true
@@ -32,3 +33,4 @@ tracing.workspace = true
 rift-history = { workspace = true, features = ["fixtures"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+toml.workspace = true

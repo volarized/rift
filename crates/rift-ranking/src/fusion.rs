@@ -204,6 +204,23 @@ pub struct RankingWeights {
 }
 
 impl RankingWeights {
+    /// The shares for an answer only the identifier ranking contributed to.
+    ///
+    /// Fusion normalizes against the kinds that answered, so one positive
+    /// share is the whole share and the other two never apply. The rank
+    /// constant is the smallest accepted value rather than the operator's
+    /// default, because with one input it cannot change an order: it divides
+    /// every position by the same monotone factor.
+    #[must_use]
+    pub const fn identifier_only() -> Self {
+        Self {
+            identifier: 1.0,
+            lexical: 0.0,
+            vector: 0.0,
+            fusion_k: FUSION_K_MIN,
+        }
+    }
+
     /// Names the three shares and the rank constant.
     ///
     /// # Errors
@@ -382,8 +399,11 @@ impl RankedCandidates {
 
 /// Fuses `inputs` by weighted reciprocal rank.
 ///
-/// Only inputs that answered take part, and their weights normalize against
-/// each other, so an unavailable input changes no order. Every candidate is
+/// Only inputs that answered take part, and the shares of the kinds that
+/// answered normalize against each other, so an unavailable input changes no
+/// order. Several selected indexes may each contribute a list of one kind;
+/// that kind's share then splits evenly among them, so adding a second index
+/// does not double what full-text matching is worth. Every candidate is
 /// stamped with `phase` and with the fields and inputs that placed it. The
 /// order is descending fused value, ties broken by identity ascending, cut to
 /// `keep_max`.
@@ -405,19 +425,25 @@ pub fn fuse(
         .iter()
         .filter(|input| input.answered() && weights.share(input.kind()) > 0.0)
         .collect();
-    let shares: f64 = answering
-        .iter()
-        .map(|input| weights.share(input.kind()))
-        .sum();
+    let mut kinds: Vec<RankingInputKind> = answering.iter().map(|input| input.kind()).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    let shares: f64 = kinds.iter().map(|kind| weights.share(*kind)).sum();
     if answering.is_empty() || shares <= 0.0 {
         return RankedCandidates::empty();
     }
     let mut accumulated: BTreeMap<&DocumentIdentity, Accumulated> = BTreeMap::new();
-    for input in answering {
+    for input in &answering {
+        let lists = as_count(
+            answering
+                .iter()
+                .filter(|other| other.kind() == input.kind())
+                .count(),
+        );
         accumulate(
             &mut accumulated,
             input,
-            weights.share(input.kind()) / shares,
+            weights.share(input.kind()) / shares / lists,
             weights.fusion_k(),
         );
     }
@@ -837,6 +863,58 @@ mod tests {
         );
         assert_eq!(identities(&joined), ["a", "b"]);
         assert_eq!(joined.truncated_at(), Some(2));
+    }
+
+    #[test]
+    fn test_two_indexes_of_one_kind_split_that_kinds_share() {
+        let held = RankingWeights::new(0.5, 0.5, 0.0, 60).expect("weights must be accepted");
+        let identifier = RankingInput::new(
+            RankingInputKind::Identifier,
+            order(&["a"], SearchableField::Name),
+        );
+        let one_lexical = RankingInput::new(
+            RankingInputKind::Lexical,
+            order(&["b"], SearchableField::Name),
+        );
+        let other_lexical = RankingInput::new(
+            RankingInputKind::Lexical,
+            order(&["b"], SearchableField::Name),
+        );
+        let one_index = fuse(
+            &[identifier.clone(), one_lexical.clone()],
+            held,
+            QueryPhase::Precise,
+            10,
+        );
+        let two_indexes = fuse(
+            &[identifier, one_lexical, other_lexical],
+            held,
+            QueryPhase::Precise,
+            10,
+        );
+        assert_eq!(identities(&one_index), ["a", "b"]);
+        assert_eq!(
+            identities(&two_indexes),
+            ["a", "b"],
+            "a second index of one kind splits that kind's share rather than \
+             doubling what full-text matching is worth"
+        );
+    }
+
+    #[test]
+    fn test_one_input_alone_carries_the_whole_share() {
+        let inputs = [RankingInput::new(
+            RankingInputKind::Identifier,
+            order(&["a"], SearchableField::Name),
+        )];
+        let ranked = fuse(
+            &inputs,
+            RankingWeights::identifier_only(),
+            QueryPhase::Precise,
+            10,
+        );
+        assert_eq!(identities(&ranked), ["a"]);
+        assert!(close(ranked.candidates()[0].score(), 1.0));
     }
 
     #[test]

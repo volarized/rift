@@ -19,6 +19,8 @@ rayon.workspace = true
 reqwest.workspace = true
 rift-core.workspace = true
 rift-index.workspace = true
+rift-ranking.workspace = true
+rig-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -27,4 +29,5 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
 tempfile.workspace = true

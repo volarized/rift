@@ -14,6 +14,7 @@
 
 mod acquisition;
 mod document;
+mod embedding;
 mod encoder;
 mod error;
 mod fusion;
@@ -24,12 +25,17 @@ pub use acquisition::{AcquisitionLimits, FetchedFile, ModelSource, acquire};
 pub use document::{
     DOCUMENT_SOURCE_BYTES_MAX, Declaration, Document, DocumentDigest, digests, document,
 };
+pub use embedding::{
+    BatchSchedule, EmbeddingModels, EmbeddingSpace, LOCAL_INPUTS_MAX, LocalEncoder,
+    REMOTE_INPUTS_MAX, RemoteEmbeddingSettings, RetrievalModels, RiftLocalDocumentModel,
+    RiftLocalQueryModel, RiftOpenAiEmbeddingModel,
+};
 pub use encoder::{Encoder, EncoderLimits, ModelFiles};
 pub use error::{SearchError, SearchFault, SearchViolation};
-pub use fusion::{DeclarationMatch, FusedRank, Ranking, best_per_file, fuse, spread_per_file};
+pub use fusion::{DeclarationMatch, best_per_file, spread_per_file};
 pub use index::{
-    DescribedUnit, Embedding, FusedRanking, RankedUnit, SearchIndex, SearchIndexLimits,
-    SearchIndexLimitsBuilder, VectorReadiness,
+    DescribedUnit, Embedding, SearchIndex, SearchIndexLimits, SearchIndexLimitsBuilder,
+    StoreRanking, VectorReadiness, local_embedding_space,
 };
 pub use rift_index::RevisionScoped;
 pub use similarity::{VectorMatch, nearest};

@@ -3584,7 +3584,7 @@
             "description": "Files eligible for the search, selected by project-relative globs. Omitted selects\nevery visible file."
           },
           "query": {
-            "description": "Text to match against file contents, symbol names, and rendered signatures. Matching\nis case-insensitive and identifier-aware - the query and the fields split on case\nand underscore boundaries, so `loadConfig` finds `load_config`. Scoring is\nserver-defined and comparable within one answer.",
+            "description": "Text to match against declaration names, qualified names, signatures, attached\ndocumentation, declaration source, and file contents. Matching is case-insensitive\nand identifier-aware: the query and the indexed names split on case, acronym, and\nseparator boundaries, so `loadConfig` finds `load_config`. Double quotes keep a\nphrase together, and an identifier written inside a question reaches its\ndeclaration without being quoted. A query naming several terms is answered by the\ndeclarations carrying all of them before the ones carrying some. Scoring is\nserver-defined and comparable within one answer.",
             "type": [
               "string",
               "null"
@@ -3769,7 +3769,7 @@
             "oneOf": [
               {
                 "const": "name",
-                "description": "The declaration's name matched.",
+                "description": "A declaration's name, qualified name, or a term derived from them matched.",
                 "type": "string"
               },
               {
@@ -3789,7 +3789,7 @@
               },
               {
                 "const": "ranked",
-                "description": "The ranked lane placed the hit; no field match proves the query's literal bytes\nappear. The lane ranks whether or not `[search.vector]` is enabled, so this member\nnames the lane rather than the ranking that may or may not have contributed to it.",
+                "description": "The vector ranking placed the hit, and no indexed field carries the query's\nliteral bytes. A hit any other ranking placed names the field that carried it\ninstead.",
                 "type": "string"
               },
               {

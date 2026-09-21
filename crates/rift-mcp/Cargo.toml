@@ -29,6 +29,7 @@ rift-core.workspace = true
 rift-dependency.workspace = true
 rift-index.workspace = true
 rift-protocol.workspace = true
+rift-ranking.workspace = true
 rift-search.workspace = true
 rift-server.workspace = true
 schemars.workspace = true

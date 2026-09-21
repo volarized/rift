@@ -41,9 +41,9 @@ use super::failure::{
 };
 use super::manifest::analyzer_revision;
 use super::walk::{PackageFiles, public_qualified_names};
-use crate::lexical::split_identifier_words;
 use crate::semantic::{PlacedDocument, WorkspaceSemantics};
 use crate::workspace::{IndexedFile, TextSourceFile, indexed_file_from_catalog};
+use rift_ranking::split_identifier_words;
 
 /// One package file as the analyzer holds it: the parsed document, where it is filed, and
 /// the public declarations it carries.

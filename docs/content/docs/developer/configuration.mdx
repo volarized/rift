@@ -445,10 +445,9 @@ fusion_k = 60
   to 1: the server normalizes the weights of the rankings that actually answered, so an
   unavailable vector ranking doesn't rescale what the other two returned. At least one
   weight must be above 0
-- `identifier_weight` <VersionBadge version="planned" inline /> weighs identifier matching,
-  which ranks the query against indexed declaration and qualified names. The key is accepted
-  today; identifier hits reach the answer outside the fused score until the ranking lane
-  reads it
+- `identifier_weight` weighs identifier matching, which ranks the identifiers a query
+  carried against the indexed declaration and qualified names. A question naming a
+  declaration in prose reaches it through this ranking
 - `lexical_weight` weighs the full-text ranking over names, signatures, attached
   documentation, declaration source, and selected text files
 - `vector_weight` weighs the vector ranking, which reaches code sharing no word with the
@@ -485,9 +484,8 @@ max_tokens = 256
 - `kind` selects which embedding runs, and each kind carries only the keys its execution
   reads: `hf` downloads the weights from a Hugging Face repository and caches them where
   every other Hugging Face client on the machine caches them, `directory` reads a directory
-  the workspace already holds and downloads nothing, and `openai_compatible`
-  <VersionBadge version="planned" inline /> sends embedding inputs to a service implementing
-  the OpenAI embedding shape
+  the workspace already holds and downloads nothing, and `openai_compatible` sends embedding
+  inputs to a service implementing the OpenAI embedding shape
 - `model` names which weights, in the form `kind` sets: under `hf` a repository identifier
   such as `minishlab/potion-retrieval-32M`, optionally carrying a revision after `@`; under
   `directory` a workspace-relative directory; under `openai_compatible` the model the
@@ -505,10 +503,9 @@ max_tokens = 256
   window, so a raised window wants a lowered batch; a static model reads one row per token,
   so its cost grows with the window rather than with its square
 
-<VersionBadge version="planned" inline /> An `openai_compatible` embedding sends declaration
-text outside the project while vectors are built, and query text while a search runs. The keys
-are accepted today; the server serves the full-text ranking alone until the remote execution
-lands:
+An `openai_compatible` embedding sends declaration text outside the project while vectors are
+built, and query text while a search runs. The local default sends neither: it starts without
+a key and makes no request once the weights are acquired.
 
 ```toml
 [search.vector.embedding]
@@ -535,6 +532,10 @@ max_in_flight = 4
 - `request_timeout`, `attempts`, `batch_inputs`, and `max_in_flight` bound one embedding
   request and the requests running together: 1s to 5m, 1 to 10, 1 to 2048 inputs, and 1 to 32
   requests
+- the service must answer one vector per input and declare each one's input `index`. The
+  server associates by that index rather than by array order, and refuses a response that
+  repeats an index, omits one, or names one past the request's own length: any of those
+  would attach a vector to the wrong declaration
 
 `disabled` keeps the workspace lexical without emptying the rest of the table. Set it where
 the workspace must not fetch model weights:

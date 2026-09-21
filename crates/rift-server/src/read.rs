@@ -14,7 +14,7 @@ use rift_history::{HistoryError, Repository};
 use rift_index::{
     DependencyIndex, DependencyIndexLimits, DependencySymbolMatch, FileDigest, IndexedFile,
     PackageIndexError, PathChanges, ReadableSymbol, RelationshipStore, SkippedPackage, SymbolMatch,
-    SymbolMatchRank, WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError,
+    WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError,
     WorkspaceIndexLimits, WorkspaceIndexWarning, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::HistoryConfiguration;
@@ -27,6 +27,7 @@ use rift_protocol::read::{
     SOURCE_WARNINGS_MAX, SearchScope, SourceLocationKind, SourceUnitId, Symbol, SymbolId,
     SymbolOrigin, TextRange,
 };
+use rift_ranking::IdentifierMatchClass;
 use rift_syntax::{ByteRange, SyntaxNode, SyntaxProvider, SyntaxSymbol, registry};
 use sha2::{Digest as _, Sha256};
 
@@ -800,8 +801,8 @@ impl ReadService {
     /// symbol and baseline text file, chunked where text exceeds
     /// `[search.text].max_chunk`.
     #[must_use]
-    pub fn lexical_units(&self) -> Vec<rift_index::LexicalUnit> {
-        self.index.lexical_units()
+    pub fn index_documents(&self) -> Vec<rift_ranking::IndexDocument> {
+        self.index.index_documents()
     }
 
     /// Returns each baseline text file split into more than one lexical
@@ -1198,7 +1199,7 @@ impl<'a> RankedMatch<'a> {
 
     /// The rank the match carries; the project index and a package index share one
     /// ranking, so an `all` answer merges the two sides by it.
-    const fn rank(&self) -> SymbolMatchRank {
+    const fn rank(&self) -> IdentifierMatchClass {
         match self {
             Self::Project(matched) => matched.rank,
             Self::Dependency(found) => found.matched.rank,
@@ -1826,7 +1827,7 @@ impl SymbolAddress {
 pub(crate) fn parse_symbol_address(address: &str) -> Result<SymbolAddress, ReadError> {
     let malformed = || ReadFault::invalid("symbol", "not a rift symbol address");
     let remainder = address
-        .strip_prefix("rift://symbol/")
+        .strip_prefix(rift_core::constants::SYMBOL_URI_PREFIX)
         .ok_or_else(malformed)?;
     let (language_segment, remainder) = remainder.split_once('/').ok_or_else(malformed)?;
     if language_segment.is_empty() {

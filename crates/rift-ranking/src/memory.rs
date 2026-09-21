@@ -223,6 +223,32 @@ impl MemoryIndex {
         ranking.finish(bound)
     }
 
+    /// The BM25 value this index computed for every document one phase kept,
+    /// best first.
+    ///
+    /// A score is the arithmetic itself rather than a rank, so nothing outside
+    /// a comparison between two adapters should read it. It exists because a
+    /// reader that must match the stored corpus has to be able to see where
+    /// the two disagree.
+    #[must_use]
+    pub fn scored(&self, query: &ParsedQuery, phase: QueryPhase) -> Vec<(DocumentIdentity, f64)> {
+        let members: Vec<Member> = query.members().iter().filter_map(Member::of).collect();
+        if members.is_empty() || self.held.is_empty() {
+            return Vec::new();
+        }
+        let inverse = self.inverse_frequencies(&members);
+        let mut scored: Vec<(DocumentIdentity, f64)> = self
+            .held
+            .iter()
+            .filter_map(|entry| {
+                let (score, _) = self.score(entry, &members, &inverse, phase)?;
+                Some((entry.document.identity().clone(), score))
+            })
+            .collect();
+        scored.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
+        scored
+    }
+
     /// Ranks the held documents by BM25 for one phase.
     fn rank_lexical(
         &self,

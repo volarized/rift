@@ -25,7 +25,7 @@ fn published(identity: &str, name: &str, qualified_name: &str) -> IndexDocument 
     IndexDocument::new(
         DocumentIdentity::new(identity).expect("identity must be accepted"),
         DocumentLocation::Unit(
-            rift_core::SourceUnitId::parse("rift://source/cargo/helper%400.1.0%2Fsrc%2Flib.rs")
+            rift_core::SourceUnitId::parse("rift://source/cargo/helper@0.1.0/src/lib.rs")
                 .expect("unit must parse"),
         ),
         DocumentKind::Symbol,
@@ -49,7 +49,7 @@ fn ranked(documents: Vec<IndexDocument>, query: &str) -> RankedCandidates {
 
 fn main() {
     let documents = vec![published(
-        "rift://source/cargo/helper%400.1.0%2Fsrc%2Flib.rs#SearchHit",
+        "rift://source/cargo/helper@0.1.0/src/lib.rs#SearchHit",
         "SearchHit",
         "search::SearchHit",
     )];

@@ -24,7 +24,15 @@ pub const IDENTIFIER_CANDIDATES_MAX: usize = 16;
 
 /// Characters that continue an identifier token inside prose, beyond the
 /// alphanumerics every language shares.
-const IDENTIFIER_JOINERS: [char; 3] = ['_', '.', '$'];
+///
+/// The colon is here for the qualifier a language spells `read::search`: a
+/// caller naming a declaration by its qualified name must reach it, and
+/// splitting the token at the separator would leave the container and the
+/// name as two unrelated candidates.
+const IDENTIFIER_JOINERS: [char; 4] = ['_', '.', '$', ':'];
+/// The separators a qualified name is written with. A token carrying one is
+/// the whole name, and its final segment is the short name inside it.
+const QUALIFIER_SEPARATORS: [char; 2] = ['.', ':'];
 
 /// How precisely a caller's identifier matched an indexed declaration.
 ///
@@ -107,7 +115,8 @@ impl IdentifierCandidate {
 /// Three shapes qualify, in this order:
 ///
 /// 1. the whole query, when it is one identifier-shaped token;
-/// 2. a dotted name embedded in prose, together with its final segment;
+/// 2. a qualified name embedded in prose, spelled with `.` or `::`, together
+///    with its final segment;
 /// 3. a token that splits into more than one word: snake case, camel case,
 ///    Pascal case, or an acronym run.
 ///
@@ -129,9 +138,9 @@ pub fn identifier_candidates(query: &str) -> Vec<IdentifierCandidate> {
         if token.is_empty() {
             continue;
         }
-        if token.contains('.') {
+        if token.contains(QUALIFIER_SEPARATORS) {
             push_candidate(&mut candidates, token);
-            if let Some(segment) = token.rsplit('.').next() {
+            if let Some(segment) = token.rsplit(QUALIFIER_SEPARATORS).next() {
                 push_candidate(&mut candidates, segment);
             }
             continue;

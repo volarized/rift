@@ -20,9 +20,9 @@ mod query;
 mod reader;
 
 pub use document::{
-    CONTENT_BYTES_MAX, CORPUS_TOKENIZER, CorpusRevision, DOCUMENTATION_BYTES_MAX, DocumentFields,
-    DocumentIdentity, DocumentKind, DocumentLocation, FieldSet, IDENTIFIER_TERMS_BYTES_MAX,
-    IDENTITY_BYTES_MAX, IndexDocument, NAME_BYTES_MAX, SIGNATURE_BYTES_MAX, SearchableField,
+    CORPUS_TOKENIZER, CorpusRevision, DOCUMENTATION_BYTES_MAX, DocumentFields, DocumentIdentity,
+    DocumentKind, DocumentLocation, FieldSet, IDENTIFIER_TERMS_BYTES_MAX, IDENTITY_BYTES_MAX,
+    IndexDocument, NAME_BYTES_MAX, SIGNATURE_BYTES_MAX, SearchableField,
 };
 pub use error::{RankingError, RankingFault, RankingViolation};
 pub use fusion::{

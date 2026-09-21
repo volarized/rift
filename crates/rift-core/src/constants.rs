@@ -6,6 +6,8 @@ pub const SOURCE_RESOLVER_ID_BYTES_MAX: usize = 128;
 pub const SOURCE_UNIT_ID_BYTES_MAX: usize = 8_192;
 /// Canonical prefix for resolver-owned source-unit identities.
 pub const SOURCE_UNIT_URI_PREFIX: &str = "rift://source/";
+/// Canonical prefix for declaration identities.
+pub const SYMBOL_URI_PREFIX: &str = "rift://symbol/";
 /// Canonical source-unit address separator.
 pub const SOURCE_UNIT_SEPARATOR: char = '/';
 /// Encoded width of one source-unit address separator.

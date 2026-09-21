@@ -8,14 +8,14 @@ use std::sync::OnceLock;
 
 use rift_core::{LoopBudget, SymbolId as CoreSymbolId};
 use rift_index::{
-    IndexedFile, PathMatcher, RelationshipEdge, RelationshipStore, SymbolMatch, SymbolMatchRank,
-    WorkspaceIndex,
+    IndexedFile, PathMatcher, RelationshipEdge, RelationshipStore, SymbolMatch, WorkspaceIndex,
 };
 use rift_protocol::read::{
     ExactKind, Extensions, GraphHop, HopDirection, MatchedField, ReadWarning, Relationship,
     RelationshipDerivation, RelationshipFacet, SEARCH_TRAVERSAL_DEPTH_MAX,
     SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX, SearchHit, SearchTraversal, SymbolId,
 };
+use rift_ranking::IdentifierMatchClass;
 use rift_syntax::SyntaxSymbol;
 
 use crate::engine_read::EngineReferences;
@@ -468,7 +468,7 @@ fn merge_traversal_hit(
         file,
         symbol,
         // This lane supplies `score` from `distance` and never reads identifier rank.
-        rank: SymbolMatchRank::Substring,
+        rank: IdentifierMatchClass::Substring,
     };
     let mut hit = build_symbol_hit(
         index,
@@ -520,6 +520,7 @@ pub(crate) mod tests {
         RelationshipDerivation, TRAVERSAL_NODES_MAX, walk_traversal_capped,
     };
     use crate::read::ReadService;
+    use crate::search::StoreAnswer;
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -1062,7 +1063,11 @@ pub(crate) mod tests {
                 "seed": "rift://symbol/rust/lib.rs/leaf"
             }
         }))?;
-        let result = service.search_with_references(&params, &[], &references)?;
+        let result = service.search_with_references(
+            &params,
+            &StoreAnswer::identifier_only(),
+            &references,
+        )?;
         let hit = result
             .results
             .iter()
@@ -1086,7 +1091,11 @@ pub(crate) mod tests {
             },
             "paths": { "include": ["elsewhere/**"] }
         }))?;
-        let result = service.search_with_references(&params, &[], &references)?;
+        let result = service.search_with_references(
+            &params,
+            &StoreAnswer::identifier_only(),
+            &references,
+        )?;
         assert!(
             result.results.is_empty(),
             "every walked hit lives outside the selected paths: {:?}",
@@ -1105,7 +1114,11 @@ pub(crate) mod tests {
                 "to": "rift://symbol/rust/lib.rs/root"
             }
         }))?;
-        let result = service.search_with_references(&params, &[], &references)?;
+        let result = service.search_with_references(
+            &params,
+            &StoreAnswer::identifier_only(),
+            &references,
+        )?;
         assert_eq!(result.results.len(), 1, "{:#?}", result.results);
         let hit = &result.results[0];
         assert!(matches!(
@@ -1125,7 +1138,11 @@ pub(crate) mod tests {
                 "to": "rift://symbol/rust/lib.rs/root"
             }
         }))?;
-        let result = service.search_with_references(&params, &[], &references)?;
+        let result = service.search_with_references(
+            &params,
+            &StoreAnswer::identifier_only(),
+            &references,
+        )?;
         assert!(result.results.is_empty(), "{:#?}", result.results);
         Ok(())
     }
@@ -1139,27 +1156,35 @@ pub(crate) mod tests {
                 "seed": "rift://symbol/rust/lib.rs/leaf"
             }
         }))?;
-        let result = service.search_with_references(&params, &[], &references)?;
+        let result = service.search_with_references(
+            &params,
+            &StoreAnswer::identifier_only(),
+            &references,
+        )?;
         assert!(result.results.is_empty(), "{:#?}", result.results);
         Ok(())
     }
 
     #[test]
-    fn search_query_and_traversal_merge_matched_by_and_keep_the_lexical_score() -> TestResult {
+    fn search_query_and_traversal_merge_matched_by_and_keep_the_fused_score() -> TestResult {
         let (_directory, service, references) = live_reference_graph_fixture()?;
-        // "ranch_a" is a substring of "branch_a", not the name or qualified name itself, so
-        // the lexical lane ranks it `Substring` (0.7) - a score distinct from what the
-        // traversal lane would give the same hit at distance 1 (1.0), so a merge that kept
-        // the traversal's score instead of the lexical one would show up here.
+        // Both candidates match at `Substring`, so the earlier one places "branch_b"
+        // first and "branch_a" second: second of two scores 0.5. The walk reaches
+        // "branch_a" at distance 1, which the traversal lane scores 1.0, so a merge that
+        // took the walk's score instead of the fused one would show up here.
         let params: SearchParams = serde_json::from_value(json!({
-            "query": "ranch_a",
+            "query": "ranch_b ranch_a",
             "target": "symbol",
             "include": ["score"],
             "traversal": {
                 "seed": "rift://symbol/rust/lib.rs/leaf"
             }
         }))?;
-        let result = service.search_with_references(&params, &[], &references)?;
+        let result = service.search_with_references(
+            &params,
+            &StoreAnswer::identifier_only(),
+            &references,
+        )?;
         let hit = result
             .results
             .iter()
@@ -1177,9 +1202,9 @@ pub(crate) mod tests {
         );
         assert_eq!(
             hit.score,
-            Some(0.7),
-            "the merge keeps the lexical Substring score rather than the traversal score: \
-             {hit:?}"
+            Some(0.5),
+            "the merge keeps the fused position score rather than the walk's distance \
+             score: {hit:?}"
         );
         Ok(())
     }
@@ -1193,7 +1218,7 @@ pub(crate) mod tests {
             }
         }))?;
         let error = service
-            .search_with_references(&params, &[], &references)
+            .search_with_references(&params, &StoreAnswer::identifier_only(), &references)
             .expect_err("an unresolvable seed must refuse");
         assert_eq!(error.descriptor().code(), "resource_not_found");
         Ok(())
@@ -1210,7 +1235,11 @@ pub(crate) mod tests {
                 "seed": "rift://symbol/rust/lib.rs/isolated"
             }
         }))?;
-        let result = service.search_with_references(&params, &[], &references)?;
+        let result = service.search_with_references(
+            &params,
+            &StoreAnswer::identifier_only(),
+            &references,
+        )?;
         assert!(result.results.is_empty(), "{:#?}", result.results);
         assert!(
             result.warnings.is_empty(),
@@ -1242,7 +1271,11 @@ pub(crate) mod tests {
             }
         });
         let params: SearchParams = serde_json::from_value(request)?;
-        let result = service.search_with_references(&params, &[], &references)?;
+        let result = service.search_with_references(
+            &params,
+            &StoreAnswer::identifier_only(),
+            &references,
+        )?;
         assert!(result.warnings.is_empty(), "{:#?}", result.warnings);
         Ok(())
     }
@@ -1260,7 +1293,11 @@ pub(crate) mod tests {
             }
         });
         let params: SearchParams = serde_json::from_value(request)?;
-        let result = service.search_with_references(&params, &[], &references)?;
+        let result = service.search_with_references(
+            &params,
+            &StoreAnswer::identifier_only(),
+            &references,
+        )?;
         assert!(
             coverage_warning(&result).is_some_and(|warning| matches!(
                 warning,
@@ -1283,7 +1320,7 @@ pub(crate) mod tests {
         });
         let params: SearchParams = serde_json::from_value(request)?;
         let error = service
-            .search(&params, &[])
+            .search(&params, &StoreAnswer::identifier_only())
             .expect_err("a workspace no engine serves must refuse the traversal lane");
         assert_eq!(error.descriptor().code(), "capability_unavailable");
         assert!(
@@ -1302,7 +1339,8 @@ pub(crate) mod tests {
                 "seed": "rift://symbol/rust/lib.rs/leaf"
             }
         }))?;
-        let error = service.search_with_references(&params, &[], &references);
+        let error =
+            service.search_with_references(&params, &StoreAnswer::identifier_only(), &references);
         // No git repository exists in this fixture, so revision resolution itself may refuse
         // first; either refusal proves `traversal` never silently combines with `rev`.
         assert!(error.is_err(), "a bare SearchParams cannot resolve `rev`");
