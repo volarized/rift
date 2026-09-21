@@ -172,6 +172,18 @@ impl SyntaxPublicationBuilder {
         })
     }
 
+    /// Declarations this publication still has room for under its bound.
+    ///
+    /// A caller offering a document with more declarations than this would cross the
+    /// per-provider bound [`ProviderPublication`] refuses at, so it can leave that
+    /// document out before the publication refuses the whole set.
+    #[must_use]
+    pub fn declarations_remaining(&self) -> usize {
+        self.limits
+            .contributions_per_provider_max()
+            .saturating_sub(self.contributions.len())
+    }
+
     /// Adds every declaration from one project-tree syntax document.
     ///
     /// The project placement is [`DocumentPlacement::project`]; the document

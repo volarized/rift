@@ -14,6 +14,8 @@ from pathlib import Path
 from mcp.shared.exceptions import McpError
 
 from rift_dev.corpus_assertions import (
+    CONTEXT_DEGRADED,
+    CONTEXT_SPAN,
     PROBE_PATH,
     PROBE_SOURCE,
     READ_COUNT,
@@ -47,7 +49,13 @@ from rift_dev.rift_test_client import (
     string_value,
 )
 
-READ_SECONDS = 30.0
+# The server answers one read within `[server] readiness_timeout`, degrading to identifier
+# matching when the lexical lane has not landed its transaction. A client deadline equal to
+# that budget tears the transport down at the instant the server answers, so a read whose
+# lane genuinely needs the whole budget can never deliver the answer the contract promises.
+# The read carries the budget plus room for that answer to arrive.
+READINESS_SECONDS = 30.0
+READ_SECONDS = READINESS_SECONDS + 10.0
 # Seconds a case keeps inside its own deadline for the served tree's removal,
 # the report write, and the process exit. Nextest allows the same grace after
 # it ends a corpus case, so the two bounds agree on what cleanup costs.
@@ -55,7 +63,12 @@ CLEANUP_RESERVE_SECONDS = 30.0
 SEED = 34
 POLL_SECONDS = 0.1
 OBSERVATION_SECONDS = 60.0
-CONFIGURATION = '[server]\nreadiness_timeout = "30s"\n[search.vector]\ndisabled = true\n[logs]\npage_records = 5000\ncapture = "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info"\n'
+CONFIGURATION = (
+    f'[server]\nreadiness_timeout = "{int(READINESS_SECONDS)}s"\n'
+    "[search.vector]\ndisabled = true\n"
+    "[logs]\npage_records = 5000\n"
+    'capture = "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info"\n'
+)
 SAMPLE_LANGUAGES = {
     "bun": ("rust", "typescript", "typescript:tsx"),
     "nextjs": ("rust", "typescript", "typescript:tsx"),
@@ -223,7 +236,7 @@ class Corpus:
                     client,
                     "rift://logs/component/dependency",
                     lambda rows: any(
-                        row.get("message") == "dependency.resolve" for row in rows
+                        row.get("message") == CONTEXT_SPAN for row in rows
                     ),
                 )
                 self.dependencies(found)
@@ -255,28 +268,27 @@ class Corpus:
             else f"{count - 256} of {count} package.json manifests were not read: at most 256 are read per workspace"
         )
         exact_degradation(found, expected)
-        passes = [row for row in found if row.get("message") == "dependency.resolve"]
-        require(len(passes) == 1, f"startup resolved dependencies {len(passes)} times")
+        passes = [row for row in found if row.get("message") == CONTEXT_SPAN]
+        require(
+            len(passes) == 1, f"startup read the dependency context {len(passes)} times"
+        )
         require(
             fields(passes[0]).get("span") == "closed",
-            "dependency resolution span did not close",
+            "the dependency context span did not close",
         )
         require(
             {"entries", "degraded"}.issubset(fields(passes[0])),
-            "dependency resolution lost named fields",
+            "the dependency context lost named fields",
         )
         if self.pin.name == "fastapi":
             degraded = [
-                row
+                fields(row).get("reason")
                 for row in found
-                if fields(row).get("resolver") == "uv"
-                and row.get("message") == "dependency resolution degraded"
+                if row.get("message") == CONTEXT_DEGRADED
             ]
-            expected_environment = f"pyproject.toml: no environment at {self.root}/.venv; packages cataloged without source roots"
             require(
-                [fields(row).get("reason") for row in degraded]
-                == [expected_environment],
-                f"unexpected fastapi uv degradation: {degraded}",
+                degraded == [],
+                f"the fastapi context reads manifests and lockfiles alone: {degraded}",
             )
         self.record(
             "manifests",

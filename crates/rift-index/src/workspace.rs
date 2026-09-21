@@ -11,8 +11,9 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{DirEntry, Match, Walk, WalkBuilder};
 use rift_core::constants::{
     READ_RESULTS_MAX_DEFAULT, VCS_IGNORE_FILE, WORKSPACE_BYTES_MAX_DEFAULT,
-    WORKSPACE_CONFIGURATION_FILE, WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT,
-    WORKSPACE_FILES_MAX_DEFAULT, WORKSPACE_IGNORED_DIRECTORIES,
+    WORKSPACE_CONFIGURATION_FILE, WORKSPACE_DECLARATIONS_MAX_DEFAULT,
+    WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT, WORKSPACE_FILES_MAX_DEFAULT,
+    WORKSPACE_IGNORED_DIRECTORIES,
 };
 use rift_core::{
     CompositionId, ContributionError, Error, ErrorCode, ErrorContext, ErrorName, Fault,
@@ -20,7 +21,9 @@ use rift_core::{
     SourceVisibility, SymbolId, TextFileInclusion, fault_label, symbol_identity,
 };
 use rift_protocol::search::FORCE_INCLUDE_FIELD;
-use rift_protocol::source::{SOURCE_FILES_FIELD, SOURCE_WORKSPACE_SIZE_FIELD};
+use rift_protocol::source::{
+    SOURCE_DECLARATIONS_FIELD, SOURCE_FILES_FIELD, SOURCE_WORKSPACE_SIZE_FIELD,
+};
 use rift_provider::{
     AssembledSymbol, Component, CompositionBuilder, NormalizedGraph, ProviderComposition,
 };
@@ -42,7 +45,7 @@ use crate::glob::{ForceIncludeReach, PathMatcher, PathVerdict};
 use crate::language::{ClassifiedPath, LanguagePolicyError, WorkspaceLanguagePolicy};
 use crate::lexical::LimitBreach;
 use crate::relationship::RelationshipStore;
-use crate::semantic::{WorkspaceSemanticError, WorkspaceSemantics};
+use crate::semantic::{BuiltSemantics, WorkspaceSemanticError, WorkspaceSemantics};
 
 #[derive(Debug)]
 pub(crate) struct WorkspaceFiles;
@@ -58,12 +61,17 @@ pub struct WorkspaceIndexLimits {
     files_max: usize,
     file_bytes_max: usize,
     workspace_bytes_max: usize,
+    declarations_max: usize,
     directory_depth_max: usize,
     results_max: usize,
 }
 
 impl WorkspaceIndexLimits {
     /// Constructs positive direct-workspace bounds.
+    ///
+    /// The declaration bound is [`WORKSPACE_DECLARATIONS_MAX_DEFAULT`]; the `[source]`
+    /// table replaces it through [`Self::with_workspace_bounds`], beside the two bounds
+    /// it owns.
     ///
     /// # Errors
     ///
@@ -75,47 +83,59 @@ impl WorkspaceIndexLimits {
         directory_depth_max: usize,
         results_max: usize,
     ) -> Result<Self, WorkspaceIndexError> {
-        let limits = Self {
+        Self {
             files_max,
             file_bytes_max,
             workspace_bytes_max,
+            declarations_max: WORKSPACE_DECLARATIONS_MAX_DEFAULT,
             directory_depth_max,
             results_max,
-        };
-        for bound in limits.bounds() {
-            positive_bound(bound)?;
         }
-        Ok(limits)
+        .validated()
     }
 
-    const fn bounds(self) -> [usize; 5] {
+    /// Refuses any bound that is zero, so no build runs under a bound it cannot meet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] when any bound is zero.
+    fn validated(self) -> Result<Self, WorkspaceIndexError> {
+        for bound in self.bounds() {
+            positive_bound(bound)?;
+        }
+        Ok(self)
+    }
+
+    const fn bounds(self) -> [usize; 6] {
         [
             self.files_max,
             self.file_bytes_max,
             self.workspace_bytes_max,
+            self.declarations_max,
             self.directory_depth_max,
             self.results_max,
         ]
     }
 
     /// The same per-file, depth, and result bounds under the `[source]` table's own
-    /// `files` and `workspace_size`.
+    /// `files`, `workspace_size`, and `declarations`.
     ///
     /// # Errors
     ///
-    /// Returns [`WorkspaceIndexError`] when either bound is zero.
+    /// Returns [`WorkspaceIndexError`] when any of the three bounds is zero.
     pub fn with_workspace_bounds(
         self,
         files_max: usize,
         workspace_bytes_max: usize,
+        declarations_max: usize,
     ) -> Result<Self, WorkspaceIndexError> {
-        Self::new(
+        Self {
             files_max,
-            self.file_bytes_max,
             workspace_bytes_max,
-            self.directory_depth_max,
-            self.results_max,
-        )
+            declarations_max,
+            ..self
+        }
+        .validated()
     }
 
     /// Returns maximum result count accepted per query.
@@ -128,6 +148,12 @@ impl WorkspaceIndexLimits {
     #[must_use]
     pub const fn files_max(self) -> usize {
         self.files_max
+    }
+
+    /// Returns maximum declarations the publication this index builds holds together.
+    #[must_use]
+    pub const fn declarations_max(self) -> usize {
+        self.declarations_max
     }
 
     /// Returns maximum bytes accepted for one source file.
@@ -152,6 +178,7 @@ impl Default for WorkspaceIndexLimits {
             files_max: WORKSPACE_FILES_MAX_DEFAULT,
             file_bytes_max: registry::file_bytes_max_default(),
             workspace_bytes_max: WORKSPACE_BYTES_MAX_DEFAULT,
+            declarations_max: WORKSPACE_DECLARATIONS_MAX_DEFAULT,
             directory_depth_max: WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT,
             results_max: READ_RESULTS_MAX_DEFAULT,
         }
@@ -994,6 +1021,8 @@ pub enum WorkspaceIndexWarning {
         /// The Contribution field the refusal names.
         field: &'static str,
     },
+    /// The workspace publication was full before this file's declarations were offered.
+    DeclarationsBeyondBound(ProjectPath),
 }
 
 /// Outcome of reading one file into the index: held, or left out with the
@@ -1161,7 +1190,8 @@ impl WorkspaceIndexWarning {
             | Self::BinarySource(path)
             | Self::FileTooLarge(path)
             | Self::SyntaxTooLarge { path, .. }
-            | Self::Contribution { path, .. } => path,
+            | Self::Contribution { path, .. }
+            | Self::DeclarationsBeyondBound(path) => path,
         }
     }
 
@@ -1178,6 +1208,11 @@ impl WorkspaceIndexWarning {
             }
             Self::Contribution { field, .. } => {
                 format!("declares a symbol the Contribution contract refuses ({field})")
+            }
+            Self::DeclarationsBeyondBound(_) => {
+                format!(
+                    "stands past the declarations the index holds ({SOURCE_DECLARATIONS_FIELD})"
+                )
             }
         }
     }
@@ -1273,7 +1308,7 @@ impl WorkspaceIndex {
             warnings,
             fingerprint,
             semantics,
-        } = built_contents(&root, contents.sorted(), None)?;
+        } = built_contents(&root, contents.sorted(), limits.declarations_max(), None)?;
         Ok(Self {
             root,
             files,
@@ -1319,7 +1354,12 @@ impl WorkspaceIndex {
             warnings,
             fingerprint,
             semantics,
-        } = built_contents(&self.root, contents.sorted(), Some(self.semantics.graph()))?;
+        } = built_contents(
+            &self.root,
+            contents.sorted(),
+            self.limits.declarations_max(),
+            Some(self.semantics.graph()),
+        )?;
         Ok(Self {
             root: self.root.clone(),
             files,
@@ -1393,7 +1433,7 @@ impl WorkspaceIndex {
             warnings,
             fingerprint,
             semantics,
-        } = built_contents(&root, contents.sorted(), None)?;
+        } = built_contents(&root, contents.sorted(), limits.declarations_max(), None)?;
         Ok(Self {
             root,
             files,
@@ -2102,9 +2142,15 @@ struct BuiltContents {
 /// it. Every pass either completes or leaves one held file out, so the passes are
 /// bounded by the held file count plus the final pass. A failure the left-out rule
 /// does not route fails the build with the fault, path attached when known.
+///
+/// `declarations_max` is the publication's own capacity, the `[source]` table's
+/// `declarations`. A workspace carrying more declarations than that publishes the files
+/// that fit and leaves the rest out, so the index serves what it can instead of refusing
+/// the whole build.
 fn built_contents(
     root: &Path,
     mut contents: IndexContents,
+    declarations_max: usize,
     previous: Option<&NormalizedGraph>,
 ) -> Result<BuiltContents, WorkspaceIndexError> {
     let passes_max = contents.files.len().saturating_add(1);
@@ -2117,11 +2163,24 @@ fn built_contents(
         );
         let built = WorkspaceSemantics::build(
             contents.files.values().map(|file| file.syntax()),
+            declarations_max,
             fingerprint.revision_number(),
             previous,
         );
         let refused = match built {
-            Ok(semantics) => {
+            Ok(BuiltSemantics {
+                semantics,
+                beyond_declaration_bound,
+            }) => {
+                if !beyond_declaration_bound.is_empty() {
+                    passes = passes.saturating_add(1);
+                    leave_out_beyond_declaration_bound(
+                        &mut contents,
+                        &beyond_declaration_bound,
+                        passes < passes_max,
+                    )?;
+                    continue;
+                }
                 let IndexContents {
                     files,
                     text_files,
@@ -2154,6 +2213,33 @@ fn built_contents(
             return Err(error);
         }
     }
+}
+
+/// Leaves every document the declaration bound had no room for out of `contents`.
+///
+/// Each one keeps its digests, as every left-out file does, so the next capture of the
+/// tree still compares against what this build read. One pass removes every named
+/// document, so the pass after it publishes.
+///
+/// # Errors
+///
+/// Returns [`WorkspaceIndexError`] when the pass budget is spent or a named document is
+/// not held, either of which means the removal cannot make progress.
+fn leave_out_beyond_declaration_bound(
+    contents: &mut IndexContents,
+    beyond: &[ProjectPath],
+    within_passes: bool,
+) -> Result<(), WorkspaceIndexError> {
+    for path in beyond {
+        let warning = WorkspaceIndexWarning::DeclarationsBeyondBound(path.clone());
+        if !within_passes || !contents.leave_out_held(path, warning) {
+            return Err(index_error_at(
+                WorkspaceIndexViolation::Provider,
+                Path::new(path.as_str()),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Source and text paths [`discover`] found below one root, each list sorted by path.
@@ -3235,6 +3321,8 @@ fn text_document(
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::*;
     use rift_syntax::{RustSyntaxProvider, SyntaxLimits};
 
@@ -6409,20 +6497,32 @@ mod tests {
     }
 
     #[test]
-    fn test_with_workspace_bounds_replaces_the_two_source_bounds_alone() {
+    fn test_with_workspace_bounds_replaces_the_three_source_bounds_alone() {
         let base = WorkspaceIndexLimits::new(8, 16, 1_024, 4, 32).expect("bounds");
+        assert_eq!(
+            base.declarations_max(),
+            WORKSPACE_DECLARATIONS_MAX_DEFAULT,
+            "a build states its declaration bound through the `[source]` table alone"
+        );
         let bounded = base
-            .with_workspace_bounds(2_000, 4_096)
+            .with_workspace_bounds(2_000, 4_096, 64)
             .expect("positive bounds");
         assert_eq!(bounded.files_max(), 2_000);
         assert_eq!(bounded.workspace_bytes_max(), 4_096);
+        assert_eq!(bounded.declarations_max(), 64);
         assert_eq!(bounded.file_bytes_max(), 16);
         assert_eq!(bounded.directory_depth_max(), 4);
         assert_eq!(bounded.results_max(), 32);
-        let zero = base
-            .with_workspace_bounds(0, 4_096)
-            .expect_err("a zero bound refuses");
-        assert_eq!(zero.fault().violation(), WorkspaceIndexViolation::ZeroLimit);
+        for zero in [
+            base.with_workspace_bounds(0, 4_096, 64),
+            base.with_workspace_bounds(2_000, 4_096, 0),
+        ] {
+            let error = zero.expect_err("a zero bound refuses");
+            assert_eq!(
+                error.fault().violation(),
+                WorkspaceIndexViolation::ZeroLimit
+            );
+        }
     }
 
     #[test]
@@ -6511,6 +6611,88 @@ mod tests {
             documents.is_empty(),
             "a refused document is left out, not published"
         );
+    }
+
+    /// One source file declaring `count` functions, as the catalog holds it.
+    fn declaring_file(name: &str, count: usize) -> TextSourceFile {
+        let mut content = String::new();
+        for index in 0..count {
+            writeln!(content, "pub fn beacon_{index}() {{}}").expect("a string write succeeds");
+        }
+        TextSourceFile {
+            path: ProjectPath::new(name.to_owned()).expect("a project path"),
+            digest: FileDigest::of(content.as_bytes()),
+            content,
+            executable: false,
+        }
+    }
+
+    /// A workspace declaring more than the publication holds keeps the files that fit and
+    /// leaves the rest out, so a large workspace is served rather than refused. The
+    /// production bound is a million declarations, which no test tree reaches, so the build
+    /// takes the bound as a parameter and this case passes one it can cross.
+    #[test]
+    fn test_a_workspace_past_the_declaration_bound_publishes_what_fits() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let provider = registry::provider_for_extension("rs").expect("the rust provider");
+        let mut contents = IndexContents::default();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            let file = declaring_file(name, 3);
+            contents
+                .hold_source_file(file, &root.path().join(name), provider)
+                .expect("the catalog holds the file");
+        }
+        let built = built_contents(root.path(), contents.sorted(), 4, None)
+            .expect("the build publishes the files that fit");
+        assert_eq!(
+            built
+                .files
+                .keys()
+                .map(ProjectPath::as_str)
+                .collect::<Vec<_>>(),
+            ["a.rs"],
+            "the first file fits the bound and the pass stops at the next one"
+        );
+        assert_eq!(
+            built
+                .left_out
+                .keys()
+                .map(ProjectPath::as_str)
+                .collect::<Vec<_>>(),
+            ["b.rs", "c.rs"],
+            "every file past the bound keeps its digests as a left-out file"
+        );
+        let beyond = built
+            .warnings
+            .iter()
+            .filter(|warning| matches!(warning, WorkspaceIndexWarning::DeclarationsBeyondBound(_)))
+            .map(|warning| warning.path().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(beyond, ["b.rs", "c.rs"]);
+        assert_eq!(
+            built.warnings[0].reason(),
+            "stands past the declarations the index holds (source.declarations)"
+        );
+    }
+
+    /// A workspace inside the bound leaves nothing out, so the bound never costs a file an
+    /// index that had room for it.
+    #[test]
+    fn test_a_workspace_within_the_declaration_bound_leaves_nothing_out() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let provider = registry::provider_for_extension("rs").expect("the rust provider");
+        let mut contents = IndexContents::default();
+        for name in ["a.rs", "b.rs"] {
+            let file = declaring_file(name, 3);
+            contents
+                .hold_source_file(file, &root.path().join(name), provider)
+                .expect("the catalog holds the file");
+        }
+        let built = built_contents(root.path(), contents.sorted(), 6, None)
+            .expect("the build publishes every file");
+        assert_eq!(built.files.len(), 2);
+        assert!(built.left_out.is_empty());
+        assert!(built.warnings.is_empty());
     }
 
     #[test]

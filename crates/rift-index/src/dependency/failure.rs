@@ -24,6 +24,8 @@ pub enum PackageIndexViolation {
     WalkEntriesExceeded,
     /// The package selects more files than `package_files_max`.
     PackageFilesExceeded,
+    /// The package's selected files declare more than the package publication holds.
+    PackageDeclarationsExceeded,
     /// The package's selected files hold more bytes than `package_bytes_max`.
     PackageBytesExceeded,
     /// Every indexed package together would exceed `total_bytes_max`.
@@ -128,6 +130,7 @@ impl Fault for PackageIndexFault {
             PackageIndexViolation::DirectoryDepthExceeded
             | PackageIndexViolation::WalkEntriesExceeded
             | PackageIndexViolation::PackageFilesExceeded
+            | PackageIndexViolation::PackageDeclarationsExceeded
             | PackageIndexViolation::PackageBytesExceeded
             | PackageIndexViolation::TotalBytesExceeded => {
                 ErrorName::Wire(ErrorCode::LimitExceeded)
@@ -202,22 +205,54 @@ mod tests {
 
     #[test]
     fn test_package_index_error_display_names_the_package_for_every_violation() {
+        // Each violation stands beside the wire identity it carries, so adding one names
+        // its own identity here instead of shifting what a positional index asserted.
         let violations = [
-            PackageIndexViolation::SourceRootMissing,
-            PackageIndexViolation::LanguageUnsupported,
-            PackageIndexViolation::Unreadable,
-            PackageIndexViolation::DirectoryDepthExceeded,
-            PackageIndexViolation::WalkEntriesExceeded,
-            PackageIndexViolation::PackageFilesExceeded,
-            PackageIndexViolation::PackageBytesExceeded,
-            PackageIndexViolation::TotalBytesExceeded,
-            PackageIndexViolation::InvalidPath,
-            PackageIndexViolation::Identity,
-            PackageIndexViolation::Syntax,
-            PackageIndexViolation::Provider,
-            PackageIndexViolation::SymbolMissing,
+            (
+                PackageIndexViolation::SourceRootMissing,
+                ErrorCode::ResourceNotFound,
+            ),
+            (
+                PackageIndexViolation::LanguageUnsupported,
+                ErrorCode::CapabilityUnavailable,
+            ),
+            (PackageIndexViolation::Unreadable, ErrorCode::StorageFailure),
+            (
+                PackageIndexViolation::DirectoryDepthExceeded,
+                ErrorCode::LimitExceeded,
+            ),
+            (
+                PackageIndexViolation::WalkEntriesExceeded,
+                ErrorCode::LimitExceeded,
+            ),
+            (
+                PackageIndexViolation::PackageFilesExceeded,
+                ErrorCode::LimitExceeded,
+            ),
+            (
+                PackageIndexViolation::PackageDeclarationsExceeded,
+                ErrorCode::LimitExceeded,
+            ),
+            (
+                PackageIndexViolation::PackageBytesExceeded,
+                ErrorCode::LimitExceeded,
+            ),
+            (
+                PackageIndexViolation::TotalBytesExceeded,
+                ErrorCode::LimitExceeded,
+            ),
+            (
+                PackageIndexViolation::InvalidPath,
+                ErrorCode::UnsupportedPath,
+            ),
+            (PackageIndexViolation::Identity, ErrorCode::InternalError),
+            (PackageIndexViolation::Provider, ErrorCode::InternalError),
+            (
+                PackageIndexViolation::SymbolMissing,
+                ErrorCode::InternalError,
+            ),
         ];
-        for violation in violations {
+        for (violation, code) in violations {
             let error = PackageIndexError::new(
                 PackageIndexFault::new(violation, &tokio()).at(Path::new("src/lib.rs")),
             );
@@ -235,24 +270,12 @@ mod tests {
                 "{violation:?} carries no limit evidence without a breach"
             );
             assert!(std::error::Error::source(&error).is_none());
+            assert_eq!(
+                error.fault().name(),
+                ErrorName::Wire(code),
+                "{violation:?} carries its own wire identity"
+            );
         }
-        let names: Vec<ErrorName> = violations
-            .iter()
-            .map(|violation| PackageIndexFault::new(*violation, &tokio()).name())
-            .collect();
-        assert_eq!(names[0], ErrorName::Wire(ErrorCode::ResourceNotFound));
-        assert_eq!(names[2], ErrorName::Wire(ErrorCode::StorageFailure));
-        assert!(
-            names[3..8]
-                .iter()
-                .all(|name| *name == ErrorName::Wire(ErrorCode::LimitExceeded))
-        );
-        assert_eq!(names[8], ErrorName::Wire(ErrorCode::UnsupportedPath));
-        assert!(
-            names[9..]
-                .iter()
-                .all(|name| *name == ErrorName::Wire(ErrorCode::InternalError))
-        );
     }
 
     #[test]
@@ -287,5 +310,9 @@ mod tests {
 
         assert_eq!(error.name(), expected);
         assert!(std::error::Error::source(&error).is_some());
+        assert!(
+            error.to_string().contains("cargo/tokio@1.53.1"),
+            "a delegated identity still names the package: {error}"
+        );
     }
 }

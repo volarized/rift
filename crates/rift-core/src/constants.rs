@@ -50,11 +50,18 @@ pub const STAGE_NAME_BYTES_MAX: usize = 64;
 /// Punctuation accepted in provider-composition stage names.
 pub const STAGE_NAME_PUNCTUATION: &[u8] = b"-";
 /// Default maximum files indexed from one workspace, every language together. The served
-/// index reads its own bound from `[source] files`.
-pub const WORKSPACE_FILES_MAX_DEFAULT: usize = 20_000;
+/// index reads its own bound from `[source] files`; this restates that key's own default,
+/// and `test_workspace_defaults_match_the_source_table` keeps the two from drifting.
+pub const WORKSPACE_FILES_MAX_DEFAULT: usize = 100_000;
 /// Default maximum aggregate source bytes indexed from one workspace, every language
-/// together. The served index reads its own bound from `[source] workspace_size`.
-pub const WORKSPACE_BYTES_MAX_DEFAULT: usize = 128 * 1_024 * 1_024;
+/// together. The served index reads its own bound from `[source] workspace_size`; this
+/// restates that key's own default.
+pub const WORKSPACE_BYTES_MAX_DEFAULT: usize = 512 * 1_024 * 1_024;
+/// Default maximum declarations one workspace publication holds, every language together.
+/// The served index reads its own bound from `[source] declarations`; this restates that
+/// key's own default, and files whose declarations stand past it are left out of the index
+/// and named in the build's warnings.
+pub const WORKSPACE_DECLARATIONS_MAX_DEFAULT: usize = 1_000_000;
 /// Default maximum directory depth scanned from one workspace.
 pub const WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT: usize = 64;
 /// Default maximum results returned by one read query.
@@ -95,3 +102,30 @@ pub const RELEASE_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::f
 pub const REDIRECT_HOPS_MAX: usize = 5;
 /// Sole URL scheme accepted for release downloads and redirects.
 pub const HTTPS_SCHEME: &str = "https";
+
+#[cfg(test)]
+mod tests {
+    use rift_protocol::source::{
+        SOURCE_DECLARATIONS_DEFAULT, SOURCE_FILES_DEFAULT, SOURCE_WORKSPACE_BYTES_DEFAULT,
+    };
+
+    use super::{
+        WORKSPACE_BYTES_MAX_DEFAULT, WORKSPACE_DECLARATIONS_MAX_DEFAULT,
+        WORKSPACE_FILES_MAX_DEFAULT,
+    };
+
+    /// A `usize` constant cannot be written as the `u64` the table declares, so the two
+    /// spellings are pinned to each other here instead.
+    #[test]
+    fn test_workspace_defaults_match_the_source_table() {
+        assert_eq!(WORKSPACE_FILES_MAX_DEFAULT as u64, SOURCE_FILES_DEFAULT);
+        assert_eq!(
+            WORKSPACE_BYTES_MAX_DEFAULT as u64,
+            SOURCE_WORKSPACE_BYTES_DEFAULT
+        );
+        assert_eq!(
+            WORKSPACE_DECLARATIONS_MAX_DEFAULT as u64,
+            SOURCE_DECLARATIONS_DEFAULT
+        );
+    }
+}
