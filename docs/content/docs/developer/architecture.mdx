@@ -442,12 +442,12 @@ exclusion remains the way to keep such files out of the walk altogether.
 It ranks declaration names, signatures, documentation, declaration source, and file content
 from the index.
 
-#### One document, seven fields
+#### The document shape
 
 Every index publishes the same document shape, whether it holds the served project, a
 cataloged package, or a fixture a test built in memory. A document carries a stable identity,
 the project path or source unit it lives at, its language, its package when it came from one,
-a content digest, and seven searchable fields:
+a content digest, and the searchable fields below:
 
 | Field | What it holds | Weight |
 | --- | --- | --- |
@@ -475,7 +475,7 @@ terms were split with, the tokenizer, and the weights. A store stamped with anot
 holds rows this build cannot read, so it answers as if nothing had been published and the next
 publication replaces it.
 
-#### Two phases
+#### Query phases
 
 A caller's text is parsed once, into quoted phrases and unquoted terms, and every member is
 rendered as a quoted string literal, so an FTS operator a caller typed cannot become an
@@ -495,32 +495,31 @@ merged answer leaves the candidate pool short does the broad phase join, and its
 append after every precise one. One index's widened hit therefore cannot displace another
 index's exact hit.
 
-#### Three inputs, one fusion
+#### Ranking inputs and fusion
 
-Three rankings answer, and all three fuse together:
+The rankings below answer, and their answers fuse together:
 
 - **identifier matching** over the declaration names, for the identifiers the query carried;
-- **full-text matching** over the seven fields, by
+- **full-text matching** over the document's searchable fields, by
   [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) under the weights above;
 - **vector similarity** over the embedded declarations, when a model is configured and its
   vectors are in.
 
 The identifier input reads the query the way a reader would. The whole query counts when it is
 one identifier-shaped token, a dotted name buried in prose counts along with its final segment,
-and any token that splits into more than one word counts: `where does impact_radius get its
-depth` reaches `impact_radius` without the caller quoting it. A plain prose word contributes
+and any token that splits into more than one word counts: `where does encode_path get its
+escape set` reaches `encode_path` without the caller quoting it. A plain prose word contributes
 nothing here, because it reaches the full-text ranking through its own input.
 
-The three score in units nothing converts between: a match class, a BM25 rank, and a cosine.
-What all three agree on is the position they put a candidate in, so fusion reads positions
+Each ranking scores in units nothing converts between: a match class, a BM25 rank, and a
+cosine. What they agree on is the position they put a candidate in, so fusion reads positions
 alone and combines them by weighted reciprocal rank.
 [`[search.ranking]`](/docs/developer/configuration#search) carries that decision: `fusion_k`
 sets how sharply a top rank counts, and `identifier_weight`, `lexical_weight`, and
-`vector_weight` set each input's share. Only the inputs that answered take part, and their
-shares normalize against each other, so an unavailable vector ranking changes no order rather
-than shrinking every score by the share it would have carried. Several selected indexes may
-each contribute one kind; that kind's share then splits among them, so reaching for a package
-index does not double what full-text matching is worth.
+`vector_weight` set each input's share. Only the inputs that answered take part, so an
+unavailable vector ranking contributes nothing and leaves the order the other two state.
+Several selected indexes may each contribute one kind; that kind's share then splits among
+them, so reaching for a package index does not double what full-text matching is worth.
 
 Fusion holds no project path and resolves no symbol. It answers ordered identities, and the
 read path resolves them afterwards, which is what lets a package index rank source units
@@ -550,9 +549,9 @@ covers it.
 
 Every model runs through one contract, whether it is an encoder this process loaded or a
 service answering the OpenAI embedding shape. Rift keeps what that contract does not cover:
-acquiring the weights, running the local encoder on a blocking thread, cutting a pass into
-batches under `batch_inputs` and `max_in_flight`, and narrowing the coordinates to the stored
-format once at the boundary.
+acquiring the weights, cutting a pass into batches under
+[`batch_inputs` and `max_in_flight`](/docs/developer/configuration#search), and narrowing the
+coordinates to the stored format once at the boundary.
 
 Vectors are filed under the identity of the space they were embedded into: the source kind, the
 endpoint origin for a remote service, the model and its resolved revision, the width, and the
