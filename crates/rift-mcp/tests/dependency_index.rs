@@ -385,6 +385,14 @@ async fn a_global_search_answers_the_package_declaration_by_unit() -> TestResult
     // The precise phase places the declaration the query names; the widened phase
     // then fills the pool with the package's other `helper` declarations, which is
     // the same order the project's own store answers in.
+    assert_eq!(
+        results
+            .iter()
+            .filter_map(|hit| hit["hit"]["symbol"]["name"].as_str())
+            .collect::<Vec<&str>>(),
+        ["helper_beacon", "beacon", "helper_extra", "helper_lantern"],
+        "{answer:#}"
+    );
     let hit = &results[0];
     assert_one_location(hit);
     assert_eq!(hit["unit"], json!(HELPER_UNIT), "{hit:#}");

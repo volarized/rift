@@ -219,6 +219,9 @@ struct Measured {
     precise: usize,
     broad: usize,
     slowest_milliseconds: u128,
+    /// One line per case that left a wanted target unanswered, so a floor that
+    /// fails names the cases that lowered it rather than a number alone.
+    missed: Vec<String>,
 }
 
 impl Measured {
@@ -245,21 +248,20 @@ impl Measured {
 
 /// Runs one case's own assertions and answers the best position it reached.
 ///
-/// Every wanted target must be answered. An ordered expectation must be the head of the
-/// answer. An exact-name or exact-qualified-name case must answer its declaration first:
-/// that class is what a caller quoting a real name relies on, and it cannot regress.
-fn gated(case: &Case, wanted: &[String], answered: &[String]) -> usize {
+/// A target this case wanted and did not get is the recall floor's business, not an
+/// assertion here: asserting it would make recall and hit rate one by construction and
+/// leave their floors unable to fail. What is asserted here is order. An ordered
+/// expectation must be the head of the answer. An exact-name or exact-qualified-name
+/// case must answer its declaration first: that class is what a caller quoting a real
+/// name relies on, and it cannot regress.
+///
+/// A case that answered none of its targets reaches no position at all, which
+/// contributes nothing to the mean reciprocal rank.
+fn gated(case: &Case, wanted: &[String], answered: &[String]) -> Option<usize> {
     let found: Vec<usize> = wanted
         .iter()
         .filter_map(|target| answered.iter().position(|held| held == target))
         .collect();
-    assert_eq!(
-        found.len(),
-        wanted.len(),
-        "{} ({}): {wanted:?} must all be answered, got {answered:?}",
-        case.name,
-        case.class
-    );
     if let Some(ordered) = case.expect.as_ref() {
         let head: Vec<&String> = answered.iter().take(ordered.len()).collect();
         let expected: Vec<&String> = ordered.iter().collect();
@@ -277,7 +279,7 @@ fn gated(case: &Case, wanted: &[String], answered: &[String]) -> usize {
             case.name
         );
     }
-    found.into_iter().min().unwrap_or(usize::MAX)
+    found.into_iter().min()
 }
 
 /// The searchable field stored in `column`.
@@ -365,10 +367,10 @@ async fn the_committed_corpus_meets_its_retrieval_floors() -> TestResult {
             continue;
         }
         measured.answering += 1;
-        // Recall and hit rate are counted from what the answer actually carried, not
-        // from having reached this line. Incrementing them beside the assertion that
-        // every wanted target was answered would make both metrics exactly one by
-        // construction, and their floors unable to fail.
+        // Recall and hit rate are counted from what the answer actually carried. No
+        // assertion here requires every wanted target, because one would make both
+        // metrics exactly one by construction and leave their floors unable to fail:
+        // the floors are what gates recall, and a case that missed is named below.
         let found = wanted
             .iter()
             .filter(|target| answered.contains(target))
@@ -377,8 +379,14 @@ async fn the_committed_corpus_meets_its_retrieval_floors() -> TestResult {
         if found > 0 {
             measured.hits += 1;
         }
+        if found < wanted.len() {
+            measured.missed.push(format!(
+                "{} ({}): wanted {wanted:?}, answered {answered:?}",
+                case.name, case.class
+            ));
+        }
         let best = gated(case, &wanted, &answered);
-        measured.reciprocal_rank += 1.0 / (counted(best) + 1.0);
+        measured.reciprocal_rank += best.map_or(0.0, |position| 1.0 / (counted(position) + 1.0));
         assert!(
             elapsed <= QUERY_MILLISECONDS_MAX,
             "{}: one query took {elapsed}ms, past the {QUERY_MILLISECONDS_MAX}ms bound",
@@ -389,7 +397,7 @@ async fn the_committed_corpus_meets_its_retrieval_floors() -> TestResult {
             "{:<44} {:<26} rank={} precise={precise} broad={broad} {elapsed}ms",
             case.name,
             case.class,
-            best + 1
+            best.map_or_else(|| "none".to_owned(), |position| (position + 1).to_string())
         );
     }
 
@@ -413,13 +421,15 @@ async fn the_committed_corpus_meets_its_retrieval_floors() -> TestResult {
     );
     assert!(
         measured.recall() >= RECALL_MIN,
-        "recall {:.3} is below the {RECALL_MIN} floor",
-        measured.recall()
+        "recall {:.3} is below the {RECALL_MIN} floor; the cases that missed are {:#?}",
+        measured.recall(),
+        measured.missed
     );
     assert!(
         measured.hit_rate() >= HIT_RATE_MIN,
-        "hit rate {:.3} is below the {HIT_RATE_MIN} floor",
-        measured.hit_rate()
+        "hit rate {:.3} is below the {HIT_RATE_MIN} floor; the cases that missed are {:#?}",
+        measured.hit_rate(),
+        measured.missed
     );
     Ok(())
 }
@@ -608,10 +618,13 @@ async fn the_two_adapters_compute_one_value_at_every_column_weight() -> TestResu
     let directory = TempDir::new()?;
     let built = |identity: &str,
                  path: &str,
-                 field: SearchableField,
+                 columns: &[SearchableField],
                  value: &str|
      -> TestResult<IndexDocument> {
-        let fields = DocumentFields::empty().with(field, value);
+        let mut fields = DocumentFields::empty();
+        for field in columns {
+            fields = fields.with(*field, value);
+        }
         let digest = fields.digest();
         Ok(IndexDocument::new(
             DocumentIdentity::new(identity)?,
@@ -630,15 +643,25 @@ async fn the_two_adapters_compute_one_value_at_every_column_weight() -> TestResu
         documents.push(built(
             &format!("carrier-{index}"),
             &format!("src/{index}.rs"),
-            field,
+            &[field],
             "beacon",
         )?);
     }
+    // One document carrying the term in every column at once. FTS5 sums the
+    // weighted counts across the columns before it saturates, so a document that
+    // matched in several columns separates summing from taking the largest; the
+    // per-column documents above cannot.
+    documents.push(built(
+        "carrier-all",
+        "src/all.rs",
+        &SearchableField::ALL,
+        "beacon",
+    )?);
     for index in 0..4 {
         documents.push(built(
             &format!("filler-{index}"),
             &format!("src/filler-{index}.rs"),
-            SearchableField::Name,
+            &[SearchableField::Name],
             "unrelated",
         )?);
     }
@@ -656,8 +679,8 @@ async fn the_two_adapters_compute_one_value_at_every_column_weight() -> TestResu
     let scored = memory.scored(&parsed, QueryPhase::Precise);
     assert_eq!(
         ranking.matches().len(),
-        SearchableField::ALL.len(),
-        "one document per column answers"
+        SearchableField::ALL.len() + 1,
+        "one document per column answers, and one carrying every column"
     );
     assert_eq!(ranking.matches().len(), scored.len());
     for (matched, (identity, score)) in ranking.matches().iter().zip(&scored) {
