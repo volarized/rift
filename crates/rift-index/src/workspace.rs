@@ -1517,7 +1517,7 @@ impl WorkspaceIndex {
         let mut documents = Vec::with_capacity(self.files.len() + self.text_files.len());
         for file in self.files() {
             for symbol in file.syntax().symbols() {
-                documents.push(symbol_document(file, symbol));
+                documents.extend(symbol_document(file, symbol));
             }
         }
         for file in self.text_files() {
@@ -1586,7 +1586,7 @@ impl WorkspaceIndex {
         for path in paths {
             if let Some(file) = self.files.get(path) {
                 for symbol in file.syntax().symbols() {
-                    units.push(symbol_document(file, symbol));
+                    units.extend(symbol_document(file, symbol));
                 }
             }
             if let Some(file) = self.text_files.get(path) {
@@ -2957,7 +2957,7 @@ pub fn declaration_identity(matched: SymbolMatch<'_>) -> DocumentIdentity {
 /// Every field a provider published lands in its own column. A provider that publishes
 /// no signature leaves that field absent rather than filling it with the declaration's
 /// source, so the two are weighed apart.
-fn symbol_document(file: &IndexedFile, symbol: &SyntaxSymbol) -> IndexDocument {
+fn symbol_document(file: &IndexedFile, symbol: &SyntaxSymbol) -> Option<IndexDocument> {
     let identity = rift_core::symbol_identity(
         &file.syntax().language().identity_segment(),
         file.path().as_str(),
@@ -3048,29 +3048,45 @@ fn bounded_field(value: &str, bytes_max: usize) -> String {
     value[..end].to_owned()
 }
 
-/// Assembles one project document, naming the failure mode this crate guarantees never
-/// fires: every identity built here is non-empty, and every field was already cut to its
-/// own bound.
+/// Assembles one project document, or leaves it out when its address or one of its short
+/// fields runs past what the document shape accepts.
+///
+/// Percent-encoding can widen a path or a qualified name past the wire's own address
+/// ceiling, so this is reachable from a legal workspace rather than a programmer error.
+/// The file keeps answering `get_symbol` and identifier search; only its place in the
+/// searchable corpus is absent, and the log says which path lost it. A package index
+/// leaves an oversized document out the same way.
 fn document(
     identity: String,
     path: &ProjectPath,
     kind: DocumentKind,
     fields: DocumentFields,
-) -> IndexDocument {
-    let identity = DocumentIdentity::new(identity).unwrap_or_else(|error| {
-        unreachable!("an index document's identity must be non-empty: error={error}")
-    });
+) -> Option<IndexDocument> {
     let digest = fields.digest();
-    IndexDocument::new(
-        identity,
-        DocumentLocation::Project(path.clone()),
-        kind,
-        digest,
-        fields,
-    )
-    .unwrap_or_else(|error| {
-        unreachable!("every document field must be within its own bound: error={error}")
-    })
+    let built = DocumentIdentity::new(identity).and_then(|identity| {
+        IndexDocument::new(
+            identity,
+            DocumentLocation::Project(path.clone()),
+            kind,
+            digest,
+            fields,
+        )
+    });
+    match built {
+        Ok(document) => Some(document),
+        Err(error) => {
+            tracing::warn!(
+                component = "index",
+                operation = "index.build",
+                path = path.as_str(),
+                error = %error,
+                "declaration left out of the search index: its address or one of its \
+                 fields runs past the document shape; the file still answers get_symbol \
+                 and identifier search"
+            );
+            None
+        }
+    }
 }
 
 /// The final segment of `path`, including its extension, when it has one.
@@ -3113,7 +3129,7 @@ fn push_text_documents(
 ) {
     let name = file_name(file.path());
     if !exceeds_chunk_bound(file.content().len(), chunk_bytes_max) {
-        documents.push(text_document(
+        documents.extend(text_document(
             file.path().as_str().to_owned(),
             file,
             name.as_deref(),
@@ -3134,7 +3150,7 @@ fn push_text_documents(
         }
         previous_offset = Some(chunk.byte_offset());
         let identity = format!("{}#{index}", file.path().as_str());
-        documents.push(text_document(
+        documents.extend(text_document(
             identity,
             file,
             name.as_deref(),
@@ -3151,7 +3167,7 @@ fn text_document(
     file: &TextSourceFile,
     name: Option<&str>,
     content: &str,
-) -> IndexDocument {
+) -> Option<IndexDocument> {
     let terms = name.map_or_else(String::new, |name| {
         identifier_terms([name], IDENTIFIER_TERMS_BYTES_MAX)
     });
@@ -6390,19 +6406,52 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "an index document's identity must be non-empty")]
-    fn test_push_text_documents_of_root_path_panics_on_empty_identity() {
-        // `ProjectPath::new("")` is valid and names the workspace root, so a whole-file text
-        // unit for it builds its identity from that empty path, which `LexicalUnit::new`
-        // refuses: this invariant must never fire for a real discovered path.
+    fn test_a_document_the_shape_refuses_is_left_out_rather_than_failing_the_build() {
+        // `ProjectPath::new("")` is valid and names the workspace root, so a whole-file
+        // document for it builds its identity from that empty path, which the document
+        // shape refuses. A refusal leaves the document out; it does not stop the build,
+        // because one such path would otherwise cost the workspace its whole index.
         let file = TextSourceFile {
             path: ProjectPath::new("").expect("an empty project path names the workspace root"),
             digest: FileDigest::of(b"hello"),
             content: "hello".to_owned(),
             executable: false,
         };
-        let mut units = Vec::new();
-        push_text_documents(&mut units, &file, 1_024);
+        let mut documents = Vec::new();
+        push_text_documents(&mut documents, &file, 1_024);
+        assert!(
+            documents.is_empty(),
+            "a refused document is left out, not published"
+        );
+    }
+
+    #[test]
+    fn test_a_path_the_wire_can_address_publishes_a_document() {
+        // The document shape's address ceiling is the wire's own, so a path at the
+        // longest a project path may be still publishes. A shorter ceiling here would
+        // leave a legal file out of the corpus.
+        let deep = std::iter::repeat_n("d".repeat(49), 19)
+            .collect::<Vec<_>>()
+            .join("/");
+        let path = format!("{deep}/notes.md");
+        assert!(
+            path.len() > 512,
+            "the fixture path must be longer than a short address ceiling: {}",
+            path.len()
+        );
+        let file = TextSourceFile {
+            path: ProjectPath::new(path).expect("a long project path is legal"),
+            digest: FileDigest::of(b"hello"),
+            content: "hello".to_owned(),
+            executable: false,
+        };
+        let mut documents = Vec::new();
+        push_text_documents(&mut documents, &file, 1_024);
+        assert_eq!(
+            documents.len(),
+            1,
+            "a legal path publishes rather than being left out"
+        );
     }
 
     /// A workspace whose `src/lib.rs` calls a function `src/run.rs` defines.

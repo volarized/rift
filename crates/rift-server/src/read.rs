@@ -1332,8 +1332,9 @@ pub(crate) fn page<T>(results: Vec<T>, page_index: u64, limit: usize) -> (Vec<T>
     (window, pagination)
 }
 
-/// The warning a result set that reached `results_max` carries: hits past that bound
-/// never reach a page, so the caller narrows the request rather than paging on.
+/// The warning a read that reached `results_max` carries: whatever the bound cut,
+/// a candidate before ranking or a hit after it, never reaches a page, so the
+/// caller narrows the request rather than paging on.
 pub(crate) fn results_truncation_warning(results_max: usize) -> ReadWarning {
     ReadWarning::ResultsTruncated {
         results_max: u64::try_from(results_max).unwrap_or(u64::MAX),

@@ -938,18 +938,28 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
+    /// The query carried more terms and quoted phrases than `terms_max`, so the server
+    /// dropped the shortest unquoted terms and ranked the answer by the rest. Every
+    /// quoted phrase is kept. Shorten `query`, or quote the terms that must be matched.
+    QueryNarrowed {
+        /// Terms and quoted phrases the query was cut to: the server's bound on one
+        /// parsed query.
+        terms_max: u64,
+    },
     /// The lexical ranking stopped at `matches_max` units; hits past it never reached the
     /// page, whatever `paths` selects. Narrow `query`.
     LexicalRankingTruncated {
         /// Units the ranking stopped at: the server's bound on one lexical ranking.
         matches_max: u64,
     },
-    /// The result set reached `results_max` hits, the server's result bound, before
-    /// ordering and paging: hits past it never reach any page, and `total_pages` counts
-    /// only what fit. The warning means the bound was reached; a set of exactly
-    /// `results_max` hits carries it too. Narrow `query` or `paths`.
+    /// The server reached `results_max`, its result bound, before ordering and paging:
+    /// what the bound cut never reaches any page, and `total_pages` counts only what fit.
+    /// The bound cuts the ranked candidates and the hit set alike. The warning means the
+    /// bound was reached; a set of exactly `results_max` hits carries it too. Narrow
+    /// `query` or `paths`.
     ResultsTruncated {
-        /// Hits the result set stopped at: the server's bound on one read's result set.
+        /// The bound the read stopped at: the server's limit on both the candidates one
+        /// read ranks and the hits it returns.
         results_max: u64,
     },
     /// A claimed file is left out of the index - its bytes are not valid UTF-8, or it
@@ -2298,6 +2308,15 @@ mod tests {
     }
 
     #[test]
+    fn the_query_narrowing_warning_round_trips_under_its_code_tag() {
+        let warning = ReadWarning::QueryNarrowed { terms_max: 32 };
+        let wire = json!({ "code": "query_narrowed", "terms_max": 32 });
+        assert_eq!(serde_json::to_value(&warning).expect("serialize"), wire);
+        let parsed: ReadWarning = serde_json::from_value(wire).expect("deserialize");
+        assert_eq!(parsed, warning);
+    }
+
+    #[test]
     fn the_lexical_truncation_warning_round_trips_under_its_code_tag() {
         let warning = ReadWarning::LexicalRankingTruncated { matches_max: 1_000 };
         let wire = json!({ "code": "lexical_ranking_truncated", "matches_max": 1_000 });
@@ -2361,6 +2380,7 @@ mod tests {
             "vector_index_preparing",
             "vector_ranking_unavailable",
             "lexical_ranking_unavailable",
+            "query_narrowed",
             "lexical_ranking_truncated",
             "results_truncated",
             "source_unavailable",

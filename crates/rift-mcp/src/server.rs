@@ -946,14 +946,22 @@ struct SearchRanking {
 }
 
 impl SearchRanking {
-    /// No ranking at all, for the reason `detail` states. The identifier ranking then
-    /// answers alone.
-    fn unavailable(detail: &str) -> Self {
+    /// No store ranking, for the reason `detail` states. The identifier ranking answers,
+    /// and so does any selected package index, under the shares `weights` carries.
+    fn unavailable(detail: &str, weights: RankingWeights) -> Self {
         Self {
-            answer: StoreAnswer::identifier_only(),
+            answer: StoreAnswer::without_store(weights),
             warnings: vec![ReadWarning::LexicalRankingUnavailable {
                 detail: detail.to_owned(),
             }],
+        }
+    }
+
+    /// No store ranking and no reason to report: the request never consulted the store.
+    fn without_store(weights: RankingWeights) -> Self {
+        Self {
+            answer: StoreAnswer::without_store(weights),
+            warnings: Vec::new(),
         }
     }
 }
@@ -984,28 +992,36 @@ fn ranking_of(
                 warnings,
             })
         }
-        (_, LexicalCommitState::Committing) => Some(SearchRanking::unavailable(&format!(
-            "the lexical index is still committing tree revision {tree_revision}, so the \
-             answer was ranked by identifier matching alone; resend the request once the \
-             commit lands"
-        ))),
-        (_, LexicalCommitState::Owed { cause }) => {
-            Some(SearchRanking::unavailable(&bounded_detail(
+        (_, LexicalCommitState::Committing) => Some(SearchRanking::unavailable(
+            &format!(
+                "the lexical index is still committing tree revision {tree_revision}, so the \
+                 answer was ranked by identifier matching alone; resend the request once the \
+                 commit lands"
+            ),
+            weights,
+        )),
+        (_, LexicalCommitState::Owed { cause }) => Some(SearchRanking::unavailable(
+            &bounded_detail(
                 format!(
                     "the lexical index missed a commit and replaces its whole unit set under \
                      the next publication, so the answer for tree revision {tree_revision} \
                      was ranked by identifier matching alone: {cause}"
                 ),
                 WARNING_DETAIL_BYTES_MAX,
-            )))
-        }
+            ),
+            weights,
+        )),
         (RevisionScoped::OtherRevision(_), LexicalCommitState::Settled) => None,
         (RevisionScoped::NoRevision, LexicalCommitState::Settled) => {
-            Some(SearchRanking::unavailable(&format!(
-                "the lexical index holds no indexed tree and no commit is under way for tree \
-                 revision {tree_revision}, so the answer was ranked by identifier matching \
-                 alone; rift://logs names what the lexical lane did, and a restart retries it"
-            )))
+            Some(SearchRanking::unavailable(
+                &format!(
+                    "the lexical index holds no indexed tree and no commit is under way for \
+                     tree revision {tree_revision}, so the answer was ranked by identifier \
+                     matching alone; rift://logs names what the lexical lane did, and a \
+                     restart retries it"
+                ),
+                weights,
+            ))
         }
     }
 }
@@ -1628,6 +1644,7 @@ impl RiftMcp {
                  request captured, and the workspace kept publishing across the bounded \
                  attempts, so the answer was ranked by identifier matching alone; resend \
                  the request once the rebuilds settle",
+                self.ranking_weights,
             )
         });
         let executed = params;
@@ -1730,14 +1747,18 @@ impl RiftMcp {
         published: &PublishedWorkspace,
         budget: Duration,
     ) -> Result<Option<SearchRanking>, ErrorData> {
+        // A global scope never consults the project store, and a selected package index
+        // answers the full-text input from its own documents, so the shares stay what the
+        // operator configured.
         if params.scope == SearchScope::Global {
-            return Ok(Some(SearchRanking::default()));
+            return Ok(Some(SearchRanking::without_store(self.ranking_weights)));
         }
         let Some(index) = self.search_index.as_ref() else {
             return Ok(Some(SearchRanking::unavailable(
                 "the workspace search database could not be opened, so the answer was ranked \
                  by identifier matching alone; the server log names the open failure, and a \
                  restart retries it",
+                self.ranking_weights,
             )));
         };
         // An absent or empty query is refused by `ReadService::search` itself; warning
@@ -1811,6 +1832,11 @@ impl RiftMcp {
     }
 
     /// One phase of the store's ranking for `tree_revision`.
+    ///
+    /// The record this raises carries the query's shape and never its text: the
+    /// byte length, how many members the parser kept, whether it narrowed, and
+    /// which phase ran. It is a `debug` record, so an operator who wants it
+    /// widens the `[logs]` capture filter; the default keeps `info`.
     async fn run_phase(
         &self,
         index: &SearchIndex,
@@ -1818,6 +1844,15 @@ impl RiftMcp {
         query: &ParsedQuery,
         phase: QueryPhase,
     ) -> Result<RevisionScoped<StoreRanking>, ErrorData> {
+        tracing::debug!(
+            component = "search",
+            operation = "search.rank",
+            phase = phase.label(),
+            query_bytes = query.source().len(),
+            members = query.members().len(),
+            narrowed = query.is_narrowed(),
+            "ranking the full-text store for one query phase"
+        );
         index
             .rank(tree_revision, query, phase, self.fetch_limit())
             .await
@@ -5285,6 +5320,65 @@ mod tests {
         Ok(())
     }
 
+    /// The record one ranked phase raises says what the query was shaped like and
+    /// never what it said. An operator reading `rift://logs` learns the phase, the
+    /// byte length, the member count, and whether the parser narrowed; the caller's
+    /// own words stay out of the store.
+    #[tokio::test]
+    async fn a_ranked_phase_records_the_query_shape_and_not_its_text() -> TestResult {
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        /// A term no fixture source carries, so finding it in the store would mean
+        /// the record carried the caller's text.
+        const SECRET_TERM: &str = "zzquixotic";
+
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "")?;
+
+        let (sink, drain) = crate::logs::log_capture();
+        let filter = tracing_subscriber::EnvFilter::try_new("rift_mcp=debug")?;
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(sink.with_filter(filter)),
+        );
+        let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
+        let store = storage.logs().ok_or("the log store must open")?;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let drain_task = tokio::spawn(drain.run(store, 10_000, cancellation.clone()));
+        let server =
+            RiftMcp::build_with_storage(directory.path(), WorkspaceIndexLimits::default(), storage)
+                .await?;
+
+        let _answered = run_search(&server, SECRET_TERM).await?;
+        let logs = server.read_logs("rift://logs/component/search").await?;
+        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = logs
+            .contents
+            .first()
+            .ok_or("a log read answers with one content")?
+        else {
+            return Err("a log read answers with text".into());
+        };
+        let answered = text.clone();
+
+        cancellation.cancel();
+        drain_task.await?;
+        assert!(
+            answered.contains("ranking the full-text store for one query phase"),
+            "the ranked phase raises its own record: {answered}"
+        );
+        assert!(
+            answered.contains("precise") && answered.contains("query_bytes"),
+            "the record carries the phase and the query's byte length: {answered}"
+        );
+        assert!(
+            !answered.contains(SECRET_TERM),
+            "the record must not carry the caller's own text: {answered}"
+        );
+        Ok(())
+    }
+
     /// One declaration's content past the lexical unit bound leaves the lexical index
     /// alone: the publication lands, the sibling answers `search`, the declaration still
     /// answers `get_symbol`, and the record names the file. The lexical commit runs on
@@ -5898,13 +5992,25 @@ mod tests {
     }
 
     #[test]
-    fn an_absent_store_warns_lexical_ranking_unavailable() -> TestResult {
-        let ranking = super::SearchRanking::unavailable("the database could not be opened");
+    fn an_absent_store_warns_lexical_ranking_unavailable_and_keeps_the_shares() -> TestResult {
+        let configured = super::ranking_weights(&shipped_search_configuration());
+        let ranking =
+            super::SearchRanking::unavailable("the database could not be opened", configured);
         let warnings = serde_json::to_value(&ranking.warnings)?;
         assert_eq!(warnings[0]["code"], json!("lexical_ranking_unavailable"));
         assert_eq!(
             warnings[0]["detail"],
             json!("the database could not be opened")
+        );
+        // A selected package index still answers the full-text input, so an absent
+        // project store must not take that share away from it.
+        assert!(
+            ranking
+                .answer
+                .weights()
+                .share(rift_ranking::RankingInputKind::Lexical)
+                > 0.0,
+            "the operator's full-text share survives an absent store"
         );
         Ok(())
     }

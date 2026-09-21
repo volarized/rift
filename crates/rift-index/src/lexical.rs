@@ -1249,6 +1249,13 @@ impl LexicalSearchIndex {
         phase: QueryPhase,
         limit: u32,
     ) -> Result<RevisionScoped<LexicalRanking>, LexicalIndexError> {
+        // The statement carries no path predicate. A caller narrowing by path
+        // screens the ranked identities it reads back, because the request's
+        // glob selector and this statement would be two spellings of one
+        // predicate, in two languages, that can disagree. What the caller pays
+        // is a query whose matches all sit outside its selector: the bound cuts
+        // before the screen runs, the answer is short, and `results_truncated`
+        // says the bound cut it.
         let expression = query.render(phase);
         let bound = limit.min(self.limits.matches_max());
         // One row past the bound tells whether the store holds a match the bound cuts.
@@ -1450,7 +1457,7 @@ impl IndexReader for PublishedIndex<'_> {
             {
                 Ok(RevisionScoped::Matched(input)) => Ok(input),
                 Ok(_) => Ok(RankingInput::unanswered(request.input())),
-                Err(error) => Err(reader_refused(&error)),
+                Err(error) => Err(reader_refused(error)),
             }
         })
     }
@@ -1459,24 +1466,18 @@ impl IndexReader for PublishedIndex<'_> {
         &'a self,
         identity: &'a DocumentIdentity,
     ) -> ReaderFuture<'a, Result<Option<IndexDocument>, RankingError>> {
-        Box::pin(async move {
-            self.store
-                .document(identity)
-                .await
-                .map_err(|error| reader_refused(&error))
-        })
+        Box::pin(async move { self.store.document(identity).await.map_err(reader_refused) })
     }
 }
 
 /// One store refusal, as the shared contract's own.
 ///
-/// The contract is storage-independent, so it cannot carry this store's violation. What
-/// it carries instead is the rendered cause, which is what a reader comparing two adapters
-/// needs to see.
-fn reader_refused(error: &LexicalIndexError) -> RankingError {
-    RankingError::new(
-        RankingFault::new(RankingViolation::CapabilitiesIncompatible).about(error.to_string()),
-    )
+/// The contract is storage-independent, so it cannot restate this store's violation. What
+/// it does carry is the failure itself, on the source chain, so a caller still reaches the
+/// driver text and the classification the store gave it. Reporting a disk failure as a
+/// capability mismatch would send that caller to compare two publications instead.
+fn reader_refused(error: LexicalIndexError) -> RankingError {
+    RankingError::new(RankingFault::new(RankingViolation::ReaderFailed).caused_by(error))
 }
 
 #[cfg(test)]
@@ -1725,21 +1726,32 @@ mod tests {
     }
 
     #[test]
-    fn test_the_corpus_migration_declares_the_columns_the_ranking_weighs() {
+    fn test_the_corpus_migration_declares_the_columns_in_the_order_bm25_weighs_them() {
         let migration = MIGRATION_FILES
             .iter()
             .find(|file| file.name() == "lexical_documents")
             .expect("the corpus migration must exist");
         let sql = migration.sql().replace('\n', " ");
-        for field in SearchableField::ALL {
-            assert!(
-                sql.contains(field.column()),
-                "the FTS table must declare {}",
-                field.column()
-            );
-        }
+        // `bm25`'s weights are positional, and the weight list is generated from
+        // `SearchableField::ALL` while this declaration is written by hand. Asserting
+        // that each name appears somewhere would pass on a reordered declaration,
+        // because the typed table names the same columns in the same string.
+        let declared = sql
+            .split_once("USING fts5(")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(columns, _)| columns.to_owned())
+            .expect("the migration must declare one FTS5 virtual table");
+        let expected = std::iter::once("identity UNINDEXED".to_owned())
+            .chain(SearchableField::ALL.map(|field| field.column().to_owned()))
+            .collect::<Vec<_>>()
+            .join(", ");
         assert!(
-            sql.contains(CORPUS_TOKENIZER),
+            declared.starts_with(&expected),
+            "the FTS columns must be declared in the order the weights are rendered:\n\
+             declared {declared}\nexpected {expected}"
+        );
+        assert!(
+            declared.contains(CORPUS_TOKENIZER),
             "the FTS table must declare the corpus tokenizer: {CORPUS_TOKENIZER}"
         );
     }

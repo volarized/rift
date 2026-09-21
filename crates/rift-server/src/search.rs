@@ -23,8 +23,9 @@ use rift_protocol::read::{
 };
 use rift_ranking::{
     DocumentIdentity, DocumentKind, DocumentLocation, FusedCandidate, IdentifierMatchClass,
-    IdentifierRanking, IndexDocument, ParsedQuery, QueryPhase, RankedCandidates, RankingInput,
-    RankingWeights, SearchableField, fuse,
+    IdentifierRanking, IndexDocument, PARSED_QUERY_MEMBERS_MAX, ParsedQuery, QueryPhase,
+    RankRequest, RankedCandidates, RankingInput, RankingInputKind, RankingWeights, SearchableField,
+    fuse,
 };
 use rift_search::{Declaration, DescribedUnit};
 use rift_syntax::{ByteRange, SyntaxSymbol};
@@ -71,8 +72,23 @@ impl StoreAnswer {
         }
     }
 
-    /// No store answer at all: the identifier ranking is the only input, so it carries
-    /// the whole share whatever the operator configured.
+    /// No store answer, under the operator's own shares.
+    ///
+    /// The project's full-text store contributed nothing, but a selected package index
+    /// answers that input from its own documents, so the shares stay what
+    /// `[search.ranking]` states rather than collapsing onto identifier matching.
+    #[must_use]
+    pub const fn without_store(weights: RankingWeights) -> Self {
+        Self {
+            precise: Vec::new(),
+            broad: Vec::new(),
+            weights,
+        }
+    }
+
+    /// No store answer and no other index that could give one: the identifier ranking
+    /// is the only input there is, so it carries the whole share whatever the operator
+    /// configured.
     #[must_use]
     pub fn identifier_only() -> Self {
         Self {
@@ -114,6 +130,15 @@ impl Default for StoreAnswer {
 /// at all come from one value.
 fn parsed_query(query: &str) -> Result<ParsedQuery, ReadError> {
     ParsedQuery::parse(query).map_err(|error| ReadFault::invalid("query", error.detail()))
+}
+
+/// The warning a query the parser narrowed carries: the terms the bound dropped matched
+/// nothing, so the caller shortens the question rather than reading the answer as though
+/// every term had been asked for.
+fn query_narrowing_warning() -> ReadWarning {
+    ReadWarning::QueryNarrowed {
+        terms_max: u64::try_from(PARSED_QUERY_MEMBERS_MAX).unwrap_or(u64::MAX),
+    }
 }
 
 impl ReadService {
@@ -181,14 +206,18 @@ impl ReadService {
         let mut warnings = self.warnings();
         warnings.extend(selected.warnings());
         warnings.extend(references.analysis_unavailable().cloned());
+        let mut ranked_truncated_at = None;
         if let Some(query) = query {
             let parsed = parsed_query(query)?;
+            if parsed.is_narrowed() {
+                warnings.push(query_narrowing_warning());
+            }
             let criteria = SearchCriteria {
-                query,
+                query: &parsed,
                 target: params.target,
                 payloads,
             };
-            self.collect_query_hits(
+            ranked_truncated_at = self.collect_query_hits(
                 criteria,
                 params.scope,
                 &selected,
@@ -217,7 +246,11 @@ impl ReadService {
                 &mut results,
             )?;
         }
-        let results_max_reached = order_and_bound_hits(&mut results, params.order, fetch_limit);
+        // Either bound reaching `results_max` costs the caller the same hits, so the two
+        // carry one warning: the candidate pool cut before resolution, and the hit set
+        // cut after it.
+        let results_max_reached =
+            order_and_bound_hits(&mut results, params.order, fetch_limit).or(ranked_truncated_at);
         let (mut results, pagination) = page(results, params.page_index, limit);
         populate_symbol_lines(&mut results, self.index(), selected.force_include.as_ref())?;
         if !payloads.score {
@@ -312,12 +345,17 @@ impl ReadService {
         })
     }
 
-    /// Fuses the three ranking inputs for one `query` and resolves what they ordered.
+    /// Fuses the three ranking inputs for one `query` and resolves what they ordered,
+    /// answering the candidate bound when fusion stopped at it.
     ///
     /// The precise phase runs first, over the identifier ranking this method builds and
     /// whatever the store answered. The broad phase joins it only when the precise
     /// answer left the candidate pool short, and its identities append after the precise
     /// ones, so one index's widened hit can never displace another index's exact hit.
+    ///
+    /// Every input is screened by the request's own `paths` and `target` filters before
+    /// it is fused, so a candidate the request cannot answer never occupies a slot in the
+    /// bounded pool.
     fn collect_query_hits(
         &self,
         criteria: SearchCriteria<'_>,
@@ -326,7 +364,7 @@ impl ReadService {
         (query, store): (&ParsedQuery, &StoreAnswer),
         dependencies: Option<&DependencyIndex>,
         results: &mut Vec<SearchHit>,
-    ) -> Result<(), ReadError> {
+    ) -> Result<Option<usize>, ReadError> {
         let index = self.index();
         let root = index.root();
         let matcher = selected.matcher.as_ref();
@@ -338,6 +376,17 @@ impl ReadService {
                 .flatten(),
             packages: dependencies,
         };
+        let resolution = Resolution {
+            force_include: sources.force_include,
+            packages: dependencies,
+        };
+        let screen = CandidateScreen {
+            index,
+            matcher,
+            root,
+            target: criteria.target,
+            resolution,
+        };
         let mut inputs = vec![identifier_input(
             index,
             matcher,
@@ -347,21 +396,39 @@ impl ReadService {
             fetch_limit,
         )?];
         inputs.extend(store.precise().iter().cloned());
-        let mut ranked = fuse(&inputs, store.weights(), QueryPhase::Precise, fetch_limit);
-        if ranked.len() < fetch_limit && !store.broad().is_empty() {
-            let widened = fuse(
-                store.broad(),
+        inputs.extend(package_inputs(
+            dependencies,
+            query,
+            QueryPhase::Precise,
+            fetch_limit,
+        ));
+        let mut ranked = fuse(
+            &screen.screened(&inputs),
+            store.weights(),
+            QueryPhase::Precise,
+            fetch_limit,
+        );
+        // The widened inputs are built only when the precise phase came up short,
+        // because ranking every package's documents again is work the full pool
+        // would throw away.
+        if ranked.len() < fetch_limit {
+            let mut widened: Vec<RankingInput> = store.broad().to_vec();
+            widened.extend(package_inputs(
+                dependencies,
+                query,
+                QueryPhase::Broad,
+                fetch_limit,
+            ));
+            let broad = fuse(
+                &screen.screened(&widened),
                 store.weights(),
                 QueryPhase::Broad,
                 fetch_limit,
             );
-            ranked.append_phase(widened, fetch_limit);
+            ranked.append_phase(broad, fetch_limit);
         }
-        let resolution = Resolution {
-            force_include: sources.force_include,
-            packages: dependencies,
-        };
-        resolve_ranked_hits(index, matcher, root, criteria, resolution, &ranked, results)
+        resolve_ranked_hits(index, criteria, resolution, &ranked, results)?;
+        Ok(ranked.truncated_at())
     }
 
     /// Derives the lexical write one change set owes: the paths whose stored units go, and
@@ -481,7 +548,7 @@ impl HitPayloads {
 /// units.
 #[derive(Clone, Copy, Debug)]
 struct SearchCriteria<'a> {
-    query: &'a str,
+    query: &'a ParsedQuery,
     target: SearchParamsTarget,
     payloads: HitPayloads,
 }
@@ -710,6 +777,41 @@ fn identifier_input(
     Ok(ranking.into_input(bound))
 }
 
+/// The full-text ranking every held package answers, one input per package.
+///
+/// A package holds its documents in memory and ranks them through the shared
+/// reader contract, so a package declaration reaches an answer by its
+/// documentation and its source as well as by its name. Every package answers
+/// the same kind, so fusion splits what full-text matching is worth among
+/// them rather than letting a wide dependency outvote the project.
+///
+/// The work is one pass over each package's own documents, each bounded by the
+/// declarations that package published, and the answer is cut to `bound`.
+fn package_inputs(
+    dependencies: Option<&DependencyIndex>,
+    query: &ParsedQuery,
+    phase: QueryPhase,
+    bound: usize,
+) -> Vec<RankingInput> {
+    let Some(dependencies) = dependencies else {
+        return Vec::new();
+    };
+    if phase == QueryPhase::Broad && !query.has_broad_phase() {
+        return Vec::new();
+    }
+    dependencies
+        .packages()
+        .map(|package| {
+            package.reader().ranked(RankRequest::new(
+                query,
+                RankingInputKind::Lexical,
+                phase,
+                bound,
+            ))
+        })
+        .collect()
+}
+
 /// Which indexes the identifier ranking reads.
 #[derive(Clone, Copy)]
 struct IdentifierSources<'a> {
@@ -725,17 +827,65 @@ fn package_symbol_identity(found: &DependencySymbolMatch<'_>) -> Option<Document
     DocumentIdentity::for_unit(unit, &found.matched.symbol.qualified_name).ok()
 }
 
+/// The request's own filters, applied to a ranked identity before it is fused.
+///
+/// A candidate the request cannot answer must not occupy a slot in the bounded candidate
+/// pool. `results_max` full-text matches outside the `paths` selector would otherwise
+/// fill that pool, leave the matches inside the selector unranked, and answer nothing;
+/// the same holds for a pool of declarations under `target: "file"`, which also skips the
+/// broad phase because the pool came back full.
+///
+/// The screen is the one place those filters run, so a filter cannot be applied to one
+/// input and forgotten on another. Each identity costs one resolution against the
+/// selected indexes, and every input the store and the identifier ranking answer with is
+/// already bounded by `results_max`.
+#[derive(Clone, Copy)]
+struct CandidateScreen<'a> {
+    index: &'a WorkspaceIndex,
+    matcher: Option<&'a PathMatcher>,
+    root: &'a Path,
+    target: SearchParamsTarget,
+    resolution: Resolution<'a>,
+}
+
+impl CandidateScreen<'_> {
+    /// `inputs` with every identity this request's filters exclude removed, each input
+    /// keeping the order it answered in. An input screened down to nothing no longer
+    /// answers, so fusion redistributes its share across the inputs that did.
+    fn screened(&self, inputs: &[RankingInput]) -> Vec<RankingInput> {
+        inputs
+            .iter()
+            .map(|input| {
+                let order = input
+                    .order()
+                    .iter()
+                    .filter(|ranked| self.admits(ranked.identity()))
+                    .cloned()
+                    .collect();
+                RankingInput::new(input.kind(), order)
+            })
+            .collect()
+    }
+
+    /// Whether this request answers `identity`. It does not when no selected index holds
+    /// it, when the `paths` selector excludes the path it names, or when `target`
+    /// excludes the kind it names.
+    fn admits(&self, identity: &DocumentIdentity) -> bool {
+        resolve_candidate(self.index, self.resolution, identity).is_some_and(|resolved| {
+            resolved.reaches(self.index, self.matcher, self.root) && resolved.answers(self.target)
+        })
+    }
+}
+
 /// Resolves every fused identity into a hit, in the order fusion produced.
 ///
 /// Resolution reads the identity alone: a `rift://symbol/` address names a project or
 /// `force_include` declaration, a `rift://source/` address names a package declaration,
 /// and anything else is a project path, optionally carrying the chunk index a large text
-/// file was split at. An identity nothing resolves is skipped: the store ranked a
-/// publication this snapshot has already moved past.
+/// file was split at. [`CandidateScreen`] resolved each identity once already, so the
+/// identities that reach here are the ones this snapshot holds and this request answers.
 fn resolve_ranked_hits(
     index: &WorkspaceIndex,
-    matcher: Option<&PathMatcher>,
-    root: &Path,
     criteria: SearchCriteria<'_>,
     resolution: Resolution<'_>,
     ranked: &RankedCandidates,
@@ -746,12 +896,6 @@ fn resolve_ranked_hits(
         let Some(resolved) = resolve_candidate(index, resolution, candidate.identity()) else {
             continue;
         };
-        if !resolved.reaches(index, matcher, root) {
-            continue;
-        }
-        if !resolved.answers(criteria.target) {
-            continue;
-        }
         // A text file past the chunk bound publishes one document per chunk, and each
         // carries its own identity through fusion. The answer names files, not chunks,
         // so the best-ranked chunk is the one that becomes the hit and the rest of that
@@ -963,20 +1107,29 @@ fn resolve_package_declaration<'a>(
 /// Separates a split text file's path from the index of one of its chunks.
 const CHUNK_SEPARATOR: char = '#';
 
-/// The file one path identity names, with the chunk suffix a split text file carries
-/// stripped: every chunk of one file resolves to that file.
+/// The file one path identity names: the file the whole identity spells when this
+/// snapshot holds one, and the file left when a chunk suffix is stripped otherwise, so
+/// every chunk of one split text file resolves to that file.
 ///
-/// The suffix is the separator followed by the chunk's index and nothing else, so a path
-/// that carries the separator as one of its own characters is read whole.
+/// The whole identity is read first because a file name may carry the separator itself.
+/// A project path admits `#`, so `docs/note#1` is a file this index can hold; stripping
+/// first would read it as chunk 1 of `docs/note`, find no such file, and drop the hit.
+/// A held `docs/note#1` therefore wins over chunk 1 of a split `docs/note`, whose other
+/// chunks still name that file.
 fn resolve_file<'a>(index: &'a WorkspaceIndex, identity: &str) -> Option<ResolvedCandidate<'a>> {
-    let path = match identity.rsplit_once(CHUNK_SEPARATOR) {
-        Some((path, chunk))
-            if !chunk.is_empty() && chunk.bytes().all(|byte| byte.is_ascii_digit()) =>
-        {
-            path
-        }
-        _ => identity,
-    };
+    held_file(index, identity).or_else(|| held_file(index, chunked_path(identity)?))
+}
+
+/// The path one chunk identity names, or nothing when `identity` carries no chunk suffix:
+/// the separator followed by the chunk's index and nothing else.
+fn chunked_path(identity: &str) -> Option<&str> {
+    let (path, chunk) = identity.rsplit_once(CHUNK_SEPARATOR)?;
+    let numbered = !chunk.is_empty() && chunk.bytes().all(|byte| byte.is_ascii_digit());
+    numbered.then_some(path)
+}
+
+/// The file `path` names in `index`, syntax-indexed or baseline text.
+fn held_file<'a>(index: &'a WorkspaceIndex, path: &str) -> Option<ResolvedCandidate<'a>> {
     let path = ProjectPath::new(path.to_owned()).ok()?;
     if let Some(file) = index.file(&path) {
         return Some(ResolvedCandidate::SourceFile(file));
@@ -1175,11 +1328,20 @@ pub(crate) fn resolve_symbol<'a>(
     (address.wire_symbol().0 == identity).then_some((file, symbol))
 }
 
-/// Finds the first line of `content` containing any of `query`'s whitespace-split terms,
+/// Finds the first line of `content` carrying one of the query's parsed members,
 /// case-insensitively, byte-exact so its span survives a CRLF file unchanged. Falls back to
 /// line 1 with a whole-file span when no line matches.
-fn locate_query_line(content: &str, query: &str) -> (u64, ByteRange, String) {
-    let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+///
+/// The members come from the same parse the full-text ranking matched through, so a quoted
+/// phrase is looked for as a phrase and a term never carries the punctuation around it.
+/// Splitting the caller's raw text here instead would leave `"impact` and `radius"` with
+/// their quotes attached, match nothing, and hand back the whole file as the excerpt.
+fn locate_query_line(content: &str, query: &ParsedQuery) -> (u64, ByteRange, String) {
+    let terms: Vec<String> = query
+        .members()
+        .iter()
+        .map(|member| member.text().to_lowercase())
+        .collect();
     let mut offset: u64 = 0;
     for (index, raw_line) in line::lines_inclusive(content).enumerate() {
         let text = line::without_ending(raw_line);
@@ -1305,16 +1467,17 @@ mod tests {
         SearchParamsTarget, SearchResult, SearchScope, SourceLocationKind, SourceUnitId,
     };
     use rift_ranking::{
-        DocumentIdentity, DocumentKind, FieldSet, ParsedQuery, QueryPhase, RankedIdentity,
-        RankingInput, RankingInputKind, RankingWeights, SearchableField, fuse,
+        DocumentIdentity, DocumentKind, FieldSet, PARSED_QUERY_MEMBERS_MAX, ParsedQuery,
+        QueryPhase, RankedIdentity, RankingInput, RankingInputKind, RankingWeights,
+        SearchableField, fuse,
     };
     use rift_search::{RevisionScoped, SearchIndex, SearchIndexLimits};
     use serde_json::json;
     use tempfile::TempDir;
 
     use super::{
-        ByteRange, HitPayloads, IdentifierSources, ReadFault, ReadService, Resolution,
-        SearchCriteria, SearchHit, SearchHitTarget, StoreAnswer,
+        ByteRange, CandidateScreen, HitPayloads, IdentifierSources, ReadFault, ReadService,
+        Resolution, SearchCriteria, SearchHit, SearchHitTarget, StoreAnswer,
     };
     use crate::packages::PackageBranch;
     use crate::read::tests::{helper_store, helper_unit, project_fixture};
@@ -1398,17 +1561,21 @@ mod tests {
         resolution: Resolution<'_>,
     ) -> TestResult<Vec<SearchHit>> {
         let index = service.index();
-        let ranked = fuse(inputs, configured_weights(), QueryPhase::Precise, 32);
-        let mut results = Vec::new();
-        super::resolve_ranked_hits(
+        let screen = CandidateScreen {
             index,
-            None,
-            index.root(),
-            criteria,
+            matcher: None,
+            root: index.root(),
+            target: criteria.target,
             resolution,
-            &ranked,
-            &mut results,
-        )?;
+        };
+        let ranked = fuse(
+            &screen.screened(inputs),
+            configured_weights(),
+            QueryPhase::Precise,
+            32,
+        );
+        let mut results = Vec::new();
+        super::resolve_ranked_hits(index, criteria, resolution, &ranked, &mut results)?;
         Ok(results)
     }
 
@@ -1429,7 +1596,7 @@ mod tests {
         };
         let input = super::identifier_input(index, None, index.root(), &parsed, sources, 32)?;
         let criteria = SearchCriteria {
-            query,
+            query: &parsed,
             target,
             payloads,
         };
@@ -1928,6 +2095,208 @@ impl Tower {
             "{:?}",
             result.warnings
         );
+        Ok(())
+    }
+
+    /// The `paths` selector screens the ranking inputs before they are fused. The store
+    /// ranked more matches outside the selector than the candidate pool holds; screening
+    /// after fusion cut the pool to those outside matches, dropped every one of them, and
+    /// answered nothing although the selector holds a match.
+    #[test]
+    fn search_paths_selector_screens_the_pool_before_ranking() -> TestResult {
+        let (_directory, service, store) = selector_fixture()?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "lookout",
+            "target": "file",
+            "paths": {"include": ["src/**"]},
+            "limit": 10
+        }))?;
+        let result = service.search(&params, &store)?;
+        assert_eq!(hit_identities(&result), ["src/keep.txt"], "{result:#?}");
+        Ok(())
+    }
+
+    /// `target` screens the same way: a pool filled with declarations under
+    /// `target: "file"` left the file match unranked and answered nothing.
+    #[test]
+    fn search_target_screens_the_pool_before_ranking() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn lookout_alpha() {}\npub fn lookout_beta() {}\npub fn lookout_gamma() {}\n",
+        )?;
+        fs::write(directory.path().join("notes.txt"), "lookout marker")?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::new(10, 4_096, 8_192, 8, 2)?,
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let mut order = Vec::new();
+        for name in ["lookout_alpha", "lookout_beta", "lookout_gamma"] {
+            order.push((
+                declaration_identity("lib.rs", name)?,
+                FieldSet::of(SearchableField::Name),
+            ));
+        }
+        order.push((
+            DocumentIdentity::new("notes.txt")?,
+            FieldSet::of(SearchableField::FileContent),
+        ));
+        let store = StoreAnswer::new(vec![lexical_input(order)], Vec::new(), configured_weights());
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "lookout",
+            "target": "file",
+            "limit": 10
+        }))?;
+        let result = service.search(&params, &store)?;
+        assert_eq!(hit_identities(&result), ["notes.txt"], "{result:#?}");
+        Ok(())
+    }
+
+    /// Three text files outside `src`, one inside it, and a store answer ranking the
+    /// outside files first, over a workspace whose candidate pool holds two.
+    fn selector_fixture() -> TestResult<(TempDir, ReadService, StoreAnswer)> {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("out"))?;
+        fs::create_dir(directory.path().join("src"))?;
+        let outside = ["out/one.txt", "out/two.txt", "out/three.txt"];
+        for path in outside {
+            fs::write(directory.path().join(path), "lookout marker")?;
+        }
+        fs::write(directory.path().join("src/keep.txt"), "lookout marker")?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::new(10, 4_096, 8_192, 8, 2)?,
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let mut order = Vec::new();
+        for path in outside.into_iter().chain(["src/keep.txt"]) {
+            order.push((
+                DocumentIdentity::new(path)?,
+                FieldSet::of(SearchableField::FileContent),
+            ));
+        }
+        let store = StoreAnswer::new(vec![lexical_input(order)], Vec::new(), configured_weights());
+        Ok((directory, service, store))
+    }
+
+    /// The candidate pool reaches `results_max` and still resolves to fewer hits, because
+    /// every chunk of one split text file collapses into that file. The answer warns the
+    /// bound all the same: the candidates past it never reach a page.
+    #[test]
+    fn search_warns_the_result_bound_when_fusion_cut_the_pool() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("guide.txt"), "word ".repeat(1000))?;
+        fs::write(directory.path().join("notes.txt"), "word marker")?;
+        // The smallest accepted chunk bound against a several-kilobyte guide forces the
+        // file into more than one document, each of which the query matches.
+        let text_inclusion = rift_core::TextFileInclusion::new(vec!["**".to_owned()], 1_024);
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::new(10, 65_536, 131_072, 8, 2)?,
+            &SourceVisibility::default(),
+            &text_inclusion,
+            HistoryConfiguration::default(),
+        )?;
+        let documents = service.index_documents();
+        let mut order: Vec<(DocumentIdentity, FieldSet)> = documents
+            .iter()
+            .filter(|document| document.identity().as_str().starts_with("guide.txt#"))
+            .map(|document| {
+                (
+                    document.identity().clone(),
+                    FieldSet::of(SearchableField::FileContent),
+                )
+            })
+            .collect();
+        assert!(
+            order.len() > 1,
+            "the oversized guide must split into more than one document: {order:?}"
+        );
+        order.truncate(2);
+        order.push((
+            DocumentIdentity::new("notes.txt")?,
+            FieldSet::of(SearchableField::FileContent),
+        ));
+        let store = StoreAnswer::new(vec![lexical_input(order)], Vec::new(), configured_weights());
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "word",
+            "target": "file",
+            "limit": 10
+        }))?;
+        let result = service.search(&params, &store)?;
+        assert_eq!(hit_identities(&result), ["guide.txt"], "{result:#?}");
+        assert!(
+            result.warnings.iter().any(|warning| matches!(
+                warning,
+                ReadWarning::ResultsTruncated { results_max } if *results_max == 2
+            )),
+            "{:?}",
+            result.warnings
+        );
+        Ok(())
+    }
+
+    /// A query past the parser's member bound drops its shortest unquoted terms, and the
+    /// answer says so rather than reading as though every term had been matched.
+    #[test]
+    fn search_warns_query_narrowed_when_the_parser_dropped_terms() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let query = (0..PARSED_QUERY_MEMBERS_MAX + 8)
+            .map(|index| format!("beacon{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": query,
+            "limit": 10
+        }))?;
+        let result = service.search(&params, &StoreAnswer::identifier_only())?;
+        assert!(
+            result.warnings.iter().any(|warning| matches!(
+                warning,
+                ReadWarning::QueryNarrowed { terms_max } if *terms_max == 32
+            )),
+            "{:?}",
+            result.warnings
+        );
+        Ok(())
+    }
+
+    /// A project path admits `#`, so a file name ending in the chunk separator and a
+    /// number is a path of its own. Stripping the suffix first resolved `docs/note#1` to
+    /// `docs/note`, found no such file, and dropped the hit.
+    #[test]
+    fn a_file_path_ending_in_the_chunk_separator_resolves_whole() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("docs"))?;
+        fs::write(directory.path().join("docs/note#1"), "lookout marker")?;
+        let text_inclusion = rift_core::TextFileInclusion::new(vec!["**".to_owned()], 1_048_576);
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &text_inclusion,
+            HistoryConfiguration::default(),
+        )?;
+        let store = StoreAnswer::new(
+            vec![lexical_input(vec![(
+                DocumentIdentity::new("docs/note#1")?,
+                FieldSet::of(SearchableField::FileContent),
+            )])],
+            Vec::new(),
+            configured_weights(),
+        );
+        let params: SearchParams = serde_json::from_value(json!({
+            "query": "lookout",
+            "target": "file",
+            "limit": 10
+        }))?;
+        let result = service.search(&params, &store)?;
+        assert_eq!(hit_identities(&result), ["docs/note#1"], "{result:#?}");
         Ok(())
     }
 
@@ -3396,7 +3765,7 @@ impl Tower {
             FieldSet::of(SearchableField::Name),
         )]);
         let criteria = SearchCriteria {
-            query: "Beacon",
+            query: &ParsedQuery::parse("Beacon")?,
             target: SearchParamsTarget::Symbol,
             payloads: HitPayloads::default(),
         };
@@ -3422,7 +3791,7 @@ impl Tower {
             FieldSet::of(SearchableField::FileContent),
         )]);
         let criteria = SearchCriteria {
-            query: "Beacon",
+            query: &ParsedQuery::parse("Beacon")?,
             target: SearchParamsTarget::File,
             payloads: HitPayloads::default(),
         };
@@ -3457,7 +3826,7 @@ impl Tower {
             ),
         ]);
         let criteria = SearchCriteria {
-            query: "beacon",
+            query: &ParsedQuery::parse("beacon")?,
             target: SearchParamsTarget::Symbol,
             payloads: HitPayloads::default(),
         };
@@ -3498,7 +3867,7 @@ impl Tower {
                 .with(SearchableField::DeclarationSource),
         )]);
         let declarations = SearchCriteria {
-            query: "Beacon",
+            query: &ParsedQuery::parse("Beacon")?,
             target: SearchParamsTarget::Symbol,
             payloads: HitPayloads::default(),
         };
@@ -3515,7 +3884,7 @@ impl Tower {
         );
 
         let files = SearchCriteria {
-            query: "Beacon",
+            query: &ParsedQuery::parse("Beacon")?,
             target: SearchParamsTarget::File,
             payloads: HitPayloads::default(),
         };
@@ -3741,7 +4110,10 @@ impl Tower {
     #[test]
     fn locate_query_line_finds_first_matching_line_case_insensitively() {
         let content = "intro line\nSEARCH replace ALL units here\nend line\n";
-        let (line_number, range, text) = super::locate_query_line(content, "replace all");
+        let (line_number, range, text) = super::locate_query_line(
+            content,
+            &ParsedQuery::parse("replace all").expect("the fixture query parses"),
+        );
         assert_eq!(line_number, 2);
         assert_eq!(text, "SEARCH replace ALL units here");
         assert_eq!(
@@ -3754,16 +4126,35 @@ impl Tower {
     #[test]
     fn locate_query_line_reports_byte_exact_spans_in_a_crlf_file() {
         let content = "one\r\ntwo replace\r\nthree\r\n";
-        let (line_number, range, text) = super::locate_query_line(content, "replace");
+        let (line_number, range, text) = super::locate_query_line(
+            content,
+            &ParsedQuery::parse("replace").expect("the fixture query parses"),
+        );
         assert_eq!(line_number, 2);
         assert_eq!(text, "two replace");
         assert_eq!(byte_slice(content, range), "two replace");
     }
 
     #[test]
+    fn locate_query_line_reads_a_quoted_phrase_as_one_phrase() {
+        // The caller's raw text carries the quotes; the parsed member does not. Splitting
+        // the raw text would leave `"impact` and `radius"` and match no line at all.
+        let content = "one line\nthe impact radius of one change\nlast line\n";
+        let (line_number, _range, text) = super::locate_query_line(
+            content,
+            &ParsedQuery::parse("\"impact radius\"").expect("the fixture query parses"),
+        );
+        assert_eq!(line_number, 2);
+        assert_eq!(text, "the impact radius of one change");
+    }
+
+    #[test]
     fn locate_query_line_falls_back_to_a_whole_file_span_without_a_term_match() {
         let content = "alpha\nbeta\n";
-        let (line_number, range, text) = super::locate_query_line(content, "gamma");
+        let (line_number, range, text) = super::locate_query_line(
+            content,
+            &ParsedQuery::parse("gamma").expect("the fixture query parses"),
+        );
         assert_eq!(line_number, 1);
         assert_eq!(range.start, 0);
         assert_eq!(range.end, content.len() as u64);

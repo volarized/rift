@@ -6,6 +6,7 @@
 //! parsed twice.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use rift_core::{ErrorContext, ProjectPath, SourceUnitId, symbol_identity};
 use rift_dependency::CatalogEntry;
@@ -17,7 +18,9 @@ use super::analyzer::{AnalyzedFile, PackageAnalysis, PackageAnalyzer};
 use super::failure::{PackageIndexError, PackageIndexFault, PackageIndexViolation};
 use super::walk::PackageFiles;
 use crate::semantic::WorkspaceSemantics;
-use rift_ranking::{DocumentIdentity, DocumentKind, DocumentLocation, IndexDocument};
+use rift_ranking::{DocumentIdentity, DocumentKind, DocumentLocation, IndexDocument, MemoryIndex};
+
+use super::manifest::analyzer_revision;
 
 use crate::workspace::{
     IndexedFile, ReadableSymbol, SymbolMatch, declaration_fields, symbol_matches_where,
@@ -36,6 +39,7 @@ pub struct PackageIndex {
     byte_count: u64,
     skipped_binary: usize,
     semantics: WorkspaceSemantics,
+    reader: OnceLock<MemoryIndex>,
 }
 
 impl PackageIndex {
@@ -78,7 +82,25 @@ impl PackageIndex {
             byte_count,
             skipped_binary,
             semantics,
+            reader: OnceLock::new(),
         }
+    }
+
+    /// The reader this package answers ranking through.
+    ///
+    /// Every index in this workspace derives its document fields with the same
+    /// pass, so the package states the same analyzer revision the project
+    /// does and the two readers' capabilities can be compared. The documents
+    /// are held on first ask: a scope that never ranks packages pays nothing,
+    /// and one that does pays the tokenizing pass once for this index.
+    ///
+    /// What the held reader costs is bounded by what the package holds, which
+    /// `[dependencies] package_size` bounds per package and `index_size`
+    /// bounds across every package this index keeps.
+    #[must_use]
+    pub fn reader(&self) -> &MemoryIndex {
+        self.reader
+            .get_or_init(|| MemoryIndex::new(self.index_documents(), analyzer_revision().0))
     }
 
     /// The canonical publication this index was built from.
@@ -237,6 +259,12 @@ mod tests {
         identity, language, names, rust_package, text, tokio, violation_of,
     };
     use super::{PackageFiles, PackageIndex, PackageIndexViolation};
+    use rift_ranking::{
+        DocumentIdentity, IndexReader as _, ParsedQuery, QueryPhase, RankRequest, RankingInputKind,
+    };
+
+    /// A bound wider than the fixture holds, so the order is the whole answer.
+    const EVERY_CANDIDATE: usize = 64;
 
     /// One package holding a single exported declaration.
     fn published_package() -> PackageIndex {
@@ -298,6 +326,62 @@ mod tests {
                 .get(rift_ranking::SearchableField::DeclarationSource)
                 .is_some_and(|source| source.contains("pub fn spawn")),
             "a package document carries the declaration's own source"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_package_answers_a_lexical_input_through_the_reader_contract() {
+        let package = published_package();
+        let reader = package.reader();
+        let query = ParsedQuery::parse("spawn").expect("a query must be accepted");
+        let request = RankRequest::new(
+            &query,
+            RankingInputKind::Lexical,
+            QueryPhase::Precise,
+            EVERY_CANDIDATE,
+        );
+        let input = reader.rank(request).await.expect("the reader must answer");
+        assert!(input.answered(), "the package answers the full-text input");
+        assert_eq!(
+            input
+                .order()
+                .iter()
+                .map(|ranked| ranked.identity().as_str())
+                .collect::<Vec<&str>>(),
+            ["rift://source/cargo/tokio@1.53.1/src/lib.rs#spawn"]
+        );
+        package
+            .reader()
+            .capabilities()
+            .accepts(&reader.capabilities())
+            .expect("one process's readers state one analyzer and one corpus revision");
+    }
+
+    #[tokio::test]
+    async fn test_the_package_reader_reads_one_document_by_its_identity() {
+        let package = published_package();
+        let identity = DocumentIdentity::new("rift://source/cargo/tokio@1.53.1/src/lib.rs#spawn")
+            .expect("the identity must be accepted");
+        let held = package
+            .reader()
+            .document(&identity)
+            .await
+            .expect("the reader must answer");
+        assert_eq!(
+            held.expect("the package holds the declaration")
+                .fields()
+                .get(rift_ranking::SearchableField::Name),
+            Some("spawn")
+        );
+        let absent = DocumentIdentity::new("rift://source/cargo/tokio@1.53.1/src/lib.rs#absent")
+            .expect("the identity must be accepted");
+        assert!(
+            package
+                .reader()
+                .document(&absent)
+                .await
+                .expect("the reader must answer")
+                .is_none()
         );
     }
 
