@@ -835,7 +835,7 @@ async fn indexed_unit_count(executor: &mut dyn Executor) -> Result<usize, Lexica
 
 /// Writes one document's typed row and its FTS row.
 ///
-/// The two carry the same seven fields, in the same order, because the typed
+/// The two carry the same fields, in the same order, because the typed
 /// row is what a read resolves through and the FTS row is what a term
 /// matches: a column filled in one and absent from the other would rank a
 /// document the reader cannot then describe.
@@ -887,7 +887,7 @@ fn fts_insert_sql() -> String {
 
 /// Rebuilds one published document from its typed row.
 ///
-/// The row carries the same seven fields the document was written from, so this is the
+/// The row carries the same fields the document was written from, so this is the
 /// inverse of [`insert_document`] and nothing is derived a second time.
 fn decode_document(record: LexicalDocumentRecord) -> Result<IndexDocument, LexicalIndexError> {
     let path = ProjectPath::new(record.path).map_err(|source| {
@@ -1431,7 +1431,7 @@ impl IndexReader for PublishedIndex<'_> {
             PublicationFormat::CURRENT,
             self.analyzer_revision.clone(),
             CorpusRevision::current(),
-            // The corpus declares all seven columns. Which of them one document filled is
+            // The corpus declares every column. Which of them one document filled is
             // the document's own answer, not the store's.
             FieldSet::all(),
             RankingInputSet::of(RankingInputKind::Lexical),
@@ -1778,7 +1778,7 @@ mod tests {
         for field in SearchableField::ALL {
             assert!(rendered.contains(field.column()));
         }
-        assert!(rendered.contains("?8"), "seven fields follow identity");
+        assert!(rendered.contains("?8"), "every field follows identity");
         assert!(!rendered.contains("?9"));
     }
 

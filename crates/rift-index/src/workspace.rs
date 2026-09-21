@@ -1515,14 +1515,21 @@ impl WorkspaceIndex {
     #[must_use]
     pub fn index_documents(&self) -> Vec<IndexDocument> {
         let mut documents = Vec::with_capacity(self.files.len() + self.text_files.len());
+        let mut left_out = LeftOut::default();
         for file in self.files() {
             for symbol in file.syntax().symbols() {
-                documents.extend(symbol_document(file, symbol));
+                documents.extend(symbol_document(file, symbol, &mut left_out));
             }
         }
         for file in self.text_files() {
-            push_text_documents(&mut documents, file, self.text_chunk_bytes_max());
+            push_text_documents(
+                &mut documents,
+                file,
+                self.text_chunk_bytes_max(),
+                &mut left_out,
+            );
         }
+        left_out.report();
         documents
     }
 
@@ -1583,14 +1590,15 @@ impl WorkspaceIndex {
         paths: impl IntoIterator<Item = &'a ProjectPath>,
     ) -> Vec<IndexDocument> {
         let mut units = Vec::new();
+        let mut left_out = LeftOut::default();
         for path in paths {
             if let Some(file) = self.files.get(path) {
                 for symbol in file.syntax().symbols() {
-                    units.extend(symbol_document(file, symbol));
+                    units.extend(symbol_document(file, symbol, &mut left_out));
                 }
             }
             if let Some(file) = self.text_files.get(path) {
-                push_text_documents(&mut units, file, self.text_chunk_bytes_max());
+                push_text_documents(&mut units, file, self.text_chunk_bytes_max(), &mut left_out);
             }
         }
         units
@@ -2957,7 +2965,11 @@ pub fn declaration_identity(matched: SymbolMatch<'_>) -> DocumentIdentity {
 /// Every field a provider published lands in its own column. A provider that publishes
 /// no signature leaves that field absent rather than filling it with the declaration's
 /// source, so the two are weighed apart.
-fn symbol_document(file: &IndexedFile, symbol: &SyntaxSymbol) -> Option<IndexDocument> {
+fn symbol_document(
+    file: &IndexedFile,
+    symbol: &SyntaxSymbol,
+    left_out: &mut LeftOut,
+) -> Option<IndexDocument> {
     let identity = rift_core::symbol_identity(
         &file.syntax().language().identity_segment(),
         file.path().as_str(),
@@ -2968,6 +2980,7 @@ fn symbol_document(file: &IndexedFile, symbol: &SyntaxSymbol) -> Option<IndexDoc
         file.path(),
         DocumentKind::Symbol,
         declaration_fields(file, symbol),
+        left_out,
     )
 }
 
@@ -3061,6 +3074,7 @@ fn document(
     path: &ProjectPath,
     kind: DocumentKind,
     fields: DocumentFields,
+    left_out: &mut LeftOut,
 ) -> Option<IndexDocument> {
     let digest = fields.digest();
     let built = DocumentIdentity::new(identity).and_then(|identity| {
@@ -3075,17 +3089,48 @@ fn document(
     match built {
         Ok(document) => Some(document),
         Err(error) => {
-            tracing::warn!(
-                component = "index",
-                operation = "index.build",
-                path = path.as_str(),
-                error = %error,
-                "declaration left out of the search index: its address or one of its \
-                 fields runs past the document shape; the file still answers get_symbol \
-                 and identifier search"
-            );
+            left_out.record(path, &error);
             None
         }
+    }
+}
+
+/// What one publication pass left out of the searchable corpus.
+///
+/// The pass counts rather than records each refusal: a workspace whose paths all
+/// breach the ceiling would otherwise write one record per declaration and evict
+/// everything else the pass recorded from the bounded log store.
+#[derive(Debug, Default)]
+pub(crate) struct LeftOut {
+    count: usize,
+    first: Option<(String, String)>,
+}
+
+impl LeftOut {
+    /// Counts one refusal, keeping the first path and violation for the record.
+    fn record(&mut self, path: &ProjectPath, error: &rift_ranking::RankingError) {
+        self.count += 1;
+        if self.first.is_none() {
+            self.first = Some((path.as_str().to_owned(), error.to_string()));
+        }
+    }
+
+    /// Raises one record for the whole pass, or none when the pass left nothing
+    /// out.
+    fn report(&self) {
+        let Some((path, error)) = self.first.as_ref() else {
+            return;
+        };
+        tracing::warn!(
+            component = "index",
+            operation = "index.build",
+            left_out = self.count,
+            path = path.as_str(),
+            error = error.as_str(),
+            "declarations left out of the search index: an address or a field runs past \
+             the document shape; the count is this pass's total and the path is the first \
+             of them, and every file still answers get_symbol and identifier search"
+        );
     }
 }
 
@@ -3126,6 +3171,7 @@ fn push_text_documents(
     documents: &mut Vec<IndexDocument>,
     file: &TextSourceFile,
     chunk_bytes_max: u64,
+    left_out: &mut LeftOut,
 ) {
     let name = file_name(file.path());
     if !exceeds_chunk_bound(file.content().len(), chunk_bytes_max) {
@@ -3134,6 +3180,7 @@ fn push_text_documents(
             file,
             name.as_deref(),
             file.content(),
+            left_out,
         ));
         return;
     }
@@ -3155,6 +3202,7 @@ fn push_text_documents(
             file,
             name.as_deref(),
             chunk.content(),
+            left_out,
         ));
     }
 }
@@ -3167,6 +3215,7 @@ fn text_document(
     file: &TextSourceFile,
     name: Option<&str>,
     content: &str,
+    left_out: &mut LeftOut,
 ) -> Option<IndexDocument> {
     let terms = name.map_or_else(String::new, |name| {
         identifier_terms([name], IDENTIFIER_TERMS_BYTES_MAX)
@@ -3175,13 +3224,52 @@ fn text_document(
         .with_optional(SearchableField::Name, name)
         .with(SearchableField::IdentifierTerms, terms)
         .with(SearchableField::FileContent, content);
-    document(identity, file.path(), DocumentKind::TextFile, fields)
+    document(
+        identity,
+        file.path(),
+        DocumentKind::TextFile,
+        fields,
+        left_out,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rift_syntax::{RustSyntaxProvider, SyntaxLimits};
+
+    #[test]
+    fn test_a_pass_counts_what_it_left_out_and_keeps_the_first_of_them() {
+        // The pass raises one record however many declarations it refused. One
+        // per declaration would fill the bounded log store from a workspace
+        // whose declarations all breach the shape, and evict everything else
+        // the pass recorded.
+        let overlong = "n".repeat(rift_ranking::NAME_BYTES_MAX + 1);
+        let mut left_out = LeftOut::default();
+        for name in ["first", "second", "third"] {
+            let path = ProjectPath::new(format!("src/{name}.rs")).expect("a legal path");
+            let fields = DocumentFields::empty().with(SearchableField::QualifiedName, &overlong);
+            assert!(
+                document(
+                    format!("rift://symbol/rust/src/{name}.rs#{overlong}"),
+                    &path,
+                    DocumentKind::Symbol,
+                    fields,
+                    &mut left_out,
+                )
+                .is_none(),
+                "a field past the shape leaves the declaration out"
+            );
+        }
+        assert_eq!(left_out.count, 3, "the pass counts every refusal");
+        let (path, error) = left_out.first.as_ref().expect("the first refusal is kept");
+        assert_eq!(path, "src/first.rs", "the record names the first of them");
+        assert!(
+            !error.contains(&overlong),
+            "the refusal names the column and the counts, never the value: {error}"
+        );
+        left_out.report();
+    }
 
     /// The project path one derived document is addressed by. Every document this
     /// index derives is a project document, so the package arm is unreachable here.
@@ -6418,7 +6506,7 @@ mod tests {
             executable: false,
         };
         let mut documents = Vec::new();
-        push_text_documents(&mut documents, &file, 1_024);
+        push_text_documents(&mut documents, &file, 1_024, &mut LeftOut::default());
         assert!(
             documents.is_empty(),
             "a refused document is left out, not published"
@@ -6446,7 +6534,7 @@ mod tests {
             executable: false,
         };
         let mut documents = Vec::new();
-        push_text_documents(&mut documents, &file, 1_024);
+        push_text_documents(&mut documents, &file, 1_024, &mut LeftOut::default());
         assert_eq!(
             documents.len(),
             1,
