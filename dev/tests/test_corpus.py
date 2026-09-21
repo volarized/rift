@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from rift_dev.check_corpus import CLEANUP_RESERVE_SECONDS, Corpus
 from rift_dev.corpus_assertions import (
+    CONTEXT_DEGRADED,
     PROBE_PATH,
     PROBE_SOURCE,
     active_operation,
@@ -422,11 +423,11 @@ class Decisions(unittest.TestCase):
     def test_manifest_degradation_requires_one_exact_record_per_resolver(self) -> None:
         expected = "585 of 841 package.json manifests were not read: at most 256 are read per workspace"
         npm: JsonObject = {
-            "message": "dependency resolution degraded",
+            "message": CONTEXT_DEGRADED,
             "fields": {"resolver": "npm", "reason": expected},
         }
         bun: JsonObject = {
-            "message": "dependency resolution degraded",
+            "message": CONTEXT_DEGRADED,
             "fields": {"resolver": "bun", "reason": expected},
         }
         exact_degradation([npm, bun], expected)
@@ -463,18 +464,27 @@ class Decisions(unittest.TestCase):
                 warnings({"warnings": source})
 
 
+# The document table as `rift-index/src/lexical.rs` creates it, with the ranking columns
+# `lexical_content` hashes.
+DOCUMENTS_TABLE = (
+    "CREATE TABLE lexical_documents(identity TEXT, path TEXT, kind TEXT, digest TEXT, "
+    "byte_length INTEGER, name TEXT, qualified_name TEXT, identifier_terms TEXT, "
+    "signature TEXT, documentation TEXT, declaration_source TEXT, file_content TEXT)"
+)
+BEACON_ROW = (
+    "INSERT INTO lexical_documents VALUES ('id','source.rs','symbol','d1',15,'beacon',"
+    "'beacon','beacon','fn beacon()','','fn beacon() {}','fn beacon() {}')"
+)
+
+
 class PersistedContent(unittest.TestCase):
     def test_reads_close_connections_on_success_and_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / ".rift").mkdir()
             with closing(sqlite3.connect(root / ".rift/db")) as fixture:
-                fixture.execute(
-                    "CREATE TABLE lexical_units(identity TEXT, path TEXT, kind TEXT, name TEXT, byte_length INTEGER, content TEXT)"
-                )
-                fixture.execute(
-                    "INSERT INTO lexical_units VALUES ('id','source.rs','symbol','beacon',15,'fn beacon() {}')"
-                )
+                fixture.execute(DOCUMENTS_TABLE)
+                fixture.execute(BEACON_ROW)
                 fixture.commit()
             connect = sqlite3.connect
             opened: list[sqlite3.Connection] = []
@@ -506,22 +516,21 @@ class PersistedContent(unittest.TestCase):
             root = Path(directory)
             (root / ".rift").mkdir()
             with sqlite3.connect(root / ".rift/db") as connection:
-                connection.execute(
-                    "CREATE TABLE lexical_units(identity TEXT, path TEXT, kind TEXT, name TEXT, byte_length INTEGER, content TEXT)"
-                )
-                connection.execute(
-                    "INSERT INTO lexical_units VALUES ('id','source.rs','symbol','beacon',15,'fn beacon() {}')"
-                )
+                connection.execute(DOCUMENTS_TABLE)
+                connection.execute(BEACON_ROW)
                 connection.commit()
                 before = lexical_content(root)
                 connection.execute(
-                    "INSERT INTO lexical_units VALUES ('probe',?,'symbol','corpus_probe',24,?)",
-                    (PROBE_PATH, PROBE_SOURCE),
+                    "INSERT INTO lexical_documents VALUES ('probe',?,'symbol','d2',24,"
+                    "'corpus_probe','corpus_probe','corpus_probe','fn corpus_probe()','',"
+                    "?,?)",
+                    (PROBE_PATH, PROBE_SOURCE, PROBE_SOURCE),
                 )
                 connection.commit()
                 self.assertEqual(lexical_content(root), before)
                 connection.execute(
-                    "UPDATE lexical_units SET content='changed' WHERE identity='id'"
+                    "UPDATE lexical_documents SET declaration_source='changed' "
+                    "WHERE identity='id'"
                 )
                 connection.commit()
                 self.assertNotEqual(lexical_content(root), before)
@@ -531,15 +540,11 @@ class PersistedContent(unittest.TestCase):
             root = Path(directory)
             (root / ".rift").mkdir()
             with sqlite3.connect(root / ".rift/db") as connection:
-                connection.execute(
-                    "CREATE TABLE lexical_units(identity TEXT, path TEXT, kind TEXT, name TEXT, byte_length INTEGER, content TEXT)"
-                )
+                connection.execute(DOCUMENTS_TABLE)
                 connection.commit()
                 with self.assertRaisesRegex(AssertionError, "empty"):
                     lexical_content(root)
-                connection.execute(
-                    "INSERT INTO lexical_units VALUES ('id','source.rs','symbol','beacon',15,'fn beacon() {}')"
-                )
+                connection.execute(BEACON_ROW)
                 connection.commit()
                 with (
                     patch("rift_dev.corpus_assertions.LEXICAL_UNITS_MAX", 0),
