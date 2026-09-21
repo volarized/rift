@@ -182,11 +182,11 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"
 checksum = \"9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e\"
 ";
 
-/// `packages` lists the direct dependencies the Cargo resolver cataloged, and follows the
-/// lockfile: rewriting `Cargo.lock` under the server re-catalogs on the next publication,
-/// which the tool call after the write waits for.
+/// `packages` lists what the static dependency context reports, and follows the
+/// lockfile: rewriting `Cargo.lock` under the server reads the context again on the next
+/// publication, which the tool call after the write waits for.
 #[tokio::test]
-async fn the_map_lists_direct_packages_and_follows_the_lockfile() -> TestResult {
+async fn the_map_lists_context_packages_and_follows_the_lockfile() -> TestResult {
     let (directory, client, server_task) = served_workspace(
         &[
             (
@@ -204,7 +204,12 @@ async fn the_map_lists_direct_packages_and_follows_the_lockfile() -> TestResult 
     let body = resource_body(&client, "rift://map").await?;
     assert_eq!(
         body["packages"],
-        serde_json::json!([{ "manager": "cargo", "name": "serde", "version": "1.0.228" }]),
+        serde_json::json!([{
+            "manager": "cargo",
+            "name": "serde",
+            "version": "1.0.228",
+            "availability": "canonical"
+        }]),
         "{body:#}"
     );
 

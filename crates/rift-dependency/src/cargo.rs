@@ -1,5 +1,6 @@
 //! The Cargo resolver: Rust packages as `cargo metadata` resolved them, or as `Cargo.lock` states.
 
+mod context;
 #[cfg(test)]
 mod fixture;
 mod lockfile;
@@ -14,12 +15,13 @@ use rift_protocol::read::{Language, ProjectPath};
 use serde::Deserialize;
 
 use crate::catalog::{CatalogEntry, Resolution, package_identity};
+use crate::context::ContextAnswer;
 use crate::manifest::{
     ResolutionBuilder, file_beside, manifest_directory_path, top_level_manifests,
 };
 use crate::resolver::{
-    CommandOutput, DependencyResolver, Inspector, ResolutionRequest, ResolverName,
-    TOOLCHAIN_OUTPUT_BYTES_MAX, ToolchainCommand,
+    CommandOutput, ContextRequest, DependencyResolver, Inspector, ResolutionRequest, ResolverName,
+    StaticInputs, TOOLCHAIN_OUTPUT_BYTES_MAX, ToolchainCommand,
 };
 
 /// The package namespace every Cargo dependency entry belongs to.
@@ -95,6 +97,14 @@ impl DependencyResolver for CargoResolver {
         }
         toolchain::resolve_stdlib(request.root, inspector, &mut answer);
         answer.build()
+    }
+
+    fn context(
+        &self,
+        request: &ContextRequest<'_>,
+        inputs: &mut dyn StaticInputs,
+    ) -> ContextAnswer {
+        context::cargo_context(request, inputs)
     }
 }
 

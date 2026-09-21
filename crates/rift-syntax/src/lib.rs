@@ -29,7 +29,7 @@ pub use language::{LanguageDefinition, ShippedLanguage, definitions};
 pub use markdown::MarkdownSyntaxProvider;
 pub use provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 pub use python::PythonSyntaxProvider;
-pub use rust::{RustCrateLayout, RustQuery, RustQueryCapture, RustSyntaxProvider};
+pub use rust::{RustQuery, RustQueryCapture, RustSyntaxProvider};
 pub use toml::TomlSyntaxProvider;
 pub use typescript::{TypeScriptDialect, TypeScriptSyntaxProvider};
 pub use yaml::YamlSyntaxProvider;

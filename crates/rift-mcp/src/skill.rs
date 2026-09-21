@@ -100,7 +100,7 @@ const DECISION_TABLE: &[DecisionRow] = &[
     DecisionRow {
         situation: "A dependency's public declaration is needed.",
         tools: &["get_symbol", "search"],
-        note: Some("with `scope: \"dependencies\"`, or `\"all\"` to answer the project's own too"),
+        note: Some("with `scope: \"global\"`, or `\"all\"` to answer the project's own too"),
     },
     DecisionRow {
         situation: "The syntax structure at one position is needed.",
@@ -108,13 +108,13 @@ const DECISION_TABLE: &[DecisionRow] = &[
         note: None,
     },
     DecisionRow {
-        situation: "A symbol's neighbors, its impact (who breaks when it changes), or a path \
-                    between two symbols is needed.",
+        situation: "The declarations that reference a symbol, its impact (what changes when \
+                    it does), or a path between two symbols is needed.",
         tools: &["search"],
         note: Some("with a `traversal` block"),
     },
     DecisionRow {
-        situation: "What two committed revisions differ in, or what a change affects, is needed.",
+        situation: "The declarations two committed revisions hold differently are needed.",
         tools: &["search"],
         note: Some("with a `change` block"),
     },
@@ -430,8 +430,8 @@ mod tests {
             let rendered = skill_markdown(form);
             assert!(
                 rendered.contains(
-                    "| What two committed revisions differ in, or what a change affects, is \
-                     needed. | `search` (with a `change` block) |"
+                    "| The declarations two committed revisions hold differently are needed. | \
+                     `search` (with a `change` block) |"
                 ),
                 "{rendered}"
             );

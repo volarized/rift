@@ -1,5 +1,6 @@
 //! The uv resolver: Python distributions as `uv.lock` pins them and the project environment holds them.
 
+mod context;
 mod environment;
 #[cfg(test)]
 mod fixture;
@@ -11,11 +12,14 @@ use rift_protocol::read::{Language, ProjectPath};
 use serde::Deserialize;
 
 use crate::catalog::{CatalogEntry, Resolution, package_identity};
+use crate::context::ContextAnswer;
 use crate::manifest::{
-    LockfileFailure, ResolutionBuilder, file_beside, is_ancestor_directory, manifest_directory,
-    manifest_directory_path, read_lockfile,
+    ResolutionBuilder, StaticFileFailure, file_beside, is_ancestor_directory, manifest_directory,
+    manifest_directory_path, read_static_file,
 };
-use crate::resolver::{DependencyResolver, Inspector, ResolutionRequest, ResolverName};
+use crate::resolver::{
+    ContextRequest, DependencyResolver, Inspector, ResolutionRequest, ResolverName, StaticInputs,
+};
 
 /// The package namespace every uv dependency entry belongs to.
 const PYPI_MANAGER: &str = "pypi";
@@ -90,6 +94,14 @@ impl DependencyResolver for UvResolver {
         }
         answer.build()
     }
+
+    fn context(
+        &self,
+        request: &ContextRequest<'_>,
+        inputs: &mut dyn StaticInputs,
+    ) -> ContextAnswer {
+        context::uv_context(request, inputs)
+    }
 }
 
 /// One listed manifest, its absolute directory, and what stood beside it.
@@ -111,7 +123,7 @@ enum LockfileBeside {
     /// No `uv.lock`: an ancestor root covers the manifest, or nothing resolves it.
     Absent,
     /// The `uv.lock` the manifest is the root of, parsed or refused.
-    Root(Result<Lockfile, LockfileFailure>),
+    Root(Result<Lockfile, StaticFileFailure>),
 }
 
 /// Reads the `uv.lock` beside one listed manifest, parsing it when it stands there.
@@ -121,7 +133,7 @@ fn observe_manifest<'a>(
     inspector: &mut dyn Inspector,
 ) -> ObservedManifest<'a> {
     let directory = manifest_directory_path(root, manifest);
-    let lockfile = match read_lockfile(&directory, UV_LOCK_FILE_NAME, inspector) {
+    let lockfile = match read_static_file(&directory, UV_LOCK_FILE_NAME, inspector) {
         Err(failure) if failure.is_absent() => LockfileBeside::Absent,
         observed => LockfileBeside::Root(observed.and_then(|bytes| parse_lockfile(&bytes))),
     };
@@ -133,9 +145,10 @@ fn observe_manifest<'a>(
 }
 
 /// Parses `uv.lock` bytes, naming the parser's message when they are not its document.
-fn parse_lockfile(bytes: &[u8]) -> Result<Lockfile, LockfileFailure> {
-    toml::from_slice(bytes)
-        .map_err(|error| LockfileFailure::unparsable(UV_LOCK_FILE_NAME, error.message().to_owned()))
+fn parse_lockfile(bytes: &[u8]) -> Result<Lockfile, StaticFileFailure> {
+    toml::from_slice(bytes).map_err(|error| {
+        StaticFileFailure::unparsable(UV_LOCK_FILE_NAME, error.message().to_owned())
+    })
 }
 
 /// Resolves one listed manifest: a root from its lockfile, a covered manifest not at all.
@@ -196,12 +209,14 @@ struct LockedPackage {
     dev_dependencies: BTreeMap<String, Vec<LockedDependency>>,
 }
 
-/// Where a locked package came from; only the two member-marking keys are read.
+/// Where a locked package came from: the two member-marking keys, and the index a
+/// distribution was fetched from.
 #[derive(Deserialize)]
 struct LockedSource {
     editable: Option<String>,
     #[serde(rename = "virtual")]
     virtual_directory: Option<String>,
+    registry: Option<String>,
 }
 
 impl LockedSource {

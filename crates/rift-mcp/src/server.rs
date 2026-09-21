@@ -5,10 +5,9 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use rift_core::SourceVisibility;
-use rift_dependency::DependencyCatalog;
 use rift_index::{
-    DependencyIndex, DependencyIndexLimits, LexicalIndexLimits, LogStore, PackageSelection,
-    PathChanges, WorkspaceDigests, WorkspaceIndexLimits, capture_digests_with_languages,
+    DependencyIndexLimits, LexicalIndexLimits, LogStore, PathChanges, WorkspaceDigests,
+    WorkspaceIndexLimits, capture_digests_with_languages,
 };
 use rift_protocol::configuration::{
     Duration as WireDuration, LspConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX, SEARCH_POOL_SLOTS_MAX,
@@ -30,8 +29,8 @@ use rift_search::{
     SearchIndex, SearchIndexLimits, SemanticReadiness,
 };
 use rift_server::{
-    DependencyStore, EnginePool, EngineReferences, LspProcessKey, ReadError, ReadFault,
-    ReadService, resolve_engine_references, uses_engine_references, wire_digest,
+    EnginePool, EngineReferences, LspProcessKey, PackageBranch, ReadError, ReadFault, ReadService,
+    resolve_engine_references, uses_engine_references, wire_digest,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{
@@ -45,7 +44,6 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
-use crate::dependency::{DependencyLane, DependencyRequest};
 use crate::failure::WireFailure;
 use crate::parameters::Parameters;
 use crate::resource;
@@ -999,10 +997,10 @@ pub struct RiftMcp {
     /// The lexical lane, absent exactly when [`Self::search_index`] is. A rebuild commits
     /// through it before its snapshot becomes current.
     lexical: Option<LexicalLane>,
-    /// The dependency index every published snapshot answers a dependency-scoped
-    /// lookup from. The lane fills it behind the answers.
+    /// The package branch every published snapshot answers a `global` or `all` lookup
+    /// from. The first such read fills it.
     #[cfg(test)]
-    dependencies: Arc<DependencyStore>,
+    dependencies: Arc<PackageBranch>,
     /// The workspace's recorded diagnostics, absent when the store could not be
     /// opened at startup; `rift://logs` then answers with that reason rather
     /// than refusing. The handle is the read side alone: the drain task that
@@ -1127,16 +1125,9 @@ impl RiftMcp {
         let (validation, invalidations) =
             IndexValidation::new(startup_configuration.index_limits(limits)?.files_max());
         let watcher = Self::start_watcher(&root, &validation, &blocking).await?;
-        let dependencies = Arc::new(DependencyStore::new(DependencyIndex::planned(
-            &DependencyCatalog::default(),
-            DependencyIndexLimits::default(),
-            PackageSelection::default(),
-        )));
+        let packages = Arc::new(PackageBranch::new(DependencyIndexLimits::default()));
         let (published, lexical_write) =
-            initial_workspace(&root, limits, &validation, &blocking, &dependencies).await?;
-        let cancellation = validation.cancellation.clone();
-        let dependency_lane =
-            Self::spawn_dependency_lane(&dependencies, &published, &blocking, cancellation)?;
+            initial_workspace(&root, limits, &validation, &blocking, &packages).await?;
         // Direct construction delays the database open until the initial scan proves the
         // workspace root. A serving process supplies the owner it opened for foreground log
         // capture; that path creates `.rift` only below an already-existing root.
@@ -1171,8 +1162,7 @@ impl RiftMcp {
             blocking: blocking.clone(),
             population: population.clone(),
             lexical: lexical.clone(),
-            dependencies: Arc::clone(&dependencies),
-            dependency_lane: dependency_lane.clone(),
+            dependencies: Arc::clone(&packages),
         };
         if let (Some(index), Some(lane), Some(acquisition)) =
             (search_index.as_ref(), population.as_ref(), acquisition)
@@ -1199,7 +1189,7 @@ impl RiftMcp {
             search_index,
             lexical,
             #[cfg(test)]
-            dependencies,
+            dependencies: packages,
             logs,
             engines,
             #[cfg(test)]
@@ -1232,26 +1222,6 @@ impl RiftMcp {
                 operation = "watch.setup"
             ))
             .await
-    }
-
-    /// Plans the dependency store over the initial publication's catalog and plan, and
-    /// spawns the lane that fills it.
-    ///
-    /// The store is planned before anything is served, so a lookup answered ahead of the
-    /// lane's first pass reports the packages still pending rather than an empty catalog.
-    fn spawn_dependency_lane(
-        dependencies: &Arc<DependencyStore>,
-        published: &PublishedWorkspace,
-        blocking: &BlockingExecutor,
-        cancellation: CancellationToken,
-    ) -> Result<DependencyLane, ReadError> {
-        let request = DependencyRequest::for_publication(published);
-        let mut index = dependencies.write()?;
-        request.follow(&mut index);
-        drop(index);
-        let lane = DependencyLane::spawn(Arc::clone(dependencies), blocking.clone(), cancellation);
-        lane.request(request);
-        Ok(lane)
     }
 
     /// Opens the search tier over `storage` and hands the lexical lane the initial write.
@@ -1332,9 +1302,9 @@ impl RiftMcp {
     /// `source`. `include: ["history"]` adds each hit's version-control timeline,
     /// walked from the served revision. `rev` serves the lookup from a
     /// version-control revision instead of the current tree. `scope` reaches
-    /// past the project tree: `dependencies` answers from the public
-    /// declarations of the cataloged packages alone, `all` from both, project
-    /// hits first. Use `search` when the name is not exactly known.
+    /// past the project tree: `global` answers from the public declarations of
+    /// the cataloged packages alone, `all` from both, project hits first. Use
+    /// `search` when the name is not exactly known.
     #[tool]
     async fn get_symbol(
         &self,
@@ -1351,7 +1321,7 @@ impl RiftMcp {
     /// declarations two committed revisions hold differently, in place of `query` and
     /// `traversal`. `rev` searches a version-control revision instead of the current tree,
     /// and never combines with `traversal` or `change`. `scope` reaches past the project
-    /// tree: `dependencies` answers `query` from the public declarations of the cataloged
+    /// tree: `global` answers `query` from the public declarations of the cataloged
     /// packages alone, `all` from both, ordered together. Use `get_symbol` when the
     /// declaration name is known.
     ///
@@ -1395,7 +1365,6 @@ impl RiftMcp {
     ) -> Result<Json<SearchResult>, ErrorData> {
         let resolved = self.published_workspace(wire::ErrorPhase::Read).await?;
         let revision_read = self.revision_read(&resolved.published)?;
-        let reads = Arc::clone(&resolved.published.reads);
         let RevisionRead {
             root,
             limits,
@@ -1413,7 +1382,6 @@ impl RiftMcp {
                     limits,
                     &visibility,
                     (&text_inclusion, &languages),
-                    &reads,
                 )
             })
             .await
@@ -1571,7 +1539,7 @@ impl RiftMcp {
         published: &PublishedWorkspace,
         budget: Duration,
     ) -> Result<Option<SearchRanking>, ErrorData> {
-        if params.scope == SearchScope::Dependencies {
+        if params.scope == SearchScope::Global {
             return Ok(Some(SearchRanking::default()));
         }
         let Some(index) = self.search_index.as_ref() else {
@@ -2667,8 +2635,8 @@ mod tests {
     use serde_json::json;
     use sha2::{Digest as _, Sha256};
 
-    use crate::dependency::empty_dependency_store;
     use crate::validation::RebuildRequest;
+    use crate::validation::tests::empty_package_branch;
 
     use super::{BlockingExecutor, Parameters, RiftMcp};
     use crate::validation::lexical_double::StoreDouble;
@@ -2721,7 +2689,7 @@ mod tests {
             root,
             WorkspaceIndexLimits::default(),
             &RebuildRequest::initial(epoch),
-            &empty_dependency_store(),
+            &empty_package_branch(),
         )? {
             WorkspaceCandidate::Stable { published, .. } => Ok(published),
             WorkspaceCandidate::ConfigurationChanged => {
@@ -3703,15 +3671,12 @@ mod tests {
                 .is_none(),
             "moved source asks for a fresh publication, not an empty engine answer"
         );
-        for override_fields in [
-            json!({"direction": "outgoing", "facets": ["references"]}),
-            json!({"direction": "incoming", "facets": ["calls"]}),
-        ] {
+        for facets in [json!(["calls"]), json!(["implements"])] {
             let mut request = json!({"traversal": {
-                "seed": "rift://symbol/rust/lib.rs/beacon", "depth": 1
+                "seed": "rift://symbol/rust/lib.rs/beacon",
+                "direction": "incoming", "depth": 1
             }});
-            request["traversal"]["direction"] = override_fields["direction"].clone();
-            request["traversal"]["facets"] = override_fields["facets"].clone();
+            request["traversal"]["facets"] = facets;
             let indexed = serde_json::from_value(request)?;
             assert!(
                 server
@@ -3762,7 +3727,7 @@ mod tests {
         )?;
         super::hermetic_workspace(
             directory.path(),
-            "[providers.binding]\nenabled = false\n[languages.python.lsp]\nembedded = 'ty'\nretry = { attempts = 2, delay = '1ms', delay_limit = '1ms' }\n",
+            "[languages.python.lsp]\nembedded = 'ty'\nretry = { attempts = 2, delay = '1ms', delay_limit = '1ms' }\n",
         )?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         let resolved = server

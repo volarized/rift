@@ -24,10 +24,11 @@ use rift_search::{Declaration, DescribedUnit, RankedUnit};
 use rift_syntax::{ByteRange, SyntaxSymbol};
 
 use crate::engine_read::EngineReferences;
+use crate::packages::PackageFallback;
 use crate::read::parse_symbol_address;
 use crate::read::{
-    ReadError, ReadFault, ReadService, accepted_limit, dependency_symbol, dependency_warnings,
-    excerpt, page, project_path, results_truncation_warning, source_warnings, text_range,
+    ReadError, ReadFault, ReadService, accepted_limit, dependency_symbol, excerpt,
+    package_warnings, page, project_path, results_truncation_warning, source_warnings, text_range,
     validate_common, wire_symbol,
 };
 use crate::traversal::{
@@ -46,8 +47,8 @@ impl ReadService {
     /// # Errors
     ///
     /// Returns [`ReadError`] for an invalid `paths` glob, a `force_include` bound crossed,
-    /// a scope beyond `project` under `[dependencies]` `enabled = false` or beside a
-    /// revision, `dependencies` beside `traversal`, and a poisoned dependency index.
+    /// a scope beyond `local` beside a revision, `global` beside `traversal`, and a
+    /// poisoned package branch.
     pub fn search(
         &self,
         params: &SearchParams,
@@ -89,6 +90,7 @@ impl ReadService {
         // bound, so `pagination.total_pages` counts the full result set and every page is
         // one window of the same ordering.
         let fetch_limit = self.index().results_max();
+        let fallback = self.fill_packages(params.scope)?;
         let dependencies = self.dependency_index(params.scope)?;
 
         let mut results = Vec::new();
@@ -144,7 +146,7 @@ impl ReadService {
             warnings: self.search_warnings(
                 warnings,
                 params.scope,
-                dependencies.as_deref(),
+                (dependencies.as_deref(), fallback),
                 traversal_report,
                 results_max_reached,
             ),
@@ -170,13 +172,13 @@ impl ReadService {
 
     /// The warnings one search answer carries: those the collection gathered - the
     /// snapshot's own and the force-included files it left out - then what the traversal
-    /// lane reported, the result bound when the pool reached it, and the dependency
-    /// warnings when `scope` reaches dependencies.
+    /// lane reported, the result bound when the pool reached it, and the package warnings
+    /// when `scope` reaches packages.
     fn search_warnings(
         &self,
         mut warnings: Vec<ReadWarning>,
         scope: SearchScope,
-        dependencies: Option<&DependencyIndex>,
+        (dependencies, fallback): (Option<&DependencyIndex>, PackageFallback),
         traversal: TraversalReport,
         results_max_reached: Option<usize>,
     ) -> Vec<ReadWarning> {
@@ -187,8 +189,12 @@ impl ReadService {
         if let Some(results_max) = results_max_reached {
             warnings.push(results_truncation_warning(results_max));
         }
-        if scope != SearchScope::Project {
-            warnings.extend(dependency_warnings(dependencies, self.dependency_catalog()));
+        if scope != SearchScope::Local {
+            warnings.extend(package_warnings(
+                dependencies,
+                self.dependency_context(),
+                fallback,
+            ));
         }
         warnings
     }
@@ -238,7 +244,7 @@ impl ReadService {
         let root = index.root();
         let matcher = selected.matcher.as_ref();
         let fetch_limit = index.results_max();
-        if scope != SearchScope::Dependencies {
+        if scope != SearchScope::Global {
             collect_indexed_hits(index, matcher, root, criteria, fetch_limit, results)?;
             if results.len() < fetch_limit
                 && let Some(extra) = selected.force_include.as_ref()
@@ -395,8 +401,8 @@ pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
             return Err(ReadFault::unsupported("traversal at a revision"));
         }
         // The `all` scope still walks the project graph beside the package
-        // declarations; `dependencies` alone leaves the walk nothing to run over.
-        if params.scope == SearchScope::Dependencies {
+        // declarations; `global` alone leaves the walk nothing to run over.
+        if params.scope == SearchScope::Global {
             return Err(ReadFault::invalid(
                 "traversal",
                 "the relationship graph serves the project alone",
@@ -406,37 +412,39 @@ pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
     Ok(())
 }
 
-/// Refuses a `traversal` whose `seed` disagrees with what the request seeds the walk from.
+/// The capability a walk beside a comparison names.
 ///
-/// A walk standing without `change` has no other starting declaration, so `seed` names it.
-/// A walk riding beside `change` starts at every changed declaration, so a `seed` beside it
-/// names a second starting point the answer cannot honor. `schemars`' cross-field rules are
-/// advisory only, so this mirrors the rule `require_traversal_seed` advertises.
+/// The language engine lane resolves the references a walk follows, and an engine session
+/// serves the current tree; a comparison names two committed revisions instead. No resend
+/// of the same request clears that.
+pub(crate) const CHANGE_TRAVERSAL_CAPABILITY: &str = "relationship traversal beside a comparison";
+
+/// Refuses a `traversal` that names no `seed`, and one riding beside `change`.
+///
+/// A walk has one starting declaration, and `seed` names it. `schemars`' cross-field rules
+/// are advisory only, so this mirrors the rule `require_traversal_seed` advertises.
 fn validate_traversal_seed(
     params: &SearchParams,
     traversal: &SearchTraversal,
 ) -> Result<(), ReadError> {
-    match (params.change.is_some(), traversal.seed.is_some()) {
-        (false, false) => Err(ReadFault::invalid(
-            "seed",
-            "a traversal without change starts at seed",
-        )),
-        (true, true) => Err(ReadFault::invalid(
-            "seed",
-            "a traversal beside change starts at every changed declaration",
-        )),
-        _ => Ok(()),
+    if params.change.is_some() {
+        return Err(ReadFault::unsupported(CHANGE_TRAVERSAL_CAPABILITY));
     }
+    if traversal.seed.is_none() {
+        return Err(ReadFault::invalid("seed", "a traversal starts at seed"));
+    }
+    Ok(())
 }
 
 /// Refuses a `change` beside a field that selects another result set or another tree, and
 /// a revision spelling that breaks the charset [`RevisionId`] advertises.
 ///
 /// The `change` block names both sides of the comparison itself, so `rev` has nothing left
-/// to address, and `query` selects a result set of its own. A `scope` past `project`
-/// follows the rule every revision-addressed read applies, since the dependency index
-/// serves the current tree alone. A `traversal` is the one block that rides beside a
-/// comparison: it extends the same result set rather than selecting another.
+/// to address, and `query` selects a result set of its own. A `scope` past `local`
+/// follows the rule every revision-addressed read applies, since the package branch
+/// serves the current tree alone. A `traversal` is refused beside a comparison by
+/// [`validate_traversal_seed`], since no lane resolves references for a committed
+/// revision.
 fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), ReadError> {
     if params.rev.is_some() {
         return Err(ReadFault::invalid(
@@ -450,10 +458,10 @@ fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), R
             "query and change select different result sets",
         ));
     }
-    if params.scope != SearchScope::Project {
+    if params.scope != SearchScope::Local {
         return Err(ReadFault::invalid(
             "scope",
-            "dependencies are served for the current tree alone",
+            "package facts are served for the current tree alone",
         ));
     }
     let sides = [
@@ -1195,8 +1203,8 @@ mod tests {
         ByteRange, ReadFault, ReadService, SearchHit, SearchHitTarget, SymbolMatchRank,
         symbol_match_score,
     };
-    use crate::read::DependencyStore;
-    use crate::read::tests::{empty_dependency_index, helper_store, helper_unit, project_fixture};
+    use crate::packages::PackageBranch;
+    use crate::read::tests::{helper_store, helper_unit, project_fixture};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -3633,7 +3641,7 @@ pub fn compute() -> i32 {
     /// `get_symbol`'s scope tests share.
     fn dependency_fixture() -> TestResult<(TempDir, ReadService)> {
         let (directory, service) = project_fixture("pub fn beacon() {}\n")?;
-        Ok((directory, service.with_dependencies(helper_store()?)))
+        Ok((directory, service.with_packages(helper_store()?)))
     }
 
     /// Each hit's declaration name and whether it is addressed by `unit`, in answer order.
@@ -3672,11 +3680,11 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn search_dependencies_scope_answers_the_helper_declaration_by_unit() -> TestResult {
+    fn search_global_scope_answers_the_helper_declaration_by_unit() -> TestResult {
         let (_directory, service) = dependency_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
             "query": "helper_beacon",
-            "scope": "dependencies",
+            "scope": "global",
             "include": ["source", "score"]
         }))?;
 
@@ -3704,19 +3712,26 @@ pub fn compute() -> i32 {
         };
         assert_eq!(symbol.name, "helper_beacon");
         assert_eq!(symbol.origin.location, Some(SourceLocationKind::Dependency));
-        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(
+            matches!(
+                result.warnings.as_slice(),
+                [ReadWarning::GlobalIndexUnavailable { indexed: 1, .. }]
+            ),
+            "{:?}",
+            result.warnings
+        );
         Ok(())
     }
 
-    /// `dependencies` skips every project lane: the project's own `beacon` never answers,
+    /// `global` skips every project lane: the project's own `beacon` never answers,
     /// the helper's exact `beacon` orders above its substring `helper_beacon`, and a
     /// `file` target answers empty since a package contributes declarations alone.
     #[test]
-    fn search_dependencies_scope_skips_the_project_lanes() -> TestResult {
+    fn search_global_scope_skips_the_project_lanes() -> TestResult {
         let (_directory, service) = dependency_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
-            "scope": "dependencies",
+            "scope": "global",
             "include": ["score"]
         }))?;
 
@@ -3741,7 +3756,7 @@ pub fn compute() -> i32 {
 
         let params: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
-            "scope": "dependencies",
+            "scope": "global",
             "target": "file"
         }))?;
         let result = service.search(&params, &[])?;
@@ -3756,7 +3771,7 @@ pub fn compute() -> i32 {
     #[test]
     fn search_all_scope_orders_project_and_package_hits_by_score() -> TestResult {
         let (_directory, service) = project_fixture("pub fn beacon_tower() {}\n")?;
-        let service = service.with_dependencies(helper_store()?);
+        let service = service.with_packages(helper_store()?);
         let params: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
             "scope": "all",
@@ -3781,7 +3796,7 @@ pub fn compute() -> i32 {
     #[test]
     fn search_all_scope_path_order_lists_the_project_hit_before_the_package_hits() -> TestResult {
         let (_directory, service) = project_fixture("pub fn beacon_tower() {}\n")?;
-        let service = service.with_dependencies(helper_store()?);
+        let service = service.with_packages(helper_store()?);
         let params: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
             "scope": "all",
@@ -3803,11 +3818,11 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn search_dependencies_scope_with_traversal_refuses_naming_traversal() -> TestResult {
+    fn search_global_scope_with_traversal_refuses_naming_traversal() -> TestResult {
         let (_directory, service) = dependency_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
-            "scope": "dependencies",
+            "scope": "global",
             "traversal": { "seed": "rift://symbol/rust/src/lib.rs/beacon" }
         }))?;
 
@@ -3829,52 +3844,60 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    /// A walk names its starting declaration exactly once: through `seed` when it stands
-    /// without `change`, and through the changed declarations themselves beside one.
+    /// A walk names its starting declaration through `seed`, and a request that omits it
+    /// leaves the walk nowhere to start.
     #[test]
-    fn validate_search_refuses_a_traversal_whose_seed_disagrees_with_its_request() {
-        let cases = [
-            json!({"traversal": {"direction": "incoming"}}),
-            json!({
-                "change": {"base": "baseline"},
-                "traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}
-            }),
-        ];
-        for arguments in cases {
-            let params: SearchParams =
-                serde_json::from_value(arguments.clone()).expect("the request parses");
-            let error = super::validate_search(&params).expect_err("the seed rule must refuse");
-            assert!(
-                matches!(error.fault(), ReadFault::Invalid { field: "seed", .. }),
-                "{arguments}: {error}"
-            );
-            assert_eq!(error.descriptor().code(), "invalid_request", "{arguments}");
-        }
+    fn validate_search_refuses_a_traversal_that_names_no_seed() {
+        let arguments = json!({"traversal": {"direction": "incoming"}});
+        let params: SearchParams =
+            serde_json::from_value(arguments.clone()).expect("the request parses");
+
+        let error = super::validate_search(&params).expect_err("the seed rule must refuse");
+
+        assert!(
+            matches!(error.fault(), ReadFault::Invalid { field: "seed", .. }),
+            "{arguments}: {error}"
+        );
+        assert_eq!(error.descriptor().code(), "invalid_request", "{arguments}");
     }
 
-    /// A walk beside a comparison names no `seed`, and one standing without a comparison
-    /// names one: both pass the rule.
+    /// A configured language engine resolves the references a walk follows, and an engine
+    /// session serves the current tree; a comparison names two committed revisions.
     #[test]
-    fn validate_search_accepts_each_way_a_walk_names_its_starting_declaration() {
-        let cases = [
-            json!({"traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}}),
-            json!({
-                "change": {"base": "baseline"},
-                "traversal": {"direction": "incoming"}
-            }),
-        ];
-        for arguments in cases {
-            let params: SearchParams =
-                serde_json::from_value(arguments.clone()).expect("the request parses");
-            let accepted = super::validate_search(&params);
-            assert!(accepted.is_ok(), "{arguments} must pass the seed rule");
-        }
+    fn validate_search_refuses_a_traversal_riding_beside_a_comparison() {
+        let params: SearchParams = serde_json::from_value(json!({
+            "change": {"base": "baseline"},
+            "traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}
+        }))
+        .expect("the request parses");
+
+        let error = super::validate_search(&params).expect_err("the pairing must refuse");
+
+        assert_eq!(error.descriptor().code(), "capability_unavailable");
+        assert!(
+            error
+                .to_string()
+                .contains(super::CHANGE_TRAVERSAL_CAPABILITY),
+            "{error}"
+        );
+    }
+
+    /// A walk standing without a comparison and naming its seed passes the rule.
+    #[test]
+    fn validate_search_accepts_a_seeded_walk_standing_alone() {
+        let arguments = json!({"traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}});
+        let params: SearchParams =
+            serde_json::from_value(arguments.clone()).expect("the request parses");
+        assert!(
+            super::validate_search(&params).is_ok(),
+            "{arguments} must pass the seed rule"
+        );
     }
 
     #[test]
-    fn search_rev_with_a_dependency_scope_refuses_naming_scope() -> TestResult {
+    fn search_rev_with_a_global_scope_refuses_naming_scope() -> TestResult {
         let (_directory, service) = dependency_fixture()?;
-        for scope in ["dependencies", "all"] {
+        for scope in ["global", "all"] {
             let params: SearchParams =
                 serde_json::from_value(json!({"query": "beacon", "scope": scope, "rev": "main"}))?;
 
@@ -3891,61 +3914,12 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    /// `[dependencies] enabled = false` refuses a search whose scope reaches dependencies
-    /// the way it refuses the `get_symbol` lookup; the project scope still answers.
+    /// The package warnings ride a `search` answer whose scope reaches packages, the
+    /// same way they ride `get_symbol`'s, and no other.
     #[test]
-    fn search_dependency_scope_with_the_index_disabled_is_unsupported() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::create_dir(directory.path().join("src"))?;
-        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
-        let disabled = rift_protocol::dependencies::DependenciesConfiguration {
-            enabled: false,
-            ..rift_protocol::dependencies::DependenciesConfiguration::default()
-        };
-        let service = ReadService::build_with_languages(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::default(),
-            &rift_core::LanguageFileSelections::default(),
-            rift_index::BindingPolicy::default(),
-            HistoryConfiguration::default(),
-            disabled,
-        )?
-        .with_dependencies(helper_store()?);
-        for scope in ["dependencies", "all"] {
-            let params: SearchParams =
-                serde_json::from_value(json!({"query": "beacon", "scope": scope}))?;
-
-            let error = service
-                .search(&params, &[])
-                .expect_err("a disabled dependency index refuses the scope");
-
-            assert!(
-                matches!(error.fault(), ReadFault::Unsupported { .. }),
-                "scope {scope}: {error}"
-            );
-            assert_eq!(error.descriptor().code(), "capability_unavailable");
-        }
-        let params: SearchParams = serde_json::from_value(json!({"query": "beacon"}))?;
-        let answer = service.search(&params, &[])?;
-        assert!(
-            !answer.results.is_empty(),
-            "the project scope still answers"
-        );
-        assert!(
-            answer.results.iter().all(|hit| hit.path.is_some()),
-            "every project hit is addressed by path: {:?}",
-            answer.results
-        );
-        Ok(())
-    }
-
-    /// The dependency warnings ride a `search` answer whose scope reaches dependencies,
-    /// the same way they ride `get_symbol`'s, and no other.
-    #[test]
-    fn search_dependency_scope_warns_a_skipped_package() -> TestResult {
-        let mut index = empty_dependency_index();
+    fn search_global_scope_warns_a_skipped_package() -> TestResult {
+        let mut index =
+            rift_index::DependencyIndex::empty(rift_index::DependencyIndexLimits::default());
         let zeta = PackageIdentity {
             manager: "cargo".to_owned(),
             name: "zeta".to_owned(),
@@ -3953,15 +3927,23 @@ pub fn compute() -> i32 {
         };
         index.skip(zeta.clone(), "zeta refused".to_owned());
         let (_directory, service) = project_fixture("pub fn beacon() {}\n")?;
-        let service = service.with_dependencies(Arc::new(DependencyStore::new(index)));
+        let service = service.with_packages(Arc::new(PackageBranch::from_index(index)));
 
-        for scope in ["dependencies", "all"] {
+        for scope in ["global", "all"] {
             let params: SearchParams =
                 serde_json::from_value(json!({"query": "beacon", "scope": scope}))?;
             let result = service.search(&params, &[])?;
+            assert!(
+                matches!(
+                    result.warnings.first(),
+                    Some(ReadWarning::GlobalIndexUnavailable { .. })
+                ),
+                "scope {scope}: {:?}",
+                result.warnings
+            );
             assert_eq!(
-                result.warnings,
-                [ReadWarning::DependencyPackageSkipped {
+                result.warnings[1..],
+                [ReadWarning::PackageSkipped {
                     package: zeta.clone(),
                     reason: "zeta refused".to_owned(),
                 }],

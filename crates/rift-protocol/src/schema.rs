@@ -776,6 +776,39 @@ pub fn declare_lsp_ranges(schema: &mut Schema) {
     );
 }
 
+/// A [`PackageContextEntry`](crate::dependencies::PackageContextEntry) states exactly
+/// one version selector: the `version` a lockfile pins, or the `requirement` a manifest
+/// declares. The context builder enforces the same rule, so a manifest-only package
+/// never carries an invented resolved version.
+pub fn require_one_package_context_selector(schema: &mut Schema) {
+    use crate::dependencies::PackageContextEntry;
+    require_one_selector(
+        schema,
+        property!(PackageContextEntry, version),
+        property!(PackageContextEntry, requirement),
+    );
+}
+
+/// A [`ConfiguredPackage`](crate::dependencies::ConfiguredPackage) states exactly one
+/// version selector, the same rule [`PackageContextEntry`](crate::dependencies::PackageContextEntry)
+/// carries. Acceptance enforces it before the entry reaches the context.
+pub fn require_one_configured_package_selector(schema: &mut Schema) {
+    use crate::dependencies::ConfiguredPackage;
+    require_one_selector(
+        schema,
+        property!(ConfiguredPackage, version),
+        property!(ConfiguredPackage, requirement),
+    );
+}
+
+/// The exactly-one-selector clause both package entry models carry.
+fn require_one_selector(schema: &mut Schema, version: &str, requirement: &str) {
+    append(
+        schema,
+        one_of(vec![requires(&[version]), requires(&[requirement])]),
+    );
+}
+
 /// An [`LspConfiguration`](crate::configuration::LspConfiguration) selects
 /// exactly one engine: a spawned `command`, or an `embedded` engine served
 /// in process. Acceptance enforces the same rule, together with the
@@ -876,9 +909,10 @@ pub fn require_search_selector(schema: &mut Schema) {
 }
 
 /// A [`SearchTraversal`](crate::search::SearchTraversal) names the declaration its walk
-/// starts at through `seed`, unless it rides beside `change`, which starts the walk at
-/// every changed declaration. The server enforces both halves, so the schema states them
-/// for a validating caller.
+/// starts at through `seed`, and no walk rides beside `change`: a comparison names two
+/// committed revisions, and the language engine lane that resolves references serves the
+/// current tree alone. The server enforces both halves, so the schema states them for a
+/// validating caller.
 pub fn require_traversal_seed(schema: &mut Schema) {
     use crate::search::{SearchParams, SearchTraversal};
     let change = property!(SearchParams, change);
@@ -887,21 +921,15 @@ pub fn require_traversal_seed(schema: &mut Schema) {
     append(
         schema,
         described(
-            "a traversal without change starts at seed",
-            otherwise(
-                requires(&[change]),
-                properties(vec![(traversal, requires(&[seed]))]),
-            ),
+            "a traversal starts at seed",
+            properties(vec![(traversal, requires(&[seed]))]),
         ),
     );
     append(
         schema,
         described(
-            "a traversal beside change starts at every changed declaration, never at seed",
-            when(
-                requires(&[change]),
-                properties(vec![(traversal, not(requires(&[seed])))]),
-            ),
+            "a traversal never rides beside change",
+            when(requires(&[change]), not(requires(&[traversal]))),
         ),
     );
 }
@@ -1748,7 +1776,19 @@ mod tests {
 
     #[test]
     fn rule_properties_exist_in_model_schemas() {
-        let cases: [(&str, Value, &[&str]); 5] = [
+        let cases: [(&str, Value, &[&str]); 7] = [
+            (
+                "PackageContextEntry",
+                serde_json::to_value(schema_for!(crate::dependencies::PackageContextEntry))
+                    .expect("schema"),
+                &["version", "requirement"],
+            ),
+            (
+                "ConfiguredPackage",
+                serde_json::to_value(schema_for!(crate::dependencies::ConfiguredPackage))
+                    .expect("schema"),
+                &["version", "requirement"],
+            ),
             (
                 "LspConfiguration",
                 serde_json::to_value(schema_for!(crate::configuration::LspConfiguration))

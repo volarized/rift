@@ -15,7 +15,6 @@ use workspace_client::{
 const SERVICE: &str = "def serve(port: int) -> int:\n    return port\n";
 const CALLER: &str = "from service import serve\n\ndef caller() -> int:\n    return serve(8080)\n";
 const CONFIGURATION: &str = "\
-[providers.binding]\nenabled = false\n\
 [languages.python.lsp]\nembedded = \"ty\"\n\
 retry = { attempts = 2, delay = \"1ms\", delay_limit = \"1ms\" }\n";
 

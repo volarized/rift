@@ -12,15 +12,14 @@ use rift_lsp::uri::{TreeRoot, UriFault};
 use rift_protocol::read::{
     ExactKind, Extensions, GraphHop, HopDirection, Language, ReadWarning, Relationship,
     RelationshipDerivation, RelationshipFacet, SearchParams, SearchParamsTarget, SearchTraversal,
-    SymbolId, TraversalDirection,
+    SymbolId,
 };
 use rift_syntax::SyntaxSymbol;
 
 use crate::engine::{EnginePool, EngineSlot};
 use crate::read::{ReadError, ReadFault, ReadService, symbol_id};
 use crate::traversal::{
-    TRAVERSAL_NODES_MAX, TraversalSeeds, resolve_graph_symbol, validate_traversal,
-    walk_traversal_with_references,
+    TRAVERSAL_NODES_MAX, resolve_graph_symbol, validate_traversal, walk_traversal_with_references,
 };
 
 /// References resolved from one published source revision.
@@ -133,7 +132,7 @@ fn reachable_reference_source(
     prior.depth -= 1;
     walk_traversal_with_references(
         store,
-        &TraversalSeeds::Named(seed.clone()),
+        seed,
         &prior,
         TRAVERSAL_NODES_MAX,
         &EngineReferences::default(),
@@ -154,13 +153,9 @@ fn reference_traversal(params: &SearchParams) -> Option<(&SearchTraversal, &Symb
         params.target,
         SearchParamsTarget::All | SearchParamsTarget::Symbol
     );
-    let incoming = matches!(
-        traversal.direction,
-        TraversalDirection::Incoming | TraversalDirection::Both
-    );
     let references =
         traversal.facets.is_empty() || traversal.facets.contains(&RelationshipFacet::References);
-    (current && symbols && incoming && references).then_some((traversal, seed))
+    (current && symbols && references).then_some((traversal, seed))
 }
 
 fn reference_source<'source>(
@@ -234,7 +229,7 @@ pub async fn resolve_engine_references(
         step.depth = depth + 1;
         pending = walk_traversal_with_references(
             reads.relationships(),
-            &TraversalSeeds::Named(seed.clone()),
+            &seed,
             &step,
             TRAVERSAL_NODES_MAX,
             &references,
@@ -1023,7 +1018,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_selected_engine_preserves_indexed_traversal() -> TestResult {
+    async fn no_selected_engine_refuses_the_walk() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(
             directory.path().join("lib.rs"),
@@ -1035,10 +1030,10 @@ mod tests {
         assert!(!super::uses_engine_references(&reads, &engines, &params)?);
         let references = Box::pin(resolve_engine_references(&reads, &engines, &params)).await?;
         assert!(references.is_empty());
-        assert_eq!(
-            reads.search(&params, &[])?,
-            reads.search_with_references(&params, &[], &references)?
-        );
+        let refused = reads
+            .search_with_references(&params, &[], &references)
+            .expect_err("no engine answered, so the walk has no edge source");
+        assert_eq!(refused.descriptor().code(), "capability_unavailable");
         Ok(())
     }
 
@@ -1103,7 +1098,7 @@ mod tests {
     }
     #[cfg(unix)]
     #[tokio::test]
-    async fn absent_references_capability_preserves_indexed_results() -> TestResult {
+    async fn absent_references_capability_refuses_the_walk() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(
             directory.path().join("lib.rs"),
@@ -1127,10 +1122,10 @@ mod tests {
         engines.shutdown().await;
         let references = result?;
         assert!(references.is_empty());
-        assert_eq!(
-            reads.search(&params, &[])?,
-            reads.search_with_references(&params, &[], &references)?
-        );
+        let refused = reads
+            .search_with_references(&params, &[], &references)
+            .expect_err("an engine without the references capability answers no edge");
+        assert_eq!(refused.descriptor().code(), "capability_unavailable");
         Ok(())
     }
 
@@ -1169,7 +1164,7 @@ mod tests {
         let engines = pool(directory.path(), "rust", configuration);
         let base = request(&symbol(&reads, "beacon"));
         for invalid in [
-            json!({"scope":"dependencies"}),
+            json!({"scope":"global"}),
             json!({"query":""}),
             json!({"limit":0}),
             json!({"paths":{"include":["["]}}),
@@ -1192,23 +1187,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolved_empty_references_work_without_binding() -> TestResult {
+    async fn resolved_empty_references_answer_an_empty_walk() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(
             directory.path().join("helper.py"),
             "def beacon() -> int:\n    return 7\n",
         )?;
-        let binding = rift_protocol::configuration::BindingConfiguration {
-            enabled: false,
-            ..Default::default()
-        };
         let reads = ReadService::build_with_languages(
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
             &TextFileInclusion::default(),
             &rift_core::LanguageFileSelections::default(),
-            rift_index::BindingPolicy::from(&binding),
             HistoryConfiguration::default(),
             rift_protocol::dependencies::DependenciesConfiguration::default(),
         )?;
@@ -1244,23 +1234,12 @@ mod tests {
         let engines = pool(directory.path(), "rust", configuration);
         let base = request(&symbol(&reads, "beacon"));
         assert!(super::uses_engine_references(&reads, &engines, &base)?);
-        let mut outgoing = base.clone();
-        outgoing.traversal.as_mut().expect("traversal").direction =
-            rift_protocol::read::TraversalDirection::Outgoing;
         let mut calls = base.clone();
         calls.traversal.as_mut().expect("traversal").facets =
             vec![rift_protocol::read::RelationshipFacet::Calls];
         let mut files = base;
         files.target = rift_protocol::read::SearchParamsTarget::File;
-        // A walk riding beside a comparison names no seed, so no engine answers it: both
-        // compared sides are committed revisions, which no engine session serves.
-        let arguments = json!({
-            "target": "symbol",
-            "change": {"base": "baseline"},
-            "traversal": {"direction": "incoming", "facets": ["references"]}
-        });
-        let compared: SearchParams = serde_json::from_value(arguments)?;
-        for params in [outgoing, calls, files, compared] {
+        for params in [calls, files] {
             assert!(!super::uses_engine_references(&reads, &engines, &params)?);
         }
         assert_eq!(

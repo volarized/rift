@@ -18,9 +18,11 @@ mod workspace;
 pub use change_set::{ChangeSet, FileDigest, PathChange, PathChanges, WorkspaceDigests};
 pub use database::{DatabasePool, WorkspaceDatabase};
 pub use dependency::{
-    DIRECTORY_DEPTH_MAX_DEFAULT, DependencyIndex, DependencyIndexLimits, DependencySymbolMatch,
-    PackageFiles, PackageIndex, PackageIndexError, PackageIndexFault, PackageIndexViolation,
-    PackageSelection, SkippedPackage, WALK_ENTRIES_MAX_DEFAULT, package_files,
+    AnalyzedFile, DIRECTORY_DEPTH_MAX_DEFAULT, DependencyIndex, DependencyIndexLimits,
+    DependencySymbolMatch, ManifestError, PackageAnalysis, PackageAnalyzer, PackageFiles,
+    PackageIndex, PackageIndexError, PackageIndexFault, PackageIndexViolation, SkippedPackage,
+    WALK_ENTRIES_MAX_DEFAULT, analyzer_manifest_path, analyzer_revision, package_files,
+    render_analyzer_manifest,
 };
 pub use glob::{ForceIncludeReach, PathMatcher, PathVerdict};
 pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
@@ -36,7 +38,6 @@ pub use relationship::{
     RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore, produced_relationship_facets,
 };
 pub use revision::RevisionPaths;
-pub use semantic::BindingPolicy;
 pub use vector::{SemanticVectorStore, StoredVector};
 pub use workspace::{
     IndexedFile, ReadableSymbol, SymbolMatch, SymbolMatchRank, TextSourceFile,

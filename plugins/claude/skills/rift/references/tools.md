@@ -9,9 +9,9 @@ carries the declaration and its source excerpt unless `include` omits
 `source`. `include: ["history"]` adds each hit's version-control timeline,
 walked from the served revision. `rev` serves the lookup from a
 version-control revision instead of the current tree. `scope` reaches
-past the project tree: `dependencies` answers from the public
-declarations of the cataloged packages alone, `all` from both, project
-hits first. Use `search` when the name is not exactly known.
+past the project tree: `global` answers from the public declarations of
+the cataloged packages alone, `all` from both, project hits first. Use
+`search` when the name is not exactly known.
 
 Parameters:
 
@@ -21,7 +21,7 @@ Parameters:
 - `name` (required) - The declaration name to look up - a name, not a full `SymbolId` or free-text query; `search` takes free text.
 - `page_index` - Zero-based page of the result set to serve, sized by `limit`.
 - `rev` - The version-control revision to read - a branch, tag, or commit id as the workspace's version control spells it.
-- `scope` - Which declarations the lookup searches: the project tree, the cataloged dependency packages, or both.
+- `scope` - Which declarations the lookup searches: the project tree, the dependency packages, or both.
 
 ## nodes
 
@@ -46,7 +46,7 @@ bounded relationship `traversal` from one seed symbol. `change` answers the
 declarations two committed revisions hold differently, in place of `query` and
 `traversal`. `rev` searches a version-control revision instead of the current tree,
 and never combines with `traversal` or `change`. `scope` reaches past the project
-tree: `dependencies` answers `query` from the public declarations of the cataloged
+tree: `global` answers `query` from the public declarations of the cataloged
 packages alone, `all` from both, ordered together. Use `get_symbol` when the
 declaration name is known.
 For a current-tree search, the published workspace is resolved exactly once and
@@ -65,7 +65,7 @@ Parameters:
 - `paths` - Files eligible for the search, selected by project-relative globs.
 - `query` - Text to match against file contents, symbol names, and rendered signatures.
 - `rev` - The version-control revision to search - a branch, tag, or commit id as the workspace's version control spells it.
-- `scope` - Which declarations `query` searches: the project tree, the public declarations of the cataloged dependency packages, or both.
+- `scope` - Which declarations `query` searches: the project tree, the public declarations of the dependency packages, or both.
 - `target` - Which entity kinds may be returned - a kind selector, never the text to search for; that is `query`.
-- `traversal` - A bounded relationship walk, standing alone or beside `query` or `change`.
+- `traversal` - A bounded relationship walk from `seed`, standing alone or beside `query`.
 

@@ -135,37 +135,30 @@ into one answer, while this table's `force_include` puts them in the index every
 
 ## Dependencies
 
-<VersionBadge version="v0.0.32" languages={["Rust", "Python", "TypeScript"]} />
+<VersionBadge version="v0.0.39" languages={["Rust", "Python", "TypeScript"]} />
 
-`dependencies` shapes the [dependency index](/docs/developer/architecture#dependency-index): whether it
-runs, how the catalog is resolved, which cataloged packages it indexes, and the bounds it reads
-and holds under. The keys are shown at their defaults:
+`dependencies` shapes the [package index](/docs/developer/architecture#package-index): how
+the catalog is resolved, which packages you name beside the ones the workspace's own files state,
+and the bounds the index reads and holds under. The keys are shown at their defaults:
 
 ```toml
 [dependencies]
-enabled = true
 resolution = "auto"
-include = []
-exclude = []
+packages = []
 package_size = "4mb"
 index_size = "256mb"
 package_files = 2000
-command_timeout = "120s"
+command_timeout = "2m"
 ```
 
-- `enabled = false` turns the index off: [`get_symbol`](/docs/mcp#tool-get_symbol) and
-  [`search`](/docs/mcp#tool-search) refuse a `scope` beyond `project` with
-  `capability_unavailable`. The catalog still resolves, so `rift://map` still lists `packages`
 - `resolution` selects how the resolvers reach a package graph: `auto` runs each toolchain and
   answers from the lockfile when the run fails; `static` never runs a toolchain, so every
   resolver answers from its lockfile and the machine's package cache alone. The Rust standard
   library is cataloged from `rustc`, so under `static` it has no entry and the answer reports
   the degradation
-- `include` and `exclude` are globs over `<manager>/<name>` - `cargo/tokio`, `npm/@types/*`,
-  `stdlib/*` - matched the way `source` patterns are, each list at most 64 patterns of at most
-  256 bytes. Empty `include` selects every cataloged package; a match in `exclude` drops a
-  package even when `include` also matches it. A dropped package is never planned: it stays in
-  the catalog and on the map, and no answer reports it pending or skipped
+- `packages` names packages beside the ones the workspace's manifests and lockfiles state, at
+  most 20000 of them. Each entry carries `manager`, `name`, and exactly one of `version` and
+  `requirement`; an entry naming both, or neither, is refused
 - `package_size` bounds the selected source one package may hold, 64kb to 1gb; a package past
   it is skipped
 - `index_size` bounds what every indexed package holds together, 1mb to 16gb; a package that
@@ -175,9 +168,22 @@ command_timeout = "120s"
 - `command_timeout` bounds one toolchain run - `cargo metadata`, `rustc --print sysroot` - 1s
   to 1h; a run past it is killed and the resolver answers from its static inputs
 
-A change to `package_size`, `index_size`, `package_files`, `include`, or `exclude` re-indexes
-every package: each held build was read under the old bounds and selection, so the next
-publication plans the index again from the catalog.
+A configured entry looks like this:
+
+```toml
+[[dependencies.packages]]
+manager = "cargo"
+name = "serde"
+version = "1.0.228"
+
+[[dependencies.packages]]
+manager = "npm"
+name = "typescript"
+requirement = "^5.9.0"
+```
+
+A change to `package_size`, `index_size`, or `package_files` analyzes every package again on the
+next package read: each package the package index holds was read under the old bounds.
 
 ## Languages and LSP
 
@@ -380,53 +386,6 @@ this table says.
 walk's cost scales with how far back it reaches. The history provider computes a
 [`SymbolHistory`](/docs/developer/protocol/reference#SymbolHistory) timeline inside that depth; a
 revision beyond it contributes no version.
-
-<VersionBadge version="v0.0.27" />
-
-`[providers.binding]` bounds the name binding provider, which resolves references from syntax
-facts inside the server. The keys are shown at their
-defaults:
-
-```toml
-[providers.binding]
-enabled = true
-max_unit_scopes = 4096
-max_unit_definitions = 16384
-max_unit_references = 65536
-max_unit_links = 4096
-max_graph_nodes = 2000000
-max_graph_links = 500000
-max_reference_work = 4096
-max_path_depth = 64
-max_reference_targets = 64
-max_publication_work = 50000000
-```
-
-`enabled = false` turns the provider off: reads answer from syntax facts alone.
-
-The provider assembles every file's facts into one graph and resolves each reference on a
-bounded work queue; each bound caps one phase of that work:
-
-- `max_unit_scopes` bounds the scopes one file may contribute, 1 to 40960
-- `max_unit_definitions` bounds the definitions one file may contribute, 1 to 163840
-- `max_unit_references` bounds the references one file may contribute, 1 to 655360
-- `max_unit_links` bounds the imports, member links, and module declarations one file may
-  contribute together, 1 to 40960
-- `max_graph_nodes` bounds the scopes, definitions, and references one build's graph holds,
-  1 to 20000000
-- `max_graph_links` bounds that graph's links, 1 to 5000000
-- `max_reference_work` bounds the work items one reference may enqueue while resolving,
-  1 to 409600
-- `max_path_depth` bounds the steps one work item may accumulate, 1 to 640
-- `max_reference_targets` bounds the definitions one reference may resolve to, 1 to 256
-- `max_publication_work` bounds the work items one build may enqueue across every reference,
-  1 to 5000000000
-
-The index's publication acceptance follows `max_graph_nodes` too: raising it also raises the
-bound on what one build can publish beside syntax.
-
-An exhausted bound never fails a build: the revision publishes with the syntax facts alone,
-and the breach lands in the server log naming the bound.
 
 Provider configuration does not set merge order or freshness. A provider rebuilding after a file
 change can serve its previous immutable revision; the result then carries a `stale_index` entry

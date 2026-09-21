@@ -15,7 +15,7 @@ check the [main documentation](/docs).
       mcp -- "Streamable HTTP /api/mcp" --> server["rift server<br/>Axum on Tokio"]:::rift
       toml["rift.toml"]:::config -- "acceptance" --> server
       subgraph indexing["providers and index"]
-        providers["providers<br/>tree-sitter + binding"]:::provider
+        providers["providers<br/>tree-sitter"]:::provider
         normalization["normalization<br/>SymbolRecord graph"]:::rift
         memory["in-memory index<br/>symbols + nodes"]:::store
         db[".rift/db<br/>search index + server logs"]:::store
@@ -52,8 +52,7 @@ tool documents.
 The server is an [Axum](https://docs.rs/axum) application on the [Tokio](https://tokio.rs)
 runtime. MCP clients use its `/api/mcp` route, which serves Streamable HTTP through
 [rmcp](https://github.com/modelcontextprotocol/rust-sdk)'s service layer; `/api/stop` serves
-`rift server stop`, and the rest of the routes are reserved for other surfaces, the SCIP
-export for example.
+`rift server stop`.
 
 Startup runs one cycle:
 
@@ -292,22 +291,37 @@ Syntax providers wrap [tree-sitter](https://tree-sitter.github.io/tree-sitter/) 
 a Rift-owned adapter: grammar node kinds resolve to numeric ids once, and raw query and cursor
 APIs never leave the syntax crate.
 
-<VersionBadge version="v0.0.27" />
+The registry itself assembles from one shipped definition list in `rift-syntax`: each entry
+names a language's identity, the file extensions it claims, and the provider parsing it, so
+adding a language is one definition plus one list entry.
 
-The binding provider is the `rift-binding` crate, run in process by the index build. A syntax
-provider may extract binding facts - scopes, definitions, references, imports - in one walk
-over the tree its parse produced and attach them to its document. The Rust provider does, and
-supplies the `ModuleLayout` implementation the build resolves module paths through, fetched
-once per language from the provider registry. The registry itself assembles from one shipped
-definition list in `rift-syntax`: each entry names a language's identity, the file extensions
-it claims, and the provider parsing it, so adding a language is one definition plus one list
-entry.
+## Package analysis
 
-The build assembles every document's facts into one graph, links modules across units, resolves
-each reference on a bounded work queue with a per-step precedence rank, and publishes the
-resolutions beside the syntax publication. An item definition carries the same declaration
-binding as its syntax Contribution, the equivalence evidence normalization uses to join the
-two records.
+<VersionBadge version="v0.0.39" />
+
+One package's source reaches the index through the package analyzer in `rift-index`, which
+holds no I/O: it takes bytes a caller already read, parses them with the shipped syntax
+providers, places each file under `rift://source/<manager>/<name>@<version>/<path>`, assembles
+the declarations, and renders one `PackagePublication`. That publication is the logical package
+index. The local package index consumes it, and a later global ingestion consumes the same
+shape, so one extraction serves both.
+
+Two publications are comparable by their own fields. `format_revision` states the shape;
+`analyzer_revision` is the digest of the analyzer manifest, which names each shipped grammar's
+version and checksum and the content digest of every source file that decides what a
+publication holds: the whole `rift-syntax` and `rift-provider` crates, the analyzer, the
+package walk, the lexical and semantic passes, and the identity module.
+Every record - a source unit, a declaration, a search document - carries a digest over its own
+content, and the whole document renders as
+[RFC 8785](https://www.rfc-editor.org/rfc/rfc8785) canonical JSON, so two runs over the same
+bytes under the same analyzer revision produce byte-identical output, and an adapter can compute
+added, replaced, and removed records by identity and digest alone. A publication addresses source
+by package-relative path and source unit, so no machine's directory layout reaches a consumer.
+
+The analyzer manifest is generated beside the served schemas and committed at
+`crates/rift-index/src/dependency/analyzer-manifest.json`, so a change to any of those files
+that ships without a regenerated manifest fails `just generate-check`. The publication's own schema is
+exported to [`package-index.schema.json`](https://volar.sh/rift/package-index.schema.json).
 
 ## Language engines
 

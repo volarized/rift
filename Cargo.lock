@@ -3580,26 +3580,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "protobuf"
-version = "3.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d65a1d4ddae7d8b5de68153b48f6aa3bba8cb002b243dbdbc55a5afbc98f99f4"
-dependencies = [
- "once_cell",
- "protobuf-support",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "protobuf-support"
-version = "3.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e36c2f31e0a47f9280fb347ef5e461ffcd2c52dd520d8e216b52f93b0b0d7d6"
-dependencies = [
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "pulp"
 version = "0.22.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3929,7 +3909,7 @@ dependencies = [
 
 [[package]]
 name = "rift"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "axum",
  "clap",
@@ -3966,18 +3946,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "rift-binding"
-version = "0.0.38"
-dependencies = [
- "rift-core",
- "rift-provider",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "rift-core"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "percent-encoding",
  "rift-protocol",
@@ -3989,7 +3959,7 @@ dependencies = [
 
 [[package]]
 name = "rift-dependency"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "rift-core",
  "rift-protocol",
@@ -4002,7 +3972,7 @@ dependencies = [
 
 [[package]]
 name = "rift-history"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "gix",
  "rift-core",
@@ -4013,10 +3983,9 @@ dependencies = [
 
 [[package]]
 name = "rift-index"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "ignore",
- "rift-binding",
  "rift-core",
  "rift-dependency",
  "rift-history",
@@ -4024,6 +3993,7 @@ dependencies = [
  "rift-provider",
  "rift-syntax",
  "serde",
+ "serde_json",
  "sha2",
  "strum",
  "tempfile",
@@ -4036,7 +4006,7 @@ dependencies = [
 
 [[package]]
 name = "rift-lsp"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "globset",
  "lsp-types",
@@ -4051,7 +4021,7 @@ dependencies = [
 
 [[package]]
 name = "rift-mcp"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "axum",
  "data-encoding",
@@ -4081,29 +4051,29 @@ dependencies = [
 
 [[package]]
 name = "rift-protocol"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "jsonschema",
  "schemars",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
  "serde_path_to_error",
  "strum",
 ]
 
 [[package]]
 name = "rift-provider"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "rift-core",
- "scip",
  "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "rift-search"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -4124,7 +4094,7 @@ dependencies = [
 
 [[package]]
 name = "rift-server"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "lsp-types",
  "percent-encoding",
@@ -4155,9 +4125,8 @@ dependencies = [
 
 [[package]]
 name = "rift-syntax"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
- "rift-binding",
  "rift-core",
  "rift-protocol",
  "rift-provider",
@@ -4553,6 +4522,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "ryu-js"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
+
+[[package]]
 name = "safetensors"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4651,15 +4626,6 @@ dependencies = [
  "quote",
  "serde_derive_internals",
  "syn 3.0.3",
-]
-
-[[package]]
-name = "scip"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26a72133c2d6fd45c9a3a343bcb3db2faa30f68f0919bfa3370ca85add5460c3"
-dependencies = [
- "protobuf",
 ]
 
 [[package]]
@@ -4762,6 +4728,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_json_canonicalizer"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe52319a927259afbfa5180c5157cd8167edfd3e8c254f9558c7fef44c5649f2"
+dependencies = [
+ "ryu-js",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

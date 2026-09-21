@@ -6,10 +6,12 @@
 //! into the docs, so the served surface and the documented surface cannot
 //! drift apart.
 
+pub mod canonical;
 pub mod configuration;
 pub mod dependencies;
 pub mod diagnostic;
 pub mod error;
+pub mod index;
 pub mod lock;
 pub mod map;
 pub mod read;

@@ -5,6 +5,7 @@ format:
 
 generate:
     cargo run -q -p rift-mcp --bin rift-schema-export -- docs plugins/claude
+    cargo run -q -p rift-mcp --bin rift-schema-export -- --analyzer-manifest .
     printf '$ rift --help\n' > docs/public/cli-help.txt
     cargo run -q -p rift -- --help >> docs/public/cli-help.txt
     printf '\n$ rift server --help\n' >> docs/public/cli-help.txt
@@ -16,6 +17,7 @@ generate-check:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo run -q -p rift-mcp --bin rift-schema-export -- --check docs plugins/claude
+    cargo run -q -p rift-mcp --bin rift-schema-export -- --check --analyzer-manifest .
     fresh="$(mktemp)"
     trap 'rm -f "$fresh"' EXIT
     printf '$ rift --help\n' > "$fresh"

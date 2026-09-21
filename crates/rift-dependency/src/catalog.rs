@@ -5,9 +5,8 @@ use std::path::{Path, PathBuf};
 
 use rift_protocol::read::{Language, PackageIdentity, ProjectPath};
 
-use crate::resolver::{
-    DependencyResolver, Inspector, MANIFESTS_MAX, ResolutionRequest, ResolverName,
-};
+use crate::manifest::claimed_manifests;
+use crate::resolver::{DependencyResolver, Inspector, ResolutionRequest, ResolverName};
 
 /// Where a cataloged package's source belongs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -216,8 +215,9 @@ impl DependencyCatalog {
 /// Runs every resolver over one workspace and assembles what they cataloged.
 ///
 /// Each resolver receives the visible paths carrying its manifest file name, at most
-/// [`MANIFESTS_MAX`] of them in path order; a workspace with more reports the drop as a
-/// degradation. A resolver claiming no visible manifest does not run. The work is
+/// [`MANIFESTS_MAX`](crate::MANIFESTS_MAX) of them in path order; a workspace with more
+/// reports the drop as a degradation. A resolver claiming no visible manifest does not
+/// run. The work is
 /// proportional to the visible path count plus what each resolver reads through
 /// `inspector`.
 pub fn resolve_catalog(
@@ -228,29 +228,16 @@ pub fn resolve_catalog(
 ) -> DependencyCatalog {
     let mut resolutions = Vec::with_capacity(resolvers.len());
     for resolver in resolvers {
-        let claimed: Vec<ProjectPath> = visible
-            .iter()
-            .filter(|path| file_name(path) == resolver.manifest_file_name())
-            .cloned()
-            .collect();
-        if claimed.is_empty() {
+        let claimed = claimed_manifests(visible, resolver.manifest_file_name());
+        if claimed.manifests.is_empty() {
             continue;
         }
-        let (manifests, dropped) = if claimed.len() > MANIFESTS_MAX {
-            (&claimed[..MANIFESTS_MAX], claimed.len() - MANIFESTS_MAX)
-        } else {
-            (&claimed[..], 0)
+        let request = ResolutionRequest {
+            root,
+            manifests: &claimed.manifests,
         };
-        let request = ResolutionRequest { root, manifests };
         let mut resolution = resolver.resolve(&request, inspector);
-        if dropped > 0 {
-            resolution.degradations.push(format!(
-                "{dropped} of {} {} manifests were not read: at most {MANIFESTS_MAX} are \
-                 read per workspace",
-                claimed.len(),
-                resolver.manifest_file_name()
-            ));
-        }
+        resolution.degradations.extend(claimed.dropped);
         resolutions.push((resolver.name(), resolution));
     }
     DependencyCatalog::assemble(resolutions)
@@ -294,6 +281,8 @@ fn merge_into(standing: &mut CatalogEntry, entry: CatalogEntry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::ContextAnswer;
+    use crate::resolver::{ContextRequest, MANIFESTS_MAX, StaticInputs};
 
     fn identity(name: &str, version: &str) -> PackageIdentity {
         PackageIdentity {
@@ -412,6 +401,14 @@ mod tests {
                 inputs: request.manifests.to_vec(),
                 degradations: Vec::new(),
             }
+        }
+
+        fn context(
+            &self,
+            _request: &ContextRequest<'_>,
+            _inputs: &mut dyn StaticInputs,
+        ) -> ContextAnswer {
+            ContextAnswer::default()
         }
     }
 

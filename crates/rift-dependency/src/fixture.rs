@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::resolver::{
-    CommandFailure, CommandOutput, FileObservation, Inspector, ToolchainCommand,
+    CommandFailure, CommandOutput, FileObservation, Inspector, StaticInputs, ToolchainCommand,
 };
 
 /// An inspector answering from scripted files, directories, commands, and environment.
@@ -113,7 +113,7 @@ impl RecordedInspector {
     }
 }
 
-impl Inspector for RecordedInspector {
+impl StaticInputs for RecordedInspector {
     fn read_file(&mut self, path: &Path, bytes_max: u64) -> FileObservation {
         self.asked.push(format!("read {}", path.display()));
         match self.files.get(path) {
@@ -124,7 +124,9 @@ impl Inspector for RecordedInspector {
             Some(bytes) => FileObservation::Bytes(bytes.clone()),
         }
     }
+}
 
+impl Inspector for RecordedInspector {
     fn directory_exists(&mut self, path: &Path) -> bool {
         self.asked.push(format!("exists {}", path.display()));
         self.directories.contains(path)

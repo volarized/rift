@@ -142,31 +142,16 @@ async fn breaking_the_file_after_boot_gates_the_next_request() -> TestResult {
     Ok(())
 }
 
+/// `[providers.binding]` is a retired table: acceptance knows no such key, so a workspace
+/// carrying it refuses every read until the operator removes it.
 #[tokio::test]
-async fn out_of_range_binding_bound_fails_reads_naming_the_field() -> TestResult {
-    let directory = workspace_with(Some("[providers.binding]\nmax_path_depth = 0\n"))?;
-    let client = client_for(directory.path()).await?;
-
-    let read = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
-    assert_eq!(read["code"], json!("configuration_invalid"));
-    assert_eq!(read["retry"], json!("operator_action"));
-    let message = read["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("providers.binding.max_path_depth"),
-        "the refusal must name the out-of-range field: {message}"
-    );
-
-    client.cancel().await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn unknown_binding_key_fails_reads_typed() -> TestResult {
-    let directory = workspace_with(Some("[providers.binding]\nunknown = 1\n"))?;
+async fn retired_binding_table_fails_reads_typed() -> TestResult {
+    let directory = workspace_with(Some("[providers.binding]\nenabled = true\n"))?;
     let client = client_for(directory.path()).await?;
 
     let refused = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
     assert_eq!(refused["code"], json!("configuration_invalid"));
+    assert_eq!(refused["retry"], json!("operator_action"));
 
     client.cancel().await?;
     Ok(())

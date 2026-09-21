@@ -4,17 +4,17 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
+use std::sync::OnceLock;
 
-use rift_core::{Language, LoopBudget, SymbolId as CoreSymbolId};
+use rift_core::{LoopBudget, SymbolId as CoreSymbolId};
 use rift_index::{
     IndexedFile, PathMatcher, RelationshipEdge, RelationshipStore, SymbolMatch, SymbolMatchRank,
-    WorkspaceIndex, produced_relationship_facets,
+    WorkspaceIndex,
 };
 use rift_protocol::read::{
     ExactKind, Extensions, GraphHop, HopDirection, MatchedField, ReadWarning, Relationship,
     RelationshipDerivation, RelationshipFacet, SEARCH_TRAVERSAL_DEPTH_MAX,
     SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX, SearchHit, SearchTraversal, SymbolId,
-    TraversalDirection,
 };
 use rift_syntax::SyntaxSymbol;
 
@@ -50,6 +50,14 @@ pub(crate) fn validate_traversal(traversal: &SearchTraversal) -> Result<(), Read
     Ok(())
 }
 
+/// The capability a refused walk names: nothing this workspace holds can answer it.
+///
+/// A walk follows the relationship store's edges and the incoming references a configured
+/// language engine resolves. With an empty store and no engine answer for the seed, the
+/// walk has no edge source at all, and a resend of the same request changes nothing.
+pub(crate) const TRAVERSAL_CAPABILITY: &str =
+    "relationship traversal (no language engine serves the seed)";
+
 /// Most distinct symbols one traversal may visit beyond `seed`. `RelationshipStore`'s
 /// adjacency lists are themselves sorted, so a walk that breaches this bound stops
 /// discovering new symbols and truncates the same way on every call over the same graph.
@@ -69,9 +77,10 @@ pub(crate) struct TraversalReport {
 ///
 /// # Errors
 ///
-/// Returns [`ReadError`] naming the binding capability when this workspace's relationship
-/// store is empty because the binding provider never ran, and `not_found` naming a seed that
-/// resolves to neither a relationship-store node nor a lexical declaration.
+/// Returns `not_found` naming a seed that resolves to neither a relationship-store node nor
+/// a lexical declaration, and [`ReadError`] naming the engine capability when the seed
+/// resolves but neither the relationship store nor a configured language engine can answer
+/// for it.
 pub(crate) fn collect_traversal_hits(
     reads: &ReadService,
     matcher: Option<&PathMatcher>,
@@ -82,16 +91,14 @@ pub(crate) fn collect_traversal_hits(
     results: &mut Vec<SearchHit>,
 ) -> Result<TraversalReport, ReadError> {
     let store = reads.relationships();
-    if store.is_empty() && !reads.index().binding_enabled() && !references.resolved(seed) {
-        return Err(ReadFault::unsupported(
-            "relationship traversal (providers.binding disabled)",
-        ));
+    let walked_seed = resolve_traversal_seed(reads, seed)?;
+    if store.is_empty() && !references.resolved(seed) {
+        return Err(ReadFault::unsupported(TRAVERSAL_CAPABILITY));
     }
-    let seed = resolve_traversal_seed(reads, seed)?;
-    let coverage_missing = relationship_coverage_missing(reads, traversal, &seed);
+    let coverage_missing = relationship_coverage_missing(traversal);
     let walk = walk_traversal_with_references(
         store,
-        &TraversalSeeds::Named(seed),
+        &walked_seed,
         traversal,
         TRAVERSAL_NODES_MAX,
         references,
@@ -100,7 +107,6 @@ pub(crate) fn collect_traversal_hits(
         matcher,
         root,
         to: traversal.to.as_ref(),
-        ranking: TraversalRanking::Distance,
         payloads,
     };
     merge_walk_hits(reads, walk.discovered, merge, results)?;
@@ -118,7 +124,6 @@ pub(crate) struct WalkMerge<'merge> {
     pub(crate) matcher: Option<&'merge PathMatcher>,
     pub(crate) root: &'merge Path,
     pub(crate) to: Option<&'merge SymbolId>,
-    pub(crate) ranking: TraversalRanking,
     pub(crate) payloads: HitPayloads,
 }
 
@@ -165,29 +170,28 @@ pub(crate) fn walkable(reads: &ReadService, identity: &CoreSymbolId) -> bool {
         || resolve_graph_symbol(reads.index(), identity).is_some()
 }
 
-/// The relationship coverage `traversal` asks for that no provider populates: the requested
-/// facets outside every provider's image, and the seed's language when the requested
-/// direction leaves the binding lane as the only provider.
+/// The relationship coverage `traversal` asks for that no lane populates: the requested
+/// facets outside every lane's image.
 ///
-/// Answers `None` when every requested facet and the seed's language have a provider: an
-/// empty answer then means the walk ran and the seed has no neighbor under the request.
-fn relationship_coverage_missing(
-    reads: &ReadService,
-    traversal: &SearchTraversal,
-    seed: &CoreSymbolId,
-) -> Option<ReadWarning> {
-    relationship_coverage_warning(
-        unproducible_facets(&traversal.facets),
-        uncovered_language(reads, traversal, seed),
-    )
+/// Answers `None` when every requested facet has a lane: an empty answer then means the
+/// walk ran and the seed has no neighbor under the request.
+fn relationship_coverage_missing(traversal: &SearchTraversal) -> Option<ReadWarning> {
+    relationship_coverage_warning(unproducible_facets(&traversal.facets))
 }
 
-/// The requested facets no provider populates, in the request's own order, deduplicated.
+/// The relationship facets a lane populates today.
 ///
-/// The store's own image is every provider's image: `role_facet` maps every reference role
-/// onto [`produced_relationship_facets`], and the engine lane adds `References` alone, which
-/// that image already holds. An empty `requested` list asks for every facet the walk can
-/// follow, so it names no gap.
+/// The language engine lane resolves incoming references, which the walk carries as
+/// [`RelationshipFacet::References`]. No provider publishes a resolved reference into the
+/// index, so the store holds no edge of any other facet.
+pub(crate) fn produced_relationship_facets() -> &'static BTreeSet<RelationshipFacet> {
+    static PRODUCED: OnceLock<BTreeSet<RelationshipFacet>> = OnceLock::new();
+    PRODUCED.get_or_init(|| BTreeSet::from([RelationshipFacet::References]))
+}
+
+/// The requested facets no lane populates, in the request's own order, deduplicated.
+///
+/// An empty `requested` list asks for every facet the walk can follow, so it names no gap.
 ///
 /// `validate_traversal` refuses a list longer than `SEARCH_TRAVERSAL_FACETS_MAX` before this
 /// runs, which bounds both the scan and the deduplication it carries.
@@ -202,47 +206,11 @@ pub(crate) fn unproducible_facets(requested: &[RelationshipFacet]) -> Vec<Relati
     missing
 }
 
-/// The seed declaration's language when no provider populates relationships for it in the
-/// requested direction.
-///
-/// The binding lane alone populates outgoing edges: every engine-resolved hop carries
-/// [`HopDirection::Incoming`], and `combined_edges` admits those hops for an `incoming` or
-/// `both` walk alone. An `outgoing` walk from a language whose indexed files carry no
-/// name-binding facts therefore has no provider, while an `incoming` or `both` walk may
-/// still be answered by a configured language engine this lane cannot ask, so those
-/// directions report no language gap.
-fn uncovered_language(
-    reads: &ReadService,
-    traversal: &SearchTraversal,
-    seed: &CoreSymbolId,
-) -> Option<Language> {
-    if traversal.direction != TraversalDirection::Outgoing {
-        return None;
-    }
-    let index = reads.index();
-    let (file, _symbol) = resolve_graph_symbol(index, seed)?;
-    let language = file.syntax().language();
-    (!index.carries_binding_facts(language)).then(|| language.clone())
-}
-
-/// The `relationship_coverage_missing` warning naming what has no provider, or `None` when
-/// neither `facets` nor `language` names a gap.
-pub(crate) fn relationship_coverage_warning(
-    facets: Vec<RelationshipFacet>,
-    language: Option<Language>,
-) -> Option<ReadWarning> {
-    let clauses: Vec<String> = facet_gap_clause(&facets)
-        .into_iter()
-        .chain(language.as_ref().map(language_gap_clause))
-        .collect();
-    if clauses.is_empty() {
-        return None;
-    }
-    Some(ReadWarning::RelationshipCoverageMissing {
-        facets,
-        language,
-        detail: clauses.join("; "),
-    })
+/// The `relationship_coverage_missing` warning naming the facets no lane populates, or
+/// `None` when `facets` names no gap.
+pub(crate) fn relationship_coverage_warning(facets: Vec<RelationshipFacet>) -> Option<ReadWarning> {
+    let detail = facet_gap_clause(&facets)?;
+    Some(ReadWarning::RelationshipCoverageMissing { facets, detail })
 }
 
 /// The detail clause for a facet gap, naming each facet in its wire spelling.
@@ -254,19 +222,10 @@ fn facet_gap_clause(facets: &[RelationshipFacet]) -> Option<String> {
         _ => ("facets", "them"),
     };
     Some(format!(
-        "no provider populates the requested {subject} {named}, so the walk followed no edge \
+        "no lane populates the requested {subject} {named}, so the walk followed no edge \
          under {reference}",
         named = named.join(", "),
     ))
-}
-
-/// The detail clause for a language gap, naming the language's identity segment.
-fn language_gap_clause(language: &Language) -> String {
-    format!(
-        "no provider populates outgoing relationships for {}, so the walk followed no edge \
-         from a declaration in it",
-        language.identity_segment(),
-    )
 }
 
 /// Resolves a traversal's `seed`, refusing `not_found` naming it when the identity exists
@@ -312,79 +271,48 @@ pub(crate) fn traversal_truncation_warning() -> ReadWarning {
     }
 }
 
-/// The declarations one walk starts at.
-pub(crate) enum TraversalSeeds {
-    /// The one declaration a `traversal` request names. The walk never reports it, since
-    /// `SearchTraversal.seed` states the seed is never a hit.
-    Named(CoreSymbolId),
-    /// Every declaration a comparison found changed. Each of them is already a hit of its
-    /// own, so a changed declaration another changed declaration reaches is reported like
-    /// any other discovery and absorbs the walk into the hit it already has.
-    Changed(Vec<CoreSymbolId>),
-}
-
-impl TraversalSeeds {
-    /// The declarations the queue begins with, each at an empty path.
-    fn queued(&self) -> Vec<CoreSymbolId> {
-        match self {
-            Self::Named(seed) => vec![seed.clone()],
-            Self::Changed(changed) => changed.clone(),
-        }
-    }
-
-    /// The declarations recorded before the first hop runs, so no hop reports them.
-    fn recorded(&self) -> BTreeSet<CoreSymbolId> {
-        match self {
-            Self::Named(seed) => BTreeSet::from([seed.clone()]),
-            Self::Changed(_) => BTreeSet::new(),
-        }
-    }
-}
-
 /// Traversal under an explicit node cap for deterministic truncation tests.
 #[cfg(test)]
 fn walk_traversal_capped(
     store: &RelationshipStore,
-    seeds: &TraversalSeeds,
+    seed: &CoreSymbolId,
     traversal: &SearchTraversal,
     nodes_max: usize,
 ) -> TraversalWalk {
     walk_traversal_with_references(
         store,
-        seeds,
+        seed,
         traversal,
         nodes_max,
         &EngineReferences::default(),
     )
 }
 
-/// Walks `store` breadth-first from every declaration in `seeds` at once, honoring
-/// `traversal`'s direction, facet filter, and depth bound. BFS visits each symbol at its
-/// shortest path first and never requeues a symbol already discovered, so every returned
-/// path is the shortest one `store` has to it from the nearest seed.
+/// Walks `store` breadth-first from `seed`, honoring `traversal`'s facet filter and depth
+/// bound. BFS visits each symbol at its shortest path first and never requeues a symbol
+/// already discovered, so every returned path is the shortest one `store` has to it.
 ///
-/// One `nodes_max` budget covers the whole walk however many declarations seed it, so the
-/// total symbols discovered keeps that bound rather than multiplying it by the seed count.
+/// The walk never reports `seed` itself, since `SearchTraversal.seed` states the seed is
+/// never a hit. One `nodes_max` budget covers the whole walk.
 pub(crate) fn walk_traversal_with_references(
     store: &RelationshipStore,
-    seeds: &TraversalSeeds,
+    seed: &CoreSymbolId,
     traversal: &SearchTraversal,
     nodes_max: usize,
     references: &EngineReferences,
 ) -> TraversalWalk {
-    let queued = seeds.queued();
-    let mut enqueued: BTreeSet<CoreSymbolId> = queued.iter().cloned().collect();
-    let mut recorded = seeds.recorded();
+    let mut enqueued: BTreeSet<CoreSymbolId> = BTreeSet::from([seed.clone()]);
+    let mut recorded: BTreeSet<CoreSymbolId> = BTreeSet::from([seed.clone()]);
     let mut budget = LoopBudget::new(nodes_max);
     let mut truncated = false;
     let mut queue: VecDeque<(CoreSymbolId, Vec<GraphHop>)> =
-        queued.into_iter().map(|seed| (seed, Vec::new())).collect();
+        VecDeque::from([(seed.clone(), Vec::new())]);
     let mut discovered = Vec::new();
     while let Some((current, path)) = queue.pop_front() {
         if path.len() as u64 >= traversal.depth {
             continue;
         }
-        for edge in combined_edges(store, &current, traversal.direction, references) {
+        for edge in combined_edges(store, &current, references) {
             if !edge.eligible(&traversal.facets) {
                 continue;
             }
@@ -460,70 +388,31 @@ impl TraversalEdge<'_> {
 }
 
 /// Borrows graph edges until the walk selects a new symbol, preserving indexed evidence.
+///
+/// A walk follows edges arriving at `current`: the store's own incoming edges, and the
+/// incoming references a language engine resolved for this read. A store edge an engine
+/// also named is reported once, as the engine's confirmation of it.
 fn combined_edges<'edge>(
     store: &'edge RelationshipStore,
     current: &CoreSymbolId,
-    direction: TraversalDirection,
     references: &'edge EngineReferences,
 ) -> Vec<TraversalEdge<'edge>> {
-    let incoming = matches!(
-        direction,
-        TraversalDirection::Incoming | TraversalDirection::Both
-    );
     let mut resolved: BTreeMap<_, _> = references
         .incoming(current)
         .iter()
-        .filter(|_| incoming)
         .map(|hop| (hop.relationship.from.0.as_str(), hop))
         .collect();
     let mut edges = Vec::new();
-    for (edge, direction) in traversal_edges(store, current, direction) {
-        let confirms =
-            direction == HopDirection::Incoming && edge.facet() == RelationshipFacet::References;
-        let confirmed = confirms
+    for edge in store.incoming(current) {
+        let confirmed = (edge.facet() == RelationshipFacet::References)
             .then(|| resolved.remove(edge.from().as_str()))
             .flatten();
         edges.push(match confirmed {
             Some(hop) => TraversalEdge::Confirmed(edge, hop),
-            None => TraversalEdge::Indexed(edge, direction),
+            None => TraversalEdge::Indexed(edge, HopDirection::Incoming),
         });
     }
     edges.extend(resolved.into_values().map(TraversalEdge::Resolved));
-    edges
-}
-
-/// The edges a search traversal walks from `current`, tagged with the [`HopDirection`] each
-/// was followed relative to its own stored orientation: `outgoing` yields edges leaving
-/// `current`; `incoming` yields edges arriving at it; `both` yields every outgoing edge before
-/// every incoming edge, keeping the walk deterministic.
-fn traversal_edges<'a>(
-    store: &'a RelationshipStore,
-    current: &CoreSymbolId,
-    direction: TraversalDirection,
-) -> Vec<(&'a RelationshipEdge, HopDirection)> {
-    let mut edges = Vec::new();
-    if matches!(
-        direction,
-        TraversalDirection::Outgoing | TraversalDirection::Both
-    ) {
-        edges.extend(
-            store
-                .outgoing(current)
-                .iter()
-                .map(|edge| (edge, HopDirection::Outgoing)),
-        );
-    }
-    if matches!(
-        direction,
-        TraversalDirection::Incoming | TraversalDirection::Both
-    ) {
-        edges.extend(
-            store
-                .incoming(current)
-                .iter()
-                .map(|edge| (edge, HopDirection::Incoming)),
-        );
-    }
     edges
 }
 
@@ -551,30 +440,13 @@ fn wire_symbol_id(identity: &CoreSymbolId) -> SymbolId {
     SymbolId(identity.as_str().to_owned())
 }
 
-/// What a walk's own hits are ranked by.
-#[derive(Clone, Copy)]
-pub(crate) enum TraversalRanking {
-    /// Score each reached hit from its `distance`: the walk is the whole ranking basis a
-    /// `traversal` request has.
-    Distance,
-    /// Leave every reached hit unscored: a comparison ranks nothing, so a walk riding
-    /// beside one adds no score its change hits could be compared against.
-    Unranked,
-}
-
-impl TraversalRanking {
-    /// A reached symbol's `relevance` score: a closer hit (`distance` 1) scores higher than
-    /// a farther one (`distance` 2, `SearchTraversal`'s own bound). Ordering by it
-    /// reproduces the distance-ascending order `SearchTraversal`'s doc comment promises; a
-    /// hit also matched lexically keeps its lexical score instead - `absorb_traversal_match`
-    /// never touches `score`.
-    fn score(self, distance: u64) -> Option<f64> {
-        match self {
-            Self::Distance if distance == 1 => Some(1.0),
-            Self::Distance => Some(0.5),
-            Self::Unranked => None,
-        }
-    }
+/// A reached symbol's `relevance` score: a closer hit (`distance` 1) scores higher than a
+/// farther one (`distance` 2, `SearchTraversal`'s own bound). Ordering by it reproduces the
+/// distance-ascending order `SearchTraversal`'s doc comment promises; a hit also matched
+/// lexically keeps its lexical score instead - `absorb_traversal_match` never touches
+/// `score`.
+fn distance_score(distance: u64) -> f64 {
+    if distance == 1 { 1.0 } else { 0.5 }
 }
 
 /// Merges one reached symbol: an existing hit for the same identity absorbs the walk;
@@ -601,7 +473,7 @@ fn merge_traversal_hit(
     let mut hit = build_symbol_hit(
         index,
         matched,
-        merge.ranking.score(distance),
+        Some(distance_score(distance)),
         vec![MatchedField::Relationship],
         merge.payloads,
     )?;
@@ -625,13 +497,14 @@ fn absorb_traversal_match(existing: &mut SearchHit, path: Vec<GraphHop>, distanc
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::collections::BTreeMap;
     use std::error::Error;
     use std::fs;
     use std::sync::Arc;
 
     use rift_core::{LanguageFileSelections, SourceVisibility};
-    use rift_index::{BindingPolicy, RelationshipStore, WorkspaceIndexLimits};
-    use rift_protocol::configuration::{BindingConfiguration, HistoryConfiguration};
+    use rift_index::{RelationshipStore, WorkspaceIndexLimits};
+    use rift_protocol::configuration::HistoryConfiguration;
     use rift_protocol::read::{
         MatchedField, ReadWarning, RelationshipFacet, SearchHitTarget, SearchParams, SearchResult,
         SearchTraversal, TraversalDirection,
@@ -642,7 +515,10 @@ pub(crate) mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    use super::{CoreSymbolId, TRAVERSAL_NODES_MAX, TraversalSeeds, walk_traversal_capped};
+    use super::{
+        CoreSymbolId, EngineReferences, ExactKind, Extensions, GraphHop, Relationship,
+        RelationshipDerivation, TRAVERSAL_NODES_MAX, walk_traversal_capped,
+    };
     use crate::read::ReadService;
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -822,15 +698,35 @@ pub(crate) mod tests {
         RelationshipStore::build(&graph_normalized(contributions))
     }
 
+    /// A recursive declaration: `loop_fn` calls itself, so the walk meets its own seed.
+    fn recursive_store() -> RelationshipStore {
+        let contributions = vec![
+            graph_definition("loop_fn", "rift://symbol/rust/lib.rs/loop_fn", (0, 40)),
+            graph_definition("caller", "rift://symbol/rust/lib.rs/caller", (40, 80)),
+            graph_reference(
+                "loop_fn_calls_loop_fn",
+                graph_binding("lib.rs", 5, 10),
+                rift_core::ReferenceRole::Call,
+                "loop_fn",
+            ),
+            graph_reference(
+                "caller_calls_loop_fn",
+                graph_binding("lib.rs", 45, 50),
+                rift_core::ReferenceRole::Call,
+                "loop_fn",
+            ),
+        ];
+        RelationshipStore::build(&graph_normalized(contributions))
+    }
+
     fn traversal_request(
         seed: &CoreSymbolId,
-        direction: TraversalDirection,
         depth: u64,
         facets: Vec<RelationshipFacet>,
     ) -> SearchTraversal {
         SearchTraversal {
             seed: Some(rift_protocol::read::SymbolId(seed.as_str().to_owned())),
-            direction,
+            direction: TraversalDirection::Incoming,
             facets,
             depth,
             to: None,
@@ -838,46 +734,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn walk_traversal_outgoing_reaches_both_direct_calls_and_records_outgoing_hops() {
-        let store = call_graph_store();
-        let root = graph_symbol_id("rift://symbol/rust/lib.rs/root");
-        let request = traversal_request(&root, TraversalDirection::Outgoing, 1, vec![]);
-        let discovered = walk_traversal_capped(
-            &store,
-            &TraversalSeeds::Named(root.clone()),
-            &request,
-            TRAVERSAL_NODES_MAX,
-        )
-        .discovered;
-        let reached: Vec<&str> = discovered.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(
-            reached,
-            [
-                "rift://symbol/rust/lib.rs/branch_a",
-                "rift://symbol/rust/lib.rs/branch_b",
-                "rift://symbol/rust/lib.rs/helper",
-            ],
-            "outgoing order follows the store's own sorted adjacency"
-        );
-        for (_, path) in &discovered {
-            assert_eq!(path.len(), 1);
-            assert_eq!(path[0].direction, super::HopDirection::Outgoing);
-            assert_eq!(path[0].relationship.from.0, root.as_str());
-        }
-    }
-
-    #[test]
     fn walk_traversal_incoming_walks_edges_backward_and_keeps_their_natural_orientation() {
         let store = call_graph_store();
         let leaf = graph_symbol_id("rift://symbol/rust/lib.rs/leaf");
-        let request = traversal_request(&leaf, TraversalDirection::Incoming, 1, vec![]);
-        let discovered = walk_traversal_capped(
-            &store,
-            &TraversalSeeds::Named(leaf.clone()),
-            &request,
-            TRAVERSAL_NODES_MAX,
-        )
-        .discovered;
+        let request = traversal_request(&leaf, 1, vec![]);
+        let discovered =
+            walk_traversal_capped(&store, &leaf, &request, TRAVERSAL_NODES_MAX).discovered;
         let reached: Vec<&str> = discovered.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(
             reached,
@@ -897,93 +759,51 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn walk_traversal_both_yields_every_outgoing_edge_before_every_incoming_edge() {
-        let store = call_graph_store();
-        let branch_a = graph_symbol_id("rift://symbol/rust/lib.rs/branch_a");
-        let request = traversal_request(&branch_a, TraversalDirection::Both, 1, vec![]);
-        let discovered = walk_traversal_capped(
-            &store,
-            &TraversalSeeds::Named(branch_a.clone()),
-            &request,
-            TRAVERSAL_NODES_MAX,
-        )
-        .discovered;
-        let reached: Vec<(&str, super::HopDirection)> = discovered
-            .iter()
-            .map(|(id, path)| (id.as_str(), path[0].direction))
-            .collect();
-        assert_eq!(
-            reached,
-            [
-                (
-                    "rift://symbol/rust/lib.rs/leaf",
-                    super::HopDirection::Outgoing
-                ),
-                (
-                    "rift://symbol/rust/lib.rs/root",
-                    super::HopDirection::Incoming
-                ),
-            ],
-            "both walks every outgoing edge before every incoming edge"
-        );
-    }
-
-    #[test]
     fn walk_traversal_facet_filter_keeps_only_the_named_facets() {
         let store = call_graph_store();
-        let root = graph_symbol_id("rift://symbol/rust/lib.rs/root");
-        let request = traversal_request(
-            &root,
-            TraversalDirection::Outgoing,
-            1,
-            vec![RelationshipFacet::Calls],
-        );
-        let discovered = walk_traversal_capped(
-            &store,
-            &TraversalSeeds::Named(root.clone()),
-            &request,
-            TRAVERSAL_NODES_MAX,
-        )
-        .discovered;
-        let reached: Vec<&str> = discovered.iter().map(|(id, _)| id.as_str()).collect();
+        let helper = graph_symbol_id("rift://symbol/rust/lib.rs/helper");
+        let reached = |facets: Vec<RelationshipFacet>| {
+            let request = traversal_request(&helper, 1, facets);
+            walk_traversal_capped(&store, &helper, &request, TRAVERSAL_NODES_MAX)
+                .discovered
+                .into_iter()
+                .map(|(id, _)| id.as_str().to_owned())
+                .collect::<Vec<String>>()
+        };
         assert_eq!(
-            reached,
-            [
-                "rift://symbol/rust/lib.rs/branch_a",
-                "rift://symbol/rust/lib.rs/branch_b",
-            ],
-            "the imports edge to helper must be excluded: {reached:?}"
+            reached(vec![RelationshipFacet::Imports]),
+            ["rift://symbol/rust/lib.rs/root"],
+            "the one edge arriving at helper is an imports edge"
+        );
+        assert!(
+            reached(vec![RelationshipFacet::Calls]).is_empty(),
+            "a calls filter follows no imports edge"
         );
     }
 
-    /// `leaf` is two hops from `root` down either branch; the walk keeps it once, at its
+    /// `root` is two hops from `leaf` up either branch; the walk keeps it once, at its
     /// shortest path, and `depth` 2 stops before a third hop could reach anything beyond it.
     #[test]
     fn walk_traversal_depth_bound_and_shortest_path_win_together() {
         let store = call_graph_store();
-        let root = graph_symbol_id("rift://symbol/rust/lib.rs/root");
-        let request = traversal_request(&root, TraversalDirection::Outgoing, 2, vec![]);
-        let discovered = walk_traversal_capped(
-            &store,
-            &TraversalSeeds::Named(root.clone()),
-            &request,
-            TRAVERSAL_NODES_MAX,
-        )
-        .discovered;
-        let leaf_hits: Vec<_> = discovered
+        let leaf = graph_symbol_id("rift://symbol/rust/lib.rs/leaf");
+        let request = traversal_request(&leaf, 2, vec![]);
+        let discovered =
+            walk_traversal_capped(&store, &leaf, &request, TRAVERSAL_NODES_MAX).discovered;
+        let root_hits: Vec<_> = discovered
             .iter()
-            .filter(|(id, _)| id.as_str() == "rift://symbol/rust/lib.rs/leaf")
+            .filter(|(id, _)| id.as_str() == "rift://symbol/rust/lib.rs/root")
             .collect();
         assert_eq!(
-            leaf_hits.len(),
+            root_hits.len(),
             1,
-            "leaf is reachable via two branches but must appear once: {discovered:?}"
+            "root is reachable via two branches but must appear once: {discovered:?}"
         );
-        assert_eq!(leaf_hits[0].1.len(), 2, "leaf's shortest path is two hops");
+        assert_eq!(root_hits[0].1.len(), 2, "root's shortest path is two hops");
         assert_eq!(
             discovered.len(),
-            4,
-            "branch_a, branch_b, helper (depth 1) and leaf (depth 2), nothing past depth 2: \
+            3,
+            "branch_a, branch_b (depth 1) and root (depth 2), nothing past depth 2: \
              {discovered:?}"
         );
     }
@@ -994,9 +814,9 @@ pub(crate) mod tests {
     #[test]
     fn walk_traversal_capped_stops_discovering_new_nodes_past_its_bound() {
         let store = call_graph_store();
-        let root = graph_symbol_id("rift://symbol/rust/lib.rs/root");
-        let request = traversal_request(&root, TraversalDirection::Outgoing, 2, vec![]);
-        let walk = walk_traversal_capped(&store, &TraversalSeeds::Named(root.clone()), &request, 2);
+        let leaf = graph_symbol_id("rift://symbol/rust/lib.rs/leaf");
+        let request = traversal_request(&leaf, 2, vec![]);
+        let walk = walk_traversal_capped(&store, &leaf, &request, 2);
         assert!(
             walk.truncated,
             "a walk stopped by its bound reports the truncation"
@@ -1018,78 +838,24 @@ pub(crate) mod tests {
         );
     }
 
-    /// A comparison seeds every changed declaration, so a seed another seed reaches is a
-    /// discovery of its own, carrying the path the walk found to it.
-    #[test]
-    fn walk_traversal_changed_reports_a_seed_another_seed_reaches() {
-        let store = call_graph_store();
-        let root = graph_symbol_id("rift://symbol/rust/lib.rs/root");
-        let branch_a = graph_symbol_id("rift://symbol/rust/lib.rs/branch_a");
-        let request = traversal_request(&root, TraversalDirection::Outgoing, 1, vec![]);
-        let seeds = TraversalSeeds::Changed(vec![root.clone(), branch_a.clone()]);
-        let discovered =
-            walk_traversal_capped(&store, &seeds, &request, TRAVERSAL_NODES_MAX).discovered;
-        let reached: Vec<&str> = discovered.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(
-            reached,
-            [
-                "rift://symbol/rust/lib.rs/branch_a",
-                "rift://symbol/rust/lib.rs/branch_b",
-                "rift://symbol/rust/lib.rs/helper",
-                "rift://symbol/rust/lib.rs/leaf",
-            ],
-            "branch_a is both a seed and root's neighbor, and its own hop still runs"
-        );
-        let branch_a_path = &discovered[0].1;
-        assert_eq!(branch_a_path.len(), 1);
-        assert_eq!(branch_a_path[0].relationship.from.0, root.as_str());
-        let leaf_path = &discovered[3].1;
-        assert_eq!(
-            leaf_path[0].relationship.from.0,
-            branch_a.as_str(),
-            "leaf is one hop from the seed that reached it, not two from root"
-        );
-    }
-
-    /// One node budget covers every seed: two seeds under a cap of two discover two
-    /// symbols between them, not two each.
-    #[test]
-    fn walk_traversal_changed_seeds_share_one_node_budget() {
-        let store = call_graph_store();
-        let root = graph_symbol_id("rift://symbol/rust/lib.rs/root");
-        let branch_a = graph_symbol_id("rift://symbol/rust/lib.rs/branch_a");
-        let request = traversal_request(&root, TraversalDirection::Outgoing, 1, vec![]);
-        let seeds = TraversalSeeds::Changed(vec![root, branch_a]);
-
-        let walk = walk_traversal_capped(&store, &seeds, &request, 2);
-
-        assert!(walk.truncated, "the shared budget stopped the walk");
-        let reached: Vec<&str> = walk.discovered.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(
-            reached,
-            [
-                "rift://symbol/rust/lib.rs/branch_a",
-                "rift://symbol/rust/lib.rs/branch_b",
-            ],
-            "a budget of its own per seed would have reached leaf as well: {reached:?}"
-        );
-    }
-
     /// A `traversal` request names one seed, and that seed is never a hit however the walk
     /// reaches it - here through the incoming edge of its own outgoing neighbor.
     #[test]
     fn walk_traversal_named_seed_is_never_reported_however_the_walk_reaches_it() {
-        let store = call_graph_store();
-        let branch_a = graph_symbol_id("rift://symbol/rust/lib.rs/branch_a");
-        let request = traversal_request(&branch_a, TraversalDirection::Both, 2, vec![]);
-        let seeds = TraversalSeeds::Named(branch_a.clone());
-
+        let store = recursive_store();
+        let loop_fn = graph_symbol_id("rift://symbol/rust/lib.rs/loop_fn");
+        let request = traversal_request(&loop_fn, 2, vec![]);
         let discovered =
-            walk_traversal_capped(&store, &seeds, &request, TRAVERSAL_NODES_MAX).discovered;
+            walk_traversal_capped(&store, &loop_fn, &request, TRAVERSAL_NODES_MAX).discovered;
 
         let reached: Vec<&str> = discovered.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            reached,
+            ["rift://symbol/rust/lib.rs/caller"],
+            "a declaration that calls itself still reaches its caller: {reached:?}"
+        );
         assert!(
-            !reached.contains(&branch_a.as_str()),
+            !reached.contains(&loop_fn.as_str()),
             "the named seed stays out of its own walk: {reached:?}"
         );
     }
@@ -1107,33 +873,31 @@ pub(crate) mod tests {
         );
     }
 
-    /// An empty `facets` list asks for every facet the walk can follow, and a list drawn
-    /// from `role_facet`'s own image names no gap.
+    /// An empty `facets` list asks for every facet the walk can follow, and the one facet
+    /// the engine lane populates names no gap.
     #[test]
     fn unproducible_facets_names_nothing_for_an_empty_or_fully_produced_list() {
         assert!(super::unproducible_facets(&[]).is_empty());
-        assert!(
-            super::unproducible_facets(&[
-                RelationshipFacet::Calls,
-                RelationshipFacet::Imports,
-                RelationshipFacet::References,
-                RelationshipFacet::Declares,
-                RelationshipFacet::Reads,
-                RelationshipFacet::Writes,
-                RelationshipFacet::HasType,
-            ])
-            .is_empty()
+        assert!(super::unproducible_facets(&[RelationshipFacet::References]).is_empty());
+    }
+
+    /// The engine lane resolves references alone, so every other facet names a gap.
+    #[test]
+    fn produced_relationship_facets_holds_references_alone() {
+        assert_eq!(
+            super::produced_relationship_facets(),
+            &std::collections::BTreeSet::from([RelationshipFacet::References])
         );
     }
 
-    /// The gap lists exactly the requested facets no provider populates, keeping the
-    /// request's own order, and never the produced ones beside them.
+    /// The gap lists exactly the requested facets no lane populates, keeping the request's
+    /// own order, and never the produced ones beside them.
     #[test]
     fn unproducible_facets_keeps_only_the_unproduced_ones_in_request_order() {
         assert_eq!(
             super::unproducible_facets(&[
                 RelationshipFacet::Implements,
-                RelationshipFacet::Calls,
+                RelationshipFacet::References,
                 RelationshipFacet::Extends,
             ]),
             [RelationshipFacet::Implements, RelationshipFacet::Extends]
@@ -1163,65 +927,34 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn relationship_coverage_warning_is_absent_when_neither_member_names_a_gap() {
-        assert!(super::relationship_coverage_warning(Vec::new(), None).is_none());
+    fn relationship_coverage_warning_is_absent_when_no_facet_names_a_gap() {
+        assert!(super::relationship_coverage_warning(Vec::new()).is_none());
     }
 
-    /// A facet gap names each unproduced facet in its wire spelling and carries no language.
+    /// A facet gap names each unproduced facet in its wire spelling.
     #[test]
     fn relationship_coverage_warning_names_every_unproduced_facet() {
         let gap = vec![RelationshipFacet::Implements, RelationshipFacet::Extends];
         assert_eq!(
-            super::relationship_coverage_warning(gap.clone(), None),
+            super::relationship_coverage_warning(gap.clone()),
             Some(ReadWarning::RelationshipCoverageMissing {
                 facets: gap,
-                language: None,
-                detail: "no provider populates the requested facets implements, extends, so \
+                detail: "no lane populates the requested facets implements, extends, so \
                          the walk followed no edge under them"
                     .to_owned(),
             })
         );
     }
 
-    /// A language gap names the language's identity segment and carries no facet.
+    /// One unproduced facet names itself in the singular.
     #[test]
-    fn relationship_coverage_warning_names_the_language_and_its_direction() {
-        let toml = rift_core::Language {
-            name: "toml".to_owned(),
-            dialect: None,
-        };
+    fn relationship_coverage_warning_names_one_unproduced_facet_in_the_singular() {
         assert_eq!(
-            super::relationship_coverage_warning(Vec::new(), Some(toml.clone())),
-            Some(ReadWarning::RelationshipCoverageMissing {
-                facets: Vec::new(),
-                language: Some(toml),
-                detail: "no provider populates outgoing relationships for toml, so the walk \
-                         followed no edge from a declaration in it"
-                    .to_owned(),
-            })
-        );
-    }
-
-    /// Both gaps ride one warning, each naming what it found, so a caller holding an empty
-    /// answer reads every reason the walk could not run.
-    #[test]
-    fn relationship_coverage_warning_carries_a_facet_gap_beside_a_language_gap() {
-        let toml = rift_core::Language {
-            name: "toml".to_owned(),
-            dialect: None,
-        };
-        assert_eq!(
-            super::relationship_coverage_warning(
-                vec![RelationshipFacet::Implements],
-                Some(toml.clone())
-            ),
+            super::relationship_coverage_warning(vec![RelationshipFacet::Implements]),
             Some(ReadWarning::RelationshipCoverageMissing {
                 facets: vec![RelationshipFacet::Implements],
-                language: Some(toml),
-                detail: "no provider populates the requested facet implements, so the walk \
-                         followed no edge under it; no provider populates outgoing \
-                         relationships for toml, so the walk followed no edge from a \
-                         declaration in it"
+                detail: "no lane populates the requested facet implements, so the walk \
+                         followed no edge under it"
                     .to_owned(),
             })
         );
@@ -1230,27 +963,44 @@ pub(crate) mod tests {
     #[test]
     fn walk_traversal_from_an_edgeless_seed_finds_nothing() {
         let store = call_graph_store();
-        let helper = graph_symbol_id("rift://symbol/rust/lib.rs/helper");
-        // `helper` has an incoming edge but no outgoing one.
-        let request = traversal_request(&helper, TraversalDirection::Outgoing, 2, vec![]);
-        let discovered = walk_traversal_capped(
-            &store,
-            &TraversalSeeds::Named(helper.clone()),
-            &request,
-            TRAVERSAL_NODES_MAX,
-        )
-        .discovered;
+        let root = graph_symbol_id("rift://symbol/rust/lib.rs/root");
+        // `root` has outgoing edges, and nothing arrives at it.
+        let request = traversal_request(&root, 2, vec![]);
+        let discovered =
+            walk_traversal_capped(&store, &root, &request, TRAVERSAL_NODES_MAX).discovered;
         assert!(discovered.is_empty(), "{discovered:?}");
     }
 
-    // -- End-to-end `ReadService::search` coverage: capability refusal, seed resolution,
-    // merges with lexical hits, `to`, and `target` interaction all need a real workspace,
-    // since they resolve reached identities back through `WorkspaceIndex::file`.
+    // -- End-to-end `ReadService::search_with_references` coverage: capability refusal,
+    // seed resolution, merges with lexical hits, `to`, and `target` interaction all need a
+    // real workspace, since they resolve reached identities back through
+    // `WorkspaceIndex::file`, and the references a configured language engine would have
+    // resolved for the read.
 
-    /// `root` calls `branch_a` and `branch_b`, each of which calls `leaf`, through the real
-    /// Rust syntax and binding pipeline - a live twin of `call_graph_store`'s synthetic graph,
-    /// used wherever a test needs a real `IndexedFile` a hit can resolve through.
-    fn live_call_graph_fixture() -> TestResult<(TempDir, ReadService)> {
+    /// One incoming reference a language engine resolved: `from` references `to`.
+    fn engine_hop(from: &str, to: &str) -> GraphHop {
+        GraphHop {
+            relationship: Relationship {
+                from: rift_protocol::read::SymbolId(from.to_owned()),
+                kind: ExactKind(rift_core::fault_label(&RelationshipFacet::References)),
+                facets: vec![RelationshipFacet::References],
+                to: rift_protocol::read::SymbolId(to.to_owned()),
+                evidence: Vec::new(),
+                derivation: RelationshipDerivation::Resolution,
+                confidence: None,
+                extensions: Extensions::default(),
+            },
+            direction: super::HopDirection::Incoming,
+        }
+    }
+
+    /// `root` calls `branch_a` and `branch_b`, each of which calls `leaf`, with `isolated`
+    /// referenced by nothing.
+    ///
+    /// The service is a real workspace, so every reached identity resolves through
+    /// `WorkspaceIndex::file`; the references are what a configured language engine
+    /// answers for this read, the one lane that resolves them.
+    fn live_reference_graph_fixture() -> TestResult<(TempDir, ReadService, EngineReferences)> {
         let directory = tempfile::tempdir()?;
         fs::write(
             directory.path().join("lib.rs"),
@@ -1267,23 +1017,37 @@ pub(crate) mod tests {
             &rift_core::TextFileInclusion::default(),
             HistoryConfiguration::default(),
         )?;
-        Ok((directory, service))
+        let symbol = |name: &str| format!("rift://symbol/rust/lib.rs/{name}");
+        let entry = |name: &str, callers: &[&str]| {
+            Ok::<_, Box<dyn Error>>((
+                CoreSymbolId::new(symbol(name))?,
+                callers
+                    .iter()
+                    .map(|caller| engine_hop(&symbol(caller), &symbol(name)))
+                    .collect::<Vec<GraphHop>>(),
+            ))
+        };
+        let references = EngineReferences::from_incoming(BTreeMap::from([
+            entry("leaf", &["branch_a", "branch_b"])?,
+            entry("branch_a", &["root"])?,
+            entry("branch_b", &["root"])?,
+            entry("isolated", &[])?,
+            entry("root", &[])?,
+        ]));
+        Ok((directory, service, references))
     }
 
-    fn binding_disabled_fixture() -> TestResult<(TempDir, ReadService)> {
+    /// A workspace with no configured language engine: its relationship store is empty,
+    /// and no engine answers for a seed in it.
+    fn engineless_fixture() -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let configuration = BindingConfiguration {
-            enabled: false,
-            ..BindingConfiguration::default()
-        };
         let service = ReadService::build_with_languages(
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
             &rift_core::TextFileInclusion::default(),
             &LanguageFileSelections::default(),
-            BindingPolicy::from(&configuration),
             HistoryConfiguration::default(),
             rift_protocol::dependencies::DependenciesConfiguration::default(),
         )?;
@@ -1291,14 +1055,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn search_traversal_reaches_a_neighbor_at_depth_one() -> TestResult {
-        let (_directory, service) = live_call_graph_fixture()?;
+    fn search_traversal_reaches_a_caller_at_depth_one() -> TestResult {
+        let (_directory, service, references) = live_reference_graph_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/root"
+                "seed": "rift://symbol/rust/lib.rs/leaf"
             }
         }))?;
-        let result = service.search(&params, &[])?;
+        let result = service.search_with_references(&params, &[], &references)?;
         let hit = result
             .results
             .iter()
@@ -1315,14 +1079,14 @@ pub(crate) mod tests {
 
     #[test]
     fn search_traversal_paths_selector_drops_a_reached_symbol_outside_it() -> TestResult {
-        let (_directory, service) = live_call_graph_fixture()?;
+        let (_directory, service, references) = live_reference_graph_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/root"
+                "seed": "rift://symbol/rust/lib.rs/leaf"
             },
             "paths": { "include": ["elsewhere/**"] }
         }))?;
-        let result = service.search(&params, &[])?;
+        let result = service.search_with_references(&params, &[], &references)?;
         assert!(
             result.results.is_empty(),
             "every walked hit lives outside the selected paths: {:?}",
@@ -1333,20 +1097,20 @@ pub(crate) mod tests {
 
     #[test]
     fn search_traversal_to_keeps_only_the_reached_target_at_its_shortest_path() -> TestResult {
-        let (_directory, service) = live_call_graph_fixture()?;
+        let (_directory, service, references) = live_reference_graph_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/root",
+                "seed": "rift://symbol/rust/lib.rs/leaf",
                 "depth": 2,
-                "to": "rift://symbol/rust/lib.rs/leaf"
+                "to": "rift://symbol/rust/lib.rs/root"
             }
         }))?;
-        let result = service.search(&params, &[])?;
+        let result = service.search_with_references(&params, &[], &references)?;
         assert_eq!(result.results.len(), 1, "{:#?}", result.results);
         let hit = &result.results[0];
         assert!(matches!(
             &hit.hit,
-            SearchHitTarget::Symbol { symbol } if symbol.name == "leaf"
+            SearchHitTarget::Symbol { symbol } if symbol.name == "root"
         ));
         assert_eq!(hit.distance, Some(2));
         Ok(())
@@ -1354,35 +1118,35 @@ pub(crate) mod tests {
 
     #[test]
     fn search_traversal_to_unreachable_within_depth_answers_empty_not_refused() -> TestResult {
-        let (_directory, service) = live_call_graph_fixture()?;
+        let (_directory, service, references) = live_reference_graph_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/root",
-                "to": "rift://symbol/rust/lib.rs/leaf"
+                "seed": "rift://symbol/rust/lib.rs/leaf",
+                "to": "rift://symbol/rust/lib.rs/root"
             }
         }))?;
-        let result = service.search(&params, &[])?;
+        let result = service.search_with_references(&params, &[], &references)?;
         assert!(result.results.is_empty(), "{:#?}", result.results);
         Ok(())
     }
 
     #[test]
     fn search_traversal_target_file_answers_empty() -> TestResult {
-        let (_directory, service) = live_call_graph_fixture()?;
+        let (_directory, service, references) = live_reference_graph_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
             "target": "file",
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/root"
+                "seed": "rift://symbol/rust/lib.rs/leaf"
             }
         }))?;
-        let result = service.search(&params, &[])?;
+        let result = service.search_with_references(&params, &[], &references)?;
         assert!(result.results.is_empty(), "{:#?}", result.results);
         Ok(())
     }
 
     #[test]
     fn search_query_and_traversal_merge_matched_by_and_keep_the_lexical_score() -> TestResult {
-        let (_directory, service) = live_call_graph_fixture()?;
+        let (_directory, service, references) = live_reference_graph_fixture()?;
         // "ranch_a" is a substring of "branch_a", not the name or qualified name itself, so
         // the lexical lane ranks it `Substring` (0.7) - a score distinct from what the
         // traversal lane would give the same hit at distance 1 (1.0), so a merge that kept
@@ -1392,10 +1156,10 @@ pub(crate) mod tests {
             "target": "symbol",
             "include": ["score"],
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/root"
+                "seed": "rift://symbol/rust/lib.rs/leaf"
             }
         }))?;
-        let result = service.search(&params, &[])?;
+        let result = service.search_with_references(&params, &[], &references)?;
         let hit = result
             .results
             .iter()
@@ -1422,30 +1186,31 @@ pub(crate) mod tests {
 
     #[test]
     fn search_traversal_seed_with_no_store_entry_and_no_declaration_is_not_found() -> TestResult {
-        let (_directory, service) = live_call_graph_fixture()?;
+        let (_directory, service, references) = live_reference_graph_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
             "traversal": {
                 "seed": "rift://symbol/rust/lib.rs/ghost"
             }
         }))?;
         let error = service
-            .search(&params, &[])
+            .search_with_references(&params, &[], &references)
             .expect_err("an unresolvable seed must refuse");
         assert_eq!(error.descriptor().code(), "resource_not_found");
         Ok(())
     }
 
-    /// `isolated` is a real declaration with zero edges: the walk finds nothing, but the
-    /// seed itself resolves, so the request answers an empty result set rather than refusing.
+    /// `isolated` is a real declaration the engine answered no reference for: the walk
+    /// finds nothing, but the seed itself resolves, so the request answers an empty result
+    /// set rather than refusing.
     #[test]
     fn search_traversal_seed_with_no_edges_but_a_real_declaration_answers_empty() -> TestResult {
-        let (_directory, service) = live_call_graph_fixture()?;
+        let (_directory, service, references) = live_reference_graph_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
             "traversal": {
                 "seed": "rift://symbol/rust/lib.rs/isolated"
             }
         }))?;
-        let result = service.search(&params, &[])?;
+        let result = service.search_with_references(&params, &[], &references)?;
         assert!(result.results.is_empty(), "{:#?}", result.results);
         assert!(
             result.warnings.is_empty(),
@@ -1453,19 +1218,6 @@ pub(crate) mod tests {
             result.warnings
         );
         Ok(())
-    }
-
-    /// One TOML declaration and nothing else: no shipped provider supplies name-binding
-    /// facts for TOML, so the index carries no relationship coverage for it.
-    fn toml_fixture() -> TestResult<(TempDir, ReadService)> {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("settings.toml"), "beacon = 7\n")?;
-        let limits = WorkspaceIndexLimits::default();
-        let visibility = SourceVisibility::default();
-        let text = rift_core::TextFileInclusion::default();
-        let history = HistoryConfiguration::default();
-        let service = ReadService::build(directory.path(), limits, &visibility, &text, history)?;
-        Ok((directory, service))
     }
 
     /// The one `relationship_coverage_missing` warning `result` carries, or `None` when it
@@ -1479,42 +1231,41 @@ pub(crate) mod tests {
     }
 
     /// An empty answer over a produced facet stays bare, so the warning keeps naming an
-    /// absent provider alone.
+    /// absent lane alone.
     #[test]
     fn search_traversal_over_a_produced_facet_carries_no_coverage_warning() -> TestResult {
-        let (_directory, service) = live_call_graph_fixture()?;
+        let (_directory, service, references) = live_reference_graph_fixture()?;
         let request = json!({
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/root",
-                "facets": ["calls"]
+                "seed": "rift://symbol/rust/lib.rs/leaf",
+                "facets": ["references"]
             }
         });
         let params: SearchParams = serde_json::from_value(request)?;
-        let result = service.search(&params, &[])?;
-        assert!(!result.results.is_empty(), "{:#?}", result.results);
+        let result = service.search_with_references(&params, &[], &references)?;
         assert!(result.warnings.is_empty(), "{:#?}", result.warnings);
         Ok(())
     }
 
-    /// `implements` reaches no reference role, so the walk could not have answered it. The
-    /// produced `calls` beside it still answers, and the warning names the one gap.
+    /// `implements` reaches no lane, so the walk could not have answered it. The produced
+    /// `references` beside it still answers, and the warning names the one gap.
     #[test]
     fn search_traversal_over_an_unproduced_facet_warns_relationship_coverage_missing() -> TestResult
     {
-        let (_directory, service) = live_call_graph_fixture()?;
+        let (_directory, service, references) = live_reference_graph_fixture()?;
         let request = json!({
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/root",
-                "facets": ["implements", "calls"]
+                "seed": "rift://symbol/rust/lib.rs/leaf",
+                "facets": ["implements", "references"]
             }
         });
         let params: SearchParams = serde_json::from_value(request)?;
-        let result = service.search(&params, &[])?;
+        let result = service.search_with_references(&params, &[], &references)?;
         assert!(
             coverage_warning(&result).is_some_and(|warning| matches!(
                 warning,
-                ReadWarning::RelationshipCoverageMissing { facets, language, .. }
-                    if *facets == [RelationshipFacet::Implements] && language.is_none()
+                ReadWarning::RelationshipCoverageMissing { facets, .. }
+                    if *facets == [RelationshipFacet::Implements]
             )),
             "{:#?}",
             result.warnings
@@ -1522,53 +1273,9 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// An outgoing walk from a TOML declaration has no provider at all, so the answer names
-    /// the language rather than leaving an empty result set to read as an absent neighbor.
     #[test]
-    fn search_traversal_from_a_language_with_no_binding_facts_warns_its_language() -> TestResult {
-        let (_directory, service) = toml_fixture()?;
-        let request = json!({
-            "traversal": {
-                "seed": "rift://symbol/toml/settings.toml/beacon"
-            }
-        });
-        let params: SearchParams = serde_json::from_value(request)?;
-        let result = service.search(&params, &[])?;
-        assert!(result.results.is_empty(), "{:#?}", result.results);
-        assert!(
-            coverage_warning(&result).is_some_and(|warning| matches!(
-                warning,
-                ReadWarning::RelationshipCoverageMissing { facets, language, detail }
-                    if facets.is_empty()
-                        && language.as_ref().is_some_and(|named| named.name == "toml")
-                        && detail.contains("outgoing relationships for toml")
-            )),
-            "{:#?}",
-            result.warnings
-        );
-        Ok(())
-    }
-
-    /// An `incoming` walk over the same language stays bare: a configured language engine
-    /// answers incoming references, and this lane cannot ask whether one is configured.
-    #[test]
-    fn search_traversal_incoming_from_that_language_carries_no_language_warning() -> TestResult {
-        let (_directory, service) = toml_fixture()?;
-        let request = json!({
-            "traversal": {
-                "seed": "rift://symbol/toml/settings.toml/beacon",
-                "direction": "incoming"
-            }
-        });
-        let params: SearchParams = serde_json::from_value(request)?;
-        let result = service.search(&params, &[])?;
-        assert!(result.warnings.is_empty(), "{:#?}", result.warnings);
-        Ok(())
-    }
-
-    #[test]
-    fn search_traversal_refuses_capability_unavailable_when_binding_is_disabled() -> TestResult {
-        let (_directory, service) = binding_disabled_fixture()?;
+    fn search_traversal_refuses_capability_unavailable_without_an_engine() -> TestResult {
+        let (_directory, service) = engineless_fixture()?;
         let request = json!({
             "traversal": {
                 "seed": "rift://symbol/rust/lib.rs/beacon"
@@ -1577,21 +1284,25 @@ pub(crate) mod tests {
         let params: SearchParams = serde_json::from_value(request)?;
         let error = service
             .search(&params, &[])
-            .expect_err("a disabled binding provider must refuse the traversal lane");
+            .expect_err("a workspace no engine serves must refuse the traversal lane");
         assert_eq!(error.descriptor().code(), "capability_unavailable");
+        assert!(
+            error.to_string().contains(super::TRAVERSAL_CAPABILITY),
+            "{error}"
+        );
         Ok(())
     }
 
     #[test]
     fn search_traversal_with_rev_refuses_capability_unavailable() -> TestResult {
-        let (_directory, service) = live_call_graph_fixture()?;
+        let (_directory, service, references) = live_reference_graph_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
             "rev": "HEAD",
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/root"
+                "seed": "rift://symbol/rust/lib.rs/leaf"
             }
         }))?;
-        let error = service.search(&params, &[]);
+        let error = service.search_with_references(&params, &[], &references);
         // No git repository exists in this fixture, so revision resolution itself may refuse
         // first; either refusal proves `traversal` never silently combines with `rev`.
         assert!(error.is_err(), "a bare SearchParams cannot resolve `rev`");
@@ -1661,15 +1372,10 @@ pub(crate) mod tests {
         let references = crate::EngineReferences::from_incoming(std::collections::BTreeMap::from(
             [(target.clone(), vec![confirmed])],
         ));
-        let request = traversal_request(
-            &target,
-            TraversalDirection::Incoming,
-            1,
-            vec![RelationshipFacet::References],
-        );
+        let request = traversal_request(&target, 1, vec![RelationshipFacet::References]);
         let walk = super::walk_traversal_with_references(
             &store,
-            &TraversalSeeds::Named(target.clone()),
+            &target,
             &request,
             TRAVERSAL_NODES_MAX,
             &references,

@@ -11,7 +11,7 @@ use serde_json::Value;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-const REGENERATE_COMMAND: &str = "cargo run -p rift-mcp --bin rift-schema-export";
+const REGENERATE_COMMAND: &str = "just generate";
 
 /// A write request keeping both export roots inside `directory`, so no test
 /// touches the checkout's own committed artifacts through the defaults.
@@ -128,6 +128,149 @@ fn configuration_schema_document_is_deterministic() -> TestResult {
     assert_eq!(first, schema::configuration_schema_document());
     let document: Value = serde_json::from_str(&first)?;
     assert_eq!(document["title"], "WorkspaceConfiguration");
+    Ok(())
+}
+
+#[test]
+fn package_index_schema_document_is_deterministic() -> TestResult {
+    let first = schema::package_index_schema_document();
+    assert_eq!(first, schema::package_index_schema_document());
+    let document: Value = serde_json::from_str(&first)?;
+    assert_eq!(document["title"], "PackagePublication");
+    Ok(())
+}
+
+#[test]
+fn check_fails_when_the_package_index_schema_is_stale() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    schema::run(&write_request(&directory)?)?;
+    fs::write(
+        directory.path().join("public/package-index.schema.json"),
+        "{}",
+    )?;
+
+    let error =
+        schema::run(&check_request(&directory)?).expect_err("a stale package index schema fails");
+    let ExportError::CheckMismatch { path } = error else {
+        panic!("expected CheckMismatch, got {error:?}");
+    };
+    assert!(path.ends_with("package-index.schema.json"));
+    Ok(())
+}
+
+/// A tree holding every input the analyzer manifest names, taken from the committed
+/// manifest itself: it lists each pinned source path, and the lockfile is copied from the
+/// repository so the grammar pins are the shipped ones.
+fn analyzer_root(repository: &std::path::Path) -> TestResult<tempfile::TempDir> {
+    let committed: Value = serde_json::from_str(&fs::read_to_string(
+        repository.join(rift_index::analyzer_manifest_path()),
+    )?)?;
+    let root = tempfile::tempdir()?;
+    fs::copy(
+        repository.join("Cargo.lock"),
+        root.path().join("Cargo.lock"),
+    )?;
+    for source in committed["sources"]
+        .as_array()
+        .ok_or("the manifest lists sources")?
+    {
+        let relative = source["path"].as_str().ok_or("a source states its path")?;
+        let path = root.path().join(relative);
+        fs::create_dir_all(path.parent().ok_or("a source has a directory")?)?;
+        fs::copy(repository.join(relative), path)?;
+    }
+    Ok(root)
+}
+
+/// The repository root this test binary was built from.
+fn repository_root() -> TestResult<std::path::PathBuf> {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR")?;
+    Ok(std::path::Path::new(&manifest)
+        .ancestors()
+        .nth(2)
+        .ok_or("the crate sits two directories below the repository root")?
+        .to_path_buf())
+}
+
+/// Writing the analyzer manifest below a root, then checking it, is the pair
+/// `just generate` and `just generate-check` run: the write lands at the committed path
+/// and the check over the same tree accepts it.
+#[test]
+fn the_analyzer_manifest_writes_below_its_root_and_checks_clean() -> TestResult {
+    let repository = repository_root()?;
+    let root = analyzer_root(&repository)?;
+    let written = schema::parse_arguments([
+        "--analyzer-manifest".to_owned(),
+        root.path().display().to_string(),
+    ])?;
+
+    schema::run(&written)?;
+
+    let path = root.path().join(rift_index::analyzer_manifest_path());
+    let rendered = fs::read_to_string(&path)?;
+    assert!(rendered.ends_with('\n'), "{rendered}");
+    let document: Value = serde_json::from_str(&rendered)?;
+    assert!(
+        document["sources"]
+            .as_array()
+            .is_some_and(|sources| !sources.is_empty()),
+        "{document}"
+    );
+
+    let checked = schema::parse_arguments([
+        "--check".to_owned(),
+        "--analyzer-manifest".to_owned(),
+        root.path().display().to_string(),
+    ])?;
+    schema::run(&checked)?;
+
+    fs::write(&path, "{}\n")?;
+    let error = schema::run(&checked).expect_err("a stale manifest fails the check");
+    let ExportError::CheckMismatch { path: named } = error else {
+        panic!("expected CheckMismatch, got {error:?}");
+    };
+    assert!(named.ends_with("analyzer-manifest.json"));
+    Ok(())
+}
+
+/// A root whose manifest path is not a writable file: the render succeeds and the write
+/// refuses, naming the path it could not write.
+#[test]
+fn the_analyzer_manifest_names_a_path_it_cannot_write() -> TestResult {
+    let repository = repository_root()?;
+    let root = analyzer_root(&repository)?;
+    fs::create_dir_all(root.path().join(rift_index::analyzer_manifest_path()))?;
+    let request = schema::parse_arguments([
+        "--analyzer-manifest".to_owned(),
+        root.path().display().to_string(),
+    ])?;
+
+    let error = schema::run(&request).expect_err("a directory takes no document");
+
+    let ExportError::WriteFailed { path, .. } = error else {
+        panic!("expected WriteFailed, got {error:?}");
+    };
+    assert!(path.ends_with("analyzer-manifest.json"));
+    Ok(())
+}
+
+/// The analyzer manifest is rendered from the repository tree, so a root holding none of
+/// its inputs names the first missing one and the remedy rather than writing a manifest
+/// derived from nothing.
+#[test]
+fn the_analyzer_manifest_over_a_root_without_inputs_names_the_missing_path() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let request = schema::parse_arguments([
+        "--analyzer-manifest".to_owned(),
+        directory.path().display().to_string(),
+    ])?;
+
+    let error = schema::run(&request).expect_err("a root holding no inputs renders no manifest");
+    let ExportError::AnalyzerManifest { .. } = error else {
+        panic!("expected AnalyzerManifest, got {error:?}");
+    };
+    assert!(error.to_string().contains("Cargo.lock"), "{error}");
+    assert!(std::error::Error::source(&error).is_some(), "{error}");
     Ok(())
 }
 

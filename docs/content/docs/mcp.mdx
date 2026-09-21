@@ -80,21 +80,20 @@ lookup while every other file stays available. An answer carries at most eight o
 project-path order; when more files were left out, one more `source_unavailable` carries no `unit`
 and counts the rest, and `rift://logs` names each.
 
-Three warnings ride a `get_symbol` or `search` answer whose `scope` reaches dependencies, and
-no other answer:
+Three warnings ride a `get_symbol` or `search` answer whose `scope` reaches packages, and no
+other answer:
 
-- `dependency_index_pending` - `pending` cataloged packages with a source root are not yet
-  indexed. The answer is served from the packages indexed so far, and holds the rest's
-  declarations once the index reaches them.
-- `dependency_package_skipped` - the dependency index refused `package` for `reason`, so none
-  of its declarations answers.
-- `dependency_resolver_degraded` - `resolver` answered less than its toolchain would have, for
-  `reason`, so the catalog can miss packages.
+- `global_index_unavailable` - no global package index answered, so the package facts came
+  from the packages this machine indexed. `indexed` counts them.
+- `package_skipped` - the local package index refused `package` for `reason`, so none of its
+  declarations answers.
+- `package_context_degraded` - `resolver` read less than its manifests and lockfiles state,
+  for `reason`, so the dependency context can miss packages.
 
-An answer carries at most eight `dependency_package_skipped` and
-`dependency_resolver_degraded` warnings together: the skipped packages first, in package
-identity order, then the degraded resolvers in resolver order. The `source_unavailable` bound
-above is separate, so an answer can carry eight of each.
+An answer carries at most eight `package_skipped` and `package_context_degraded` warnings
+together: the skipped packages first, in package identity order, then the degraded resolvers
+in resolver order. The `source_unavailable` bound above is separate, so an answer can carry
+eight of each.
 
 Every read carries an optional `rev`, and reads the workspace tree when it is absent.
 
@@ -156,32 +155,35 @@ parsed, or where the symbol is absent, contributes no version. `complete` says w
 walk reached the repository's first commit; `false` means one of those bounds ended it first,
 so revisions older than the listed ones may have touched the symbol.
 
-### Dependency scope [#get_symbol-scope]
+### Package scope [#get_symbol-scope]
 
-<VersionBadge version="v0.0.32" languages={["Rust", "Python", "TypeScript"]} />
+<VersionBadge version="v0.0.39" languages={["Rust", "Python", "TypeScript"]} />
 
-`scope` selects which declarations the lookup searches. `project`, the default, searches the
-workspace tree. `dependencies` searches the public declarations of the packages the
-[dependency resolvers](/docs/developer/architecture#source-discovery) cataloged with a source root, as
-the [dependency index](/docs/developer/architecture#dependency-index) holds them. `all` searches both and
-lists a project hit before a dependency hit of equal rank.
+`scope` selects which corpus the lookup searches, by what the corpus holds rather than by
+where it is stored. `local`, the default, searches the workspace tree. `global` searches the
+public declarations of the workspace's dependency packages. `all` searches both and lists a
+project hit before a package hit of equal rank.
 
-A dependency hit carries `unit` in place of `path`: the
+A package hit carries `unit` in place of `path`: the
 [`SourceUnitId`](/docs/developer/protocol/reference#SourceUnitId) of the package file, spelled
 `rift://source/<manager>/<name>@<version>/<file>`. Its `symbol.origin` names the owning
 package. The hit carries neither `node` nor `history`.
 
-The server refuses `rev` together with a scope beyond `project` as `invalid_request`: the
-dependency index serves the current tree alone. While the workspace's
-[`[dependencies]`](/docs/developer/configuration#dependencies) table sets `enabled = false`, the server
-refuses a scope beyond `project` as `capability_unavailable`, naming the switch.
+A `local` read reaches no package declaration and resolves no package. The first `global` or
+`all` read indexes the workspace's dependency packages on this machine within the
+[`[dependencies]`](/docs/developer/configuration#dependencies) bounds, then reuses what it
+built. No global package index exists yet, so every package read carries a
+`global_index_unavailable` warning stating what the local fallback produced.
+
+The server refuses `rev` together with a scope beyond `local` as `invalid_request`: package
+facts are served for the current tree alone.
 
 This lookup reaches the `helper` crate a workspace's `Cargo.toml` names by path:
 
 **Request:**
 
 ```json
-{ "name": "helper_beacon", "scope": "dependencies" }
+{ "name": "helper_beacon", "scope": "global" }
 ```
 
 **Response:**
@@ -210,7 +212,14 @@ This lookup reaches the `helper` crate a workspace's `Cargo.toml` names by path:
       "source": "pub fn helper_beacon() {}"
     }
   ],
-  "pagination": { "page_index": 0, "total_pages": 1 }
+  "pagination": { "page_index": 0, "total_pages": 1 },
+  "warnings": [
+    {
+      "code": "global_index_unavailable",
+      "indexed": 1,
+      "detail": "no global package index answered; 1 of the workspace's packages were analyzed on this machine, and 0 named no source this machine holds"
+    }
+  ]
 }
 ```
 
@@ -341,22 +350,21 @@ answer.
 
 <VersionBadge version="v0.0.29" languages={["Rust"]} />
 
-`traversal` walks the relationship graph `[providers.binding]` builds: a bounded search from
-one `seed`, following `direction` and narrowed to `facets`, up to `depth` hops. `seed` and the
-optional `to` are declaration [`SymbolId`](/docs/developer/protocol/reference#SymbolId) values, the same
-identity a `get_symbol` or `search` hit already carries.
+`traversal` walks the references a configured
+[language engine](/docs/developer/configuration#languages-and-lsp) resolves: a bounded search
+from one `seed`, following `direction` and narrowed to `facets`, up to `depth` hops. `seed` and
+the optional `to` are declaration [`SymbolId`](/docs/developer/protocol/reference#SymbolId)
+values, the same identity a `get_symbol` or `search` hit already carries.
 
 `traversal` stands alone as a pure graph walk or rides beside `query`; a symbol both lanes
 reach keeps its lexical `score` and gains the walk's `traversal_path`, and its `matched_by`
-carries both entries. It also rides beside `change`, where the walk starts at every changed
-declaration instead of at `seed` - see [Impact of a change](#search-change-impact).
+carries both entries.
 
-Three shapes cover most questions:
+`direction` takes `incoming`, its default and its one value: the engine answers which
+declarations reference the seed, and no lane resolves what a declaration reaches outward. Two
+shapes cover most questions:
 
-- **Neighbors** - `seed` alone, `direction` and `depth` at their defaults (`outgoing`, 1): what
-  this symbol calls, imports, or otherwise references directly.
-- **Impact** - `direction: "incoming"`: what would change if this symbol did, read the other
-  way round.
+- **Impact** - `seed` alone, `depth` at its default: what would change if this symbol did.
 - **Path** - `to` set: whether, and by which shortest route, the walk reaches one named symbol.
 
 Each reached symbol becomes a hit tagged `matched_by: ["relationship"]`, carrying `distance` -
@@ -386,46 +394,44 @@ Each caller's `traversal_path` carries a relationship from the caller to `serve`
 `facets: ["references"]` and `derivation: "resolution"`. The hop's direction is `incoming`.
 
 `facets` narrows the walk to [`RelationshipFacet`](/docs/developer/protocol/reference#RelationshipFacet)
-values such as `calls`, `references`, and `imports`; an empty or omitted list follows every
-facet. `target: "file"` never carries a walked hit, since a traversal only reaches symbols.
+values; an empty or omitted list follows every facet a lane populates, which is `references`
+today. `target: "file"` never carries a walked hit, since a traversal only reaches symbols.
 
-A `traversal` standing without `change` names the declaration its walk starts at, so a request
-carrying neither `seed` nor `change` refuses `invalid_request` naming `seed`.
+A `traversal` names the declaration its walk starts at, so a request carrying no `seed`
+refuses `invalid_request` naming the field.
 
-A workspace with the binding provider disabled, no successful engine reference answer, and no
-relationship data left from an earlier build refuses `capability_unavailable` naming
-`relationship traversal (providers.binding disabled)`: the graph this walk needs was never built.
-With no indexed relationships, a successful engine answer with no callers returns an empty result set.
-`traversal` never combines with `rev` -
-the relationship graph serves the current tree alone - and refuses `capability_unavailable`
-the same way. A `seed` that resolves to neither a graph node nor a lexical declaration refuses
-`resource_not_found`; one that resolves but carries no edges answers an empty result set, since
-an isolated declaration is a legitimate answer.
+A walk whose seed no engine answers for refuses `capability_unavailable` naming
+`relationship traversal (no language engine serves the seed)`: nothing this workspace holds
+resolves a reference to that declaration, and a resend changes nothing. A `facets` list naming
+no facet a lane populates draws the same refusal. An engine session serves the current tree, so
+`traversal` combines with neither `rev` nor `change`, and refuses `capability_unavailable` for
+each. A `seed` that resolves to no declaration refuses `resource_not_found`; one the engine
+answers for with no callers returns an empty result set, since an isolated declaration is a
+legitimate answer.
 
 A walk the server stops at its node bound attaches a `traversal_truncated` entry to
 `warnings`, naming how many symbols it visited: hits reachable beyond the bound are missing,
 and a tighter `facets` list, a smaller `depth`, or a less-connected `seed` fits the walk under it.
 
-A walk no provider can answer attaches a `relationship_coverage_missing` entry to `warnings`.
-Its `facets` names the requested facets no provider populates, such as `implements`; its
-`language` names the seed declaration's language when an `outgoing` walk starts in a language
-no provider supplies relationships for. An empty result set carrying this warning means the
-walk could not run; an empty result set without it means the walk ran and the seed has no
-neighbor under the request.
+A walk asking for coverage no lane populates attaches a `relationship_coverage_missing` entry
+to `warnings`. Its `facets` names the requested facets no lane populates, such as `implements`
+beside the `references` the engine lane resolves. An empty answer carrying it means the walk
+could not run; an empty answer without it means the walk ran and the seed has no neighbor
+under the request.
 
 ### Language-engine references [#search-engine-references]
 
 <VersionBadge version="v0.0.35" languages={["Rust", "TypeScript", "Python"]} />
 
 A current-tree symbol traversal consults the configured
-[language engine](/docs/developer/configuration#languages-and-lsp) when `direction` is `incoming`
-or `both` and `facets` contains `references` or is empty. The server adds engine-resolved
-references to the indexed relationships and applies the same traversal depth and result bounds.
+[language engine](/docs/developer/configuration#languages-and-lsp) when `facets` contains
+`references` or is empty. The engine's answer is what the walk follows, under the same
+traversal depth and result bounds.
 
 The server maps each reference location to the smallest indexed declaration containing it.
 Locations outside the workspace or without an indexed declaration contribute no hit. When no
-engine is configured, or the engine lacks reference support, the indexed relationships answer.
-A configured engine that fails to start returns its failure through
+engine is configured, or the engine lacks reference support, the walk refuses
+`capability_unavailable`. A configured engine that fails to start returns its failure through
 [`ErrorData`](/docs/developer/protocol/reference#ErrorData).
 
 The server captures source and configuration before and after the engine request. If either
@@ -541,138 +547,48 @@ and its `results_truncated` warning. A changed file either revision cannot read 
 per-file byte bound, bytes that are not UTF-8, or a syntax tree the provider refuses -
 contributes no declaration, and the changed paths beside it still answer.
 
-`traversal` is the one block that rides beside `change`, extending the same result set rather
-than selecting another; [Impact of a change](#search-change-impact) states what it answers. The
-server refuses `change` beside `rev` with `invalid_request`, since `change` names its own
+The server refuses `change` beside `rev` with `invalid_request`, since `change` names its own
 revisions, and beside `query` with `invalid_request`, since the two select different result
-sets. A `scope` past `project` refuses with `invalid_request`, because the dependency index
-serves the current tree alone.
+sets. A `traversal` beside it refuses `capability_unavailable`, since a language engine serves
+the current tree and a comparison names two committed revisions. A `scope` past `local`
+refuses with `invalid_request`, because package facts are served for the current tree alone.
 [`[providers.history]`](/docs/developer/configuration#providers) owns the capability the way it owns
 [revision-addressed reads](#revision-reads): `enabled = false` refuses a comparison, a workspace
 with no git repository refuses `capability_unavailable`, and a revision neither side resolves
 refuses `resource_not_found`.
 
-### Impact of a change [#search-change-impact]
+### Package scope [#search-scope]
 
-<VersionBadge version="v0.0.36" languages={["Rust"]} />
-
-A `traversal` riding beside `change` starts its walk at every changed declaration instead of at
-one named `seed`. The block keeps its `direction`, `facets`, `depth`, and `to`; it names no
-`seed`, and the server refuses one beside `change` with `invalid_request` naming the field. A
-workspace whose binding provider never built a relationship graph refuses
-`capability_unavailable` naming `relationship traversal (providers.binding disabled)`, the same
-way it refuses a walk standing alone.
-
-Each declaration the walk reaches becomes a hit tagged `matched_by: ["relationship"]`, carrying
-`distance` and the `traversal_path` a seeded walk's hit carries. The changed declaration the
-walk started at is one end of the first `GraphHop`'s own relationship, so no field restates it.
-A declaration that is both changed and reached carries `matched_by: ["change", "relationship"]`,
-keeps its `change` block beside the walk's path, and is answered once.
-
-**Request:**
-
-```json
-{
-  "change": { "base": "main", "head": "HEAD" },
-  "traversal": { "direction": "incoming", "facets": ["calls"], "depth": 1 }
-}
-```
-
-**Search hit:**
-
-```json
-{
-  "hit": {
-    "target": "symbol",
-    "symbol": {
-      "id": "rift://symbol/rust/src/server.rs/serve",
-      "language": "rust",
-      "name": "serve",
-      "kind": "function",
-      "facets": ["value", "callable", "public"],
-      "visibility": "pub"
-    }
-  },
-  "matched_by": ["relationship"],
-  "distance": 1,
-  "traversal_path": [
-    {
-      "relationship": {
-        "from": "rift://symbol/rust/src/server.rs/serve",
-        "kind": "calls",
-        "facets": ["calls"],
-        "to": "rift://symbol/rust/src/config.rs/load_config",
-        "derivation": "resolution"
-      },
-      "direction": "incoming"
-    }
-  ],
-  "range": { "start": 210, "end": 402 },
-  "line": 12,
-  "path": "src/server.rs"
-}
-```
-
-The relationship graph covers the current tree, and the server holds no other: that is why
-`traversal` refuses `rev`. A comparison names two committed revisions, so the walk's edges are
-neither compared revision's. Every answer whose comparison carried a walk therefore attaches a
-`change_traversal_current_tree` entry to `warnings`, whether or not the walk reached anything.
-Its `unplaced` counts the changed declarations the current tree holds no node for, a
-declaration the head revision removed among them, since such a declaration starts no walk. The
-warning states which tree supplied the edges; it never states that the answer is incomplete for
-that tree.
-
-A `facets` list naming a facet no provider populates attaches a `relationship_coverage_missing`
-entry to `warnings`, as it does beside a `seed`. Its `facets` names the gap; its `language` stays
-absent, since a comparison seeds declarations in every language it found changed and no one
-language answers for them.
-
-One walk budget covers every starting declaration, so the symbols one comparison's walk
-discovers keep the same node bound a seeded walk keeps rather than that bound per changed
-declaration. A walk the server stops at that bound attaches one `traversal_truncated` entry to
-`warnings` however many declarations changed. The result set keeps its own bound and its
-`results_truncated` warning.
-
-`paths` narrows which changed paths are compared, never where the walk may reach: a caller
-outside that selection is still code the changed declaration affects. A comparison ranks
-nothing, so a walked hit carries no `score` either, and `relevance` orders every hit by path,
-then by name.
-
-### Dependency scope [#search-scope]
-
-<VersionBadge version="v0.0.32" languages={["Rust", "Python", "TypeScript"]} />
+<VersionBadge version="v0.0.39" languages={["Rust", "Python", "TypeScript"]} />
 
 `scope` selects what `query` runs over, with the three values
-[`get_symbol`](#get_symbol-scope) takes. `project`, the default, runs the lanes above: the
+[`get_symbol`](#get_symbol-scope) takes. `local`, the default, runs the lanes above: the
 indexed declarations and lines, the `paths.force_include` files, the ranked tier, and
-`traversal`. `dependencies` runs none of them and answers from the public declarations of the
-packages the [dependency index](/docs/developer/architecture#dependency-index) holds, ranked the way the
-project index ranks a name. `all` runs both and orders the two sides together under `order`:
-by score under `relevance`; under `path`, every project path first, then the dependency hits
-in unit order.
+`traversal`. `global` runs none of them and answers from the public declarations of the
+workspace's dependency packages, ranked the way the project index ranks a name. `all` runs
+both and orders the two sides together under `order`: by score under `relevance`; under
+`path`, every project path first, then the package hits in unit order.
 
-A dependency hit is a `symbol` hit tagged `matched_by: ["name"]`, addressed by `unit` in place
+A package hit is a `symbol` hit tagged `matched_by: ["name"]`, addressed by `unit` in place
 of `path` - the [`SourceUnitId`](/docs/developer/protocol/reference#SourceUnitId) of the package file -
 with `range` and `line` inside that unit, and `source` when `include` names it. A package
 contributes declarations alone, so `target: "file"` answers nothing from it.
 
-The server refuses `rev` together with a scope beyond `project` as `invalid_request`, since
-the dependency index serves the current tree alone, and refuses `traversal` together with
-`dependencies` the same way, since the relationship graph serves the project alone; `all`
-still walks the project graph. While the workspace's `[dependencies]` table sets
-`enabled = false`, the server refuses a scope beyond `project` as `capability_unavailable`,
-as it does on `get_symbol`. The three dependency warnings under [Reads](#reads) ride a
-`search` answer whose `scope` reaches dependencies, as they ride a `get_symbol` answer.
+The server refuses `rev` together with a scope beyond `local` as `invalid_request`, since
+package facts are served for the current tree alone, and refuses `traversal` together with
+`global` the same way, since a walk runs over the project alone; `all` still walks the
+project graph. The three package warnings under [Reads](#reads) ride a `search` answer whose
+`scope` reaches packages, as they ride a `get_symbol` answer.
 
-The resolvers read at most 256 manifests per workspace, taken in path order, so a `dependencies`
-or `all` search over a workspace holding more answers from the packages those manifests declare.
+The resolvers read at most 256 manifests per workspace, taken in path order, so a `global` or
+`all` search over a workspace holding more answers from the packages those manifests declare.
 
 This search reaches the `helper` crate the `get_symbol` lookup above reaches:
 
 **Request:**
 
 ```json
-{ "query": "helper_beacon", "scope": "dependencies" }
+{ "query": "helper_beacon", "scope": "global" }
 ```
 
 **Response:**
@@ -704,7 +620,14 @@ This search reaches the `helper` crate the `get_symbol` lookup above reaches:
       "unit": "rift://source/cargo/helper@0.1.0/src/lib.rs"
     }
   ],
-  "pagination": { "page_index": 0, "total_pages": 1 }
+  "pagination": { "page_index": 0, "total_pages": 1 },
+  "warnings": [
+    {
+      "code": "global_index_unavailable",
+      "indexed": 1,
+      "detail": "no global package index answered; 1 of the workspace's packages were analyzed on this machine, and 0 named no source this machine holds"
+    }
+  ]
 }
 ```
 
@@ -779,36 +702,36 @@ costs a lookup. The answer carries:
 - `docs` - markdown files, in path order
 - `module_relationships` - the modules a resolved reference reaches between, ranked by that
   count descending
-- `packages` - the packages the workspace's manifests declare directly, as their package
-  managers resolved them, in `manager`, `name`, `version` order; a transitive dependency is
-  cataloged but not listed
+- `packages` - the packages the workspace's manifests and lockfiles state, in `manager`,
+  `name`, then selector order
 - `pagination` - always page zero of one, the whole map on one page
 
 <VersionBadge version="v0.0.29" languages={["Rust"]} />
 
-`hubs`, `entry_points`, and `module_relationships` need facts only the Rust provider currently
-supplies. `hubs` ranks
-[`SymbolId`](/docs/developer/protocol/reference#SymbolId)s by the reference counts the
-[binding provider](/docs/developer/architecture#semantics) resolves; `entry_points` lists symbols
-carrying the `entrypoint` [`SymbolFacet`](/docs/developer/protocol/reference#SymbolFacet) - a file-scope
-`fn main`, not one nested in a module, an `impl` block, or another function. Each stays empty for
-a workspace with no such facts.
+`entry_points` lists symbols carrying the `entrypoint`
+[`SymbolFacet`](/docs/developer/protocol/reference#SymbolFacet) - a file-scope `fn main`, not one
+nested in a module, an `impl` block, or another function. It stays empty for a workspace with no
+such facts.
 
-`module_relationships` folds both ends of every resolved reference to the module `modules` lists
-them under, drops a pair whose two ends fold to one module, and counts what is left. A reference
-whose source or target is not project-located contributes none: a dependency declaration is
-reported by `packages` instead. The list carries at most 100 entries, ordered by `references`
-descending, then `from`, then `to`, so a workspace past that bound keeps the strongest pairs and
-two reads of one tree agree.
+`hubs` ranks [`SymbolId`](/docs/developer/protocol/reference#SymbolId)s by how often the index
+holds a resolved reference to them, and `module_relationships` folds both ends of every such
+reference to the module `modules` lists them under, drops a pair whose two ends fold to one
+module, and counts what is left. `module_relationships` carries at most 100 entries, ordered
+by `references` descending, then `from`, then `to`, so a workspace past that bound keeps the
+strongest pairs and two reads of one tree agree. Both read the index alone: the language
+engine resolves a reference for one read and publishes none, so both lists stay empty until a
+provider publishes resolved references into the index.
 
 <VersionBadge version="v0.0.32" languages={["Rust", "Python", "TypeScript"]} />
 
-`packages` lists what the [dependency resolvers](/docs/developer/architecture#source-discovery) cataloged:
-the Cargo resolver reads the resolved graph from `cargo metadata` and falls back to
-`Cargo.lock` when `cargo` is not on the server's `PATH`; the uv, npm, and Bun resolvers read
-`uv.lock`, `package-lock.json`, and `bun.lock`. Each entry is a
-[`PackageIdentity`](/docs/developer/protocol/reference#PackageIdentity). The list follows the lockfile:
-a lockfile rewritten while the server runs is re-cataloged on the next publication.
+`packages` lists the [dependency context](/docs/developer/architecture#dependency-context): what the
+Cargo, uv, npm, and Bun resolvers read from `Cargo.toml` and `Cargo.lock`, `pyproject.toml` and
+`uv.lock`, `package.json` and `package-lock.json`, and `package.json` and `bun.lock`. The pass
+reads those files and nothing else, so it runs no toolchain. Each entry is a
+[`PackageContextEntry`](/docs/developer/protocol/reference#PackageContextEntry) carrying the exact
+`version` a lockfile pins or the `requirement` a manifest declares, never both, and the
+`availability` a global package index could answer under. The list follows those files: one
+rewritten while the server runs is read again on the next publication.
 
 A resolver reads at most 256 manifests per workspace, taken in path order, so `packages` over a
 workspace holding more lists what the manifests it read declare.
@@ -837,24 +760,15 @@ workspace holding more lists what the manifests it read declare.
       ]
     }
   ],
-  "hubs": [
-    {
-      "symbol": "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService",
-      "kind": "struct",
-      "references": 87
-    }
-  ],
   "entry_points": ["rift://symbol/rust/crates/rift/src/main.rs/main"],
   "docs": ["README.md"],
-  "module_relationships": [
-    {
-      "from": "crates/rift-server",
-      "to": "crates/rift-protocol",
-      "references": 87
-    }
-  ],
   "packages": [
-    { "manager": "cargo", "name": "tokio", "version": "1.53.1" }
+    {
+      "manager": "cargo",
+      "name": "tokio",
+      "version": "1.53.1",
+      "availability": "canonical"
+    }
   ],
   "pagination": { "page_index": 0, "total_pages": 1 }
 }

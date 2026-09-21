@@ -8,6 +8,7 @@ use serde::Serialize;
 use strum::VariantArray;
 
 use crate::catalog::Resolution;
+use crate::context::ContextAnswer;
 
 /// Bytes one toolchain run may write to standard output before the inspector stops
 /// keeping it. Held below the server's stream drain ceiling, so an output that reaches
@@ -148,15 +149,23 @@ pub enum FileObservation {
     },
 }
 
+/// The workspace files a static pass reads.
+///
+/// A pass holding only this trait reads files and nothing else: it cannot run a
+/// toolchain, inspect a package cache, or read the environment, because the trait
+/// declares no way to ask for any of them. The dependency context pass takes
+/// `&mut dyn StaticInputs` for exactly that reason.
+pub trait StaticInputs {
+    /// The content of one file, refused past `bytes_max`.
+    fn read_file(&mut self, path: &Path, bytes_max: u64) -> FileObservation;
+}
+
 /// The workspace and machine facts a resolver reads.
 ///
 /// Resolvers hold no I/O: every file, directory, environment value, and toolchain run
 /// comes through this trait, so a catalog is a function of the inspector's answers.
 /// The server supplies a filesystem-backed inspector; tests supply a recorded one.
-pub trait Inspector {
-    /// The content of one file, refused past `bytes_max`.
-    fn read_file(&mut self, path: &Path, bytes_max: u64) -> FileObservation;
-
+pub trait Inspector: StaticInputs {
     /// Whether a directory stands at `path`.
     fn directory_exists(&mut self, path: &Path) -> bool;
 
@@ -190,6 +199,16 @@ pub struct ResolutionRequest<'a> {
     pub manifests: &'a [ProjectPath],
 }
 
+/// One resolver's view of a workspace for the static context pass: the same root and
+/// claimed manifests [`ResolutionRequest`] carries.
+#[derive(Clone, Copy, Debug)]
+pub struct ContextRequest<'a> {
+    /// The workspace root, absolute.
+    pub root: &'a Path,
+    /// The visible manifests the resolver claims, project-relative, in path order.
+    pub manifests: &'a [ProjectPath],
+}
+
 /// One shipped resolver: the ecosystem it serves and how it catalogs that ecosystem's packages.
 pub trait DependencyResolver: fmt::Debug + Send + Sync {
     /// The resolver's identity.
@@ -211,6 +230,15 @@ pub trait DependencyResolver: fmt::Debug + Send + Sync {
     /// static inputs state; it never fails the resolution.
     fn resolve(&self, request: &ResolutionRequest<'_>, inspector: &mut dyn Inspector)
     -> Resolution;
+
+    /// Reports what the request's manifests and lockfiles state about each package the
+    /// workspace depends on, reading only through `inputs`.
+    ///
+    /// A lockfile entry contributes the exact version it pins; a manifest entry no
+    /// lockfile pins contributes the requirement it declares. No toolchain runs and no
+    /// package cache is read, because [`StaticInputs`] offers neither.
+    fn context(&self, request: &ContextRequest<'_>, inputs: &mut dyn StaticInputs)
+    -> ContextAnswer;
 }
 
 #[cfg(test)]
