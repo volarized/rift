@@ -131,7 +131,11 @@ def test_churn_validates_all_tools_overlap_and_final_source(
     client.call.side_effect = call
     monkeypatch.setattr(asyncio, "sleep", sleep)
     if failure == "perpetual_stale":
+        # The convergence loop never converges here, so every budget it nests inside
+        # has to be short or the loop spins for the real one.
         monkeypatch.setattr(check_corpus, "READ_SECONDS", 0.05)
+        monkeypatch.setattr(check_corpus, "STEADY_READ_SECONDS", 0.05)
+        monkeypatch.setattr(check_corpus, "CONVERGENCE_SECONDS", 0.05)
     asyncio.run(exercise())
     assert not path.exists()
     assert sleeps and set(sleeps) <= {2.0, check_corpus.POLL_SECONDS}
@@ -145,12 +149,40 @@ def test_churn_validates_all_tools_overlap_and_final_source(
             ).values()
         )
         assert cast(int, summary["overlapping_writes"]) >= 2
-        # The recorded budget is what a reader compares a slow read against, and it has
-        # to stand above the server's own readiness budget: equal budgets end the call at
-        # the instant the server answers.
+        # The recorded budgets are what a reader compares a slow read against, and each
+        # stands strictly inside the one outside it: equal budgets end the call at the
+        # instant the server answers, and tear down whatever the outer one was waiting on.
         assert summary["read_seconds_max"] == check_corpus.READ_SECONDS
-        assert check_corpus.READ_SECONDS > check_corpus.READINESS_SECONDS
+        assert summary["steady_read_seconds_max"] == check_corpus.STEADY_READ_SECONDS
+        assert (
+            check_corpus.READINESS_SECONDS
+            < check_corpus.READ_SECONDS
+            < check_corpus.CONVERGENCE_SECONDS
+            < pins()["nextjs"].seconds - check_corpus.CLEANUP_RESERVE_SECONDS
+        )
+        assert check_corpus.STEADY_READ_SECONDS < check_corpus.READINESS_SECONDS
         assert f'"{int(check_corpus.READINESS_SECONDS)}s"' in check_corpus.CONFIGURATION
+        # A tool's first read carries the whole read budget; every read after it carries
+        # the steady one, so a later read that starts waiting for the index fails here.
+        reads = [
+            entry
+            for action in corpus.actions
+            if (entry := object_value(action, "churn action"))["action"] == "churn_read"
+        ]
+        assert [entry["tool"] for entry in reads if entry["first"]] == [
+            "get_symbol",
+            "search",
+            "nodes",
+        ]
+        assert all(
+            entry["deadline_seconds"]
+            == (
+                check_corpus.READ_SECONDS
+                if entry["first"]
+                else check_corpus.STEADY_READ_SECONDS
+            )
+            for entry in reads
+        )
         assert set(object_value(summary["latency"], "latency")) == {
             "search",
             "get_symbol",
