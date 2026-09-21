@@ -23,8 +23,10 @@ use rift_core::{
 };
 use rift_protocol::configuration::LEXICAL_UNITS_MAX_DEFAULT;
 use rift_ranking::{
-    CorpusRevision, DocumentIdentity, DocumentKind, DocumentLocation, FieldSet, IndexDocument,
-    ParsedQuery, QueryPhase, RankedIdentity, RankingInput, RankingInputKind, SearchableField,
+    CorpusRevision, DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, FieldSet,
+    IndexCapabilities, IndexDocument, IndexReader, ParsedQuery, PublicationFormat, QueryPhase,
+    RankRequest, RankedIdentity, RankingError, RankingFault, RankingInput, RankingInputKind,
+    RankingInputSet, RankingViolation, ReaderFuture, SearchableField,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -883,6 +885,50 @@ fn fts_insert_sql() -> String {
     format!("INSERT INTO lexical_documents_fts(identity, {columns}) VALUES ({placeholders})")
 }
 
+/// Rebuilds one published document from its typed row.
+///
+/// The row carries the same seven fields the document was written from, so this is the
+/// inverse of [`insert_document`] and nothing is derived a second time.
+fn decode_document(record: LexicalDocumentRecord) -> Result<IndexDocument, LexicalIndexError> {
+    let path = ProjectPath::new(record.path).map_err(|source| {
+        lexical_error_caused_by(LexicalIndexViolation::StoredPathInvalid, None, source)
+    })?;
+    let kind = DocumentKind::from_stored(&record.kind).ok_or_else(|| {
+        lexical_error(LexicalIndexViolation::StoredKindInvalid)
+            .with_context(ErrorContext::new("kind", record.kind.clone()))
+    })?;
+    let identity = DocumentIdentity::new(record.identity).map_err(|source| {
+        lexical_error_caused_by(LexicalIndexViolation::StoredKindInvalid, None, source)
+    })?;
+    let stored = [
+        (SearchableField::Name, record.name),
+        (SearchableField::QualifiedName, record.qualified_name),
+        (SearchableField::IdentifierTerms, record.identifier_terms),
+        (SearchableField::Signature, record.signature),
+        (SearchableField::Documentation, record.documentation),
+        (
+            SearchableField::DeclarationSource,
+            record.declaration_source,
+        ),
+        (SearchableField::FileContent, record.file_content),
+    ];
+    let fields = stored
+        .into_iter()
+        .fold(DocumentFields::empty(), |held, (field, value)| {
+            held.with_optional(field, value)
+        });
+    IndexDocument::new(
+        identity,
+        DocumentLocation::Project(path),
+        kind,
+        record.digest,
+        fields,
+    )
+    .map_err(|source| {
+        lexical_error_caused_by(LexicalIndexViolation::StoredKindInvalid, None, source)
+    })
+}
+
 /// Reconstructs one search hit from a raw joined row.
 ///
 /// The row shape follows directly from this module's own `SELECT` and
@@ -1300,6 +1346,30 @@ impl LexicalSearchIndex {
         Ok(record.and_then(|record| record.declaration_source.or(record.file_content)))
     }
 
+    /// Reads one document back by its stable identity, or `None` when this store
+    /// does not hold it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LexicalIndexError`] when a stored row fails to decode, or on storage
+    /// failure.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancellation performs no writes; this issues one read-only lookup.
+    pub async fn document(
+        &self,
+        identity: &DocumentIdentity,
+    ) -> Result<Option<IndexDocument>, LexicalIndexError> {
+        let mut connection = self.configured_connection().await?;
+        let record = LexicalDocumentRecord::filter_by_identity(identity.as_str())
+            .first()
+            .exec(&mut connection)
+            .await
+            .map_err(storage_error)?;
+        record.map(decode_document).transpose()
+    }
+
     /// Returns the tree revision stamped by the most recent `replace_all`,
     /// or `None` before the first successful `replace_all`.
     ///
@@ -1316,6 +1386,97 @@ impl LexicalSearchIndex {
             .await?
             .map(|stamp| stamp.tree_revision))
     }
+}
+
+/// One published snapshot of the project store, read through the shared contract.
+///
+/// [`LexicalSearchIndex::rank`] answers a revision-qualified result, because a caller that
+/// captured a publication has to tell a store that moved on from one that never published.
+/// The shared contract has no place for that distinction: it is the shape a reader holding
+/// no local tree implements. Binding the store to one publication is what lets the two be
+/// compared over one set of documents, and a store that has moved on answers nothing here.
+#[derive(Debug)]
+pub struct PublishedIndex<'a> {
+    store: &'a LexicalSearchIndex,
+    tree_revision: &'a str,
+    analyzer_revision: String,
+}
+
+impl<'a> PublishedIndex<'a> {
+    /// Reads `store` as the publication `tree_revision` names.
+    #[must_use]
+    pub fn new(
+        store: &'a LexicalSearchIndex,
+        tree_revision: &'a str,
+        analyzer_revision: impl Into<String>,
+    ) -> Self {
+        Self {
+            store,
+            tree_revision,
+            analyzer_revision: analyzer_revision.into(),
+        }
+    }
+}
+
+impl IndexReader for PublishedIndex<'_> {
+    fn capabilities(&self) -> IndexCapabilities {
+        IndexCapabilities::new(
+            PublicationFormat::CURRENT,
+            self.analyzer_revision.clone(),
+            CorpusRevision::current(),
+            // The corpus declares all seven columns. Which of them one document filled is
+            // the document's own answer, not the store's.
+            FieldSet::all(),
+            RankingInputSet::of(RankingInputKind::Lexical),
+        )
+    }
+
+    fn rank<'a>(
+        &'a self,
+        request: RankRequest<'a>,
+    ) -> ReaderFuture<'a, Result<RankingInput, RankingError>> {
+        Box::pin(async move {
+            if request.input() != RankingInputKind::Lexical {
+                // Identifier matching reads the declarations the workspace index holds,
+                // and vector similarity reads a corpus the search tier publishes. Neither
+                // is this store's to answer.
+                return Ok(RankingInput::unanswered(request.input()));
+            }
+            let bound = u32::try_from(request.bound()).unwrap_or(u32::MAX);
+            match self
+                .store
+                .rank(self.tree_revision, request.query(), request.phase(), bound)
+                .await
+            {
+                Ok(RevisionScoped::Matched(input)) => Ok(input),
+                Ok(_) => Ok(RankingInput::unanswered(request.input())),
+                Err(error) => Err(reader_refused(&error)),
+            }
+        })
+    }
+
+    fn document<'a>(
+        &'a self,
+        identity: &'a DocumentIdentity,
+    ) -> ReaderFuture<'a, Result<Option<IndexDocument>, RankingError>> {
+        Box::pin(async move {
+            self.store
+                .document(identity)
+                .await
+                .map_err(|error| reader_refused(&error))
+        })
+    }
+}
+
+/// One store refusal, as the shared contract's own.
+///
+/// The contract is storage-independent, so it cannot carry this store's violation. What
+/// it carries instead is the rendered cause, which is what a reader comparing two adapters
+/// needs to see.
+fn reader_refused(error: &LexicalIndexError) -> RankingError {
+    RankingError::new(
+        RankingFault::new(RankingViolation::CapabilitiesIncompatible).about(error.to_string()),
+    )
 }
 
 #[cfg(test)]

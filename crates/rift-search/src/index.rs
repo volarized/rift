@@ -858,13 +858,14 @@ impl SearchIndex {
         wanted: &[&UnitDocument],
     ) -> Result<(), SearchError> {
         let batch = batch_size(self.limits.batch_declarations);
-        let schedule = BatchSchedule::new(
-            batch,
-            model
-                .models
-                .requests_in_flight_max(as_usize(self.limits.max_in_flight)),
-        );
-        for chunk in wanted.chunks(batch_size(self.limits.batch_declarations)) {
+        let in_flight = model
+            .models
+            .requests_in_flight_max(as_usize(self.limits.max_in_flight));
+        let schedule = BatchSchedule::new(batch, in_flight);
+        // One pass hands over enough work for every request the schedule may open at
+        // once. Handing over one batch instead would leave the concurrency bound with
+        // nothing to apply to, and a bound that cannot trip is not a bound.
+        for chunk in wanted.chunks(batch.saturating_mul(in_flight).max(1)) {
             let texts: Vec<String> = chunk.iter().map(|one| one.text.clone()).collect();
             let embedded = model.models.embed_documents(texts, schedule).await?;
             let vectors = paired(chunk, embedded);

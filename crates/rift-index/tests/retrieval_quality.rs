@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use rift_core::{LanguageFileSelections, SourceVisibility, TextFileInclusion};
 use rift_index::{
-    DatabasePool, LexicalIndexLimits, LexicalSearchIndex, RevisionScoped, WorkspaceDatabase,
+    DatabasePool, LexicalIndexLimits, LexicalSearchIndex, PublishedIndex, WorkspaceDatabase,
     WorkspaceIndex, WorkspaceIndexLimits,
 };
 use rift_ranking::{
@@ -40,8 +40,6 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 /// Candidates one gated query keeps.
 const KEEP_MAX: usize = 20;
-/// The same bound in the width the store's own `limit` takes.
-const KEEP_MAX_LIMIT: u32 = 20;
 /// The mean reciprocal rank at 20 the corpus must reach.
 const RECIPROCAL_RANK_MIN: f64 = 0.80;
 /// The recall at 20 the corpus must reach.
@@ -142,26 +140,15 @@ async fn stored(documents: &[IndexDocument], directory: &Path) -> TestResult<Lex
     Ok(store)
 }
 
-/// The full-text input the stored corpus answers one phase with.
-async fn stored_input(
-    store: &LexicalSearchIndex,
-    query: &ParsedQuery,
-    phase: QueryPhase,
-) -> TestResult<RankingInput> {
-    match store.rank("corpus", query, phase, KEEP_MAX_LIMIT).await? {
-        RevisionScoped::Matched(input) => Ok(input),
-        other => Err(format!("the store must hold the corpus: {other:?}").into()),
-    }
-}
-
-/// The full-text input the in-memory adapter answers one phase with.
-async fn memory_input(
-    memory: &MemoryIndex,
+/// The full-text input one reader answers a phase with, asked through the shared
+/// contract so the stored corpus and the in-memory adapter are driven the same way.
+async fn reader_input(
+    reader: &dyn IndexReader,
     query: &ParsedQuery,
     phase: QueryPhase,
 ) -> TestResult<RankingInput> {
     let request = RankRequest::new(query, RankingInputKind::Lexical, phase, KEEP_MAX);
-    Ok(memory.rank(request).await?)
+    Ok(reader.rank(request).await?)
 }
 
 /// The shares this gate fuses under: the shipped triple.
@@ -313,6 +300,7 @@ async fn the_committed_corpus_meets_its_retrieval_floors() -> TestResult {
     let documents = index.index_documents();
     let targets = targets(&documents);
     let store = stored(&documents, directory.path()).await?;
+    let published = PublishedIndex::new(&store, "corpus", "retrieval-gate");
     let cases: QuerySet =
         toml::from_str(&std::fs::read_to_string(fixtures().join("queries.toml"))?)?;
 
@@ -322,7 +310,7 @@ async fn the_committed_corpus_meets_its_retrieval_floors() -> TestResult {
         let parsed = ParsedQuery::parse(&case.query)?;
         let started = Instant::now();
         let (fused, precise, broad) = ranked(&index, &parsed, |phase| {
-            stored_input(&store, &parsed, phase)
+            reader_input(&published, &parsed, phase)
         })
         .await?;
         let elapsed = started.elapsed().as_millis();
@@ -424,16 +412,18 @@ async fn one_tree_below_two_host_roots_publishes_one_corpus_and_one_order() -> T
 
     let one_store = stored(&one_documents, &directory.path().join("one-db")).await?;
     let other_store = stored(&other_documents, &directory.path().join("other-db")).await?;
+    let one_published = PublishedIndex::new(&one_store, "corpus", "retrieval-gate");
+    let other_published = PublishedIndex::new(&other_store, "corpus", "retrieval-gate");
     let one_targets = targets(&one_documents);
     let other_targets = targets(&other_documents);
     for query in ["SearchHit", "impact radius", "\"impact radius\"", "request"] {
         let parsed = ParsedQuery::parse(query)?;
         let (one_fused, _, _) = ranked(&one_index, &parsed, |phase| {
-            stored_input(&one_store, &parsed, phase)
+            reader_input(&one_published, &parsed, phase)
         })
         .await?;
         let (other_fused, _, _) = ranked(&other_index, &parsed, |phase| {
-            stored_input(&other_store, &parsed, phase)
+            reader_input(&other_published, &parsed, phase)
         })
         .await?;
         assert_eq!(
@@ -454,6 +444,7 @@ async fn the_stored_corpus_and_the_in_memory_adapter_answer_one_order() -> TestR
     let documents = index.index_documents();
     let targets = targets(&documents);
     let store = stored(&documents, directory.path()).await?;
+    let published = PublishedIndex::new(&store, "corpus", "retrieval-gate");
     let memory = MemoryIndex::new(documents.clone(), "retrieval-gate");
 
     assert_eq!(
@@ -461,16 +452,35 @@ async fn the_stored_corpus_and_the_in_memory_adapter_answer_one_order() -> TestR
         documents.len(),
         "both adapters hold one publication"
     );
+    published
+        .capabilities()
+        .accepts(&memory.capabilities())
+        .map_err(|error| {
+            format!("two adapters over one publication must rank together: {error}")
+        })?;
+    for document in &documents {
+        let read = published
+            .document(document.identity())
+            .await?
+            .ok_or("the stored corpus must read every document it published back")?;
+        assert_eq!(
+            read.digest(),
+            document.digest(),
+            "a document read back is the document that was published"
+        );
+        assert_eq!(read.fields(), document.fields());
+        assert_eq!(read.kind(), document.kind());
+    }
     let cases: QuerySet =
         toml::from_str(&std::fs::read_to_string(fixtures().join("queries.toml"))?)?;
     for case in &cases.case {
         let parsed = ParsedQuery::parse(&case.query)?;
         let (from_store, _, _) = ranked(&index, &parsed, |phase| {
-            stored_input(&store, &parsed, phase)
+            reader_input(&published, &parsed, phase)
         })
         .await?;
         let (from_memory, _, _) = ranked(&index, &parsed, |phase| {
-            memory_input(&memory, &parsed, phase)
+            reader_input(&memory, &parsed, phase)
         })
         .await?;
         let held = answered(&from_store, &targets);

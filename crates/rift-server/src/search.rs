@@ -718,19 +718,12 @@ struct IdentifierSources<'a> {
     packages: Option<&'a DependencyIndex>,
 }
 
-/// One package declaration's ranking identity: its source unit and its qualified name,
-/// which is what addresses it, since a package file carries no project path.
+/// One package declaration's ranking identity, in the one spelling the package index
+/// publishes its documents under.
 fn package_symbol_identity(found: &DependencySymbolMatch<'_>) -> Option<DocumentIdentity> {
     let unit = found.package.unit_of(found.matched.file)?;
-    DocumentIdentity::new(format!(
-        "{unit}{PACKAGE_IDENTITY_SEPARATOR}{}",
-        found.matched.symbol.qualified_name
-    ))
-    .ok()
+    DocumentIdentity::for_unit(unit, &found.matched.symbol.qualified_name).ok()
 }
-
-/// Separates a package document's source unit from the qualified name inside it.
-const PACKAGE_IDENTITY_SEPARATOR: char = '#';
 
 /// Resolves every fused identity into a hit, in the order fusion produced.
 ///
@@ -917,7 +910,7 @@ fn resolve_candidate<'a>(
         return resolve_declaration(index, resolution.force_include, value);
     }
     if value.starts_with(SOURCE_UNIT_URI_PREFIX) {
-        return resolve_package_declaration(resolution.packages, value);
+        return resolve_package_declaration(resolution.packages, identity);
     }
     resolve_file(index, value)
 }
@@ -958,14 +951,17 @@ const fn declared<'a>(file: &'a IndexedFile, symbol: &'a SyntaxSymbol) -> Symbol
 /// The package declaration one `rift://source/` identity names.
 fn resolve_package_declaration<'a>(
     packages: Option<&'a DependencyIndex>,
-    identity: &str,
+    identity: &DocumentIdentity,
 ) -> Option<ResolvedCandidate<'a>> {
-    let (unit, qualified_name) = identity.split_once(PACKAGE_IDENTITY_SEPARATOR)?;
+    let (unit, qualified_name) = identity.as_unit()?;
     let unit = SourceUnitId::parse(unit).ok()?;
     packages?
         .symbol_at(&unit, qualified_name)
         .map(ResolvedCandidate::Package)
 }
+
+/// Separates a split text file's path from the index of one of its chunks.
+const CHUNK_SEPARATOR: char = '#';
 
 /// The file one path identity names, with the chunk suffix a split text file carries
 /// stripped: every chunk of one file resolves to that file.
@@ -973,7 +969,7 @@ fn resolve_package_declaration<'a>(
 /// The suffix is the separator followed by the chunk's index and nothing else, so a path
 /// that carries the separator as one of its own characters is read whole.
 fn resolve_file<'a>(index: &'a WorkspaceIndex, identity: &str) -> Option<ResolvedCandidate<'a>> {
-    let path = match identity.rsplit_once(PACKAGE_IDENTITY_SEPARATOR) {
+    let path = match identity.rsplit_once(CHUNK_SEPARATOR) {
         Some((path, chunk))
             if !chunk.is_empty() && chunk.bytes().all(|byte| byte.is_ascii_digit()) =>
         {

@@ -1786,7 +1786,13 @@ impl RiftMcp {
                 _ => RevisionScoped::NoRevision,
             });
         };
-        let broad = if query.has_broad_phase() {
+        // The precise phase alone can already fill the pool, and the read layer would
+        // then never read a widened answer. Asking for one costs a full-text query the
+        // answer cannot use.
+        let filled = precise.inputs().iter().any(|input| {
+            input.order().len() >= usize::try_from(self.fetch_limit()).unwrap_or(usize::MAX)
+        });
+        let broad = if query.has_broad_phase() && !filled {
             match self
                 .run_phase(index, tree_revision, query, QueryPhase::Broad)
                 .await?

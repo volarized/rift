@@ -2963,6 +2963,21 @@ fn symbol_document(file: &IndexedFile, symbol: &SyntaxSymbol) -> IndexDocument {
         file.path().as_str(),
         &symbol.qualified_name,
     );
+    document(
+        identity,
+        file.path(),
+        DocumentKind::Symbol,
+        declaration_fields(file, symbol),
+    )
+}
+
+/// The searchable fields one declaration fills, wherever it was read from.
+///
+/// A package index publishes the same fields for its own declarations; only the identity
+/// and the address differ. Sharing the derivation is what makes the two comparable:
+/// equal bytes produce equal fields and one digest, whichever index published them.
+#[must_use]
+pub(crate) fn declaration_fields(file: &IndexedFile, symbol: &SyntaxSymbol) -> DocumentFields {
     let source = declaration_source(file, symbol.range);
     let containers = symbol.container.iter().map(String::as_str);
     let terms = identifier_terms(
@@ -2971,7 +2986,7 @@ fn symbol_document(file: &IndexedFile, symbol: &SyntaxSymbol) -> IndexDocument {
             .chain(containers),
         IDENTIFIER_TERMS_BYTES_MAX,
     );
-    let fields = DocumentFields::empty()
+    DocumentFields::empty()
         .with(SearchableField::Name, symbol.name.clone())
         .with(
             SearchableField::QualifiedName,
@@ -2983,8 +2998,7 @@ fn symbol_document(file: &IndexedFile, symbol: &SyntaxSymbol) -> IndexDocument {
             SearchableField::Documentation,
             attached_documentation(symbol),
         )
-        .with(SearchableField::DeclarationSource, source);
-    document(identity, file.path(), DocumentKind::Symbol, fields)
+        .with(SearchableField::DeclarationSource, source)
 }
 
 /// The declaration's rendered signatures, one per line.

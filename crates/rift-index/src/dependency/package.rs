@@ -17,7 +17,11 @@ use super::analyzer::{AnalyzedFile, PackageAnalysis, PackageAnalyzer};
 use super::failure::{PackageIndexError, PackageIndexFault, PackageIndexViolation};
 use super::walk::PackageFiles;
 use crate::semantic::WorkspaceSemantics;
-use crate::workspace::{IndexedFile, ReadableSymbol, SymbolMatch, symbol_matches_where};
+use rift_ranking::{DocumentIdentity, DocumentKind, DocumentLocation, IndexDocument};
+
+use crate::workspace::{
+    IndexedFile, ReadableSymbol, SymbolMatch, declaration_fields, symbol_matches_where,
+};
 
 /// One cataloged package's publication, and the reads it answers.
 ///
@@ -125,6 +129,48 @@ impl PackageIndex {
         self.held(file.path()).map(|held| held.placement().unit())
     }
 
+    /// Every exported declaration this package publishes, as index documents.
+    ///
+    /// The fields are the ones the project index derives for its own declarations, so a
+    /// package document and a project document over the same bytes carry one digest.
+    /// What differs is the address: a package file has no project path, so its documents
+    /// are addressed by the source unit the dependency lane minted and the qualified name
+    /// inside it.
+    ///
+    /// The export rule runs first, exactly as it does for a read: a declaration this
+    /// package does not export is not a document a caller can reach.
+    #[must_use]
+    pub fn index_documents(&self) -> Vec<IndexDocument> {
+        let package = self.identity().clone();
+        let mut documents = Vec::with_capacity(self.declaration_count);
+        for file in self.files() {
+            let Some(unit) = self.unit_of(file) else {
+                continue;
+            };
+            for symbol in file.syntax().symbols() {
+                if !self.is_public(file.path(), symbol) {
+                    continue;
+                }
+                let Ok(identity) = DocumentIdentity::for_unit(unit, &symbol.qualified_name) else {
+                    continue;
+                };
+                let fields = declaration_fields(file, symbol);
+                let digest = fields.digest();
+                let Ok(document) = IndexDocument::new(
+                    identity,
+                    DocumentLocation::Unit(unit.clone()),
+                    DocumentKind::Symbol,
+                    digest,
+                    fields,
+                ) else {
+                    continue;
+                };
+                documents.push(document.in_package(package.clone()));
+            }
+        }
+        documents
+    }
+
     /// Exported declarations matching `query`, ranked as the project index ranks.
     ///
     /// The export rule runs before ranking and truncation, so the answer fills `limit`
@@ -191,6 +237,105 @@ mod tests {
         identity, language, names, rust_package, text, tokio, violation_of,
     };
     use super::{PackageFiles, PackageIndex, PackageIndexViolation};
+
+    /// One package holding a single exported declaration.
+    fn published_package() -> PackageIndex {
+        let entry = CatalogEntry::dependency(
+            tokio(),
+            language(ShippedLanguage::Rust),
+            Some(PathBuf::from("/cache/tokio-1.53.1")),
+            true,
+        );
+        let files = PackageFiles::new(
+            vec![text(
+                "src/lib.rs",
+                "/// Runs one future to completion.\npub fn spawn() {}\nfn hidden() {}\n",
+            )],
+            0,
+        );
+        PackageIndex::build(&entry, &files, 7).expect("package builds")
+    }
+
+    #[test]
+    fn test_a_package_publishes_one_document_per_exported_declaration() {
+        let package = published_package();
+        let documents = package.index_documents();
+
+        assert_eq!(
+            documents.len(),
+            1,
+            "a declaration the package does not export is no document a caller reaches"
+        );
+        let document = &documents[0];
+        assert_eq!(
+            document.identity().as_str(),
+            "rift://source/cargo/tokio@1.53.1/src/lib.rs#spawn"
+        );
+        assert_eq!(
+            document.identity().as_unit(),
+            Some(("rift://source/cargo/tokio@1.53.1/src/lib.rs", "spawn")),
+            "a package identity reads back as the unit and the name inside it"
+        );
+        assert_eq!(document.package(), Some(&tokio()));
+        assert_eq!(document.kind(), rift_ranking::DocumentKind::Symbol);
+        assert!(matches!(
+            document.location(),
+            rift_ranking::DocumentLocation::Unit(_)
+        ));
+        assert_eq!(
+            document.fields().get(rift_ranking::SearchableField::Name),
+            Some("spawn")
+        );
+        assert_eq!(
+            document
+                .fields()
+                .get(rift_ranking::SearchableField::Documentation),
+            Some("Runs one future to completion.")
+        );
+        assert!(
+            document
+                .fields()
+                .get(rift_ranking::SearchableField::DeclarationSource)
+                .is_some_and(|source| source.contains("pub fn spawn")),
+            "a package document carries the declaration's own source"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_package_publication_ranks_through_the_shared_contract() {
+        use rift_ranking::{IndexReader, ParsedQuery, QueryPhase, RankRequest, RankingInputKind};
+
+        let package = published_package();
+        let documents = package.index_documents();
+        let published = rift_ranking::MemoryIndex::new(documents.clone(), "package-fixture");
+        let query = ParsedQuery::parse("spawn").expect("query parses");
+        let answered = published
+            .rank(RankRequest::new(
+                &query,
+                RankingInputKind::Lexical,
+                QueryPhase::Precise,
+                10,
+            ))
+            .await
+            .expect("the in-memory adapter never refuses");
+
+        assert_eq!(
+            answered
+                .order()
+                .iter()
+                .map(|entry| entry.identity().as_str())
+                .collect::<Vec<_>>(),
+            ["rift://source/cargo/tokio@1.53.1/src/lib.rs#spawn"],
+            "a package publication ranks through the same contract the project store does"
+        );
+        let read = published
+            .document(documents[0].identity())
+            .await
+            .expect("no refusal")
+            .expect("the adapter holds what it was given");
+        assert_eq!(read.digest(), documents[0].digest());
+        assert_eq!(read.fields(), documents[0].fields());
+    }
 
     #[test]
     fn test_package_index_answers_pub_declarations_with_dependency_origin_unit_and_identity() {

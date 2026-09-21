@@ -10,7 +10,7 @@
 //! differently would then be weighing the same bytes twice.
 
 use data_encoding::HEXLOWER;
-use rift_core::constants::DIGEST_WIRE_CHARS;
+use rift_core::constants::{DIGEST_WIRE_CHARS, SOURCE_UNIT_URI_PREFIX};
 use rift_core::{Language, PackageIdentity, ProjectPath, SourceUnitId};
 use sha2::{Digest as _, Sha256};
 
@@ -39,6 +39,9 @@ pub const DOCUMENTATION_BYTES_MAX: usize = 16_384;
 /// A reader that folded on one side and not the other would rank the same
 /// publication two ways.
 pub const CORPUS_TOKENIZER: &str = "unicode61 remove_diacritics 0";
+
+/// Separates a package declaration's source unit from the qualified name inside it.
+const UNIT_QUALIFIER_SEPARATOR: char = '#';
 
 /// Separates one field's column name from its value in digest material.
 const FIELD_NAME_SEPARATOR: u8 = 0;
@@ -301,6 +304,30 @@ impl DocumentIdentity {
             ));
         }
         Ok(Self(value))
+    }
+
+    /// The identity one package declaration is addressed by: its source unit and the
+    /// qualified name inside it.
+    ///
+    /// A package file carries no project path, so the unit is what places it. The unit
+    /// is percent-encoded and holds no separator of its own, which is what lets
+    /// [`Self::as_unit`] read the two halves back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RankingError`] when the spelling runs past [`IDENTITY_BYTES_MAX`].
+    pub fn for_unit(unit: &SourceUnitId, qualified_name: &str) -> Result<Self, RankingError> {
+        Self::new(format!("{unit}{UNIT_QUALIFIER_SEPARATOR}{qualified_name}"))
+    }
+
+    /// The source unit and the qualified name inside it, or `None` for an identity that
+    /// names no package declaration.
+    #[must_use]
+    pub fn as_unit(&self) -> Option<(&str, &str)> {
+        self.0
+            .starts_with(SOURCE_UNIT_URI_PREFIX)
+            .then(|| self.0.split_once(UNIT_QUALIFIER_SEPARATOR))
+            .flatten()
     }
 
     /// The identity as stored and compared.
