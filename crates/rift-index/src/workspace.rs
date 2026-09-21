@@ -1657,7 +1657,7 @@ impl WorkspaceIndex {
 
     /// Finds lexical content lines containing `query` across included `[search.text]` files -
     /// the same content-line search [`Self::source_matches`] runs over syntax-indexed files,
-    /// reaching a text-lane file's bytes directly rather than only through the semantic tier.
+    /// reaching a text-lane file's bytes directly rather than only through the vector ranking.
     ///
     /// # Errors
     ///

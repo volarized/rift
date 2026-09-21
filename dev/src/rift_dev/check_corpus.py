@@ -55,7 +55,7 @@ CLEANUP_RESERVE_SECONDS = 30.0
 SEED = 34
 POLL_SECONDS = 0.1
 OBSERVATION_SECONDS = 60.0
-CONFIGURATION = '[server]\nreadiness_timeout = "30s"\n[search.semantic]\ndisabled = true\n[logs]\npage_records = 5000\ncapture = "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info"\n'
+CONFIGURATION = '[server]\nreadiness_timeout = "30s"\n[search.vector]\ndisabled = true\n[logs]\npage_records = 5000\ncapture = "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info"\n'
 SAMPLE_LANGUAGES = {
     "bun": ("rust", "typescript", "typescript:tsx"),
     "nextjs": ("rust", "typescript", "typescript:tsx"),

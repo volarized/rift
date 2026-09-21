@@ -2,7 +2,7 @@
 
 use rift_core::ProjectPath;
 use rift_search::{
-    DeclarationMatch, FusedRank, Ranking, SearchViolation, SemanticMatch, best_per_file, fuse,
+    DeclarationMatch, FusedRank, Ranking, SearchViolation, VectorMatch, best_per_file, fuse,
     spread_per_file,
 };
 
@@ -39,7 +39,7 @@ fn declaration(
     let file = ProjectPath::new(path.to_owned())?;
     Ok(DeclarationMatch::new(
         file,
-        SemanticMatch::new(digest.to_owned(), similarity),
+        VectorMatch::new(digest.to_owned(), similarity),
     ))
 }
 
@@ -57,9 +57,9 @@ fn digests(matches: &[DeclarationMatch]) -> Vec<&str> {
 #[test]
 fn the_fused_score_is_each_rankings_weight_over_the_rank_it_gave() -> TestResult {
     let lexical = ["a", "b", "c"];
-    let semantic = ["c", "a"];
+    let vector = ["c", "a"];
     let fused = fuse(
-        &[Ranking::new(0.6, &lexical), Ranking::new(0.4, &semantic)],
+        &[Ranking::new(0.6, &lexical), Ranking::new(0.4, &vector)],
         FUSION_K,
         8,
     )?;
@@ -77,9 +77,9 @@ fn the_fused_score_is_each_rankings_weight_over_the_rank_it_gave() -> TestResult
 #[test]
 fn a_candidate_every_ranking_put_first_scores_exactly_one() -> TestResult {
     let lexical = ["shared", "other"];
-    let semantic = ["shared"];
+    let vector = ["shared"];
     let fused = fuse(
-        &[Ranking::new(0.6, &lexical), Ranking::new(0.4, &semantic)],
+        &[Ranking::new(0.6, &lexical), Ranking::new(0.4, &vector)],
         FUSION_K,
         8,
     )?;
@@ -99,9 +99,9 @@ fn a_candidate_every_ranking_put_first_scores_exactly_one() -> TestResult {
 #[test]
 fn a_candidate_one_ranking_alone_returned_carries_that_rankings_share() -> TestResult {
     let lexical = ["only"];
-    let semantic = ["elsewhere"];
+    let vector = ["elsewhere"];
     let fused = fuse(
-        &[Ranking::new(0.75, &lexical), Ranking::new(0.25, &semantic)],
+        &[Ranking::new(0.75, &lexical), Ranking::new(0.25, &vector)],
         FUSION_K,
         8,
     )?;
@@ -179,10 +179,10 @@ fn a_fusion_constant_of_zero_is_refused_as_a_bound_never_applied() {
 #[test]
 fn a_fusion_constant_at_either_end_of_its_range_fuses() -> TestResult {
     let lexical = ["a", "b"];
-    let semantic = ["b", "a"];
+    let vector = ["b", "a"];
     for fusion_k in [FUSION_K_MIN, FUSION_K_MAX] {
         let fused = fuse(
-            &[Ranking::new(0.5, &lexical), Ranking::new(0.5, &semantic)],
+            &[Ranking::new(0.5, &lexical), Ranking::new(0.5, &vector)],
             fusion_k,
             8,
         )?;
@@ -244,9 +244,9 @@ fn the_result_is_truncated_to_what_the_caller_keeps() -> TestResult {
 #[test]
 fn two_candidates_of_one_score_are_ordered_by_identity() -> TestResult {
     let lexical = ["zebra", "alpha"];
-    let semantic = ["alpha", "zebra"];
+    let vector = ["alpha", "zebra"];
     let fused = fuse(
-        &[Ranking::new(0.5, &lexical), Ranking::new(0.5, &semantic)],
+        &[Ranking::new(0.5, &lexical), Ranking::new(0.5, &vector)],
         FUSION_K,
         8,
     )?;
@@ -387,7 +387,7 @@ fn the_debug_render_names_the_file_and_the_match_it_carries() -> TestResult {
     let rendered = format!("{matched:?}");
     assert!(rendered.starts_with("DeclarationMatch"), "{rendered}");
     assert!(rendered.contains("src/index.rs"), "{rendered}");
-    assert!(rendered.contains("SemanticMatch"), "{rendered}");
+    assert!(rendered.contains("VectorMatch"), "{rendered}");
     assert_eq!(matched.file().as_str(), "src/index.rs");
     assert_eq!(matched.matched().digest(), "aaa");
     Ok(())

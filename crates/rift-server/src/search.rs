@@ -38,7 +38,7 @@ use crate::traversal::{
 impl ReadService {
     /// Searches indexed declarations and source lines, optionally narrowed or extended by
     /// `params.paths`, merged with `ranked` from the caller's search index - the lexical
-    /// and semantic rankings already fused into one score. `ranked` is empty when that
+    /// and vector rankings already fused into one score. `ranked` is empty when that
     /// index is unavailable or its stamped revision no longer matches what is published -
     /// the caller decides that, this method only merges what it is handed. `params.scope`
     /// selects what the lexical `query` runs over: the project lanes, the attached
@@ -271,7 +271,7 @@ impl ReadService {
         )
     }
 
-    /// Pairs each symbol unit in `units` with the declaration the semantic tier embeds for
+    /// Pairs each symbol unit in `units` with the declaration the vector ranking embeds for
     /// it.
     ///
     /// Only a symbol unit carries a declaration: a text file's chunk describes none, so it
@@ -296,7 +296,7 @@ impl ReadService {
 
     /// How many visible files this snapshot indexes across syntax and baseline text.
     ///
-    /// A caller estimates the semantic tier's preparation work from this count.
+    /// A caller estimates the vector ranking's preparation work from this count.
     #[must_use]
     pub fn file_count(&self) -> u64 {
         let files = self.index().files().len() + self.index().text_files().len();
@@ -1085,7 +1085,7 @@ fn merge_file_hit(
 
 /// Records that `existing` also matched through the ranked lane: adds
 /// [`MatchedField::Ranked`] when absent, and raises its score to the better of the two. The
-/// ranked lane fuses a lexical and a semantic tier into one score with no per-hit record of
+/// ranked lane fuses a lexical and a vector ranking into one score with no per-hit record of
 /// which tier placed it, so it can never claim [`MatchedField::Content`] - that member stays
 /// a claim the identifier or line matcher proved against literal bytes.
 fn absorb_ranked_match(existing: &mut SearchHit, score: f64) {
@@ -1908,7 +1908,7 @@ pub fn compute() -> i32 {
 
     /// A sentence present in both a provider-claimed file (markdown, syntax index) and a
     /// `.mdx` file (`[search.text]`, no provider claims it) returns both hits: the text-lane
-    /// lexical lane used to reach a text file only through the semantic tier, so this
+    /// lexical lane used to reach a text file only through the vector ranking, so this
     /// sentence never reached the mdx file's hit before the lexical lane searched it too.
     #[test]
     fn search_returns_a_text_lane_hit_alongside_a_provider_claimed_hit_for_the_same_sentence()
@@ -2968,7 +2968,7 @@ pub fn compute() -> i32 {
         );
 
         // A second merge at a lower score keeps the existing higher score and does not
-        // duplicate the already-present Semantic field.
+        // duplicate the already-present Ranked field.
         super::merge_symbol_hit(
             service.index(),
             &mut results,
@@ -2986,7 +2986,7 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    /// One search index over `database`, semantic tier off, holding `service`'s own units,
+    /// One search index over `database`, vector ranking off, holding `service`'s own units,
     /// searched for `query`. A [`RankedUnit`] carries no constructor of its own, so the tier
     /// that produces them is the only way a test obtains one.
     async fn ranked_units(
@@ -2995,7 +2995,7 @@ pub fn compute() -> i32 {
         query: &str,
     ) -> TestResult<Vec<RankedUnit>> {
         let limits = SearchIndexLimits::builder(LexicalIndexLimits::default())
-            .disable_semantic()
+            .disable_vector()
             .build();
         let index = SearchIndex::open(database, limits).await?;
         let units = service.lexical_units();
@@ -3248,7 +3248,7 @@ pub fn compute() -> i32 {
     }
 
     #[tokio::test]
-    async fn search_merges_every_ranked_unit_while_the_semantic_tier_is_off() -> TestResult {
+    async fn search_merges_every_ranked_unit_while_the_vector_ranking_is_off() -> TestResult {
         let (directory, service) = fixture()?;
         let database = directory.path().join("search.db");
         let ranked = ranked_units(&database, &service, "Beacon").await?;

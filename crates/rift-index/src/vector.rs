@@ -1,4 +1,4 @@
-//! Persistence for the semantic tier's vectors, beside the lexical index.
+//! Persistence for the vector ranking's vectors, beside the lexical index.
 //!
 //! A vector is addressed by the model that produced it and the digest of the
 //! text it was produced from, never by a declaration's identity. Two models'
@@ -54,12 +54,12 @@ impl StoredVector {
 
 /// The workspace's stored vectors, one row per model and digest.
 #[derive(Debug)]
-pub struct SemanticVectorStore {
+pub struct VectorStore {
     database: Arc<WorkspaceDatabase>,
 }
 
-impl SemanticVectorStore {
-    /// Attaches the semantic tier to one already-open workspace database.
+impl VectorStore {
+    /// Attaches the vector ranking to one already-open workspace database.
     ///
     /// The pool is shared with the lexical tier and the log store, because
     /// `SQLite` serializes writers per file rather than per connection.
@@ -342,7 +342,7 @@ fn decode(blob: &[u8], dimension: usize) -> Option<Vec<f32>> {
 
 #[derive(Debug, toasty::Model)]
 #[table = "semantic_vectors"]
-pub(crate) struct SemanticVectorRecord {
+pub(crate) struct VectorRecord {
     #[key]
     identity: String,
     #[index]
@@ -354,7 +354,7 @@ pub(crate) struct SemanticVectorRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::{SemanticVectorStore, StoredVector, address, decode, encode};
+    use super::{StoredVector, VectorStore, address, decode, encode};
     use crate::DatabasePool;
     use std::collections::BTreeSet;
 
@@ -387,9 +387,9 @@ mod tests {
 
     async fn opened(
         directory: &std::path::Path,
-    ) -> Result<SemanticVectorStore, Box<dyn std::error::Error>> {
+    ) -> Result<VectorStore, Box<dyn std::error::Error>> {
         let database = crate::WorkspaceDatabase::open(&directory.join("db"), pool()).await?;
-        Ok(SemanticVectorStore::attached(database))
+        Ok(VectorStore::attached(database))
     }
 
     #[tokio::test]

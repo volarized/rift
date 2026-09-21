@@ -66,8 +66,8 @@ pub const EXECUTION_OUTPUT_BYTES_MAX: u64 = 16 << 10;
 pub const EXECUTION_CONCURRENT_MAX: u64 = 64;
 /// Revisions the history provider may walk from the current head, at most.
 pub const HISTORY_REVISIONS_MAX: u64 = 100_000;
-/// Bytes `search.semantic.model` may hold, at most.
-pub const SEMANTIC_MODEL_BYTES_MAX: usize = 128;
+/// Bytes an `[search.vector.embedding]` model value may hold, at most.
+pub const EMBEDDING_MODEL_BYTES_MAX: usize = 128;
 
 /// Literal arguments one configured command may hold, at most.
 pub const COMMAND_ARGUMENTS_MAX: usize = 64;
@@ -750,29 +750,24 @@ impl ExecutionConfiguration {
     }
 }
 
-/// The `[search]` table. Search fuses a lexical ranking with a semantic one:
-/// `lexical` and `semantic` weigh the two against each other, `fusion_k` sets
-/// how sharply a top rank counts, `pool_slots` and `busy_timeout` bound the
-/// shared `SQLite` connections behind search and logs, and `text` bounds
-/// lexical chunks derived from visible text files.
+/// The `[search]` table. `ranking` weighs the ranking inputs against each
+/// other, `lexical` and `vector` bound the two indexed rankings, `text`
+/// bounds the lexical chunks derived from visible text files, and
+/// `pool_slots` and `busy_timeout` bound the shared `SQLite` connections
+/// behind search and logs.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_search_ranges)]
 pub struct SearchConfiguration {
     /// Chunking policy for visible text files in lexical search.
     pub text: TextSearchConfiguration,
-    /// The lexical ranking's share of a fused score.
+    /// How many units the lexical index holds.
     pub lexical: LexicalSearchConfiguration,
-    /// The embedding model that adds semantic ranking, and the bounds its
+    /// What each ranking input contributes to a fused score.
+    pub ranking: RankingConfiguration,
+    /// The embedding model that adds vector ranking, and the bounds its
     /// preparation runs under.
-    pub semantic: SemanticSearchConfiguration,
-    /// The reciprocal-rank fusion constant, 1 to 1000. A result scores as the
-    /// weighted sum of `1 / (k + rank)` over the rankings that returned it, so
-    /// a larger value flattens the contribution curve and lets agreement
-    /// between the two rankings outweigh one ranking's top position.
-    #[schemars(range(min = 1, max = 1000))]
-    #[serde(default = "default_search_fusion_k")]
-    pub fusion_k: u64,
+    pub vector: VectorSearchConfiguration,
     /// Pooled `SQLite` connections the workspace database may open at once,
     /// 1 to 16. Search reads and stored logs share this pool.
     #[schemars(range(min = 1, max = 16))]
@@ -789,8 +784,8 @@ impl Default for SearchConfiguration {
         Self {
             text: TextSearchConfiguration::default(),
             lexical: LexicalSearchConfiguration::default(),
-            semantic: SemanticSearchConfiguration::default(),
-            fusion_k: SEARCH_FUSION_K_DEFAULT,
+            ranking: RankingConfiguration::default(),
+            vector: VectorSearchConfiguration::default(),
             pool_slots: SEARCH_POOL_SLOTS_DEFAULT,
             busy_timeout: default_search_busy_timeout(),
         }
@@ -798,22 +793,17 @@ impl Default for SearchConfiguration {
 }
 
 impl SearchConfiguration {
-    /// The ranking-weight pair, then the `[search.lexical]`, `[search.semantic]`,
-    /// and `[search.text]` tables' own rules, then this table's numeric bounds,
+    /// The `[search.lexical]`, `[search.ranking]`, `[search.vector]`, and
+    /// `[search.text]` tables' own rules, then this table's numeric bounds,
     /// in key order.
     fn violation(&self) -> Option<ConfigurationViolation> {
-        search_weights_violation(self.lexical.weight, self.semantic.weight)
-            .or_else(|| self.lexical.violation())
-            .or_else(|| self.semantic.violation())
+        self.lexical
+            .violation()
+            .or_else(|| self.ranking.violation())
+            .or_else(|| self.vector.violation())
             .or_else(|| self.text.violation())
             .or_else(|| {
                 first_out_of_range([
-                    (
-                        "search.fusion_k",
-                        self.fusion_k,
-                        SEARCH_FUSION_K_MIN,
-                        SEARCH_FUSION_K_MAX,
-                    ),
                     (
                         "search.pool_slots",
                         self.pool_slots,
@@ -844,12 +834,13 @@ pub const SEARCH_BUSY_TIMEOUT_MS_MAX: u64 = 30_000;
 /// Milliseconds `search.busy_timeout` holds when the key is absent.
 const SEARCH_BUSY_TIMEOUT_MS_DEFAULT: u64 = 5_000;
 
-/// `search.fusion_k` accepted, at least.
+/// `search.ranking.fusion_k` accepted, at least.
 pub const SEARCH_FUSION_K_MIN: u64 = 1;
-/// `search.fusion_k` accepted, at most.
+/// `search.ranking.fusion_k` accepted, at most.
 pub const SEARCH_FUSION_K_MAX: u64 = 1_000;
-/// `search.fusion_k` when the key is absent: the value the reciprocal-rank
-/// fusion paper uses, and the one the fusion library defaults to.
+/// `search.ranking.fusion_k` when the key is absent: the value the
+/// reciprocal-rank fusion paper uses, and the one the fusion library
+/// defaults to.
 const SEARCH_FUSION_K_DEFAULT: u64 = 60;
 
 fn default_search_fusion_k() -> u64 {
@@ -864,37 +855,50 @@ fn default_search_busy_timeout() -> Duration {
     Duration::from_millis(SEARCH_BUSY_TIMEOUT_MS_DEFAULT)
 }
 
-/// Whether the two ranking weights form a pair of shares: each finite and
-/// between 0 and 1, and the two summing to 1 within
-/// [`SEARCH_WEIGHT_SUM_TOLERANCE`]. The tolerance is what admits the default
-/// pair, since `0.7 + 0.3` lands a fraction below 1 in binary floating point.
-fn search_weights_violation(lexical: f64, semantic: f64) -> Option<ConfigurationViolation> {
+/// Whether the three ranking weights form a usable set: each finite and
+/// between 0 and 1, and at least one strictly positive. They need not sum to
+/// 1, because the executor normalizes the weights of the inputs that
+/// answered; a set of zeros leaves nothing to normalize and is refused.
+fn search_weights_violation(
+    identifier: f64,
+    lexical: f64,
+    vector: f64,
+) -> Option<ConfigurationViolation> {
     let within_unit = |weight: f64| weight.is_finite() && (0.0..=1.0).contains(&weight);
-    let bounded = within_unit(lexical) && within_unit(semantic);
-    let normalized = (lexical + semantic - 1.0).abs() <= SEARCH_WEIGHT_SUM_TOLERANCE;
-    let valid = bounded && normalized;
-    (!valid).then_some(ConfigurationViolation::SearchWeightsInvalid { lexical, semantic })
+    let bounded = within_unit(identifier) && within_unit(lexical) && within_unit(vector);
+    let positive = identifier > 0.0 || lexical > 0.0 || vector > 0.0;
+    let valid = bounded && positive;
+    (!valid).then_some(ConfigurationViolation::SearchWeightsInvalid {
+        identifier,
+        lexical,
+        vector,
+    })
 }
 
-/// Classifies one model value against the form its declared source sets.
-/// Arms are ordered by precedence: the byte bound both sources share, then
-/// the declared source's own form.
+/// Classifies one model value against the form its embedding kind sets.
+/// Arms are ordered by precedence: the byte bound every kind shares, then
+/// `refused_form`, the kind's own rule.
 fn model_violation(
     field: &'static str,
-    source: SemanticSource,
     value: &str,
-    bytes_max: usize,
+    refused_form: fn(&str) -> bool,
 ) -> Option<ConfigurationViolation> {
-    let refused = match (source, value.as_bytes()) {
-        (_, []) => true,
-        (_, bytes) if bytes.len() > bytes_max => true,
-        (SemanticSource::Hf, _) => repository_refused(value),
-        (SemanticSource::Directory, _) => path_pattern_violation(value).is_some(),
+    let refused = match value.as_bytes() {
+        [] => true,
+        bytes if bytes.len() > EMBEDDING_MODEL_BYTES_MAX => true,
+        _ => refused_form(value),
     };
-    refused.then(|| ConfigurationViolation::SemanticModelInvalid {
+    refused.then(|| ConfigurationViolation::EmbeddingModelInvalid {
         field,
         value: value.to_owned(),
     })
+}
+
+/// Whether `value` breaks the workspace-relative directory form a
+/// `directory` embedding names: the same path rule every configured pattern
+/// keeps.
+fn directory_refused(value: &str) -> bool {
+    path_pattern_violation(value).is_some()
 }
 
 /// Whether `value` breaks the Hugging Face repository form: an owner and a
@@ -923,18 +927,10 @@ fn is_repository_word(word: &str) -> bool {
         })
 }
 
-/// The `[search.lexical]` table: what the lexical ranking contributes to a
-/// fused score, and how many units the lexical index holds.
+/// The `[search.lexical]` table: how many units the lexical index holds.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LexicalSearchConfiguration {
-    /// The lexical ranking's share of a fused score, 0.0 to 1.0. It and
-    /// `[search.semantic].weight` must sum to 1: a fused score is the weighted
-    /// average of the two rankings, and a pair summing to anything else scales
-    /// every score rather than trading one ranking against the other.
-    #[schemars(range(min = 0.0, max = 1.0))]
-    #[serde(default = "default_lexical_weight")]
-    pub weight: f64,
     /// Most units the lexical index holds: one per indexed file, text chunk,
     /// and declaration, 1000 to 50000000. A workspace past it refuses its
     /// rebuild naming this key.
@@ -946,7 +942,6 @@ pub struct LexicalSearchConfiguration {
 impl Default for LexicalSearchConfiguration {
     fn default() -> Self {
         Self {
-            weight: LEXICAL_WEIGHT_DEFAULT,
             units_max: LEXICAL_UNITS_MAX_DEFAULT,
         }
     }
@@ -964,243 +959,544 @@ impl LexicalSearchConfiguration {
     }
 }
 
-/// Where the semantic ranking's model weights come from.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SemanticSource {
-    /// Weights come from a Hugging Face repository, cached where every
-    /// other Hugging Face client on the machine caches them.
-    Hf,
-    /// Weights are a directory the workspace already holds. Nothing is
-    /// downloaded.
-    Directory,
+/// The `[search.ranking]` table: what each ranking input contributes to a
+/// fused score, and how sharply a top rank counts.
+///
+/// The three weights need not sum to 1. The executor normalizes the weights
+/// of the inputs that answered, so an unavailable vector ranking does not
+/// rescale what identifier matching and the lexical ranking returned.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RankingConfiguration {
+    /// The identifier ranking's share of a fused score, 0.0 to 1.0.
+    /// Identifier matching ranks a query against indexed declaration and
+    /// qualified names.
+    #[schemars(range(min = 0.0, max = 1.0))]
+    #[serde(default = "default_identifier_weight")]
+    pub identifier_weight: f64,
+    /// The lexical ranking's share of a fused score, 0.0 to 1.0. The lexical
+    /// ranking is the `SQLite` full-text index over names, signatures,
+    /// attached documentation, declaration source, and selected text files.
+    #[schemars(range(min = 0.0, max = 1.0))]
+    #[serde(default = "default_lexical_weight")]
+    pub lexical_weight: f64,
+    /// The vector ranking's share of a fused score, 0.0 to 1.0. The vector
+    /// ranking answers a query that shares no word with the code it should
+    /// reach.
+    #[schemars(range(min = 0.0, max = 1.0))]
+    #[serde(default = "default_vector_weight")]
+    pub vector_weight: f64,
+    /// The reciprocal-rank fusion constant, 1 to 1000. A result scores as the
+    /// weighted sum of `1 / (k + rank)` over the rankings that returned it, so
+    /// a larger value flattens the contribution curve and lets agreement
+    /// between the rankings outweigh one ranking's top position.
+    #[schemars(range(min = 1, max = 1000))]
+    #[serde(default = "default_search_fusion_k")]
+    pub fusion_k: u64,
 }
 
-/// The `[search.semantic]` table: the embedding model that ranks a query
-/// against code sharing no word with it, and the bounds its preparation runs
-/// under.
+impl Default for RankingConfiguration {
+    fn default() -> Self {
+        Self {
+            identifier_weight: IDENTIFIER_WEIGHT_DEFAULT,
+            lexical_weight: LEXICAL_WEIGHT_DEFAULT,
+            vector_weight: VECTOR_WEIGHT_DEFAULT,
+            fusion_k: SEARCH_FUSION_K_DEFAULT,
+        }
+    }
+}
+
+impl RankingConfiguration {
+    /// The weight rule, then this table's numeric bounds, in key order.
+    fn violation(&self) -> Option<ConfigurationViolation> {
+        search_weights_violation(
+            self.identifier_weight,
+            self.lexical_weight,
+            self.vector_weight,
+        )
+        .or_else(|| {
+            first_out_of_range([(
+                "search.ranking.fusion_k",
+                self.fusion_k,
+                SEARCH_FUSION_K_MIN,
+                SEARCH_FUSION_K_MAX,
+            )])
+        })
+    }
+}
+
+/// The `[search.vector.embedding]` table: which embedding model runs, and
+/// the bounds its execution keeps. `kind` selects the arm, and each arm
+/// carries only the keys its execution reads.
 ///
-/// Preparation runs behind the answers. A search issued before the vectors are
-/// in is answered lexically and carries a warning naming what is still
+/// A `directory` model downloads nothing, so it carries no download keys. An
+/// `openai_compatible` model sends declaration text while vectors are built
+/// and query text while a search runs; `api_key_env` names the environment
+/// variable holding the credential and never carries the credential itself.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[schemars(transform = crate::schema::declare_embedding_ranges)]
+pub enum EmbeddingConfiguration {
+    /// Weights come from a Hugging Face repository, cached where every other
+    /// Hugging Face client on the machine caches them.
+    Hf {
+        /// A repository identifier such as `minishlab/potion-retrieval-32M`,
+        /// optionally carrying a revision after `@`. Vectors are stored per
+        /// model, so changing the value embeds the workspace again.
+        ///
+        /// The model's own `config.json` decides how it is read. A
+        /// `model_type` of `model2vec` is a static model, which embeds a
+        /// declaration by averaging one row per token; anything else is read
+        /// as a BERT checkpoint, which runs a forward pass per batch and
+        /// costs minutes rather than seconds over a whole workspace.
+        #[schemars(length(min = 1, max = 128))]
+        #[serde(default = "default_embedding_model")]
+        model: String,
+        /// Wall-clock budget one model download has, 10s to 1h.
+        #[serde(default = "default_embedding_download_timeout")]
+        download_timeout: Duration,
+        /// Attempts one model download makes before vector ranking degrades
+        /// to lexical for the life of the server, 1 to 10.
+        #[schemars(range(min = 1, max = 10))]
+        #[serde(default = "default_embedding_download_attempts")]
+        download_attempts: u64,
+        /// Inputs one embedding pass hands the encoder at once, 1 to 256.
+        /// Attention memory grows with the square of `max_tokens`, so a
+        /// raised token window wants a lowered batch.
+        #[schemars(range(min = 1, max = 256))]
+        #[serde(default = "default_embedding_batch_inputs")]
+        batch_inputs: u64,
+        /// Tokens the encoder reads from one input, 32 to 512. What follows
+        /// them is truncated.
+        #[schemars(range(min = 32, max = 512))]
+        #[serde(default = "default_embedding_max_tokens")]
+        max_tokens: u64,
+    },
+    /// Weights are a directory the workspace already holds. Nothing is
+    /// downloaded.
+    Directory {
+        /// A workspace-relative directory holding the model files.
+        #[schemars(length(min = 1, max = 128))]
+        #[serde(default = "default_directory_embedding_model")]
+        model: String,
+        /// Inputs one embedding pass hands the encoder at once, 1 to 256.
+        #[schemars(range(min = 1, max = 256))]
+        #[serde(default = "default_embedding_batch_inputs")]
+        batch_inputs: u64,
+        /// Tokens the encoder reads from one input, 32 to 512. What follows
+        /// them is truncated.
+        #[schemars(range(min = 32, max = 512))]
+        #[serde(default = "default_embedding_max_tokens")]
+        max_tokens: u64,
+    },
+    /// Vectors come from a service implementing the `OpenAI` embedding
+    /// request and response shape at `/embeddings`.
+    OpenaiCompatible {
+        /// The base URL the request path is appended to. It uses `https`;
+        /// `http` is accepted only when the host is a loopback address.
+        #[schemars(length(min = 1, max = 512))]
+        #[serde(default = "default_embedding_endpoint")]
+        endpoint: String,
+        /// The model the service exposes, such as `text-embedding-3-small`.
+        #[schemars(length(min = 1, max = 128))]
+        #[serde(default = "default_remote_embedding_model")]
+        model: String,
+        /// A deployment identifier the operator states, such as a dated
+        /// release. It participates in vector invalidation, so an endpoint
+        /// serving new weights under one model name gets a new value here.
+        #[schemars(length(min = 1, max = 128))]
+        #[serde(default = "default_embedding_revision")]
+        revision: String,
+        /// Coordinates one vector carries, 1 to 16384.
+        #[schemars(range(min = 1, max = 16_384))]
+        #[serde(default = "default_embedding_dimensions")]
+        dimensions: u64,
+        /// The environment variable holding the credential. The value names
+        /// the variable; it never carries the credential.
+        #[schemars(length(min = 1, max = 128))]
+        #[serde(default = "default_embedding_api_key_env")]
+        api_key_env: String,
+        /// Wall-clock budget one embedding request has, 1s to 5m.
+        #[serde(default = "default_embedding_request_timeout")]
+        request_timeout: Duration,
+        /// Attempts one embedding request makes, 1 to 10. Retries spend the
+        /// same request timeout.
+        #[schemars(range(min = 1, max = 10))]
+        #[serde(default = "default_embedding_attempts")]
+        attempts: u64,
+        /// Inputs one embedding request carries, 1 to 2048.
+        #[schemars(range(min = 1, max = 2_048))]
+        #[serde(default = "default_remote_embedding_batch_inputs")]
+        batch_inputs: u64,
+        /// Embedding requests running at once, 1 to 32.
+        #[schemars(range(min = 1, max = 32))]
+        #[serde(default = "default_embedding_max_in_flight")]
+        max_in_flight: u64,
+    },
+}
+
+impl Default for EmbeddingConfiguration {
+    fn default() -> Self {
+        Self::Hf {
+            model: default_embedding_model(),
+            download_timeout: default_embedding_download_timeout(),
+            download_attempts: EMBEDDING_DOWNLOAD_ATTEMPTS_DEFAULT,
+            batch_inputs: EMBEDDING_BATCH_INPUTS_DEFAULT,
+            max_tokens: EMBEDDING_MAX_TOKENS_DEFAULT,
+        }
+    }
+}
+
+impl EmbeddingConfiguration {
+    /// The selected arm's own rules, in key order: the model identifier form,
+    /// then the text keys, then the numeric bounds.
+    fn violation(&self) -> Option<ConfigurationViolation> {
+        match self {
+            Self::Hf {
+                model,
+                download_timeout,
+                download_attempts,
+                batch_inputs,
+                max_tokens,
+            } => hf_violation(
+                model,
+                download_timeout.milliseconds(),
+                *download_attempts,
+                *batch_inputs,
+                *max_tokens,
+            ),
+            Self::Directory {
+                model,
+                batch_inputs,
+                max_tokens,
+            } => directory_violation(model, *batch_inputs, *max_tokens),
+            Self::OpenaiCompatible {
+                endpoint,
+                model,
+                revision,
+                dimensions,
+                api_key_env,
+                request_timeout,
+                attempts,
+                batch_inputs,
+                max_in_flight,
+            } => endpoint_violation(endpoint)
+                .or_else(|| model_violation(EMBEDDING_MODEL_FIELD, model, remote_model_refused))
+                .or_else(|| identifier_violation("search.vector.embedding.revision", revision))
+                .or_else(|| {
+                    identifier_violation("search.vector.embedding.api_key_env", api_key_env)
+                })
+                .or_else(|| {
+                    first_out_of_range([
+                        (
+                            "search.vector.embedding.dimensions",
+                            *dimensions,
+                            EMBEDDING_DIMENSIONS_MIN,
+                            EMBEDDING_DIMENSIONS_MAX,
+                        ),
+                        (
+                            "search.vector.embedding.request_timeout",
+                            request_timeout.milliseconds(),
+                            EMBEDDING_REQUEST_TIMEOUT_MS_MIN,
+                            EMBEDDING_REQUEST_TIMEOUT_MS_MAX,
+                        ),
+                        (
+                            "search.vector.embedding.attempts",
+                            *attempts,
+                            EMBEDDING_ATTEMPTS_MIN,
+                            EMBEDDING_ATTEMPTS_MAX,
+                        ),
+                        (
+                            EMBEDDING_BATCH_INPUTS_FIELD,
+                            *batch_inputs,
+                            REMOTE_EMBEDDING_BATCH_INPUTS_MIN,
+                            REMOTE_EMBEDDING_BATCH_INPUTS_MAX,
+                        ),
+                        (
+                            "search.vector.embedding.max_in_flight",
+                            *max_in_flight,
+                            EMBEDDING_MAX_IN_FLIGHT_MIN,
+                            EMBEDDING_MAX_IN_FLIGHT_MAX,
+                        ),
+                    ])
+                }),
+        }
+    }
+}
+
+/// The `hf` arm's rules, in key order.
+fn hf_violation(
+    model: &str,
+    download_timeout_ms: u64,
+    download_attempts: u64,
+    batch_inputs: u64,
+    max_tokens: u64,
+) -> Option<ConfigurationViolation> {
+    model_violation(EMBEDDING_MODEL_FIELD, model, repository_refused).or_else(|| {
+        first_out_of_range([
+            (
+                "search.vector.embedding.download_timeout",
+                download_timeout_ms,
+                EMBEDDING_DOWNLOAD_TIMEOUT_MS_MIN,
+                EMBEDDING_DOWNLOAD_TIMEOUT_MS_MAX,
+            ),
+            (
+                "search.vector.embedding.download_attempts",
+                download_attempts,
+                EMBEDDING_DOWNLOAD_ATTEMPTS_MIN,
+                EMBEDDING_DOWNLOAD_ATTEMPTS_MAX,
+            ),
+            (
+                EMBEDDING_BATCH_INPUTS_FIELD,
+                batch_inputs,
+                EMBEDDING_BATCH_INPUTS_MIN,
+                EMBEDDING_BATCH_INPUTS_MAX,
+            ),
+            (
+                EMBEDDING_MAX_TOKENS_FIELD,
+                max_tokens,
+                EMBEDDING_MAX_TOKENS_MIN,
+                EMBEDDING_MAX_TOKENS_MAX,
+            ),
+        ])
+    })
+}
+
+/// The `directory` arm's rules, in key order.
+fn directory_violation(
+    model: &str,
+    batch_inputs: u64,
+    max_tokens: u64,
+) -> Option<ConfigurationViolation> {
+    model_violation(EMBEDDING_MODEL_FIELD, model, directory_refused).or_else(|| {
+        first_out_of_range([
+            (
+                EMBEDDING_BATCH_INPUTS_FIELD,
+                batch_inputs,
+                EMBEDDING_BATCH_INPUTS_MIN,
+                EMBEDDING_BATCH_INPUTS_MAX,
+            ),
+            (
+                EMBEDDING_MAX_TOKENS_FIELD,
+                max_tokens,
+                EMBEDDING_MAX_TOKENS_MIN,
+                EMBEDDING_MAX_TOKENS_MAX,
+            ),
+        ])
+    })
+}
+
+/// The `[search.vector]` table: the vector ranking that reaches code sharing
+/// no word with a query, and the bounds its preparation runs under.
+///
+/// Preparation runs behind the answers. A search issued before the vectors
+/// are in is answered lexically and carries a warning naming what is still
 /// missing.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
-#[schemars(transform = crate::schema::declare_semantic_ranges)]
-pub struct SemanticSearchConfiguration {
-    /// Whether semantic ranking is off. Set it when the workspace must not
+pub struct VectorSearchConfiguration {
+    /// Whether vector ranking is off. Set it when the workspace must not
     /// fetch model weights: search then answers lexically alone and raises no
     /// preparation warning.
     pub disabled: bool,
-    /// The semantic ranking's share of a fused score, 0.0 to 1.0. It and
-    /// `[search.lexical].weight` must sum to 1.
-    #[schemars(range(min = 0.0, max = 1.0))]
-    #[serde(default = "default_semantic_weight")]
-    pub weight: f64,
-    /// Where the weights come from, which decides how `model` reads.
-    #[serde(default = "default_semantic_source")]
-    pub source: SemanticSource,
-    /// Which weights: under `hf` a repository identifier such as
-    /// `minishlab/potion-retrieval-32M`, optionally carrying a revision after
-    /// `@`; under `directory` a workspace-relative directory holding them.
-    /// Vectors are stored per model, so changing the value embeds the
-    /// workspace again.
-    ///
-    /// The model's own `config.json` decides how it is read. A `model_type` of
-    /// `model2vec` is a static model, which embeds a declaration by averaging
-    /// one row per token; anything else is read as a BERT checkpoint, which
-    /// runs a forward pass per batch and costs minutes rather than seconds
-    /// over a whole workspace.
-    #[schemars(length(min = 1, max = 128))]
-    #[serde(default = "default_semantic_model")]
-    pub model: String,
-    /// Wall-clock budget one model download has, 10s to 1h.
-    #[serde(default = "default_semantic_download_timeout")]
-    pub download_timeout: Duration,
-    /// Attempts one model download makes before semantic ranking degrades to
-    /// lexical for the life of the server, 1 to 10.
-    #[schemars(range(min = 1, max = 10))]
-    #[serde(default = "default_semantic_download_attempts")]
-    pub download_attempts: u64,
-    /// Declarations one embedding pass hands the encoder at once, 1 to 256.
-    /// Attention memory grows with the square of `max_tokens`, so a raised
-    /// token window wants a lowered batch.
-    #[schemars(range(min = 1, max = 256))]
-    #[serde(default = "default_semantic_batch_declarations")]
-    pub batch_declarations: u64,
-    /// Tokens the encoder reads from one declaration, 32 to 512. What follows
-    /// them is truncated.
-    #[schemars(range(min = 32, max = 512))]
-    #[serde(default = "default_semantic_max_tokens")]
-    pub max_tokens: u64,
-    /// Declarations the semantic ranking returns before the two rankings are
+    /// Declarations the vector ranking returns before the rankings are
     /// fused, 1 to 1000.
     #[schemars(range(min = 1, max = 1000))]
-    #[serde(default = "default_semantic_candidates")]
+    #[serde(default = "default_vector_candidates")]
     pub candidates: u64,
-    /// Declarations one file may contribute to the semantic ranking before
+    /// Declarations one file may contribute to the vector ranking before
     /// the rest of its declarations are dropped, 1 to 64. Without the bound
     /// one file whose declarations all rank well fills `candidates` on its
     /// own, and no other file reaches the candidate list however well it
     /// would have ranked.
     #[schemars(range(min = 1, max = 64))]
-    #[serde(default = "default_semantic_candidates_per_file")]
+    #[serde(default = "default_vector_candidates_per_file")]
     pub candidates_per_file: u64,
     /// Vectors the workspace may hold, 1000 to 1000000. Embedding stops at the
     /// bound and the search warning says so; each vector costs the model's
     /// dimension in single-precision floats.
     #[schemars(range(min = 1_000, max = 1_000_000))]
-    #[serde(default = "default_semantic_max_vectors")]
+    #[serde(default = "default_vector_max_vectors")]
     pub max_vectors: u64,
+    /// Which embedding model builds the vectors, and the bounds its
+    /// execution keeps.
+    pub embedding: EmbeddingConfiguration,
 }
 
-impl Default for SemanticSearchConfiguration {
+impl Default for VectorSearchConfiguration {
     fn default() -> Self {
         Self {
             disabled: false,
-            weight: SEMANTIC_WEIGHT_DEFAULT,
-            source: SEMANTIC_SOURCE_DEFAULT,
-            model: default_semantic_model(),
-            download_timeout: default_semantic_download_timeout(),
-            download_attempts: SEMANTIC_DOWNLOAD_ATTEMPTS_DEFAULT,
-            batch_declarations: SEMANTIC_BATCH_DECLARATIONS_DEFAULT,
-            max_tokens: SEMANTIC_MAX_TOKENS_DEFAULT,
-            candidates: SEMANTIC_CANDIDATES_DEFAULT,
-            candidates_per_file: SEMANTIC_CANDIDATES_PER_FILE_DEFAULT,
-            max_vectors: SEMANTIC_MAX_VECTORS_DEFAULT,
+            candidates: VECTOR_CANDIDATES_DEFAULT,
+            candidates_per_file: VECTOR_CANDIDATES_PER_FILE_DEFAULT,
+            max_vectors: VECTOR_MAX_VECTORS_DEFAULT,
+            embedding: EmbeddingConfiguration::default(),
         }
     }
 }
 
-impl SemanticSearchConfiguration {
-    /// The model identifier rule, then this table's numeric bounds, in key
-    /// order.
+impl VectorSearchConfiguration {
+    /// This table's numeric bounds in key order, then the
+    /// `[search.vector.embedding]` table's own rules.
     fn violation(&self) -> Option<ConfigurationViolation> {
-        model_violation(
-            "search.semantic.model",
-            self.source,
-            &self.model,
-            SEMANTIC_MODEL_BYTES_MAX,
-        )
-        .or_else(|| {
-            first_out_of_range([
-                (
-                    "search.semantic.download_timeout",
-                    self.download_timeout.milliseconds(),
-                    SEMANTIC_DOWNLOAD_TIMEOUT_MS_MIN,
-                    SEMANTIC_DOWNLOAD_TIMEOUT_MS_MAX,
-                ),
-                (
-                    "search.semantic.download_attempts",
-                    self.download_attempts,
-                    SEMANTIC_DOWNLOAD_ATTEMPTS_MIN,
-                    SEMANTIC_DOWNLOAD_ATTEMPTS_MAX,
-                ),
-                (
-                    "search.semantic.batch_declarations",
-                    self.batch_declarations,
-                    SEMANTIC_BATCH_DECLARATIONS_MIN,
-                    SEMANTIC_BATCH_DECLARATIONS_MAX,
-                ),
-                (
-                    "search.semantic.max_tokens",
-                    self.max_tokens,
-                    SEMANTIC_MAX_TOKENS_MIN,
-                    SEMANTIC_MAX_TOKENS_MAX,
-                ),
-                (
-                    "search.semantic.candidates",
-                    self.candidates,
-                    SEMANTIC_CANDIDATES_MIN,
-                    SEMANTIC_CANDIDATES_MAX,
-                ),
-                (
-                    "search.semantic.candidates_per_file",
-                    self.candidates_per_file,
-                    SEMANTIC_CANDIDATES_PER_FILE_MIN,
-                    SEMANTIC_CANDIDATES_PER_FILE_MAX,
-                ),
-                (
-                    "search.semantic.max_vectors",
-                    self.max_vectors,
-                    SEMANTIC_MAX_VECTORS_MIN,
-                    SEMANTIC_MAX_VECTORS_MAX,
-                ),
-            ])
-        })
+        first_out_of_range([
+            (
+                "search.vector.candidates",
+                self.candidates,
+                VECTOR_CANDIDATES_MIN,
+                VECTOR_CANDIDATES_MAX,
+            ),
+            (
+                "search.vector.candidates_per_file",
+                self.candidates_per_file,
+                VECTOR_CANDIDATES_PER_FILE_MIN,
+                VECTOR_CANDIDATES_PER_FILE_MAX,
+            ),
+            (
+                "search.vector.max_vectors",
+                self.max_vectors,
+                VECTOR_MAX_VECTORS_MIN,
+                VECTOR_MAX_VECTORS_MAX,
+            ),
+        ])
+        .or_else(|| self.embedding.violation())
     }
 }
 
-/// `search.lexical.weight` when the key is absent. Code's literal signal
-/// carries the larger share: a caller quoting a real name is the common case,
-/// and the lexical ranking is the stronger side of exactly that.
-pub const LEXICAL_WEIGHT_DEFAULT: f64 = 0.7;
-/// `search.semantic.weight` when the key is absent.
-pub const SEMANTIC_WEIGHT_DEFAULT: f64 = 0.3;
-/// How far the two ranking weights may sum from 1 and still be accepted.
-pub const SEARCH_WEIGHT_SUM_TOLERANCE: f64 = 1e-9;
-/// `search.semantic.source` when the key is absent: the default model is a
-/// Hugging Face repository.
-pub const SEMANTIC_SOURCE_DEFAULT: SemanticSource = SemanticSource::Hf;
-/// `search.semantic.model` when the key is absent: 32M parameters, 512
-/// dimensions, MIT, and a static model that carries no transformer at all.
-///
-/// A workspace is embedded once before its first search can rank
-/// semantically, so what the default costs is the wait a new workspace pays.
-/// A 12-layer encoder spends a forward pass on every declaration and takes
-/// minutes over a workspace of this size on a laptop CPU; this model gathers
-/// one row per token and averages them, which is the same answer shape for
-/// arithmetic a machine finishes in seconds. It ranks less sharply than a
-/// transformer, and the lexical tier carries the larger share of a fused
-/// score anyway.
-pub const SEMANTIC_MODEL_DEFAULT: &str = "minishlab/potion-retrieval-32M";
-/// Milliseconds `search.semantic.download_timeout` may hold, at least.
-pub const SEMANTIC_DOWNLOAD_TIMEOUT_MS_MIN: u64 = 10_000;
-/// Milliseconds `search.semantic.download_timeout` may hold, at most: one hour.
-pub const SEMANTIC_DOWNLOAD_TIMEOUT_MS_MAX: u64 = 3_600_000;
-/// Milliseconds `search.semantic.download_timeout` holds when the key is
-/// absent: five minutes.
-const SEMANTIC_DOWNLOAD_TIMEOUT_MS_DEFAULT: u64 = 300_000;
-/// `search.semantic.download_attempts` accepted, at least.
-pub const SEMANTIC_DOWNLOAD_ATTEMPTS_MIN: u64 = 1;
-/// `search.semantic.download_attempts` accepted, at most.
-pub const SEMANTIC_DOWNLOAD_ATTEMPTS_MAX: u64 = 10;
-/// `search.semantic.download_attempts` when the key is absent.
-const SEMANTIC_DOWNLOAD_ATTEMPTS_DEFAULT: u64 = 3;
-/// `search.semantic.batch_declarations` accepted, at least.
-pub const SEMANTIC_BATCH_DECLARATIONS_MIN: u64 = 1;
-/// `search.semantic.batch_declarations` accepted, at most.
-pub const SEMANTIC_BATCH_DECLARATIONS_MAX: u64 = 256;
-/// `search.semantic.batch_declarations` when the key is absent.
-const SEMANTIC_BATCH_DECLARATIONS_DEFAULT: u64 = 32;
-/// `search.semantic.max_tokens` accepted, at least.
-pub const SEMANTIC_MAX_TOKENS_MIN: u64 = 32;
-/// `search.semantic.max_tokens` accepted, at most.
-pub const SEMANTIC_MAX_TOKENS_MAX: u64 = 512;
-/// `search.semantic.max_tokens` when the key is absent: enough for a
-/// signature, a doc comment, and the head of a body.
-const SEMANTIC_MAX_TOKENS_DEFAULT: u64 = 256;
-/// `search.semantic.candidates` accepted, at least.
-pub const SEMANTIC_CANDIDATES_MIN: u64 = 1;
-/// `search.semantic.candidates` accepted, at most.
-pub const SEMANTIC_CANDIDATES_MAX: u64 = 1_000;
-/// `search.semantic.candidates` when the key is absent.
-const SEMANTIC_CANDIDATES_DEFAULT: u64 = 200;
-/// `search.semantic.candidates_per_file` accepted, at least.
-pub const SEMANTIC_CANDIDATES_PER_FILE_MIN: u64 = 1;
-/// `search.semantic.candidates_per_file` accepted, at most.
-pub const SEMANTIC_CANDIDATES_PER_FILE_MAX: u64 = 64;
-/// `search.semantic.candidates_per_file` when the key is absent.
-const SEMANTIC_CANDIDATES_PER_FILE_DEFAULT: u64 = 3;
-/// `search.semantic.max_vectors` accepted, at least.
-pub const SEMANTIC_MAX_VECTORS_MIN: u64 = 1_000;
-/// `search.semantic.max_vectors` accepted, at most.
-pub const SEMANTIC_MAX_VECTORS_MAX: u64 = 1_000_000;
-/// `search.semantic.max_vectors` when the key is absent.
-const SEMANTIC_MAX_VECTORS_DEFAULT: u64 = 200_000;
+/// The key path every `[search.vector.embedding]` arm spells its model
+/// under.
+const EMBEDDING_MODEL_FIELD: &str = "search.vector.embedding.model";
+/// The key path every `[search.vector.embedding]` arm spells its batch bound
+/// under.
+const EMBEDDING_BATCH_INPUTS_FIELD: &str = "search.vector.embedding.batch_inputs";
+/// The key path the local `[search.vector.embedding]` arms spell their token
+/// window under.
+const EMBEDDING_MAX_TOKENS_FIELD: &str = "search.vector.embedding.max_tokens";
 
-fn default_lexical_weight() -> f64 {
-    LEXICAL_WEIGHT_DEFAULT
-}
+/// `search.ranking.identifier_weight` when the key is absent. Identifier
+/// matching and the lexical ranking carry equal shares: a caller quoting a
+/// real name is the common case, and both inputs answer it.
+pub const IDENTIFIER_WEIGHT_DEFAULT: f64 = 0.35;
+/// `search.ranking.lexical_weight` when the key is absent.
+pub const LEXICAL_WEIGHT_DEFAULT: f64 = 0.35;
+/// `search.ranking.vector_weight` when the key is absent: the smaller share,
+/// because the vector ranking answers the queries the other two miss rather
+/// than the queries they already answer.
+pub const VECTOR_WEIGHT_DEFAULT: f64 = 0.30;
+/// The `[search.vector.embedding]` model value when the key is absent: 32M
+/// parameters, 512 dimensions, and a static model, so a workspace embeds in
+/// seconds rather than minutes.
+pub const EMBEDDING_MODEL_DEFAULT: &str = "minishlab/potion-retrieval-32M";
+/// The `[search.vector.embedding]` model value a `directory` table holds when
+/// the key is absent: the path `rift model download` writes the default model
+/// to, so the two arms name one set of files.
+pub const DIRECTORY_EMBEDDING_MODEL_DEFAULT: &str = ".rift/models/potion-retrieval-32M";
+/// Milliseconds `search.vector.embedding.download_timeout` may hold, at
+/// least.
+pub const EMBEDDING_DOWNLOAD_TIMEOUT_MS_MIN: u64 = 10_000;
+/// Milliseconds `search.vector.embedding.download_timeout` may hold, at
+/// most: one hour.
+pub const EMBEDDING_DOWNLOAD_TIMEOUT_MS_MAX: u64 = 3_600_000;
+/// Milliseconds `search.vector.embedding.download_timeout` holds when the
+/// key is absent.
+const EMBEDDING_DOWNLOAD_TIMEOUT_MS_DEFAULT: u64 = 300_000;
+/// `search.vector.embedding.download_attempts` accepted, at least.
+pub const EMBEDDING_DOWNLOAD_ATTEMPTS_MIN: u64 = 1;
+/// `search.vector.embedding.download_attempts` accepted, at most.
+pub const EMBEDDING_DOWNLOAD_ATTEMPTS_MAX: u64 = 10;
+/// `search.vector.embedding.download_attempts` when the key is absent.
+const EMBEDDING_DOWNLOAD_ATTEMPTS_DEFAULT: u64 = 3;
+/// `search.vector.embedding.batch_inputs` accepted under a local model, at
+/// least.
+pub const EMBEDDING_BATCH_INPUTS_MIN: u64 = 1;
+/// `search.vector.embedding.batch_inputs` accepted under a local model, at
+/// most.
+pub const EMBEDDING_BATCH_INPUTS_MAX: u64 = 256;
+/// `search.vector.embedding.batch_inputs` under a local model when the key
+/// is absent.
+const EMBEDDING_BATCH_INPUTS_DEFAULT: u64 = 32;
+/// `search.vector.embedding.max_tokens` accepted, at least.
+pub const EMBEDDING_MAX_TOKENS_MIN: u64 = 32;
+/// `search.vector.embedding.max_tokens` accepted, at most.
+pub const EMBEDDING_MAX_TOKENS_MAX: u64 = 512;
+/// `search.vector.embedding.max_tokens` when the key is absent: enough for a
+/// declaration's signature and the documentation attached to it.
+const EMBEDDING_MAX_TOKENS_DEFAULT: u64 = 256;
+/// `search.vector.embedding.endpoint` when the key is absent: the `OpenAI`
+/// base URL.
+pub const EMBEDDING_ENDPOINT_DEFAULT: &str = "https://api.openai.com/v1";
+/// The `search.vector.embedding.model` value under `openai_compatible` when
+/// the key is absent.
+pub const REMOTE_EMBEDDING_MODEL_DEFAULT: &str = "text-embedding-3-small";
+/// `search.vector.embedding.revision` when the key is absent: the release
+/// date the default model was published under.
+pub const EMBEDDING_REVISION_DEFAULT: &str = "2024-01-25";
+/// `search.vector.embedding.dimensions` accepted, at least.
+pub const EMBEDDING_DIMENSIONS_MIN: u64 = 1;
+/// `search.vector.embedding.dimensions` accepted, at most.
+pub const EMBEDDING_DIMENSIONS_MAX: u64 = 16_384;
+/// `search.vector.embedding.dimensions` when the key is absent: the default
+/// model's own width.
+const EMBEDDING_DIMENSIONS_DEFAULT: u64 = 1_536;
+/// `search.vector.embedding.api_key_env` when the key is absent.
+pub const EMBEDDING_API_KEY_ENV_DEFAULT: &str = "OPENAI_API_KEY";
+/// Milliseconds `search.vector.embedding.request_timeout` may hold, at
+/// least: one second.
+pub const EMBEDDING_REQUEST_TIMEOUT_MS_MIN: u64 = 1_000;
+/// Milliseconds `search.vector.embedding.request_timeout` may hold, at most:
+/// five minutes.
+pub const EMBEDDING_REQUEST_TIMEOUT_MS_MAX: u64 = 300_000;
+/// Milliseconds `search.vector.embedding.request_timeout` holds when the key
+/// is absent.
+const EMBEDDING_REQUEST_TIMEOUT_MS_DEFAULT: u64 = 30_000;
+/// `search.vector.embedding.attempts` accepted, at least.
+pub const EMBEDDING_ATTEMPTS_MIN: u64 = 1;
+/// `search.vector.embedding.attempts` accepted, at most.
+pub const EMBEDDING_ATTEMPTS_MAX: u64 = 10;
+/// `search.vector.embedding.attempts` when the key is absent.
+const EMBEDDING_ATTEMPTS_DEFAULT: u64 = 3;
+/// `search.vector.embedding.batch_inputs` accepted under
+/// `openai_compatible`, at least.
+pub const REMOTE_EMBEDDING_BATCH_INPUTS_MIN: u64 = 1;
+/// `search.vector.embedding.batch_inputs` accepted under
+/// `openai_compatible`, at most.
+pub const REMOTE_EMBEDDING_BATCH_INPUTS_MAX: u64 = 2_048;
+/// `search.vector.embedding.batch_inputs` under `openai_compatible` when the
+/// key is absent.
+const REMOTE_EMBEDDING_BATCH_INPUTS_DEFAULT: u64 = 64;
+/// `search.vector.embedding.max_in_flight` accepted, at least.
+pub const EMBEDDING_MAX_IN_FLIGHT_MIN: u64 = 1;
+/// `search.vector.embedding.max_in_flight` accepted, at most.
+pub const EMBEDDING_MAX_IN_FLIGHT_MAX: u64 = 32;
+/// `search.vector.embedding.max_in_flight` when the key is absent.
+const EMBEDDING_MAX_IN_FLIGHT_DEFAULT: u64 = 4;
+/// Bytes `search.vector.embedding.endpoint` may hold, at most.
+pub const EMBEDDING_ENDPOINT_BYTES_MAX: usize = 512;
+/// Bytes one `[search.vector.embedding]` identifier value - `revision`,
+/// `api_key_env` - may hold, at most.
+pub const EMBEDDING_IDENTIFIER_BYTES_MAX: usize = 128;
+/// The hosts a plain `http` embedding endpoint may name. A credential sent
+/// in clear never leaves the machine under these, and does under any other
+/// host.
+const EMBEDDING_LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
+/// `search.vector.candidates` accepted, at least.
+pub const VECTOR_CANDIDATES_MIN: u64 = 1;
+/// `search.vector.candidates` accepted, at most.
+pub const VECTOR_CANDIDATES_MAX: u64 = 1_000;
+/// `search.vector.candidates` when the key is absent.
+const VECTOR_CANDIDATES_DEFAULT: u64 = 200;
+/// `search.vector.candidates_per_file` accepted, at least.
+pub const VECTOR_CANDIDATES_PER_FILE_MIN: u64 = 1;
+/// `search.vector.candidates_per_file` accepted, at most.
+pub const VECTOR_CANDIDATES_PER_FILE_MAX: u64 = 64;
+/// `search.vector.candidates_per_file` when the key is absent.
+const VECTOR_CANDIDATES_PER_FILE_DEFAULT: u64 = 3;
+/// `search.vector.max_vectors` accepted, at least.
+pub const VECTOR_MAX_VECTORS_MIN: u64 = 1_000;
+/// `search.vector.max_vectors` accepted, at most.
+pub const VECTOR_MAX_VECTORS_MAX: u64 = 1_000_000;
+/// `search.vector.max_vectors` when the key is absent.
+const VECTOR_MAX_VECTORS_DEFAULT: u64 = 200_000;
 
 /// `search.lexical.units_max` accepted, at least.
 pub const LEXICAL_UNITS_MAX_MIN: u64 = 1_000;
@@ -1211,49 +1507,154 @@ pub const LEXICAL_UNITS_MAX_MAX: u64 = 50_000_000;
 /// thousand files fits.
 pub const LEXICAL_UNITS_MAX_DEFAULT: u64 = 1_000_000;
 
+/// Whether `value` breaks the model form an `openai_compatible` endpoint
+/// serves: one nonempty token carrying no path separator and no whitespace.
+fn remote_model_refused(value: &str) -> bool {
+    value.contains('/') || value.chars().any(char::is_whitespace)
+}
+
+/// Classifies one endpoint value: nonempty, within
+/// [`EMBEDDING_ENDPOINT_BYTES_MAX`], and an absolute URL under `https`, or
+/// under `http` when its host is a loopback address.
+fn endpoint_violation(value: &str) -> Option<ConfigurationViolation> {
+    let refused =
+        value.is_empty() || value.len() > EMBEDDING_ENDPOINT_BYTES_MAX || endpoint_refused(value);
+    refused.then(|| ConfigurationViolation::EmbeddingEndpointInvalid {
+        field: "search.vector.embedding.endpoint",
+        value: value.to_owned(),
+    })
+}
+
+/// Whether `value` breaks the endpoint form. The check reads the scheme, then
+/// the authority up to the first `/`, `?`, or `#`, and matches the host that
+/// authority names.
+fn endpoint_refused(value: &str) -> bool {
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return true;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority_host(authority);
+    if host.is_empty() {
+        return true;
+    }
+    let loopback = EMBEDDING_LOOPBACK_HOSTS
+        .iter()
+        .any(|known| host.eq_ignore_ascii_case(known));
+    let accepted =
+        scheme.eq_ignore_ascii_case("https") || (scheme.eq_ignore_ascii_case("http") && loopback);
+    !accepted
+}
+
+/// The host `authority` names: the text after any `user@` prefix, with a
+/// bracketed IPv6 literal unwrapped and any `:port` suffix removed.
+fn authority_host(authority: &str) -> &str {
+    let after_userinfo = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    match after_userinfo.split_once(']') {
+        Some((bracketed, _)) => bracketed.strip_prefix('[').unwrap_or(bracketed),
+        None => after_userinfo.split(':').next().unwrap_or_default(),
+    }
+}
+
+/// Classifies one `[search.vector.embedding]` identifier value: nonempty and
+/// within [`EMBEDDING_IDENTIFIER_BYTES_MAX`].
+fn identifier_violation(field: &'static str, value: &str) -> Option<ConfigurationViolation> {
+    let refused = value.is_empty() || value.len() > EMBEDDING_IDENTIFIER_BYTES_MAX;
+    refused.then(|| ConfigurationViolation::EmbeddingIdentifierInvalid {
+        field,
+        value: value.to_owned(),
+    })
+}
+
+fn default_identifier_weight() -> f64 {
+    IDENTIFIER_WEIGHT_DEFAULT
+}
+
+fn default_lexical_weight() -> f64 {
+    LEXICAL_WEIGHT_DEFAULT
+}
+
+fn default_vector_weight() -> f64 {
+    VECTOR_WEIGHT_DEFAULT
+}
+
 fn default_lexical_units_max() -> u64 {
     LEXICAL_UNITS_MAX_DEFAULT
 }
 
-fn default_semantic_weight() -> f64 {
-    SEMANTIC_WEIGHT_DEFAULT
+fn default_embedding_model() -> String {
+    EMBEDDING_MODEL_DEFAULT.to_owned()
 }
 
-fn default_semantic_source() -> SemanticSource {
-    SEMANTIC_SOURCE_DEFAULT
+fn default_directory_embedding_model() -> String {
+    DIRECTORY_EMBEDDING_MODEL_DEFAULT.to_owned()
 }
 
-fn default_semantic_model() -> String {
-    SEMANTIC_MODEL_DEFAULT.to_owned()
+fn default_embedding_download_timeout() -> Duration {
+    Duration::from_millis(EMBEDDING_DOWNLOAD_TIMEOUT_MS_DEFAULT)
 }
 
-fn default_semantic_download_timeout() -> Duration {
-    Duration::from_millis(SEMANTIC_DOWNLOAD_TIMEOUT_MS_DEFAULT)
+fn default_embedding_download_attempts() -> u64 {
+    EMBEDDING_DOWNLOAD_ATTEMPTS_DEFAULT
 }
 
-fn default_semantic_download_attempts() -> u64 {
-    SEMANTIC_DOWNLOAD_ATTEMPTS_DEFAULT
+fn default_embedding_batch_inputs() -> u64 {
+    EMBEDDING_BATCH_INPUTS_DEFAULT
 }
 
-fn default_semantic_batch_declarations() -> u64 {
-    SEMANTIC_BATCH_DECLARATIONS_DEFAULT
+fn default_embedding_max_tokens() -> u64 {
+    EMBEDDING_MAX_TOKENS_DEFAULT
 }
 
-fn default_semantic_max_tokens() -> u64 {
-    SEMANTIC_MAX_TOKENS_DEFAULT
+fn default_embedding_endpoint() -> String {
+    EMBEDDING_ENDPOINT_DEFAULT.to_owned()
 }
 
-fn default_semantic_candidates() -> u64 {
-    SEMANTIC_CANDIDATES_DEFAULT
+fn default_remote_embedding_model() -> String {
+    REMOTE_EMBEDDING_MODEL_DEFAULT.to_owned()
 }
 
-fn default_semantic_candidates_per_file() -> u64 {
-    SEMANTIC_CANDIDATES_PER_FILE_DEFAULT
+fn default_embedding_revision() -> String {
+    EMBEDDING_REVISION_DEFAULT.to_owned()
 }
 
-fn default_semantic_max_vectors() -> u64 {
-    SEMANTIC_MAX_VECTORS_DEFAULT
+fn default_embedding_dimensions() -> u64 {
+    EMBEDDING_DIMENSIONS_DEFAULT
 }
+
+fn default_embedding_api_key_env() -> String {
+    EMBEDDING_API_KEY_ENV_DEFAULT.to_owned()
+}
+
+fn default_embedding_request_timeout() -> Duration {
+    Duration::from_millis(EMBEDDING_REQUEST_TIMEOUT_MS_DEFAULT)
+}
+
+fn default_embedding_attempts() -> u64 {
+    EMBEDDING_ATTEMPTS_DEFAULT
+}
+
+fn default_remote_embedding_batch_inputs() -> u64 {
+    REMOTE_EMBEDDING_BATCH_INPUTS_DEFAULT
+}
+
+fn default_embedding_max_in_flight() -> u64 {
+    EMBEDDING_MAX_IN_FLIGHT_DEFAULT
+}
+
+fn default_vector_candidates() -> u64 {
+    VECTOR_CANDIDATES_DEFAULT
+}
+
+fn default_vector_candidates_per_file() -> u64 {
+    VECTOR_CANDIDATES_PER_FILE_DEFAULT
+}
+
+fn default_vector_max_vectors() -> u64 {
+    VECTOR_MAX_VECTORS_DEFAULT
+}
+
 /// Bytes one lexical chunk from a `search.text` file may hold, at least.
 pub const TEXT_CHUNK_BYTES_MIN: u64 = 1 << 10;
 /// Bytes one lexical chunk from a `search.text` file may hold, at most.
@@ -1582,22 +1983,41 @@ pub enum ConfigurationViolation {
         /// Later language entry carrying it.
         second: String,
     },
-    /// A `[search.semantic]` identifier is empty, too long, or breaks the form
-    /// its declared source sets: `owner/name` with at most one revision after
-    /// `@` under `hf`, a workspace-relative directory under `directory`.
-    SemanticModelInvalid {
-        /// The key's path in the file, such as `search.semantic.model`.
+    /// A `[search.vector.embedding]` model value is empty, too long, or breaks
+    /// the form its `kind` sets: `owner/name` with at most one revision after
+    /// `@` under `hf`, a workspace-relative directory under `directory`, one
+    /// token carrying no separator under `openai_compatible`.
+    EmbeddingModelInvalid {
+        /// The key's path in the file: `search.vector.embedding.model`.
         field: &'static str,
         /// The rejected value.
         value: String,
     },
-    /// The `[search.lexical]` and `[search.semantic]` weights are not a pair of
-    /// shares: each must lie between 0.0 and 1.0, and the two must sum to 1.
+    /// `search.vector.embedding.endpoint` is empty, too long, or not an
+    /// absolute URL under `https`, or under `http` with a loopback host.
+    EmbeddingEndpointInvalid {
+        /// The key's path in the file: `search.vector.embedding.endpoint`.
+        field: &'static str,
+        /// The rejected value.
+        value: String,
+    },
+    /// A `[search.vector.embedding]` identifier value is empty or too long.
+    EmbeddingIdentifierInvalid {
+        /// The key's path in the file, such as
+        /// `search.vector.embedding.revision`.
+        field: &'static str,
+        /// The rejected value.
+        value: String,
+    },
+    /// The `[search.ranking]` weights are not a usable set: each must lie
+    /// between 0.0 and 1.0, and at least one must be above 0.
     SearchWeightsInvalid {
+        /// The configured identifier weight.
+        identifier: f64,
         /// The configured lexical weight.
         lexical: f64,
-        /// The configured semantic weight.
-        semantic: f64,
+        /// The configured vector weight.
+        vector: f64,
     },
 
     /// A command carries no executable.
@@ -1745,12 +2165,19 @@ impl ConfigurationViolation {
                 ("first", first.clone()),
                 ("second", second.clone()),
             ],
-            Self::SemanticModelInvalid { field, value } => {
+            Self::EmbeddingModelInvalid { field, value }
+            | Self::EmbeddingEndpointInvalid { field, value }
+            | Self::EmbeddingIdentifierInvalid { field, value } => {
                 vec![("field", (*field).to_owned()), ("value", value.clone())]
             }
-            Self::SearchWeightsInvalid { lexical, semantic } => vec![
+            Self::SearchWeightsInvalid {
+                identifier,
+                lexical,
+                vector,
+            } => vec![
+                ("identifier_weight", identifier.to_string()),
                 ("lexical_weight", lexical.to_string()),
-                ("semantic_weight", semantic.to_string()),
+                ("vector_weight", vector.to_string()),
             ],
 
             Self::CommandProgramEmpty { field } => vec![("field", (*field).to_owned())],
@@ -2282,29 +2709,31 @@ mod tests {
         assert_eq!(execution.max_concurrent, 2);
         assert!(configuration.providers.history.enabled);
         assert_eq!(configuration.providers.history.max_revisions, 500);
-        let semantic = &configuration.search.semantic;
+        let vector = &configuration.search.vector;
+        let ranking = &configuration.search.ranking;
         assert!(is_weight(
-            configuration.search.lexical.weight,
-            LEXICAL_WEIGHT_DEFAULT
+            ranking.identifier_weight,
+            IDENTIFIER_WEIGHT_DEFAULT
         ));
-        assert!(is_weight(semantic.weight, SEMANTIC_WEIGHT_DEFAULT));
-        assert!(!semantic.disabled);
-        assert_eq!(semantic.source, SemanticSource::Hf);
-        assert_eq!(semantic.model, SEMANTIC_MODEL_DEFAULT);
-        assert!(is_weight(
-            configuration.search.lexical.weight + semantic.weight,
-            1.0
-        ));
-        assert_eq!(semantic.download_timeout, Duration::from_millis(300_000));
-        assert_eq!(semantic.download_attempts, 3);
-        assert_eq!(semantic.batch_declarations, 32);
-        assert_eq!(semantic.max_tokens, 256);
-        assert_eq!(semantic.candidates, 200);
-        assert_eq!(semantic.candidates_per_file, 3);
-        assert_eq!(semantic.max_vectors, 200_000);
+        assert!(is_weight(ranking.lexical_weight, LEXICAL_WEIGHT_DEFAULT));
+        assert!(is_weight(ranking.vector_weight, VECTOR_WEIGHT_DEFAULT));
+        assert!(!vector.disabled);
+        assert_eq!(
+            vector.embedding,
+            EmbeddingConfiguration::Hf {
+                model: EMBEDDING_MODEL_DEFAULT.to_owned(),
+                download_timeout: Duration::from_millis(300_000),
+                download_attempts: 3,
+                batch_inputs: 32,
+                max_tokens: 256,
+            }
+        );
+        assert_eq!(vector.candidates, 200);
+        assert_eq!(vector.candidates_per_file, 3);
+        assert_eq!(vector.max_vectors, 200_000);
         assert_eq!(configuration.search.pool_slots, 4);
         assert_eq!(configuration.search.lexical.units_max, 1_000_000);
-        assert_eq!(configuration.search.fusion_k, 60);
+        assert_eq!(ranking.fusion_k, 60);
         assert_eq!(
             configuration.search.busy_timeout,
             Duration::from_millis(SEARCH_BUSY_TIMEOUT_MS_DEFAULT)
@@ -2609,22 +3038,55 @@ mod tests {
         ));
     }
 
-    /// The verdict `[search.semantic]` reaches on one model value under one
-    /// declared source.
-    fn semantic_model_verdict(
-        source: SemanticSource,
-        model: &str,
+    /// The verdict `[search.vector.embedding]` reaches on one model value
+    /// under one declared kind.
+    fn embedding_model_verdict(
+        embedding: EmbeddingConfiguration,
     ) -> Result<(), ConfigurationViolation> {
         let mut configuration = WorkspaceConfiguration::default();
-        configuration.search.semantic.source = source;
-        configuration.search.semantic.model = model.to_owned();
+        configuration.search.vector.embedding = embedding;
         configuration.validate()
     }
 
+    /// One `hf` embedding naming `model`, every other key defaulted.
+    fn hf_embedding(model: &str) -> EmbeddingConfiguration {
+        EmbeddingConfiguration::Hf {
+            model: model.to_owned(),
+            download_timeout: Duration::from_millis(EMBEDDING_DOWNLOAD_TIMEOUT_MS_DEFAULT),
+            download_attempts: EMBEDDING_DOWNLOAD_ATTEMPTS_DEFAULT,
+            batch_inputs: EMBEDDING_BATCH_INPUTS_DEFAULT,
+            max_tokens: EMBEDDING_MAX_TOKENS_DEFAULT,
+        }
+    }
+
+    /// One `directory` embedding naming `model`, every other key defaulted.
+    fn directory_embedding(model: &str) -> EmbeddingConfiguration {
+        EmbeddingConfiguration::Directory {
+            model: model.to_owned(),
+            batch_inputs: EMBEDDING_BATCH_INPUTS_DEFAULT,
+            max_tokens: EMBEDDING_MAX_TOKENS_DEFAULT,
+        }
+    }
+
+    /// One `openai_compatible` embedding carrying every default.
+    fn openai_embedding() -> EmbeddingConfiguration {
+        EmbeddingConfiguration::OpenaiCompatible {
+            endpoint: EMBEDDING_ENDPOINT_DEFAULT.to_owned(),
+            model: REMOTE_EMBEDDING_MODEL_DEFAULT.to_owned(),
+            revision: EMBEDDING_REVISION_DEFAULT.to_owned(),
+            dimensions: EMBEDDING_DIMENSIONS_DEFAULT,
+            api_key_env: EMBEDDING_API_KEY_ENV_DEFAULT.to_owned(),
+            request_timeout: Duration::from_millis(EMBEDDING_REQUEST_TIMEOUT_MS_DEFAULT),
+            attempts: EMBEDDING_ATTEMPTS_DEFAULT,
+            batch_inputs: REMOTE_EMBEDDING_BATCH_INPUTS_DEFAULT,
+            max_in_flight: EMBEDDING_MAX_IN_FLIGHT_DEFAULT,
+        }
+    }
+
     /// The refusal every rejected model value must draw.
-    fn semantic_model_refusal(model: &str) -> Result<(), ConfigurationViolation> {
-        Err(ConfigurationViolation::SemanticModelInvalid {
-            field: "search.semantic.model",
+    fn embedding_model_refusal(model: &str) -> Result<(), ConfigurationViolation> {
+        Err(ConfigurationViolation::EmbeddingModelInvalid {
+            field: "search.vector.embedding.model",
             value: model.to_owned(),
         })
     }
@@ -2637,7 +3099,7 @@ mod tests {
             "BAAI/bge-small-en-v1.5@a5beb1e",
         ] {
             assert_eq!(
-                semantic_model_verdict(SemanticSource::Hf, accepted),
+                embedding_model_verdict(hf_embedding(accepted)),
                 Ok(()),
                 "{accepted} must be accepted"
             );
@@ -2656,8 +3118,8 @@ mod tests {
             "spaced out",
         ] {
             assert_eq!(
-                semantic_model_verdict(SemanticSource::Hf, refused),
-                semantic_model_refusal(refused),
+                embedding_model_verdict(hf_embedding(refused)),
+                embedding_model_refusal(refused),
                 "{refused:?} must be refused"
             );
         }
@@ -2666,7 +3128,7 @@ mod tests {
     #[test]
     fn test_directory_model_names_a_workspace_relative_directory() {
         assert_eq!(
-            semantic_model_verdict(SemanticSource::Directory, "vendor/bge-small"),
+            embedding_model_verdict(directory_embedding("vendor/bge-small")),
             Ok(())
         );
         for refused in [
@@ -2676,62 +3138,124 @@ mod tests {
             "vendor/../bge-small",
         ] {
             assert_eq!(
-                semantic_model_verdict(SemanticSource::Directory, refused),
-                semantic_model_refusal(refused),
+                embedding_model_verdict(directory_embedding(refused)),
+                embedding_model_refusal(refused),
                 "{refused:?} must be refused"
             );
         }
     }
 
     #[test]
-    fn test_semantic_model_byte_bound_holds_under_both_sources() {
-        let bound = SEMANTIC_MODEL_BYTES_MAX;
+    fn test_embedding_model_byte_bound_holds_under_every_kind() {
+        let bound = EMBEDDING_MODEL_BYTES_MAX;
         let cases = [
-            (
-                SemanticSource::Hf,
-                format!("{}/{}", "a".repeat(63), "b".repeat(64)),
-            ),
-            (SemanticSource::Directory, "a".repeat(bound)),
+            hf_embedding(&format!("{}/{}", "a".repeat(63), "b".repeat(64))),
+            directory_embedding(&"a".repeat(bound)),
         ];
-        for (source, accepted) in cases {
-            assert_eq!(accepted.len(), bound, "the case must sit on the bound");
+        for accepted in cases {
+            let model = embedding_model(&accepted);
+            assert_eq!(model.len(), bound, "the case must sit on the bound");
+            let refused = format!("{model}a");
             assert_eq!(
-                semantic_model_verdict(source, &accepted),
+                embedding_model_verdict(accepted.clone()),
                 Ok(()),
                 "{bound} bytes must be accepted"
             );
-            let refused = format!("{accepted}a");
             assert_eq!(
-                semantic_model_verdict(source, &refused),
-                semantic_model_refusal(&refused),
+                embedding_model_verdict(with_model(accepted, &refused)),
+                embedding_model_refusal(&refused),
                 "one byte past the bound must be refused"
             );
         }
     }
 
+    /// The model value one embedding names.
+    fn embedding_model(embedding: &EmbeddingConfiguration) -> String {
+        match embedding {
+            EmbeddingConfiguration::Hf { model, .. }
+            | EmbeddingConfiguration::Directory { model, .. }
+            | EmbeddingConfiguration::OpenaiCompatible { model, .. } => model.clone(),
+        }
+    }
+
+    /// The same embedding, naming `replacement` as its model.
+    fn with_model(embedding: EmbeddingConfiguration, replacement: &str) -> EmbeddingConfiguration {
+        match embedding {
+            EmbeddingConfiguration::Hf {
+                download_timeout,
+                download_attempts,
+                batch_inputs,
+                max_tokens,
+                ..
+            } => EmbeddingConfiguration::Hf {
+                model: replacement.to_owned(),
+                download_timeout,
+                download_attempts,
+                batch_inputs,
+                max_tokens,
+            },
+            EmbeddingConfiguration::Directory {
+                batch_inputs,
+                max_tokens,
+                ..
+            } => EmbeddingConfiguration::Directory {
+                model: replacement.to_owned(),
+                batch_inputs,
+                max_tokens,
+            },
+            EmbeddingConfiguration::OpenaiCompatible {
+                endpoint,
+                revision,
+                dimensions,
+                api_key_env,
+                request_timeout,
+                attempts,
+                batch_inputs,
+                max_in_flight,
+                ..
+            } => EmbeddingConfiguration::OpenaiCompatible {
+                endpoint,
+                model: replacement.to_owned(),
+                revision,
+                dimensions,
+                api_key_env,
+                request_timeout,
+                attempts,
+                batch_inputs,
+                max_in_flight,
+            },
+        }
+    }
+
     #[test]
-    fn test_semantic_source_parses_both_declared_values() {
-        for (spelling, declared) in [
-            ("hf", SemanticSource::Hf),
-            ("directory", SemanticSource::Directory),
-        ] {
+    fn test_every_embedding_kind_parses_under_its_tag() {
+        let cases = [
+            (
+                json!({ "kind": "hf", "model": "BAAI/bge-small-en-v1.5" }),
+                hf_embedding("BAAI/bge-small-en-v1.5"),
+            ),
+            (
+                json!({ "kind": "directory", "model": ".rift/models/potion" }),
+                directory_embedding(".rift/models/potion"),
+            ),
+            (json!({ "kind": "openai_compatible" }), openai_embedding()),
+        ];
+        for (wire, declared) in cases {
             let configuration: WorkspaceConfiguration = serde_json::from_value(json!({
-                "search": {
-                    "semantic": { "source": spelling, "model": "vendor/bge-small" }
-                }
+                "search": { "vector": { "embedding": wire } }
             }))
-            .expect("a declared source must parse");
-            assert_eq!(configuration.search.semantic.source, declared);
+            .expect("a declared embedding kind must parse");
+            assert_eq!(configuration.search.vector.embedding, declared);
             assert_eq!(configuration.validate(), Ok(()));
         }
     }
 
     #[test]
-    fn test_semantic_source_outside_the_declared_pair_is_refused() {
+    fn test_an_embedding_kind_outside_the_declared_set_is_refused() {
         let error = serde_json::from_value::<WorkspaceConfiguration>(json!({
-            "search": { "semantic": { "source": "hub" } }
+            "search": { "vector": { "embedding": { "kind": "hub" } } }
         }))
-        .expect_err("a source outside the declared pair must be refused");
+        .expect_err("a kind outside the declared set must be refused");
         assert!(
             error.to_string().contains("unknown variant"),
             "the refusal must name the unknown variant: {error}"
@@ -2739,53 +3263,202 @@ mod tests {
     }
 
     #[test]
-    fn test_omitted_semantic_source_keeps_the_default() {
-        let configuration: WorkspaceConfiguration = serde_json::from_value(json!({
-            "search": { "semantic": { "model": SEMANTIC_MODEL_DEFAULT } }
+    fn test_an_embedding_key_belonging_to_another_kind_is_refused() {
+        let error = serde_json::from_value::<WorkspaceConfiguration>(json!({
+            "search": {
+                "vector": {
+                    "embedding": { "kind": "directory", "download_attempts": 2 }
+                }
+            }
         }))
-        .expect("an omitted source must keep its default");
-        assert_eq!(
-            configuration.search.semantic.source,
-            SEMANTIC_SOURCE_DEFAULT
+        .expect_err("a key from another kind must be refused");
+        assert!(
+            error.to_string().contains("unknown field"),
+            "the refusal must name the unknown field: {error}"
         );
-        assert_eq!(configuration.validate(), Ok(()));
     }
 
     #[test]
-    fn test_search_weights_must_be_a_pair_of_shares() {
+    fn test_the_openai_endpoint_accepts_https_and_loopback_http_alone() {
+        for accepted in [
+            "https://api.openai.com/v1",
+            "https://embeddings.example.com:8443/v1",
+            "http://localhost:8080/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://[::1]:8080/v1",
+        ] {
+            assert_eq!(
+                embedding_model_verdict(with_endpoint(accepted)),
+                Ok(()),
+                "{accepted} must be accepted"
+            );
+        }
+        for refused in [
+            "",
+            "api.openai.com/v1",
+            "ftp://api.openai.com/v1",
+            "http://api.openai.com/v1",
+            "http://localhost.example.com/v1",
+            "https:///v1",
+        ] {
+            assert_eq!(
+                embedding_model_verdict(with_endpoint(refused)),
+                Err(ConfigurationViolation::EmbeddingEndpointInvalid {
+                    field: "search.vector.embedding.endpoint",
+                    value: refused.to_owned(),
+                }),
+                "{refused:?} must be refused"
+            );
+        }
+        let overlong = format!(
+            "https://example.com/{}",
+            "a".repeat(EMBEDDING_ENDPOINT_BYTES_MAX)
+        );
+        assert!(matches!(
+            embedding_model_verdict(with_endpoint(&overlong)),
+            Err(ConfigurationViolation::EmbeddingEndpointInvalid { .. })
+        ));
+    }
+
+    /// One `openai_compatible` embedding naming `endpoint`, every other key
+    /// defaulted.
+    fn with_endpoint(endpoint: &str) -> EmbeddingConfiguration {
+        match openai_embedding() {
+            EmbeddingConfiguration::OpenaiCompatible {
+                model,
+                revision,
+                dimensions,
+                api_key_env,
+                request_timeout,
+                attempts,
+                batch_inputs,
+                max_in_flight,
+                ..
+            } => EmbeddingConfiguration::OpenaiCompatible {
+                endpoint: endpoint.to_owned(),
+                model,
+                revision,
+                dimensions,
+                api_key_env,
+                request_timeout,
+                attempts,
+                batch_inputs,
+                max_in_flight,
+            },
+            other => other,
+        }
+    }
+
+    #[test]
+    fn test_authority_host_drops_userinfo_and_port_and_unwraps_a_bracketed_literal() {
+        let cases = [
+            ("example.com", "example.com"),
+            ("example.com:8443", "example.com"),
+            ("user@example.com", "example.com"),
+            ("user:secret@example.com:8443", "example.com"),
+            ("[::1]", "::1"),
+            ("[::1]:8080", "::1"),
+            ("user@[::1]:8080", "::1"),
+            ("", ""),
+        ];
+        for (authority, expected) in cases {
+            assert_eq!(
+                super::authority_host(authority),
+                expected,
+                "{authority:?} names {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_the_openai_identifier_keys_refuse_empty_and_overlong_values() {
+        let overlong = "a".repeat(EMBEDDING_IDENTIFIER_BYTES_MAX + 1);
+        let cases: [EmbeddingTextCase; 2] = [
+            ("search.vector.embedding.revision", |embedding, value| {
+                if let EmbeddingConfiguration::OpenaiCompatible { revision, .. } = embedding {
+                    *revision = value;
+                }
+            }),
+            ("search.vector.embedding.api_key_env", |embedding, value| {
+                if let EmbeddingConfiguration::OpenaiCompatible { api_key_env, .. } = embedding {
+                    *api_key_env = value;
+                }
+            }),
+        ];
+        for (field, apply) in cases {
+            for value in [String::new(), overlong.clone()] {
+                let mut embedding = openai_embedding();
+                apply(&mut embedding, value.clone());
+                assert_eq!(
+                    embedding_model_verdict(embedding),
+                    Err(ConfigurationViolation::EmbeddingIdentifierInvalid {
+                        field,
+                        value: value.clone(),
+                    }),
+                    "{field} must refuse {value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_search_weights_must_hold_one_positive_share() {
         let mut configuration = WorkspaceConfiguration::default();
         assert_eq!(
             configuration.validate(),
             Ok(()),
-            "the defaults must sum to 1"
+            "the defaults must be accepted"
         );
-        configuration.search.lexical.weight = 0.5;
-        configuration.search.semantic.weight = 0.5;
-        assert_eq!(configuration.validate(), Ok(()));
-        configuration.search.semantic.weight = 0.6;
-        assert!(matches!(
+        let ranking = &mut configuration.search.ranking;
+        ranking.identifier_weight = 0.5;
+        ranking.lexical_weight = 0.5;
+        ranking.vector_weight = 0.5;
+        assert_eq!(
+            configuration.validate(),
+            Ok(()),
+            "weights need not sum to 1"
+        );
+        let ranking = &mut configuration.search.ranking;
+        ranking.identifier_weight = 0.0;
+        ranking.lexical_weight = 0.0;
+        ranking.vector_weight = 0.0;
+        assert_eq!(
             configuration.validate(),
             Err(ConfigurationViolation::SearchWeightsInvalid {
-                lexical: 0.5,
-                semantic: 0.6
+                identifier: 0.0,
+                lexical: 0.0,
+                vector: 0.0,
             })
-        ));
-        configuration.search.lexical.weight = -0.1;
-        configuration.search.semantic.weight = 1.1;
+        );
+        let ranking = &mut configuration.search.ranking;
+        ranking.identifier_weight = -0.1;
+        ranking.lexical_weight = 1.1;
+        ranking.vector_weight = 0.5;
         assert!(matches!(
             configuration.validate(),
             Err(ConfigurationViolation::SearchWeightsInvalid { .. })
         ));
-        configuration.search.lexical.weight = f64::NAN;
-        configuration.search.semantic.weight = f64::NAN;
+        let ranking = &mut configuration.search.ranking;
+        ranking.identifier_weight = f64::NAN;
+        ranking.lexical_weight = f64::NAN;
+        ranking.vector_weight = f64::NAN;
         assert!(matches!(
             configuration.validate(),
             Err(ConfigurationViolation::SearchWeightsInvalid { .. })
         ));
     }
 
-    /// One key of `[search.semantic]`, and one way to push it out of range.
-    type SemanticBoundCase = (&'static str, fn(&mut SemanticSearchConfiguration));
+    /// One key of `[search.vector]` or `[search.vector.embedding]`, and one
+    /// way to push it out of range.
+    type VectorBoundCase = (&'static str, fn(&mut VectorSearchConfiguration));
+
+    /// One key of `[search.vector.embedding]`, and one way to push it out of
+    /// range.
+    type EmbeddingBoundCase = (&'static str, fn(&mut EmbeddingConfiguration));
+
+    /// One text key of `[search.vector.embedding]`, and the value to set it
+    /// to.
+    type EmbeddingTextCase = (&'static str, fn(&mut EmbeddingConfiguration, String));
 
     /// Whether a configured weight is the expected share. Weights round-trip
     /// through TOML and JSON as written, so the two differ only by the error
@@ -2795,34 +3468,48 @@ mod tests {
     }
 
     #[test]
-    fn test_semantic_numeric_bounds_are_enforced() {
-        let cases: [SemanticBoundCase; 7] = [
-            ("search.semantic.download_timeout", |semantic| {
-                semantic.download_timeout =
-                    Duration::from_millis(SEMANTIC_DOWNLOAD_TIMEOUT_MS_MAX + 1);
+    fn test_vector_numeric_bounds_are_enforced() {
+        let cases: [VectorBoundCase; 7] = [
+            ("search.vector.candidates", |vector| {
+                vector.candidates = VECTOR_CANDIDATES_MAX + 1;
             }),
-            ("search.semantic.download_attempts", |semantic| {
-                semantic.download_attempts = SEMANTIC_DOWNLOAD_ATTEMPTS_MAX + 1;
+            ("search.vector.candidates_per_file", |vector| {
+                vector.candidates_per_file = VECTOR_CANDIDATES_PER_FILE_MAX + 1;
             }),
-            ("search.semantic.batch_declarations", |semantic| {
-                semantic.batch_declarations = SEMANTIC_BATCH_DECLARATIONS_MAX + 1;
+            ("search.vector.max_vectors", |vector| {
+                vector.max_vectors = VECTOR_MAX_VECTORS_MIN - 1;
             }),
-            ("search.semantic.max_tokens", |semantic| {
-                semantic.max_tokens = SEMANTIC_MAX_TOKENS_MIN - 1;
+            ("search.vector.embedding.download_timeout", |vector| {
+                if let EmbeddingConfiguration::Hf {
+                    download_timeout, ..
+                } = &mut vector.embedding
+                {
+                    *download_timeout =
+                        Duration::from_millis(EMBEDDING_DOWNLOAD_TIMEOUT_MS_MAX + 1);
+                }
             }),
-            ("search.semantic.candidates", |semantic| {
-                semantic.candidates = SEMANTIC_CANDIDATES_MAX + 1;
+            ("search.vector.embedding.download_attempts", |vector| {
+                if let EmbeddingConfiguration::Hf {
+                    download_attempts, ..
+                } = &mut vector.embedding
+                {
+                    *download_attempts = EMBEDDING_DOWNLOAD_ATTEMPTS_MAX + 1;
+                }
             }),
-            ("search.semantic.candidates_per_file", |semantic| {
-                semantic.candidates_per_file = SEMANTIC_CANDIDATES_PER_FILE_MAX + 1;
+            ("search.vector.embedding.batch_inputs", |vector| {
+                if let EmbeddingConfiguration::Hf { batch_inputs, .. } = &mut vector.embedding {
+                    *batch_inputs = EMBEDDING_BATCH_INPUTS_MAX + 1;
+                }
             }),
-            ("search.semantic.max_vectors", |semantic| {
-                semantic.max_vectors = SEMANTIC_MAX_VECTORS_MIN - 1;
+            ("search.vector.embedding.max_tokens", |vector| {
+                if let EmbeddingConfiguration::Hf { max_tokens, .. } = &mut vector.embedding {
+                    *max_tokens = EMBEDDING_MAX_TOKENS_MIN - 1;
+                }
             }),
         ];
         for (field, apply) in cases {
             let mut configuration = WorkspaceConfiguration::default();
-            apply(&mut configuration.search.semantic);
+            apply(&mut configuration.search.vector);
             let violation = configuration
                 .validate()
                 .expect_err("the bound must refuse the value");
@@ -2838,11 +3525,59 @@ mod tests {
     }
 
     #[test]
-    fn test_disabled_semantic_search_still_validates_its_own_keys() {
+    fn test_openai_numeric_bounds_are_enforced() {
+        let cases: [EmbeddingBoundCase; 5] = [
+            ("search.vector.embedding.dimensions", |embedding| {
+                if let EmbeddingConfiguration::OpenaiCompatible { dimensions, .. } = embedding {
+                    *dimensions = EMBEDDING_DIMENSIONS_MAX + 1;
+                }
+            }),
+            ("search.vector.embedding.request_timeout", |embedding| {
+                if let EmbeddingConfiguration::OpenaiCompatible {
+                    request_timeout, ..
+                } = embedding
+                {
+                    *request_timeout = Duration::from_millis(EMBEDDING_REQUEST_TIMEOUT_MS_MIN - 1);
+                }
+            }),
+            ("search.vector.embedding.attempts", |embedding| {
+                if let EmbeddingConfiguration::OpenaiCompatible { attempts, .. } = embedding {
+                    *attempts = EMBEDDING_ATTEMPTS_MAX + 1;
+                }
+            }),
+            ("search.vector.embedding.batch_inputs", |embedding| {
+                if let EmbeddingConfiguration::OpenaiCompatible { batch_inputs, .. } = embedding {
+                    *batch_inputs = REMOTE_EMBEDDING_BATCH_INPUTS_MAX + 1;
+                }
+            }),
+            ("search.vector.embedding.max_in_flight", |embedding| {
+                if let EmbeddingConfiguration::OpenaiCompatible { max_in_flight, .. } = embedding {
+                    *max_in_flight = EMBEDDING_MAX_IN_FLIGHT_MAX + 1;
+                }
+            }),
+        ];
+        for (field, apply) in cases {
+            let mut embedding = openai_embedding();
+            apply(&mut embedding);
+            let violation =
+                embedding_model_verdict(embedding).expect_err("the bound must refuse the value");
+            assert!(
+                matches!(
+                    violation,
+                    ConfigurationViolation::LimitOutOfRange { field: reported, .. }
+                        if reported == field
+                ),
+                "expected {field} to be reported, got {violation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_disabled_vector_search_still_validates_its_own_keys() {
         let mut configuration = WorkspaceConfiguration::default();
-        configuration.search.semantic.disabled = true;
+        configuration.search.vector.disabled = true;
         assert_eq!(configuration.validate(), Ok(()));
-        configuration.search.semantic.candidates = SEMANTIC_CANDIDATES_MAX + 1;
+        configuration.search.vector.candidates = VECTOR_CANDIDATES_MAX + 1;
         assert!(matches!(
             configuration.validate(),
             Err(ConfigurationViolation::LimitOutOfRange { .. })
@@ -2850,47 +3585,47 @@ mod tests {
     }
 
     #[test]
-    fn test_semantic_candidates_per_file_parses_and_keeps_its_default() {
+    fn test_vector_candidates_per_file_parses_and_keeps_its_default() {
         let configured: WorkspaceConfiguration = serde_json::from_value(json!({
-            "search": { "semantic": { "candidates_per_file": 8 } }
+            "search": { "vector": { "candidates_per_file": 8 } }
         }))
         .expect("the key must parse");
-        assert_eq!(configured.search.semantic.candidates_per_file, 8);
+        assert_eq!(configured.search.vector.candidates_per_file, 8);
         assert_eq!(
-            configured.search.semantic.candidates,
-            SEMANTIC_CANDIDATES_DEFAULT
+            configured.search.vector.candidates,
+            VECTOR_CANDIDATES_DEFAULT
         );
         assert_eq!(configured.validate(), Ok(()));
         let omitted: WorkspaceConfiguration = serde_json::from_value(json!({
-            "search": { "semantic": { "candidates": 100 } }
+            "search": { "vector": { "candidates": 100 } }
         }))
         .expect("an omitted key must keep its default");
         assert_eq!(
-            omitted.search.semantic.candidates_per_file,
-            SEMANTIC_CANDIDATES_PER_FILE_DEFAULT
+            omitted.search.vector.candidates_per_file,
+            VECTOR_CANDIDATES_PER_FILE_DEFAULT
         );
     }
 
     #[test]
-    fn test_semantic_candidates_per_file_bounds_are_enforced() {
+    fn test_vector_candidates_per_file_bounds_are_enforced() {
         let mut configuration = WorkspaceConfiguration::default();
         for accepted in [
-            SEMANTIC_CANDIDATES_PER_FILE_MIN,
-            SEMANTIC_CANDIDATES_PER_FILE_MAX,
+            VECTOR_CANDIDATES_PER_FILE_MIN,
+            VECTOR_CANDIDATES_PER_FILE_MAX,
         ] {
-            configuration.search.semantic.candidates_per_file = accepted;
+            configuration.search.vector.candidates_per_file = accepted;
             assert_eq!(configuration.validate(), Ok(()), "{accepted} is in range");
         }
         for refused in [
-            SEMANTIC_CANDIDATES_PER_FILE_MIN - 1,
-            SEMANTIC_CANDIDATES_PER_FILE_MAX + 1,
+            VECTOR_CANDIDATES_PER_FILE_MIN - 1,
+            VECTOR_CANDIDATES_PER_FILE_MAX + 1,
         ] {
-            configuration.search.semantic.candidates_per_file = refused;
+            configuration.search.vector.candidates_per_file = refused;
             assert!(
                 matches!(
                     configuration.validate(),
                     Err(ConfigurationViolation::LimitOutOfRange {
-                        field: "search.semantic.candidates_per_file",
+                        field: "search.vector.candidates_per_file",
                         ..
                     })
                 ),
@@ -2903,16 +3638,16 @@ mod tests {
     fn test_search_fusion_k_bounds_are_enforced() {
         let mut configuration = WorkspaceConfiguration::default();
         for accepted in [SEARCH_FUSION_K_MIN, SEARCH_FUSION_K_MAX] {
-            configuration.search.fusion_k = accepted;
+            configuration.search.ranking.fusion_k = accepted;
             assert_eq!(configuration.validate(), Ok(()), "{accepted} is in range");
         }
         for refused in [SEARCH_FUSION_K_MIN - 1, SEARCH_FUSION_K_MAX + 1] {
-            configuration.search.fusion_k = refused;
+            configuration.search.ranking.fusion_k = refused;
             assert!(
                 matches!(
                     configuration.validate(),
                     Err(ConfigurationViolation::LimitOutOfRange {
-                        field: "search.fusion_k",
+                        field: "search.ranking.fusion_k",
                         ..
                     })
                 ),
@@ -3036,11 +3771,10 @@ mod tests {
     fn test_search_table_parses_text_chunk_from_full_configuration() {
         let configuration: WorkspaceConfiguration = serde_json::from_value(json!({
             "search": {
-                "lexical": { "weight": 0.8 },
-                "semantic": {
-                    "weight": 0.2,
-                    "download_timeout": "5m",
-                    "max_vectors": 50000
+                "ranking": { "lexical_weight": 0.8, "vector_weight": 0.2 },
+                "vector": {
+                    "max_vectors": 50000,
+                    "embedding": { "kind": "hf", "download_timeout": "5m" }
                 },
                 "text": { "max_chunk": "2mb" }
             }
@@ -3050,12 +3784,18 @@ mod tests {
             configuration.search.text.max_chunk,
             ByteSize::from_bytes(2 << 20)
         );
-        assert!(is_weight(configuration.search.lexical.weight, 0.8));
-        assert!(is_weight(configuration.search.semantic.weight, 0.2));
-        assert_eq!(configuration.search.semantic.max_vectors, 50_000);
+        assert!(is_weight(configuration.search.ranking.lexical_weight, 0.8));
+        assert!(is_weight(configuration.search.ranking.vector_weight, 0.2));
+        assert_eq!(configuration.search.vector.max_vectors, 50_000);
         assert_eq!(
-            configuration.search.semantic.download_timeout,
-            Duration::from_millis(300_000)
+            configuration.search.vector.embedding,
+            EmbeddingConfiguration::Hf {
+                model: EMBEDDING_MODEL_DEFAULT.to_owned(),
+                download_timeout: Duration::from_millis(300_000),
+                download_attempts: EMBEDDING_DOWNLOAD_ATTEMPTS_DEFAULT,
+                batch_inputs: EMBEDDING_BATCH_INPUTS_DEFAULT,
+                max_tokens: EMBEDDING_MAX_TOKENS_DEFAULT,
+            }
         );
         assert_eq!(configuration.validate(), Ok(()));
     }
@@ -3083,43 +3823,64 @@ mod tests {
         }
     }
 
+    /// The properties one `[search.vector.embedding]` arm advertises,
+    /// selected by its `kind` constant.
+    fn embedding_arm(schema: &serde_json::Value, kind: &str) -> serde_json::Value {
+        schema["$defs"]["EmbeddingConfiguration"]["oneOf"]
+            .as_array()
+            .expect("the embedding schema must serve a oneOf")
+            .iter()
+            .find(|arm| arm["properties"]["kind"]["const"] == json!(kind))
+            .unwrap_or_else(|| panic!("the embedding schema must serve a {kind} arm"))["properties"]
+            .clone()
+    }
+
     #[test]
     fn test_fusion_schema_bounds_equal_the_enforced_constants() {
         let schema =
             serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
         let definitions = &schema["$defs"];
-        let search = &definitions["SearchConfiguration"]["properties"];
+        let ranking = &definitions["RankingConfiguration"]["properties"];
         let lexical = &definitions["LexicalSearchConfiguration"]["properties"];
-        let semantic = &definitions["SemanticSearchConfiguration"]["properties"];
         let cases = [
             (
                 "fusion k min",
-                &search["fusion_k"]["minimum"],
+                &ranking["fusion_k"]["minimum"],
                 json!(SEARCH_FUSION_K_MIN),
             ),
             (
                 "fusion k max",
-                &search["fusion_k"]["maximum"],
+                &ranking["fusion_k"]["maximum"],
                 json!(SEARCH_FUSION_K_MAX),
             ),
             (
+                "identifier weight min",
+                &ranking["identifier_weight"]["minimum"],
+                json!(0.0),
+            ),
+            (
+                "identifier weight max",
+                &ranking["identifier_weight"]["maximum"],
+                json!(1.0),
+            ),
+            (
                 "lexical weight min",
-                &lexical["weight"]["minimum"],
+                &ranking["lexical_weight"]["minimum"],
                 json!(0.0),
             ),
             (
                 "lexical weight max",
-                &lexical["weight"]["maximum"],
+                &ranking["lexical_weight"]["maximum"],
                 json!(1.0),
             ),
             (
-                "semantic weight min",
-                &semantic["weight"]["minimum"],
+                "vector weight min",
+                &ranking["vector_weight"]["minimum"],
                 json!(0.0),
             ),
             (
-                "semantic weight max",
-                &semantic["weight"]["maximum"],
+                "vector weight max",
+                &ranking["vector_weight"]["maximum"],
                 json!(1.0),
             ),
             (
@@ -3142,98 +3903,191 @@ mod tests {
     }
 
     #[test]
-    fn test_semantic_schema_bounds_equal_the_enforced_constants() {
+    fn test_vector_schema_bounds_equal_the_enforced_constants() {
         let schema =
             serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
-        let semantic = &schema["$defs"]["SemanticSearchConfiguration"]["properties"];
+        let vector = &schema["$defs"]["VectorSearchConfiguration"]["properties"];
         let cases = [
-            ("model min", &semantic["model"]["minLength"], json!(1)),
             (
-                "model max",
-                &semantic["model"]["maxLength"],
-                json!(SEMANTIC_MODEL_BYTES_MAX),
-            ),
-            (
-                "semantic disabled default",
-                &semantic["disabled"]["default"],
+                "vector disabled default",
+                &vector["disabled"]["default"],
                 json!(false),
             ),
             (
-                "download attempts min",
-                &semantic["download_attempts"]["minimum"],
-                json!(SEMANTIC_DOWNLOAD_ATTEMPTS_MIN),
-            ),
-            (
-                "download attempts max",
-                &semantic["download_attempts"]["maximum"],
-                json!(SEMANTIC_DOWNLOAD_ATTEMPTS_MAX),
-            ),
-            (
-                "batch declarations min",
-                &semantic["batch_declarations"]["minimum"],
-                json!(SEMANTIC_BATCH_DECLARATIONS_MIN),
-            ),
-            (
-                "batch declarations max",
-                &semantic["batch_declarations"]["maximum"],
-                json!(SEMANTIC_BATCH_DECLARATIONS_MAX),
-            ),
-            (
-                "max tokens min",
-                &semantic["max_tokens"]["minimum"],
-                json!(SEMANTIC_MAX_TOKENS_MIN),
-            ),
-            (
-                "max tokens max",
-                &semantic["max_tokens"]["maximum"],
-                json!(SEMANTIC_MAX_TOKENS_MAX),
-            ),
-            (
                 "candidates min",
-                &semantic["candidates"]["minimum"],
-                json!(SEMANTIC_CANDIDATES_MIN),
+                &vector["candidates"]["minimum"],
+                json!(VECTOR_CANDIDATES_MIN),
             ),
             (
                 "candidates max",
-                &semantic["candidates"]["maximum"],
-                json!(SEMANTIC_CANDIDATES_MAX),
+                &vector["candidates"]["maximum"],
+                json!(VECTOR_CANDIDATES_MAX),
             ),
             (
                 "candidates per file min",
-                &semantic["candidates_per_file"]["minimum"],
-                json!(SEMANTIC_CANDIDATES_PER_FILE_MIN),
+                &vector["candidates_per_file"]["minimum"],
+                json!(VECTOR_CANDIDATES_PER_FILE_MIN),
             ),
             (
                 "candidates per file max",
-                &semantic["candidates_per_file"]["maximum"],
-                json!(SEMANTIC_CANDIDATES_PER_FILE_MAX),
+                &vector["candidates_per_file"]["maximum"],
+                json!(VECTOR_CANDIDATES_PER_FILE_MAX),
             ),
             (
                 "max vectors min",
-                &semantic["max_vectors"]["minimum"],
-                json!(SEMANTIC_MAX_VECTORS_MIN),
+                &vector["max_vectors"]["minimum"],
+                json!(VECTOR_MAX_VECTORS_MIN),
             ),
             (
                 "max vectors max",
-                &semantic["max_vectors"]["maximum"],
-                json!(SEMANTIC_MAX_VECTORS_MAX),
+                &vector["max_vectors"]["maximum"],
+                json!(VECTOR_MAX_VECTORS_MAX),
             ),
         ];
         assert_schema_bounds(&cases);
     }
 
     #[test]
-    fn test_semantic_source_schema_default_equals_the_enforced_constant() {
+    fn test_local_embedding_schema_bounds_equal_the_enforced_constants() {
         let schema =
             serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
-        let semantic = &schema["$defs"]["SemanticSearchConfiguration"]["properties"];
-        let enforced = serde_json::to_value(SEMANTIC_SOURCE_DEFAULT)
-            .expect("the default source must serialize");
-        assert_schema_bounds(&[(
-            "semantic source default",
-            &semantic["source"]["default"],
-            enforced,
-        )]);
+        let hf = embedding_arm(&schema, "hf");
+        let directory = embedding_arm(&schema, "directory");
+        let cases = [
+            ("hf model min", &hf["model"]["minLength"], json!(1)),
+            (
+                "hf model max",
+                &hf["model"]["maxLength"],
+                json!(EMBEDDING_MODEL_BYTES_MAX),
+            ),
+            (
+                "hf model default",
+                &hf["model"]["default"],
+                json!(EMBEDDING_MODEL_DEFAULT),
+            ),
+            (
+                "download attempts min",
+                &hf["download_attempts"]["minimum"],
+                json!(EMBEDDING_DOWNLOAD_ATTEMPTS_MIN),
+            ),
+            (
+                "download attempts max",
+                &hf["download_attempts"]["maximum"],
+                json!(EMBEDDING_DOWNLOAD_ATTEMPTS_MAX),
+            ),
+            (
+                "hf batch inputs min",
+                &hf["batch_inputs"]["minimum"],
+                json!(EMBEDDING_BATCH_INPUTS_MIN),
+            ),
+            (
+                "hf batch inputs max",
+                &hf["batch_inputs"]["maximum"],
+                json!(EMBEDDING_BATCH_INPUTS_MAX),
+            ),
+            (
+                "hf max tokens min",
+                &hf["max_tokens"]["minimum"],
+                json!(EMBEDDING_MAX_TOKENS_MIN),
+            ),
+            (
+                "hf max tokens max",
+                &hf["max_tokens"]["maximum"],
+                json!(EMBEDDING_MAX_TOKENS_MAX),
+            ),
+            (
+                "directory batch inputs max",
+                &directory["batch_inputs"]["maximum"],
+                json!(EMBEDDING_BATCH_INPUTS_MAX),
+            ),
+            (
+                "directory max tokens min",
+                &directory["max_tokens"]["minimum"],
+                json!(EMBEDDING_MAX_TOKENS_MIN),
+            ),
+        ];
+        assert_schema_bounds(&cases);
+    }
+
+    #[test]
+    fn test_remote_embedding_schema_bounds_equal_the_enforced_constants() {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let openai = embedding_arm(&schema, "openai_compatible");
+        let cases = [
+            (
+                "endpoint max",
+                &openai["endpoint"]["maxLength"],
+                json!(EMBEDDING_ENDPOINT_BYTES_MAX),
+            ),
+            (
+                "endpoint default",
+                &openai["endpoint"]["default"],
+                json!(EMBEDDING_ENDPOINT_DEFAULT),
+            ),
+            (
+                "model default",
+                &openai["model"]["default"],
+                json!(REMOTE_EMBEDDING_MODEL_DEFAULT),
+            ),
+            (
+                "revision max",
+                &openai["revision"]["maxLength"],
+                json!(EMBEDDING_IDENTIFIER_BYTES_MAX),
+            ),
+            (
+                "revision default",
+                &openai["revision"]["default"],
+                json!(EMBEDDING_REVISION_DEFAULT),
+            ),
+            (
+                "api key env default",
+                &openai["api_key_env"]["default"],
+                json!(EMBEDDING_API_KEY_ENV_DEFAULT),
+            ),
+            (
+                "dimensions min",
+                &openai["dimensions"]["minimum"],
+                json!(EMBEDDING_DIMENSIONS_MIN),
+            ),
+            (
+                "dimensions max",
+                &openai["dimensions"]["maximum"],
+                json!(EMBEDDING_DIMENSIONS_MAX),
+            ),
+            (
+                "attempts max",
+                &openai["attempts"]["maximum"],
+                json!(EMBEDDING_ATTEMPTS_MAX),
+            ),
+            (
+                "remote batch inputs max",
+                &openai["batch_inputs"]["maximum"],
+                json!(REMOTE_EMBEDDING_BATCH_INPUTS_MAX),
+            ),
+            (
+                "max in flight max",
+                &openai["max_in_flight"]["maximum"],
+                json!(EMBEDDING_MAX_IN_FLIGHT_MAX),
+            ),
+        ];
+        assert_schema_bounds(&cases);
+    }
+
+    #[test]
+    fn test_embedding_duration_ranges_reach_every_arm_that_carries_one() {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let hf = embedding_arm(&schema, "hf");
+        let openai = embedding_arm(&schema, "openai_compatible");
+        assert_eq!(
+            hf["download_timeout"]["rift:range"],
+            json!({ "min": "10s", "max": "1h" })
+        );
+        assert_eq!(
+            openai["request_timeout"]["rift:range"],
+            json!({ "min": "1s", "max": "5m" })
+        );
     }
 
     #[test]
@@ -3747,13 +4601,22 @@ mod tests {
                 first: text(),
                 second: text(),
             },
-            ConfigurationViolation::SemanticModelInvalid {
+            ConfigurationViolation::EmbeddingModelInvalid {
+                field: "x",
+                value: text(),
+            },
+            ConfigurationViolation::EmbeddingEndpointInvalid {
+                field: "x",
+                value: text(),
+            },
+            ConfigurationViolation::EmbeddingIdentifierInvalid {
                 field: "x",
                 value: text(),
             },
             ConfigurationViolation::SearchWeightsInvalid {
-                lexical: 0.2,
-                semantic: 0.2,
+                identifier: 0.0,
+                lexical: 0.0,
+                vector: 0.0,
             },
             ConfigurationViolation::CommandProgramEmpty { field: "x" },
             ConfigurationViolation::CommandProgramWhitespace {

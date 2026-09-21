@@ -413,7 +413,7 @@ transaction that refuses leaves the previous rows and stamp intact and is record
 [`rift://logs`](/docs/mcp#resource-logs), and the next publication replaces the whole
 unit set rather than applying its change on top of rows the store missed.
 
-The semantic tier's vectors are not part of that transaction. Embedding one declaration can cost
+The vector ranking's vectors are not part of that transaction. Embedding one declaration can cost
 more than a read is willing to wait, so vectors are refreshed after the index publishes, and a
 search whose vectors are still being written ranks lexically and reports the tier's readiness in
 `warnings`.
@@ -455,7 +455,7 @@ The server indexes names both as spelled and split into words on case and separa
 so `get user name` reaches a declaration spelled `getUserName`, and a concept-level search does
 not depend on guessing the identifier first.
 
-#### Semantic ranking
+#### Vector ranking
 
 <VersionBadge
   version="v0.0.16"
@@ -479,8 +479,8 @@ covers it.
 The two rankings are combined by reciprocal rank rather than by averaging their scores. A
 full-text relevance score and a cosine similarity share no scale, so a weighted average of the
 two is decided by whichever side happens to spread wider.
-[`fusion_k`](/docs/developer/configuration#search) sets how sharply a top rank counts, and the two
-`weight` keys set each ranking's share.
+[`[search.ranking]`](/docs/developer/configuration#search) carries both halves of that decision:
+`fusion_k` sets how sharply a top rank counts, and the weight keys set each ranking's share.
 
 Preparation runs behind the answers. A search issued before the vectors are in is answered
 lexically and says so, rather than waiting for a model to load.

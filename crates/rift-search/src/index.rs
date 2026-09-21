@@ -1,4 +1,4 @@
-//! One index over both search tiers, and how far the semantic tier has got.
+//! One index over both search tiers, and how far the vector ranking has got.
 //!
 //! [`SearchIndex`] owns the lexical index and the vector store against one
 //! database file, so a caller drives search through it and never opens either
@@ -12,7 +12,7 @@
 //! through `tokio::task::spawn_blocking` and the runtime's workers stay free
 //! for whatever else the caller is serving.
 //!
-//! What the semantic tier can answer right now is [`SemanticReadiness`]. This
+//! What the vector ranking can answer right now is [`VectorReadiness`]. This
 //! crate reports it and stops there: the wire warning a caller attaches to a
 //! result is built above, by the layer that owns the protocol models, because
 //! the search tier sits below that layer and never depends on it.
@@ -25,7 +25,7 @@ use rift_core::ProjectPath;
 use rift_index::{DatabasePool, WorkspaceDatabase};
 use rift_index::{
     LexicalChange, LexicalIndexError, LexicalIndexLimits, LexicalMatch, LexicalSearchIndex,
-    LexicalUnit, LexicalUnitKind, RevisionScoped, SemanticVectorStore, StoredVector,
+    LexicalUnit, LexicalUnitKind, RevisionScoped, StoredVector, VectorStore,
 };
 
 use crate::acquisition::{AcquisitionLimits, ModelSource, acquire};
@@ -33,15 +33,15 @@ use crate::document::{Declaration, digests, document};
 use crate::encoder::{Encoder, EncoderLimits};
 use crate::error::{SearchError, SearchFault, SearchViolation};
 use crate::fusion::{DeclarationMatch, FusedRank, Ranking, fuse, spread_per_file};
-use crate::similarity::{SemanticMatch, nearest};
+use crate::similarity::{VectorMatch, nearest};
 
 /// The lexical ranking's share of a fused score when the caller sets none.
-const LEXICAL_WEIGHT_DEFAULT: f64 = 0.7;
-/// The semantic ranking's share of a fused score when the caller sets none.
-const SEMANTIC_WEIGHT_DEFAULT: f64 = 0.3;
+const LEXICAL_WEIGHT_DEFAULT: f64 = 0.35;
+/// The vector ranking's share of a fused score when the caller sets none.
+const VECTOR_WEIGHT_DEFAULT: f64 = 0.30;
 /// The reciprocal-rank constant when the caller sets none.
 const FUSION_K_DEFAULT: u64 = 60;
-/// Declarations the semantic ranking returns when the caller sets none.
+/// Declarations the vector ranking returns when the caller sets none.
 const CANDIDATES_DEFAULT: u64 = 200;
 /// Vectors the workspace may hold when the caller sets none.
 const MAX_VECTORS_DEFAULT: u64 = 200_000;
@@ -52,10 +52,10 @@ const MAX_TOKENS_DEFAULT: u64 = 256;
 /// Candidates one file may contribute when the caller sets none.
 const PER_FILE_MAX_DEFAULT: u64 = 3;
 
-/// How far the semantic tier has got.
+/// How far the vector ranking has got.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SemanticReadiness {
-    /// No semantic tier: the workspace turned it off.
+pub enum VectorReadiness {
+    /// No vector ranking: the workspace turned it off.
     Disabled,
     /// Embedding is under way.
     Preparing {
@@ -70,7 +70,7 @@ pub enum SemanticReadiness {
     Unavailable,
 }
 
-impl SemanticReadiness {
+impl VectorReadiness {
     /// Whether the tier may take part in a ranking.
     ///
     /// `Preparing` counts: what is already embedded ranks, and a partial
@@ -165,14 +165,14 @@ impl FusedRanking {
 pub struct SearchIndexLimits {
     lexical: LexicalIndexLimits,
     lexical_weight: f64,
-    semantic_weight: f64,
+    vector_weight: f64,
     fusion_k: u64,
     candidates: u64,
     max_vectors: u64,
     batch_declarations: u64,
     max_tokens: u64,
     per_file_max: u64,
-    semantic_disabled: bool,
+    vector_disabled: bool,
 }
 
 impl SearchIndexLimits {
@@ -182,14 +182,14 @@ impl SearchIndexLimits {
             limits: Self {
                 lexical,
                 lexical_weight: LEXICAL_WEIGHT_DEFAULT,
-                semantic_weight: SEMANTIC_WEIGHT_DEFAULT,
+                vector_weight: VECTOR_WEIGHT_DEFAULT,
                 fusion_k: FUSION_K_DEFAULT,
                 candidates: CANDIDATES_DEFAULT,
                 max_vectors: MAX_VECTORS_DEFAULT,
                 batch_declarations: BATCH_DECLARATIONS_DEFAULT,
                 max_tokens: MAX_TOKENS_DEFAULT,
                 per_file_max: PER_FILE_MAX_DEFAULT,
-                semantic_disabled: false,
+                vector_disabled: false,
             },
         }
     }
@@ -206,10 +206,10 @@ impl SearchIndexLimits {
         self.lexical_weight
     }
 
-    /// The semantic ranking's share of a fused score.
+    /// The vector ranking's share of a fused score.
     #[must_use]
-    pub const fn semantic_weight(self) -> f64 {
-        self.semantic_weight
+    pub const fn vector_weight(self) -> f64 {
+        self.vector_weight
     }
 
     /// The reciprocal-rank constant fusion flattens each ranking's head with.
@@ -218,7 +218,7 @@ impl SearchIndexLimits {
         self.fusion_k
     }
 
-    /// Declarations the semantic ranking returns before the two are fused.
+    /// Declarations the vector ranking returns before the two are fused.
     #[must_use]
     pub const fn candidates(self) -> u64 {
         self.candidates
@@ -242,16 +242,16 @@ impl SearchIndexLimits {
         self.max_tokens
     }
 
-    /// Candidates one file may contribute to the semantic ranking.
+    /// Candidates one file may contribute to the vector ranking.
     #[must_use]
     pub const fn per_file_max(self) -> u64 {
         self.per_file_max
     }
 
-    /// Whether the workspace turned the semantic tier off.
+    /// Whether the workspace turned the vector ranking off.
     #[must_use]
-    pub const fn is_semantic_disabled(self) -> bool {
-        self.semantic_disabled
+    pub const fn is_vector_disabled(self) -> bool {
+        self.vector_disabled
     }
 
     /// The bounds one encoder loads under.
@@ -265,18 +265,18 @@ impl SearchIndexLimits {
     }
 
     /// The readiness one freshly opened index starts at.
-    const fn initial_readiness(self) -> SemanticReadiness {
-        if self.semantic_disabled {
-            SemanticReadiness::Disabled
+    const fn initial_readiness(self) -> VectorReadiness {
+        if self.vector_disabled {
+            VectorReadiness::Disabled
         } else {
-            SemanticReadiness::Preparing {
+            VectorReadiness::Preparing {
                 prepared: 0,
                 total: 0,
             }
         }
     }
 
-    /// How deep the semantic ranking is read before it is spread across files.
+    /// How deep the vector ranking is read before it is spread across files.
     ///
     /// A file may keep `per_file_max` candidates, so reading the ranking that
     /// many times deeper than the candidate list leaves a full list even when
@@ -287,8 +287,8 @@ impl SearchIndexLimits {
 }
 
 impl Default for SearchIndexLimits {
-    /// The shipped bounds: the lexical defaults, a 0.7 and 0.3 weight pair,
-    /// a rank constant of 60, 200 semantic candidates spread 3 per file, and
+    /// The shipped bounds: the lexical defaults, a 0.35 and 0.30 weight pair,
+    /// a rank constant of 60, 200 vector candidates spread 3 per file, and
     /// 200,000 vectors embedded 32 at a time over 256 tokens each.
     fn default() -> Self {
         Self::builder(LexicalIndexLimits::default()).build()
@@ -308,9 +308,9 @@ impl SearchIndexLimitsBuilder {
     /// The pair is set together because it is one decision: the two trade
     /// against each other, and fusion refuses a pair that cannot carry a
     /// score.
-    pub const fn weights(mut self, lexical: f64, semantic: f64) -> Self {
+    pub const fn weights(mut self, lexical: f64, vector: f64) -> Self {
         self.limits.lexical_weight = lexical;
-        self.limits.semantic_weight = semantic;
+        self.limits.vector_weight = vector;
         self
     }
 
@@ -320,7 +320,7 @@ impl SearchIndexLimitsBuilder {
         self
     }
 
-    /// Sets how many declarations the semantic ranking returns.
+    /// Sets how many declarations the vector ranking returns.
     pub const fn candidates(mut self, candidates: u64) -> Self {
         self.limits.candidates = candidates;
         self
@@ -350,10 +350,10 @@ impl SearchIndexLimitsBuilder {
         self
     }
 
-    /// Turns the semantic tier off, so nothing is acquired and nothing is
+    /// Turns the vector ranking off, so nothing is acquired and nothing is
     /// embedded.
-    pub const fn disable_semantic(mut self) -> Self {
-        self.limits.semantic_disabled = true;
+    pub const fn disable_vector(mut self) -> Self {
+        self.limits.vector_disabled = true;
         self
     }
 
@@ -394,8 +394,8 @@ impl UnitAddress {
     }
 }
 
-/// One lexical unit together with the declaration whose text the semantic
-/// tier embeds for it.
+/// One lexical unit together with the declaration whose text the vector
+/// ranking embeds for it.
 ///
 /// A unit no declaration describes - a text file chunk - has no entry, so the
 /// unit set and the described set are never parallel and never need to be.
@@ -446,10 +446,10 @@ pub enum Embedding {
     Missing,
 }
 
-/// The digest-to-unit map the semantic tier ranks through.
+/// The digest-to-unit map the vector ranking ranks through.
 type Addresses = BTreeMap<String, UnitAddress>;
 
-/// The vectors the semantic tier scans, as one pass read them back.
+/// The vectors the vector ranking scans, as one pass read them back.
 type Corpus = Vec<StoredVector>;
 
 /// What one embedding pass published: the vectors it read back, the map that places each
@@ -472,7 +472,7 @@ struct HeldCorpus {
 /// The vector store keys on the digest of the text a declaration was embedded
 /// from and the lexical store keys on a unit identity, so neither of them can
 /// answer which unit a vector belongs to. The pass that embeds holds that map
-/// in memory and publishes it whole, which is why a semantic ranking answers
+/// in memory and publishes it whole, which is why a vector ranking answers
 /// only after a [`SearchIndex::embed_described`] in this process.
 ///
 /// The vectors themselves are held beside that map, and the pass publishes the
@@ -480,16 +480,16 @@ struct HeldCorpus {
 /// every row this workspace embedded and one decode of every blob it returned,
 /// paid before a single row was scored and paid again for the next query. What
 /// holding them costs is the ceiling the operator already set:
-/// `search.semantic.max_vectors` vectors, each as wide as the encoder's
+/// `search.vector.max_vectors` vectors, each as wide as the encoder's
 /// dimension, held for as long as this index is open. The store stays the
 /// record: a restart reads the corpus back once, in the first pass, rather
 /// than embedding it again.
 #[derive(Debug)]
 pub struct SearchIndex {
     lexical: LexicalSearchIndex,
-    vectors: SemanticVectorStore,
+    vectors: VectorStore,
     model: Mutex<Option<Arc<LoadedModel>>>,
-    readiness: Mutex<SemanticReadiness>,
+    readiness: Mutex<VectorReadiness>,
     held: Mutex<Option<Arc<HeldCorpus>>>,
     limits: SearchIndexLimits,
 }
@@ -534,7 +534,7 @@ impl SearchIndex {
         limits: SearchIndexLimits,
     ) -> Result<Self, SearchError> {
         let lexical = LexicalSearchIndex::attached(Arc::clone(&database), limits.lexical());
-        let vectors = SemanticVectorStore::attached(database);
+        let vectors = VectorStore::attached(database);
         Ok(Self {
             lexical,
             vectors,
@@ -545,7 +545,7 @@ impl SearchIndex {
         })
     }
 
-    /// Loads the encoder, so the semantic tier can answer.
+    /// Loads the encoder, so the vector ranking can answer.
     ///
     /// Runs the acquisition the caller configured, then drops every vector
     /// another model wrote and clears the held corpus with them: two models
@@ -553,7 +553,7 @@ impl SearchIndex {
     /// read again.
     ///
     /// A disabled tier acquires nothing and answers `Ok`. A tier already
-    /// marked [`SemanticReadiness::Unavailable`] stays that way, so one
+    /// marked [`VectorReadiness::Unavailable`] stays that way, so one
     /// failure is final for the life of this index.
     ///
     /// # Errors
@@ -570,13 +570,13 @@ impl SearchIndex {
         source: &ModelSource,
         limits: AcquisitionLimits,
     ) -> Result<(), SearchError> {
-        if self.readiness() == SemanticReadiness::Disabled {
+        if self.readiness() == VectorReadiness::Disabled {
             return Ok(());
         }
         match self.load(source, limits).await {
             Ok(model) => self.hold(model).await,
             Err(error) => {
-                self.set_readiness(SemanticReadiness::Unavailable);
+                self.set_readiness(VectorReadiness::Unavailable);
                 Err(error)
             }
         }
@@ -641,7 +641,7 @@ impl SearchIndex {
     }
 
     /// Embeds the declarations one publication describes, prunes the vectors no live
-    /// declaration addresses, and publishes the corpus the semantic tier scans.
+    /// declaration addresses, and publishes the corpus the vector ranking scans.
     ///
     /// This is the half a request never waits for. A vector costs an embedding pass, which
     /// can run for longer than any freshness deadline, while a lexical row costs an insert.
@@ -676,7 +676,7 @@ impl SearchIndex {
 
     /// Runs both tiers and fuses them.
     ///
-    /// The lexical tier always runs. The semantic tier runs when its readiness
+    /// The lexical tier always runs. The vector ranking runs when its readiness
     /// says it answers and a pass has published a corpus to scan.
     /// Both rankings go to [`fuse`]: a tier that returned nothing contributes
     /// no ranking, and one ranking fused alone is still the fused score, so
@@ -684,7 +684,7 @@ impl SearchIndex {
     /// bound the lexical tier stopped at, when its store held a match past it.
     ///
     /// An empty query returns nothing. The lexical tier has no term to match,
-    /// and the semantic tier would rank the retrieval prefix alone.
+    /// and the vector ranking would rank the retrieval prefix alone.
     ///
     /// # Errors
     ///
@@ -719,17 +719,17 @@ impl SearchIndex {
                 lexical_truncated_at: None,
             }));
         }
-        let semantic = self.semantic(query, tree_revision).await?;
-        let fused = self.fused(lexical.matches(), &semantic, limit)?;
+        let vector = self.vector(query, tree_revision).await?;
+        let fused = self.fused(lexical.matches(), &vector, limit)?;
         Ok(RevisionScoped::Matched(FusedRanking {
-            units: ranked(&fused, &directory(lexical.matches(), &semantic)),
+            units: ranked(&fused, &directory(lexical.matches(), &vector)),
             lexical_truncated_at: lexical.truncated_at(),
         }))
     }
 
-    /// What the semantic tier can answer right now.
+    /// What the vector ranking can answer right now.
     #[must_use]
-    pub fn readiness(&self) -> SemanticReadiness {
+    pub fn readiness(&self) -> VectorReadiness {
         *self
             .readiness
             .lock()
@@ -825,7 +825,7 @@ impl SearchIndex {
         Ok(())
     }
 
-    /// The vectors this model holds, read back for the semantic tier to scan.
+    /// The vectors this model holds, read back for the vector ranking to scan.
     ///
     /// The read stops at `max_vectors`, the same ceiling `documents` cuts the
     /// described set to, because this is what the index goes on holding: a
@@ -879,7 +879,7 @@ impl SearchIndex {
         Ok(())
     }
 
-    /// The semantic ranking for `tree_revision`, or nothing when the tier cannot answer
+    /// The vector ranking for `tree_revision`, or nothing when the tier cannot answer
     /// for that tree.
     ///
     /// The scan runs over the corpus the last pass published, and the query
@@ -898,7 +898,7 @@ impl SearchIndex {
     /// one call schedules the work once rather than twice. The corpus travels
     /// into that call as the `Arc` this index holds, so the scan borrows the
     /// vectors rather than copying them.
-    async fn semantic(
+    async fn vector(
         &self,
         query: &str,
         tree_revision: &str,
@@ -937,17 +937,17 @@ impl SearchIndex {
     fn fused(
         &self,
         lexical: &[LexicalMatch],
-        semantic: &[UnitAddress],
+        vector: &[UnitAddress],
         limit: u32,
     ) -> Result<Vec<FusedRank>, SearchError> {
         let lexical_order: Vec<&str> = lexical.iter().map(LexicalMatch::identity).collect();
-        let semantic_order: Vec<&str> = semantic
+        let vector_order: Vec<&str> = vector
             .iter()
             .map(|address| address.identity.as_str())
             .collect();
         let rankings = [
             Ranking::new(self.limits.lexical_weight, &lexical_order),
-            Ranking::new(self.limits.semantic_weight, &semantic_order),
+            Ranking::new(self.limits.vector_weight, &vector_order),
         ];
         fuse(&rankings, self.limits.fusion_k, as_usize(u64::from(limit)))
     }
@@ -984,7 +984,7 @@ impl SearchIndex {
         }));
     }
 
-    /// Installs what the semantic tier scans from here on, or clears it.
+    /// Installs what the vector ranking scans from here on, or clears it.
     fn publish_held(&self, corpus: Option<HeldCorpus>) {
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
         *held = corpus.map(Arc::new);
@@ -993,16 +993,16 @@ impl SearchIndex {
     /// Records that a pass embedded nothing, without clearing a tier that is
     /// off or one that already failed for good.
     fn note_nothing_embedded(&self, total: usize) {
-        if matches!(self.readiness(), SemanticReadiness::Preparing { .. }) {
-            self.set_readiness(SemanticReadiness::Preparing {
+        if matches!(self.readiness(), VectorReadiness::Preparing { .. }) {
+            self.set_readiness(VectorReadiness::Preparing {
                 prepared: 0,
                 total: as_count(total),
             });
         }
     }
 
-    /// Records how far the semantic tier has got.
-    fn set_readiness(&self, readiness: SemanticReadiness) {
+    /// Records how far the vector ranking has got.
+    fn set_readiness(&self, readiness: VectorReadiness) {
         let mut held = self
             .readiness
             .lock()
@@ -1065,11 +1065,11 @@ fn paired(chunk: &[&UnitDocument], embedded: Vec<Vec<f32>>) -> Vec<StoredVector>
         .collect()
 }
 
-/// Each semantic match under the file its declaration lives in.
+/// Each vector match under the file its declaration lives in.
 ///
 /// The loop runs over what `nearest` returned, which is already the caller's
 /// own depth bound.
-fn placed(matched: &[SemanticMatch], addresses: &Addresses) -> Vec<DeclarationMatch> {
+fn placed(matched: &[VectorMatch], addresses: &Addresses) -> Vec<DeclarationMatch> {
     matched
         .iter()
         .filter_map(|one| {
@@ -1080,7 +1080,7 @@ fn placed(matched: &[SemanticMatch], addresses: &Addresses) -> Vec<DeclarationMa
         .collect()
 }
 
-/// The units a spread semantic ranking names, best first, keeping `keep_max`.
+/// The units a spread vector ranking names, best first, keeping `keep_max`.
 fn resolved(
     spread: &[DeclarationMatch],
     addresses: &Addresses,
@@ -1099,15 +1099,15 @@ fn resolved(
 /// names every identity fusion can return.
 fn directory<'a>(
     lexical: &'a [LexicalMatch],
-    semantic: &'a [UnitAddress],
+    vector: &'a [UnitAddress],
 ) -> BTreeMap<&'a str, (&'a ProjectPath, LexicalUnitKind)> {
     let from_lexical = lexical
         .iter()
         .map(|one| (one.identity(), (one.path(), one.kind())));
-    let from_semantic = semantic
+    let from_vector = vector
         .iter()
         .map(|one| (one.identity.as_str(), (&one.path, one.kind)));
-    from_lexical.chain(from_semantic).collect()
+    from_lexical.chain(from_vector).collect()
 }
 
 /// The fused ranks as units, in the order fusion produced.
@@ -1131,11 +1131,11 @@ fn ranked(
 }
 
 /// The readiness a pass that embedded `prepared` of `total` reaches.
-const fn reached(prepared: u64, total: u64) -> SemanticReadiness {
+const fn reached(prepared: u64, total: u64) -> VectorReadiness {
     if prepared == total {
-        SemanticReadiness::Ready
+        VectorReadiness::Ready
     } else {
-        SemanticReadiness::Preparing { prepared, total }
+        VectorReadiness::Preparing { prepared, total }
     }
 }
 
@@ -1191,8 +1191,8 @@ fn as_count(count: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Embedding, LEXICAL_WEIGHT_DEFAULT, SearchIndexLimits, SemanticReadiness, UnitAddress,
-        UnitDocument, as_count, as_usize, batch_size, model_identity, reached, selected,
+        Embedding, LEXICAL_WEIGHT_DEFAULT, SearchIndexLimits, UnitAddress, UnitDocument,
+        VectorReadiness, as_count, as_usize, batch_size, model_identity, reached, selected,
     };
     use crate::acquisition::ModelSource;
     use rift_core::ProjectPath;
@@ -1215,11 +1215,11 @@ mod tests {
 
     #[test]
     fn test_a_pass_that_covered_every_declaration_is_ready() {
-        assert_eq!(reached(0, 0), SemanticReadiness::Ready);
-        assert_eq!(reached(4, 4), SemanticReadiness::Ready);
+        assert_eq!(reached(0, 0), VectorReadiness::Ready);
+        assert_eq!(reached(4, 4), VectorReadiness::Ready);
         assert_eq!(
             reached(2, 5),
-            SemanticReadiness::Preparing {
+            VectorReadiness::Preparing {
                 prepared: 2,
                 total: 5
             }
@@ -1228,16 +1228,16 @@ mod tests {
 
     #[test]
     fn test_readiness_answers_while_it_is_ready_or_preparing() {
-        assert!(SemanticReadiness::Ready.answers());
+        assert!(VectorReadiness::Ready.answers());
         assert!(
-            SemanticReadiness::Preparing {
+            VectorReadiness::Preparing {
                 prepared: 1,
                 total: 2
             }
             .answers()
         );
-        assert!(!SemanticReadiness::Disabled.answers());
-        assert!(!SemanticReadiness::Unavailable.answers());
+        assert!(!VectorReadiness::Disabled.answers());
+        assert!(!VectorReadiness::Unavailable.answers());
     }
 
     #[test]
@@ -1298,19 +1298,19 @@ mod tests {
             .batch_declarations(13)
             .max_tokens(64)
             .per_file_max(2)
-            .disable_semantic()
+            .disable_vector()
             .build();
         assert!((limits.lexical_weight() - 0.5).abs() < f64::EPSILON);
-        assert!((limits.semantic_weight() - 0.5).abs() < f64::EPSILON);
+        assert!((limits.vector_weight() - 0.5).abs() < f64::EPSILON);
         assert_eq!(limits.fusion_k(), 7);
         assert_eq!(limits.candidates(), 9);
         assert_eq!(limits.max_vectors(), 11);
         assert_eq!(limits.batch_declarations(), 13);
         assert_eq!(limits.max_tokens(), 64);
         assert_eq!(limits.per_file_max(), 2);
-        assert!(limits.is_semantic_disabled());
+        assert!(limits.is_vector_disabled());
         assert_eq!(limits.lexical(), LexicalIndexLimits::default());
-        assert_eq!(limits.initial_readiness(), SemanticReadiness::Disabled);
+        assert_eq!(limits.initial_readiness(), VectorReadiness::Disabled);
         assert_eq!(limits.depth(), 18);
         assert_eq!(limits.encoder_limits().tokens_max(), 64);
         assert_eq!(limits.encoder_limits().batch_declarations(), 13);
@@ -1321,10 +1321,10 @@ mod tests {
     fn test_the_shipped_bounds_start_preparing_with_nothing_embedded() {
         let limits = SearchIndexLimits::default();
         assert!((limits.lexical_weight() - LEXICAL_WEIGHT_DEFAULT).abs() < f64::EPSILON);
-        assert!(!limits.is_semantic_disabled());
+        assert!(!limits.is_vector_disabled());
         assert_eq!(
             limits.initial_readiness(),
-            SemanticReadiness::Preparing {
+            VectorReadiness::Preparing {
                 prepared: 0,
                 total: 0
             }

@@ -9,13 +9,12 @@ use candle_core::{DType, Device, Tensor};
 use rift_core::ProjectPath;
 use rift_index::{DatabasePool, WorkspaceDatabase};
 use rift_index::{
-    LexicalIndexLimits, LexicalSearchIndex, LexicalUnit, LexicalUnitKind, SemanticVectorStore,
-    StoredVector,
+    LexicalIndexLimits, LexicalSearchIndex, LexicalUnit, LexicalUnitKind, StoredVector, VectorStore,
 };
 use rift_search::{
     AcquisitionLimits, Declaration, DescribedUnit, DocumentDigest, Embedding, ModelSource,
     RankedUnit, RevisionScoped, SearchError, SearchIndex, SearchIndexLimits, SearchViolation,
-    SemanticReadiness, document,
+    VectorReadiness, document,
 };
 use tokenizers::models::wordpiece::WordPiece;
 use tokenizers::processors::bert::BertProcessing;
@@ -274,9 +273,9 @@ fn digest_of(declaration: &Declaration<'_>) -> String {
     DocumentDigest::of(document(declaration).text()).to_hex()
 }
 
-async fn store(root: &Path) -> Fallible<SemanticVectorStore> {
+async fn store(root: &Path) -> Fallible<VectorStore> {
     let database = WorkspaceDatabase::open(&database(root), database_pool()).await?;
-    Ok(SemanticVectorStore::attached(database))
+    Ok(VectorStore::attached(database))
 }
 
 /// The vectors one model holds, in digest order.
@@ -459,7 +458,7 @@ async fn a_fresh_path_starts_preparing_and_reopening_reads_what_was_left() -> Te
     let index = opened(root.path(), limits()).await?;
     assert_eq!(
         index.readiness(),
-        SemanticReadiness::Preparing {
+        VectorReadiness::Preparing {
             prepared: 0,
             total: 0
         }
@@ -480,13 +479,13 @@ async fn a_fresh_path_starts_preparing_and_reopening_reads_what_was_left() -> Te
 }
 
 #[tokio::test]
-async fn a_build_with_no_declarations_leaves_the_semantic_tier_ready() -> TestResult {
+async fn a_build_with_no_declarations_leaves_the_vector_ranking_ready() -> TestResult {
     let root = workspace()?;
     let index = prepared(root.path(), limits()).await?;
     whole_pass(&index, &[], &[], REVISION).await?;
     assert_eq!(
         index.readiness(),
-        SemanticReadiness::Ready,
+        VectorReadiness::Ready,
         "an empty set has a vector for every declaration it holds"
     );
     assert_eq!(index.tree_revision().await?, Some(REVISION.to_owned()));
@@ -506,7 +505,7 @@ async fn a_build_gives_every_declaration_a_vector_and_stamps_the_tree_revision()
     let declarations = two_declarations();
     whole_pass(&index, &units, &described(&units, &declarations), REVISION).await?;
 
-    assert_eq!(index.readiness(), SemanticReadiness::Ready);
+    assert_eq!(index.readiness(), VectorReadiness::Ready);
     assert_eq!(index.tree_revision().await?, Some(REVISION.to_owned()));
     let vectors = stored(root.path(), "model").await?;
     let held: Vec<&str> = vectors.iter().map(StoredVector::digest).collect();
@@ -543,7 +542,7 @@ async fn a_refresh_leaves_a_moved_declaration_the_vector_it_already_had() -> Tes
         is_marked(&vectors, &carried),
         "a declaration whose own text is unchanged keeps the vector it had"
     );
-    assert_eq!(index.readiness(), SemanticReadiness::Ready);
+    assert_eq!(index.readiness(), VectorReadiness::Ready);
     assert_eq!(index.tree_revision().await?, Some("rev-two".to_owned()));
     Ok(())
 }
@@ -616,7 +615,7 @@ async fn a_build_stopping_at_the_vector_bound_reports_preparing() -> TestResult 
     whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
     assert_eq!(
         index.readiness(),
-        SemanticReadiness::Preparing {
+        VectorReadiness::Preparing {
             prepared: 1,
             total: 2
         },
@@ -630,21 +629,21 @@ async fn a_build_stopping_at_the_vector_bound_reports_preparing() -> TestResult 
 async fn a_disabled_tier_answers_in_the_lexical_order_alone() -> TestResult {
     let root = workspace()?;
     let disabled = SearchIndexLimits::builder(lexical_limits())
-        .disable_semantic()
+        .disable_vector()
         .build();
     let index = opened(root.path(), disabled).await?;
-    assert_eq!(index.readiness(), SemanticReadiness::Disabled);
+    assert_eq!(index.readiness(), VectorReadiness::Disabled);
     index
         .prepare(&model_source(root.path(), "model")?, acquisition_limits())
         .await?;
     assert_eq!(
         index.readiness(),
-        SemanticReadiness::Disabled,
+        VectorReadiness::Disabled,
         "a disabled tier acquires nothing"
     );
     let fixture = two()?;
     whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
-    assert_eq!(index.readiness(), SemanticReadiness::Disabled);
+    assert_eq!(index.readiness(), VectorReadiness::Disabled);
     assert!(
         stored(root.path(), "model").await?.is_empty(),
         "a disabled tier embeds nothing"
@@ -663,10 +662,10 @@ async fn a_disabled_tier_answers_in_the_lexical_order_alone() -> TestResult {
 
 /// The fixture model's vectors carry no trained meaning: its two layers hold
 /// values this suite wrote, so nothing here measures relevance. What it proves
-/// is that the semantic ranking reaches the fused result at all, for a query
+/// is that the vector ranking reaches the fused result at all, for a query
 /// the lexical tier cannot answer.
 #[tokio::test]
-async fn a_query_the_lexical_tier_cannot_answer_is_still_ranked_through_the_semantic_tier()
+async fn a_query_the_lexical_tier_cannot_answer_is_still_ranked_through_the_vector_ranking()
 -> TestResult {
     let root = workspace()?;
     let index = prepared(root.path(), limits()).await?;
@@ -681,7 +680,7 @@ async fn a_query_the_lexical_tier_cannot_answer_is_still_ranked_through_the_sema
     let reached = identities(&ranked);
     assert!(
         reached.contains(&"one") && reached.contains(&"two"),
-        "the semantic tier reaches units the lexical tier cannot: {reached:?}"
+        "the vector ranking reaches units the lexical tier cannot: {reached:?}"
     );
     assert_eq!(paths(&ranked).len(), 2);
     Ok(())
@@ -745,7 +744,7 @@ async fn more_units_than_described_entries_leave_the_undescribed_ones_without_a_
         ["sym-one"],
         "the only vector resolves to the only described unit"
     );
-    assert_eq!(index.readiness(), SemanticReadiness::Ready);
+    assert_eq!(index.readiness(), VectorReadiness::Ready);
     Ok(())
 }
 
@@ -782,7 +781,7 @@ async fn a_tier_that_will_not_load_leaves_the_lexical_ranking_serving() -> TestR
     whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
     assert_eq!(
         index.readiness(),
-        SemanticReadiness::Preparing {
+        VectorReadiness::Preparing {
             prepared: 0,
             total: 2
         },
@@ -794,7 +793,7 @@ async fn a_tier_that_will_not_load_leaves_the_lexical_ranking_serving() -> TestR
         .await
         .expect_err("the directory holds no model");
     assert_eq!(error.fault().violation(), SearchViolation::ModelFileMissing);
-    assert_eq!(index.readiness(), SemanticReadiness::Unavailable);
+    assert_eq!(index.readiness(), VectorReadiness::Unavailable);
 
     assert_eq!(
         identities(&ranked_units(&index, "load config", 10).await?),
@@ -808,7 +807,7 @@ async fn a_tier_that_will_not_load_leaves_the_lexical_ranking_serving() -> TestR
     whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
     assert_eq!(
         index.readiness(),
-        SemanticReadiness::Unavailable,
+        VectorReadiness::Unavailable,
         "one failure is final for the life of this index"
     );
     Ok(())
@@ -875,7 +874,7 @@ async fn readiness_walks_from_preparing_to_ready() -> TestResult {
     let index = opened(root.path(), limits()).await?;
     assert_eq!(
         index.readiness(),
-        SemanticReadiness::Preparing {
+        VectorReadiness::Preparing {
             prepared: 0,
             total: 0
         }
@@ -884,7 +883,7 @@ async fn readiness_walks_from_preparing_to_ready() -> TestResult {
     whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
     assert_eq!(
         index.readiness(),
-        SemanticReadiness::Preparing {
+        VectorReadiness::Preparing {
             prepared: 0,
             total: 2
         }
@@ -893,7 +892,7 @@ async fn readiness_walks_from_preparing_to_ready() -> TestResult {
         .prepare(&model_source(root.path(), "model")?, acquisition_limits())
         .await?;
     incremental_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
-    assert_eq!(index.readiness(), SemanticReadiness::Ready);
+    assert_eq!(index.readiness(), VectorReadiness::Ready);
     Ok(())
 }
 
@@ -957,7 +956,7 @@ async fn a_query_ranks_from_the_held_corpus_after_the_stored_rows_are_gone() -> 
     whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
     assert!(
         lexical_order(root.path(), "search", 10).await?.is_empty(),
-        "the query shares no token with either unit, so only the semantic tier can answer it"
+        "the query shares no token with either unit, so only the vector ranking can answer it"
     );
     let answered = ranked_units(&index, "search", 10).await?;
     let ranked = placed(&answered);
@@ -1080,7 +1079,7 @@ async fn the_held_corpus_stops_at_the_vector_bound() -> TestResult {
 async fn a_store_refusal_carries_the_stores_own_violation() -> TestResult {
     let root = workspace()?;
     let narrow = SearchIndexLimits::builder(LexicalIndexLimits::new(1, 1 << 20, 32, 64, 4, 1_000))
-        .disable_semantic()
+        .disable_vector()
         .build();
     let index = opened(root.path(), narrow).await?;
     let fixture = two()?;
@@ -1108,7 +1107,7 @@ async fn a_store_refusal_carries_the_stores_own_violation() -> TestResult {
 async fn a_store_bound_keeps_its_registry_identity_and_its_limit_evidence() -> TestResult {
     let root = workspace()?;
     let narrow = SearchIndexLimits::builder(LexicalIndexLimits::new(1, 1 << 20, 32, 64, 4, 1_000))
-        .disable_semantic()
+        .disable_vector()
         .build();
     let index = opened(root.path(), narrow).await?;
     let fixture = two()?;
@@ -1181,7 +1180,7 @@ async fn a_corpus_described_for_the_previous_tree_ranks_nothing() -> TestResult 
     whole_pass(&index, fixture.units(), &fixture.described(), REVISION).await?;
     assert!(
         lexical_order(root.path(), "search", 10).await?.is_empty(),
-        "the query shares no token with either unit, so only the semantic tier can answer it"
+        "the query shares no token with either unit, so only the vector ranking can answer it"
     );
     assert_eq!(ranked_units(&index, "search", 10).await?.len(), 2);
 

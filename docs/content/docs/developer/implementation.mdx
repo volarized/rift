@@ -146,7 +146,7 @@ ends. The corpus shutdown tests use these records to observe work in progress be
   languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
 />
 
-One [SQLite](https://www.sqlite.org/) database at `.rift/db` holds the lexical index, semantic
+One [SQLite](https://www.sqlite.org/) database at `.rift/db` holds the lexical index, the
 vectors, and server logs. The server lock stays in a separate file under `.rift`. Access goes
 through [Toasty](https://github.com/tokio-rs/toasty) models; the full-text surface is raw SQL,
 because Toasty 0.10 has no typed virtual-table or `MATCH` API, and the raw boundary stays confined
@@ -192,7 +192,7 @@ two rebuilds captured from one publication both write what they read, and the se
 the first left.
 
 Search is a layered configuration: the default is this full-text store alone, and
-[`[search.semantic]`](/docs/developer/configuration#search) adds the vector store below, whose ranking
+[`[search.vector]`](/docs/developer/configuration#search) adds the vector store below, whose ranking
 the server fuses with this one by reciprocal rank.
 
 ## Server logs
@@ -215,7 +215,7 @@ The flags narrow what prints:
 Agents read these records through [`rift://logs`](/docs/mcp#resource-logs).
 The [`[logs]`](/docs/developer/configuration#logs) table bounds how many the server keeps.
 
-## Semantic search
+## Vector search
 
 <VersionBadge
   version="v0.0.16"
@@ -234,7 +234,7 @@ retrieval query carries the prefix that checkpoint was trained with. A static mo
 forward pass, so neither the prefix nor the pooling applies to it.
 
 The shipped [default](/docs/developer/configuration#search) is static. A workspace is embedded once
-before its first search can rank semantically, and a forward pass over every declaration
+before its first search can rank by vector, and a forward pass over every declaration
 costs minutes on a laptop CPU where a row gather costs seconds.
 
 Weights are read through candle's safetensors loader rather than its memory-mapped
@@ -244,7 +244,7 @@ is that a load holds the file's bytes once while the tensors are built.
 Every encoder call runs on a blocking thread. Candle's forward pass would otherwise hold a
 runtime worker for the length of a batch, and a request arriving meanwhile would wait behind
 it. Passes run one at a time, bounded by
-[`batch_declarations` and `max_tokens`](/docs/developer/configuration#search). A BERT checkpoint's
+[`batch_inputs` and `max_tokens`](/docs/developer/configuration#search). A BERT checkpoint's
 attention memory grows with the square of the token window, and candle's kernels already
 spread one pass across the thread pool, so running several at once buys nothing and costs the
 machine its memory.
@@ -310,7 +310,7 @@ Two publications are comparable by their own fields. `format_revision` states th
 `analyzer_revision` is the digest of the analyzer manifest, which names each shipped grammar's
 version and checksum and the content digest of every source file that decides what a
 publication holds: the whole `rift-syntax` and `rift-provider` crates, the analyzer, the
-package walk, the lexical and semantic passes, and the identity module.
+package walk, the lexical and vector passes, and the identity module.
 Every record - a source unit, a declaration, a search document - carries a digest over its own
 content, and the whole document renders as
 [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785) canonical JSON, so two runs over the same

@@ -508,10 +508,10 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The semantic ranking is still being built, so the answer was ranked lexically alone.\n`prepared` and `total` state how many declarations already carry a vector, and\n`ready_in` is derived from workspace size and embedding progress.",
+                "description": "The vector ranking is still being built, so the answer was ranked lexically alone.\n`prepared` and `total` state how many declarations already carry a vector, and\n`ready_in` is derived from workspace size and embedding progress.",
                 "properties": {
                   "code": {
-                    "const": "semantic_index_preparing",
+                    "const": "vector_index_preparing",
                     "type": "string"
                   },
                   "detail": {
@@ -527,7 +527,7 @@
                   },
                   "ready_in": {
                     "$ref": "#/$defs/Duration",
-                    "description": "Estimated wait before the semantic ranking joins an answer, not a measurement\nof this machine. A caller may report it and must not schedule against it."
+                    "description": "Estimated wait before the vector ranking joins an answer, not a measurement\nof this machine. A caller may report it and must not schedule against it."
                   },
                   "total": {
                     "description": "Declarations the published set holds.",
@@ -547,10 +547,10 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The semantic ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. No retry is coming: fix the `[search.semantic]`\nconfiguration and start the server again.",
+                "description": "The vector ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. No retry is coming: fix the `[search.vector]`\nconfiguration and start the server again.",
                 "properties": {
                   "code": {
-                    "const": "semantic_ranking_unavailable",
+                    "const": "vector_ranking_unavailable",
                     "type": "string"
                   },
                   "detail": {
@@ -2313,10 +2313,10 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The semantic ranking is still being built, so the answer was ranked lexically alone.\n`prepared` and `total` state how many declarations already carry a vector, and\n`ready_in` is derived from workspace size and embedding progress.",
+                "description": "The vector ranking is still being built, so the answer was ranked lexically alone.\n`prepared` and `total` state how many declarations already carry a vector, and\n`ready_in` is derived from workspace size and embedding progress.",
                 "properties": {
                   "code": {
-                    "const": "semantic_index_preparing",
+                    "const": "vector_index_preparing",
                     "type": "string"
                   },
                   "detail": {
@@ -2332,7 +2332,7 @@
                   },
                   "ready_in": {
                     "$ref": "#/$defs/Duration",
-                    "description": "Estimated wait before the semantic ranking joins an answer, not a measurement\nof this machine. A caller may report it and must not schedule against it."
+                    "description": "Estimated wait before the vector ranking joins an answer, not a measurement\nof this machine. A caller may report it and must not schedule against it."
                   },
                   "total": {
                     "description": "Declarations the published set holds.",
@@ -2352,10 +2352,10 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The semantic ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. No retry is coming: fix the `[search.semantic]`\nconfiguration and start the server again.",
+                "description": "The vector ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. No retry is coming: fix the `[search.vector]`\nconfiguration and start the server again.",
                 "properties": {
                   "code": {
-                    "const": "semantic_ranking_unavailable",
+                    "const": "vector_ranking_unavailable",
                     "type": "string"
                   },
                   "detail": {
@@ -3789,7 +3789,7 @@
               },
               {
                 "const": "ranked",
-                "description": "The ranked lane placed the hit; no field match proves the query's literal bytes\nappear. The lane ranks whether or not `[search.semantic]` is enabled, so this member\nnames the lane rather than the tier that may or may not have contributed to it.",
+                "description": "The ranked lane placed the hit; no field match proves the query's literal bytes\nappear. The lane ranks whether or not `[search.vector]` is enabled, so this member\nnames the lane rather than the ranking that may or may not have contributed to it.",
                 "type": "string"
               },
               {
@@ -3972,10 +3972,10 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The semantic ranking is still being built, so the answer was ranked lexically alone.\n`prepared` and `total` state how many declarations already carry a vector, and\n`ready_in` is derived from workspace size and embedding progress.",
+                "description": "The vector ranking is still being built, so the answer was ranked lexically alone.\n`prepared` and `total` state how many declarations already carry a vector, and\n`ready_in` is derived from workspace size and embedding progress.",
                 "properties": {
                   "code": {
-                    "const": "semantic_index_preparing",
+                    "const": "vector_index_preparing",
                     "type": "string"
                   },
                   "detail": {
@@ -3991,7 +3991,7 @@
                   },
                   "ready_in": {
                     "$ref": "#/$defs/Duration",
-                    "description": "Estimated wait before the semantic ranking joins an answer, not a measurement\nof this machine. A caller may report it and must not schedule against it."
+                    "description": "Estimated wait before the vector ranking joins an answer, not a measurement\nof this machine. A caller may report it and must not schedule against it."
                   },
                   "total": {
                     "description": "Declarations the published set holds.",
@@ -4011,10 +4011,10 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The semantic ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. No retry is coming: fix the `[search.semantic]`\nconfiguration and start the server again.",
+                "description": "The vector ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. No retry is coming: fix the `[search.vector]`\nconfiguration and start the server again.",
                 "properties": {
                   "code": {
-                    "const": "semantic_ranking_unavailable",
+                    "const": "vector_ranking_unavailable",
                     "type": "string"
                   },
                   "detail": {

@@ -10,9 +10,9 @@ use rift_index::{
     WorkspaceIndexLimits, capture_digests_with_languages,
 };
 use rift_protocol::configuration::{
-    Duration as WireDuration, LspConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX, SEARCH_POOL_SLOTS_MAX,
-    SERVER_NUM_WORKERS_MAX, SearchConfiguration, SemanticSearchConfiguration, SemanticSource,
-    ServerConfiguration, WorkspaceConfiguration,
+    Duration as WireDuration, EmbeddingConfiguration, LspConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX,
+    SEARCH_POOL_SLOTS_MAX, SERVER_NUM_WORKERS_MAX, SearchConfiguration, ServerConfiguration,
+    VectorSearchConfiguration, WorkspaceConfiguration,
 };
 use rift_protocol::error as wire;
 use rift_protocol::lock::ProductIdentity;
@@ -25,8 +25,8 @@ use rift_protocol::workspace::{
     WorkspaceResourcePage, WorkspaceSourceUnit,
 };
 use rift_search::{
-    AcquisitionLimits, FusedRanking, ModelSource, RankedUnit, RevisionScoped, SearchError,
-    SearchIndex, SearchIndexLimits, SemanticReadiness,
+    AcquisitionLimits, FusedRanking, ModelSource, RankedUnit, RevisionScoped, SearchIndex,
+    SearchIndexLimits, VectorReadiness,
 };
 use rift_server::{
     EnginePool, EngineReferences, LspProcessKey, PackageBranch, ReadError, ReadFault, ReadService,
@@ -55,13 +55,13 @@ use crate::validation::{
     run_index_supervisor, workspace_watcher,
 };
 
-/// Semantic candidates one file may contribute to a fused ranking.
+/// Vector candidates one file may contribute to a fused ranking.
 ///
-/// Provisional: the `[search.semantic] per_file_max` key replaces it once that key lands,
+/// Provisional: the `[search.vector] per_file_max` key replaces it once that key lands,
 /// and [`search_index_limits`] is the one place that reads it, so the swap is one line
 /// there and nowhere else. Three lets a module that genuinely answers the query place its
 /// overloads without one file's declarations filling the whole candidate list on their own.
-const SEMANTIC_PER_FILE_MAX: u64 = 3;
+const VECTOR_PER_FILE_MAX: u64 = 3;
 
 /// Files a workspace holds before [`PREPARATION_SPAN_LARGE`] applies.
 const PREPARATION_FILES_LARGE: u64 = 10_000;
@@ -79,11 +79,11 @@ const PREPARATION_SPAN_SMALL: WireDuration = WireDuration::from_millis(10_000);
 /// Preparing a workspace no larger than [`PREPARATION_FILES_SMALL`]: a few seconds.
 const PREPARATION_SPAN_MINIMAL: WireDuration = WireDuration::from_millis(3_000);
 
-/// Wait before a model file's second download attempt. No `[search.semantic]` key sets it;
+/// Wait before a model file's second download attempt. No `[search.vector]` key sets it;
 /// each further attempt doubles the wait up to [`MODEL_RETRY_DELAY_LIMIT`].
 const MODEL_RETRY_DELAY: Duration = Duration::from_secs(1);
 
-/// Wait no model-download retry grows past. No `[search.semantic]` key sets it: the
+/// Wait no model-download retry grows past. No `[search.vector]` key sets it: the
 /// download's own `download_timeout` is the budget an operator tunes.
 const MODEL_RETRY_DELAY_LIMIT: Duration = Duration::from_secs(30);
 
@@ -217,103 +217,146 @@ fn lexical_index_limits(search: &SearchConfiguration) -> LexicalIndexLimits {
     )
 }
 
-/// Where one `[search.semantic]` table's weights come from, and what fetching them may
-/// spend.
+/// Where one `[search.vector.embedding]` table's weights come from, and what fetching them
+/// may spend.
 #[derive(Clone, Debug)]
 struct ModelAcquisition {
     source: ModelSource,
     limits: AcquisitionLimits,
 }
 
-/// The acquisition one `[search.semantic]` table describes, or nothing when the tier is off
-/// or its `model` value is one [`ModelSource`] refuses.
+/// The acquisition bound a `directory` embedding runs under. Acquisition reads the files
+/// the workspace already holds and issues no request, so neither the timeout nor the
+/// attempt count is ever read.
+const DIRECTORY_ACQUISITION: AcquisitionLimits = AcquisitionLimits::new(
+    MODEL_RETRY_DELAY,
+    1,
+    MODEL_RETRY_DELAY,
+    MODEL_RETRY_DELAY_LIMIT,
+);
+
+/// The acquisition one `[search.vector]` table describes, or nothing when the vector
+/// ranking is off, its `model` value is one [`ModelSource`] refuses, or its embedding runs
+/// outside this release.
 ///
-/// Acceptance bounds `model` by byte length and by the form its declared source sets;
-/// `ModelSource` enforces the narrower rule. A value that passes the first and fails the
-/// second is a warning and a disabled semantic tier, never a startup failure: the workspace
-/// still has a full-text tier.
-fn model_acquisition(
-    semantic: &SemanticSearchConfiguration,
-    root: &Path,
-) -> Option<ModelAcquisition> {
-    if semantic.disabled {
+/// Acceptance bounds `model` by byte length and by the form its `kind` sets; `ModelSource`
+/// enforces the narrower rule. A value that passes the first and fails the second is a
+/// warning and a disabled vector ranking, never a startup failure: the workspace still has
+/// a full-text tier.
+fn model_acquisition(vector: &VectorSearchConfiguration, root: &Path) -> Option<ModelAcquisition> {
+    if vector.disabled {
         return None;
     }
-    let source = match semantic_model_source(semantic, root) {
-        Ok(source) => source,
-        Err(error) => {
-            let model = semantic.model.as_str();
+    let resolved = match &vector.embedding {
+        EmbeddingConfiguration::Hf {
+            model,
+            download_timeout,
+            download_attempts,
+            ..
+        } => ModelSource::repository(model).map(|source| ModelAcquisition {
+            source,
+            limits: acquisition_limits(download_timeout.milliseconds(), *download_attempts),
+        }),
+        EmbeddingConfiguration::Directory { model, .. } => {
+            ModelSource::directory(model, root).map(|source| ModelAcquisition {
+                source,
+                limits: DIRECTORY_ACQUISITION,
+            })
+        }
+        EmbeddingConfiguration::OpenaiCompatible { endpoint, .. } => {
             tracing::warn!(
                 component = "search",
                 operation = "search.prepare",
-                model,
-                error = %error,
-                "the semantic model could not be read; the workspace serves the full-text \
-                 tier alone"
+                endpoint = endpoint.as_str(),
+                "this release runs local embedding models alone; the workspace serves the \
+                 full-text tier alone"
             );
             return None;
         }
     };
-    Some(ModelAcquisition {
-        source,
-        limits: acquisition_limits(semantic),
-    })
-}
-
-/// The model one `[search.semantic]` table names, read as its `source` key declares: a hub
-/// repository, or a directory resolved against the workspace root.
-///
-/// # Errors
-///
-/// Returns `model_source_invalid` naming the value and the form that was expected.
-fn semantic_model_source(
-    semantic: &SemanticSearchConfiguration,
-    root: &Path,
-) -> Result<ModelSource, SearchError> {
-    match semantic.source {
-        SemanticSource::Hf => ModelSource::repository(&semantic.model),
-        SemanticSource::Directory => ModelSource::directory(&semantic.model, root),
+    match resolved {
+        Ok(acquisition) => Some(acquisition),
+        Err(error) => {
+            tracing::warn!(
+                component = "search",
+                operation = "search.prepare",
+                model = embedding_model(&vector.embedding),
+                error = %error,
+                "the embedding model could not be read; the workspace serves the full-text \
+                 tier alone"
+            );
+            None
+        }
     }
 }
 
-/// What one model acquisition may spend, from the `[search.semantic]` table.
+/// The model value one `[search.vector.embedding]` table names.
+fn embedding_model(embedding: &EmbeddingConfiguration) -> &str {
+    match embedding {
+        EmbeddingConfiguration::Hf { model, .. }
+        | EmbeddingConfiguration::Directory { model, .. }
+        | EmbeddingConfiguration::OpenaiCompatible { model, .. } => model.as_str(),
+    }
+}
+
+/// What one model download may spend, from the `[search.vector.embedding]` table.
 ///
 /// Acceptance bounds `download_attempts` to 1 through 10, so the clamp only guards the
 /// narrowing conversion. The retry delay and its ceiling are this release's fixed values.
-fn acquisition_limits(semantic: &SemanticSearchConfiguration) -> AcquisitionLimits {
-    let attempts = u32::try_from(semantic.download_attempts)
-        .unwrap_or(1)
-        .max(1);
+fn acquisition_limits(download_timeout_ms: u64, download_attempts: u64) -> AcquisitionLimits {
+    let attempts = u32::try_from(download_attempts).unwrap_or(1).max(1);
     AcquisitionLimits::new(
-        Duration::from_millis(semantic.download_timeout.milliseconds()),
+        Duration::from_millis(download_timeout_ms),
         attempts,
         MODEL_RETRY_DELAY,
         MODEL_RETRY_DELAY_LIMIT,
     )
 }
 
+/// The inputs one embedding pass hands the encoder and the tokens it reads from each, or
+/// nothing when the configured embedding runs outside this process and the encoder's own
+/// bounds never apply.
+const fn local_embedding_batch(embedding: &EmbeddingConfiguration) -> Option<(u64, u64)> {
+    match embedding {
+        EmbeddingConfiguration::Hf {
+            batch_inputs,
+            max_tokens,
+            ..
+        }
+        | EmbeddingConfiguration::Directory {
+            batch_inputs,
+            max_tokens,
+            ..
+        } => Some((*batch_inputs, *max_tokens)),
+        EmbeddingConfiguration::OpenaiCompatible { .. } => None,
+    }
+}
+
 /// Sizes one search index from an accepted `[search]` table and the acquisition its
-/// `[search.semantic]` half resolved to.
+/// `[search.vector]` half resolved to.
 ///
-/// `acquisition` is absent when the semantic tier is off or its `model` value could not be
-/// read; either way the tier is disabled here, so the index reports `Disabled` rather than
-/// a preparation that never runs.
+/// `acquisition` is absent when the vector ranking is off or its `model` value could not be
+/// read; either way the ranking is disabled here, so the index reports `Disabled` rather
+/// than a preparation that never runs.
 fn search_index_limits(
     search: &SearchConfiguration,
     acquisition: Option<&ModelAcquisition>,
 ) -> SearchIndexLimits {
-    let builder = SearchIndexLimits::builder(lexical_index_limits(search))
-        .weights(search.lexical.weight, search.semantic.weight)
-        .fusion_k(search.fusion_k)
-        .candidates(search.semantic.candidates)
-        .max_vectors(search.semantic.max_vectors)
-        .batch_declarations(search.semantic.batch_declarations)
-        .max_tokens(search.semantic.max_tokens)
-        .per_file_max(SEMANTIC_PER_FILE_MAX);
+    let mut builder = SearchIndexLimits::builder(lexical_index_limits(search))
+        .weights(search.ranking.lexical_weight, search.ranking.vector_weight)
+        .fusion_k(search.ranking.fusion_k)
+        .candidates(search.vector.candidates)
+        .max_vectors(search.vector.max_vectors)
+        .per_file_max(VECTOR_PER_FILE_MAX);
+    if let Some((batch_inputs, max_tokens)) = local_embedding_batch(&search.vector.embedding) {
+        builder = builder
+            .batch_declarations(batch_inputs)
+            .max_tokens(max_tokens);
+    }
     if acquisition.is_some() {
         builder.build()
     } else {
-        builder.disable_semantic().build()
+        builder.disable_vector().build()
     }
 }
 
@@ -341,7 +384,7 @@ fn open_search_index(
     }
 }
 
-/// Loads the semantic model behind the answers, so startup waits on nothing.
+/// Loads the embedding model behind the answers, so startup waits on nothing.
 ///
 /// A search arriving while this runs is answered by the full-text tier alone and carries the
 /// preparation warning. A loaded model then asks the population lane for the pass that
@@ -350,7 +393,7 @@ fn open_search_index(
 ///
 /// The task ends when the server does. It races the same cancellation token the index
 /// supervisor runs under, which the last server clone's drop guard cancels.
-fn spawn_semantic_preparation(
+fn spawn_vector_preparation(
     index: Arc<SearchIndex>,
     acquisition: ModelAcquisition,
     published: Arc<RwLock<IndexState>>,
@@ -368,7 +411,7 @@ fn spawn_semantic_preparation(
                 component = "search",
                 operation = "search.prepare",
                 error = %error,
-                "the semantic tier could not be prepared; the workspace serves the full-text \
+                "the vector ranking could not be prepared; the workspace serves the full-text \
                  tier alone for the life of this server"
             ),
         }
@@ -380,14 +423,14 @@ fn spawn_semantic_preparation(
 ///
 /// The run's first pass may already have replaced the unit set with no model held, so this
 /// request is what gives the workspace its vectors. Without it nothing would embed until
-/// the next filesystem event, and a workspace nobody writes to would never rank
-/// semantically. The lane runs that pass rather than this task, so a pass a change or the
+/// the next filesystem event, and a workspace nobody writes to would never carry a vector
+/// ranking. The lane runs that pass rather than this task, so a pass a change or the
 /// supervisor already asked for is never run twice over.
 async fn embed_prepared(published: &RwLock<IndexState>, population: &PopulationLane) {
     tracing::info!(
         component = "search",
         operation = "search.prepare",
-        "the semantic tier is prepared"
+        "the vector ranking is prepared"
     );
     let (current, _) = published.read().await.snapshot();
     population.request(current);
@@ -788,7 +831,7 @@ impl SearchRanking {
 /// bound never reach a page.
 fn ranking_of(
     searched: RevisionScoped<FusedRanking>,
-    readiness: SemanticReadiness,
+    readiness: VectorReadiness,
     files: u64,
     tree_revision: &str,
     commit_state: LexicalCommitState,
@@ -873,15 +916,15 @@ fn lexical_truncated(matches_max: u32) -> ReadWarning {
 ///
 /// `Ready` and `Disabled` add none: the first ranks with both tiers, and the second is the
 /// workspace's own decision, which a caller does not need told on every answer.
-fn readiness_warnings(readiness: SemanticReadiness, files: u64) -> Vec<ReadWarning> {
+fn readiness_warnings(readiness: VectorReadiness, files: u64) -> Vec<ReadWarning> {
     match readiness {
-        SemanticReadiness::Disabled | SemanticReadiness::Ready => Vec::new(),
-        SemanticReadiness::Preparing { prepared, total } => {
-            vec![semantic_preparing(files, prepared, total)]
+        VectorReadiness::Disabled | VectorReadiness::Ready => Vec::new(),
+        VectorReadiness::Preparing { prepared, total } => {
+            vec![vector_preparing(files, prepared, total)]
         }
-        SemanticReadiness::Unavailable => vec![ReadWarning::SemanticRankingUnavailable {
-            detail: "the semantic ranking's model could not be loaded, so the answer was \
-                     ranked lexically alone; correct `[search.semantic]` and start the \
+        VectorReadiness::Unavailable => vec![ReadWarning::VectorRankingUnavailable {
+            detail: "the vector ranking's model could not be loaded, so the answer was \
+                     ranked lexically alone; correct `[search.vector]` and start the \
                      server again"
                 .to_owned(),
         }],
@@ -889,14 +932,14 @@ fn readiness_warnings(readiness: SemanticReadiness, files: u64) -> Vec<ReadWarni
 }
 
 /// The preparation warning, with the wait scaled by what is still missing.
-fn semantic_preparing(files: u64, prepared: u64, total: u64) -> ReadWarning {
-    ReadWarning::SemanticIndexPreparing {
+fn vector_preparing(files: u64, prepared: u64, total: u64) -> ReadWarning {
+    ReadWarning::VectorIndexPreparing {
         prepared,
         total,
         ready_in: ready_in(files, prepared, total),
         detail: format!(
             "{prepared} of {total} declarations carry a vector, so the answer was ranked \
-             lexically alone; resend the request once the semantic tier has caught up"
+             lexically alone; resend the request once the vector ranking has caught up"
         ),
     }
 }
@@ -920,7 +963,7 @@ const fn preparation_span(files: u64) -> WireDuration {
     }
 }
 
-/// The wait before the semantic ranking joins an answer: the whole workspace's declared
+/// The wait before the vector ranking joins an answer: the whole workspace's declared
 /// span, scaled by the declarations still to embed over the declarations the set holds, so
 /// the value shrinks as the pass runs.
 ///
@@ -942,9 +985,9 @@ fn ready_in(files: u64, prepared: u64, total: u64) -> WireDuration {
     }
 }
 
-/// The `[search.semantic]` table every unit-test fixture in this crate declares.
+/// The `[search.vector]` table every unit-test fixture in this crate declares.
 ///
-/// Rift ships the semantic tier on, so a fixture carrying no `rift.toml` would acquire the
+/// Rift ships the vector ranking on, so a fixture carrying no `rift.toml` would acquire the
 /// default model from the hub. A hermetic suite must not write into the developer's own
 /// Hugging Face cache, and on a runner with no network a default-on tier would spend its
 /// whole retry budget inside a detached task nobody waits on. The integration suites
@@ -952,11 +995,11 @@ fn ready_in(files: u64, prepared: u64, total: u64) -> WireDuration {
 /// test are two crates, and one value shared between them would have to leave the
 /// library's public surface.
 ///
-/// Three fixtures do not use it. Two drive `[search.semantic]` themselves and neither
+/// Three fixtures do not use it. Two drive `[search.vector]` themselves and neither
 /// reaches a network. The third serves a `rift.toml` acceptance refuses, where
 /// [`RiftMcp::build`]'s own gate is what holds the acquisition back.
 #[cfg(test)]
-pub(crate) const SEMANTIC_DISABLED: &str = "[search.semantic]\ndisabled = true\n";
+pub(crate) const VECTOR_DISABLED: &str = "[search.vector]\ndisabled = true\n";
 
 /// Writes `root`'s `rift.toml`: the disabling table, then `configuration`.
 ///
@@ -968,7 +1011,7 @@ pub(crate) const SEMANTIC_DISABLED: &str = "[search.semantic]\ndisabled = true\n
 /// Returns the write's own failure.
 #[cfg(test)]
 pub(crate) fn hermetic_workspace(root: &Path, configuration: &str) -> std::io::Result<()> {
-    let contents = format!("{SEMANTIC_DISABLED}{configuration}");
+    let contents = format!("{VECTOR_DISABLED}{configuration}");
     std::fs::write(root.join("rift.toml"), contents)
 }
 
@@ -1015,7 +1058,7 @@ pub struct RiftMcp {
 }
 
 /// The search tier one server opens at startup: the index, the lanes over it, and the
-/// model acquisition the semantic ranking waits on. Every part is absent when the index
+/// model acquisition the vector ranking waits on. Every part is absent when the index
 /// could not be opened.
 struct SearchTier {
     acquisition: Option<ModelAcquisition>,
@@ -1167,7 +1210,7 @@ impl RiftMcp {
         if let (Some(index), Some(lane), Some(acquisition)) =
             (search_index.as_ref(), population.as_ref(), acquisition)
         {
-            spawn_semantic_preparation(
+            spawn_vector_preparation(
                 Arc::clone(index),
                 acquisition,
                 Arc::clone(&published),
@@ -1249,7 +1292,7 @@ impl RiftMcp {
         // tier waits for a workspace whose configuration was accepted.
         let acquisition = startup_configuration
             .is_accepted()
-            .then(|| model_acquisition(&search_configuration.semantic, root))
+            .then(|| model_acquisition(&search_configuration.vector, root))
             .flatten();
         let search_limits = search_index_limits(&search_configuration, acquisition.as_ref());
         let search_index = open_search_index(storage, search_limits);
@@ -2621,12 +2664,12 @@ mod tests {
     use rift_index::WorkspaceIndexLimits;
 
     use rift_protocol::configuration::{
-        Duration as WireDuration, LspConfiguration, SearchConfiguration,
-        SemanticSearchConfiguration, SemanticSource,
+        Duration as WireDuration, EmbeddingConfiguration, LspConfiguration, SearchConfiguration,
+        VectorSearchConfiguration,
     };
     use rift_protocol::lock::ProductIdentity;
     use rift_protocol::read::{GetSymbolResult, ReadWarning, SearchParams, SearchResult};
-    use rift_search::{FusedRanking, ModelSource, RevisionScoped, SemanticReadiness};
+    use rift_search::{FusedRanking, ModelSource, RevisionScoped, VectorReadiness};
     use rift_server::{LspProcessKey, ReadError, ReadFault};
 
     use rmcp::ServiceError;
@@ -5193,54 +5236,71 @@ mod tests {
     fn search_index_limits_carry_every_accepted_search_key() -> TestResult {
         let search = shipped_search_configuration();
         let root = std::path::Path::new("/workspace");
-        let acquisition = super::model_acquisition(&search.semantic, root)
+        let acquisition = super::model_acquisition(&search.vector, root)
             .ok_or("the shipped table must resolve an acquisition")?;
         let limits = super::search_index_limits(&search, Some(&acquisition));
-        assert!(!limits.is_semantic_disabled());
+        let EmbeddingConfiguration::Hf {
+            download_timeout,
+            batch_inputs,
+            max_tokens,
+            ..
+        } = search.vector.embedding.clone()
+        else {
+            return Err("the shipped embedding must be the hub arm".into());
+        };
+        assert!(!limits.is_vector_disabled());
         assert_eq!(limits.lexical(), super::lexical_index_limits(&search));
-        assert_eq!(limits.fusion_k(), search.fusion_k);
-        assert_eq!(limits.candidates(), search.semantic.candidates);
-        assert_eq!(limits.max_vectors(), search.semantic.max_vectors);
-        assert_eq!(
-            limits.batch_declarations(),
-            search.semantic.batch_declarations
-        );
-        assert_eq!(limits.max_tokens(), search.semantic.max_tokens);
+        assert_eq!(limits.fusion_k(), search.ranking.fusion_k);
+        assert_eq!(limits.candidates(), search.vector.candidates);
+        assert_eq!(limits.max_vectors(), search.vector.max_vectors);
+        assert_eq!(limits.batch_declarations(), batch_inputs);
+        assert_eq!(limits.max_tokens(), max_tokens);
         assert_eq!(
             limits.per_file_max(),
             3,
             "no key sets the per-file candidate bound yet"
         );
-        assert!((limits.lexical_weight() - search.lexical.weight).abs() < f64::EPSILON);
-        assert!((limits.semantic_weight() - search.semantic.weight).abs() < f64::EPSILON);
+        assert!((limits.lexical_weight() - search.ranking.lexical_weight).abs() < f64::EPSILON);
+        assert!((limits.vector_weight() - search.ranking.vector_weight).abs() < f64::EPSILON);
         assert_eq!(acquisition.limits.attempts(), 3);
         assert_eq!(
             acquisition.limits.timeout(),
-            Duration::from_millis(search.semantic.download_timeout.milliseconds())
+            Duration::from_millis(download_timeout.milliseconds())
         );
         Ok(())
     }
 
     #[test]
-    fn a_disabled_semantic_tier_resolves_no_acquisition_and_disables_the_index() {
+    fn a_disabled_vector_ranking_resolves_no_acquisition_and_disables_the_index() {
         let mut search = shipped_search_configuration();
-        search.semantic.disabled = true;
+        search.vector.disabled = true;
         let root = std::path::Path::new("/workspace");
-        assert!(super::model_acquisition(&search.semantic, root).is_none());
+        assert!(super::model_acquisition(&search.vector, root).is_none());
         let limits = super::search_index_limits(&search, None);
         assert!(
-            limits.is_semantic_disabled(),
-            "an unresolved acquisition must disable the tier rather than leave it preparing"
+            limits.is_vector_disabled(),
+            "an unresolved acquisition must disable the ranking rather than leave it preparing"
         );
     }
 
+    /// One `[search.vector]` table carrying `embedding`, every other key defaulted.
+    fn vector_with(embedding: EmbeddingConfiguration) -> VectorSearchConfiguration {
+        VectorSearchConfiguration {
+            embedding,
+            ..VectorSearchConfiguration::default()
+        }
+    }
+
     #[test]
-    fn each_semantic_source_reads_its_own_model_form() -> TestResult {
+    fn each_embedding_kind_reads_its_own_model_form() -> TestResult {
         let root = std::path::Path::new("/workspace");
-        let hub = SemanticSearchConfiguration {
+        let hub = vector_with(EmbeddingConfiguration::Hf {
             model: "BAAI/bge-small-en-v1.5@dd0a482".to_owned(),
-            ..SemanticSearchConfiguration::default()
-        };
+            download_timeout: WireDuration::from_millis(300_000),
+            download_attempts: 3,
+            batch_inputs: 32,
+            max_tokens: 256,
+        });
         let acquired =
             super::model_acquisition(&hub, root).ok_or("a hub repository must resolve")?;
         assert_eq!(
@@ -5250,11 +5310,11 @@ mod tests {
                 revision: "dd0a482".to_owned(),
             }
         );
-        let held = SemanticSearchConfiguration {
-            source: SemanticSource::Directory,
+        let held = vector_with(EmbeddingConfiguration::Directory {
             model: "models/bge".to_owned(),
-            ..SemanticSearchConfiguration::default()
-        };
+            batch_inputs: 32,
+            max_tokens: 256,
+        });
         let acquired =
             super::model_acquisition(&held, root).ok_or("a held directory must resolve")?;
         assert_eq!(
@@ -5263,6 +5323,31 @@ mod tests {
             "a directory model resolves against the workspace root"
         );
         Ok(())
+    }
+
+    #[test]
+    fn an_openai_compatible_embedding_resolves_no_local_acquisition() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let remote = vector_with(EmbeddingConfiguration::OpenaiCompatible {
+            endpoint: "https://api.openai.com/v1".to_owned(),
+            model: "text-embedding-3-small".to_owned(),
+            revision: "2024-01-25".to_owned(),
+            dimensions: 1_536,
+            api_key_env: "OPENAI_API_KEY".to_owned(),
+            request_timeout: WireDuration::from_millis(30_000),
+            attempts: 3,
+            batch_inputs: 64,
+            max_in_flight: 4,
+        });
+        let root = std::path::Path::new("/workspace");
+        assert!(
+            super::model_acquisition(&remote, root).is_none(),
+            "this release runs local embedding models alone"
+        );
     }
 
     #[tokio::test]
@@ -5274,13 +5359,13 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
         // Acceptance's path rule allows an empty segment; `ModelSource` refuses one, so this
         // value passes the first gate and fails the second.
-        let refused = SemanticSearchConfiguration {
-            source: SemanticSource::Directory,
+        let refused = vector_with(EmbeddingConfiguration::Directory {
             model: "models//bge".to_owned(),
-            ..SemanticSearchConfiguration::default()
-        };
+            batch_inputs: 32,
+            max_tokens: 256,
+        });
         assert!(
-            super::semantic_model_source(&refused, std::path::Path::new("/workspace")).is_err(),
+            ModelSource::directory("models//bge", std::path::Path::new("/workspace")).is_err(),
             "the model value must be one ModelSource refuses"
         );
         assert!(super::model_acquisition(&refused, std::path::Path::new("/workspace")).is_none());
@@ -5288,7 +5373,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let rift_toml = directory.path().join("rift.toml");
-        let table = "[search.semantic]\nsource = \"directory\"\nmodel = \"models//bge\"\n";
+        let table = "[search.vector.embedding]\nkind = \"directory\"\nmodel = \"models//bge\"\n";
         fs::write(rift_toml, table)?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         let index = server
@@ -5297,7 +5382,7 @@ mod tests {
             .ok_or("a refused model must not stop the search index from opening")?;
         assert_eq!(
             index.readiness(),
-            SemanticReadiness::Disabled,
+            VectorReadiness::Disabled,
             "a refused model disables the tier rather than leaving it preparing"
         );
         // The run's first pass lands after `build` returns, and until it does the answer
@@ -5327,7 +5412,7 @@ mod tests {
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         // The table naming the model is the very part acceptance could not read.
         let rift_toml = directory.path().join("rift.toml");
-        fs::write(rift_toml, "[search.semantic]\nnot_a_key = 1\n")?;
+        fs::write(rift_toml, "[search.vector]\nnot_a_key = 1\n")?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         let index = server
             .search_index
@@ -5335,7 +5420,7 @@ mod tests {
             .ok_or("an invalid configuration must not stop the search index from opening")?;
         assert_eq!(
             index.readiness(),
-            SemanticReadiness::Disabled,
+            VectorReadiness::Disabled,
             "a server that answers nothing must not spend a download first"
         );
         Ok(())
@@ -5355,7 +5440,7 @@ mod tests {
         // refuses without reaching a network.
         fs::create_dir_all(directory.path().join("weights"))?;
         let rift_toml = directory.path().join("rift.toml");
-        let table = "[search.semantic]\nsource = \"directory\"\nmodel = \"weights\"\n";
+        let table = "[search.vector.embedding]\nkind = \"directory\"\nmodel = \"weights\"\n";
         fs::write(rift_toml, table)?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         // Preparation runs behind startup, so poll for its verdict under a bound rather
@@ -5365,7 +5450,7 @@ mod tests {
             let refused = result
                 .warnings
                 .iter()
-                .any(|warning| matches!(warning, ReadWarning::SemanticRankingUnavailable { .. }));
+                .any(|warning| matches!(warning, ReadWarning::VectorRankingUnavailable { .. }));
             if refused {
                 assert!(
                     !result.results.is_empty(),
@@ -5392,7 +5477,7 @@ mod tests {
         assert!(
             super::ranking_of(
                 RevisionScoped::OtherRevision("aaaaaaaa".to_owned()),
-                SemanticReadiness::Ready,
+                VectorReadiness::Ready,
                 10,
                 "bbbbbbbb",
                 LexicalCommitState::Settled,
@@ -5407,7 +5492,7 @@ mod tests {
     fn a_settled_store_holding_no_tree_warns_that_it_will_not_answer() -> TestResult {
         let ranking = super::ranking_of(
             RevisionScoped::NoRevision,
-            SemanticReadiness::Ready,
+            VectorReadiness::Ready,
             10,
             "bbbbbbbb",
             LexicalCommitState::Settled,
@@ -5429,7 +5514,7 @@ mod tests {
         ] {
             let ranking = super::ranking_of(
                 searched,
-                SemanticReadiness::Ready,
+                VectorReadiness::Ready,
                 10,
                 "bbbbbbbb",
                 LexicalCommitState::Committing,
@@ -5450,7 +5535,7 @@ mod tests {
     fn a_store_owed_a_whole_replace_warns_that_it_missed_a_commit() -> TestResult {
         let ranking = super::ranking_of(
             RevisionScoped::OtherRevision("aaaaaaaa".to_owned()),
-            SemanticReadiness::Ready,
+            VectorReadiness::Ready,
             10,
             "bbbbbbbb",
             LexicalCommitState::Owed {
@@ -5472,7 +5557,7 @@ mod tests {
     fn a_matched_store_ranks_its_units_and_carries_the_readiness_warning() -> TestResult {
         let ranking = super::ranking_of(
             RevisionScoped::Matched(FusedRanking::new(Vec::new(), None)),
-            SemanticReadiness::Preparing {
+            VectorReadiness::Preparing {
                 prepared: 1,
                 total: 4,
             },
@@ -5483,7 +5568,7 @@ mod tests {
         .ok_or("a matched store ranks")?;
         assert!(ranking.units.is_empty());
         let warnings = serde_json::to_value(&ranking.warnings)?;
-        assert_eq!(warnings[0]["code"], json!("semantic_index_preparing"));
+        assert_eq!(warnings[0]["code"], json!("vector_index_preparing"));
         assert_eq!(
             ranking.warnings.len(),
             1,
@@ -5496,7 +5581,7 @@ mod tests {
     fn a_matched_store_cut_at_its_bound_carries_the_truncation_warning() -> TestResult {
         let ranking = super::ranking_of(
             RevisionScoped::Matched(FusedRanking::new(Vec::new(), Some(1_000))),
-            SemanticReadiness::Ready,
+            VectorReadiness::Ready,
             10,
             "bbbbbbbb",
             LexicalCommitState::Settled,
@@ -5544,29 +5629,29 @@ mod tests {
     #[test]
     fn each_readiness_state_produces_its_own_warning() {
         assert_eq!(
-            super::readiness_warnings(SemanticReadiness::Ready, 10),
+            super::readiness_warnings(VectorReadiness::Ready, 10),
             Vec::new()
         );
         assert_eq!(
-            super::readiness_warnings(SemanticReadiness::Disabled, 10),
+            super::readiness_warnings(VectorReadiness::Disabled, 10),
             Vec::new()
         );
-        let unavailable = super::readiness_warnings(SemanticReadiness::Unavailable, 10);
+        let unavailable = super::readiness_warnings(VectorReadiness::Unavailable, 10);
         assert!(matches!(
             unavailable.as_slice(),
-            [ReadWarning::SemanticRankingUnavailable { .. }]
+            [ReadWarning::VectorRankingUnavailable { .. }]
         ));
-        let readiness = SemanticReadiness::Preparing {
+        let readiness = VectorReadiness::Preparing {
             prepared: 1,
             total: 4,
         };
-        let expected = ReadWarning::SemanticIndexPreparing {
+        let expected = ReadWarning::VectorIndexPreparing {
             prepared: 1,
             total: 4,
             // Three of four declarations left is three quarters of a small workspace's span.
             ready_in: WireDuration::from_millis(2_250),
             detail: "1 of 4 declarations carry a vector, so the answer was ranked lexically \
-                     alone; resend the request once the semantic tier has caught up"
+                     alone; resend the request once the vector ranking has caught up"
                 .to_owned(),
         };
         assert_eq!(super::readiness_warnings(readiness, 10), vec![expected]);

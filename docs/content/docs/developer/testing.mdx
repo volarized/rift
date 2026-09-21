@@ -5,7 +5,7 @@ title: Testing
 <VersionBadge version="v0.0.35" />
 
 Unit tests run on pull requests and pushes to `main`. Integration tests run after a merge to
-`main` and on manual dispatch, with live language engines and semantic models, and pinned Next.js, Bun, and FastAPI repositories.
+`main` and on manual dispatch, with live language engines and embedding models, and pinned Next.js, Bun, and FastAPI repositories.
 
 ## Unit tests
 
@@ -87,7 +87,7 @@ A repin must update the recorded measurements.
 Corpus checks cover search, symbol lookup, syntax reads, history, and shutdown. They also create
 and remove source files outside Rift, compare later reads with those bytes, and verify that
 unrelated persisted lexical rows remain unchanged. They serve the
-same source and dependency configuration used by a workspace. Semantic model downloads stay
+same source and dependency configuration used by a workspace. Embedding model downloads stay
 disabled for corpus runs, so repository checks measure source and lexical indexing.
 
 The Next.js churn case writes a probe declaration every two seconds while `search`, `get_symbol`,

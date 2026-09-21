@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Hybrid lexical and semantic search for Rift"
+description = "Hybrid lexical and vector search for Rift"
 
 [lints]
 workspace = true

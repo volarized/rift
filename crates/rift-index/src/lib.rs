@@ -38,7 +38,7 @@ pub use relationship::{
     RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore, produced_relationship_facets,
 };
 pub use revision::RevisionPaths;
-pub use vector::{SemanticVectorStore, StoredVector};
+pub use vector::{StoredVector, VectorStore};
 pub use workspace::{
     IndexedFile, ReadableSymbol, SymbolMatch, SymbolMatchRank, TextSourceFile,
     WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexFault,

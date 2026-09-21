@@ -45,12 +45,12 @@ const PINNED_PORT_CONFIGURATION: &str = r"
 port = 11777
 ";
 
-/// One workspace whose `rift.toml` turns the semantic tier off and then carries
+/// One workspace whose `rift.toml` turns the vector ranking off and then carries
 /// `configuration`, so a suite about ports never reaches the model hub.
 fn workspace_with(configuration: Option<&str>) -> TestResult<tempfile::TempDir> {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-    let mut contents = hermetic_search::SEMANTIC_DISABLED.to_owned();
+    let mut contents = hermetic_search::VECTOR_DISABLED.to_owned();
     if let Some(configuration) = configuration {
         contents.push_str(configuration);
     }

@@ -26,7 +26,7 @@ use crate::lexical::{
 };
 use crate::lexical::{LexicalIndexStateRecord, LexicalUnitRecord};
 use crate::log::LogRecordRow;
-use crate::vector::SemanticVectorRecord;
+use crate::vector::VectorRecord;
 
 /// Connection count and lock-wait bounds for one database file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,7 +95,7 @@ impl WorkspaceDatabase {
             .models(toasty::models!(
                 LexicalUnitRecord,
                 LexicalIndexStateRecord,
-                SemanticVectorRecord,
+                VectorRecord,
                 LogRecordRow
             ))
             .max_pool_size(bound_as_usize(pool.slots()));

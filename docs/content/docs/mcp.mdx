@@ -51,10 +51,10 @@ the tree moved in recorded files outside the syntax-indexed ones or in the confi
 
 The search ranking tiers carry their own warnings:
 
-- `semantic_index_preparing` - the semantic ranking is still being built. A query sharing no
+- `vector_index_preparing` - the vector ranking is still being built. A query sharing no
   token with the code it describes reaches nothing until every declaration carries a vector;
   `prepared` and `total` state how far that has got.
-- `semantic_ranking_unavailable` - the semantic ranking will not answer for the life of this
+- `vector_ranking_unavailable` - the vector ranking will not answer for the life of this
   server: the model weights could not be acquired, or the model failed to load.
 - `lexical_ranking_unavailable` - the full-text tier has not yet committed the captured tree,
   missed a commit, failed to load, or holds no indexed tree; the `detail` names which, and the

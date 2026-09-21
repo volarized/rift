@@ -73,7 +73,7 @@ async fn source_exclude_drops_an_already_indexed_file_from_get_symbol_and_the_le
     )?;
     fs::write(
         directory.path().join("rift.toml"),
-        hermetic_search::SEMANTIC_DISABLED,
+        hermetic_search::VECTOR_DISABLED,
     )?;
     let client = client_for(directory.path()).await?;
 
@@ -107,7 +107,7 @@ async fn source_exclude_drops_an_already_indexed_file_from_get_symbol_and_the_le
     // `[source].exclude` now names both already-indexed files.
     let excluded_configuration = format!(
         "{}\n[source]\nexclude = [\"phantom_symbol.rs\", \"phantom_notes.txt\"]\n",
-        hermetic_search::SEMANTIC_DISABLED
+        hermetic_search::VECTOR_DISABLED
     );
     fs::write(directory.path().join("rift.toml"), excluded_configuration)?;
 
@@ -157,7 +157,7 @@ async fn force_include_still_reaches_a_file_source_exclude_dropped() -> TestResu
     )?;
     let excluded_configuration = format!(
         "{}\n[source]\nexclude = [\"phantom_symbol.rs\"]\n",
-        hermetic_search::SEMANTIC_DISABLED
+        hermetic_search::VECTOR_DISABLED
     );
     fs::write(directory.path().join("rift.toml"), excluded_configuration)?;
     let client = client_for(directory.path()).await?;
@@ -213,7 +213,7 @@ async fn source_force_include_reaches_a_gitignored_file_on_the_next_request() ->
     )?;
     fs::write(
         directory.path().join("rift.toml"),
-        hermetic_search::SEMANTIC_DISABLED,
+        hermetic_search::VECTOR_DISABLED,
     )?;
     let client = client_for(directory.path()).await?;
 
@@ -233,7 +233,7 @@ async fn source_force_include_reaches_a_gitignored_file_on_the_next_request() ->
 
     let forcing_configuration = format!(
         "{}\n[source]\nforce_include = [\"notes/**\"]\n",
-        hermetic_search::SEMANTIC_DISABLED
+        hermetic_search::VECTOR_DISABLED
     );
     fs::write(directory.path().join("rift.toml"), forcing_configuration)?;
 
@@ -268,7 +268,7 @@ async fn source_exclude_wins_over_source_force_include() -> TestResult {
     )?;
     let configuration = format!(
         "{}\n[source]\nexclude = [\"notes/**\"]\nforce_include = [\"notes/**\"]\n",
-        hermetic_search::SEMANTIC_DISABLED
+        hermetic_search::VECTOR_DISABLED
     );
     fs::write(directory.path().join("rift.toml"), configuration)?;
     let client = client_for(directory.path()).await?;

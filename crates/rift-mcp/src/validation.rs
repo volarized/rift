@@ -28,7 +28,7 @@ use rift_protocol::dependencies::DependenciesConfiguration;
 use rift_protocol::error as wire;
 use rift_protocol::map::WorkspaceMap;
 use rift_protocol::source::SourceConfiguration;
-use rift_search::{Embedding, SearchError, SearchIndex, SemanticReadiness};
+use rift_search::{Embedding, SearchError, SearchIndex, VectorReadiness};
 use rift_server::{
     CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, LspProcessKey, PackageBranch, ReadError,
     ReadFault, ReadService, load_configuration,
@@ -1439,7 +1439,7 @@ fn shared_workspace_candidate(
     })
 }
 
-/// Embeds the declarations `published` describes, so the semantic tier ranks the tree the
+/// Embeds the declarations `published` describes, so the vector ranking ranks the tree the
 /// lexical index already holds.
 ///
 /// The lexical set is not written here. The lexical lane commits it in publication order,
@@ -1451,9 +1451,9 @@ fn shared_workspace_candidate(
 /// stored. A store this process found on disk was written by an earlier one, possibly under
 /// another model, so the first pass of a run establishes rather than trusts.
 ///
-/// Population failure is a warning, never a request failure: the semantic tier reports its
+/// Population failure is a warning, never a request failure: the vector ranking reports its
 /// own readiness, and the next successful publication asks for another pass.
-/// A disabled semantic tier still reports chunked files, then skips declaration derivation.
+/// A disabled vector ranking still reports chunked files, then skips declaration derivation.
 ///
 /// # Cancel safety
 ///
@@ -1474,7 +1474,7 @@ pub(crate) async fn populate_search(
              in [source], or increase search.text.max_chunk, to avoid this"
         );
     }
-    if index.readiness() == SemanticReadiness::Disabled {
+    if index.readiness() == VectorReadiness::Disabled {
         return;
     }
     let units = published.reads.lexical_units();
@@ -1489,7 +1489,7 @@ pub(crate) async fn populate_search(
             operation = "search.populate",
             tree_revision = published.reads.tree_revision(),
             error = %error,
-            "the semantic tier could not embed this publication; the full-text tier keeps \
+            "the vector ranking could not embed this publication; the full-text tier keeps \
              answering until a later pass lands"
         );
     }
@@ -2144,7 +2144,7 @@ fn lexical_unavailable(detail: &str) -> ReadError {
 /// was handed rather than a backlog of superseded ones.
 ///
 /// An answer computed while a pass is pending needs nothing new: the lexical tier already
-/// holds the published tree, and the semantic tier ranks nothing until the pass for that
+/// holds the published tree, and the vector ranking ranks nothing until the pass for that
 /// tree publishes its corpus.
 #[derive(Clone, Debug)]
 pub(crate) struct PopulationLane {
@@ -3068,7 +3068,7 @@ pub(crate) mod tests {
     use notify::{Event, EventKind};
     use rift_index::{LexicalChange, LexicalIndexLimits, WorkspaceIndexLimits};
     use rift_protocol::configuration::ServerConfiguration;
-    use rift_search::{RevisionScoped, SearchIndex, SearchIndexLimits, SemanticReadiness};
+    use rift_search::{RevisionScoped, SearchIndex, SearchIndexLimits, VectorReadiness};
     use rift_server::ReadFault;
     use tokio::sync::{Barrier as AsyncBarrier, RwLock};
     use tokio_util::sync::CancellationToken;
@@ -4862,9 +4862,7 @@ pub(crate) mod tests {
             defaults.pool_slots(),
             defaults.busy_timeout_ms(),
         );
-        let limits = SearchIndexLimits::builder(lexical)
-            .disable_semantic()
-            .build();
+        let limits = SearchIndexLimits::builder(lexical).disable_vector().build();
         Ok(SearchIndex::open(database, limits).await?)
     }
 
@@ -5907,7 +5905,7 @@ pub(crate) mod tests {
     /// # Errors
     ///
     /// Returns the stamp the store still carried once the bound runs out.
-    /// One index whose semantic tier is enabled but holds no model, so a pass records the
+    /// One index whose vector ranking is enabled but holds no model, so a pass records the
     /// declaration count it was handed as its readiness rather than embedding anything.
     ///
     /// That count is the population lane's observable: with the tier disabled a pass leaves
@@ -5917,7 +5915,7 @@ pub(crate) mod tests {
         let index = SearchIndex::open(database, limits).await?;
         assert_eq!(
             index.readiness(),
-            SemanticReadiness::Preparing {
+            VectorReadiness::Preparing {
                 prepared: 0,
                 total: 0
             }
@@ -5942,7 +5940,7 @@ pub(crate) mod tests {
     /// Waits until the lane's readiness names `total` declarations.
     async fn described_within_bound(index: &SearchIndex, total: u64) -> TestResult {
         for _attempt in 0..LANE_ATTEMPTS_MAX {
-            if index.readiness() == (SemanticReadiness::Preparing { prepared: 0, total }) {
+            if index.readiness() == (VectorReadiness::Preparing { prepared: 0, total }) {
                 return Ok(());
             }
             tokio::time::sleep(LANE_POLL).await;
@@ -6039,7 +6037,7 @@ pub(crate) mod tests {
         lane.request(Arc::clone(&newest));
         assert_eq!(
             index.readiness(),
-            SemanticReadiness::Preparing {
+            VectorReadiness::Preparing {
                 prepared: 0,
                 total: described
             },
@@ -6082,7 +6080,7 @@ pub(crate) mod tests {
         let subscriber = tracing_subscriber::registry().with(sink);
         let _guard = tracing::subscriber::set_default(subscriber);
         super::populate_search(&index, &published, rift_search::Embedding::Every).await;
-        assert_eq!(index.readiness(), SemanticReadiness::Disabled);
+        assert_eq!(index.readiness(), VectorReadiness::Disabled);
         assert_eq!(index.tree_revision().await?.as_deref(), Some(revision));
         assert_eq!(ranked_at(&index, revision, "beacon", 8).await?, before);
         let records = queued_records(&mut drain);
@@ -6092,21 +6090,21 @@ pub(crate) mod tests {
                 record.message().contains("was indexed in chunks")
                     && record.fields().contains("guide.txt")
             })
-            .ok_or("disabled semantics must still report the chunked guide")?;
+            .ok_or("a disabled vector ranking must still report the chunked guide")?;
         assert_eq!(warning.level(), "warn");
         assert_eq!(warning.component(), "search");
         cancellation.cancel();
         Ok(())
     }
 
-    /// One search index over `database` with the semantic tier off, so a test drives the
+    /// One search index over `database` with the vector ranking off, so a test drives the
     /// full-text half without acquiring model weights.
     async fn search_index(database: &std::path::Path) -> TestResult<SearchIndex> {
         let limits = SearchIndexLimits::builder(LexicalIndexLimits::default())
-            .disable_semantic()
+            .disable_vector()
             .build();
         let index = SearchIndex::open(database, limits).await?;
-        assert_eq!(index.readiness(), SemanticReadiness::Disabled);
+        assert_eq!(index.readiness(), VectorReadiness::Disabled);
         Ok(index)
     }
 

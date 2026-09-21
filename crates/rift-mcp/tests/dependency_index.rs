@@ -565,7 +565,7 @@ async fn raising_package_files_after_a_refusal_reindexes_on_the_next_request() -
         directory.path().join("rift.toml"),
         format!(
             "{}[dependencies]\npackage_files = 2000\n",
-            hermetic_search::SEMANTIC_DISABLED
+            hermetic_search::VECTOR_DISABLED
         ),
     )?;
     let answer = call_retrying_acceptance(

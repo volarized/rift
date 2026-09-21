@@ -70,8 +70,8 @@ name = "index_bounds"
 path = "tests/index_bounds.rs"
 
 [[test]]
-name = "live_semantic_search"
-path = "tests/live_semantic_search.rs"
+name = "live_vector_search"
+path = "tests/live_vector_search.rs"
 
 [[test]]
 name = "map_resource"

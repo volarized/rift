@@ -50,8 +50,8 @@ pub enum MatchedField {
     /// The file's contents matched.
     Content,
     /// The ranked lane placed the hit; no field match proves the query's literal bytes
-    /// appear. The lane ranks whether or not `[search.semantic]` is enabled, so this member
-    /// names the lane rather than the tier that may or may not have contributed to it.
+    /// appear. The lane ranks whether or not `[search.vector]` is enabled, so this member
+    /// names the lane rather than the ranking that may or may not have contributed to it.
     Ranked,
     /// The project-relative path matched.
     Path,

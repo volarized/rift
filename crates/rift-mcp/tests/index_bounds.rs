@@ -125,7 +125,7 @@ async fn a_workspace_past_units_max_serves_and_search_names_the_key() -> TestRes
     for (name, source) in unit_files() {
         fs::write(directory.path().join(name), source)?;
     }
-    let mut configuration = hermetic_search::SEMANTIC_DISABLED.to_owned();
+    let mut configuration = hermetic_search::VECTOR_DISABLED.to_owned();
     configuration.push_str(UNITS_MAX_CONFIGURATION);
     fs::write(directory.path().join("rift.toml"), configuration)?;
     let (client, server_task) = served_root(directory.path()).await?;
@@ -283,7 +283,7 @@ async fn a_workspace_past_workspace_size_refuses_to_build_naming_the_key() -> Te
     for (name, source) in workspace_files() {
         fs::write(directory.path().join(name), source)?;
     }
-    let mut configuration = hermetic_search::SEMANTIC_DISABLED.to_owned();
+    let mut configuration = hermetic_search::VECTOR_DISABLED.to_owned();
     configuration.push_str(WORKSPACE_SIZE_CONFIGURATION);
     fs::write(directory.path().join("rift.toml"), configuration)?;
 
@@ -309,7 +309,7 @@ async fn the_same_workspace_serves_under_the_default_workspace_size_and_a_change
     let answer = search_page(&client, "beacon").await?;
     assert!(hit_paths(&answer).contains(&"lib.rs"), "{answer:#}");
 
-    let mut lowered = hermetic_search::SEMANTIC_DISABLED.to_owned();
+    let mut lowered = hermetic_search::VECTOR_DISABLED.to_owned();
     lowered.push_str(WORKSPACE_SIZE_CONFIGURATION);
     fs::write(directory.path().join("rift.toml"), lowered)?;
     // The rebuild under the lowered bound fails, and the read answers from the last
@@ -327,7 +327,7 @@ async fn the_same_workspace_serves_under_the_default_workspace_size_and_a_change
     // recovery is polled under a bound rather than asserted on the next request.
     fs::write(
         directory.path().join("rift.toml"),
-        hermetic_search::SEMANTIC_DISABLED,
+        hermetic_search::VECTOR_DISABLED,
     )?;
     search_until(
         &client,

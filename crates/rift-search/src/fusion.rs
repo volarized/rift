@@ -1,6 +1,6 @@
 //! Weighted reciprocal rank fusion, and the two per-file aggregations it feeds.
 //!
-//! The lexical and the semantic tier score in different units: one is a BM25
+//! The lexical and the vector ranking score in different units: one is a BM25
 //! rank, the other a cosine. Neither is comparable to the other, and neither
 //! becomes comparable by rescaling. What both tiers agree on is the position
 //! they put a candidate in, so fusion reads positions alone:
@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rift_core::ProjectPath;
 
 use crate::error::{SearchError, SearchFault, SearchViolation};
-use crate::similarity::SemanticMatch;
+use crate::similarity::VectorMatch;
 
 /// One ranking handed to fusion: the share it carries of a fused score, and
 /// the identities it ranked, best first.
@@ -216,17 +216,17 @@ fn strongest_first(one: &FusedRank, other: &FusedRank) -> Ordering {
         .then_with(|| one.identity.cmp(&other.identity))
 }
 
-/// One semantic match together with the file whose declaration produced it.
+/// One vector match together with the file whose declaration produced it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DeclarationMatch {
     file: ProjectPath,
-    matched: SemanticMatch,
+    matched: VectorMatch,
 }
 
 impl DeclarationMatch {
-    /// Pairs one semantic match with the file its declaration lives in.
+    /// Pairs one vector match with the file its declaration lives in.
     #[must_use]
-    pub const fn new(file: ProjectPath, matched: SemanticMatch) -> Self {
+    pub const fn new(file: ProjectPath, matched: VectorMatch) -> Self {
         Self { file, matched }
     }
 
@@ -238,7 +238,7 @@ impl DeclarationMatch {
 
     /// The match that declaration reached.
     #[must_use]
-    pub const fn matched(&self) -> &SemanticMatch {
+    pub const fn matched(&self) -> &VectorMatch {
         &self.matched
     }
 }
@@ -246,7 +246,7 @@ impl DeclarationMatch {
 /// Collapses `matches` to one entry per file, keeping the best similarity any
 /// declaration in that file reached.
 ///
-/// A file's semantic rank is the best its declarations reached: a query that
+/// A file's vector rank is the best its declarations reached: a query that
 /// matched one function has matched the file that holds it, and the file's
 /// other declarations say nothing about that.
 ///
@@ -321,7 +321,7 @@ mod tests {
         DeclarationMatch, FusedRank, Ranking, as_f64, contribution, divisor, keep_better,
         strongest_file_first, strongest_first, weights_refusal, weights_sum,
     };
-    use crate::similarity::SemanticMatch;
+    use crate::similarity::VectorMatch;
     use rift_core::ProjectPath;
     use std::cmp::Ordering;
     use std::collections::BTreeMap;
@@ -342,7 +342,7 @@ mod tests {
         let file = ProjectPath::new(path.to_owned())?;
         Ok(DeclarationMatch::new(
             file,
-            SemanticMatch::new(digest.to_owned(), similarity),
+            VectorMatch::new(digest.to_owned(), similarity),
         ))
     }
 

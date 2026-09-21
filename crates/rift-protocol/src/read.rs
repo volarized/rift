@@ -907,25 +907,25 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
-    /// The semantic ranking is still being built, so the answer was ranked lexically alone.
+    /// The vector ranking is still being built, so the answer was ranked lexically alone.
     /// `prepared` and `total` state how many declarations already carry a vector, and
     /// `ready_in` is derived from workspace size and embedding progress.
-    SemanticIndexPreparing {
+    VectorIndexPreparing {
         /// Declarations that already carry a vector.
         prepared: u64,
         /// Declarations the published set holds.
         total: u64,
-        /// Estimated wait before the semantic ranking joins an answer, not a measurement
+        /// Estimated wait before the vector ranking joins an answer, not a measurement
         /// of this machine. A caller may report it and must not schedule against it.
         ready_in: Duration,
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
         detail: String,
     },
-    /// The semantic ranking will not answer for the life of this server, so every answer
-    /// is ranked lexically alone. No retry is coming: fix the `[search.semantic]`
+    /// The vector ranking will not answer for the life of this server, so every answer
+    /// is ranked lexically alone. No retry is coming: fix the `[search.vector]`
     /// configuration and start the server again.
-    SemanticRankingUnavailable {
+    VectorRankingUnavailable {
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
         detail: String,
@@ -2177,26 +2177,26 @@ mod tests {
     fn every_tier_warning_round_trips_under_its_code_tag() {
         let cases = [
             (
-                ReadWarning::SemanticIndexPreparing {
+                ReadWarning::VectorIndexPreparing {
                     prepared: 1_200,
                     total: 4_800,
                     ready_in: Duration::from_millis(45_000),
-                    detail: "Semantic search is being prepared".to_owned(),
+                    detail: "Vector search is being prepared".to_owned(),
                 },
                 json!({
-                    "code": "semantic_index_preparing",
+                    "code": "vector_index_preparing",
                     "prepared": 1_200,
                     "total": 4_800,
                     "ready_in": "45s",
-                    "detail": "Semantic search is being prepared",
+                    "detail": "Vector search is being prepared",
                 }),
             ),
             (
-                ReadWarning::SemanticRankingUnavailable {
+                ReadWarning::VectorRankingUnavailable {
                     detail: "the model weights could not be acquired".to_owned(),
                 },
                 json!({
-                    "code": "semantic_ranking_unavailable",
+                    "code": "vector_ranking_unavailable",
                     "detail": "the model weights could not be acquired",
                 }),
             ),
@@ -2358,8 +2358,8 @@ mod tests {
             .collect();
         for code in [
             "stale_index",
-            "semantic_index_preparing",
-            "semantic_ranking_unavailable",
+            "vector_index_preparing",
+            "vector_ranking_unavailable",
             "lexical_ranking_unavailable",
             "lexical_ranking_truncated",
             "results_truncated",

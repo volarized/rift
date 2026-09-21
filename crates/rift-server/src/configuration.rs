@@ -264,12 +264,13 @@ max_concurrent = 2
 enabled = true
 max_revisions = 500
 
-[search.lexical]
-weight = 0.6
+[search.ranking]
+identifier_weight = 0.3
+lexical_weight = 0.6
+vector_weight = 0.4
 
-[search.semantic]
-weight = 0.4
-source = "hf"
+[search.vector.embedding]
+kind = "hf"
 model = "BAAI/bge-small-en-v1.5"
 download_timeout = "5m"
 "#;
@@ -280,17 +281,26 @@ download_timeout = "5m"
             configuration.execution.max_code,
             ByteSize::from_bytes(16 << 10)
         );
-        assert!((configuration.search.lexical.weight - 0.6).abs() < f64::EPSILON);
-        assert!((configuration.search.semantic.weight - 0.4).abs() < f64::EPSILON);
-        assert_eq!(configuration.search.semantic.source, SemanticSource::Hf);
+        let ranking = &configuration.search.ranking;
+        assert!((ranking.identifier_weight - 0.3).abs() < f64::EPSILON);
+        assert!((ranking.lexical_weight - 0.6).abs() < f64::EPSILON);
+        assert!((ranking.vector_weight - 0.4).abs() < f64::EPSILON);
         assert_eq!(
-            configuration.search.semantic.model,
-            "BAAI/bge-small-en-v1.5"
+            configuration.search.vector.embedding,
+            EmbeddingConfiguration::Hf {
+                model: "BAAI/bge-small-en-v1.5".to_owned(),
+                download_timeout: Duration::from_millis(300_000),
+                download_attempts: 3,
+                batch_inputs: 32,
+                max_tokens: 256,
+            }
         );
     }
 
     use super::*;
-    use rift_protocol::configuration::{ByteSize, SemanticSource, WorkspaceConfiguration};
+    use rift_protocol::configuration::{
+        ByteSize, Duration, EmbeddingConfiguration, WorkspaceConfiguration,
+    };
 
     #[test]
     fn test_missing_file_is_the_default_configuration() {
@@ -301,12 +311,12 @@ download_timeout = "5m"
     }
 
     #[test]
-    fn test_semantic_candidate_bounds_parse_from_toml() {
+    fn test_vector_candidate_bounds_parse_from_toml() {
         let configuration =
-            accept_configuration("[search.semantic]\ncandidates = 100\ncandidates_per_file = 8\n")
+            accept_configuration("[search.vector]\ncandidates = 100\ncandidates_per_file = 8\n")
                 .expect("both candidate bounds must be accepted");
-        assert_eq!(configuration.search.semantic.candidates, 100);
-        assert_eq!(configuration.search.semantic.candidates_per_file, 8);
+        assert_eq!(configuration.search.vector.candidates, 100);
+        assert_eq!(configuration.search.vector.candidates_per_file, 8);
     }
 
     #[test]

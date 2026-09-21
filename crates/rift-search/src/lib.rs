@@ -1,4 +1,4 @@
-//! Hybrid lexical and semantic search for Rift.
+//! Hybrid lexical and vector search for Rift.
 //!
 //! The lexical tier answers a query that shares a token with the code. A query
 //! that shares none - a description of what a declaration does, in the words a
@@ -9,7 +9,7 @@
 //!
 //! The two tiers are fused, never substituted. Whenever the caller quotes a real
 //! name - a symbol, a config key, a message from a traceback - the lexical tier
-//! is the stronger side, and the semantic tier is measurably worse at exactly
+//! is the stronger side, and the vector ranking is measurably worse at exactly
 //! that.
 
 mod acquisition;
@@ -29,10 +29,10 @@ pub use error::{SearchError, SearchFault, SearchViolation};
 pub use fusion::{DeclarationMatch, FusedRank, Ranking, best_per_file, fuse, spread_per_file};
 pub use index::{
     DescribedUnit, Embedding, FusedRanking, RankedUnit, SearchIndex, SearchIndexLimits,
-    SearchIndexLimitsBuilder, SemanticReadiness,
+    SearchIndexLimitsBuilder, VectorReadiness,
 };
 pub use rift_index::RevisionScoped;
-pub use similarity::{SemanticMatch, nearest};
+pub use similarity::{VectorMatch, nearest};
 
 /// Compile-time marker for search-layer ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

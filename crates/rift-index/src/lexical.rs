@@ -117,7 +117,7 @@ pub(crate) const MIGRATIONS: MigrationSet = MigrationSet::new(MIGRATION_FILES);
 
 /// Unit granularity the lexical tier indexes.
 ///
-/// The semantic tier stores its vectors in the same database, addressed by the
+/// The vector ranking stores its vectors in the same database, addressed by the
 /// digest of the text they were embedded from rather than by a unit identity:
 /// a declaration that moves or is renamed keeps its text, so it keeps its
 /// vector.

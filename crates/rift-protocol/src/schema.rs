@@ -619,24 +619,42 @@ pub fn declare_search_ranges(schema: &mut Schema) {
     );
 }
 
-/// A [`SemanticSearchConfiguration`](crate::configuration::SemanticSearchConfiguration)
-/// states its `Duration` bounds as `rift:range` on the key: schema validation alone cannot
-/// compare `"5m"` against a ceiling, so the server enforces the bounds at load and the
-/// schema carries them for readers.
-pub fn declare_semantic_ranges(schema: &mut Schema) {
+/// An [`EmbeddingConfiguration`](crate::configuration::EmbeddingConfiguration) states the
+/// `Duration` bounds of each arm that carries one as `rift:range` on the key: schema
+/// validation alone cannot compare `"5m"` against a ceiling, so the server enforces the
+/// bounds at load and the schema carries them for readers.
+pub fn declare_embedding_ranges(schema: &mut Schema) {
     use crate::configuration::{
-        Duration, SEMANTIC_DOWNLOAD_TIMEOUT_MS_MAX, SEMANTIC_DOWNLOAD_TIMEOUT_MS_MIN,
-        SemanticSearchConfiguration,
+        Duration, EMBEDDING_DOWNLOAD_TIMEOUT_MS_MAX, EMBEDDING_DOWNLOAD_TIMEOUT_MS_MIN,
+        EMBEDDING_REQUEST_TIMEOUT_MS_MAX, EMBEDDING_REQUEST_TIMEOUT_MS_MIN,
     };
-    annotate_property(
-        schema,
-        property!(SemanticSearchConfiguration, download_timeout),
-        RIFT_RANGE,
-        range(
-            &Duration::from_millis(SEMANTIC_DOWNLOAD_TIMEOUT_MS_MIN),
-            &Duration::from_millis(SEMANTIC_DOWNLOAD_TIMEOUT_MS_MAX),
-        ),
-    );
+    const EMBEDDING_KIND_TAG: &str = "kind";
+    const EMBEDDING_HF: &str = "hf";
+    const EMBEDDING_OPENAI_COMPATIBLE: &str = "openai_compatible";
+    const EMBEDDING_DOWNLOAD_TIMEOUT: &str = "download_timeout";
+    const EMBEDDING_REQUEST_TIMEOUT: &str = "request_timeout";
+    if let Some(arm) = tagged_union_arm(schema, EMBEDDING_KIND_TAG, EMBEDDING_HF) {
+        annotate_property_in(
+            arm,
+            EMBEDDING_DOWNLOAD_TIMEOUT,
+            RIFT_RANGE,
+            range(
+                &Duration::from_millis(EMBEDDING_DOWNLOAD_TIMEOUT_MS_MIN),
+                &Duration::from_millis(EMBEDDING_DOWNLOAD_TIMEOUT_MS_MAX),
+            ),
+        );
+    }
+    if let Some(arm) = tagged_union_arm(schema, EMBEDDING_KIND_TAG, EMBEDDING_OPENAI_COMPATIBLE) {
+        annotate_property_in(
+            arm,
+            EMBEDDING_REQUEST_TIMEOUT,
+            RIFT_RANGE,
+            range(
+                &Duration::from_millis(EMBEDDING_REQUEST_TIMEOUT_MS_MIN),
+                &Duration::from_millis(EMBEDDING_REQUEST_TIMEOUT_MS_MAX),
+            ),
+        );
+    }
 }
 
 /// A [`TextSearchConfiguration`](crate::configuration::TextSearchConfiguration) states its
