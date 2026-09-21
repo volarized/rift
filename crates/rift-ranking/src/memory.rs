@@ -304,6 +304,12 @@ impl MemoryIndex {
 
     /// One document's BM25 score for `phase`, or `None` when the phase's own
     /// rule leaves the document out.
+    ///
+    /// The arithmetic follows FTS5's own `bm25` exactly: for each member the
+    /// per-column occurrence counts are weighted and summed first, and the
+    /// saturation applies once to that sum. The two forms coincide only where
+    /// every column weight is one, so a corpus that exercises a single
+    /// weight cannot tell them apart.
     fn score(
         &self,
         entry: &HeldDocument,
@@ -316,16 +322,22 @@ impl MemoryIndex {
         let mut terms_matched = 0;
         let mut terms_total = 0;
         for (member, idf) in members.iter().zip(inverse) {
-            let mut member_matched = false;
+            // FTS5 weights each column's occurrence count, sums those across the
+            // columns, and saturates the sum once. Saturating per column and
+            // weighting the result instead agrees only where every weight is one,
+            // and diverges by the weight itself everywhere else.
+            let mut weighted = 0.0;
             for field in SearchableField::ALL {
                 let frequency = as_float(entry.tokens.frequency(field, member));
                 if frequency <= 0.0 {
                     continue;
                 }
-                member_matched = true;
                 matched = matched.with(field);
-                score +=
-                    idf * field.rank_weight() * saturation(frequency, entry, self.average_length);
+                weighted += field.rank_weight() * frequency;
+            }
+            let member_matched = weighted > 0.0;
+            if member_matched {
+                score += idf * saturation(weighted, entry, self.average_length);
             }
             if member.is_phrase() {
                 if !member_matched {
@@ -445,18 +457,7 @@ impl IndexReader for MemoryIndex {
         &'a self,
         request: RankRequest<'a>,
     ) -> ReaderFuture<'a, Result<RankingInput, RankingError>> {
-        Box::pin(async move {
-            let order = match request.input() {
-                RankingInputKind::Identifier => {
-                    self.rank_identifiers(request.query(), request.bound())
-                }
-                RankingInputKind::Lexical => {
-                    self.rank_lexical(request.query(), request.phase(), request.bound())
-                }
-                RankingInputKind::Vector => Vec::new(),
-            };
-            Ok(RankingInput::new(request.input(), order))
-        })
+        Box::pin(async move { Ok(self.ranked(request)) })
     }
 
     fn document<'a>(
@@ -474,6 +475,23 @@ impl IndexReader for MemoryIndex {
 }
 
 impl MemoryIndex {
+    /// The ranking [`IndexReader::rank`] answers, computed without a runtime.
+    ///
+    /// This index reads no storage, so its answer needs no await. A caller
+    /// already inside an async function reaches it through the contract; one
+    /// that is not calls this and gets the same value.
+    #[must_use]
+    pub fn ranked(&self, request: RankRequest<'_>) -> RankingInput {
+        let order = match request.input() {
+            RankingInputKind::Identifier => self.rank_identifiers(request.query(), request.bound()),
+            RankingInputKind::Lexical => {
+                self.rank_lexical(request.query(), request.phase(), request.bound())
+            }
+            RankingInputKind::Vector => Vec::new(),
+        };
+        RankingInput::new(request.input(), order)
+    }
+
     /// Ranks the held vectors against one embedded query, best first.
     ///
     /// The vector input is separate from [`IndexReader::rank`] because this
