@@ -1507,6 +1507,9 @@ pub const LEXICAL_UNITS_MAX_MAX: u64 = 50_000_000;
 /// thousand files fits.
 pub const LEXICAL_UNITS_MAX_DEFAULT: u64 = 1_000_000;
 
+/// What stands in for a credential an endpoint value carried.
+const CREDENTIAL_REDACTED: &str = "[redacted]";
+
 /// Whether `value` breaks the model form an `openai_compatible` endpoint
 /// serves: one nonempty token carrying no path separator and no whitespace.
 fn remote_model_refused(value: &str) -> bool {
@@ -1521,8 +1524,30 @@ fn endpoint_violation(value: &str) -> Option<ConfigurationViolation> {
         value.is_empty() || value.len() > EMBEDDING_ENDPOINT_BYTES_MAX || endpoint_refused(value);
     refused.then(|| ConfigurationViolation::EmbeddingEndpointInvalid {
         field: "search.vector.embedding.endpoint",
-        value: value.to_owned(),
+        value: without_userinfo(value),
     })
+}
+
+/// `value` with whatever its authority carried before the `@` replaced.
+///
+/// The refusal names the endpoint so an operator can find the key it came
+/// from, and the endpoint is exactly where a credential must not be. The
+/// refusal rides a `configuration_invalid` wire error and the server records
+/// it, so carrying the userinfo through would publish the secret the check
+/// exists to refuse.
+fn without_userinfo(value: &str) -> String {
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return value.to_owned();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let Some(separator) = authority.rfind('@') else {
+        return value.to_owned();
+    };
+    format!(
+        "{scheme}://{CREDENTIAL_REDACTED}@{}{tail}",
+        &authority[separator + 1..]
+    )
 }
 
 /// Whether `value` breaks the endpoint form. The check reads the scheme, then
@@ -3307,11 +3332,6 @@ mod tests {
             "http://api.openai.com/v1",
             "http://localhost.example.com/v1",
             "https:///v1",
-            // A credential in the authority would travel wherever the endpoint does,
-            // and the server records the endpoint in its own log.
-            "https://token@api.openai.com/v1",
-            "https://user:secret@api.openai.com/v1",
-            "http://user:secret@localhost:8080/v1",
         ] {
             assert_eq!(
                 embedding_model_verdict(with_endpoint(refused)),
@@ -3330,6 +3350,49 @@ mod tests {
             embedding_model_verdict(with_endpoint(&overlong)),
             Err(ConfigurationViolation::EmbeddingEndpointInvalid { .. })
         ));
+    }
+
+    #[test]
+    fn test_a_refused_endpoint_names_the_host_without_the_credential_it_carried() {
+        // The refusal rides a `configuration_invalid` wire error and the server
+        // records it, so the value it names must not carry the credential the
+        // check exists to refuse. An operator still reads the host and the path.
+        for (refused, expected) in [
+            (
+                "https://token@api.openai.com/v1",
+                "https://[redacted]@api.openai.com/v1",
+            ),
+            (
+                "https://user:secret@api.openai.com/v1",
+                "https://[redacted]@api.openai.com/v1",
+            ),
+            (
+                "http://user:secret@localhost:8080/v1?model=small",
+                "http://[redacted]@localhost:8080/v1?model=small",
+            ),
+            (
+                "https://first@second@api.openai.com/v1",
+                "https://[redacted]@api.openai.com/v1",
+            ),
+        ] {
+            let verdict = embedding_model_verdict(with_endpoint(refused));
+            assert_eq!(
+                verdict,
+                Err(ConfigurationViolation::EmbeddingEndpointInvalid {
+                    field: "search.vector.embedding.endpoint",
+                    value: expected.to_owned(),
+                }),
+                "{refused:?} must be refused without its credential"
+            );
+            let rendered = format!(
+                "{:?}",
+                verdict.expect_err("the endpoint is refused").evidence()
+            );
+            assert!(
+                !rendered.contains("secret") && !rendered.contains("token"),
+                "no evidence the refusal carries may hold the credential: {rendered}"
+            );
+        }
     }
 
     /// One `openai_compatible` embedding naming `endpoint`, every other key
