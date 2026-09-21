@@ -15,3 +15,13 @@ class DocumentPipeline:
 def derive_identifier_terms(name: str) -> list[str]:
     """Splits one identifier into the terms a caller might type."""
     return name.replace("_", " ").split()
+
+
+def ledger(entries: list[str]) -> int:
+    """Answers how many bytes the handed entries carry."""
+
+    def record(entry: str) -> int:
+        """Answers the bytes one entry carries."""
+        return len(entry)
+
+    return sum(record(entry) for entry in entries)

@@ -5,6 +5,10 @@
 //! exact name and qualified name, an identifier embedded in prose, an inner camel case,
 //! Pascal case, acronym, or snake case term, a prefix, a term only one field carries, a
 //! quoted phrase, precise and broad widening, and a query the corpus does not answer.
+//! A case may also name the FTS column every answer it receives must be placed through,
+//! which is how a column that only a container spelling reaches is pinned: the
+//! `qualified_name` case answers through that column alone, and its near miss, a
+//! container and a member the corpus never pairs, answers nothing.
 //!
 //! Three properties are gated beside the metrics. Exact-name cases cannot regress: the
 //! declaration a caller named by its own name comes first. Indexing one tree below two
@@ -12,13 +16,10 @@
 //! directory can never reach a rank. And the stored corpus and an in-memory adapter over
 //! one publication answer the same documents, first hit included.
 //!
-//! The in-memory adapter reimplements FTS5's own `bm25`, and over a corpus whose fields
-//! tokenize one way on both sides the two compute the same value to the last bits, which
-//! `the_two_adapters_compute_one_value_over_a_plain_corpus` pins. Over this corpus they
-//! still order two pairs of near-scoring candidates the other way round, so some document
-//! here tokenizes differently on the two sides. That difference is unlocated, which is why
-//! this gate compares the answered documents and the first hit rather than the whole
-//! sequence. A reader that must reproduce the stored order exactly runs the stored corpus.
+//! The in-memory adapter reimplements FTS5's own `bm25`, and
+//! `the_two_adapters_compute_one_value_at_every_column_weight` pins the two to one value
+//! over a corpus that exercises every column weight, not just the one weight at which the
+//! two arrangements of the formula happen to coincide.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -31,9 +32,9 @@ use rift_index::{
     WorkspaceDatabase, WorkspaceIndex, WorkspaceIndexLimits,
 };
 use rift_ranking::{
-    DocumentIdentity, DocumentKind, DocumentLocation, IndexDocument, IndexReader, MemoryIndex,
-    ParsedQuery, QueryPhase, RankRequest, RankedCandidates, RankingInput, RankingInputKind,
-    RankingWeights, SearchableField, fuse,
+    DocumentIdentity, DocumentKind, DocumentLocation, FieldSet, IndexDocument, IndexReader,
+    MemoryIndex, ParsedQuery, QueryPhase, RankRequest, RankedCandidates, RankingInput,
+    RankingInputKind, RankingWeights, SearchableField, fuse,
 };
 use tempfile::TempDir;
 
@@ -60,6 +61,9 @@ struct Case {
     expect: Option<Vec<String>>,
     #[serde(default)]
     contains: Vec<String>,
+    /// The FTS column every answer this case receives must be placed through.
+    #[serde(default)]
+    field: Option<String>,
 }
 
 /// The committed query set.
@@ -276,6 +280,33 @@ fn gated(case: &Case, wanted: &[String], answered: &[String]) -> usize {
     found.into_iter().min().unwrap_or(usize::MAX)
 }
 
+/// The searchable field stored in `column`.
+fn named_field(column: &str) -> TestResult<SearchableField> {
+    let held = SearchableField::ALL
+        .into_iter()
+        .find(|field| field.column() == column);
+    held.ok_or_else(|| format!("no searchable field is stored in the {column} column").into())
+}
+
+/// Requires every candidate one case answered to be placed through `column` alone.
+///
+/// A case naming a column states that nothing else in the corpus carries what it
+/// asked for: a hit through a second column means another field answers the query
+/// too, and the class the case covers is no longer the one it names.
+fn placed_through(case: &Case, column: &str, fused: &RankedCandidates) -> TestResult {
+    let only = FieldSet::of(named_field(column)?);
+    for candidate in fused.candidates() {
+        assert_eq!(
+            candidate.fields(),
+            only,
+            "{}: every answer must be placed through the {column} column alone, got {:?}",
+            case.name,
+            candidate.fields().fields().collect::<Vec<_>>()
+        );
+    }
+    Ok(())
+}
+
 /// Widens one bounded count into the domain a metric is computed in. Every count here
 /// is the size of the committed query set.
 fn counted(value: usize) -> f64 {
@@ -316,6 +347,9 @@ async fn the_committed_corpus_meets_its_retrieval_floors() -> TestResult {
         .await?;
         let elapsed = started.elapsed().as_millis();
         let answered = answered(&fused, &targets);
+        if let Some(column) = case.field.as_deref() {
+            placed_through(case, column, &fused)?;
+        }
         measured.cases += 1;
         measured.precise += precise;
         measured.broad += broad;
@@ -331,9 +365,19 @@ async fn the_committed_corpus_meets_its_retrieval_floors() -> TestResult {
             continue;
         }
         measured.answering += 1;
+        // Recall and hit rate are counted from what the answer actually carried, not
+        // from having reached this line. Incrementing them beside the assertion that
+        // every wanted target was answered would make both metrics exactly one by
+        // construction, and their floors unable to fail.
+        let found = wanted
+            .iter()
+            .filter(|target| answered.contains(target))
+            .count();
+        measured.recalled += counted(found) / counted(wanted.len());
+        if found > 0 {
+            measured.hits += 1;
+        }
         let best = gated(case, &wanted, &answered);
-        measured.hits += 1;
-        measured.recalled += 1.0;
         measured.reciprocal_rank += 1.0 / (counted(best) + 1.0);
         assert!(
             elapsed <= QUERY_MILLISECONDS_MAX,
@@ -484,21 +528,10 @@ async fn the_stored_corpus_and_the_in_memory_adapter_answer_one_order() -> TestR
             reader_input(&memory, &parsed, phase)
         })
         .await?;
-        let held = answered(&from_store, &targets);
-        let memory_held = answered(&from_memory, &targets);
         assert_eq!(
-            held.first(),
-            memory_held.first(),
-            "{}: both adapters must answer the same declaration first",
-            case.name
-        );
-        let mut held_set = held.clone();
-        held_set.sort();
-        let mut memory_set = memory_held.clone();
-        memory_set.sort();
-        assert_eq!(
-            held_set, memory_set,
-            "{}: both adapters must answer the same documents",
+            answered(&from_store, &targets),
+            answered(&from_memory, &targets),
+            "{}: both adapters must rank one order",
             case.name
         );
     }
@@ -536,6 +569,8 @@ fn every_named_result_class_is_covered_once() -> TestResult {
     for class in [
         "name_exact",
         "qualified_exact",
+        "qualified_name_only",
+        "qualified_name_no_hit",
         "identifier_in_prose",
         "inner_camel_case",
         "inner_acronym",
@@ -551,65 +586,92 @@ fn every_named_result_class_is_covered_once() -> TestResult {
         "broad",
         "no_hit",
     ] {
-        assert!(
-            declared.contains(&class),
-            "the query set must cover the {class} class"
+        let covering: Vec<&str> = declared
+            .iter()
+            .copied()
+            .filter(|held| *held == class)
+            .collect();
+        assert_eq!(
+            covering.len(),
+            1,
+            "the query set must cover the {class} class once, covered {} times",
+            covering.len()
         );
     }
     Ok(())
 }
 #[tokio::test]
-async fn the_two_adapters_compute_one_value_over_a_plain_corpus() -> TestResult {
+async fn the_two_adapters_compute_one_value_at_every_column_weight() -> TestResult {
     use rift_core::ProjectPath;
     use rift_ranking::{DocumentFields, DocumentIdentity, DocumentLocation, SearchableField};
 
     let directory = TempDir::new()?;
-    let built =
-        |identity: &str, path: &str, name: &str, source: &str| -> TestResult<IndexDocument> {
-            let fields = DocumentFields::empty()
-                .with(SearchableField::Name, name)
-                .with(SearchableField::DeclarationSource, source);
-            let digest = fields.digest();
-            Ok(IndexDocument::new(
-                DocumentIdentity::new(identity)?,
-                DocumentLocation::Project(ProjectPath::new(path)?),
-                DocumentKind::Symbol,
-                digest,
-                fields,
-            )?)
-        };
-    let documents = vec![
-        built("a", "src/a.rs", "alpha", "alpha carries pipeline once")?,
-        built("b", "src/b.rs", "beta", "beta carries pipeline once too")?,
-        built("c", "src/c.rs", "gamma", "gamma carries listener once")?,
-    ];
+    let built = |identity: &str,
+                 path: &str,
+                 field: SearchableField,
+                 value: &str|
+     -> TestResult<IndexDocument> {
+        let fields = DocumentFields::empty().with(field, value);
+        let digest = fields.digest();
+        Ok(IndexDocument::new(
+            DocumentIdentity::new(identity)?,
+            DocumentLocation::Project(ProjectPath::new(path)?),
+            DocumentKind::Symbol,
+            digest,
+            fields,
+        )?)
+    };
+    // One document per column, each carrying the term in that column alone, so a
+    // difference between weighting the saturated value and saturating the weighted
+    // one shows up as the weight itself. A corpus exercising one weight cannot
+    // separate the two forms: at weight one they are equal.
+    let mut documents = Vec::new();
+    for (index, field) in SearchableField::ALL.into_iter().enumerate() {
+        documents.push(built(
+            &format!("carrier-{index}"),
+            &format!("src/{index}.rs"),
+            field,
+            "beacon",
+        )?);
+    }
+    for index in 0..4 {
+        documents.push(built(
+            &format!("filler-{index}"),
+            &format!("src/filler-{index}.rs"),
+            SearchableField::Name,
+            "unrelated",
+        )?);
+    }
     let store = stored(&documents, directory.path()).await?;
-    let memory = MemoryIndex::new(documents, "plain-corpus");
+    let memory = MemoryIndex::new(documents, "weighted-corpus");
 
-    for text in ["pipeline", "listener", "carries"] {
-        let parsed = ParsedQuery::parse(text)?;
-        let ranking = match store
-            .search("corpus", &parsed, QueryPhase::Precise, 20)
-            .await?
-        {
-            RevisionScoped::Matched(ranking) => ranking,
-            other => return Err(format!("the store must hold the corpus: {other:?}").into()),
-        };
-        let scored = memory.scored(&parsed, QueryPhase::Precise);
+    let parsed = ParsedQuery::parse("beacon")?;
+    let ranking = match store
+        .search("corpus", &parsed, QueryPhase::Precise, 20)
+        .await?
+    {
+        RevisionScoped::Matched(ranking) => ranking,
+        other => return Err(format!("the store must hold the corpus: {other:?}").into()),
+    };
+    let scored = memory.scored(&parsed, QueryPhase::Precise);
+    assert_eq!(
+        ranking.matches().len(),
+        SearchableField::ALL.len(),
+        "one document per column answers"
+    );
+    assert_eq!(ranking.matches().len(), scored.len());
+    for (matched, (identity, score)) in ranking.matches().iter().zip(&scored) {
         assert_eq!(
-            ranking.matches().len(),
-            scored.len(),
-            "{text}: both adapters answer the same documents"
+            matched.identity(),
+            identity,
+            "both adapters must rank one order over every column weight"
         );
-        for (matched, (identity, score)) in ranking.matches().iter().zip(&scored) {
-            assert_eq!(matched.identity(), identity, "{text}: one order");
-            assert!(
-                (matched.rank().abs() - score).abs() < 1e-9,
-                "{text}: the two adapters must compute one value for {identity}, \
-                 store {} and memory {score}",
-                matched.rank().abs()
-            );
-        }
+        assert!(
+            (matched.rank().abs() - score).abs() < 1e-9,
+            "the two adapters must compute one value for {identity}, store {} and \
+             memory {score}",
+            matched.rank().abs()
+        );
     }
     Ok(())
 }

@@ -4,6 +4,8 @@
 # the declarations or files that must come back. `expect` lists the answers in
 # the order the gate requires; `contains` lists answers whose order is free.
 # An empty `expect` and `contains` means the query must answer nothing.
+# `field` names the FTS column every answer the case receives must be placed
+# through, and through nothing else.
 #
 # A target is `<path>` for a file answer and `<path>#<qualified name>` for a
 # declaration.
@@ -102,4 +104,17 @@ contains = ["service/pipeline.py#DocumentPipeline", "src/http.rs#HTTPServer::lis
 name = "a term the corpus does not carry"
 class = "no_hit"
 query = "quaternion"
+expect = []
+
+[[case]]
+name = "a container and its member spelled as one phrase"
+class = "qualified_name_only"
+query = "\"ledger record\""
+expect = ["service/pipeline.py#ledger.record"]
+field = "qualified_name"
+
+[[case]]
+name = "a container and a member the corpus never pairs"
+class = "qualified_name_no_hit"
+query = "\"ledger publish\""
 expect = []
