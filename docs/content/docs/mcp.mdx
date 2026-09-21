@@ -66,10 +66,14 @@ The search ranking tiers carry their own warnings:
 - `lexical_ranking_truncated` - the lexical ranking stopped at `matches_max` units, and hits
   past that bound never reach a page, whatever `paths` selects. `total_pages` counts the units
   that did; a narrower `query` brings the rest inside the bound.
-- `results_truncated` - the result set reached `results_max` hits, the server's result bound,
-  before ordering and paging, so hits past it never reach a page and `total_pages` counts only
-  what fit. The warning means the bound was reached: a set of exactly `results_max` hits carries
-  it too. A narrower `query` or `paths` brings the set inside the bound.
+- `query_narrowed` - the query carried more terms and quoted phrases than `terms_max`, so the
+  server dropped the shortest unquoted terms and ranked the answer by the rest. Every quoted
+  phrase is kept. Shorten `query`, or quote the terms that must be matched.
+- `results_truncated` - the server reached `results_max`, its result bound, before ordering and
+  paging. The bound covers both the candidates one read ranks and the hits it returns, so what
+  it cut never reaches any page and `total_pages` counts only what fit. The warning means the
+  bound was reached: a read that cut nothing else but filled the candidate pool carries it too.
+  A narrower `query` or `paths` brings the read inside the bound.
 
 A `symbol_disagreement` warning names a symbol whose selected presentation and at least one
 provider's own facts disagree.
@@ -276,8 +280,8 @@ carries a `lexical_ranking_truncated` warning naming that bound, and hits past i
 a page: `paths` selects among the ranked units, so only a narrower `query` brings the rest
 inside the bound.
 
-The result set has its own bound of 1,000 hits, applied before ordering and paging: an answer
-whose set reached it warns `results_truncated`.
+The read has its own bound of 1,000, applied to the candidates it ranks and again to the hits
+it orders and pages: a read that reached it warns `results_truncated`.
 
 A symbol whose only match sits in its documentation and its source, not in its name, still
 returns as a `symbol` hit. `matched_by` names every field that carried a term, so this one

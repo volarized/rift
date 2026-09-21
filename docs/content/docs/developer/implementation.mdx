@@ -174,7 +174,7 @@ The database tables:
 
 - `lexical_documents` - one row per indexed document: a code symbol, or a text file split into
   chunks past the [`[search.text]`](/docs/developer/configuration#search) chunk bound. The row
-  carries the document's identity, path, kind, and content digest beside the seven searchable
+  carries the document's identity, path, kind, and content digest beside the searchable
   fields.
 - `lexical_index_state` - stamps the set with the tree revision that published it and the
   corpus revision it was built under. One read transaction reads that stamp and runs the query,
@@ -185,7 +185,7 @@ The database tables:
   holding another corpus revision returns no rows either: its columns, derivation, tokenizer,
   or weights are not this build's.
 - `lexical_documents_fts` - the [FTS5](https://www.sqlite.org/fts5.html) virtual table over the
-  seven searchable columns, with `identity` riding unindexed as the join key. Ranking is FTS5's
+  searchable columns, with `identity` riding unindexed as the join key. Ranking is FTS5's
   `bm25` with the per-column weights the
   [architecture page](/docs/developer/architecture#search) lists, comparable only within one
   search. The same statement asks `bm25` once per column with every other weight zeroed, which
