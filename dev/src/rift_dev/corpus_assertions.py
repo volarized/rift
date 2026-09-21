@@ -29,6 +29,11 @@ LEXICAL_BYTES_MAX = 512 * 1024 * 1024
 PROBE_PATH = "rift_corpus_probe.rs"
 PROBE_SOURCE = "pub fn corpus_probe(){}\n"
 MAP_MODULES_MAX = 100_000
+# The span startup opens while it reads the manifests and lockfiles, and the warning each
+# unread input is reported under. The catalog resolvers keep `dependency.resolve`, which no
+# startup opens: a package read is what runs them.
+CONTEXT_SPAN = "dependency.context"
+CONTEXT_DEGRADED = "dependency context degraded"
 
 
 def map_paths(answer: JsonObject) -> set[str]:
@@ -229,7 +234,7 @@ def exact_degradation(found: list[JsonObject], expected: str | None) -> None:
             string_value(fields(record).get("reason"), "dependency reason"),
         )
         for record in found
-        if record.get("message") == "dependency resolution degraded"
+        if record.get("message") == CONTEXT_DEGRADED
     ]
     drops = sorted(
         (resolver, reason)
@@ -329,10 +334,11 @@ class LexicalContent:
 
 
 def lexical_content(root: Path) -> LexicalContent:
-    """Hash ordered source rows through SQLite's read-only connection.
+    """Hash every ranking column of the ordered document rows.
 
-    The schema is owned by rift-index/src/lexical.rs. Diagnostics and the
-    revision row change on each publication; unrelated source rows must not.
+    The schema is owned by rift-index/src/lexical.rs, whose fifth migration replaced
+    `lexical_units` with `lexical_documents`. Diagnostics and the revision row change on
+    each publication; unrelated document rows must not.
     """
     digest = hashlib.sha256()
     count = size = 0
@@ -341,8 +347,9 @@ def lexical_content(root: Path) -> LexicalContent:
         sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True, timeout=5.0)
     ) as connection:
         cursor = connection.execute(
-            "SELECT identity,path,kind,name,byte_length,content FROM lexical_units "
-            "WHERE path != ? ORDER BY identity",
+            "SELECT identity,path,kind,digest,byte_length,name,qualified_name,"
+            "identifier_terms,signature,documentation,declaration_source,file_content "
+            "FROM lexical_documents WHERE path != ? ORDER BY identity",
             (PROBE_PATH,),
         )
         for row in cursor:
@@ -380,7 +387,7 @@ def probe_units(root: Path) -> int:
         sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True, timeout=5.0)
     ) as connection:
         row = connection.execute(
-            "SELECT COUNT(*) FROM lexical_units WHERE path = ?", (PROBE_PATH,)
+            "SELECT COUNT(*) FROM lexical_documents WHERE path = ?", (PROBE_PATH,)
         ).fetchone()
     require(row is not None, "lexical probe count returned no row")
     return number(row[0], "lexical probe units")

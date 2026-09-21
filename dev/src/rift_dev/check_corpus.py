@@ -14,6 +14,8 @@ from pathlib import Path
 from mcp.shared.exceptions import McpError
 
 from rift_dev.corpus_assertions import (
+    CONTEXT_DEGRADED,
+    CONTEXT_SPAN,
     PROBE_PATH,
     PROBE_SOURCE,
     READ_COUNT,
@@ -223,7 +225,7 @@ class Corpus:
                     client,
                     "rift://logs/component/dependency",
                     lambda rows: any(
-                        row.get("message") == "dependency.resolve" for row in rows
+                        row.get("message") == CONTEXT_SPAN for row in rows
                     ),
                 )
                 self.dependencies(found)
@@ -255,28 +257,27 @@ class Corpus:
             else f"{count - 256} of {count} package.json manifests were not read: at most 256 are read per workspace"
         )
         exact_degradation(found, expected)
-        passes = [row for row in found if row.get("message") == "dependency.resolve"]
-        require(len(passes) == 1, f"startup resolved dependencies {len(passes)} times")
+        passes = [row for row in found if row.get("message") == CONTEXT_SPAN]
+        require(
+            len(passes) == 1, f"startup read the dependency context {len(passes)} times"
+        )
         require(
             fields(passes[0]).get("span") == "closed",
-            "dependency resolution span did not close",
+            "the dependency context span did not close",
         )
         require(
             {"entries", "degraded"}.issubset(fields(passes[0])),
-            "dependency resolution lost named fields",
+            "the dependency context lost named fields",
         )
         if self.pin.name == "fastapi":
             degraded = [
-                row
+                fields(row).get("reason")
                 for row in found
-                if fields(row).get("resolver") == "uv"
-                and row.get("message") == "dependency resolution degraded"
+                if row.get("message") == CONTEXT_DEGRADED
             ]
-            expected_environment = f"pyproject.toml: no environment at {self.root}/.venv; packages cataloged without source roots"
             require(
-                [fields(row).get("reason") for row in degraded]
-                == [expected_environment],
-                f"unexpected fastapi uv degradation: {degraded}",
+                degraded == [],
+                f"the fastapi context reads manifests and lockfiles alone: {degraded}",
             )
         self.record(
             "manifests",
