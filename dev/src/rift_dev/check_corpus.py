@@ -49,7 +49,13 @@ from rift_dev.rift_test_client import (
     string_value,
 )
 
-READ_SECONDS = 30.0
+# The server answers one read within `[server] readiness_timeout`, degrading to identifier
+# matching when the lexical lane has not landed its transaction. A client deadline equal to
+# that budget tears the transport down at the instant the server answers, so a read whose
+# lane genuinely needs the whole budget can never deliver the answer the contract promises.
+# The read carries the budget plus room for that answer to arrive.
+READINESS_SECONDS = 30.0
+READ_SECONDS = READINESS_SECONDS + 10.0
 # Seconds a case keeps inside its own deadline for the served tree's removal,
 # the report write, and the process exit. Nextest allows the same grace after
 # it ends a corpus case, so the two bounds agree on what cleanup costs.
@@ -57,7 +63,12 @@ CLEANUP_RESERVE_SECONDS = 30.0
 SEED = 34
 POLL_SECONDS = 0.1
 OBSERVATION_SECONDS = 60.0
-CONFIGURATION = '[server]\nreadiness_timeout = "30s"\n[search.vector]\ndisabled = true\n[logs]\npage_records = 5000\ncapture = "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info"\n'
+CONFIGURATION = (
+    f'[server]\nreadiness_timeout = "{int(READINESS_SECONDS)}s"\n'
+    "[search.vector]\ndisabled = true\n"
+    "[logs]\npage_records = 5000\n"
+    'capture = "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info"\n'
+)
 SAMPLE_LANGUAGES = {
     "bun": ("rust", "typescript", "typescript:tsx"),
     "nextjs": ("rust", "typescript", "typescript:tsx"),

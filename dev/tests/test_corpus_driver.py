@@ -145,7 +145,12 @@ def test_churn_validates_all_tools_overlap_and_final_source(
             ).values()
         )
         assert cast(int, summary["overlapping_writes"]) >= 2
-        assert summary["read_seconds_max"] == 30.0
+        # The recorded budget is what a reader compares a slow read against, and it has
+        # to stand above the server's own readiness budget: equal budgets end the call at
+        # the instant the server answers.
+        assert summary["read_seconds_max"] == check_corpus.READ_SECONDS
+        assert check_corpus.READ_SECONDS > check_corpus.READINESS_SECONDS
+        assert f'"{int(check_corpus.READINESS_SECONDS)}s"' in check_corpus.CONFIGURATION
         assert set(object_value(summary["latency"], "latency")) == {
             "search",
             "get_symbol",
