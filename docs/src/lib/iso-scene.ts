@@ -145,6 +145,17 @@ export type IsoScene = {
   metrics: IsoMetrics;
 };
 
+export type IsoFootprint = {
+  width?: number;
+  depth?: number;
+};
+
+export type IsoRoute = (
+  edge: { from: string; to: string },
+  from: IsoPlate,
+  to: IsoPlate,
+) => Ground[] | null;
+
 /**
  * The isometric basis, as scale factors rather than vectors.
  *
@@ -179,6 +190,31 @@ function textWidth(lines: string[], size: number): number {
 
 function textHeight(lines: string[], size: number): number {
   return lines.length === 0 ? 0 : size + (lines.length - 1) * size * LEADING;
+}
+
+function pathMidpoint(points: Ground[]): Ground {
+  const lengths = points.slice(1).map((point, index) => {
+    const previous = points[index];
+    return Math.hypot(point[0] - previous[0], point[1] - previous[1]);
+  });
+  const halfway = lengths.reduce((sum, length) => sum + length, 0) / 2;
+  let covered = 0;
+
+  for (let index = 0; index < lengths.length; index += 1) {
+    const length = lengths[index];
+    if (covered + length >= halfway) {
+      const previous = points[index];
+      const next = points[index + 1];
+      const ratio = length === 0 ? 0 : (halfway - covered) / length;
+      return [
+        previous[0] + (next[0] - previous[0]) * ratio,
+        previous[1] + (next[1] - previous[1]) * ratio,
+      ];
+    }
+    covered += length;
+  }
+
+  return points.at(-1) ?? [0, 0];
 }
 
 /**
@@ -273,6 +309,12 @@ export function buildScene(
   flow: FlowGraph,
   markFor: (node: { id: string; classes: string[] }) => string | null,
   overrides: Partial<IsoMetrics> = {},
+  footprintFor: (node: {
+    id: string;
+    classes: string[];
+    label: string[];
+  }) => IsoFootprint | null = () => null,
+  routeFor: IsoRoute = () => null,
 ): IsoScene {
   const metrics = { ...DEFAULT_METRICS, ...overrides };
 
@@ -299,9 +341,14 @@ export function buildScene(
     content.set(node.id, { label, mark });
 
     const caption = captionSize(label, mark !== null, metrics);
+    const footprint = footprintFor(node);
     graph.setNode(node.id, {
-      width: caption.width + metrics.margin * 2,
-      height: Math.max(metrics.minDepth, caption.height + metrics.margin * 2),
+      width: Math.max(caption.width + metrics.margin * 2, footprint?.width ?? 0),
+      height: Math.max(
+        metrics.minDepth,
+        caption.height + metrics.margin * 2,
+        footprint?.depth ?? 0,
+      ),
     });
   }
 
@@ -382,7 +429,11 @@ export function buildScene(
     const routed = graph.edge({ v: edge.from, w: edge.to, name: String(index) });
     if (!routed?.points || routed.points.length < 2) return [];
 
-    const run: Ground[] = routed.points.map((p) => [p.x, p.y]);
+    const defaultRun: Ground[] = routed.points.map((p) => [p.x, p.y]);
+    const from = plates.find((plate) => plate.id === edge.from);
+    const to = plates.find((plate) => plate.id === edge.to);
+    const customRun = from && to ? routeFor(edge, from, to) : null;
+    const run: Ground[] = customRun && customRun.length >= 2 ? customRun : defaultRun;
 
     return [
       {
@@ -392,9 +443,13 @@ export function buildScene(
         style: edge.style,
         label: edge.label,
         labelAt:
-          edge.label.length > 0 && routed.x !== undefined && routed.y !== undefined
-            ? [routed.x, routed.y]
-            : null,
+          edge.label.length === 0
+            ? null
+            : customRun
+              ? pathMidpoint(run)
+              : routed.x !== undefined && routed.y !== undefined
+                ? [routed.x, routed.y]
+                : null,
       },
     ];
   });
