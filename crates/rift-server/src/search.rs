@@ -785,7 +785,8 @@ fn identifier_input(
 /// the same kind, so fusion splits what full-text matching is worth among
 /// them rather than letting a wide dependency outvote the project.
 ///
-/// The work is one pass over each package's own documents, each bounded by the
+/// The work is two passes over each package's own documents, one deriving the
+/// members' inverse frequencies and one scoring, each bounded by the
 /// declarations that package published, and the answer is cut to `bound`.
 fn package_inputs(
     dependencies: Option<&DependencyIndex>,
