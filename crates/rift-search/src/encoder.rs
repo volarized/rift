@@ -15,15 +15,19 @@
 //! static path buys.
 
 use std::collections::HashMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config};
+use data_encoding::HEXLOWER;
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 use tokenizers::models::ModelWrapper;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
+use crate::embedding::QueryTransformation;
 use crate::error::{SearchError, SearchFault, SearchViolation};
 
 /// The file a model's architecture and dimensions are read from.
@@ -54,38 +58,127 @@ const STATIC_WEIGHTS_TENSOR: &str = "embeddings";
 /// `length + 1e-32`.
 const NORMALIZATION_GUARD: f32 = 1e-32;
 
-/// The three files an encoder loads.
+/// Bytes one digest pass reads at a time.
+///
+/// The loop over a file runs `ceil(len / MODEL_DIGEST_CHUNK_BYTES)` times and
+/// holds one chunk, so a weights file of any size costs one buffer.
+const MODEL_DIGEST_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Characters a directory-derived model revision renders as.
+const MODEL_REVISION_CHARS: usize = 16;
+
+/// The three files an encoder loads, and what identifies their bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelFiles {
     configuration: PathBuf,
     tokenizer: PathBuf,
     weights: PathBuf,
+    revision: String,
 }
 
 impl ModelFiles {
-    /// The three files below one model directory.
+    /// The three files below one model directory, addressed by their own
+    /// bytes.
+    ///
+    /// A workspace-held directory declares no revision, so the digest over the
+    /// three files in load order is the revision: swapping a file in place
+    /// mints another one, and two clones of one workspace mint the same one.
     ///
     /// # Errors
     ///
     /// Returns `model_file_missing` naming the first of the three that is
     /// absent, so an operator learns which file to supply rather than that the
-    /// directory was rejected.
+    /// directory was rejected, or the file's own read violation when one
+    /// cannot be digested.
     pub fn in_directory(directory: &Path) -> Result<Self, SearchError> {
+        let files = Self::at(directory, String::new())?;
+        let revision = files.digest()?;
+        Ok(Self { revision, ..files })
+    }
+
+    /// The three files below one cached snapshot, addressed by its commit.
+    ///
+    /// The origin resolved `commit` for the branch or tag the operator asked
+    /// for, so it names the checkpoint the bytes came from even after that
+    /// branch moves.
+    ///
+    /// # Errors
+    ///
+    /// Returns `model_file_missing` naming the first of the three that is
+    /// absent.
+    pub fn in_snapshot(directory: &Path, commit: &str) -> Result<Self, SearchError> {
+        Self::at(directory, commit.to_owned())
+    }
+
+    /// What identifies the bytes these three files hold.
+    #[must_use]
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+
+    /// The directory the three files sit in, which is where an acquisition
+    /// placed them.
+    #[must_use]
+    pub fn directory(&self) -> Option<&Path> {
+        self.configuration.parent()
+    }
+
+    /// The three paths below `directory`, refusing the first one absent.
+    fn at(directory: &Path, revision: String) -> Result<Self, SearchError> {
         let files = Self {
             configuration: directory.join(CONFIGURATION_FILE),
             tokenizer: directory.join(TOKENIZER_FILE),
             weights: directory.join(WEIGHTS_FILE),
+            revision,
         };
-        let missing = [&files.configuration, &files.tokenizer, &files.weights]
+        let missing = files
+            .in_load_order()
             .into_iter()
-            .find(|path| !path.is_file());
+            .find(|(path, _)| !path.is_file());
         match missing {
-            Some(path) => Err(SearchError::new(
+            Some((path, _)) => Err(SearchError::new(
                 SearchFault::new(SearchViolation::ModelFileMissing)
                     .about(path.display().to_string()),
             )),
             None => Ok(files),
         }
+    }
+
+    /// The three files in load order, each with the violation its own read
+    /// failure classifies as.
+    fn in_load_order(&self) -> [(&PathBuf, SearchViolation); 3] {
+        [
+            (
+                &self.configuration,
+                SearchViolation::ModelConfigurationInvalid,
+            ),
+            (&self.tokenizer, SearchViolation::TokenizerUnreadable),
+            (&self.weights, SearchViolation::WeightsUnreadable),
+        ]
+    }
+
+    /// The digest over the three files' names and bytes, in load order.
+    fn digest(&self) -> Result<String, SearchError> {
+        let mut hasher = Sha256::new();
+        let mut chunk = vec![0_u8; MODEL_DIGEST_CHUNK_BYTES];
+        for (path, violation) in self.in_load_order() {
+            let name = path.file_name().unwrap_or_default();
+            hasher.update(name.as_encoded_bytes());
+            hasher.update([0]);
+            let file =
+                std::fs::File::open(path).map_err(|error| failure(violation, path, error))?;
+            let mut reader = std::io::BufReader::new(file);
+            loop {
+                let read = reader
+                    .read(&mut chunk)
+                    .map_err(|error| failure(violation, path, error))?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&chunk[..read]);
+            }
+        }
+        Ok(HEXLOWER.encode(&hasher.finalize())[..MODEL_REVISION_CHARS].to_owned())
     }
 }
 
@@ -285,6 +378,19 @@ impl Encoder {
     #[must_use]
     pub const fn limits(&self) -> EncoderLimits {
         self.limits
+    }
+
+    /// What this model does to a query before embedding it.
+    ///
+    /// The embedding space records this, so an asymmetric checkpoint and a
+    /// symmetric one embed into two spaces even when every other part of the
+    /// space agrees. [`Self::embed_query`] applies whichever this names.
+    #[must_use]
+    pub const fn query_transformation(&self) -> QueryTransformation {
+        match self.model {
+            Model::Bert(_) => QueryTransformation::Instructed(QUERY_PREFIX),
+            Model::Static(_) => QueryTransformation::Symmetric,
+        }
     }
 
     /// Embeds one retrieval query.
@@ -950,6 +1056,25 @@ mod tests {
         write_bert_weights(directory)?;
         let files = ModelFiles::in_directory(directory)?;
         Ok(Encoder::load(&files, limits())?)
+    }
+
+    #[test]
+    fn test_the_acquired_files_name_the_directory_they_were_placed_in() {
+        // An acquisition answers paths, and a caller copying or inspecting the
+        // model needs the one directory the three sit in.
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let held = root.path().join("model");
+        std::fs::create_dir_all(&held).expect("the directory is created");
+        for name in [
+            super::CONFIGURATION_FILE,
+            super::TOKENIZER_FILE,
+            super::WEIGHTS_FILE,
+        ] {
+            std::fs::write(held.join(name), "{}").expect("the file is written");
+        }
+        let files = ModelFiles::in_snapshot(&held, "dd0a482").expect("the three files are there");
+        assert_eq!(files.directory(), Some(held.as_path()));
+        assert_eq!(files.revision(), "dd0a482");
     }
 
     #[test]

@@ -28,7 +28,7 @@ pub use glob::{ForceIncludeReach, PathMatcher, PathVerdict};
 pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
 pub use lexical::{
     LexicalChange, LexicalIndexError, LexicalIndexFault, LexicalIndexLimits, LexicalIndexViolation,
-    LexicalMatch, LexicalRanking, LexicalSearchIndex, LexicalUnit, LexicalUnitKind, RevisionScoped,
+    LexicalMatch, LexicalRanking, LexicalSearchIndex, PublishedIndex, RevisionScoped,
 };
 pub use log::{
     LOG_BATCH_RECORDS_MAX, LOG_FIELDS_BYTES_MAX, LOG_LABEL_BYTES_MAX, LOG_LEVELS,
@@ -38,13 +38,12 @@ pub use relationship::{
     RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore, produced_relationship_facets,
 };
 pub use revision::RevisionPaths;
-pub use vector::{SemanticVectorStore, StoredVector};
+pub use vector::{StoredVector, VectorStore};
 pub use workspace::{
-    IndexedFile, ReadableSymbol, SymbolMatch, SymbolMatchRank, TextSourceFile,
-    WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexFault,
-    WorkspaceIndexLimits, WorkspaceIndexViolation, WorkspaceIndexWarning, WorkspaceSourcePolicy,
-    capture_digests, capture_digests_with_languages, source_line_matches, symbol_matches,
-    text_line_matches,
+    IndexedFile, ReadableSymbol, SymbolMatch, TextSourceFile, WorkspaceFingerprint, WorkspaceIndex,
+    WorkspaceIndexError, WorkspaceIndexFault, WorkspaceIndexLimits, WorkspaceIndexViolation,
+    WorkspaceIndexWarning, WorkspaceSourcePolicy, capture_digests, capture_digests_with_languages,
+    declaration_identity, source_line_matches, symbol_matches, text_line_matches,
 };
 
 /// Compile-time marker for index-layer ownership.

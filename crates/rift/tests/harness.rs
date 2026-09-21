@@ -80,18 +80,18 @@ pub(crate) fn rust_engine_workspace() -> TestResult<tempfile::TempDir> {
     )
 }
 
-/// The `[search.semantic]` table every fixture here declares.
+/// The `[search.vector]` table every fixture here declares.
 ///
-/// Rift ships the semantic tier on, so a fixture carrying no such table would acquire
+/// Rift ships the vector ranking on, so a fixture carrying no such table would acquire
 /// the default model from the hub. A hermetic suite must not write into the developer's
 /// own Hugging Face cache, and on a runner with no network a default-on tier would spend
 /// its whole retry budget inside a detached task nobody waits on. `rift-mcp`'s
 /// `tests/hermetic_search.rs` states the same policy for that crate's suites, and its
-/// `live_semantic_search` suite is the one place the shipped default is exercised.
-const SEMANTIC_DISABLED: &str = "[search.semantic]\ndisabled = true\n";
+/// `live_vector_search` suite is the one place the shipped default is exercised.
+const VECTOR_DISABLED: &str = "[search.vector]\ndisabled = true\n";
 
 /// One fixture workspace holding `files` and a `rift.toml` carrying the disabled
-/// semantic tier, the orphan-safety idle timeout, and `extra_toml` - an
+/// vector ranking, the orphan-safety idle timeout, and `extra_toml` - an
 /// LSP configuration, a `[source]` policy, or another
 /// table a case needs beyond the two every fixture already carries.
 pub(crate) fn laid_out_workspace(
@@ -108,7 +108,7 @@ pub(crate) fn laid_out_workspace(
     }
     fs::write(
         directory.path().join("rift.toml"),
-        format!("{SEMANTIC_DISABLED}[server]\nidle_timeout = \"60s\"\n{extra_toml}"),
+        format!("{VECTOR_DISABLED}[server]\nidle_timeout = \"60s\"\n{extra_toml}"),
     )?;
     Ok(directory)
 }

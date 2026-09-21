@@ -51,10 +51,10 @@ the tree moved in recorded files outside the syntax-indexed ones or in the confi
 
 The search ranking tiers carry their own warnings:
 
-- `semantic_index_preparing` - the semantic ranking is still being built. A query sharing no
+- `vector_index_preparing` - the vector ranking is still being built. A query sharing no
   token with the code it describes reaches nothing until every declaration carries a vector;
   `prepared` and `total` state how far that has got.
-- `semantic_ranking_unavailable` - the semantic ranking will not answer for the life of this
+- `vector_ranking_unavailable` - the vector ranking will not answer for the life of this
   server: the model weights could not be acquired, or the model failed to load.
 - `lexical_ranking_unavailable` - the full-text tier has not yet committed the captured tree,
   missed a commit, failed to load, or holds no indexed tree; the `detail` names which, and the
@@ -66,10 +66,14 @@ The search ranking tiers carry their own warnings:
 - `lexical_ranking_truncated` - the lexical ranking stopped at `matches_max` units, and hits
   past that bound never reach a page, whatever `paths` selects. `total_pages` counts the units
   that did; a narrower `query` brings the rest inside the bound.
-- `results_truncated` - the result set reached `results_max` hits, the server's result bound,
-  before ordering and paging, so hits past it never reach a page and `total_pages` counts only
-  what fit. The warning means the bound was reached: a set of exactly `results_max` hits carries
-  it too. A narrower `query` or `paths` brings the set inside the bound.
+- `query_narrowed` - the query carried more terms and quoted phrases than `terms_max`, so the
+  server dropped the shortest unquoted terms and ranked the answer by the rest. Every quoted
+  phrase is kept. Shorten `query`, or quote the terms that must be matched.
+- `results_truncated` - the server reached `results_max`, its result bound, before ordering and
+  paging. The bound covers both the candidates one read ranks and the hits it returns, so what
+  it cut never reaches any page and `total_pages` counts only what fit. The warning means the
+  bound was reached: a read that cut nothing else but filled the candidate pool carries it too.
+  A narrower `query` or `paths` brings the read inside the bound.
 
 A `symbol_disagreement` warning names a symbol whose selected presentation and at least one
 provider's own facts disagree.
@@ -261,21 +265,29 @@ This request narrows the search to the tests tree, then reaches one file the wor
   languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
 />
 
-`query` matches declaration names, file contents, and declaration sources through a full-text
-index. A multi-word query matches a unit that carries any one of its terms anywhere in its
-content, and a unit carrying more of the query's terms ranks above one carrying fewer.
+`query` matches declaration names, qualified names, signatures, attached documentation,
+declaration sources, and file contents through a full-text index, and the identifiers it
+carries against the indexed names. A multi-word query is answered first by the documents
+carrying every term; only when that leaves the answer short do documents carrying some of
+them join, behind every exact one. Double quotes keep a phrase together in both passes.
+
+An identifier written inside a question reaches its declaration without being quoted:
+`where does encode_path get its escape set` ranks `encode_path` through the identifier
+matching, while the prose around it ranks through the full-text index.
 
 The index ranks at most 1,000 units for one request. When more units match, the answer
 carries a `lexical_ranking_truncated` warning naming that bound, and hits past it never reach
 a page: `paths` selects among the ranked units, so only a narrower `query` brings the rest
 inside the bound.
 
-The result set has its own bound of 1,000 hits, applied before ordering and paging: an answer
-whose set reached it warns `results_truncated`.
+The read has its own bound of 1,000, applied to the candidates it ranks and again to the hits
+it orders and pages: a read that reached it warns `results_truncated`.
 
-A symbol whose only match sits in its declaration, not its name, still returns as a `symbol`
-hit. The ranked lane placed it, so the hit is tagged `matched_by: ["ranked"]`, not
-`["content"]` - a claim only the identifier or line matcher can make against literal bytes:
+A symbol whose only match sits in its documentation and its source, not in its name, still
+returns as a `symbol` hit. `matched_by` names every field that carried a term, so this one
+is tagged `["documentation", "content"]`: the attached doc comment carried both words, and
+the declaration's own source carries that comment. A hit tagged `["ranked"]` is one the
+vector ranking placed, where no indexed field carries the query's literal bytes at all.
 
 **Request:**
 
@@ -298,7 +310,7 @@ hit. The ranked lane placed it, so the hit is tagged `matched_by: ["ranked"]`, n
       "visibility": "pub"
     }
   },
-  "matched_by": ["ranked"],
+  "matched_by": ["documentation", "content"],
   "range": { "start": 1496, "end": 1925 },
   "line": 43,
   "path": "crates/rift-core/src/identity.rs"
@@ -309,8 +321,7 @@ hit. The ranked lane placed it, so the hit is tagged `matched_by: ["ranked"]`, n
 
 Every visible bounded UTF-8 file without a NUL byte joins the same index when its effective
 language entry or [`[search.text].include`](/docs/developer/configuration#search) selects it. A hit on one
-of those files returns as a `file` hit, tagged
-`matched_by: ["ranked"]` the same way:
+of those files returns as a `file` hit, tagged `matched_by: ["content"]` the same way:
 
 **Request:**
 
@@ -326,7 +337,7 @@ of those files returns as a `file` hit, tagged
     "target": "file",
     "size": 3546
   },
-  "matched_by": ["ranked"],
+  "matched_by": ["content"],
   "range": { "start": 820, "end": 920 },
   "line": 35,
   "path": "README.md"
@@ -335,8 +346,8 @@ of those files returns as a `file` hit, tagged
 
 A path carrying no extension - `justfile`, `Dockerfile` - is selected by the same patterns and
 returns the same way, because the selection reads the whole project-relative path. A file hit
-carries `languages` only where a syntax provider claims the path; the ranked lane can also reach
-a file no provider claims, as this one does.
+carries `languages` only where a syntax provider claims the path; the full-text index also
+reaches a file no provider claims, as this one does.
 
 The hit above carries no `source`: a request pays that lookup only when `include` names it.
 `include: ["source"]` attaches the excerpt as `source` on every hit; an omitted `include` returns

@@ -203,13 +203,15 @@ outlined above. They differ in which source they cover and where that analysis r
 ### Local
 
 The local server builds a local index for one project. It reads the project's text, syntax,
-semantics, documentation, and revision history without sending project source elsewhere.
+semantics, documentation, and revision history on the user's machine. Project source does not
+enter the global index.
 
 The server also reads the project's dependency list, or accepts one through configuration. It
-uses that list to identify which OSS packages are relevant, but it does not analyze their source
-locally. When a read needs facts about those packages, the local server requests them from the
-global index through an API, carrying the context of the current project
-<VersionBadge version="planned" inline />.
+uses that list to identify which OSS packages are relevant. When a read needs facts about those
+packages, the local server requests them from the global index through an API, carrying the context
+of the current project <VersionBadge version="planned" inline />. The local server falls back to
+local dependency indexing when the global index is unavailable or does not contain a dependency.
+Local dependency indexing and global ingestion use the same package analysis and index structure.
 
 ### Global <VersionBadge version="planned" inline />
 
@@ -220,3 +222,81 @@ and links between packages, so each local project does not have to reproduce the
 The global server exposes that index through two entrypoints. An agent connected directly over MCP
 can search and inspect the collected OSS packages. A local Rift server reaches it through an API,
 and the global server answers using the package context supplied by that project.
+
+## Search
+
+The local server processes and indexes project source on the user's machine. The global service
+does not process or index that source. <VersionBadge version="planned" inline /> Global search
+uses a separate index of collected OSS package versions.
+
+### Local ranking
+
+<VersionBadge
+  version="v0.0.9"
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
+/>
+
+The local baseline combines identifier-aware matching with a
+[SQLite FTS5](https://www.sqlite.org/fts5.html) index over declaration names, declaration source,
+and selected text files. FTS5 ranks matching units with BM25.
+
+<VersionBadge
+  version="v0.0.16"
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
+/>
+
+Local search can add optional vector search to this baseline. The reviewed local model families
+are:
+
+- Model2Vec retrieval models, including the default `minishlab/potion-retrieval-32M`
+- BGE retrieval models that use Rift's supported BERT configuration and query contract, including
+  `BAAI/bge-small-en-v1.5`
+
+Rift can download supported model weights from Hugging Face or read them from a configured
+workspace directory. Both paths execute the model inside the local server, so neither path sends
+project text to an embedding service.
+
+<VersionBadge
+  version="v0.0.39"
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
+/>
+
+The full-text index covers more of a declaration than its name and its source: the name, the
+qualified name, the identifier words those two split into, the rendered signature, the attached
+documentation, the declaration's own source, and the text of a selected file, each weighted so a
+name outranks a body. An answer states which of them carried the term.
+
+Identifier matching, full-text matching, and vector similarity now rank one query together,
+rather than answering as lanes in turn. They score in units nothing converts between, so Rift
+reads the position each puts a result in and combines those by weighted reciprocal rank.
+[`[search.ranking]`](/docs/developer/configuration#search) carries `identifier_weight`,
+`lexical_weight`, `vector_weight`, and `fusion_k`. Only the rankings that answered take part, so
+a vector index still building changes no order.
+
+An OpenAI-compatible embedding endpoint adds optional remote embedding execution, configured
+through [`[search.vector.embedding]`](/docs/developer/configuration#search) with the credential
+read from the environment variable `api_key_env` names. Endpoint execution is explicit because it
+sends declaration text while building vectors and query text while searching, which is the one
+path that takes project text off the machine.
+
+Rift supports these local model families and OpenAI-compatible embedding endpoints. Hugging Face
+repository support does not mean that Rift can execute every model in that repository. Other model
+families, including Qwen3 embeddings, require a separate reviewed local runtime.
+
+### Global ranking <VersionBadge version="planned" inline />
+
+The global server ranks facts from collected OSS package versions. A local server supplies the
+resolved package versions for its project, which keeps the remote answer within the dependencies
+that project can use.
+
+The local and global rankings do not need the same embedding model. Each index ranks its own
+corpus, then Rift merges their ranks rather than comparing their model-specific scores.
+
+### Query routing <VersionBadge version="planned" inline />
+
+The request's `scope` follows the two-index model:
+
+- `local`, the default, searches the local index
+- `global` searches package facts within the project's resolved package versions, using local
+  dependency indexing when the global index is unavailable or does not contain a dependency
+- `all` searches project and package facts and merges the ranked results

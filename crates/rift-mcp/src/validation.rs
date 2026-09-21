@@ -17,8 +17,8 @@ use rift_core::constants::{
 };
 use rift_core::{LanguageFileSelections, SourceVisibility, TextFileInclusion};
 use rift_index::{
-    ChangeSet, FileDigest, LexicalChange, LexicalUnit, PathChanges, WorkspaceFingerprint,
-    WorkspaceIndexLimits, WorkspaceSourcePolicy,
+    ChangeSet, FileDigest, LexicalChange, PathChanges, WorkspaceFingerprint, WorkspaceIndexLimits,
+    WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::{
     HistoryConfiguration, LanguageLspConfiguration, LogsConfiguration, LspConfiguration,
@@ -28,7 +28,8 @@ use rift_protocol::dependencies::DependenciesConfiguration;
 use rift_protocol::error as wire;
 use rift_protocol::map::WorkspaceMap;
 use rift_protocol::source::SourceConfiguration;
-use rift_search::{Embedding, SearchError, SearchIndex, SemanticReadiness};
+use rift_ranking::IndexDocument;
+use rift_search::{Embedding, SearchError, SearchIndex, VectorReadiness};
 use rift_server::{
     CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, LspProcessKey, PackageBranch, ReadError,
     ReadFault, ReadService, load_configuration,
@@ -1366,7 +1367,7 @@ pub(crate) fn lexical_write(
     change_set: &ChangeSet,
 ) -> LexicalWrite {
     match change_set {
-        ChangeSet::Full => LexicalWrite::Whole(published.reads.lexical_units()),
+        ChangeSet::Full => LexicalWrite::Whole(published.reads.index_documents()),
         ChangeSet::Incremental(changes) => {
             LexicalWrite::Change(published.reads.lexical_change(changes))
         }
@@ -1439,7 +1440,7 @@ fn shared_workspace_candidate(
     })
 }
 
-/// Embeds the declarations `published` describes, so the semantic tier ranks the tree the
+/// Embeds the declarations `published` describes, so the vector ranking ranks the tree the
 /// lexical index already holds.
 ///
 /// The lexical set is not written here. The lexical lane commits it in publication order,
@@ -1451,9 +1452,9 @@ fn shared_workspace_candidate(
 /// stored. A store this process found on disk was written by an earlier one, possibly under
 /// another model, so the first pass of a run establishes rather than trusts.
 ///
-/// Population failure is a warning, never a request failure: the semantic tier reports its
+/// Population failure is a warning, never a request failure: the vector ranking reports its
 /// own readiness, and the next successful publication asks for another pass.
-/// A disabled semantic tier still reports chunked files, then skips declaration derivation.
+/// A disabled vector ranking still reports chunked files, then skips declaration derivation.
 ///
 /// # Cancel safety
 ///
@@ -1474,10 +1475,10 @@ pub(crate) async fn populate_search(
              in [source], or increase search.text.max_chunk, to avoid this"
         );
     }
-    if index.readiness() == SemanticReadiness::Disabled {
+    if index.readiness() == VectorReadiness::Disabled {
         return;
     }
-    let units = published.reads.lexical_units();
+    let units = published.reads.index_documents();
     let described = published.reads.described_units(&units);
     let tree_revision = published.reads.tree_revision();
     if let Err(error) = index
@@ -1489,7 +1490,7 @@ pub(crate) async fn populate_search(
             operation = "search.populate",
             tree_revision = published.reads.tree_revision(),
             error = %error,
-            "the semantic tier could not embed this publication; the full-text tier keeps \
+            "the vector ranking could not embed this publication; the full-text tier keeps \
              answering until a later pass lands"
         );
     }
@@ -1535,7 +1536,7 @@ pub(crate) fn commit_deadline(unit_count: usize) -> Duration {
 #[derive(Debug)]
 pub(crate) enum LexicalWrite {
     /// The whole unit set, replacing whatever is stored.
-    Whole(Vec<LexicalUnit>),
+    Whole(Vec<IndexDocument>),
     /// Only the units one change set names.
     Change(LexicalChange),
 }
@@ -1582,9 +1583,9 @@ impl LexicalWrite {
     /// answering `get_symbol` and symbol search, and only its text ranking is absent. A
     /// change set keeps every replaced path, so the stored units of a file whose one unit
     /// grew past the bound are still deleted.
-    fn within_unit_bound(self, unit_bytes_max: usize) -> (Self, Vec<LexicalUnit>) {
+    fn within_unit_bound(self, unit_bytes_max: usize) -> (Self, Vec<IndexDocument>) {
         let mut left_out = Vec::new();
-        let mut within = |unit: LexicalUnit| {
+        let mut within = |unit: IndexDocument| {
             if unit.content().len() > unit_bytes_max {
                 left_out.push(unit);
                 None
@@ -1618,12 +1619,12 @@ impl LexicalWrite {
 
 /// Records each unit one commit left out of the lexical index, once per build, in the
 /// form `file left out of the index` takes.
-fn record_units_left_out(left_out: &[LexicalUnit], unit_bytes_max: usize) {
+fn record_units_left_out(left_out: &[IndexDocument], unit_bytes_max: usize) {
     for unit in left_out {
         tracing::warn!(
             component = "index",
             operation = "index.build",
-            path = unit.path().as_str(),
+            path = unit.project_path().map_or("", ProjectPath::as_str),
             observed = unit.content().len(),
             maximum = unit_bytes_max,
             "lexical unit left out of the search index: its content exceeds the unit byte \
@@ -1638,7 +1639,7 @@ pub(crate) trait LexicalStore: Send + Sync + 'static {
     /// transaction.
     fn replace(
         &self,
-        units: &[LexicalUnit],
+        units: &[IndexDocument],
         tree_revision: &str,
     ) -> impl Future<Output = Result<(), SearchError>> + Send;
 
@@ -1653,7 +1654,7 @@ pub(crate) trait LexicalStore: Send + Sync + 'static {
 impl LexicalStore for SearchIndex {
     fn replace(
         &self,
-        units: &[LexicalUnit],
+        units: &[IndexDocument],
         tree_revision: &str,
     ) -> impl Future<Output = Result<(), SearchError>> + Send {
         self.replace_lexical(units, tree_revision)
@@ -2063,7 +2064,7 @@ impl<Store: LexicalStore> LexicalTask<Store> {
         let tree_revision = published.reads.tree_revision().to_owned();
         self.blocking
             .run("lexical unit derivation", move || {
-                Ok(LexicalWrite::Whole(published.reads.lexical_units()))
+                Ok(LexicalWrite::Whole(published.reads.index_documents()))
             })
             .await
             .inspect_err(|error| record_commit_failure(&tree_revision, "whole", error))
@@ -2144,7 +2145,7 @@ fn lexical_unavailable(detail: &str) -> ReadError {
 /// was handed rather than a backlog of superseded ones.
 ///
 /// An answer computed while a pass is pending needs nothing new: the lexical tier already
-/// holds the published tree, and the semantic tier ranks nothing until the pass for that
+/// holds the published tree, and the vector ranking ranks nothing until the pass for that
 /// tree publishes its corpus.
 #[derive(Clone, Debug)]
 pub(crate) struct PopulationLane {
@@ -2773,7 +2774,8 @@ pub(crate) mod lexical_double {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use rift_index::{LexicalChange, LexicalUnit};
+    use rift_index::LexicalChange;
+    use rift_ranking::IndexDocument;
     use rift_search::{SearchError, SearchFault, SearchIndex, SearchViolation};
     use tokio::sync::Semaphore;
 
@@ -2912,7 +2914,7 @@ pub(crate) mod lexical_double {
     impl LexicalStore for StoreDouble {
         async fn replace(
             &self,
-            units: &[LexicalUnit],
+            units: &[IndexDocument],
             tree_revision: &str,
         ) -> Result<(), SearchError> {
             let through = async {
@@ -3068,7 +3070,11 @@ pub(crate) mod tests {
     use notify::{Event, EventKind};
     use rift_index::{LexicalChange, LexicalIndexLimits, WorkspaceIndexLimits};
     use rift_protocol::configuration::ServerConfiguration;
-    use rift_search::{RevisionScoped, SearchIndex, SearchIndexLimits, SemanticReadiness};
+    use rift_ranking::{
+        DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, IndexDocument,
+        ParsedQuery, QueryPhase, RankingInput, SearchableField,
+    };
+    use rift_search::{RevisionScoped, SearchIndex, SearchIndexLimits, VectorReadiness};
     use rift_server::ReadFault;
     use tokio::sync::{Barrier as AsyncBarrier, RwLock};
     use tokio_util::sync::CancellationToken;
@@ -4653,11 +4659,8 @@ pub(crate) mod tests {
             "the oversized guide must split into more than one chunk: {chunk_count}"
         );
 
-        let units = published.reads.lexical_units();
-        let guide_units = units
-            .iter()
-            .filter(|unit| unit.path().as_str() == "guide.txt")
-            .count();
+        let units = published.reads.index_documents();
+        let guide_units = units.iter().filter(|unit| names_guide(unit)).count();
         assert!(
             guide_units > 1,
             "the oversized file must contribute more than one lexical unit: {guide_units}"
@@ -4684,12 +4687,9 @@ pub(crate) mod tests {
             "the commit must succeed and stamp the published tree revision, not merely warn"
         );
         let ranked = ranked_at(&index, published.reads.tree_revision(), "word", 64).await?;
-        for unit in units
-            .iter()
-            .filter(|unit| unit.path().as_str() == "guide.txt")
-        {
+        for unit in units.iter().filter(|unit| names_guide(unit)) {
             assert!(
-                ranked.iter().any(|one| one.identity() == unit.identity()),
+                ranked.iter().any(|one| one == unit.identity()),
                 "every chunk unit must have been persisted: identity={} ranked={ranked:#?}",
                 unit.identity()
             );
@@ -4857,25 +4857,34 @@ pub(crate) mod tests {
         let lexical = LexicalIndexLimits::new(
             defaults.units_max(),
             unit_bytes_max,
-            defaults.query_terms_max(),
             defaults.matches_max(),
             defaults.pool_slots(),
             defaults.busy_timeout_ms(),
         );
-        let limits = SearchIndexLimits::builder(lexical)
-            .disable_semantic()
-            .build();
+        let limits = SearchIndexLimits::builder(lexical).disable_vector().build();
         Ok(SearchIndex::open(database, limits).await?)
     }
 
-    /// One unit `bytes` long at `path`, for the bound cases.
-    fn unit_of(path: &str, identity: &str, bytes: usize) -> TestResult<rift_index::LexicalUnit> {
-        let project_path = rift_core::ProjectPath::new(path)?;
-        let kind = rift_index::LexicalUnitKind::Symbol;
-        let name = Some(identity.to_owned());
-        let text = "x".repeat(bytes);
-        let unit = rift_index::LexicalUnit::new(identity, project_path, kind, name, text)?;
-        Ok(unit)
+    /// One symbol document whose declaration source is `bytes` long, for the bound cases.
+    fn unit_of(path: &str, identity: &str, bytes: usize) -> TestResult<IndexDocument> {
+        let fields = DocumentFields::empty()
+            .with(SearchableField::Name, identity)
+            .with(SearchableField::DeclarationSource, "x".repeat(bytes));
+        let document = IndexDocument::new(
+            DocumentIdentity::new(identity)?,
+            DocumentLocation::Project(rift_core::ProjectPath::new(path)?),
+            DocumentKind::Symbol,
+            fields.digest(),
+            fields,
+        )?;
+        Ok(document)
+    }
+
+    /// Whether `document` addresses the chunked guide the text-file cases write.
+    fn names_guide(document: &IndexDocument) -> bool {
+        document
+            .project_path()
+            .is_some_and(|path| path.as_str() == "guide.txt")
     }
 
     #[test]
@@ -4893,12 +4902,17 @@ pub(crate) mod tests {
         };
         assert_eq!(
             kept.iter()
-                .map(rift_index::LexicalUnit::identity)
+                .map(|unit| unit.identity().as_str())
                 .collect::<Vec<_>>(),
             ["small", "exact"]
         );
         assert_eq!(left_out.len(), 1);
-        assert_eq!(left_out[0].path().as_str(), "b.rs");
+        assert_eq!(
+            left_out[0]
+                .project_path()
+                .map(rift_core::ProjectPath::as_str),
+            Some("b.rs")
+        );
         Ok(())
     }
 
@@ -5907,7 +5921,7 @@ pub(crate) mod tests {
     /// # Errors
     ///
     /// Returns the stamp the store still carried once the bound runs out.
-    /// One index whose semantic tier is enabled but holds no model, so a pass records the
+    /// One index whose vector ranking is enabled but holds no model, so a pass records the
     /// declaration count it was handed as its readiness rather than embedding anything.
     ///
     /// That count is the population lane's observable: with the tier disabled a pass leaves
@@ -5917,7 +5931,7 @@ pub(crate) mod tests {
         let index = SearchIndex::open(database, limits).await?;
         assert_eq!(
             index.readiness(),
-            SemanticReadiness::Preparing {
+            VectorReadiness::Preparing {
                 prepared: 0,
                 total: 0
             }
@@ -5925,16 +5939,25 @@ pub(crate) mod tests {
         Ok(index)
     }
 
-    /// The units one revision-qualified search ranked, refusing an answer the store could
-    /// not place under `tree_revision`.
+    /// The identities one revision-qualified store answer placed in its precise phase,
+    /// refusing an answer the store could not place under `tree_revision`.
     async fn ranked_at(
         index: &SearchIndex,
         tree_revision: &str,
         query: &str,
         limit: u32,
-    ) -> TestResult<Vec<rift_search::RankedUnit>> {
-        match index.search(tree_revision, query, limit).await? {
-            RevisionScoped::Matched(ranked) => Ok(ranked.into_units()),
+    ) -> TestResult<Vec<DocumentIdentity>> {
+        let parsed = ParsedQuery::parse(query)?;
+        let ranking = index
+            .rank(tree_revision, &parsed, QueryPhase::Precise, limit)
+            .await?;
+        match ranking {
+            RevisionScoped::Matched(ranking) => Ok(ranking
+                .inputs()
+                .iter()
+                .flat_map(RankingInput::order)
+                .map(|ranked| ranked.identity().clone())
+                .collect()),
             other => Err(format!("the store must hold {tree_revision}: {other:?}").into()),
         }
     }
@@ -5942,7 +5965,7 @@ pub(crate) mod tests {
     /// Waits until the lane's readiness names `total` declarations.
     async fn described_within_bound(index: &SearchIndex, total: u64) -> TestResult {
         for _attempt in 0..LANE_ATTEMPTS_MAX {
-            if index.readiness() == (SemanticReadiness::Preparing { prepared: 0, total }) {
+            if index.readiness() == (VectorReadiness::Preparing { prepared: 0, total }) {
                 return Ok(());
             }
             tokio::time::sleep(LANE_POLL).await;
@@ -5963,7 +5986,7 @@ pub(crate) mod tests {
         let cancellation = CancellationToken::new();
         let lane = PopulationLane::spawn(Arc::clone(&index), cancellation.clone());
 
-        let units = published.reads.lexical_units();
+        let units = published.reads.index_documents();
         let described = published.reads.described_units(&units).len() as u64;
         lane.request(Arc::clone(&published));
         described_within_bound(&index, described).await?;
@@ -5993,7 +6016,7 @@ pub(crate) mod tests {
         let cancellation = CancellationToken::new();
         let lane = PopulationLane::spawn(Arc::clone(&index), cancellation.clone());
 
-        let units = newest.reads.lexical_units();
+        let units = newest.reads.index_documents();
         let described = newest.reads.described_units(&units).len() as u64;
         lane.request(Arc::clone(&earlier));
         lane.request(Arc::clone(&newest));
@@ -6014,7 +6037,7 @@ pub(crate) mod tests {
         let index = Arc::new(counting_index(&directory.path().join("search.db")).await?);
         let cancellation = CancellationToken::new();
         let lane = PopulationLane::spawn(Arc::clone(&index), cancellation.clone());
-        let units = earlier.reads.lexical_units();
+        let units = earlier.reads.index_documents();
         let described = earlier.reads.described_units(&units).len() as u64;
         lane.request(Arc::clone(&earlier));
         described_within_bound(&index, described).await?;
@@ -6039,7 +6062,7 @@ pub(crate) mod tests {
         lane.request(Arc::clone(&newest));
         assert_eq!(
             index.readiness(),
-            SemanticReadiness::Preparing {
+            VectorReadiness::Preparing {
                 prepared: 0,
                 total: described
             },
@@ -6082,7 +6105,7 @@ pub(crate) mod tests {
         let subscriber = tracing_subscriber::registry().with(sink);
         let _guard = tracing::subscriber::set_default(subscriber);
         super::populate_search(&index, &published, rift_search::Embedding::Every).await;
-        assert_eq!(index.readiness(), SemanticReadiness::Disabled);
+        assert_eq!(index.readiness(), VectorReadiness::Disabled);
         assert_eq!(index.tree_revision().await?.as_deref(), Some(revision));
         assert_eq!(ranked_at(&index, revision, "beacon", 8).await?, before);
         let records = queued_records(&mut drain);
@@ -6092,21 +6115,21 @@ pub(crate) mod tests {
                 record.message().contains("was indexed in chunks")
                     && record.fields().contains("guide.txt")
             })
-            .ok_or("disabled semantics must still report the chunked guide")?;
+            .ok_or("a disabled vector ranking must still report the chunked guide")?;
         assert_eq!(warning.level(), "warn");
         assert_eq!(warning.component(), "search");
         cancellation.cancel();
         Ok(())
     }
 
-    /// One search index over `database` with the semantic tier off, so a test drives the
+    /// One search index over `database` with the vector ranking off, so a test drives the
     /// full-text half without acquiring model weights.
     async fn search_index(database: &std::path::Path) -> TestResult<SearchIndex> {
         let limits = SearchIndexLimits::builder(LexicalIndexLimits::default())
-            .disable_semantic()
+            .disable_vector()
             .build();
         let index = SearchIndex::open(database, limits).await?;
-        assert_eq!(index.readiness(), SemanticReadiness::Disabled);
+        assert_eq!(index.readiness(), VectorReadiness::Disabled);
         Ok(index)
     }
 

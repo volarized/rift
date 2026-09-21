@@ -1,22 +1,33 @@
-//! Full-text search over lexical units: code symbols and visible text files
-//! files.
+//! Full-text search over index documents: code symbols and visible text files.
 //!
-//! Unit granularity is the symbol or the text file, chosen so a later
-//! dense-ranking layer can attach per-unit vectors without reshaping this
-//! store.
+//! Document granularity is the symbol or the text file, chosen so the vector
+//! ranking can attach one vector per document without reshaping this store.
+//!
+//! The searchable fields, their `bm25` weights, and the tokenizer all come
+//! from [`rift_ranking`], so the column list this module declares and the
+//! ranking every other reader runs cannot drift. The corpus revision the
+//! state row carries covers exactly that shape: a store stamped with another
+//! revision answers nothing until the workspace republishes.
 //!
 //! `SQLite` FTS5 is reached through raw SQL because Toasty 0.10 has no typed
 //! virtual-table or `MATCH` API, the same boundary the Toasty compatibility
 //! test documents. Raw SQL stays isolated to the FTS virtual table and its
-//! rows; the authoritative `lexical_units` and `lexical_index_state` tables are
+//! rows; the authoritative `lexical_documents` and `lexical_index_state` tables are
 //! ordinary Toasty models.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use rift_core::{
     Error, ErrorCode, ErrorContext, ErrorName, Fault, LimitEvidence, ProjectPath, fault_label,
 };
 use rift_protocol::configuration::LEXICAL_UNITS_MAX_DEFAULT;
+use rift_ranking::{
+    CorpusRevision, DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, FieldSet,
+    IndexCapabilities, IndexDocument, IndexReader, ParsedQuery, PublicationFormat, QueryPhase,
+    RankRequest, RankedIdentity, RankingError, RankingFault, RankingInput, RankingInputKind,
+    RankingInputSet, RankingViolation, ReaderFuture, SearchableField,
+};
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -27,10 +38,8 @@ use toasty::stmt::{Type, Value};
 
 use crate::database::WorkspaceDatabase;
 
-/// Default maximum content bytes accepted for one lexical unit (1 MiB).
+/// Default maximum content bytes accepted for one lexical document (1 MiB).
 const LEXICAL_UNIT_BYTES_MAX_DEFAULT: u32 = 1_048_576;
-/// Default maximum distinct query terms accepted per search.
-const LEXICAL_QUERY_TERMS_MAX_DEFAULT: u32 = 32;
 /// Default maximum search results returned per query.
 const LEXICAL_MATCHES_MAX_DEFAULT: u32 = 1_000;
 /// Default pooled `SQLite` connection slots.
@@ -38,20 +47,11 @@ const LEXICAL_POOL_SLOTS_DEFAULT: u32 = 4;
 /// Default busy-wait budget, in milliseconds, `SQLite` grants a connection
 /// before returning `SQLITE_BUSY`.
 const LEXICAL_BUSY_TIMEOUT_MS_DEFAULT: u32 = 5_000;
-/// Maximum UTF-8 bytes accepted for one unit's declaration name, matching
-/// the wire's symbol-name maximum.
-const UNIT_NAME_BYTES_MAX: usize = 4_096;
-
 /// `bm25` column weight applied to the FTS `identity` column. `identity` is
 /// `UNINDEXED` and never matches a term, but `bm25` still numbers every
 /// declared column positionally, `identity` included, so this placeholder
-/// keeps the `name` and `content` weights that follow aligned to their
-/// columns.
+/// keeps the searchable columns' weights aligned to their own positions.
 const LEXICAL_IDENTITY_RANK_WEIGHT: f64 = 0.0;
-/// `bm25` column weight applied to the FTS `name` column.
-const LEXICAL_NAME_RANK_WEIGHT: f64 = 10.0;
-/// `bm25` column weight applied to the FTS `content` column.
-const LEXICAL_CONTENT_RANK_WEIGHT: f64 = 1.0;
 
 /// Primary key of the single `lexical_index_state` row this adapter maintains.
 const LEXICAL_INDEX_STATE_ID: i64 = 1;
@@ -112,112 +112,38 @@ CREATE INDEX log_records_level ON log_records(level)
 -- #[toasty::breakpoint]
 CREATE INDEX log_records_component ON log_records(component)",
     ),
+    MigrationFile::new(
+        5,
+        "lexical_documents",
+        "DROP TABLE lexical_units_fts
+-- #[toasty::breakpoint]
+DROP TABLE lexical_units
+-- #[toasty::breakpoint]
+CREATE TABLE lexical_documents(
+        identity TEXT PRIMARY KEY NOT NULL,
+        path TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        digest TEXT NOT NULL,
+        byte_length BIGINT NOT NULL,
+        name TEXT,
+        qualified_name TEXT,
+        identifier_terms TEXT,
+        signature TEXT,
+        documentation TEXT,
+        declaration_source TEXT,
+        file_content TEXT
+    )
+-- #[toasty::breakpoint]
+CREATE INDEX lexical_documents_path ON lexical_documents(path)
+-- #[toasty::breakpoint]
+CREATE VIRTUAL TABLE lexical_documents_fts USING fts5(identity UNINDEXED, name, \
+qualified_name, identifier_terms, signature, documentation, declaration_source, \
+file_content, tokenize='unicode61 remove_diacritics 0')
+-- #[toasty::breakpoint]
+ALTER TABLE lexical_index_state ADD COLUMN corpus_revision TEXT NOT NULL DEFAULT ''",
+    ),
 ];
 pub(crate) const MIGRATIONS: MigrationSet = MigrationSet::new(MIGRATION_FILES);
-
-/// Unit granularity the lexical tier indexes.
-///
-/// The semantic tier stores its vectors in the same database, addressed by the
-/// digest of the text they were embedded from rather than by a unit identity:
-/// a declaration that moves or is renamed keeps its text, so it keeps its
-/// vector.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LexicalUnitKind {
-    /// A code symbol: one declaration extracted from source.
-    Symbol,
-    /// A visible text file indexed as one whole unit.
-    TextFile,
-}
-
-impl LexicalUnitKind {
-    /// Returns the spelling stored in `lexical_units.kind`, derived from this
-    /// type's serde form so the column value and the wire spelling cannot
-    /// drift.
-    fn stored_value(self) -> String {
-        fault_label(&self)
-    }
-
-    /// Parses a stored spelling back into a unit kind.
-    fn from_stored(value: &str) -> Option<Self> {
-        [Self::Symbol, Self::TextFile]
-            .into_iter()
-            .find(|kind| kind.stored_value() == value)
-    }
-}
-
-/// One immutable indexed unit: a code symbol or a whole text file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LexicalUnit {
-    identity: String,
-    path: ProjectPath,
-    kind: LexicalUnitKind,
-    name: Option<String>,
-    content: String,
-}
-
-impl LexicalUnit {
-    /// Constructs one lexical unit.
-    ///
-    /// `identity` is the unit's stable key: the rift symbol id for a symbol
-    /// unit, the project path for a text-file unit. `name` is the
-    /// declaration name for a symbol unit or the file stem for a text-file
-    /// unit, when known.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LexicalIndexError`] with [`LexicalIndexViolation::IdentityEmpty`]
-    /// when `identity` is empty.
-    pub fn new(
-        identity: impl Into<String>,
-        path: ProjectPath,
-        kind: LexicalUnitKind,
-        name: Option<String>,
-        content: impl Into<String>,
-    ) -> Result<Self, LexicalIndexError> {
-        let identity = identity.into();
-        if identity.is_empty() {
-            return Err(lexical_error(LexicalIndexViolation::IdentityEmpty));
-        }
-        Ok(Self {
-            identity,
-            path,
-            kind,
-            name,
-            content: content.into(),
-        })
-    }
-
-    /// Returns the unit's stable identity.
-    #[must_use]
-    pub fn identity(&self) -> &str {
-        &self.identity
-    }
-
-    /// Returns the unit's project-relative path.
-    #[must_use]
-    pub const fn path(&self) -> &ProjectPath {
-        &self.path
-    }
-
-    /// Returns the unit's granularity.
-    #[must_use]
-    pub const fn kind(&self) -> LexicalUnitKind {
-        self.kind
-    }
-
-    /// Returns the unit's declaration name or file stem, when known.
-    #[must_use]
-    pub fn name(&self) -> Option<&str> {
-        self.name.as_deref()
-    }
-
-    /// Returns the unit's indexed text content.
-    #[must_use]
-    pub fn content(&self) -> &str {
-        &self.content
-    }
-}
 
 /// What one revision-qualified read of the store found.
 ///
@@ -278,19 +204,38 @@ impl LexicalRanking {
     pub const fn truncated_at(&self) -> Option<u32> {
         self.truncated_at
     }
+
+    /// This ranking as one fusion input: the identities in rank order, each
+    /// carrying the columns that placed it.
+    #[must_use]
+    pub fn into_input(self) -> RankingInput {
+        RankingInput::new(
+            RankingInputKind::Lexical,
+            self.matches
+                .into_iter()
+                .map(|matched| RankedIdentity::new(matched.identity, matched.fields))
+                .collect(),
+        )
+    }
 }
 
 /// One lexical search hit.
 ///
 /// `bm25` is negative; lower is better. `rank` is only comparable within the
-/// results of one `search` call.
+/// results of one `search` call, and fusion reads the position it produces
+/// rather than the value itself.
+///
+/// `fields` names every column that carried a query member. The store proves
+/// it by asking `bm25` for each column alone, so a documentation-only hit and
+/// a name hit are distinguishable in the answer rather than both reported as
+/// "the full-text ranking placed it".
 #[derive(Debug, Clone, PartialEq)]
 pub struct LexicalMatch {
-    identity: String,
+    identity: DocumentIdentity,
     path: ProjectPath,
-    kind: LexicalUnitKind,
-    name: Option<String>,
+    kind: DocumentKind,
     rank: f64,
+    fields: FieldSet,
 }
 
 impl LexicalMatch {
@@ -299,50 +244,50 @@ impl LexicalMatch {
     /// merge or resolve matches from a search result they already hold - most notably
     /// tests exercising that merge without a live database.
     #[must_use]
-    pub fn new(
-        identity: impl Into<String>,
+    pub const fn new(
+        identity: DocumentIdentity,
         path: ProjectPath,
-        kind: LexicalUnitKind,
-        name: Option<String>,
+        kind: DocumentKind,
         rank: f64,
+        fields: FieldSet,
     ) -> Self {
         Self {
-            identity: identity.into(),
+            identity,
             path,
             kind,
-            name,
             rank,
+            fields,
         }
     }
 
-    /// Returns the matched unit's stable identity.
+    /// Returns the matched document's stable identity.
     #[must_use]
-    pub fn identity(&self) -> &str {
+    pub const fn identity(&self) -> &DocumentIdentity {
         &self.identity
     }
 
-    /// Returns the matched unit's project-relative path.
+    /// Returns the matched document's project-relative path.
     #[must_use]
     pub const fn path(&self) -> &ProjectPath {
         &self.path
     }
 
-    /// Returns the matched unit's granularity.
+    /// Returns the matched document's granularity.
     #[must_use]
-    pub const fn kind(&self) -> LexicalUnitKind {
+    pub const fn kind(&self) -> DocumentKind {
         self.kind
-    }
-
-    /// Returns the matched unit's declaration name or file stem, when known.
-    #[must_use]
-    pub fn name(&self) -> Option<&str> {
-        self.name.as_deref()
     }
 
     /// Returns this hit's `bm25` rank, comparable only within one search.
     #[must_use]
     pub const fn rank(&self) -> f64 {
         self.rank
+    }
+
+    /// Returns every column that carried a query member.
+    #[must_use]
+    pub const fn fields(&self) -> FieldSet {
+        self.fields
     }
 }
 
@@ -351,7 +296,6 @@ impl LexicalMatch {
 pub struct LexicalIndexLimits {
     units_max: u32,
     unit_bytes_max: u32,
-    query_terms_max: u32,
     matches_max: u32,
     pool_slots: u32,
     busy_timeout_ms: u32,
@@ -363,7 +307,6 @@ impl LexicalIndexLimits {
     pub const fn new(
         units_max: u32,
         unit_bytes_max: u32,
-        query_terms_max: u32,
         matches_max: u32,
         pool_slots: u32,
         busy_timeout_ms: u32,
@@ -371,29 +314,22 @@ impl LexicalIndexLimits {
         Self {
             units_max,
             unit_bytes_max,
-            query_terms_max,
             matches_max,
             pool_slots,
             busy_timeout_ms,
         }
     }
 
-    /// Returns maximum indexed units accepted per `replace_all`.
+    /// Returns maximum indexed documents accepted per `replace_all`.
     #[must_use]
     pub const fn units_max(self) -> u32 {
         self.units_max
     }
 
-    /// Returns maximum content bytes accepted for one unit.
+    /// Returns maximum content bytes accepted for one document field.
     #[must_use]
     pub const fn unit_bytes_max(self) -> u32 {
         self.unit_bytes_max
-    }
-
-    /// Returns maximum distinct query terms accepted per search.
-    #[must_use]
-    pub const fn query_terms_max(self) -> u32 {
-        self.query_terms_max
     }
 
     /// Returns maximum search results returned per query.
@@ -429,13 +365,16 @@ impl LexicalIndexLimits {
 
 impl Default for LexicalIndexLimits {
     /// Defaults accept the `[search.lexical] units_max` default of 1,000,000
-    /// units, 1 MiB per unit, 32 distinct query terms, 1,000 returned matches,
-    /// 4 pooled connections, and a 5,000ms busy timeout.
+    /// documents, 1 MiB per content field, 1,000 returned matches, 4 pooled
+    /// connections, and a 5,000ms busy timeout.
+    ///
+    /// The query's own bounds are not here: [`ParsedQuery`] owns them, and
+    /// every reader parses the caller's text through it before this store
+    /// sees an expression.
     fn default() -> Self {
         Self::new(
             Self::accepted_units_max(LEXICAL_UNITS_MAX_DEFAULT),
             LEXICAL_UNIT_BYTES_MAX_DEFAULT,
-            LEXICAL_QUERY_TERMS_MAX_DEFAULT,
             LEXICAL_MATCHES_MAX_DEFAULT,
             LEXICAL_POOL_SLOTS_DEFAULT,
             LEXICAL_BUSY_TIMEOUT_MS_DEFAULT,
@@ -451,18 +390,17 @@ pub enum LexicalIndexViolation {
     Storage,
     /// A `replace_all` batch exceeded `units_max`.
     UnitLimit,
-    /// One unit's `content` exceeded `unit_bytes_max` or its `name` exceeded
-    /// `UNIT_NAME_BYTES_MAX`.
+    /// One document's content field exceeded `unit_bytes_max`.
     UnitTooLarge,
-    /// A search query's distinct term count exceeded `query_terms_max`.
-    QueryTermLimit,
     /// A stored row's path failed [`ProjectPath`] validation.
     StoredPathInvalid,
-    /// A stored row's kind failed to parse as a known [`LexicalUnitKind`].
+    /// A stored row's kind failed to parse as a known [`DocumentKind`].
     StoredKindInvalid,
-    /// A unit was constructed with an empty identity.
-    IdentityEmpty,
-    /// A `replace_all` batch repeated one identity across units.
+    /// A write carried a document addressed by a source unit. This store
+    /// holds project documents; a package document belongs to a package
+    /// index.
+    DocumentLocationUnsupported,
+    /// A `replace_all` batch repeated one identity across documents.
     DuplicateIdentity,
     /// One write carried more records than the batch bound accepts.
     RecordLimit,
@@ -539,12 +477,11 @@ impl Fault for LexicalIndexFault {
             LexicalIndexViolation::Storage => ErrorName::Wire(ErrorCode::StorageFailure),
             LexicalIndexViolation::UnitLimit
             | LexicalIndexViolation::UnitTooLarge
-            | LexicalIndexViolation::QueryTermLimit
             | LexicalIndexViolation::RecordLimit => ErrorName::Wire(ErrorCode::LimitExceeded),
             LexicalIndexViolation::StoredPathInvalid
             | LexicalIndexViolation::StoredKindInvalid
+            | LexicalIndexViolation::DocumentLocationUnsupported
             | LexicalIndexViolation::DuplicateIdentity => ErrorName::Wire(ErrorCode::InternalError),
-            LexicalIndexViolation::IdentityEmpty => ErrorName::Wire(ErrorCode::InvalidRequest),
         }
     }
 
@@ -644,103 +581,6 @@ pub(crate) fn storage_error(source: toasty::Error) -> LexicalIndexError {
     lexical_error_caused_by(LexicalIndexViolation::Storage, None, source)
 }
 
-/// Builds an FTS5 `MATCH` expression from a free-text query.
-///
-/// Terms split on non-alphanumeric Unicode boundaries, empty segments drop,
-/// and duplicates dedupe keeping first occurrence. FTS5's default `AND`
-/// between bareword terms would require every term to match one row, so
-/// terms join with `OR` instead: a multi-word query must not require every
-/// word to be present. Each term is double-quoted so an FTS5 keyword used as
-/// a term (`AND`, `OR`, `NOT`, `NEAR`) cannot be parsed as an operator.
-///
-/// Returns `None` when the query carries no terms.
-///
-/// The loop refuses the instant a distinct term count passes `terms_max`,
-/// before considering any later part of the query: a query with far more
-/// distinct terms than `terms_max` is never fully scanned.
-///
-/// # Errors
-///
-/// Returns [`LexicalIndexError`] with [`LexicalIndexViolation::QueryTermLimit`]
-/// when the query's distinct term count exceeds `terms_max`.
-fn match_expression(query: &str, terms_max: usize) -> Result<Option<String>, LexicalIndexError> {
-    let mut seen = std::collections::HashSet::new();
-    let mut terms: Vec<&str> = Vec::new();
-    for candidate in query.split(|character: char| !character.is_alphanumeric()) {
-        if candidate.is_empty() || !seen.insert(candidate) {
-            continue;
-        }
-        terms.push(candidate);
-        if terms.len() > terms_max {
-            return Err(lexical_error_over_limit(
-                LexicalIndexViolation::QueryTermLimit,
-                None,
-                "query_terms_max",
-                limit_count(terms.len()),
-                limit_count(terms_max),
-            ));
-        }
-    }
-    if terms.is_empty() {
-        return Ok(None);
-    }
-    let expression = terms
-        .iter()
-        .map(|term| format!("\"{term}\""))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    Ok(Some(expression))
-}
-
-/// Splits an identifier into words on case boundaries and non-alphanumeric
-/// separators, preserving each word's original casing.
-pub(crate) fn split_identifier_words(name: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut previous_lowercase = false;
-    for character in name.chars() {
-        if character.is_alphanumeric() {
-            if previous_lowercase && character.is_uppercase() && !current.is_empty() {
-                words.push(std::mem::take(&mut current));
-            }
-            current.push(character);
-            previous_lowercase = character.is_lowercase();
-        } else {
-            if !current.is_empty() {
-                words.push(std::mem::take(&mut current));
-            }
-            previous_lowercase = false;
-        }
-    }
-    if !current.is_empty() {
-        words.push(current);
-    }
-    words
-}
-
-/// Expands an identifier into its case-split words for FTS indexing.
-///
-/// FTS5's `unicode61` tokenizer has no `camelCase` folding, so this writes
-/// case-split tokens at insert time instead: `SearchHit` becomes
-/// `"SearchHit search hit"`, `parse_config_file` becomes
-/// `"parse_config_file parse config file"`. Returns the input unchanged when
-/// splitting adds no new word.
-fn identifier_expansion(name: &str) -> String {
-    let words = split_identifier_words(name);
-    if words.len() == 1 && words[0] == name {
-        return name.to_owned();
-    }
-    let expansion = words
-        .iter()
-        .map(|word| word.to_lowercase())
-        .collect::<Vec<_>>()
-        .join(" ");
-    if expansion.is_empty() || expansion == name {
-        return name.to_owned();
-    }
-    format!("{name} {expansion}")
-}
-
 /// Widens a `u32` domain bound into `usize` for in-memory comparisons; `u32`
 /// always fits `usize` on every platform Rift targets.
 pub(crate) fn bound_as_usize(bound: u32) -> usize {
@@ -752,14 +592,14 @@ pub(crate) fn bound_as_usize(bound: u32) -> usize {
 /// Refuses one unit's out-of-bound `name` or `content` field, naming which
 /// field and the offending path.
 fn oversized_field_error(
-    unit: &LexicalUnit,
+    path: &ProjectPath,
     field: &'static str,
     observed: usize,
     maximum: usize,
 ) -> LexicalIndexError {
     lexical_error_over_limit(
         LexicalIndexViolation::UnitTooLarge,
-        Some(Path::new(unit.path().as_str())),
+        Some(Path::new(path.as_str())),
         field,
         limit_count(observed),
         limit_count(maximum),
@@ -768,15 +608,14 @@ fn oversized_field_error(
 }
 
 /// Refuses a `replace_all` batch that violates a configured bound, before any
-/// database work begins. Bounds apply to the batch size, each unit's
-/// `content` (`unit_bytes_max`), and each unit's `name`
-/// (`UNIT_NAME_BYTES_MAX`).
+/// database work begins. Bounds apply to the batch size and to each
+/// document's content field (`unit_bytes_max`).
 fn validate_lexical_batch(
-    units: &[LexicalUnit],
+    documents: &[IndexDocument],
     limits: LexicalIndexLimits,
 ) -> Result<(), LexicalIndexError> {
-    validate_indexed_count(units.len(), limits)?;
-    validate_lexical_units(units, limits)
+    validate_indexed_count(documents.len(), limits)?;
+    validate_lexical_units(documents, limits)
 }
 
 /// Refuses an indexed set larger than `units_max`.
@@ -800,49 +639,69 @@ fn validate_indexed_count(
     Ok(())
 }
 
-/// Refuses a unit whose fields break their bounds, and a batch spelling one identity twice.
+/// Refuses a document whose content field breaks the configured bound, one
+/// addressed by a source unit, and a batch spelling one identity twice.
+///
+/// Field byte bounds of their own are already enforced where the document is
+/// built: [`IndexDocument::new`] refuses a name, signature, or documentation
+/// past the shape's own ceiling. What is left to this store is the operator's
+/// `unit_bytes_max`, which only the content field can reach.
 fn validate_lexical_units(
-    units: &[LexicalUnit],
+    documents: &[IndexDocument],
     limits: LexicalIndexLimits,
 ) -> Result<(), LexicalIndexError> {
-    let mut identities_seen = std::collections::HashSet::with_capacity(units.len());
-    for unit in units {
-        if let Some(name) = unit.name()
-            && name.len() > UNIT_NAME_BYTES_MAX
-        {
+    let mut identities_seen = std::collections::HashSet::with_capacity(documents.len());
+    for document in documents {
+        let path = project_location(document)?;
+        let field = document.kind().content_field();
+        let observed = document.content().len();
+        if observed > bound_as_usize(limits.unit_bytes_max()) {
             return Err(oversized_field_error(
-                unit,
-                "name",
-                name.len(),
-                UNIT_NAME_BYTES_MAX,
-            ));
-        }
-        if unit.content().len() > bound_as_usize(limits.unit_bytes_max()) {
-            return Err(oversized_field_error(
-                unit,
-                "content",
-                unit.content().len(),
+                path,
+                field.column(),
+                observed,
                 bound_as_usize(limits.unit_bytes_max()),
             ));
         }
-        if !identities_seen.insert(unit.identity()) {
-            return Err(lexical_error(LexicalIndexViolation::DuplicateIdentity)
-                .with_context(ErrorContext::new("identity", unit.identity().to_owned())));
+        if !identities_seen.insert(document.identity()) {
+            return Err(
+                lexical_error(LexicalIndexViolation::DuplicateIdentity).with_context(
+                    ErrorContext::new("identity", document.identity().as_str().to_owned()),
+                ),
+            );
         }
     }
     Ok(())
 }
 
+/// The project path a document is addressed by, or the refusal a package
+/// document earns from this store.
+fn project_location(document: &IndexDocument) -> Result<&ProjectPath, LexicalIndexError> {
+    match document.location() {
+        DocumentLocation::Project(path) => Ok(path),
+        DocumentLocation::Unit(unit) => Err(lexical_error(
+            LexicalIndexViolation::DocumentLocationUnsupported,
+        )
+        .with_context(ErrorContext::new("unit", unit.to_string()))),
+    }
+}
+
 #[derive(Debug, toasty::Model)]
-#[table = "lexical_units"]
-pub(crate) struct LexicalUnitRecord {
+#[table = "lexical_documents"]
+pub(crate) struct LexicalDocumentRecord {
     #[key]
     identity: String,
     path: String,
     kind: String,
-    name: Option<String>,
+    digest: String,
     byte_length: i64,
-    content: String,
+    name: Option<String>,
+    qualified_name: Option<String>,
+    identifier_terms: Option<String>,
+    signature: Option<String>,
+    documentation: Option<String>,
+    declaration_source: Option<String>,
+    file_content: Option<String>,
 }
 
 #[derive(Debug, toasty::Model)]
@@ -851,10 +710,11 @@ pub(crate) struct LexicalIndexStateRecord {
     #[key]
     id: i64,
     tree_revision: String,
+    corpus_revision: String,
 }
 
 /// Converts a content byte length already bounded by `unit_bytes_max` (a
-/// `u32`) into the wire-width integer `lexical_units.byte_length` stores.
+/// `u32`) into the wire-width integer `lexical_documents.byte_length` stores.
 fn checked_byte_length(bytes: usize) -> i64 {
     i64::try_from(bytes).unwrap_or_else(|_| {
         unreachable!(
@@ -884,21 +744,22 @@ pub(crate) fn require_pragma_row(
 /// Inserts one unit's typed row and its derived FTS row.
 /// Deletes every unit filed under one path, from the typed table and the FTS index alike.
 ///
-/// The FTS rows go first, while `lexical_units` still holds the identities that name them:
+/// The FTS rows go first, while `lexical_documents` still holds the identities that name
+/// them:
 /// the virtual table carries no path column of its own.
 async fn delete_path_units(
     executor: &mut dyn Executor,
     path: &ProjectPath,
 ) -> Result<(), LexicalIndexError> {
     toasty::sql::statement(
-        "DELETE FROM lexical_units_fts WHERE identity IN \
-         (SELECT identity FROM lexical_units WHERE path = ?1)",
+        "DELETE FROM lexical_documents_fts WHERE identity IN \
+         (SELECT identity FROM lexical_documents WHERE path = ?1)",
     )
     .bind(path.as_str().to_owned())
     .exec(executor)
     .await
     .map_err(storage_error)?;
-    toasty::sql::statement("DELETE FROM lexical_units WHERE path = ?1")
+    toasty::sql::statement("DELETE FROM lexical_documents WHERE path = ?1")
         .bind(path.as_str().to_owned())
         .exec(executor)
         .await
@@ -906,22 +767,49 @@ async fn delete_path_units(
     Ok(())
 }
 
-/// The tree revision the store is stamped with, read through `executor` so a caller can
-/// place it in the same transaction as the query it qualifies.
-async fn stored_tree_revision(
+/// What one publication stamped the store with.
+///
+/// The two revisions travel together because a read needs both: the tree
+/// revision says which publication the rows belong to, and the corpus
+/// revision says whether this build can read them at all.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StoredStamp {
+    tree_revision: String,
+    corpus_revision: CorpusRevision,
+}
+
+/// The stamp the store carries, read through `executor` so a caller can place
+/// it in the same transaction as the query it qualifies.
+async fn stored_stamp(
     executor: &mut dyn Executor,
-) -> Result<Option<String>, LexicalIndexError> {
+) -> Result<Option<StoredStamp>, LexicalIndexError> {
     let record = LexicalIndexStateRecord::filter_by_id(LEXICAL_INDEX_STATE_ID)
         .first()
         .exec(executor)
         .await
         .map_err(storage_error)?;
-    Ok(record.map(|record| record.tree_revision))
+    Ok(record.map(|record| StoredStamp {
+        tree_revision: record.tree_revision,
+        corpus_revision: CorpusRevision::stored(record.corpus_revision),
+    }))
 }
 
-/// How many units the typed table holds right now.
+/// Stamps the store with `tree_revision` and the corpus revision this build
+/// derives, so a later read can tell both which publication the rows belong
+/// to and whether it can read them at all.
+async fn stamp(executor: &mut dyn Executor, tree_revision: &str) -> Result<(), LexicalIndexError> {
+    LexicalIndexStateRecord::upsert_by_id(LEXICAL_INDEX_STATE_ID)
+        .tree_revision(tree_revision.to_owned())
+        .corpus_revision(CorpusRevision::current().as_str().to_owned())
+        .exec(executor)
+        .await
+        .map_err(storage_error)?;
+    Ok(())
+}
+
+/// How many documents the typed table holds right now.
 async fn indexed_unit_count(executor: &mut dyn Executor) -> Result<usize, LexicalIndexError> {
-    let rows = toasty::sql::query("SELECT count(*) FROM lexical_units")
+    let rows = toasty::sql::query("SELECT count(*) FROM lexical_documents")
         .column_types([Type::I64])
         .exec(executor)
         .await
@@ -945,33 +833,100 @@ async fn indexed_unit_count(executor: &mut dyn Executor) -> Result<usize, Lexica
     Ok(usize::try_from(*counted).unwrap_or(usize::MAX))
 }
 
-async fn insert_lexical_unit(
+/// Writes one document's typed row and its FTS row.
+///
+/// The two carry the same fields, in the same order, because the typed
+/// row is what a read resolves through and the FTS row is what a term
+/// matches: a column filled in one and absent from the other would rank a
+/// document the reader cannot then describe.
+async fn insert_document(
     executor: &mut dyn Executor,
-    unit: &LexicalUnit,
+    document: &IndexDocument,
+    path: &ProjectPath,
 ) -> Result<(), LexicalIndexError> {
-    toasty::create!(LexicalUnitRecord {
-        identity: unit.identity().to_owned(),
-        path: unit.path().as_str().to_owned(),
-        kind: unit.kind().stored_value(),
-        name: unit.name().map(str::to_owned),
-        byte_length: checked_byte_length(unit.content().len()),
-        content: unit.content().to_owned(),
+    let fields = document.fields();
+    let field = |searchable: SearchableField| fields.get(searchable).map(str::to_owned);
+    let content = document.content();
+    toasty::create!(LexicalDocumentRecord {
+        identity: document.identity().as_str().to_owned(),
+        path: path.as_str().to_owned(),
+        kind: document.kind().stored_value().to_owned(),
+        digest: document.digest().to_owned(),
+        byte_length: checked_byte_length(content.len()),
+        name: field(SearchableField::Name),
+        qualified_name: field(SearchableField::QualifiedName),
+        identifier_terms: field(SearchableField::IdentifierTerms),
+        signature: field(SearchableField::Signature),
+        documentation: field(SearchableField::Documentation),
+        declaration_source: field(SearchableField::DeclarationSource),
+        file_content: field(SearchableField::FileContent),
     })
     .exec(executor)
     .await
     .map_err(storage_error)?;
 
-    let expanded_name = unit.name().map_or_else(String::new, identifier_expansion);
-    toasty::sql::statement(
-        "INSERT INTO lexical_units_fts(identity, name, content) VALUES (?1, ?2, ?3)",
-    )
-    .bind(unit.identity().to_owned())
-    .bind(expanded_name)
-    .bind(unit.content().to_owned())
-    .exec(executor)
-    .await
-    .map_err(storage_error)?;
+    let mut insert =
+        toasty::sql::statement(fts_insert_sql()).bind(document.identity().as_str().to_owned());
+    for searchable in SearchableField::ALL {
+        insert = insert.bind(fields.get(searchable).unwrap_or_default().to_owned());
+    }
+    insert.exec(executor).await.map_err(storage_error)?;
     Ok(())
+}
+
+/// The FTS insert, with one placeholder for `identity` and one per searchable
+/// field, in the column order [`SearchableField::ALL`] declares.
+fn fts_insert_sql() -> String {
+    let columns = SearchableField::ALL.map(SearchableField::column).join(", ");
+    let placeholders = (1..=SearchableField::ALL.len() + 1)
+        .map(|position| format!("?{position}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("INSERT INTO lexical_documents_fts(identity, {columns}) VALUES ({placeholders})")
+}
+
+/// Rebuilds one published document from its typed row.
+///
+/// The row carries the same fields the document was written from, so this is the
+/// inverse of [`insert_document`] and nothing is derived a second time.
+fn decode_document(record: LexicalDocumentRecord) -> Result<IndexDocument, LexicalIndexError> {
+    let path = ProjectPath::new(record.path).map_err(|source| {
+        lexical_error_caused_by(LexicalIndexViolation::StoredPathInvalid, None, source)
+    })?;
+    let kind = DocumentKind::from_stored(&record.kind).ok_or_else(|| {
+        lexical_error(LexicalIndexViolation::StoredKindInvalid)
+            .with_context(ErrorContext::new("kind", record.kind.clone()))
+    })?;
+    let identity = DocumentIdentity::new(record.identity).map_err(|source| {
+        lexical_error_caused_by(LexicalIndexViolation::StoredKindInvalid, None, source)
+    })?;
+    let stored = [
+        (SearchableField::Name, record.name),
+        (SearchableField::QualifiedName, record.qualified_name),
+        (SearchableField::IdentifierTerms, record.identifier_terms),
+        (SearchableField::Signature, record.signature),
+        (SearchableField::Documentation, record.documentation),
+        (
+            SearchableField::DeclarationSource,
+            record.declaration_source,
+        ),
+        (SearchableField::FileContent, record.file_content),
+    ];
+    let fields = stored
+        .into_iter()
+        .fold(DocumentFields::empty(), |held, (field, value)| {
+            held.with_optional(field, value)
+        });
+    IndexDocument::new(
+        identity,
+        DocumentLocation::Project(path),
+        kind,
+        record.digest,
+        fields,
+    )
+    .map_err(|source| {
+        lexical_error_caused_by(LexicalIndexViolation::StoredKindInvalid, None, source)
+    })
 }
 
 /// Reconstructs one search hit from a raw joined row.
@@ -987,8 +942,8 @@ fn decode_lexical_match(row: &Value) -> Result<LexicalMatch, LexicalIndexError> 
         Value::String(identity),
         Value::String(path),
         Value::String(kind),
-        name,
         Value::F64(rank),
+        isolated @ ..,
     ] = record.as_slice()
     else {
         unreachable!("lexical search row must match its declared column types: row={row:?}");
@@ -996,41 +951,100 @@ fn decode_lexical_match(row: &Value) -> Result<LexicalMatch, LexicalIndexError> 
     let path = ProjectPath::new(path.clone()).map_err(|source| {
         lexical_error_caused_by(LexicalIndexViolation::StoredPathInvalid, None, source)
     })?;
-    let kind = LexicalUnitKind::from_stored(kind).ok_or_else(|| {
+    let kind = DocumentKind::from_stored(kind).ok_or_else(|| {
         lexical_error(LexicalIndexViolation::StoredKindInvalid)
             .with_context(ErrorContext::new("kind", kind.clone()))
     })?;
+    let identity = DocumentIdentity::new(identity.clone()).map_err(|source| {
+        lexical_error_caused_by(LexicalIndexViolation::StoredKindInvalid, None, source)
+    })?;
     Ok(LexicalMatch {
-        identity: identity.clone(),
+        identity,
         path,
         kind,
-        name: decode_name_column(name),
         rank: *rank,
+        fields: matched_fields(isolated),
     })
 }
 
-/// Reads the nullable `name` column of a joined search row.
-fn decode_name_column(value: &Value) -> Option<String> {
-    match value {
-        Value::String(name) => Some(name.clone()),
-        _ => None,
-    }
+/// The columns that carried a query member.
+///
+/// Each value is `bm25` run with every weight zeroed but one. A column that
+/// matched no member contributes nothing and the call answers zero, so a
+/// non-zero value is exactly the proof that this column placed the hit.
+fn matched_fields(isolated: &[Value]) -> FieldSet {
+    SearchableField::ALL
+        .into_iter()
+        .zip(isolated)
+        .filter(|(_, value)| matches!(value, Value::F64(score) if *score != 0.0))
+        .map(|(field, _)| field)
+        .collect()
 }
 
-/// Builds the joined ranking query, embedding this module's own weight
-/// constants directly since FTS5's `bm25` column-weight arguments are not
-/// bind parameters.
+/// The `bm25` weight arguments, in FTS column order: the `identity`
+/// placeholder first, then one weight per searchable field.
+///
+/// The weights come from [`SearchableField`] rather than from constants here,
+/// so the ranking this store runs and the ranking every other reader runs are
+/// the same numbers. FTS5 takes them as literal arguments, never as bind
+/// parameters, which is why they are rendered into the statement.
+fn rank_weights() -> String {
+    std::iter::once(LEXICAL_IDENTITY_RANK_WEIGHT)
+        .chain(SearchableField::ALL.map(SearchableField::rank_weight))
+        .map(|weight| weight.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The `bm25` weight arguments that isolate one column: every weight zero
+/// except this field's, set to one.
+fn isolated_weights(field: SearchableField) -> String {
+    std::iter::once(0.0_f64)
+        .chain(SearchableField::ALL.map(|declared| f64::from(u8::from(declared == field))))
+        .map(|weight| weight.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Builds the joined ranking query.
+///
+/// Equal ranks order by identity, because `SQLite` would otherwise return them
+/// in whatever order it read the rows and two readers over one publication
+/// must answer one order.
+///
+/// One `bm25` call ranks the row and one more per column proves which columns
+/// carried a member. FTS5 evaluates an auxiliary function per candidate row,
+/// so the answer costs eight evaluations where it used to cost one; the
+/// `matches_max` bound is what keeps that bounded, and what it buys is a
+/// `matched_by` a reader can act on.
 fn lexical_search_sql() -> String {
+    let ranked = rank_weights();
+    let mut isolated = String::new();
+    for field in SearchableField::ALL {
+        let weights = isolated_weights(field);
+        let column = field.column();
+        let _ = write!(
+            isolated,
+            ", bm25(lexical_documents_fts, {weights}) AS {column}_hit"
+        );
+    }
     format!(
-        "SELECT lexical_units_fts.identity, lexical_units.path, lexical_units.kind, \
-         lexical_units.name, \
-         bm25(lexical_units_fts, {LEXICAL_IDENTITY_RANK_WEIGHT}, {LEXICAL_NAME_RANK_WEIGHT}, \
-         {LEXICAL_CONTENT_RANK_WEIGHT}) AS rank \
-         FROM lexical_units_fts \
-         JOIN lexical_units ON lexical_units.identity = lexical_units_fts.identity \
-         WHERE lexical_units_fts MATCH ?1 \
-         ORDER BY rank LIMIT ?2"
+        "SELECT lexical_documents_fts.identity, lexical_documents.path, \
+         lexical_documents.kind, \
+         bm25(lexical_documents_fts, {ranked}) AS rank{isolated} \
+         FROM lexical_documents_fts \
+         JOIN lexical_documents \
+         ON lexical_documents.identity = lexical_documents_fts.identity \
+         WHERE lexical_documents_fts MATCH ?1 \
+         ORDER BY rank, lexical_documents_fts.identity LIMIT ?2"
     )
+}
+
+/// The declared result types of [`lexical_search_sql`], in column order.
+fn lexical_search_column_types() -> Vec<Type> {
+    let mut types = vec![Type::String, Type::String, Type::String, Type::F64];
+    types.extend(SearchableField::ALL.map(|_| Type::F64));
+    types
 }
 
 /// What one change set does to the lexical index.
@@ -1042,13 +1056,13 @@ fn lexical_search_sql() -> String {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LexicalChange {
     replaced: Vec<ProjectPath>,
-    inserted: Vec<LexicalUnit>,
+    inserted: Vec<IndexDocument>,
 }
 
 impl LexicalChange {
     /// Builds one change from the paths whose units go and the units that replace them.
     #[must_use]
-    pub fn new(replaced: Vec<ProjectPath>, inserted: Vec<LexicalUnit>) -> Self {
+    pub fn new(replaced: Vec<ProjectPath>, inserted: Vec<IndexDocument>) -> Self {
         Self { replaced, inserted }
     }
 
@@ -1060,7 +1074,7 @@ impl LexicalChange {
 
     /// The units this change inserts.
     #[must_use]
-    pub fn inserted(&self) -> &[LexicalUnit] {
+    pub fn inserted(&self) -> &[IndexDocument] {
         &self.inserted
     }
 
@@ -1074,12 +1088,18 @@ impl LexicalChange {
     /// The change as its two halves, for a caller that rebuilds it over a narrowed
     /// unit list.
     #[must_use]
-    pub fn into_parts(self) -> (Vec<ProjectPath>, Vec<LexicalUnit>) {
+    pub fn into_parts(self) -> (Vec<ProjectPath>, Vec<IndexDocument>) {
         (self.replaced, self.inserted)
     }
 }
 
 /// `SQLite` FTS5-backed lexical search index.
+///
+/// [`IndexDocument`] is the one shape every Rift index publishes, so a
+/// project row, a package row, and an in-memory fixture carry the same fields
+/// and the same identity spelling. This store holds project documents: a
+/// document addressed by a source unit belongs to a package index, and the
+/// write path refuses it rather than filing a unit URI in the path column.
 #[derive(Debug)]
 pub struct LexicalSearchIndex {
     database: Arc<WorkspaceDatabase>,
@@ -1121,38 +1141,34 @@ impl LexicalSearchIndex {
     /// normal completion.
     pub async fn replace_all(
         &self,
-        units: &[LexicalUnit],
+        documents: &[IndexDocument],
         tree_revision: &str,
     ) -> Result<(), LexicalIndexError> {
-        validate_lexical_batch(units, self.limits)?;
+        validate_lexical_batch(documents, self.limits)?;
 
         let mut access = self.database.writing().await?;
         let mut transaction = access.transaction().await?;
 
-        toasty::sql::statement("DELETE FROM lexical_units_fts")
+        toasty::sql::statement("DELETE FROM lexical_documents_fts")
             .exec(&mut transaction)
             .await
             .map_err(storage_error)?;
-        LexicalUnitRecord::all()
+        LexicalDocumentRecord::all()
             .delete()
             .exec(&mut transaction)
             .await
             .map_err(storage_error)?;
 
-        for unit in units {
-            insert_lexical_unit(&mut transaction, unit).await?;
+        for document in documents {
+            insert_document(&mut transaction, document, project_location(document)?).await?;
         }
 
-        LexicalIndexStateRecord::upsert_by_id(LEXICAL_INDEX_STATE_ID)
-            .tree_revision(tree_revision.to_owned())
-            .exec(&mut transaction)
-            .await
-            .map_err(storage_error)?;
+        stamp(&mut transaction, tree_revision).await?;
 
         transaction.commit().await.map_err(storage_error)
     }
 
-    /// Applies one change set's units and stamps `tree_revision`, in one transaction.
+    /// Applies one change set's documents and stamps `tree_revision`, in one transaction.
     ///
     /// The transaction deletes every unit filed under a dropped path, inserts the units the
     /// change derived, and stamps the revision. Deleting by path is what makes this
@@ -1190,20 +1206,16 @@ impl LexicalSearchIndex {
         let stored = indexed_unit_count(&mut transaction).await?;
         validate_indexed_count(stored.saturating_add(change.inserted().len()), self.limits)?;
 
-        for unit in change.inserted() {
-            insert_lexical_unit(&mut transaction, unit).await?;
+        for document in change.inserted() {
+            insert_document(&mut transaction, document, project_location(document)?).await?;
         }
 
-        LexicalIndexStateRecord::upsert_by_id(LEXICAL_INDEX_STATE_ID)
-            .tree_revision(tree_revision.to_owned())
-            .exec(&mut transaction)
-            .await
-            .map_err(storage_error)?;
+        stamp(&mut transaction, tree_revision).await?;
 
         transaction.commit().await.map_err(storage_error)
     }
 
-    /// Searches the units stamped with `tree_revision`, best matches first.
+    /// Searches the documents stamped with `tree_revision`, best matches first.
     ///
     /// The stored stamp and the matching rows are read in one transaction, so a commit
     /// that lands between them cannot slip rows from another tree into the answer.
@@ -1211,7 +1223,12 @@ impl LexicalSearchIndex {
     /// rows the caller cannot place, and one holding no tree at all returns
     /// [`RevisionScoped::NoRevision`].
     ///
-    /// An empty or all-punctuation `query` matches nothing. The effective result count is
+    /// A store built under another corpus revision answers
+    /// [`RevisionScoped::NoRevision`] as well: its columns, derivation,
+    /// tokenizer, or weights are not this build's, so it holds no publication
+    /// this build can read, and the next publication replaces it.
+    ///
+    /// A query carrying no member matches nothing. The effective result count is
     /// `limit` capped by `matches_max`; the ranking says when the store held a match past
     /// that count, so a caller can tell a full answer from a cut one.
     ///
@@ -1228,22 +1245,32 @@ impl LexicalSearchIndex {
     pub async fn search(
         &self,
         tree_revision: &str,
-        query: &str,
+        query: &ParsedQuery,
+        phase: QueryPhase,
         limit: u32,
     ) -> Result<RevisionScoped<LexicalRanking>, LexicalIndexError> {
-        let terms_max = bound_as_usize(self.limits.query_terms_max());
-        let expression = match_expression(query, terms_max)?;
+        // The statement carries no path predicate. A caller narrowing by path
+        // screens the ranked identities it reads back, because the request's
+        // glob selector and this statement would be two spellings of one
+        // predicate, in two languages, that can disagree. What the caller pays
+        // is a query whose matches all sit outside its selector: the bound cuts
+        // before the screen runs, the answer is short, and `results_truncated`
+        // says the bound cut it.
+        let expression = query.render(phase);
         let bound = limit.min(self.limits.matches_max());
         // One row past the bound tells whether the store holds a match the bound cuts.
         let probe_limit = i64::from(bound) + 1;
 
         let mut connection = self.database.connection().await?;
         let mut transaction = connection.transaction().await.map_err(storage_error)?;
-        let stored = stored_tree_revision(&mut transaction).await?;
+        let stored = stored_stamp(&mut transaction).await?;
         match stored {
             None => return Ok(RevisionScoped::NoRevision),
-            Some(stored) if stored != tree_revision => {
-                return Ok(RevisionScoped::OtherRevision(stored));
+            Some(stored) if stored.corpus_revision != CorpusRevision::current() => {
+                return Ok(RevisionScoped::NoRevision);
+            }
+            Some(stored) if stored.tree_revision != tree_revision => {
+                return Ok(RevisionScoped::OtherRevision(stored.tree_revision));
             }
             Some(_) => {}
         }
@@ -1256,13 +1283,7 @@ impl LexicalSearchIndex {
         let rows = toasty::sql::query(lexical_search_sql())
             .bind(expression)
             .bind(probe_limit)
-            .column_types([
-                Type::String,
-                Type::String,
-                Type::String,
-                Type::String,
-                Type::F64,
-            ])
+            .column_types(lexical_search_column_types())
             .exec(&mut transaction)
             .await
             .map_err(storage_error)?;
@@ -1276,8 +1297,41 @@ impl LexicalSearchIndex {
         )))
     }
 
-    /// Returns one unit's indexed content by its identity, or `None` when no
-    /// unit with that identity is indexed.
+    /// Runs the full-text ranking as one fusion input, best first.
+    ///
+    /// The input carries the identities in rank order together with the
+    /// columns that placed each of them, which is what lets an answer report
+    /// a documentation hit and a name hit apart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LexicalIndexError`] when a stored row fails to decode, or on
+    /// storage failure.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancellation performs no writes; the transaction is read-only.
+    pub async fn rank(
+        &self,
+        tree_revision: &str,
+        query: &ParsedQuery,
+        phase: QueryPhase,
+        limit: u32,
+    ) -> Result<RevisionScoped<RankingInput>, LexicalIndexError> {
+        Ok(
+            match self.search(tree_revision, query, phase, limit).await? {
+                RevisionScoped::Matched(ranking) => RevisionScoped::Matched(ranking.into_input()),
+                RevisionScoped::OtherRevision(stored) => RevisionScoped::OtherRevision(stored),
+                RevisionScoped::NoRevision => RevisionScoped::NoRevision,
+            },
+        )
+    }
+
+    /// Returns one document's indexed content by its identity, or `None` when
+    /// no document with that identity is indexed.
+    ///
+    /// The content is the declaration source of a symbol document and the
+    /// text of a file document: the one field a reader excerpts from.
     ///
     /// # Errors
     ///
@@ -1286,14 +1340,41 @@ impl LexicalSearchIndex {
     /// # Cancel safety
     ///
     /// Cancellation performs no writes; this issues one read-only lookup.
-    pub async fn content(&self, identity: &str) -> Result<Option<String>, LexicalIndexError> {
+    pub async fn content(
+        &self,
+        identity: &DocumentIdentity,
+    ) -> Result<Option<String>, LexicalIndexError> {
         let mut connection = self.configured_connection().await?;
-        let record = LexicalUnitRecord::filter_by_identity(identity)
+        let record = LexicalDocumentRecord::filter_by_identity(identity.as_str())
             .first()
             .exec(&mut connection)
             .await
             .map_err(storage_error)?;
-        Ok(record.map(|record| record.content))
+        Ok(record.and_then(|record| record.declaration_source.or(record.file_content)))
+    }
+
+    /// Reads one document back by its stable identity, or `None` when this store
+    /// does not hold it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LexicalIndexError`] when a stored row fails to decode, or on storage
+    /// failure.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancellation performs no writes; this issues one read-only lookup.
+    pub async fn document(
+        &self,
+        identity: &DocumentIdentity,
+    ) -> Result<Option<IndexDocument>, LexicalIndexError> {
+        let mut connection = self.configured_connection().await?;
+        let record = LexicalDocumentRecord::filter_by_identity(identity.as_str())
+            .first()
+            .exec(&mut connection)
+            .await
+            .map_err(storage_error)?;
+        record.map(decode_document).transpose()
     }
 
     /// Returns the tree revision stamped by the most recent `replace_all`,
@@ -1308,25 +1389,146 @@ impl LexicalSearchIndex {
     /// Cancellation performs no writes; this issues one read-only lookup.
     pub async fn tree_revision(&self) -> Result<Option<String>, LexicalIndexError> {
         let mut connection = self.configured_connection().await?;
-        stored_tree_revision(&mut connection).await
+        Ok(stored_stamp(&mut connection)
+            .await?
+            .map(|stamp| stamp.tree_revision))
     }
+}
+
+/// One published snapshot of the project store, read through the shared contract.
+///
+/// [`LexicalSearchIndex::rank`] answers a revision-qualified result, because a caller that
+/// captured a publication has to tell a store that moved on from one that never published.
+/// The shared contract has no place for that distinction: it is the shape a reader holding
+/// no local tree implements. Binding the store to one publication is what lets the two be
+/// compared over one set of documents, and a store that has moved on answers nothing here.
+#[derive(Debug)]
+pub struct PublishedIndex<'a> {
+    store: &'a LexicalSearchIndex,
+    tree_revision: &'a str,
+    analyzer_revision: String,
+}
+
+impl<'a> PublishedIndex<'a> {
+    /// Reads `store` as the publication `tree_revision` names.
+    #[must_use]
+    pub fn new(
+        store: &'a LexicalSearchIndex,
+        tree_revision: &'a str,
+        analyzer_revision: impl Into<String>,
+    ) -> Self {
+        Self {
+            store,
+            tree_revision,
+            analyzer_revision: analyzer_revision.into(),
+        }
+    }
+}
+
+impl IndexReader for PublishedIndex<'_> {
+    fn capabilities(&self) -> IndexCapabilities {
+        IndexCapabilities::new(
+            PublicationFormat::CURRENT,
+            self.analyzer_revision.clone(),
+            CorpusRevision::current(),
+            // The corpus declares every column. Which of them one document filled is
+            // the document's own answer, not the store's.
+            FieldSet::all(),
+            RankingInputSet::of(RankingInputKind::Lexical),
+        )
+    }
+
+    fn rank<'a>(
+        &'a self,
+        request: RankRequest<'a>,
+    ) -> ReaderFuture<'a, Result<RankingInput, RankingError>> {
+        Box::pin(async move {
+            if request.input() != RankingInputKind::Lexical {
+                // Identifier matching reads the declarations the workspace index holds,
+                // and vector similarity reads a corpus the search tier publishes. Neither
+                // is this store's to answer.
+                return Ok(RankingInput::unanswered(request.input()));
+            }
+            let bound = u32::try_from(request.bound()).unwrap_or(u32::MAX);
+            match self
+                .store
+                .rank(self.tree_revision, request.query(), request.phase(), bound)
+                .await
+            {
+                Ok(RevisionScoped::Matched(input)) => Ok(input),
+                Ok(_) => Ok(RankingInput::unanswered(request.input())),
+                Err(error) => Err(reader_refused(error)),
+            }
+        })
+    }
+
+    fn document<'a>(
+        &'a self,
+        identity: &'a DocumentIdentity,
+    ) -> ReaderFuture<'a, Result<Option<IndexDocument>, RankingError>> {
+        Box::pin(async move { self.store.document(identity).await.map_err(reader_refused) })
+    }
+}
+
+/// One store refusal, as the shared contract's own.
+///
+/// The contract is storage-independent, so it cannot restate this store's violation. What
+/// it does carry is the failure itself, on the source chain, so a caller still reaches the
+/// driver text and the classification the store gave it. Reporting a disk failure as a
+/// capability mismatch would send that caller to compare two publications instead.
+fn reader_refused(error: LexicalIndexError) -> RankingError {
+    RankingError::new(RankingFault::new(RankingViolation::ReaderFailed).caused_by(error))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        LexicalIndexFault, LexicalIndexLimits, LexicalIndexStateRecord, LexicalIndexViolation,
-        LexicalMatch, LexicalRanking, LexicalSearchIndex, LexicalUnit, LexicalUnitKind,
-        LexicalUnitRecord, UNIT_NAME_BYTES_MAX, checked_byte_length, decode_lexical_match,
-        identifier_expansion, lexical_error, lexical_error_caused_by, match_expression,
-        require_pragma_row, validate_lexical_batch,
+        LexicalDocumentRecord, LexicalIndexFault, LexicalIndexLimits, LexicalIndexStateRecord,
+        LexicalIndexViolation, LexicalMatch, LexicalRanking, LexicalSearchIndex, MIGRATION_FILES,
+        checked_byte_length, decode_lexical_match, fts_insert_sql, isolated_weights, lexical_error,
+        lexical_error_caused_by, lexical_search_column_types, lexical_search_sql, matched_fields,
+        project_location, rank_weights, require_pragma_row, validate_lexical_batch,
     };
-    use rift_core::{ErrorCode, ErrorName, Fault, ProjectPath};
+    use rift_core::{ErrorCode, ErrorName, Fault, ProjectPath, SourceUnitId};
+    use rift_ranking::{
+        CORPUS_TOKENIZER, DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation,
+        FieldSet, IndexDocument, RankingInputKind, SearchableField,
+    };
     use toasty::stmt::Value;
 
-    fn ranked(identity: &str) -> LexicalMatch {
-        let path = ProjectPath::new("docs/a.md").expect("fixture path must be valid");
-        LexicalMatch::new(identity, path, LexicalUnitKind::TextFile, None, -1.0)
+    fn identity(value: &str) -> DocumentIdentity {
+        DocumentIdentity::new(value).expect("fixture identity must be accepted")
+    }
+
+    fn fixture_path() -> ProjectPath {
+        ProjectPath::new("docs/a.md").expect("fixture path must be valid")
+    }
+
+    fn ranked(value: &str) -> LexicalMatch {
+        LexicalMatch::new(
+            identity(value),
+            fixture_path(),
+            DocumentKind::TextFile,
+            -1.0,
+            FieldSet::of(SearchableField::FileContent),
+        )
+    }
+
+    fn symbol_document(name: &str, source: &str) -> IndexDocument {
+        let path = ProjectPath::new("src/a.rs").expect("fixture path must be valid");
+        let fields = DocumentFields::empty()
+            .with(SearchableField::Name, name)
+            .with(SearchableField::QualifiedName, format!("crate::{name}"))
+            .with(SearchableField::DeclarationSource, source);
+        let digest = fields.digest();
+        IndexDocument::new(
+            identity(&format!("crate::{name}")),
+            DocumentLocation::Project(path),
+            DocumentKind::Symbol,
+            digest,
+            fields,
+        )
+        .expect("fixture document must construct")
     }
 
     #[test]
@@ -1351,7 +1553,7 @@ mod tests {
             ranking
                 .matches()
                 .iter()
-                .map(LexicalMatch::identity)
+                .map(|matched| matched.identity().as_str())
                 .collect::<Vec<_>>(),
             vec!["a", "b"]
         );
@@ -1359,14 +1561,32 @@ mod tests {
     }
 
     #[test]
-    fn test_lexical_unit_new_refuses_empty_identity() {
-        let path = ProjectPath::new("docs/a.md").expect("fixture path must be valid");
-        let error = LexicalUnit::new("", path, LexicalUnitKind::TextFile, None, "content")
-            .expect_err("empty identity must refuse");
+    fn test_a_ranking_becomes_one_fusion_input_in_rank_order() {
+        let ranking = LexicalRanking::from_probe(vec![ranked("a"), ranked("b")], 8);
+        let input = ranking.into_input();
+        assert_eq!(input.kind(), RankingInputKind::Lexical);
         assert_eq!(
-            error.fault().violation(),
-            LexicalIndexViolation::IdentityEmpty
+            input
+                .order()
+                .iter()
+                .map(|entry| entry.identity().as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
         );
+        assert!(
+            input.order()[0]
+                .fields()
+                .holds(SearchableField::FileContent)
+        );
+    }
+
+    #[test]
+    fn test_a_match_reports_the_columns_that_placed_it() {
+        let matched = ranked("a");
+        assert_eq!(matched.path(), &fixture_path());
+        assert_eq!(matched.kind(), DocumentKind::TextFile);
+        assert!((matched.rank() + 1.0).abs() < 1e-12);
+        assert!(matched.fields().holds(SearchableField::FileContent));
     }
 
     #[test]
@@ -1375,6 +1595,8 @@ mod tests {
         assert_eq!(limits.units_max(), 1_000_000);
         assert_eq!(limits.pool_slots(), 4);
         assert_eq!(limits.busy_timeout_ms(), 5_000);
+        assert_eq!(limits.matches_max(), 1_000);
+        assert_eq!(limits.unit_bytes_max(), 1_048_576);
     }
 
     #[test]
@@ -1392,30 +1614,20 @@ mod tests {
         assert_eq!(LexicalIndexLimits::accepted_units_max(u64::MAX), u32::MAX);
     }
 
-    fn symbol_unit_with_name(name: String) -> LexicalUnit {
-        let path = ProjectPath::new("src/a.rs").expect("fixture path must be valid");
-        LexicalUnit::new(
-            "crate::a",
-            path,
-            LexicalUnitKind::Symbol,
-            Some(name),
-            "body",
-        )
-        .expect("fixture unit must construct")
+    #[test]
+    fn test_a_content_field_at_the_configured_bound_passes() {
+        let document = symbol_document("a", "12345678");
+        let limits = LexicalIndexLimits::new(100, 8, 100, 4, 1_000);
+        validate_lexical_batch(&[document], limits)
+            .expect("content at the exact bound must not refuse");
     }
 
     #[test]
-    fn test_validate_lexical_batch_name_at_exact_limit_passes() {
-        let unit = symbol_unit_with_name("n".repeat(UNIT_NAME_BYTES_MAX));
-        validate_lexical_batch(&[unit], LexicalIndexLimits::default())
-            .expect("name at exact limit must not refuse");
-    }
-
-    #[test]
-    fn test_validate_lexical_batch_name_one_over_limit_refuses_naming_field_and_path() {
-        let unit = symbol_unit_with_name("n".repeat(UNIT_NAME_BYTES_MAX + 1));
-        let error = validate_lexical_batch(&[unit], LexicalIndexLimits::default())
-            .expect_err("name one over limit must refuse");
+    fn test_a_content_field_over_the_configured_bound_refuses_naming_the_column() {
+        let document = symbol_document("a", "way too much body content");
+        let limits = LexicalIndexLimits::new(100, 8, 100, 4, 1_000);
+        let error = validate_lexical_batch(&[document], limits)
+            .expect_err("content one over the bound must refuse");
         assert_eq!(
             error.fault().violation(),
             LexicalIndexViolation::UnitTooLarge
@@ -1425,34 +1637,62 @@ mod tests {
             .iter()
             .find(|entry| entry.key() == "field")
             .map(rift_core::ErrorContext::value);
-        assert_eq!(field, Some("name"));
+        assert_eq!(field, Some("declaration_source"));
         assert_eq!(error.fault().path(), Some(std::path::Path::new("src/a.rs")));
     }
 
     #[test]
-    fn test_validate_lexical_batch_content_over_limit_refuses_naming_content_field() {
-        let path = ProjectPath::new("src/a.rs").expect("fixture path must be valid");
-        let unit = LexicalUnit::new(
-            "crate::a",
-            path,
-            LexicalUnitKind::Symbol,
-            None,
-            "way too much body content",
-        )
-        .expect("fixture unit must construct");
-        let limits = LexicalIndexLimits::new(100, 8, 32, 100, 4, 1_000);
-        let error = validate_lexical_batch(&[unit], limits)
-            .expect_err("content one over limit must refuse");
+    fn test_a_batch_repeating_one_identity_refuses() {
+        let documents = vec![symbol_document("a", "body"), symbol_document("a", "other")];
+        let error = validate_lexical_batch(&documents, LexicalIndexLimits::default())
+            .expect_err("a repeated identity must refuse");
         assert_eq!(
             error.fault().violation(),
-            LexicalIndexViolation::UnitTooLarge
+            LexicalIndexViolation::DuplicateIdentity
         );
-        let context = error.context();
-        let field = context
-            .iter()
-            .find(|entry| entry.key() == "field")
-            .map(rift_core::ErrorContext::value);
-        assert_eq!(field, Some("content"));
+    }
+
+    #[test]
+    fn test_a_package_document_is_refused_by_the_project_store() {
+        let unit = SourceUnitId::parse("rift://source/cargo/helper@0.1.0/src/lib.rs")
+            .expect("fixture unit must parse");
+        let fields = DocumentFields::empty().with(SearchableField::Name, "helper");
+        let digest = fields.digest();
+        let document = IndexDocument::new(
+            identity("rift://source/cargo/helper@0.1.0/src/lib.rs"),
+            DocumentLocation::Unit(unit),
+            DocumentKind::Symbol,
+            digest,
+            fields,
+        )
+        .expect("fixture document must construct");
+        let error = project_location(&document).expect_err("a unit location must refuse");
+        assert_eq!(
+            error.fault().violation(),
+            LexicalIndexViolation::DocumentLocationUnsupported
+        );
+    }
+
+    #[test]
+    fn test_unit_limit_exposes_typed_limit_evidence() {
+        let documents = vec![symbol_document("a", "body"), symbol_document("b", "body")];
+        let limits = LexicalIndexLimits::new(1, 1_048_576, 1_000, 4, 1_000);
+        let error = validate_lexical_batch(&documents, limits)
+            .expect_err("a batch over units_max must refuse");
+        assert_eq!(
+            error.fault().limit_evidence(),
+            Some(rift_core::LimitEvidence {
+                field: "units_max".to_owned(),
+                limit: 1,
+                required: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn test_a_non_limit_violation_exposes_no_limit_evidence() {
+        let error = lexical_error(LexicalIndexViolation::DuplicateIdentity);
+        assert_eq!(error.fault().limit_evidence(), None);
     }
 
     #[test]
@@ -1481,216 +1721,102 @@ mod tests {
 
     #[test]
     fn test_lexical_error_without_cause_exposes_no_source() {
-        let error = lexical_error(LexicalIndexViolation::IdentityEmpty);
+        let error = lexical_error(LexicalIndexViolation::DuplicateIdentity);
         assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]
-    fn test_match_expression_empty_query_returns_none() {
-        let expression = match_expression("", 8).expect("empty query must not refuse");
-        assert_eq!(expression, None);
-    }
-
-    #[test]
-    fn test_match_expression_punctuation_only_returns_none() {
-        let expression =
-            match_expression("   ...--- ", 8).expect("punctuation-only query must not refuse");
-        assert_eq!(expression, None);
-    }
-
-    #[test]
-    fn test_match_expression_dedupes_preserving_first_occurrence() {
-        let expression =
-            match_expression("alpha beta alpha", 8).expect("query must be within terms_max");
-        assert_eq!(expression, Some("\"alpha\" OR \"beta\"".to_owned()));
-    }
-
-    #[test]
-    fn test_match_expression_exact_limit_is_accepted() {
-        let expression =
-            match_expression("one two three", 3).expect("exact-limit query must not refuse");
-        assert_eq!(
-            expression,
-            Some("\"one\" OR \"two\" OR \"three\"".to_owned())
-        );
-    }
-
-    #[test]
-    fn test_match_expression_one_over_limit_is_refused() {
-        let error = match_expression("one two three four", 3)
-            .expect_err("one-over-limit query must refuse");
-        assert_eq!(
-            error.fault().violation(),
-            LexicalIndexViolation::QueryTermLimit
-        );
-    }
-
-    #[test]
-    fn test_match_expression_stops_counting_immediately_past_terms_max() {
-        let error = match_expression("alpha beta gamma delta epsilon", 2)
-            .expect_err("over-limit query must refuse");
-        assert_eq!(
-            error.fault().violation(),
-            LexicalIndexViolation::QueryTermLimit
-        );
-        let context = error.context();
-        let observed = context
+    fn test_the_corpus_migration_declares_the_columns_in_the_order_bm25_weighs_them() {
+        let migration = MIGRATION_FILES
             .iter()
-            .find(|entry| entry.key() == "observed")
-            .map(rift_core::ErrorContext::value);
-        let maximum = context
-            .iter()
-            .find(|entry| entry.key() == "maximum")
-            .map(rift_core::ErrorContext::value);
-        assert_eq!(
-            observed,
-            Some("3"),
-            "loop must refuse on the first term past terms_max, not after scanning every term"
+            .find(|file| file.name() == "lexical_documents")
+            .expect("the corpus migration must exist");
+        let sql = migration.sql().replace('\n', " ");
+        // `bm25`'s weights are positional, and the weight list is generated from
+        // `SearchableField::ALL` while this declaration is written by hand. Asserting
+        // that each name appears somewhere would pass on a reordered declaration,
+        // because the typed table names the same columns in the same string.
+        let declared = sql
+            .split_once("USING fts5(")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(columns, _)| columns.to_owned())
+            .expect("the migration must declare one FTS5 virtual table");
+        let expected = std::iter::once("identity UNINDEXED".to_owned())
+            .chain(SearchableField::ALL.map(|field| field.column().to_owned()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(
+            declared.starts_with(&expected),
+            "the FTS columns must be declared in the order the weights are rendered:\n\
+             declared {declared}\nexpected {expected}"
         );
-        assert_eq!(maximum, Some("2"));
-    }
-
-    #[test]
-    fn test_query_term_limit_exposes_typed_limit_evidence() {
-        let error = match_expression("alpha beta gamma delta", 3)
-            .expect_err("over-limit query must refuse");
-        assert_eq!(
-            error.fault().limit_evidence(),
-            Some(rift_core::LimitEvidence {
-                field: "query_terms_max".to_owned(),
-                limit: 3,
-                required: 4,
-            }),
-            "the wire evidence must derive from the same typed breach as the rendered context"
+        assert!(
+            declared.contains(CORPUS_TOKENIZER),
+            "the FTS table must declare the corpus tokenizer: {CORPUS_TOKENIZER}"
         );
     }
 
     #[test]
-    fn test_unit_limit_exposes_typed_limit_evidence() {
-        let units = vec![
-            symbol_unit_with_name("a".to_owned()),
-            symbol_unit_with_name("b".to_owned()),
-        ];
-        let limits = LexicalIndexLimits::new(1, 1_048_576, 32, 1_000, 4, 1_000);
-        let error =
-            validate_lexical_batch(&units, limits).expect_err("a batch over units_max must refuse");
+    fn test_the_rank_weights_follow_the_declared_field_order() {
+        let rendered = rank_weights();
+        let expected = std::iter::once("0".to_owned())
+            .chain(SearchableField::ALL.map(|field| field.rank_weight().to_string()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn test_isolated_weights_raise_exactly_one_column() {
+        let rendered = isolated_weights(SearchableField::Documentation);
+        assert_eq!(rendered, "0, 0, 0, 0, 0, 1, 0, 0");
+    }
+
+    #[test]
+    fn test_the_insert_places_one_holder_per_declared_column() {
+        let rendered = fts_insert_sql();
+        for field in SearchableField::ALL {
+            assert!(rendered.contains(field.column()));
+        }
+        assert!(rendered.contains("?8"), "every field follows identity");
+        assert!(!rendered.contains("?9"));
+    }
+
+    #[test]
+    fn test_the_ranking_query_declares_one_type_per_selected_column() {
+        let sql = lexical_search_sql();
+        let aliased = sql.matches(" AS ").count();
         assert_eq!(
-            error.fault().limit_evidence(),
-            Some(rift_core::LimitEvidence {
-                field: "units_max".to_owned(),
-                limit: 1,
-                required: 2,
+            aliased,
+            SearchableField::ALL.len() + 1,
+            "one alias ranks the row and one more isolates each column"
+        );
+        // Three plain columns precede the aliases: identity, path, and kind.
+        assert_eq!(lexical_search_column_types().len(), aliased + 3);
+        for field in SearchableField::ALL {
+            assert!(
+                sql.contains(&format!("AS {}_hit", field.column())),
+                "the statement must isolate {}",
+                field.column()
+            );
+        }
+    }
+
+    #[test]
+    fn test_matched_fields_reads_a_non_zero_isolated_score_as_a_hit() {
+        let isolated: Vec<Value> = SearchableField::ALL
+            .into_iter()
+            .map(|field| {
+                Value::F64(if field == SearchableField::Name {
+                    -1.5
+                } else {
+                    0.0
+                })
             })
-        );
-    }
-
-    #[test]
-    fn test_unit_too_large_exposes_typed_limit_evidence_and_field_context() {
-        let unit = symbol_unit_with_name("n".repeat(UNIT_NAME_BYTES_MAX + 1));
-        let error = validate_lexical_batch(&[unit], LexicalIndexLimits::default())
-            .expect_err("an oversized name must refuse");
-        assert_eq!(
-            error.fault().limit_evidence(),
-            Some(rift_core::LimitEvidence {
-                field: "name".to_owned(),
-                limit: UNIT_NAME_BYTES_MAX as u64,
-                required: (UNIT_NAME_BYTES_MAX + 1) as u64,
-            })
-        );
-        // The rendered `field` context (used by the human-readable message) still comes
-        // from the same `oversized_field_error` call, not a second, drifting source.
-        let context = error.context();
-        let field = context
-            .iter()
-            .find(|entry| entry.key() == "field")
-            .map(rift_core::ErrorContext::value);
-        assert_eq!(field, Some("name"));
-    }
-
-    #[test]
-    fn test_a_non_limit_violation_exposes_no_limit_evidence() {
-        let error = lexical_error(LexicalIndexViolation::IdentityEmpty);
-        assert_eq!(error.fault().limit_evidence(), None);
-    }
-
-    #[test]
-    fn test_match_expression_quotes_every_term() {
-        let expression = match_expression("hello", 8).expect("single-term query must not refuse");
-        assert_eq!(expression, Some("\"hello\"".to_owned()));
-    }
-
-    #[test]
-    fn test_match_expression_quotes_fts_keyword_used_as_term() {
-        let expression = match_expression("AND OR NOT NEAR", 8)
-            .expect("keyword-shaped terms must still be accepted");
-        assert_eq!(
-            expression,
-            Some("\"AND\" OR \"OR\" OR \"NOT\" OR \"NEAR\"".to_owned())
-        );
-    }
-
-    #[test]
-    fn test_match_expression_splits_on_unicode_word_boundary() {
-        let expression = match_expression("caf\u{e9},th\u{e9}", 8)
-            .expect("unicode-letter query must not refuse");
-        assert_eq!(expression, Some("\"caf\u{e9}\" OR \"th\u{e9}\"".to_owned()));
-    }
-
-    #[test]
-    fn test_identifier_expansion_camel_case_appends_split_words() {
-        assert_eq!(
-            identifier_expansion("getUserName"),
-            "getUserName get user name"
-        );
-    }
-
-    #[test]
-    fn test_identifier_expansion_pascal_case_appends_split_words() {
-        assert_eq!(identifier_expansion("SearchHit"), "SearchHit search hit");
-    }
-
-    #[test]
-    fn test_identifier_expansion_snake_case_appends_split_words() {
-        assert_eq!(
-            identifier_expansion("parse_config_file"),
-            "parse_config_file parse config file"
-        );
-    }
-
-    #[test]
-    fn test_identifier_expansion_screaming_snake_case_appends_split_words() {
-        assert_eq!(identifier_expansion("MAX_VALUE"), "MAX_VALUE max value");
-    }
-
-    #[test]
-    fn test_identifier_expansion_single_word_is_unchanged() {
-        assert_eq!(identifier_expansion("identifier"), "identifier");
-    }
-
-    #[test]
-    fn test_identifier_expansion_digits_inside_word_stay_attached() {
-        assert_eq!(
-            identifier_expansion("utf8_decode"),
-            "utf8_decode utf8 decode"
-        );
-    }
-
-    #[test]
-    fn test_identifier_expansion_unicode_case_boundary_appends_split_words() {
-        assert_eq!(
-            identifier_expansion("caf\u{e9}Menu"),
-            "caf\u{e9}Menu caf\u{e9} menu"
-        );
-    }
-
-    #[test]
-    fn test_identifier_expansion_multi_word_already_lowercase_is_unchanged() {
-        assert_eq!(identifier_expansion("foo bar"), "foo bar");
-    }
-
-    #[test]
-    fn test_identifier_expansion_empty_string_is_unchanged() {
-        assert_eq!(identifier_expansion(""), "");
+            .collect();
+        let fields = matched_fields(&isolated);
+        assert!(fields.holds(SearchableField::Name));
+        assert_eq!(fields.fields().count(), 1);
     }
 
     #[test]
@@ -1720,18 +1846,25 @@ mod tests {
     }
 
     #[test]
-    fn test_lexical_unit_record_debug_formats_declared_fields() {
-        let record = LexicalUnitRecord {
+    fn test_lexical_document_record_debug_formats_declared_fields() {
+        let record = LexicalDocumentRecord {
             identity: "crate::a".to_owned(),
             path: "src/a.rs".to_owned(),
             kind: "symbol".to_owned(),
-            name: Some("a".to_owned()),
+            digest: "0f1e2d3c".to_owned(),
             byte_length: 4,
-            content: "body".to_owned(),
+            name: Some("a".to_owned()),
+            qualified_name: Some("crate::a".to_owned()),
+            identifier_terms: None,
+            signature: None,
+            documentation: None,
+            declaration_source: Some("body".to_owned()),
+            file_content: None,
         };
         let formatted = format!("{record:?}");
         assert!(formatted.contains("crate::a"));
         assert!(formatted.contains("src/a.rs"));
+        assert!(formatted.contains("0f1e2d3c"));
     }
 
     #[test]
@@ -1739,9 +1872,11 @@ mod tests {
         let record = LexicalIndexStateRecord {
             id: 1,
             tree_revision: "deadbeef".to_owned(),
+            corpus_revision: "0f1e2d3c".to_owned(),
         };
         let formatted = format!("{record:?}");
         assert!(formatted.contains("deadbeef"));
+        assert!(formatted.contains("0f1e2d3c"));
     }
 
     #[test]
@@ -1767,10 +1902,7 @@ mod tests {
                 LexicalIndexViolation::UnitTooLarge,
                 ErrorCode::LimitExceeded,
             ),
-            (
-                LexicalIndexViolation::QueryTermLimit,
-                ErrorCode::LimitExceeded,
-            ),
+            (LexicalIndexViolation::RecordLimit, ErrorCode::LimitExceeded),
             (
                 LexicalIndexViolation::StoredPathInvalid,
                 ErrorCode::InternalError,
@@ -1780,8 +1912,8 @@ mod tests {
                 ErrorCode::InternalError,
             ),
             (
-                LexicalIndexViolation::IdentityEmpty,
-                ErrorCode::InvalidRequest,
+                LexicalIndexViolation::DocumentLocationUnsupported,
+                ErrorCode::InternalError,
             ),
             (
                 LexicalIndexViolation::DuplicateIdentity,
@@ -1823,11 +1955,11 @@ mod tests {
 
     #[test]
     fn test_lexical_index_error_display_names_violation_and_action() {
-        let error = lexical_error(LexicalIndexViolation::IdentityEmpty);
+        let error = lexical_error(LexicalIndexViolation::DuplicateIdentity);
         assert_eq!(
             error.to_string(),
-            "the request does not match the documented form: violation identity_empty; \
-             correct the reported field and resend the request"
+            "the server failed in a way it did not classify: violation duplicate_identity; \
+             retry once, and report the full message if the failure repeats"
         );
     }
 

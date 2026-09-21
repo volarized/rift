@@ -27,8 +27,10 @@ pub use walk::{PackageFiles, package_files};
 
 use std::collections::BTreeMap;
 
+use rift_core::SourceUnitId;
 use rift_protocol::dependencies::DependenciesConfiguration;
 use rift_protocol::read::PackageIdentity;
+use rift_ranking::IdentifierMatchClass;
 
 use crate::workspace::SymbolMatch;
 
@@ -203,6 +205,38 @@ impl DependencyIndex {
         matches
     }
 
+    /// The declaration one source unit and qualified name name, when a held
+    /// package carries it.
+    ///
+    /// A ranking carries identities, never declarations, so resolving one
+    /// package candidate back to its declaration is a lookup by the two
+    /// coordinates the identity spells. The walk visits one package's files
+    /// only after that package claimed the unit, so it costs one file's
+    /// symbol scan rather than the catalog's.
+    #[must_use]
+    pub fn symbol_at(
+        &self,
+        unit: &SourceUnitId,
+        qualified_name: &str,
+    ) -> Option<DependencySymbolMatch<'_>> {
+        self.packages.values().find_map(|package| {
+            let file = package
+                .files()
+                .find(|file| package.unit_of(file) == Some(unit))?;
+            let symbol = file
+                .syntax()
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.qualified_name == qualified_name)?;
+            let matched = SymbolMatch {
+                file,
+                symbol,
+                rank: IdentifierMatchClass::QualifiedExact,
+            };
+            Some(DependencySymbolMatch { package, matched })
+        })
+    }
+
     /// Every indexed package, in identity order.
     #[must_use]
     pub fn packages(&self) -> impl ExactSizeIterator<Item = &PackageIndex> {
@@ -258,7 +292,7 @@ mod tests {
         DIRECTORY_DEPTH_MAX_DEFAULT, DependencyIndex, DependencyIndexLimits, PackageIndexViolation,
         WALK_ENTRIES_MAX_DEFAULT,
     };
-    use crate::workspace::SymbolMatchRank;
+    use rift_ranking::IdentifierMatchClass;
 
     #[test]
     fn test_limits_follow_the_dependencies_table_under_the_walk_bounds() {
@@ -295,7 +329,7 @@ mod tests {
 
         let matches = index.symbols("spawn", 10);
 
-        let found: Vec<(&str, &str, SymbolMatchRank)> = matches
+        let found: Vec<(&str, &str, IdentifierMatchClass)> = matches
             .iter()
             .map(|found| {
                 (
@@ -308,9 +342,9 @@ mod tests {
         assert_eq!(
             found,
             [
-                ("alpha", "spawn", SymbolMatchRank::QualifiedExact),
-                ("zeta", "spawn", SymbolMatchRank::QualifiedExact),
-                ("alpha", "spawn_blocking", SymbolMatchRank::NamePrefix),
+                ("alpha", "spawn", IdentifierMatchClass::QualifiedExact),
+                ("zeta", "spawn", IdentifierMatchClass::QualifiedExact),
+                ("alpha", "spawn_blocking", IdentifierMatchClass::NamePrefix),
             ]
         );
         assert_eq!(

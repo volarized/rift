@@ -18,7 +18,7 @@ from rift_dev.rift_test_client import (
 )
 
 ARTIFACT_SECONDS = 240.0
-CONFIGURATION = "[search.semantic]\ndisabled = true\n"
+CONFIGURATION = "[search.vector]\ndisabled = true\n"
 SOURCE = "pub fn beacon_one() -> u8 { 1 }\npub fn beacon_two() -> u8 { 2 }\n"
 
 

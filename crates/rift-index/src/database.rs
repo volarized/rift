@@ -20,13 +20,13 @@ use toasty_core::driver::operation::TransactionMode;
 use toasty_driver_sqlite::Sqlite;
 use tokio::sync::{Mutex, MutexGuard};
 
+use crate::lexical::{LexicalDocumentRecord, LexicalIndexStateRecord};
 use crate::lexical::{
     LexicalIndexError, MIGRATIONS, bound_as_usize, lexical_error_caused_by, require_pragma_row,
     storage_error,
 };
-use crate::lexical::{LexicalIndexStateRecord, LexicalUnitRecord};
 use crate::log::LogRecordRow;
-use crate::vector::SemanticVectorRecord;
+use crate::vector::VectorRecord;
 
 /// Connection count and lock-wait bounds for one database file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,9 +93,9 @@ impl WorkspaceDatabase {
         let mut builder = Db::builder();
         builder
             .models(toasty::models!(
-                LexicalUnitRecord,
+                LexicalDocumentRecord,
                 LexicalIndexStateRecord,
-                SemanticVectorRecord,
+                VectorRecord,
                 LogRecordRow
             ))
             .max_pool_size(bound_as_usize(pool.slots()));
@@ -259,7 +259,7 @@ mod tests {
         let tables = toasty::sql::query(
             "SELECT COUNT(*) FROM sqlite_master \
              WHERE type = 'table' \
-             AND name IN ('lexical_units', 'semantic_vectors', 'log_records')",
+             AND name IN ('lexical_documents', 'semantic_vectors', 'log_records')",
         )
         .column_types([toasty::stmt::Type::I64])
         .exec(&mut connection)

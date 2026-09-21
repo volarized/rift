@@ -1,6 +1,6 @@
 //! Shared scaffolding for served workspace integration suites.
 //!
-//! Each workspace disables semantic search through `hermetic_search.rs`
+//! Each workspace disables vector search through `hermetic_search.rs`
 //! and drives the read tools through a live rmcp client.
 
 use std::error::Error;
@@ -55,7 +55,7 @@ pub(crate) async fn served_relative_workspace(
 }
 
 /// One temporary workspace holding `files` and a `rift.toml`: the table that turns
-/// the semantic tier off, then the LSP configuration when the suite drives one.
+/// the vector ranking off, then the LSP configuration when the suite drives one.
 ///
 /// A table header ends where the next one begins, so the LSP configuration follows
 /// unchanged and each suite still proves whatever its own table carries.
@@ -71,7 +71,7 @@ fn laid_out_workspace(
         }
         fs::write(path, source)?;
     }
-    let mut configuration = crate::hermetic_search::SEMANTIC_DISABLED.to_owned();
+    let mut configuration = crate::hermetic_search::VECTOR_DISABLED.to_owned();
     if let Some(lsp_configuration) = lsp_configuration {
         configuration.push('\n');
         configuration.push_str(&lsp_configuration);

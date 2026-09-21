@@ -1,14 +1,14 @@
-//! Live integration: the semantic search tier against the real model hub.
+//! Live integration: the vector search tier against the real model hub.
 //!
-//! `RIFT_SEARCH_LIVE=1 cargo test -p rift-mcp --test live_semantic_search`
+//! `RIFT_SEARCH_LIVE=1 cargo test -p rift-mcp --test live_vector_search`
 //! runs the suite; without the variable every test skips visibly. This is the
-//! one suite that lets a fixture keep the shipped `[search.semantic]` table, so
+//! one suite that lets a fixture keep the shipped `[search.vector]` table, so
 //! it is the one that proves what every other fixture turns off: the weights are
 //! acquired from the hub, the published declarations are embedded, and a query
 //! sharing no word with the code it describes still reaches it.
 //!
 //! The suite drives a live rmcp client and reads the tier's state the way a
-//! caller does, from a `search` result's own warnings: `semantic_index_preparing`
+//! caller does, from a `search` result's own warnings: `vector_index_preparing`
 //! while the pass runs, and nothing once every declaration carries a vector.
 //! Nothing here reads server internals, because nothing a caller cannot see is
 //! what this suite is for.
@@ -74,7 +74,7 @@ type Served = (
 );
 
 /// Serves one workspace carrying no `rift.toml`, so every shipped default
-/// applies and the semantic tier acquires its model.
+/// applies and the vector ranking acquires its model.
 async fn served_default_workspace(files: &[(&str, &str)]) -> TestResult<Served> {
     served_configured_workspace(files, None).await
 }
@@ -83,7 +83,7 @@ async fn served_default_workspace(files: &[(&str, &str)]) -> TestResult<Served> 
 ///
 /// The `None` spelling leaves the shipped defaults in place, which is the whole
 /// point of this suite; the `Some` spelling is how the control below turns the
-/// semantic tier off over the very same files.
+/// vector ranking off over the very same files.
 async fn served_configured_workspace(
     files: &[(&str, &str)],
     configuration: Option<&str>,
@@ -126,22 +126,22 @@ async fn search(client: &RunningService<RoleClient, ()>, query: &str) -> TestRes
         .ok_or_else(|| "search must return structured content".into())
 }
 
-/// Whether one search answer still reports the semantic tier as not answering.
+/// Whether one search answer still reports the vector ranking as not answering.
 fn tier_is_waiting(answer: &Value) -> bool {
     answer["warnings"]
         .as_array()
-        .is_some_and(|warnings| warnings.iter().any(is_semantic_warning))
+        .is_some_and(|warnings| warnings.iter().any(is_vector_warning))
 }
 
-/// Whether one warning is the semantic tier reporting on itself.
-fn is_semantic_warning(warning: &Value) -> bool {
+/// Whether one warning is the vector ranking reporting on itself.
+fn is_vector_warning(warning: &Value) -> bool {
     matches!(
         warning["code"].as_str(),
-        Some("semantic_index_preparing" | "semantic_ranking_unavailable")
+        Some("vector_index_preparing" | "vector_ranking_unavailable")
     )
 }
 
-/// Polls `query` until the semantic tier stops warning about itself, and returns
+/// Polls `query` until the vector ranking stops warning about itself, and returns
 /// the answer it settled on together with how long that took.
 ///
 /// The loop runs at most `budget / READINESS_POLL` times, so a hub that never
@@ -164,7 +164,7 @@ async fn ready_answer(
         tokio::time::sleep(READINESS_POLL).await;
     }
     Err(format!(
-        "the semantic tier did not answer within {budget:?}; last warnings: {}",
+        "the vector ranking did not answer within {budget:?}; last warnings: {}",
         last["warnings"]
     )
     .into())
@@ -194,7 +194,7 @@ fn reaches(answer: &Value, path: &str) -> bool {
 
 /// The control's table: the same files, served with the tier the suite is about
 /// turned off.
-const SEMANTIC_DISABLED: &str = "[search.semantic]\ndisabled = true\n";
+const VECTOR_DISABLED: &str = "[search.vector]\ndisabled = true\n";
 
 #[tokio::test]
 async fn a_paraphrase_reaches_code_it_shares_no_word_with() -> TestResult {
@@ -203,11 +203,11 @@ async fn a_paraphrase_reaches_code_it_shares_no_word_with() -> TestResult {
     }
     assert_shares_no_token(PARAPHRASE, &workspace());
 
-    // The control: the same files with the semantic tier off. A disabled tier never
+    // The control: the same files with the vector ranking off. A disabled tier never
     // prepares, so this answer is the lexical one whatever the cache already holds -
     // which is what makes the comparison below a fact rather than a race.
     let (_off_directory, off, off_task) =
-        served_configured_workspace(&workspace(), Some(SEMANTIC_DISABLED)).await?;
+        served_configured_workspace(&workspace(), Some(VECTOR_DISABLED)).await?;
     let lexical_only = search(&off, PARAPHRASE).await?;
     assert!(
         !reaches(&lexical_only, "lib.rs"),
@@ -220,7 +220,7 @@ async fn a_paraphrase_reaches_code_it_shares_no_word_with() -> TestResult {
     let (answer, elapsed) = ready_answer(&client, PARAPHRASE, COLD_READY_MAX).await?;
     assert!(
         reaches(&answer, "lib.rs"),
-        "the prepared semantic tier must reach the declaration the paraphrase describes \
+        "the prepared vector ranking must reach the declaration the paraphrase describes \
          after {elapsed:?}: {answer:#}"
     );
 

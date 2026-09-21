@@ -1,7 +1,7 @@
 //! Cosine ranking over a corpus built in the test, so no suite loads a model.
 
 use rift_index::StoredVector;
-use rift_search::{SearchViolation, SemanticMatch, nearest};
+use rift_search::{SearchViolation, VectorMatch, nearest};
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -21,8 +21,8 @@ fn stored(digest: &str, values: [f32; WIDTH]) -> StoredVector {
     StoredVector::new(digest.to_owned(), values.to_vec())
 }
 
-fn digests(matches: &[SemanticMatch]) -> Vec<&str> {
-    matches.iter().map(SemanticMatch::digest).collect()
+fn digests(matches: &[VectorMatch]) -> Vec<&str> {
+    matches.iter().map(VectorMatch::digest).collect()
 }
 
 /// One corpus holding the query's own direction, one at 45 degrees to it, one
@@ -193,7 +193,7 @@ fn the_head_is_the_strongest_rows_wherever_they_sit_in_the_corpus() -> TestResul
 fn the_debug_render_names_the_digest_and_the_similarity() -> TestResult {
     let ranked = nearest(&QUERY, &corpus(), 1)?;
     let rendered = format!("{:?}", ranked[0]);
-    assert!(rendered.starts_with("SemanticMatch"), "{rendered}");
+    assert!(rendered.starts_with("VectorMatch"), "{rendered}");
     assert!(rendered.contains("digest: \"identical\""), "{rendered}");
     assert!(rendered.contains("similarity: 1.0"), "{rendered}");
     Ok(())

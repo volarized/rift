@@ -67,25 +67,25 @@ fn stale_identity() -> ProductIdentity {
     }
 }
 
-/// The `[search.semantic]` table every fixture here declares.
+/// The `[search.vector]` table every fixture here declares.
 ///
-/// Rift ships the semantic tier on, so a fixture carrying no such table would acquire
+/// Rift ships the vector ranking on, so a fixture carrying no such table would acquire
 /// the default model from the hub. A hermetic suite must not write into the developer's
 /// own Hugging Face cache, and on a runner with no network a default-on tier would spend
 /// its whole retry budget inside a detached task nobody waits on. `rift-mcp`'s
 /// `tests/hermetic_search.rs` states the same policy for that crate's suites, and its
-/// `live_semantic_search` suite is the one place the shipped default is exercised.
-const SEMANTIC_DISABLED: &str = "[search.semantic]\ndisabled = true\n";
+/// `live_vector_search` suite is the one place the shipped default is exercised.
+const VECTOR_DISABLED: &str = "[search.vector]\ndisabled = true\n";
 
-/// A workspace fixture: one Rust source and a `rift.toml` that turns the semantic
-/// tier off and whose `[server]` idle timeout reaps any orphaned server within a
+/// A workspace fixture: one Rust source and a `rift.toml` that turns the vector
+/// ranking off and whose `[server]` idle timeout reaps any orphaned server within a
 /// minute.
 fn workspace() -> TestResult<tempfile::TempDir> {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
     fs::write(
         directory.path().join("rift.toml"),
-        format!("{SEMANTIC_DISABLED}[server]\nidle_timeout = \"60s\"\n"),
+        format!("{VECTOR_DISABLED}[server]\nidle_timeout = \"60s\"\n"),
     )?;
     Ok(directory)
 }
@@ -827,7 +827,7 @@ fn start_reports_a_server_that_exits_before_publishing() -> TestResult {
         fs::write(unit, "pub fn beacon() {}\n")?;
     }
     let configuration =
-        format!("{SEMANTIC_DISABLED}[server]\nidle_timeout = \"60s\"\n[source]\nfiles = 1000\n");
+        format!("{VECTOR_DISABLED}[server]\nidle_timeout = \"60s\"\n[source]\nfiles = 1000\n");
     fs::write(root.join("rift.toml"), configuration)?;
 
     let started = rift(root, &["server", "start"])?;

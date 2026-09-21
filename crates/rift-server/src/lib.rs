@@ -23,6 +23,7 @@ pub use engine_read::{EngineReferences, resolve_engine_references, uses_engine_r
 pub use packages::PackageBranch;
 pub use read::{ReadError, ReadFault, ReadService, wire_digest};
 pub use rift_core::CapturedStream;
+pub use search::StoreAnswer;
 
 /// Compile-time marker for server-layer ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

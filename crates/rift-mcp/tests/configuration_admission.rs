@@ -35,7 +35,7 @@ const VALID_TEXT_CONFIGURATION: &str = r#"
 max_chunk = "2mb"
 "#;
 
-/// One workspace whose `rift.toml` turns the semantic tier off and then carries
+/// One workspace whose `rift.toml` turns the vector ranking off and then carries
 /// `configuration`, so the suite still proves what acceptance does with that block.
 ///
 /// A fixture serving a block acceptance refuses falls back to the shipped tables,
@@ -44,7 +44,7 @@ max_chunk = "2mb"
 fn workspace_with(configuration: Option<&str>) -> TestResult<tempfile::TempDir> {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-    let mut contents = hermetic_search::SEMANTIC_DISABLED.to_owned();
+    let mut contents = hermetic_search::VECTOR_DISABLED.to_owned();
     if let Some(configuration) = configuration {
         contents.push_str(configuration);
     }
@@ -95,10 +95,7 @@ async fn fixing_the_file_recovers_without_a_restart() -> TestResult {
     let client = client_for(directory.path()).await?;
 
     refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
-    let contents = format!(
-        "{}{VALID_CONFIGURATION}",
-        hermetic_search::SEMANTIC_DISABLED
-    );
+    let contents = format!("{}{VALID_CONFIGURATION}", hermetic_search::VECTOR_DISABLED);
     fs::write(directory.path().join("rift.toml"), contents)?;
 
     let recovered = client
@@ -131,7 +128,7 @@ async fn breaking_the_file_after_boot_gates_the_next_request() -> TestResult {
 
     let contents = format!(
         "{}{INVALID_CONFIGURATION}",
-        hermetic_search::SEMANTIC_DISABLED
+        hermetic_search::VECTOR_DISABLED
     );
     fs::write(directory.path().join("rift.toml"), contents)?;
     let refused = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;

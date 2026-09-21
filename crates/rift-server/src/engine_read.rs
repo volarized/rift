@@ -608,6 +608,7 @@ mod tests {
         EngineReferences, ReferenceReport, declaration_name_offset, map_references,
         resolve_engine_references,
     };
+    use crate::search::StoreAnswer;
     use crate::{EnginePool, LspProcessKey, ReadService};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -871,7 +872,8 @@ mod tests {
             references.incoming(&caller)[0].relationship.from,
             symbol(&reads, "outer")
         );
-        let answer = reads.search_with_references(&params, &[], &references)?;
+        let answer =
+            reads.search_with_references(&params, &StoreAnswer::identifier_only(), &references)?;
         assert_eq!(answer.results.len(), 2);
         Ok(())
     }
@@ -1011,7 +1013,11 @@ mod tests {
         };
         assert!(
             reads
-                .search_with_references(&request(&symbol(&reads, "beacon")), &[], &references)
+                .search_with_references(
+                    &request(&symbol(&reads, "beacon")),
+                    &StoreAnswer::identifier_only(),
+                    &references
+                )
                 .is_err()
         );
         Ok(())
@@ -1031,7 +1037,7 @@ mod tests {
         let references = Box::pin(resolve_engine_references(&reads, &engines, &params)).await?;
         assert!(references.is_empty());
         let refused = reads
-            .search_with_references(&params, &[], &references)
+            .search_with_references(&params, &StoreAnswer::identifier_only(), &references)
             .expect_err("no engine answered, so the walk has no edge source");
         assert_eq!(refused.descriptor().code(), "capability_unavailable");
         Ok(())
@@ -1079,7 +1085,8 @@ mod tests {
             !references.is_empty(),
             "engine must contribute the cross-file reference"
         );
-        let answer = reads.search_with_references(&params, &[], &references)?;
+        let answer =
+            reads.search_with_references(&params, &StoreAnswer::identifier_only(), &references)?;
         assert!(
             answer
                 .results
@@ -1123,7 +1130,7 @@ mod tests {
         let references = result?;
         assert!(references.is_empty());
         let refused = reads
-            .search_with_references(&params, &[], &references)
+            .search_with_references(&params, &StoreAnswer::identifier_only(), &references)
             .expect_err("an engine without the references capability answers no edge");
         assert_eq!(refused.descriptor().code(), "capability_unavailable");
         Ok(())
@@ -1175,7 +1182,9 @@ mod tests {
                 .expect("request")
                 .extend(invalid.as_object().expect("overrides").clone());
             let params = serde_json::from_value(value)?;
-            let expected = reads.search(&params, &[]).expect_err("invalid search");
+            let expected = reads
+                .search(&params, &StoreAnswer::identifier_only())
+                .expect_err("invalid search");
             let error = Box::pin(resolve_engine_references(&reads, &engines, &params))
                 .await
                 .expect_err("invalid search before engine");
@@ -1219,7 +1228,7 @@ mod tests {
         assert!(references.resolved(seed));
         assert!(
             reads
-                .search_with_references(&params, &[], &references)?
+                .search_with_references(&params, &StoreAnswer::identifier_only(), &references)?
                 .results
                 .is_empty()
         );

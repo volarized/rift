@@ -9,15 +9,19 @@ use std::sync::Arc;
 
 use rift_core::ProjectPath;
 use rift_index::{
-    DatabasePool, LexicalIndexLimits, LexicalSearchIndex, LexicalUnit, LexicalUnitKind, LogQuery,
-    LogRecord, LogStore, WorkspaceDatabase,
+    DatabasePool, LexicalIndexLimits, LexicalSearchIndex, LogQuery, LogRecord, LogStore,
+    WorkspaceDatabase,
+};
+use rift_ranking::{
+    DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, IndexDocument,
+    SearchableField,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-/// Units one commit carries, enough that the write holds its lock while the
+/// Documents one commit carries, enough that the write holds its lock while the
 /// log append asks for the same file.
-const COMMIT_UNITS: usize = 2_000;
+const COMMIT_DOCUMENTS: usize = 2_000;
 /// Records the log side writes against that commit.
 const LOG_BATCHES: usize = 8;
 /// Retention no suite here reaches.
@@ -28,18 +32,27 @@ fn database_pool() -> DatabasePool {
     DatabasePool::new(4, 15_000)
 }
 
-/// Index bounds wide enough for [`COMMIT_UNITS`].
+/// Index bounds wide enough for [`COMMIT_DOCUMENTS`].
 fn index_limits() -> LexicalIndexLimits {
-    LexicalIndexLimits::new(10_000, 1 << 20, 32, 64, 4, 15_000)
+    LexicalIndexLimits::new(10_000, 1 << 20, 64, 4, 15_000)
 }
 
-fn unit(index: usize) -> Result<LexicalUnit, Box<dyn std::error::Error>> {
-    Ok(LexicalUnit::new(
-        format!("rift://symbol/rust/unit_{index}.rs/declaration"),
-        ProjectPath::new(format!("unit_{index}.rs"))?,
-        LexicalUnitKind::Symbol,
-        Some(format!("declaration_{index}")),
-        format!("fn declaration_{index}() -> u32 {{ {index} }}"),
+fn document(index: usize) -> Result<IndexDocument, Box<dyn std::error::Error>> {
+    let name = format!("declaration_{index}");
+    let fields = DocumentFields::empty()
+        .with(SearchableField::Name, name.clone())
+        .with(SearchableField::QualifiedName, format!("crate::{name}"))
+        .with(
+            SearchableField::DeclarationSource,
+            format!("fn {name}() -> u32 {{ {index} }}"),
+        );
+    let digest = fields.digest();
+    Ok(IndexDocument::new(
+        DocumentIdentity::new(format!("rift://symbol/rust/unit_{index}.rs/declaration"))?,
+        DocumentLocation::Project(ProjectPath::new(format!("unit_{index}.rs"))?),
+        DocumentKind::Symbol,
+        digest,
+        fields,
     )?)
 }
 
@@ -61,9 +74,11 @@ async fn a_log_append_lands_while_the_index_commits_to_the_same_file() -> TestRe
     let database = WorkspaceDatabase::open(&directory.path().join("db"), database_pool()).await?;
     let index = LexicalSearchIndex::attached(Arc::clone(&database), index_limits());
     let logs = LogStore::attached(Arc::clone(&database));
-    let units: Vec<LexicalUnit> = (0..COMMIT_UNITS).map(unit).collect::<Result<_, _>>()?;
+    let documents: Vec<IndexDocument> = (0..COMMIT_DOCUMENTS)
+        .map(document)
+        .collect::<Result<_, _>>()?;
 
-    let commit = tokio::spawn(async move { index.replace_all(&units, "revision").await });
+    let commit = tokio::spawn(async move { index.replace_all(&documents, "revision").await });
     let mut appended = 0;
     for batch in 0..LOG_BATCHES {
         logs.append(&[record(&format!("batch {batch}"))], KEEP_EVERY)
@@ -85,9 +100,11 @@ async fn a_log_store_attached_first_leaves_the_index_its_own_bounds() -> TestRes
     let database = WorkspaceDatabase::open(&directory.path().join("db"), database_pool()).await?;
     let _logs = LogStore::attached(Arc::clone(&database));
     let index = LexicalSearchIndex::attached(Arc::clone(&database), index_limits());
-    let units: Vec<LexicalUnit> = (0..COMMIT_UNITS).map(unit).collect::<Result<_, _>>()?;
+    let documents: Vec<IndexDocument> = (0..COMMIT_DOCUMENTS)
+        .map(document)
+        .collect::<Result<_, _>>()?;
 
-    let committed = index.replace_all(&units, "revision").await;
+    let committed = index.replace_all(&documents, "revision").await;
 
     assert!(
         committed.is_ok(),

@@ -14,13 +14,14 @@ use rift_core::constants::SEARCH_RESULTS_DEFAULT;
 use rift_core::{LanguageFileSelections, ProjectPath, SourceVisibility, TextFileInclusion};
 use rift_history::Repository;
 use rift_index::{
-    IndexedFile, RevisionPaths, SymbolMatch, SymbolMatchRank, WorkspaceIndex, WorkspaceIndexLimits,
+    IndexedFile, RevisionPaths, SymbolMatch, WorkspaceIndex, WorkspaceIndexLimits,
     WorkspaceIndexWarning,
 };
 use rift_protocol::read::{
     MatchedField, PathSelector, ReadWarning, ResultOrder, SEARCH_CHANGE_PATHS_MAX, SearchChange,
     SearchHit, SearchParams, SearchParamsTarget, SearchResult, SymbolChange, SymbolVersionKind,
 };
+use rift_ranking::IdentifierMatchClass;
 use rift_syntax::SyntaxSymbol;
 
 use crate::history::{SymbolShape, SymbolState, classify};
@@ -432,7 +433,7 @@ fn changed_hit(
         file: declaration.file,
         symbol: declaration.symbol,
         // This lane reads no identifier rank: nothing here was matched by name.
-        rank: SymbolMatchRank::Substring,
+        rank: IdentifierMatchClass::Substring,
     };
     let matched_by = vec![MatchedField::Change];
     let mut hit = build_symbol_hit(declaration.index, matched, None, matched_by, payloads)?;

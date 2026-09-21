@@ -429,69 +429,119 @@ busy_timeout = "5s"
   languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
 />
 
-The two rankings are combined by reciprocal-rank fusion: a result scores as the weighted sum
-of `1 / (k + rank)` over the rankings that returned it. `[search.lexical]` and
-`[search.semantic]` carry the weights, `fusion_k` carries the `k`, and `[search.semantic]`
-names the model the second ranking runs on:
+The rankings are combined by reciprocal-rank fusion: a result scores as the weighted sum of
+`1 / (k + rank)` over the rankings that returned it. `[search.ranking]` carries the weights
+and the `k`:
 
 ```toml
-[search]
+[search.ranking]
+identifier_weight = 0.35
+lexical_weight = 0.35
+vector_weight = 0.30
 fusion_k = 60
+```
 
-[search.lexical]
-weight = 0.7
+- each weight is that ranking's share of a fused score, 0.0 to 1.0. They don't have to sum
+  to 1: the server normalizes the weights of the rankings that actually answered, so an
+  unavailable vector ranking doesn't rescale what the other two returned. At least one
+  weight must be above 0
+- `identifier_weight` weighs identifier matching, which ranks the identifiers a query
+  carried against the indexed declaration and qualified names. A question naming a
+  declaration in prose reaches it through this ranking
+- `lexical_weight` weighs the full-text ranking over names, signatures, attached
+  documentation, declaration source, and selected text files
+- `vector_weight` weighs the vector ranking, which reaches code sharing no word with the
+  query
+- `fusion_k` sets how sharply a top rank counts, 1 to 1000; a larger value flattens the
+  contribution curve and lets agreement between the rankings outweigh one ranking's top
+  position
 
-[search.semantic]
-weight = 0.3
-source = "hf"
-model = "minishlab/potion-retrieval-32M"
-download_timeout = "5m"
-download_attempts = 3
-batch_declarations = 32
-max_tokens = 256
+`[search.vector]` bounds the vector ranking, and `[search.vector.embedding]` names the model
+it runs on:
+
+```toml
+[search.vector]
 candidates = 200
 candidates_per_file = 3
 max_vectors = 200000
+
+[search.vector.embedding]
+kind = "hf"
+model = "minishlab/potion-retrieval-32M"
+download_timeout = "5m"
+download_attempts = 3
+batch_inputs = 32
+max_tokens = 256
 ```
 
-- `weight` is each ranking's share of a fused score, 0.0 to 1.0; the two must sum to 1, so
-  each reads as a share of one whole
-- `fusion_k` sets how sharply a top rank counts, 1 to 1000; a larger value flattens the
-  contribution curve and lets agreement between the two rankings outweigh one ranking's top
-  position
-- `[search.semantic].source` names where the weights come from: `hf` downloads them from a
-  Hugging Face repository and caches them where every other Hugging Face client on the
-  machine caches them, `directory` reads a directory the workspace already holds and
-  downloads nothing
-- `model` names which weights, in the form the semantic tier's `source` sets: under `hf` a
-  repository identifier such as `minishlab/potion-retrieval-32M`, optionally carrying a
-  revision after `@`; under `directory` a workspace-relative directory. The server stores
-  vectors per model - two models' vectors aren't comparable - so changing the value embeds
-  the workspace again
-- The model's own `config.json` decides how the server reads it. A `model_type` of
-  `model2vec` names a static model, which embeds a declaration by averaging one row per
-  token; anything else is read as a BERT checkpoint, which runs a forward pass per batch.
-  The shipped default is static, because a forward pass over every declaration in a
-  workspace costs minutes on a laptop CPU and a row gather costs seconds
-- `download_timeout` and `download_attempts` bound one model acquisition, 10s to 1h and 1 to
-  10; a spent budget leaves search lexical for the life of the server
-- `batch_declarations` and `max_tokens` bound one embedding pass, 1 to 256 and 32 to 512.
-  A BERT checkpoint's attention memory grows with the square of the token window, so a
-  raised window wants a lowered batch; a static model reads one row per token, so its cost
-  grows with the window rather than with its square
-- `candidates` bounds how many declarations the semantic ranking returns before the two
-  rankings are fused, 1 to 1000, and `candidates_per_file` bounds any one file's share of them
+- `candidates` bounds how many declarations the vector ranking returns before the rankings
+  are fused, 1 to 1000
 - `candidates_per_file` bounds how many declarations one file contributes to that list, 1 to
   64; the rest of the file's declarations are dropped, so one file whose declarations all rank
   well can't fill the list on its own and leave every other file unreachable
 - `max_vectors` bounds how many vectors the workspace holds, 1000 to 1000000; each vector
   costs the model's dimension in single-precision floats
+- `kind` selects which embedding runs, and each kind carries only the keys its execution
+  reads: `hf` downloads the weights from a Hugging Face repository and caches them where
+  every other Hugging Face client on the machine caches them, `directory` reads a directory
+  the workspace already holds and downloads nothing, and `openai_compatible` sends embedding
+  inputs to a service implementing the OpenAI embedding shape
+- `model` names which weights, in the form `kind` sets: under `hf` a repository identifier
+  such as `minishlab/potion-retrieval-32M`, optionally carrying a revision after `@`; under
+  `directory` a workspace-relative directory; under `openai_compatible` the model the
+  service exposes. The server stores vectors per model - two models' vectors aren't
+  comparable - so changing the value embeds the workspace again
+- The model's own `config.json` decides how the server reads it. A `model_type` of
+  `model2vec` names a static model, which embeds a declaration by averaging one row per
+  token; anything else is read as a BERT checkpoint, which runs a forward pass per batch.
+  The shipped default is static, because a forward pass over every declaration in a
+  workspace costs minutes on a laptop CPU and a row gather costs seconds
+- `download_timeout` and `download_attempts` bound one model acquisition under `hf`, 10s to
+  1h and 1 to 10; a spent budget leaves search lexical for the life of the server
+- `batch_inputs` and `max_tokens` bound one embedding pass, 1 to 256 and 32 to 512 under a
+  local model. A BERT checkpoint's attention memory grows with the square of the token
+  window, so a raised window wants a lowered batch; a static model reads one row per token,
+  so its cost grows with the window rather than with its square
+
+An `openai_compatible` embedding sends declaration text outside the project while vectors are
+built, and query text while a search runs. The local default sends neither: it starts without
+a key and makes no request once the weights are acquired.
+
+```toml
+[search.vector.embedding]
+kind = "openai_compatible"
+endpoint = "https://api.openai.com/v1"
+model = "text-embedding-3-small"
+revision = "2024-01-25"
+dimensions = 1536
+api_key_env = "OPENAI_API_KEY"
+request_timeout = "30s"
+attempts = 3
+batch_inputs = 64
+max_in_flight = 4
+```
+
+- `endpoint` is the base URL the request path is appended to. It uses `https`; `http` is
+  accepted only when the host is `localhost`, `127.0.0.1`, or `::1`
+- `revision` is a deployment identifier the operator states, such as a dated release. It
+  participates in vector invalidation, so an endpoint serving new weights under one model
+  name gets a new value here
+- `dimensions` is how many coordinates one vector carries, 1 to 16384
+- `api_key_env` names the environment variable holding the credential, and never carries the
+  credential itself
+- `request_timeout`, `attempts`, `batch_inputs`, and `max_in_flight` bound one embedding
+  request and the requests running together: 1s to 5m, 1 to 10, 1 to 2048 inputs, and 1 to 32
+  requests
+- the service must answer one vector per input and declare each one's input `index`. The
+  server associates by that index rather than by array order, and refuses a response that
+  repeats an index, omits one, or names one past the request's own length: any of those
+  would attach a vector to the wrong declaration
 
 `disabled` keeps the workspace lexical without emptying the rest of the table. Set it where
 the workspace must not fetch model weights:
 
 ```toml
-[search.semantic]
+[search.vector]
 disabled = true
 ```
 

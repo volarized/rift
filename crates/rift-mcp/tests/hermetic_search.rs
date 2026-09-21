@@ -1,7 +1,7 @@
-//! The `[search.semantic]` table every fixture outside the live suite declares.
+//! The `[search.vector]` table every fixture outside the live suite declares.
 //!
-//! Rift ships the semantic tier on: a workspace with no `rift.toml` acquires the
-//! default model from the hub, and `live_semantic_search` is the suite that proves
+//! Rift ships the vector ranking on: a workspace with no `rift.toml` acquires the
+//! default model from the hub, and `live_vector_search` is the suite that proves
 //! it. Every other fixture opts out the same way an operator would, for two
 //! reasons. A hermetic suite must not write into the developer's own Hugging Face
 //! cache. And on a runner with no network a default-on tier would spend its whole
@@ -12,5 +12,5 @@
 //! integration test and a unit test are two crates, and a value shared between
 //! them would have to leave the library's public surface to do it.
 
-/// The table that turns the semantic tier off for one fixture workspace.
-pub(crate) const SEMANTIC_DISABLED: &str = "[search.semantic]\ndisabled = true\n";
+/// The table that turns the vector ranking off for one fixture workspace.
+pub(crate) const VECTOR_DISABLED: &str = "[search.vector]\ndisabled = true\n";

@@ -50,7 +50,7 @@ RUNNER_SECONDS_MAX = 300.0
 # Longest wait for the `rift` binary to build.
 BUILD_SECONDS_MAX = 1800.0
 
-FIXTURE_CONFIGURATION = """[search.semantic]
+FIXTURE_CONFIGURATION = """[search.vector]
 disabled = true
 """
 FIXTURE_SOURCE = 'fn main() {\n    println!("beacon");\n}\n'
@@ -63,7 +63,7 @@ def lay_out_workspace(root: Path) -> None:
     `cargo metadata --format-version 1 --locked --offline` refuse, and the
     degraded resolution that follows rebuilds the index while the server is
     still capturing its first tree, so the server exits before it publishes.
-    The configuration keeps the semantic tier off, so the run reaches no
+    The configuration keeps the vector ranking off, so the run reaches no
     model hub.
     """
     (root / "src").mkdir(parents=True, exist_ok=True)

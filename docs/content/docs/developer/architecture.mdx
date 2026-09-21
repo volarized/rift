@@ -413,7 +413,7 @@ transaction that refuses leaves the previous rows and stamp intact and is record
 [`rift://logs`](/docs/mcp#resource-logs), and the next publication replaces the whole
 unit set rather than applying its change on top of rows the store missed.
 
-The semantic tier's vectors are not part of that transaction. Embedding one declaration can cost
+The vector ranking's vectors are not part of that transaction. Embedding one declaration can cost
 more than a read is willing to wait, so vectors are refreshed after the index publishes, and a
 search whose vectors are still being written ranks lexically and reports the tier's readiness in
 `warnings`.
@@ -439,55 +439,133 @@ exclusion remains the way to keep such files out of the walk altogether.
 ### Search
 
 [`search`](/docs/mcp#tool-search) is for reads where the exact name isn't known.
-It ranks symbol names, signatures, documentation, and file content from the index.
+It ranks declaration names, signatures, documentation, declaration source, and file content
+from the index.
 
-What the index holds comes from normalized Contributions. Syntax providers contribute each
-declaration's name, signature, and documentation; the lexical tier adds file content - source
-and plain text alike - so a hit can land in a comment, a configuration key, or a README as well
-as a declaration.
+#### The document shape
 
-Matching serves two query shapes. An identifier-shaped query - `ReadService`,
-`num_workers` - matches the declaration names it resembles. A prose query - `visible source
-included` - ranks by [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) term relevance
-over names, signatures, documentation, and content together.
+Every index publishes the same document shape, whether it holds the served project, a
+cataloged package, or a fixture a test built in memory. A document carries a stable identity,
+the project path or source unit it lives at, its language, its package when it came from one,
+a content digest, and the searchable fields below:
 
-The server indexes names both as spelled and split into words on case and separator boundaries,
-so `get user name` reaches a declaration spelled `getUserName`, and a concept-level search does
-not depend on guessing the identifier first.
+| Field | What it holds | Weight |
+| --- | --- | --- |
+| `name` | A declaration's name, or a file's final path segment with its extension | 10 |
+| `qualified_name` | The declaration's qualified name | 6 |
+| `identifier_terms` | The names split on case, acronym, and separator boundaries | 4 |
+| `signature` | The rendered signature, when a provider published one | 2 |
+| `documentation` | The attached doc comment, when a provider published one | 1.5 |
+| `declaration_source` | The declaration's own source text | 1 |
+| `file_content` | A visible text file's content | 1 |
 
-#### Semantic ranking
+A fact no provider published stays absent. Nothing substitutes declaration source into the
+signature or documentation field, because the two are weighed apart and filling one with the
+other would count the same bytes twice. The weights are what make a name hit outrank a hit
+buried in a comment, and the answer reports which field placed each hit, so a documentation
+match and a name match are distinguishable rather than both reported as "the ranking found it".
+
+The project path, the source unit, the package identity, the language, and the kind stay
+metadata. None of them enters the ranked text: indexing one tree below two different host
+roots must produce one order, and a path in the ranked text would make the clone directory
+part of the score.
+
+The index records a corpus revision covering the field shape, the derivation the identifier
+terms were split with, the tokenizer, and the weights. A store stamped with another revision
+holds rows this build cannot read, so it answers as if nothing had been published and the next
+publication replaces it.
+
+#### Query phases
+
+A caller's text is parsed once, into quoted phrases and unquoted terms, and every member is
+rendered as a quoted string literal, so an FTS operator a caller typed cannot become an
+operator the store executes. The parse is bounded: 4,096 bytes of query, 32 members, 256 bytes
+per member. A question carrying more terms than the bound narrows rather than failing - every
+quoted phrase survives and the longest remaining terms fill what is left - because a long
+question deserves an answer, not a refusal. More quoted phrases than the bound is still
+refused: dropping one would answer a question nobody asked.
+
+Two expressions come out of one parse. The **precise** phase requires every member, which is
+what answers a multi-term question exactly. The **broad** phase keeps every phrase required and
+widens only the unquoted terms with `OR`, so `"impact radius" graph search` renders as
+`"impact radius" AND ("graph"* OR "search"*)`.
+
+Every selected index runs the precise phase first and the results fuse together. Only when that
+merged answer leaves the candidate pool short does the broad phase join, and its identities
+append after every precise one. One index's widened hit therefore cannot displace another
+index's exact hit.
+
+#### Ranking inputs and fusion
+
+The rankings below answer, and their answers fuse together:
+
+- **identifier matching** over the declaration names, for the identifiers the query carried;
+- **full-text matching** over the document's searchable fields, by
+  [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) under the weights above;
+- **vector similarity** over the embedded declarations, when a model is configured and its
+  vectors are in.
+
+The identifier input reads the query the way a reader would. The whole query counts when it is
+one identifier-shaped token, a dotted name buried in prose counts along with its final segment,
+and any token that splits into more than one word counts: `where does encode_path get its
+escape set` reaches `encode_path` without the caller quoting it. A plain prose word contributes
+nothing here, because it reaches the full-text ranking through its own input.
+
+Each ranking scores in units nothing converts between: a match class, a BM25 rank, and a
+cosine. What they agree on is the position they put a candidate in, so fusion reads positions
+alone and combines them by weighted reciprocal rank.
+[`[search.ranking]`](/docs/developer/configuration#search) carries that decision: `fusion_k`
+sets how sharply a top rank counts, and `identifier_weight`, `lexical_weight`, and
+`vector_weight` set each input's share. Only the inputs that answered take part, so an
+unavailable vector ranking contributes nothing and leaves the order the other two state.
+Several selected indexes may each contribute one kind; that kind's share then splits among
+them, so reaching for a package index does not double what full-text matching is worth.
+
+Fusion holds no project path and resolves no symbol. It answers ordered identities, and the
+read path resolves them afterwards, which is what lets a package index rank source units
+through the same code. A hit's `score` is derived from its place in the final order: it is
+comparable inside one answer and nowhere else.
+
+#### Vector ranking
 
 <VersionBadge
   version="v0.0.16"
   languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
 />
 
-The lexical ranking answers a query that shares a token with the code. A query that shares
+Full-text matching answers a query that shares a token with the code. A query that shares
 none - a description of what a declaration does, in the words a bug report would use - reaches
-nothing lexically, and no amount of ranking repairs that, because the words are not there.
+nothing that way, and no amount of ranking repairs that, because the words are not there.
 
 An embedding puts the query and the declaration in one space, so a paraphrase finds code it
 has no word in common with. It replaces nothing. A caller who quotes a real name - a symbol, a
-configuration key, a line from a traceback - has handed the lexical ranking an exact token to
+configuration key, a line from a traceback - has handed the full-text ranking an exact token to
 score, while the embedding maps that name into a space where its near neighbours crowd it.
 
 A declaration is embedded as its own source under its qualified name. The name carries the
 module the source doesn't state; the source carries the identifiers and documentation an
-encoder trained on code reads best. The path is left out, because the lexical ranking already
+encoder trained on code reads best. The path is left out, because the full-text ranking already
 covers it.
 
-The two rankings are combined by reciprocal rank rather than by averaging their scores. A
-full-text relevance score and a cosine similarity share no scale, so a weighted average of the
-two is decided by whichever side happens to spread wider.
-[`fusion_k`](/docs/developer/configuration#search) sets how sharply a top rank counts, and the two
-`weight` keys set each ranking's share.
+Every model runs through one contract, whether it is an encoder this process loaded or a
+service answering the OpenAI embedding shape. Rift keeps what that contract does not cover:
+acquiring the weights, cutting a pass into batches under
+[`batch_inputs` and `max_in_flight`](/docs/developer/configuration#search), and narrowing the
+coordinates to the stored format once at the boundary.
 
-Preparation runs behind the answers. A search issued before the vectors are in is answered
-lexically and says so, rather than waiting for a model to load.
+Vectors are filed under the identity of the space they were embedded into: the source kind, the
+endpoint origin for a remote service, the model and its resolved revision, the width, and the
+document and query transformations. Any change there mints another identity and the held
+vectors are dropped rather than scored against, because two spaces are two coordinate systems.
+Credentials never enter it.
 
-Vectors are stored per model and addressed by the text they were embedded from. A declaration
-that moves or is renamed keeps its text, so it keeps its vector; changing the configured model
-embeds the workspace again rather than mixing two spaces.
+A remote endpoint sends declaration text outside the project while the vectors are built, and
+query text while a caller searches. The configuration page states both transfers. The local
+default sends nothing: it starts without a key and makes no request once the weights are
+acquired.
+
+Preparation runs behind the answers. A search issued before the vectors are in is answered by
+the other two inputs and says so, rather than waiting for a model to load.
 
 ### Retrieve symbol
 

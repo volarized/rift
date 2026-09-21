@@ -3,24 +3,27 @@ import {
   BracketsCurlyIcon,
   ClockCounterClockwiseIcon,
   CpuIcon,
-  DatabaseIcon,
   FileTextIcon,
   GlobeHemisphereWestIcon,
   GraphIcon,
   HardDrivesIcon,
+  MagnifyingGlassIcon,
   PlugsConnectedIcon,
+  RankingIcon,
   TextTIcon,
 } from "@phosphor-icons/react/ssr";
 import type { ReactNode } from "react";
 
 import { FlatDiagram } from "@/components/flat-diagram";
 import { Badge } from "@/components/ui/badge";
+import { HuggingFace } from "@/components/ui/svgs/huggingFace";
+import { Openai } from "@/components/ui/svgs/openai";
 
 const CHART = `
   flowchart BT
     subgraph surface["MCP entrypoints"]
       local_mcp["Local server<br/>Project reads"]
-      global_mcp["Global server<br/>Direct MCP · Planned"]
+      global_mcp["Global server<br/>Direct MCP"]
     end
 
     subgraph local["Local index"]
@@ -28,39 +31,48 @@ const CHART = `
       local_text["Text"]
       local_syntax["Syntax"]
       local_semantics["Semantics<br/>Symbol references on request"]
-      local_documentation["Documentation<br/>Planned"]
+      local_documentation["Documentation"]
       local_context["Revision + origin"]
-      local_facts["Project facts"]
+      local_fts["FTS corpus<br/>Names + signatures + docs + file content"]
+      local_vector["Vector corpus<br/>Qualified name + declaration source"]
+      local_embeddings["Embedding"]
+      local_search["Hybrid search<br/>Identifier + BM25 + vector"]
+      local_ranking["Ranking<br/>Weighted reciprocal rank fusion"]
     end
 
-    subgraph global["Global index · Planned"]
+    subgraph global["Global index"]
       global_source["OSS package versions"]
       global_text["Text"]
       global_syntax["Syntax"]
       global_semantics["Semantics<br/>Package relationships"]
-      global_documentation["Documentation<br/>Planned"]
+      global_documentation["Documentation"]
       global_context["Revision + origin"]
-      global_facts["OSS package facts"]
+      global_search["FTS + vector<br/>(hybrid)"]
+      global_ranking["Ranking"]
     end
 
     local_source --> local_text --> local_syntax --> local_semantics
     local_syntax --> local_documentation
     local_source --> local_context
-    local_text --> local_facts
-    local_semantics --> local_facts
-    local_documentation --> local_facts
-    local_context --> local_facts
-    local_facts --> local_mcp
+    local_documentation --> local_fts
+    local_syntax --> local_vector
+    local_vector --> local_embeddings
+    local_fts --> local_search
+    local_embeddings --> local_search
+    local_semantics --> local_mcp
+    local_search --> local_ranking
+    local_ranking -->|local| local_mcp
 
     global_source --> global_text --> global_syntax --> global_semantics
     global_syntax --> global_documentation
     global_source --> global_context
-    global_text --> global_facts
-    global_semantics --> global_facts
-    global_documentation --> global_facts
-    global_context --> global_facts
-    global_facts --> global_mcp
-    global_facts -. "API · project package context" .-> local_mcp
+    global_text --> global_search
+    global_semantics --> global_search
+    global_documentation --> global_search
+    global_context --> global_search
+    global_search --> global_ranking
+    global_ranking --> global_mcp
+    global_ranking -. "API · global / all · project package context" .-> local_mcp
 `;
 
 function Logo({ name, size = 24 }: { name: string; size?: number }) {
@@ -93,22 +105,61 @@ const ICONS: Record<string, ReactNode> = {
   global_documentation: <FileTextIcon size={24} />,
   local_context: <ClockCounterClockwiseIcon size={24} />,
   global_context: <ClockCounterClockwiseIcon size={24} />,
-  local_facts: <DatabaseIcon size={24} />,
-  global_facts: <DatabaseIcon size={24} />,
+  local_fts: <TextTIcon size={24} />,
+  local_vector: <GraphIcon size={24} />,
+  local_embeddings: <CpuIcon size={24} />,
+  local_search: <MagnifyingGlassIcon size={24} />,
+  global_search: <MagnifyingGlassIcon size={24} />,
+  local_ranking: <RankingIcon size={24} />,
+  global_ranking: <RankingIcon size={24} />,
 };
 
 export function CodebaseIntelligence() {
   return (
     <section aria-label="Codebase intelligence" className="not-prose my-10">
-      <div className="flex flex-wrap justify-between gap-3 border-b border-border pb-4 font-mono text-xs text-muted-foreground">
-        <span>Same intelligence layers, different source</span>
-        <span>Dashed: global API</span>
+      <div className="border-b border-border pb-4 font-mono text-xs text-muted-foreground">
+        <span>Overview</span>
       </div>
       <FlatDiagram
         chart={CHART}
-        alt="The local index applies text, syntax, semantics, planned documentation, revision, and origin to the current project, then serves those facts through the local MCP server. The planned global index applies the same layers to OSS package versions, stores package relationships, serves direct MCP reads, and supplies package facts to the local server through an API carrying project package context."
+        alt="The local index applies text, syntax, semantics, planned documentation, revision, and origin to the current project. Hybrid local search indexes names, signatures, documentation, and file content for full-text search, and qualified names with declaration source for vector search. Identifier, BM25, and vector results enter weighted reciprocal rank fusion. Embeddings can come from Hugging Face, a workspace directory, or a planned OpenAI-compatible endpoint. Planned global search combines full-text and vector search, with ranking details still to be defined. The local server exposes local, global, and all search scopes, while the planned global server also provides direct MCP access."
         variant="soft"
         icons={ICONS}
+        nodeBadges={{
+          global_mcp: "Planned",
+          local_documentation: "Planned",
+          global_documentation: "Planned",
+          global_search: "Planned",
+          global_ranking: "Planned",
+        }}
+        groupBadges={{ global: "Planned" }}
+        connectorRoutes={{
+          "global_ranking->global_mcp": { from: "top", to: "bottom" },
+          "global_ranking->local_mcp": { from: "left", to: "right" },
+        }}
+        nodePanels={{
+          local_embeddings: {
+            title: "Embedding",
+            layout: "column",
+            minWidth: 460,
+            minDepth: 220,
+            options: [
+              {
+                label: "Local",
+                note: "Hugging Face / workspace directory",
+                icon: <HuggingFace width="100%" height="100%" aria-hidden="true" />,
+                weight: 1.4,
+              },
+              {
+                label: "OpenAI-compatible",
+                badge: "Planned",
+                icon: (
+                  <Openai width="100%" height="100%" className="dark:invert" aria-hidden="true" />
+                ),
+              },
+            ],
+          },
+        }}
         metrics={{
           label: 15,
           note: 13,
@@ -121,10 +172,6 @@ export function CodebaseIntelligence() {
         }}
         className="mx-auto my-8"
       />
-      <p className="border-t border-border pt-4 text-xs text-muted-foreground">
-        Select the diagram to zoom. Both indexes use the same intelligence layers. The local server
-        reads project facts directly and requests relevant OSS package facts from the global index.
-      </p>
     </section>
   );
 }
@@ -215,9 +262,9 @@ export function CodebaseLanguages() {
       {LANGUAGES.map((language) => (
         <section
           key={language.name}
-          className={`rounded-xl border border-border bg-muted/30 p-6 ${language.wide ? "lg:col-span-2" : ""}`}
+          className={`rounded-xl border border-border bg-muted/30 px-6 py-4 ${language.wide ? "lg:col-span-2" : ""}`}
         >
-          <div className="mb-5 flex items-center gap-3">
+          <div className="mb-2 flex items-center gap-3">
             {language.logos.length ? (
               <div className="flex shrink-0 gap-2">
                 {language.logos.map((logo) => (
@@ -231,7 +278,7 @@ export function CodebaseLanguages() {
             )}
             <h3 className="text-sm font-medium">{language.name}</h3>
           </div>
-          <div className="mb-5 grid gap-3">
+          <div className="mb-3 grid gap-1.5">
             <div className="flex flex-wrap items-center gap-3">
               <div className="flex min-w-20 items-center gap-2 font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
                 <HardDrivesIcon size={14} />

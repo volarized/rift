@@ -9,7 +9,7 @@ use crate::constants::{
     HEX_LETTER_VALUE_OFFSET, HEX_NIBBLE_BITS, PERCENT_ESCAPE_BYTES, PERCENT_ESCAPE_HIGH_OFFSET,
     PERCENT_ESCAPE_LOW_OFFSET, PERCENT_ESCAPE_MARKER, SOURCE_RESOLVER_ID_BYTES_MAX,
     SOURCE_RESOLVER_PUNCTUATION, SOURCE_UNIT_ID_BYTES_MAX, SOURCE_UNIT_SAFE_PUNCTUATION,
-    SOURCE_UNIT_SEPARATOR, SOURCE_UNIT_SEPARATOR_BYTES, SOURCE_UNIT_URI_PREFIX,
+    SOURCE_UNIT_SEPARATOR, SOURCE_UNIT_SEPARATOR_BYTES, SOURCE_UNIT_URI_PREFIX, SYMBOL_URI_PREFIX,
 };
 use crate::{
     Error, ErrorCode, ErrorContext, ErrorName, Fault, PackageIdentity, PathError, ProjectPath,
@@ -66,7 +66,7 @@ pub fn encode_path(value: &str) -> String {
 #[must_use]
 pub fn symbol_identity(language_segment: &str, path: &str, qualified_name: &str) -> String {
     format!(
-        "rift://symbol/{language_segment}/{}/{}",
+        "{SYMBOL_URI_PREFIX}{language_segment}/{}/{}",
         encode_path(path),
         utf8_percent_encode(qualified_name, RIFT_SYMBOL_ESCAPE_SET)
     )

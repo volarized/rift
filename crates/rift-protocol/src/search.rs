@@ -41,7 +41,7 @@ pub enum HopDirection {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum MatchedField {
-    /// The declaration's name matched.
+    /// A declaration's name, qualified name, or a term derived from them matched.
     Name,
     /// A rendered signature matched.
     Signature,
@@ -49,9 +49,9 @@ pub enum MatchedField {
     Documentation,
     /// The file's contents matched.
     Content,
-    /// The ranked lane placed the hit; no field match proves the query's literal bytes
-    /// appear. The lane ranks whether or not `[search.semantic]` is enabled, so this member
-    /// names the lane rather than the tier that may or may not have contributed to it.
+    /// The vector ranking placed the hit, and no indexed field carries the query's
+    /// literal bytes. A hit any other ranking placed names the field that carried it
+    /// instead.
     Ranked,
     /// The project-relative path matched.
     Path,
@@ -400,9 +400,13 @@ pub struct SearchParams {
     /// Which total order the page comes back in. Omitted, relevance.
     #[serde(default = "default_search_params_order")]
     pub order: ResultOrder,
-    /// Text to match against file contents, symbol names, and rendered signatures. Matching
-    /// is case-insensitive and identifier-aware - the query and the fields split on case
-    /// and underscore boundaries, so `loadConfig` finds `load_config`. Scoring is
+    /// Text to match against declaration names, qualified names, signatures, attached
+    /// documentation, declaration source, and file contents. Matching is case-insensitive
+    /// and identifier-aware: the query and the indexed names split on case, acronym, and
+    /// separator boundaries, so `loadConfig` finds `load_config`. Double quotes keep a
+    /// phrase together, and an identifier written inside a question reaches its
+    /// declaration without being quoted. A query naming several terms is answered by the
+    /// declarations carrying all of them before the ones carrying some. Scoring is
     /// server-defined and comparable within one answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,

@@ -17,16 +17,16 @@ use rift_index::StoredVector;
 
 use crate::error::{SearchError, SearchFault, SearchViolation};
 
-/// One vector the semantic ranking returned, addressed by the digest of the
+/// One vector the vector ranking returned, addressed by the digest of the
 /// text it was built from.
 #[derive(Clone, Debug, PartialEq)]
-pub struct SemanticMatch {
+pub struct VectorMatch {
     digest: String,
     similarity: f32,
 }
 
-impl SemanticMatch {
-    /// Constructs one semantic match directly. Production code only ever builds
+impl VectorMatch {
+    /// Constructs one vector match directly. Production code only ever builds
     /// these from [`nearest`]; this constructor exists for callers that carry a
     /// match they already hold into another ranking.
     #[must_use]
@@ -71,7 +71,7 @@ pub fn nearest(
     query: &[f32],
     corpus: &[StoredVector],
     keep_max: usize,
-) -> Result<Vec<SemanticMatch>, SearchError> {
+) -> Result<Vec<VectorMatch>, SearchError> {
     if let Some((query_width, stored_width)) = width_refusal(query, corpus) {
         return Err(SearchError::new(
             SearchFault::new(SearchViolation::VectorWidthMismatch).about(format!(
@@ -83,9 +83,9 @@ pub fn nearest(
         return Ok(Vec::new());
     }
     let query_magnitude = magnitude(query);
-    let mut scored: Vec<SemanticMatch> = corpus
+    let mut scored: Vec<VectorMatch> = corpus
         .par_iter()
-        .map(|stored| SemanticMatch {
+        .map(|stored| VectorMatch {
             digest: stored.digest().to_owned(),
             similarity: cosine(query, stored.values(), query_magnitude),
         })
@@ -145,7 +145,7 @@ fn magnitude(values: &[f32]) -> f32 {
 /// The comparison is total: `f32::total_cmp` orders every value a stored row
 /// can hold, so a partition cannot depend on which rows the pool compared
 /// first.
-fn nearest_first(one: &SemanticMatch, other: &SemanticMatch) -> Ordering {
+fn nearest_first(one: &VectorMatch, other: &VectorMatch) -> Ordering {
     other
         .similarity
         .total_cmp(&one.similarity)
@@ -154,7 +154,7 @@ fn nearest_first(one: &SemanticMatch, other: &SemanticMatch) -> Ordering {
 
 #[cfg(test)]
 mod tests {
-    use super::{SemanticMatch, cosine, magnitude, nearest_first, width_refusal};
+    use super::{VectorMatch, cosine, magnitude, nearest_first, width_refusal};
     use rift_index::StoredVector;
     use std::cmp::Ordering;
 
@@ -200,13 +200,13 @@ mod tests {
 
     #[test]
     fn test_the_order_is_similarity_then_digest() {
-        let strong = SemanticMatch::new("bbb".to_owned(), 0.9);
-        let weak = SemanticMatch::new("aaa".to_owned(), 0.1);
+        let strong = VectorMatch::new("bbb".to_owned(), 0.9);
+        let weak = VectorMatch::new("aaa".to_owned(), 0.1);
         assert_eq!(nearest_first(&strong, &weak), Ordering::Less);
         assert_eq!(nearest_first(&weak, &strong), Ordering::Greater);
-        let tied = SemanticMatch::new("ccc".to_owned(), 0.9);
+        let tied = VectorMatch::new("ccc".to_owned(), 0.9);
         assert_eq!(nearest_first(&strong, &tied), Ordering::Less);
-        let same = SemanticMatch::new("bbb".to_owned(), 0.9);
+        let same = VectorMatch::new("bbb".to_owned(), 0.9);
         assert_eq!(nearest_first(&strong, &same), Ordering::Equal);
     }
 
@@ -226,7 +226,7 @@ mod tests {
 
     #[test]
     fn test_a_match_reports_its_digest_and_similarity() {
-        let matched = SemanticMatch::new("aaa".to_owned(), 0.5);
+        let matched = VectorMatch::new("aaa".to_owned(), 0.5);
         assert_eq!(matched.digest(), "aaa");
         assert!(is_similarity(matched.similarity(), 0.5));
     }

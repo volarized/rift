@@ -22,9 +22,11 @@ use workspace_client::{
 /// The unit every helper declaration is served under.
 const HELPER_UNIT: &str = "rift://source/cargo/helper@0.1.0/src/lib.rs";
 
-/// The helper crate: two public declarations and one private one.
-const HELPER_SOURCE: &str =
-    "pub fn helper_beacon() {}\nfn helper_private() {}\npub fn beacon() {}\n";
+/// The helper crate: public declarations and one private one.
+///
+/// `helper_lantern` is documented and named nothing like its documentation, so
+/// only a full-text ranking over the package's own documents reaches it.
+const HELPER_SOURCE: &str = "pub fn helper_beacon() {}\nfn helper_private() {}\npub fn beacon() {}\n/// Signals the harbour pilots at dusk.\npub fn helper_lantern() {}\n";
 
 /// A second helper source file, so the crate selects two files and a `package_files`
 /// bound of one refuses it.
@@ -380,11 +382,27 @@ async fn a_global_search_answers_the_package_declaration_by_unit() -> TestResult
     .await?;
 
     let results = answer["results"].as_array().ok_or("results are an array")?;
-    assert_eq!(results.len(), 1, "{answer:#}");
+    // The precise phase places the declaration the query names; the widened phase
+    // then fills the pool with the package's other `helper` declarations, which is
+    // the same order the project's own store answers in.
+    assert_eq!(
+        results
+            .iter()
+            .filter_map(|hit| hit["hit"]["symbol"]["name"].as_str())
+            .collect::<Vec<&str>>(),
+        ["helper_beacon", "beacon", "helper_extra", "helper_lantern"],
+        "{answer:#}"
+    );
     let hit = &results[0];
     assert_one_location(hit);
     assert_eq!(hit["unit"], json!(HELPER_UNIT), "{hit:#}");
-    assert_eq!(hit["matched_by"], json!(["name"]), "{hit:#}");
+    // The identifier ranking placed it by name and the package's own full-text
+    // ranking placed it again through the signature and the declaration source.
+    assert_eq!(
+        hit["matched_by"],
+        json!(["name", "signature", "content"]),
+        "{hit:#}"
+    );
     assert_eq!(hit["hit"]["target"], json!("symbol"), "{hit:#}");
     assert_eq!(
         hit["hit"]["symbol"]["name"],
@@ -455,6 +473,43 @@ async fn the_all_scope_search_answers_local_and_package_hits() -> TestResult {
         .find(|hit| hit.get("path").is_some())
         .ok_or("the project hit is addressed by path")?;
     assert_eq!(project["path"], json!("src/lib.rs"), "{project:#}");
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_global_search_reaches_a_package_declaration_through_its_documentation() -> TestResult {
+    // The query shares no word with the declaration's name, so the identifier
+    // ranking cannot place it. Only the package's own full-text ranking can,
+    // which is the input this scope gained.
+    let workspace = served_dependent_workspace(None).await?;
+    let (_directory, client, server_task) = workspace.served;
+    helper_indexed(&client).await?;
+
+    let answer = search(
+        &client,
+        json!({ "query": "harbour pilots", "scope": "global" }),
+    )
+    .await?;
+
+    let results = answer["results"].as_array().ok_or("results are an array")?;
+    assert_eq!(results.len(), 1, "{answer:#}");
+    let hit = &results[0];
+    assert_eq!(hit["unit"], json!(HELPER_UNIT), "{hit:#}");
+    assert_eq!(
+        hit["hit"]["symbol"]["name"],
+        json!("helper_lantern"),
+        "{hit:#}"
+    );
+    // The declaration's own source carries the doc comment too, so both columns
+    // placed it.
+    assert_eq!(
+        hit["matched_by"],
+        json!(["documentation", "content"]),
+        "{hit:#}"
+    );
 
     client.cancel().await?;
     server_task.await?;
@@ -565,7 +620,7 @@ async fn raising_package_files_after_a_refusal_reindexes_on_the_next_request() -
         directory.path().join("rift.toml"),
         format!(
             "{}[dependencies]\npackage_files = 2000\n",
-            hermetic_search::SEMANTIC_DISABLED
+            hermetic_search::VECTOR_DISABLED
         ),
     )?;
     let answer = call_retrying_acceptance(

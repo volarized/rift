@@ -279,8 +279,8 @@ fn assert_no_bare_sha256_digest(value: &Value, context: &str) {
 /// consults the search index at all.
 ///
 /// `search` does consult it, and the search tier is prepared behind the answers, so this
-/// fixture's default `[search.semantic]` table legitimately produces
-/// `semantic_index_preparing` while the corpus runs. What it must never produce is
+/// fixture's default `[search.vector]` table legitimately produces
+/// `vector_index_preparing` while the corpus runs. What it must never produce is
 /// `lexical_ranking_unavailable`: that warning is reserved for a tier that will not answer
 /// without operator action, and one that fired in ordinary operation would be one every
 /// caller learned to ignore.
@@ -552,7 +552,7 @@ async fn served_fixture() -> TestResult<(
     // `hidden.rs` stays gitignored and uncommitted, everything else lands in
     // the fixture's one commit on `main`.
     //
-    let configuration = format!("{}{ENGINE}", hermetic_search::SEMANTIC_DISABLED);
+    let configuration = format!("{}{ENGINE}", hermetic_search::VECTOR_DISABLED);
     fs::write(directory.path().join("rift.toml"), configuration)?;
     rift_history::fixture::init(directory.path());
     rift_history::fixture::commit_all(directory.path(), "fixture baseline");

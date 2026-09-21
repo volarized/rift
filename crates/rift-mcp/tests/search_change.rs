@@ -43,7 +43,7 @@ async fn served_change_workspace() -> TestResult<(
     let directory = tempfile::tempdir()?;
     fs::write(
         directory.path().join("rift.toml"),
-        hermetic_search::SEMANTIC_DISABLED,
+        hermetic_search::VECTOR_DISABLED,
     )?;
     write_all(directory.path(), BASELINE)?;
     init(directory.path());
@@ -245,7 +245,7 @@ async fn search_change_refuses_a_workspace_with_history_disabled() -> TestResult
         directory.path().join("rift.toml"),
         format!(
             "{}\n[providers.history]\nenabled = false\n",
-            hermetic_search::SEMANTIC_DISABLED
+            hermetic_search::VECTOR_DISABLED
         ),
     )?;
     write_all(directory.path(), BASELINE)?;
@@ -281,7 +281,7 @@ async fn search_change_refuses_a_workspace_with_no_repository() -> TestResult {
     let directory = tempfile::tempdir()?;
     fs::write(
         directory.path().join("rift.toml"),
-        hermetic_search::SEMANTIC_DISABLED,
+        hermetic_search::VECTOR_DISABLED,
     )?;
     write_all(directory.path(), BASELINE)?;
     let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
@@ -320,7 +320,7 @@ async fn search_change_pairs_a_declaration_moved_between_paths() -> TestResult {
     let directory = tempfile::tempdir()?;
     fs::write(
         directory.path().join("rift.toml"),
-        hermetic_search::SEMANTIC_DISABLED,
+        hermetic_search::VECTOR_DISABLED,
     )?;
     write_all(
         directory.path(),

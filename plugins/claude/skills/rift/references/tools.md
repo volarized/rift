@@ -63,7 +63,7 @@ Parameters:
 - `order` - Which total order the page comes back in.
 - `page_index` - Zero-based page of the result set to serve, sized by `limit`.
 - `paths` - Files eligible for the search, selected by project-relative globs.
-- `query` - Text to match against file contents, symbol names, and rendered signatures.
+- `query` - Text to match against declaration names, qualified names, signatures, attached documentation, declaration source, and file contents.
 - `rev` - The version-control revision to search - a branch, tag, or commit id as the workspace's version control spells it.
 - `scope` - Which declarations `query` searches: the project tree, the public declarations of the dependency packages, or both.
 - `target` - Which entity kinds may be returned - a kind selector, never the text to search for; that is `query`.

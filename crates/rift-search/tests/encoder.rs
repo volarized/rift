@@ -25,7 +25,7 @@ const WORDS: [&str; 8] = [
     "[UNK]", "[CLS]", "[SEP]", "load", "config", "read", "search", "index",
 ];
 
-type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Writes one loadable model into `directory`.
 fn write_model(directory: &Path) -> TestResult {
@@ -380,4 +380,179 @@ fn a_batch_the_tokenizer_empties_is_refused_rather_than_embedded() -> TestResult
         "{error}"
     );
     Ok(())
+}
+
+/// The document and query handles Rig's contract is called through, over the fixture
+/// model this suite already builds.
+///
+/// The adapters are what every caller of the vector ranking reaches, so the difference
+/// the encoder keeps between a document and a query has to survive the trait: a model
+/// family added later must not be able to apply one transformation to both sides by
+/// accident.
+mod through_the_embedding_contract {
+    use super::{HIDDEN, TestResult, loaded, write_model};
+    use rift_search::{
+        BatchSchedule, EmbeddingModels, EmbeddingSpace, LOCAL_INPUTS_MAX, LocalEncoder,
+        QueryTransformation, RetrievalModels, RiftLocalDocumentModel, RiftLocalQueryModel,
+        RiftOpenAiEmbeddingModel,
+    };
+    use rig_core::embeddings::EmbeddingModel as _;
+    use std::sync::Arc;
+
+    /// The fixture model behind both handles, in its own space.
+    fn pair(directory: &std::path::Path) -> TestResult<EmbeddingModels> {
+        write_model(directory)?;
+        let held = LocalEncoder::new(Arc::new(loaded(directory)?));
+        let space = EmbeddingSpace::local(
+            "directory",
+            "fixture",
+            "fixture",
+            HIDDEN,
+            QueryTransformation::Instructed("probe-instruction"),
+        );
+        Ok(EmbeddingModels::Local(RetrievalModels::new(
+            held.documents(),
+            held.query(),
+            space,
+        )))
+    }
+
+    #[tokio::test]
+    async fn rig_builds_each_handle_from_the_encoder_it_was_handed() -> TestResult {
+        // Rift never calls `make`; the trait requires it, and a handle built from
+        // the wrong side of the encoder would be invisible until a Rig client of
+        // these models' own type existed.
+        let directory = tempfile::tempdir()?;
+        write_model(directory.path())?;
+        let held = LocalEncoder::new(Arc::new(loaded(directory.path())?));
+        let documents = RiftLocalDocumentModel::make(&held, "fixture", None);
+        let query = RiftLocalQueryModel::make(&held, "fixture", None);
+        assert_eq!(documents.ndims(), HIDDEN);
+        assert_eq!(query.ndims(), HIDDEN);
+        let asked = query.embed_texts(vec!["load config".to_owned()]).await?;
+        let built = held
+            .query()
+            .embed_texts(vec!["load config".to_owned()])
+            .await?;
+        assert_eq!(
+            asked[0].vec, built[0].vec,
+            "the handle Rig builds is the handle the encoder answers"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_pair_answers_the_space_both_of_its_handles_embed_into() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let models = pair(directory.path())?;
+        assert_eq!(models.space().dimensions(), HIDDEN);
+        let remote = EmbeddingModels::OpenAi(RetrievalModels::new(
+            RiftOpenAiEmbeddingModel::new(&remote_settings())?,
+            RiftOpenAiEmbeddingModel::new(&remote_settings())?,
+            EmbeddingSpace::remote("https://api.openai.com/v1", "model", "2024-01-25", 1_536),
+        ));
+        assert_eq!(remote.space().dimensions(), 1_536);
+        assert_ne!(models.space().identity(), remote.space().identity());
+        Ok(())
+    }
+
+    fn remote_settings() -> rift_search::RemoteEmbeddingSettings {
+        rift_search::RemoteEmbeddingSettings {
+            endpoint: "https://api.openai.com/v1".to_owned(),
+            model: "text-embedding-3-small".to_owned(),
+            revision: "2024-01-25".to_owned(),
+            dimensions: 1_536,
+            api_key: "test-key".to_owned(),
+            request_timeout: std::time::Duration::from_secs(5),
+            attempts: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_two_handles_transform_one_text_differently() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        write_model(directory.path())?;
+        let held = LocalEncoder::new(Arc::new(loaded(directory.path())?));
+        let documents = held.documents();
+        let query = held.query();
+        assert_eq!(documents.ndims(), HIDDEN);
+        assert_eq!(query.ndims(), HIDDEN);
+
+        let embedded = documents
+            .embed_texts(vec!["load config".to_owned()])
+            .await?;
+        let asked = query.embed_texts(vec!["load config".to_owned()]).await?;
+        assert_eq!(embedded.len(), 1);
+        assert_eq!(asked.len(), 1);
+        assert_eq!(embedded[0].document, "load config");
+        let difference: f64 = embedded[0]
+            .vec
+            .iter()
+            .zip(&asked[0].vec)
+            .map(|(one, other)| (one - other).abs())
+            .sum();
+        assert!(
+            difference > 1e-6,
+            "this checkpoint's query instruction must survive the contract, \
+             difference {difference}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_pass_keeps_every_vector_in_its_own_input_slot() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let models = pair(directory.path())?;
+        let texts: Vec<String> = ["load", "config", "read", "search", "index"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let embedded = models
+            .embed_documents(texts.clone(), BatchSchedule::local(2))
+            .await?;
+        assert_eq!(embedded.len(), texts.len());
+        assert!(embedded.iter().all(|vector| vector.len() == HIDDEN));
+        let one_at_a_time = models
+            .embed_documents(texts, BatchSchedule::local(1))
+            .await?;
+        assert_eq!(
+            embedded, one_at_a_time,
+            "the batch bound cuts the pass into requests and never reorders it"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_query_embeds_through_the_query_handle() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let models = pair(directory.path())?;
+        let embedded = models.embed_query("load config").await?;
+        assert_eq!(embedded.len(), HIDDEN);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_empty_pass_embeds_nothing() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let models = pair(directory.path())?;
+        assert!(
+            models
+                .embed_documents(Vec::new(), BatchSchedule::local(4))
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_handle_states_the_widest_batch_it_accepts() {
+        assert_eq!(
+            <rift_search::RiftLocalDocumentModel as rig_core::embeddings::EmbeddingModel>::MAX_DOCUMENTS,
+            LOCAL_INPUTS_MAX
+        );
+        assert_eq!(
+            <rift_search::RiftLocalQueryModel as rig_core::embeddings::EmbeddingModel>::MAX_DOCUMENTS,
+            LOCAL_INPUTS_MAX
+        );
+    }
 }

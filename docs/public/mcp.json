@@ -508,10 +508,10 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The semantic ranking is still being built, so the answer was ranked lexically alone.\n`prepared` and `total` state how many declarations already carry a vector, and\n`ready_in` is derived from workspace size and embedding progress.",
+                "description": "The vector ranking is still being built, so the answer was ranked lexically alone.\n`prepared` and `total` state how many declarations already carry a vector, and\n`ready_in` is derived from workspace size and embedding progress.",
                 "properties": {
                   "code": {
-                    "const": "semantic_index_preparing",
+                    "const": "vector_index_preparing",
                     "type": "string"
                   },
                   "detail": {
@@ -527,7 +527,7 @@
                   },
                   "ready_in": {
                     "$ref": "#/$defs/Duration",
-                    "description": "Estimated wait before the semantic ranking joins an answer, not a measurement\nof this machine. A caller may report it and must not schedule against it."
+                    "description": "Estimated wait before the vector ranking joins an answer, not a measurement\nof this machine. A caller may report it and must not schedule against it."
                   },
                   "total": {
                     "description": "Declarations the published set holds.",
@@ -547,10 +547,10 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The semantic ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. No retry is coming: fix the `[search.semantic]`\nconfiguration and start the server again.",
+                "description": "The vector ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. No retry is coming: fix the `[search.vector]`\nconfiguration and start the server again.",
                 "properties": {
                   "code": {
-                    "const": "semantic_ranking_unavailable",
+                    "const": "vector_ranking_unavailable",
                     "type": "string"
                   },
                   "detail": {
@@ -587,6 +587,27 @@
               },
               {
                 "additionalProperties": false,
+                "description": "The query carried more terms and quoted phrases than `terms_max`, so the server\ndropped the shortest unquoted terms and ranked the answer by the rest. Every\nquoted phrase is kept. Shorten `query`, or quote the terms that must be matched.",
+                "properties": {
+                  "code": {
+                    "const": "query_narrowed",
+                    "type": "string"
+                  },
+                  "terms_max": {
+                    "description": "Terms and quoted phrases the query was cut to: the server's bound on one\nparsed query.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "terms_max"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "The lexical ranking stopped at `matches_max` units; hits past it never reached the\npage, whatever `paths` selects. Narrow `query`.",
                 "properties": {
                   "code": {
@@ -608,14 +629,14 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The result set reached `results_max` hits, the server's result bound, before\nordering and paging: hits past it never reach any page, and `total_pages` counts\nonly what fit. The warning means the bound was reached; a set of exactly\n`results_max` hits carries it too. Narrow `query` or `paths`.",
+                "description": "The server reached `results_max`, its result bound, before ordering and paging:\nwhat the bound cut never reaches any page, and `total_pages` counts only what fit.\nThe bound cuts the ranked candidates and the hit set alike. The warning means the\nbound was reached; a set of exactly `results_max` hits carries it too. Narrow\n`query` or `paths`.",
                 "properties": {
                   "code": {
                     "const": "results_truncated",
                     "type": "string"
                   },
                   "results_max": {
-                    "description": "Hits the result set stopped at: the server's bound on one read's result set.",
+                    "description": "The bound the read stopped at: the server's limit on both the candidates one\nread ranks and the hits it returns.",
                     "format": "uint64",
                     "minimum": 0,
                     "type": "integer"
@@ -2313,10 +2334,10 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The semantic ranking is still being built, so the answer was ranked lexically alone.\n`prepared` and `total` state how many declarations already carry a vector, and\n`ready_in` is derived from workspace size and embedding progress.",
+                "description": "The vector ranking is still being built, so the answer was ranked lexically alone.\n`prepared` and `total` state how many declarations already carry a vector, and\n`ready_in` is derived from workspace size and embedding progress.",
                 "properties": {
                   "code": {
-                    "const": "semantic_index_preparing",
+                    "const": "vector_index_preparing",
                     "type": "string"
                   },
                   "detail": {
@@ -2332,7 +2353,7 @@
                   },
                   "ready_in": {
                     "$ref": "#/$defs/Duration",
-                    "description": "Estimated wait before the semantic ranking joins an answer, not a measurement\nof this machine. A caller may report it and must not schedule against it."
+                    "description": "Estimated wait before the vector ranking joins an answer, not a measurement\nof this machine. A caller may report it and must not schedule against it."
                   },
                   "total": {
                     "description": "Declarations the published set holds.",
@@ -2352,10 +2373,10 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The semantic ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. No retry is coming: fix the `[search.semantic]`\nconfiguration and start the server again.",
+                "description": "The vector ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. No retry is coming: fix the `[search.vector]`\nconfiguration and start the server again.",
                 "properties": {
                   "code": {
-                    "const": "semantic_ranking_unavailable",
+                    "const": "vector_ranking_unavailable",
                     "type": "string"
                   },
                   "detail": {
@@ -2392,6 +2413,27 @@
               },
               {
                 "additionalProperties": false,
+                "description": "The query carried more terms and quoted phrases than `terms_max`, so the server\ndropped the shortest unquoted terms and ranked the answer by the rest. Every\nquoted phrase is kept. Shorten `query`, or quote the terms that must be matched.",
+                "properties": {
+                  "code": {
+                    "const": "query_narrowed",
+                    "type": "string"
+                  },
+                  "terms_max": {
+                    "description": "Terms and quoted phrases the query was cut to: the server's bound on one\nparsed query.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "terms_max"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "The lexical ranking stopped at `matches_max` units; hits past it never reached the\npage, whatever `paths` selects. Narrow `query`.",
                 "properties": {
                   "code": {
@@ -2413,14 +2455,14 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The result set reached `results_max` hits, the server's result bound, before\nordering and paging: hits past it never reach any page, and `total_pages` counts\nonly what fit. The warning means the bound was reached; a set of exactly\n`results_max` hits carries it too. Narrow `query` or `paths`.",
+                "description": "The server reached `results_max`, its result bound, before ordering and paging:\nwhat the bound cut never reaches any page, and `total_pages` counts only what fit.\nThe bound cuts the ranked candidates and the hit set alike. The warning means the\nbound was reached; a set of exactly `results_max` hits carries it too. Narrow\n`query` or `paths`.",
                 "properties": {
                   "code": {
                     "const": "results_truncated",
                     "type": "string"
                   },
                   "results_max": {
-                    "description": "Hits the result set stopped at: the server's bound on one read's result set.",
+                    "description": "The bound the read stopped at: the server's limit on both the candidates one\nread ranks and the hits it returns.",
                     "format": "uint64",
                     "minimum": 0,
                     "type": "integer"
@@ -3584,7 +3626,7 @@
             "description": "Files eligible for the search, selected by project-relative globs. Omitted selects\nevery visible file."
           },
           "query": {
-            "description": "Text to match against file contents, symbol names, and rendered signatures. Matching\nis case-insensitive and identifier-aware - the query and the fields split on case\nand underscore boundaries, so `loadConfig` finds `load_config`. Scoring is\nserver-defined and comparable within one answer.",
+            "description": "Text to match against declaration names, qualified names, signatures, attached\ndocumentation, declaration source, and file contents. Matching is case-insensitive\nand identifier-aware: the query and the indexed names split on case, acronym, and\nseparator boundaries, so `loadConfig` finds `load_config`. Double quotes keep a\nphrase together, and an identifier written inside a question reaches its\ndeclaration without being quoted. A query naming several terms is answered by the\ndeclarations carrying all of them before the ones carrying some. Scoring is\nserver-defined and comparable within one answer.",
             "type": [
               "string",
               "null"
@@ -3769,7 +3811,7 @@
             "oneOf": [
               {
                 "const": "name",
-                "description": "The declaration's name matched.",
+                "description": "A declaration's name, qualified name, or a term derived from them matched.",
                 "type": "string"
               },
               {
@@ -3789,7 +3831,7 @@
               },
               {
                 "const": "ranked",
-                "description": "The ranked lane placed the hit; no field match proves the query's literal bytes\nappear. The lane ranks whether or not `[search.semantic]` is enabled, so this member\nnames the lane rather than the tier that may or may not have contributed to it.",
+                "description": "The vector ranking placed the hit, and no indexed field carries the query's\nliteral bytes. A hit any other ranking placed names the field that carried it\ninstead.",
                 "type": "string"
               },
               {
@@ -3972,10 +4014,10 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The semantic ranking is still being built, so the answer was ranked lexically alone.\n`prepared` and `total` state how many declarations already carry a vector, and\n`ready_in` is derived from workspace size and embedding progress.",
+                "description": "The vector ranking is still being built, so the answer was ranked lexically alone.\n`prepared` and `total` state how many declarations already carry a vector, and\n`ready_in` is derived from workspace size and embedding progress.",
                 "properties": {
                   "code": {
-                    "const": "semantic_index_preparing",
+                    "const": "vector_index_preparing",
                     "type": "string"
                   },
                   "detail": {
@@ -3991,7 +4033,7 @@
                   },
                   "ready_in": {
                     "$ref": "#/$defs/Duration",
-                    "description": "Estimated wait before the semantic ranking joins an answer, not a measurement\nof this machine. A caller may report it and must not schedule against it."
+                    "description": "Estimated wait before the vector ranking joins an answer, not a measurement\nof this machine. A caller may report it and must not schedule against it."
                   },
                   "total": {
                     "description": "Declarations the published set holds.",
@@ -4011,10 +4053,10 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The semantic ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. No retry is coming: fix the `[search.semantic]`\nconfiguration and start the server again.",
+                "description": "The vector ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. No retry is coming: fix the `[search.vector]`\nconfiguration and start the server again.",
                 "properties": {
                   "code": {
-                    "const": "semantic_ranking_unavailable",
+                    "const": "vector_ranking_unavailable",
                     "type": "string"
                   },
                   "detail": {
@@ -4051,6 +4093,27 @@
               },
               {
                 "additionalProperties": false,
+                "description": "The query carried more terms and quoted phrases than `terms_max`, so the server\ndropped the shortest unquoted terms and ranked the answer by the rest. Every\nquoted phrase is kept. Shorten `query`, or quote the terms that must be matched.",
+                "properties": {
+                  "code": {
+                    "const": "query_narrowed",
+                    "type": "string"
+                  },
+                  "terms_max": {
+                    "description": "Terms and quoted phrases the query was cut to: the server's bound on one\nparsed query.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "terms_max"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "The lexical ranking stopped at `matches_max` units; hits past it never reached the\npage, whatever `paths` selects. Narrow `query`.",
                 "properties": {
                   "code": {
@@ -4072,14 +4135,14 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The result set reached `results_max` hits, the server's result bound, before\nordering and paging: hits past it never reach any page, and `total_pages` counts\nonly what fit. The warning means the bound was reached; a set of exactly\n`results_max` hits carries it too. Narrow `query` or `paths`.",
+                "description": "The server reached `results_max`, its result bound, before ordering and paging:\nwhat the bound cut never reaches any page, and `total_pages` counts only what fit.\nThe bound cuts the ranked candidates and the hit set alike. The warning means the\nbound was reached; a set of exactly `results_max` hits carries it too. Narrow\n`query` or `paths`.",
                 "properties": {
                   "code": {
                     "const": "results_truncated",
                     "type": "string"
                   },
                   "results_max": {
-                    "description": "Hits the result set stopped at: the server's bound on one read's result set.",
+                    "description": "The bound the read stopped at: the server's limit on both the candidates one\nread ranks and the hits it returns.",
                     "format": "uint64",
                     "minimum": 0,
                     "type": "integer"
