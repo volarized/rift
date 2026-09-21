@@ -66,12 +66,12 @@ READINESS_SECONDS = 30.0
 READ_SECONDS = READINESS_SECONDS + 10.0
 # A tool's first read over a large workspace under sustained edits waits for the first
 # index to land, so it gets the whole read budget. Every read after it answers from a
-# published index and never enters the readiness wait: run 35653920223 over `nextjs`
-# measured 59 reads at a median of 1.07 seconds and a maximum of 1.24 after each tool's
-# first, against a first `search` at 25.08. The steady budget stands an order of magnitude
-# above that maximum and strictly inside the readiness budget, so a steady read that does
-# start waiting for the index fails the case instead of hiding in the first read's room.
-STEADY_READ_SECONDS = READINESS_SECONDS / 2
+# published index: run 35661449692 over `nextjs` measured 53 such reads at a median of
+# 1.56 seconds, one outlier at 7.24 waiting out a rebuild, and everything else under 3.34,
+# against a first `search` that spent the server's whole budget. The steady budget stands
+# well above that outlier and strictly inside the readiness budget, so a steady read that
+# starts waiting for the index fails the case instead of hiding in the first read's room.
+STEADY_READ_SECONDS = READINESS_SECONDS * 2 / 3
 # Seconds a case keeps inside its own deadline for the served tree's removal,
 # the report write, and the process exit. Nextest allows the same grace after
 # it ends a corpus case, so the two bounds agree on what cleanup costs.

@@ -101,7 +101,7 @@ the action that ran long instead of tearing down whatever the next budget out wa
 
 | Budget | Seconds | What it bounds |
 | --- | ---: | --- |
-| Every read after a tool's first | 15 | A read answered from an index already published |
+| Every read after a tool's first | 20 | A read answered from an index already published |
 | `[server] readiness_timeout` | 30 | The server's own waiting inside one read |
 | A tool's first read | 40 | The readiness budget, plus room for that answer to arrive |
 | Convergence after the writes stop | 120 | Resending all three tools until the final source lands |
