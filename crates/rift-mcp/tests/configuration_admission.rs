@@ -248,6 +248,50 @@ async fn out_of_range_source_files_fails_reads_naming_the_field() -> TestResult 
 }
 
 #[tokio::test]
+async fn out_of_range_source_declarations_fails_reads_naming_the_field() -> TestResult {
+    for configuration in [
+        "[source]\ndeclarations = 9999\n",
+        "[source]\ndeclarations = 50000001\n",
+    ] {
+        let directory = workspace_with(Some(configuration))?;
+        let client = client_for(directory.path()).await?;
+
+        let read = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
+        assert_eq!(read["code"], json!("configuration_invalid"));
+        let message = read["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("source.declarations") && message.contains("10000..=50000000"),
+            "the refusal must name the field and its range: {message}"
+        );
+
+        client.cancel().await?;
+    }
+    Ok(())
+}
+
+/// The key reaches the index build: a bound the workspace fits inside serves as it always
+/// did, so the table's own value is what the build runs under.
+#[tokio::test]
+async fn a_declaration_bound_the_workspace_fits_inside_serves_every_read() -> TestResult {
+    let directory = workspace_with(Some("[source]\ndeclarations = 10000\n"))?;
+    let client = client_for(directory.path()).await?;
+
+    let answer = client
+        .call_tool(
+            CallToolRequestParams::new("get_symbol")
+                .with_arguments(arguments(&json!({"name": "beacon"}))?),
+        )
+        .await?;
+    assert_eq!(
+        answer.structured_content.ok_or("structured content")?["hits"][0]["symbol"]["name"],
+        json!("beacon")
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn out_of_range_source_workspace_size_fails_reads_naming_the_field() -> TestResult {
     for configuration in [
         "[source]\nworkspace_size = \"15mb\"\n",

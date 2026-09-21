@@ -32,6 +32,7 @@ use rift_protocol::read::{
     Digest, ExactKind, Language, PackageIdentity, ProjectPath, SourceKind, SourceLocationKind,
     SourceUnitId, SymbolId, SymbolOrigin, TextRange,
 };
+use rift_provider::CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT;
 use rift_syntax::{DocumentPlacement, SyntaxSymbol};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -153,15 +154,26 @@ impl PackageAnalyzer {
                 placement: held.placement.clone(),
             })
             .collect();
-        let semantics =
-            WorkspaceSemantics::build_placed(&placed, revision, None).map_err(|error| {
-                PackageIndexFault::new(PackageIndexViolation::Provider, package).caused_by(error)
-            })?;
+        let built = WorkspaceSemantics::build_placed(
+            &placed,
+            CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT,
+            revision,
+            None,
+        )
+        .map_err(|error| {
+            PackageIndexFault::new(PackageIndexViolation::Provider, package).caused_by(error)
+        })?;
+        if let Some(path) = built.beyond_declaration_bound.first() {
+            return Err(PackageIndexError::new(
+                PackageIndexFault::new(PackageIndexViolation::PackageDeclarationsExceeded, package)
+                    .at(Path::new(path.as_str())),
+            ));
+        }
         let publication = publish(entry, &analyzed)?;
         Ok(PackageAnalysis {
             publication,
             files: analyzed,
-            semantics,
+            semantics: built.semantics,
         })
     }
 }

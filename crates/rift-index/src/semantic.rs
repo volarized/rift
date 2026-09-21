@@ -8,8 +8,8 @@ use rift_core::{
     TreeRevision,
 };
 use rift_provider::{
-    AssembledSymbol, NormalizedGraph, Normalizer, PublicationError, PublicationLimits,
-    PublicationSet, SymbolAssembler,
+    AssembledSymbol, NormalizedGraph, Normalizer, PROVIDERS_MAX_DEFAULT, PublicationError,
+    PublicationLimits, PublicationSet, SymbolAssembler,
 };
 use rift_syntax::{
     DocumentPlacement, SYNTAX_PROVIDER_ID, SyntaxDocument, SyntaxPublicationBuilder,
@@ -17,6 +17,25 @@ use rift_syntax::{
 };
 
 use crate::relationship::RelationshipStore;
+
+/// Publication bounds for a build that holds at most `declarations_max` declarations.
+///
+/// The workspace index publishes one provider, so the set bound is the per-provider bound.
+/// The caller states the capacity it owns: a workspace build passes the `[source]` table's
+/// `declarations`, a package analysis the provider crate's own default.
+///
+/// # Errors
+///
+/// Returns [`WorkspaceSemanticError`] when `declarations_max` is zero.
+fn publication_limits(
+    declarations_max: usize,
+) -> Result<PublicationLimits, WorkspaceSemanticError> {
+    Ok(PublicationLimits::new(
+        PROVIDERS_MAX_DEFAULT,
+        declarations_max,
+        declarations_max,
+    )?)
+}
 
 /// One syntax document and the placement its declarations are filed under.
 #[derive(Debug)]
@@ -35,6 +54,15 @@ pub(crate) struct WorkspaceSemantics {
     syntax_provider: ProviderId,
 }
 
+/// One build's captured semantics with the documents its declaration bound left out.
+#[derive(Debug)]
+pub(crate) struct BuiltSemantics {
+    /// The graph built over the documents that fit.
+    pub(crate) semantics: WorkspaceSemantics,
+    /// The documents the publication had no room for, in the order they were offered.
+    pub(crate) beyond_declaration_bound: Vec<ProjectPath>,
+}
+
 impl WorkspaceSemantics {
     /// Builds one syntax publication and one normalized graph over one file set.
     ///
@@ -42,9 +70,10 @@ impl WorkspaceSemantics {
     /// the build itself is [`Self::build_placed`].
     pub(crate) fn build<'a>(
         documents: impl IntoIterator<Item = &'a SyntaxDocument>,
+        declarations_max: usize,
         revision: u64,
         previous: Option<&NormalizedGraph>,
-    ) -> Result<Self, WorkspaceSemanticError> {
+    ) -> Result<BuiltSemantics, WorkspaceSemanticError> {
         let placed = documents
             .into_iter()
             .map(|document| {
@@ -54,30 +83,46 @@ impl WorkspaceSemantics {
                 })
             })
             .collect::<Result<Vec<_>, SyntaxPublicationError>>()?;
-        Self::build_placed(&placed, revision, previous)
+        Self::build_placed(&placed, declarations_max, revision, previous)
     }
 
     /// Builds the publication and one normalized graph over documents the caller placed.
     ///
-    /// A document whose declarations the syntax publication refuses names itself in
-    /// the error, so the index can leave that one file out instead of failing the build.
+    /// The publication holds `declarations_max` declarations. A document that would cross
+    /// that bound stops the pass: it and every document after it are named in
+    /// [`BuiltSemantics::beyond_declaration_bound`], so the index leaves them out and
+    /// serves what fits instead of refusing the whole build. Stopping at the first document
+    /// that does not fit is the rule the file bound already follows, so which documents
+    /// survive does not depend on how the walk happened to order them.
+    ///
+    /// A document whose declarations the syntax publication refuses for any other reason
+    /// names itself in the error, so the index can leave that one file out instead.
     pub(crate) fn build_placed(
         documents: &[PlacedDocument<'_>],
+        declarations_max: usize,
         revision: u64,
         previous: Option<&NormalizedGraph>,
-    ) -> Result<Self, WorkspaceSemanticError> {
+    ) -> Result<BuiltSemantics, WorkspaceSemanticError> {
         let index_revision = IndexRevision::new(revision)?;
         let source_revision = SourceRevision::new(revision)?;
         let tree_revision = TreeRevision::new(revision)?;
         let provider_revision = ProviderRevision::new(revision)?;
-        let limits = PublicationLimits::default();
+        let limits = publication_limits(declarations_max)?;
         let mut builder = SyntaxPublicationBuilder::new(
             provider_revision,
             source_revision,
             tree_revision,
             limits,
         )?;
-        for placed in documents {
+        let mut beyond_declaration_bound = Vec::new();
+        for (offered, placed) in documents.iter().enumerate() {
+            if placed.document.symbols().len() > builder.declarations_remaining() {
+                beyond_declaration_bound = documents[offered..]
+                    .iter()
+                    .map(|left_out| left_out.document.path().clone())
+                    .collect();
+                break;
+            }
             builder
                 .add_document_placed(placed.document, &placed.placement)
                 .map_err(|error| WorkspaceSemanticError::Document {
@@ -95,11 +140,14 @@ impl WorkspaceSemantics {
             previous,
         )?;
         let relationships = RelationshipStore::build(&graph);
-        Ok(Self {
-            graph,
-            relationships,
-            syntax_provider: ProviderId::new(SYNTAX_PROVIDER_ID)
-                .map_err(SyntaxPublicationError::Identity)?,
+        Ok(BuiltSemantics {
+            semantics: Self {
+                graph,
+                relationships,
+                syntax_provider: ProviderId::new(SYNTAX_PROVIDER_ID)
+                    .map_err(SyntaxPublicationError::Identity)?,
+            },
+            beyond_declaration_bound,
         })
     }
 
@@ -220,10 +268,12 @@ impl From<SourceUnitIdError> for WorkspaceSemanticError {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use rift_core::ProjectPath;
     use rift_syntax::{SyntaxSource, registry};
 
-    use super::{WorkspaceSemanticError, WorkspaceSemantics};
+    use super::{WorkspaceSemanticError, WorkspaceSemantics, publication_limits};
 
     fn document() -> rift_syntax::SyntaxDocument {
         let path = ProjectPath::new("src/lib.rs").expect("path");
@@ -236,10 +286,28 @@ mod tests {
             .expect("document")
     }
 
+    /// One document declaring `count` functions, filed at `path`.
+    fn declaring(path: &str, count: usize) -> rift_syntax::SyntaxDocument {
+        let path = ProjectPath::new(path.to_owned()).expect("path");
+        let mut text = String::new();
+        for index in 0..count {
+            writeln!(text, "pub fn beacon_{index}() {{}}").expect("a string write succeeds");
+        }
+        registry::provider_for_extension("rs")
+            .expect("rust provider")
+            .analyze(SyntaxSource {
+                path: &path,
+                text: &text,
+            })
+            .expect("document")
+    }
+
     #[test]
     fn syntax_graph_assembles_existing_symbol_identity() {
         let document = document();
-        let semantics = WorkspaceSemantics::build([&document], 7, None).expect("semantics");
+        let semantics = WorkspaceSemantics::build([&document], 1, 7, None)
+            .expect("semantics")
+            .semantics;
         let identity = "rift://symbol/rust/src/lib.rs/beacon";
         let assembled = semantics.assembled(identity).expect("assembled symbol");
         assert_eq!(
@@ -253,7 +321,7 @@ mod tests {
     #[test]
     fn zero_revision_is_typed_failure() {
         let error =
-            WorkspaceSemantics::build(std::iter::empty(), 0, None).expect_err("zero revision");
+            WorkspaceSemantics::build(std::iter::empty(), 1, 0, None).expect_err("zero revision");
         assert!(matches!(error, WorkspaceSemanticError::Revision(_)));
         assert!(std::error::Error::source(&error).is_some());
         assert!(!error.to_string().is_empty());
@@ -264,11 +332,52 @@ mod tests {
     #[test]
     fn test_build_publishes_the_syntax_provider_alone() {
         let document = document();
-        let semantics = WorkspaceSemantics::build([&document], 3, None).expect("semantics");
+        let semantics = WorkspaceSemantics::build([&document], 1, 3, None)
+            .expect("semantics")
+            .semantics;
         let syntax =
             rift_core::ProviderId::new(rift_syntax::SYNTAX_PROVIDER_ID).expect("provider identity");
         assert!(semantics.graph().publications().provider(&syntax).is_some());
         assert_eq!(semantics.graph().publications().provider_count(), 1);
+    }
+
+    /// The bound is the whole publication's, so the documents that fit are published and
+    /// the rest are named. A build that refused the set outright would leave the caller
+    /// with no index at all.
+    #[test]
+    fn test_documents_past_the_declaration_bound_are_named_and_the_rest_publish() {
+        let first = declaring("src/first.rs", 3);
+        let second = declaring("src/second.rs", 3);
+        let third = declaring("src/third.rs", 3);
+        let built = WorkspaceSemantics::build([&first, &second, &third], 4, 11, None)
+            .expect("the publication keeps the documents that fit");
+        assert_eq!(
+            built
+                .beyond_declaration_bound
+                .iter()
+                .map(ProjectPath::as_str)
+                .collect::<Vec<_>>(),
+            ["src/second.rs", "src/third.rs"],
+            "the pass stops at the first document that does not fit"
+        );
+        assert_eq!(built.semantics.graph().records().len(), 3);
+    }
+
+    /// A build under the bound names nothing, so the index never leaves a file out for a
+    /// bound it did not cross.
+    #[test]
+    fn test_a_build_within_the_declaration_bound_names_no_document() {
+        let document = declaring("src/first.rs", 3);
+        let built = WorkspaceSemantics::build([&document], 3, 5, None).expect("semantics");
+        assert!(built.beyond_declaration_bound.is_empty());
+        assert_eq!(built.semantics.graph().records().len(), 3);
+    }
+
+    #[test]
+    fn test_zero_declaration_bound_is_a_typed_failure() {
+        let error = publication_limits(0).expect_err("a zero bound is refused");
+        assert!(matches!(error, WorkspaceSemanticError::Publication(_)));
+        assert!(!error.to_string().is_empty());
     }
 
     #[test]

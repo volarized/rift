@@ -1,5 +1,6 @@
 //! The `[source]` table of `rift.toml`: which files below the workspace root the index and
-//! reads consider visible, and how many files and bytes the index holds together.
+//! reads consider visible, and how many files, bytes, and declarations the index holds
+//! together.
 
 use crate::configuration::{ByteSize, ConfigurationViolation, first_out_of_range};
 use crate::read::PathPattern;
@@ -20,16 +21,30 @@ pub const SOURCE_WORKSPACE_BYTES_DEFAULT: u64 = 512 << 20;
 pub const SOURCE_WORKSPACE_BYTES_MIN: u64 = 16 << 20;
 /// Bytes every indexed file may hold together, at most: 64 GiB.
 pub const SOURCE_WORKSPACE_BYTES_MAX: u64 = 64 << 30;
+/// Declarations the index may hold, by default.
+///
+/// The index costs about 4 KiB per declaration and 25 KiB per file above a 270 MiB base,
+/// measured over three real trees, so a workspace of this size holds its index in about
+/// 5 GiB. bun v1.4.2 declares 402,812 from 14,654 files and Next.js v16.3.5 declares
+/// 439,749 from 26,162, so the default leaves room for a workspace twice either one.
+pub const SOURCE_DECLARATIONS_DEFAULT: u64 = 1_000_000;
+/// Declarations the index may hold, at least.
+pub const SOURCE_DECLARATIONS_MIN: u64 = 10_000;
+/// Declarations the index may hold, at most.
+pub const SOURCE_DECLARATIONS_MAX: u64 = 50_000_000;
 /// The key path acceptance and the index build both name when the file count bound is
 /// crossed.
 pub const SOURCE_FILES_FIELD: &str = "source.files";
 /// The key path acceptance and the index build both name when the aggregate byte bound
 /// is crossed.
 pub const SOURCE_WORKSPACE_SIZE_FIELD: &str = "source.workspace_size";
+/// The key path acceptance names when the declaration bound is crossed, and the key the
+/// index build reports a file left out past that bound against.
+pub const SOURCE_DECLARATIONS_FIELD: &str = "source.declarations";
 
 /// The `[source]` table: which files below the workspace root the index and reads consider
-/// visible, and how many files and bytes the index holds together. `.git`, `.rift`, and
-/// `target` stay invisible whatever this table says.
+/// visible, and how many files, bytes, and declarations the index holds together. `.git`,
+/// `.rift`, and `target` stay invisible whatever this table says.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_source_ranges)]
@@ -59,6 +74,12 @@ pub struct SourceConfiguration {
     /// refuses its rebuild naming this key.
     #[serde(default = "default_source_workspace_size")]
     pub workspace_size: ByteSize,
+    /// Most declarations the index holds together, 10000 to 50000000. A workspace
+    /// declaring more publishes the files that fit and leaves the rest out, each one
+    /// reported as an unavailable source naming this key.
+    #[schemars(range(min = 10_000, max = 50_000_000))]
+    #[serde(default = "default_source_declarations")]
+    pub declarations: u64,
 }
 
 impl Default for SourceConfiguration {
@@ -70,6 +91,7 @@ impl Default for SourceConfiguration {
             respect_gitignore: true,
             files: default_source_files(),
             workspace_size: default_source_workspace_size(),
+            declarations: default_source_declarations(),
         }
     }
 }
@@ -103,6 +125,12 @@ impl SourceConfiguration {
                 SOURCE_WORKSPACE_BYTES_MIN,
                 SOURCE_WORKSPACE_BYTES_MAX,
             ),
+            (
+                SOURCE_DECLARATIONS_FIELD,
+                self.declarations,
+                SOURCE_DECLARATIONS_MIN,
+                SOURCE_DECLARATIONS_MAX,
+            ),
         ])
         .or_else(|| pattern_list_violation("source.include", &self.include))
         .or_else(|| pattern_list_violation("source.exclude", &self.exclude))
@@ -115,6 +143,10 @@ fn default_source_files() -> u64 {
 
 fn default_source_workspace_size() -> ByteSize {
     ByteSize::from_bytes(SOURCE_WORKSPACE_BYTES_DEFAULT)
+}
+
+fn default_source_declarations() -> u64 {
+    SOURCE_DECLARATIONS_DEFAULT
 }
 
 /// The first pattern in `patterns` breaking [`PathPattern`]'s forward-slash-only contract,
@@ -276,6 +308,7 @@ mod tests {
             table.workspace_size,
             ByteSize::from_bytes(SOURCE_WORKSPACE_BYTES_DEFAULT)
         );
+        assert_eq!(table.declarations, SOURCE_DECLARATIONS_DEFAULT);
         let parsed: SourceConfiguration =
             serde_json::from_value(json!({})).expect("an empty table deserializes");
         assert_eq!(parsed, table);
@@ -287,7 +320,7 @@ mod tests {
 
     #[test]
     fn test_source_numeric_bounds_are_enforced_naming_the_field() {
-        let cases: [(&str, Setter, [u64; 2]); 2] = [
+        let cases: [(&str, Setter, [u64; 2]); 3] = [
             (
                 SOURCE_FILES_FIELD,
                 |table, value| table.files = value,
@@ -300,6 +333,11 @@ mod tests {
                     SOURCE_WORKSPACE_BYTES_MIN - 1,
                     SOURCE_WORKSPACE_BYTES_MAX + 1,
                 ],
+            ),
+            (
+                SOURCE_DECLARATIONS_FIELD,
+                |table, value| table.declarations = value,
+                [SOURCE_DECLARATIONS_MIN - 1, SOURCE_DECLARATIONS_MAX + 1],
             ),
         ];
         for (field, set, values) in cases {
@@ -326,8 +364,11 @@ mod tests {
         configuration.source.files = SOURCE_FILES_MIN;
         configuration.source.workspace_size = ByteSize::from_bytes(SOURCE_WORKSPACE_BYTES_MAX);
         assert_eq!(configuration.validate(), Ok(()));
+        configuration.source.declarations = SOURCE_DECLARATIONS_MIN;
+        assert_eq!(configuration.validate(), Ok(()));
         configuration.source.files = SOURCE_FILES_MAX;
         configuration.source.workspace_size = ByteSize::from_bytes(SOURCE_WORKSPACE_BYTES_MIN);
+        configuration.source.declarations = SOURCE_DECLARATIONS_MAX;
         assert_eq!(configuration.validate(), Ok(()));
     }
 
@@ -339,10 +380,12 @@ mod tests {
             "respect_gitignore": false,
             "files": 2000,
             "workspace_size": "1gb",
+            "declarations": 250_000,
         }))
         .expect("every documented key parses");
         assert_eq!(table.files, 2000);
         assert_eq!(table.workspace_size, ByteSize::from_bytes(1 << 30));
+        assert_eq!(table.declarations, 250_000);
         assert_eq!(table.violation(), None);
     }
 
@@ -379,6 +422,21 @@ mod tests {
                     "min": ByteSize::from_bytes(SOURCE_WORKSPACE_BYTES_MIN),
                     "max": ByteSize::from_bytes(SOURCE_WORKSPACE_BYTES_MAX),
                 }),
+            ),
+            (
+                "declarations default",
+                &table["declarations"]["default"],
+                json!(SOURCE_DECLARATIONS_DEFAULT),
+            ),
+            (
+                "declarations min",
+                &table["declarations"]["minimum"],
+                json!(SOURCE_DECLARATIONS_MIN),
+            ),
+            (
+                "declarations max",
+                &table["declarations"]["maximum"],
+                json!(SOURCE_DECLARATIONS_MAX),
             ),
         ];
         for (name, found, expected) in cases {

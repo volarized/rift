@@ -389,9 +389,10 @@ impl ConfigurationState {
             .unwrap_or_default()
     }
 
-    /// The bounds the index builds under: `base` with its file count and aggregate byte
-    /// bounds replaced by the `[source]` table's `files` and `workspace_size`. The
-    /// per-file, depth, and result bounds stay as `base` carries them.
+    /// The bounds the index builds under: `base` with its file count, aggregate byte, and
+    /// declaration bounds replaced by the `[source]` table's `files`, `workspace_size`,
+    /// and `declarations`. The per-file, depth, and result bounds stay as `base` carries
+    /// them.
     pub(crate) fn index_limits(
         &self,
         base: WorkspaceIndexLimits,
@@ -400,7 +401,8 @@ impl ConfigurationState {
         let files_max = usize::try_from(source.files).unwrap_or(usize::MAX);
         let workspace_bytes_max =
             usize::try_from(source.workspace_size.bytes()).unwrap_or(usize::MAX);
-        base.with_workspace_bounds(files_max, workspace_bytes_max)
+        let declarations_max = usize::try_from(source.declarations).unwrap_or(usize::MAX);
+        base.with_workspace_bounds(files_max, workspace_bytes_max, declarations_max)
             .map_err(|error| ReadError::from(ReadFault::Index(error)))
     }
 
