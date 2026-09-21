@@ -92,14 +92,28 @@ disabled for corpus runs, so repository checks measure source and lexical indexi
 
 The Next.js churn case writes a probe declaration every two seconds while `search`, `get_symbol`,
 and `nodes` read it. It runs at least 50 calls across those tools and requires at least two writes
-during pending reads. Each call must finish within 30 seconds, matching the configured readiness
-timeout, and return the same symbol identity, a complete written source revision, and its matching
-byte range. Source older than the revision present when the call started must carry `stale_index`.
+during pending reads. Every call must return the same symbol identity, a complete written source
+revision, and its matching byte range. Source older than the revision present when the call started
+must carry `stale_index`.
 
-After writes stop, all three tools must return the final source within one shared 30-second bound.
-The check repeats only reads that returned older source with `stale_index`; older source without
-that warning fails. The report records source revisions, warnings, each call's duration and
-overlapping writes, and each tool's maximum duration. The case retains its 720-second bound.
+Each budget the case applies stands strictly inside the one outside it, so a breach fails naming
+the action that ran long instead of tearing down whatever the next budget out was waiting on:
+
+| Budget | Seconds | What it bounds |
+| --- | ---: | --- |
+| Every read after a tool's first | 15 | A read answered from an index already published |
+| `[server] readiness_timeout` | 30 | The server's own waiting inside one read |
+| A tool's first read | 40 | The readiness budget, plus room for that answer to arrive |
+| Convergence after the writes stop | 120 | Resending all three tools until the final source lands |
+| The reads and the writes | 570 | The case's actions less what convergence is owed |
+| The case's own actions | 690 | The 720-second case bound less what cleanup costs |
+
+A tool's first read waits for the index the workspace is still building. Every read after it
+answers from a published index and never enters the readiness wait, so a steady read that does
+start waiting fails the case rather than hiding inside the first read's room. After writes stop,
+the check repeats only reads that returned older source with `stale_index`; older source without
+that warning fails. The report records source revisions, warnings, each call's duration and its
+own deadline, its overlapping writes, and each tool's first and maximum duration.
 
 Reports record the commit, seed, case, selected identities and languages, actions, elapsed time,
 and failure. `RIFT_CORPUS_REPORT` selects the JSON report location. Harness logs and reports

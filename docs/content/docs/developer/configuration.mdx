@@ -43,8 +43,9 @@ readiness_timeout = "30s"
   stacking another waiter
 - `idle_timeout` stops the server once no request remains active and that span has passed after
   the last response completed, 1s to 1d; the next `rift mcp` or `rift server start` brings it back
-- `readiness_timeout` bounds one request's wait for the workspace's index to become ready,
-  1s to 1h
+- `readiness_timeout` bounds one request's waiting, 1s to 1h. A read takes the deadline once,
+  where it enters, and the waits it makes - for the workspace's index, for the full-text tier's
+  transaction, for a language engine's references - each spend what is left of that one budget
 - `port` pins the exact loopback port, 1024 or above; omitted, the server picks the first free
   port from `port_range` - `port_range = { min = 12000, max = 13000 }` is the default - and the
   two keys exclude each other
