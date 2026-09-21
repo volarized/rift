@@ -918,8 +918,16 @@
     },
     "SourceConfiguration": {
       "additionalProperties": false,
-      "description": "The `[source]` table: which files below the workspace root the index and reads consider\nvisible, and how many files and bytes the index holds together. `.git`, `.rift`, and\n`target` stay invisible whatever this table says.",
+      "description": "The `[source]` table: which files below the workspace root the index and reads consider\nvisible, and how many files, bytes, and declarations the index holds together. `.git`,\n`.rift`, and `target` stay invisible whatever this table says.",
       "properties": {
+        "declarations": {
+          "default": 1000000,
+          "description": "Most declarations the index holds together, 10000 to 50000000. A workspace\ndeclaring more publishes the files that fit and leaves the rest out, each one\nreported as an unavailable source naming this key.",
+          "format": "uint64",
+          "maximum": 50000000,
+          "minimum": 10000,
+          "type": "integer"
+        },
         "exclude": {
           "default": [],
           "description": "Exact file paths or globs dropped from visibility, in [`PathPattern`] syntax. A match\nhere is dropped even when `include` also matches it.",
@@ -1169,6 +1177,7 @@
     "source": {
       "$ref": "#/$defs/SourceConfiguration",
       "default": {
+        "declarations": 1000000,
         "exclude": [],
         "files": 100000,
         "force_include": [],

@@ -96,6 +96,7 @@ force_include = []
 respect_gitignore = true
 files = 100000
 workspace_size = "512mb"
+declarations = 1000000
 ```
 
 The four glob lists decide in one order:
@@ -126,6 +127,12 @@ naming one walks those subtrees a second time with `.gitignore` not consulted, s
 bytes they hold together, 16mb to 64gb. The server refuses to index a workspace past either bound
 and names the key in the refusal; a change to either key rebuilds the index, as a change to
 `include`, `exclude`, or `force_include` does.
+
+`declarations` bounds how many declarations those files publish together, 10000 to 50000000.
+This one is a capacity, not a refusal: a workspace declaring more indexes the files that fit,
+leaves the rest out, and reports each one as an unavailable source naming this key. The default
+holds a full index in about 5 GiB, which is room for a workspace twice the size of the largest
+Rift is tested against - raise it on a machine with memory to spare, lower it on one without.
 
 `source` shapes what the index walks: a file it excludes stops reaching `search` and
 [`get_symbol`](/docs/mcp#tool-get_symbol) results. A single `search` request can still
