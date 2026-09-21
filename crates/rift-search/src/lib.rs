@@ -23,12 +23,13 @@ mod similarity;
 
 pub use acquisition::{AcquisitionLimits, FetchedFile, ModelSource, acquire};
 pub use document::{
-    DOCUMENT_SOURCE_BYTES_MAX, Declaration, Document, DocumentDigest, digests, document,
+    DOCUMENT_SOURCE_BYTES_MAX, Declaration, Document, DocumentDigest, composition_revision,
+    digests, document,
 };
 pub use embedding::{
     BatchSchedule, EmbeddingModels, EmbeddingSpace, LOCAL_INPUTS_MAX, LocalEncoder,
-    REMOTE_INPUTS_MAX, RemoteEmbeddingSettings, RetrievalModels, RiftLocalDocumentModel,
-    RiftLocalQueryModel, RiftOpenAiEmbeddingModel,
+    QueryTransformation, REMOTE_INPUTS_MAX, RemoteEmbeddingSettings, RetrievalModels,
+    RiftLocalDocumentModel, RiftLocalQueryModel, RiftOpenAiEmbeddingModel,
 };
 pub use encoder::{Encoder, EncoderLimits, ModelFiles};
 pub use error::{SearchError, SearchFault, SearchViolation};

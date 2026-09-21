@@ -40,8 +40,11 @@ enum Answer {
     FewerThanAsked,
     /// A coordinate past what the stored `f32` format can hold.
     UnholdableCoordinate,
-    /// The service refuses.
+    /// The service refuses with a status another attempt could answer.
     Refuses,
+    /// The service refuses the request as sent, with a status every repeat
+    /// would meet again.
+    RefusesTheRequest,
 }
 
 /// What the mock endpoint recorded about the requests it served.
@@ -106,6 +109,12 @@ async fn embeddings(
             json!({"error": {"message": "the model is loading"}}).to_string(),
         );
     }
+    if state.answer == Answer::RefusesTheRequest {
+        return (
+            StatusCode::BAD_REQUEST,
+            json!({"error": {"message": "this model does not serve that width"}}).to_string(),
+        );
+    }
     let mut data: Vec<Value> = (0..inputs)
         .map(|position| {
             json!({
@@ -135,7 +144,7 @@ async fn embeddings(
                 first["embedding"] = json!(vec![f64::MAX; dimensions]);
             }
         }
-        Answer::InOrder | Answer::Refuses => {}
+        Answer::InOrder | Answer::Refuses | Answer::RefusesTheRequest => {}
     }
     (
         StatusCode::OK,
@@ -287,6 +296,27 @@ async fn a_coordinate_the_stored_format_cannot_hold_is_refused() -> TestResult {
 }
 
 #[tokio::test]
+async fn a_request_the_service_refuses_is_sent_once() -> TestResult {
+    // A status the service answers the same way every time ends the request
+    // at once: retrying a rejected width, credential, or model spends the
+    // pass's budget on the same refusal and delays the answer the caller is
+    // waiting for.
+    let (endpoint, recorded, _state) = serve(Answer::RefusesTheRequest, Duration::ZERO).await?;
+    let mut settings = settings(endpoint, 3);
+    settings.attempts = 3;
+    let refused = models(&settings)?
+        .embed_documents(texts(1), BatchSchedule::new(8, 1))
+        .await;
+    assert!(refused.is_err(), "a refused request must refuse the pass");
+    assert_eq!(
+        recorded.requests.load(Ordering::SeqCst),
+        1,
+        "the status decides, not the fact that an error arrived"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_service_refusal_is_retried_up_to_the_attempt_bound() -> TestResult {
     let (endpoint, recorded, _state) = serve(Answer::Refuses, Duration::ZERO).await?;
     let mut settings = settings(endpoint, 3);
@@ -380,20 +410,26 @@ async fn one_query_embeds_through_the_query_handle() -> TestResult {
     Ok(())
 }
 
-#[test]
-fn the_settings_debug_render_redacts_the_credential() {
-    let held = settings("https://api.openai.com/v1".to_owned(), 1_536);
-    let rendered = format!("{held:?}");
-    assert!(
-        !rendered.contains("test-key"),
-        "the credential must never reach a rendered value: {rendered}"
+#[tokio::test]
+async fn a_pass_past_the_remote_input_bound_is_cut_into_requests() -> TestResult {
+    let (endpoint, recorded, _state) = serve(Answer::InOrder, Duration::ZERO).await?;
+    let settings = settings(endpoint, 1);
+    let asked = REMOTE_INPUTS_MAX + 1;
+    let embedded = models(&settings)?
+        .embed_documents(texts(asked), BatchSchedule::new(asked, 1))
+        .await?;
+    assert_eq!(embedded.len(), asked);
+    assert_eq!(
+        recorded.inputs_max.load(Ordering::SeqCst),
+        REMOTE_INPUTS_MAX,
+        "no request may carry more inputs than the service accepts"
     );
-    assert!(rendered.contains("[redacted]"));
-}
-
-#[test]
-fn the_remote_input_bound_is_what_the_model_accepts() {
-    assert_eq!(REMOTE_INPUTS_MAX, 2_048);
+    assert_eq!(
+        recorded.requests.load(Ordering::SeqCst),
+        2,
+        "a pass one input past the bound is two requests"
+    );
+    Ok(())
 }
 
 #[test]

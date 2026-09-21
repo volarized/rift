@@ -14,9 +14,9 @@ use rift_ranking::{
     ParsedQuery, QueryPhase, RankingInput, RankingInputKind, SearchableField,
 };
 use rift_search::{
-    AcquisitionLimits, Declaration, DescribedUnit, DocumentDigest, Embedding, ModelSource,
-    RevisionScoped, SearchError, SearchIndex, SearchIndexLimits, SearchViolation, StoreRanking,
-    VectorReadiness, document,
+    AcquisitionLimits, Declaration, DescribedUnit, DocumentDigest, Embedding, Encoder,
+    EncoderLimits, ModelFiles, ModelSource, RevisionScoped, SearchError, SearchIndex,
+    SearchIndexLimits, SearchViolation, StoreRanking, VectorReadiness, document,
 };
 use tokenizers::models::wordpiece::WordPiece;
 use tokenizers::processors::bert::BertProcessing;
@@ -240,9 +240,20 @@ fn model_source(root: &Path, name: &str) -> Fallible<ModelSource> {
 
 /// The identity a directory model's vectors are addressed under: the same
 /// value the index derives, asked of the crate rather than spelled twice.
-fn model_identity(root: &Path, name: &str) -> String {
-    let source = ModelSource::Directory(root.join(name));
-    rift_search::local_embedding_space(&source, HIDDEN).identity()
+///
+/// The encoder is loaded rather than described, because the width and the
+/// query transformation the space records are the loaded model's own answers.
+fn model_identity(root: &Path, name: &str) -> Fallible<String> {
+    let directory = root.join(name);
+    let files = ModelFiles::in_directory(&directory)?;
+    let encoder = Encoder::load(&files, EncoderLimits::new(2, 16, 256))?;
+    Ok(rift_search::local_embedding_space(
+        &ModelSource::Directory(directory),
+        &files,
+        encoder.dimension(),
+        encoder.query_transformation(),
+    )
+    .identity())
 }
 
 /// An acquisition that spends no wall clock: a directory model reads no
@@ -330,7 +341,7 @@ async fn store(root: &Path) -> Fallible<VectorStore> {
 async fn stored(root: &Path, name: &str) -> Fallible<Vec<StoredVector>> {
     Ok(store(root)
         .await?
-        .vectors(&model_identity(root, name), HIDDEN, EVERY)
+        .vectors(&model_identity(root, name)?, HIDDEN, EVERY)
         .await?)
 }
 
@@ -340,7 +351,7 @@ async fn mark(root: &Path, digest: &str) -> TestResult {
     store(root)
         .await?
         .store(
-            &model_identity(root, "model"),
+            &model_identity(root, "model")?,
             HIDDEN,
             &[StoredVector::new(digest.to_owned(), vec![MARK; HIDDEN])],
         )
@@ -361,7 +372,7 @@ fn is_marked(vectors: &[StoredVector], digest: &str) -> bool {
 async fn drop_stored_vectors(root: &Path, name: &str) -> TestResult {
     let dropped = store(root)
         .await?
-        .prune_absent(&model_identity(root, name), &BTreeSet::new())
+        .prune_absent(&model_identity(root, name)?, &BTreeSet::new())
         .await?;
     assert!(dropped > 0, "the pass left rows to delete");
     Ok(())

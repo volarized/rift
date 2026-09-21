@@ -160,6 +160,36 @@ fn bounded_source(source: &str) -> &str {
     &source[..cut]
 }
 
+/// Characters one composition revision renders as.
+const COMPOSITION_REVISION_CHARS: usize = 16;
+
+/// What this build composes a declaration into, as a digest.
+///
+/// The vector store files a corpus under the embedding space, and the space
+/// carries this value, so changing what a document is made of mints another
+/// space and the previous vectors are dropped rather than ranked against a
+/// query composed differently. The digest is taken over the text the builder
+/// actually produces for two probes, one on each path it has, so a changed
+/// order, separator, or fallback changes it without anyone remembering to
+/// restate it here.
+#[must_use]
+pub fn composition_revision() -> String {
+    let with_source = Declaration::new("kind", "qualified::name")
+        .signature("signature")
+        .documentation("documentation")
+        .source("source");
+    let without_source = Declaration::new("kind", "qualified::name")
+        .signature("signature")
+        .documentation("documentation");
+    let mut hasher = Sha256::new();
+    for probe in [&with_source, &without_source] {
+        hasher.update(document(probe).text().as_bytes());
+        hasher.update([0]);
+    }
+    hasher.update(DOCUMENT_SOURCE_BYTES_MAX.to_le_bytes());
+    HEXLOWER.encode(&hasher.finalize())[..COMPOSITION_REVISION_CHARS].to_owned()
+}
+
 /// The key one document's vector is stored under.
 ///
 /// Two models' vectors share no space, so the store keys on the model as well;
@@ -208,7 +238,10 @@ pub fn digests(documents: &[String]) -> Vec<DocumentDigest> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DOCUMENT_SOURCE_BYTES_MAX, Declaration, DocumentDigest, digests, document};
+    use super::{
+        DOCUMENT_SOURCE_BYTES_MAX, Declaration, DocumentDigest, composition_revision, digests,
+        document,
+    };
 
     #[test]
     fn test_document_is_the_declarations_source_under_its_qualified_name() {
@@ -287,6 +320,15 @@ mod tests {
         let source = "a".repeat(DOCUMENT_SOURCE_BYTES_MAX + 1);
         let declaration = Declaration::new("const", "letters").source(&source);
         assert_eq!(document(&declaration).source_bytes_dropped(), 1);
+    }
+
+    #[test]
+    fn test_the_composition_revision_pins_what_the_builder_produces() {
+        // The revision is derived from the builder's own output, so a changed
+        // order, separator, bound, or fallback moves it. Pinning the value is
+        // what makes that visible: an edit to the composition fails here, and
+        // the author reads why the held vectors are about to be dropped.
+        assert_eq!(composition_revision(), "3aa4825a04c76561");
     }
 
     #[test]

@@ -35,9 +35,10 @@ use rift_ranking::{
 use crate::acquisition::{AcquisitionLimits, ModelSource, acquire};
 use crate::document::{Declaration, digests, document};
 use crate::embedding::{
-    BatchSchedule, EmbeddingModels, EmbeddingSpace, LocalEncoder, RetrievalModels,
+    BatchSchedule, EmbeddingModels, EmbeddingSpace, LocalEncoder, QueryTransformation,
+    RetrievalModels,
 };
-use crate::encoder::{Encoder, EncoderLimits};
+use crate::encoder::{Encoder, EncoderLimits, ModelFiles};
 use crate::error::{SearchError, SearchFault, SearchViolation};
 use crate::fusion::{DeclarationMatch, spread_per_file};
 use crate::similarity::{VectorMatch, nearest};
@@ -744,7 +745,12 @@ impl SearchIndex {
     ) -> Result<LoadedModel, SearchError> {
         let files = acquire(source, limits).await?;
         let encoder = Encoder::load(&files, self.limits.encoder_limits())?;
-        let space = local_embedding_space(source, encoder.dimension());
+        let space = local_embedding_space(
+            source,
+            &files,
+            encoder.dimension(),
+            encoder.query_transformation(),
+        );
         let held = LocalEncoder::new(Arc::new(encoder));
         Ok(LoadedModel {
             models: EmbeddingModels::Local(RetrievalModels::new(
@@ -1098,25 +1104,24 @@ const fn reached(prepared: u64, total: u64) -> VectorReadiness {
 /// Public because the stored vectors are filed under this space's identity: a
 /// caller inspecting the store, or a test writing rows into it, needs the same
 /// value the index derives rather than a second spelling of it.
-#[must_use]
 ///
-/// A repository carries its revision: two revisions are two checkpoints, and
-/// their vectors share no space. A directory carries the path it was read
-/// from, which is the only revision a workspace-held model has.
-pub fn local_embedding_space(source: &ModelSource, dimensions: usize) -> EmbeddingSpace {
-    match source {
-        ModelSource::Repository {
-            repository,
-            revision,
-        } => EmbeddingSpace::local("hf", repository, revision, dimensions, false),
-        ModelSource::Directory(directory) => EmbeddingSpace::local(
-            "directory",
-            directory.display().to_string(),
-            directory.display().to_string(),
-            dimensions,
-            false,
-        ),
-    }
+/// The revision is the one the acquired files carry, never the one the
+/// operator asked for: a repository answers the commit its origin resolved,
+/// so a branch that moves serves its new weights under a new space, and a
+/// directory answers the digest over its own files, so two clones of one
+/// workspace share a space and a file swapped in place does not.
+#[must_use]
+pub fn local_embedding_space(
+    source: &ModelSource,
+    files: &ModelFiles,
+    dimensions: usize,
+    query: QueryTransformation,
+) -> EmbeddingSpace {
+    let (kind, model) = match source {
+        ModelSource::Repository { repository, .. } => ("hf", repository.clone()),
+        ModelSource::Directory(directory) => ("directory", directory.display().to_string()),
+    };
+    EmbeddingSpace::local(kind, model, files.revision(), dimensions, query)
 }
 
 /// One store failure, with that store's own violation riding as the cause.
@@ -1160,6 +1165,9 @@ mod tests {
         as_usize, batch_size, local_embedding_space, reached, selected,
     };
     use crate::acquisition::ModelSource;
+    use crate::embedding::QueryTransformation;
+    use crate::encoder::ModelFiles;
+    use crate::error::SearchError;
     use rift_core::ProjectPath;
     use rift_index::LexicalIndexLimits;
     use rift_ranking::DocumentIdentity;
@@ -1238,32 +1246,109 @@ mod tests {
         assert_eq!(as_count(7), 7);
     }
 
+    /// Three readable files below `directory`, with `weights` as their
+    /// differing part.
+    fn model_directory(directory: &std::path::Path, weights: &str) -> TestResult {
+        std::fs::create_dir_all(directory)?;
+        for (name, body) in [
+            ("config.json", "{}"),
+            ("tokenizer.json", "{}"),
+            ("model.safetensors", weights),
+        ] {
+            std::fs::write(directory.join(name), body)?;
+        }
+        Ok(())
+    }
+
     #[test]
-    fn test_a_local_space_separates_revisions_widths_and_directories() -> TestResult {
-        let repository =
-            local_embedding_space(&ModelSource::repository("BAAI/bge-small-en-v1.5")?, 384);
-        let pinned = local_embedding_space(
-            &ModelSource::repository("BAAI/bge-small-en-v1.5@dd0a482")?,
+    fn test_a_local_space_separates_resolved_revisions_widths_and_kinds() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let directory = root.path().join("model");
+        model_directory(&directory, "weights")?;
+        let files = ModelFiles::in_directory(&directory)?;
+        let repository = ModelSource::repository("BAAI/bge-small-en-v1.5")?;
+        let one = local_embedding_space(
+            &repository,
+            &ModelFiles::in_snapshot(&directory, "dd0a482")?,
             384,
+            QueryTransformation::Instructed,
+        );
+        let other = local_embedding_space(
+            &repository,
+            &ModelFiles::in_snapshot(&directory, "9f21c3b")?,
+            384,
+            QueryTransformation::Instructed,
         );
         assert_ne!(
-            repository.identity(),
-            pinned.identity(),
-            "a pinned revision addresses its own space"
+            one.identity(),
+            other.identity(),
+            "two resolved commits are two spaces"
         );
-        let widened =
-            local_embedding_space(&ModelSource::repository("BAAI/bge-small-en-v1.5")?, 768);
+        let widened = local_embedding_space(
+            &repository,
+            &ModelFiles::in_snapshot(&directory, "dd0a482")?,
+            768,
+            QueryTransformation::Instructed,
+        );
         assert_ne!(
-            repository.identity(),
+            one.identity(),
             widened.identity(),
             "two widths are two spaces"
         );
-        let directory = local_embedding_space(
-            &ModelSource::Directory(std::path::PathBuf::from("models/bge")),
+        let symmetric = local_embedding_space(
+            &repository,
+            &ModelFiles::in_snapshot(&directory, "dd0a482")?,
             384,
+            QueryTransformation::Symmetric,
         );
-        assert_ne!(repository.identity(), directory.identity());
-        assert_eq!(directory.dimensions(), 384);
+        assert_ne!(
+            one.identity(),
+            symmetric.identity(),
+            "two query transformations are two spaces"
+        );
+        let held = local_embedding_space(
+            &ModelSource::Directory(directory.clone()),
+            &files,
+            384,
+            QueryTransformation::Instructed,
+        );
+        assert_ne!(one.identity(), held.identity());
+        assert_eq!(held.dimensions(), 384);
+        Ok(())
+    }
+
+    #[test]
+    fn test_a_directory_space_reads_the_files_rather_than_the_path() -> TestResult {
+        // The revision a workspace-held model carries is the digest over its
+        // own files, so a second clone of one workspace ranks against the
+        // vectors the first embedded, and a file swapped in place does not.
+        let root = tempfile::tempdir()?;
+        let first = root.path().join("one/model");
+        let second = root.path().join("two/model");
+        model_directory(&first, "weights")?;
+        model_directory(&second, "weights")?;
+        let space = |directory: &std::path::Path| -> Result<String, SearchError> {
+            let files = ModelFiles::in_directory(directory)?;
+            Ok(local_embedding_space(
+                &ModelSource::Directory(directory.to_path_buf()),
+                &files,
+                384,
+                QueryTransformation::Instructed,
+            )
+            .identity())
+        };
+        let cloned = space(&second)?;
+        assert_ne!(
+            space(&first)?,
+            cloned,
+            "two directories are two models until the paths agree"
+        );
+        model_directory(&second, "other weights")?;
+        assert_ne!(
+            cloned,
+            space(&second)?,
+            "a file swapped in place mints another space"
+        );
         Ok(())
     }
 

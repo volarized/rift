@@ -607,13 +607,14 @@ impl RepositoryCache {
         self.directory.join(SNAPSHOTS_DIRECTORY).join(commit)
     }
 
-    /// The snapshot this cache already holds every model file in.
+    /// The snapshot this cache already holds every model file in, and the
+    /// commit that snapshot is.
     ///
     /// A hit is any existing entry: `huggingface_hub` links a snapshot name to
     /// its blob where it can and copies where it cannot, and `Path::exists`
     /// answers true for both. A commit that would address a path outside this
     /// repository is no hit, so a damaged `refs` file cannot steer a read.
-    fn cached_snapshot(&self, revision: &str) -> Option<PathBuf> {
+    fn cached_snapshot(&self, revision: &str) -> Option<(PathBuf, String)> {
         let recorded = std::fs::read_to_string(self.refs().join(revision)).ok()?;
         let commit = recorded.trim();
         if segment_violation(commit).is_some() {
@@ -623,7 +624,7 @@ impl RepositoryCache {
         MODEL_FILES
             .iter()
             .all(|file| snapshot.join(file.name).exists())
-            .then_some(snapshot)
+            .then(|| (snapshot, commit.to_owned()))
     }
 
     /// Fetches one file and puts its content in this cache's blobs.
@@ -871,9 +872,11 @@ async fn acquire_from(
 /// Puts one repository revision's three files in the cache below `root`.
 ///
 /// The first file's commit fixes the snapshot the other two are placed in, so
-/// the three an encoder loads are one revision of the repository. The revision
-/// file is written last: until it names the commit, a later run sees a miss and
-/// fetches again rather than reading a snapshot that is short a file.
+/// the three an encoder loads are one revision of the repository, and that
+/// resolved commit is the revision the files carry rather than the branch or
+/// tag the operator asked for. The revision file is written last: until it
+/// names the commit, a later run sees a miss and fetches again rather than
+/// reading a snapshot that is short a file.
 async fn acquire_repository<T: FileTransport>(
     origin: &RepositoryOrigin,
     limits: AcquisitionLimits,
@@ -881,8 +884,8 @@ async fn acquire_repository<T: FileTransport>(
     root: &Path,
 ) -> Result<ModelFiles, SearchError> {
     let cache = RepositoryCache::new(root, &origin.repository);
-    if let Some(snapshot) = cache.cached_snapshot(origin.revision()) {
-        return ModelFiles::in_directory(&snapshot);
+    if let Some((snapshot, commit)) = cache.cached_snapshot(origin.revision()) {
+        return ModelFiles::in_snapshot(&snapshot, &commit);
     }
     let [configuration, joining @ ..] = MODEL_FILES;
     let fetched = cache
@@ -895,7 +898,7 @@ async fn acquire_repository<T: FileTransport>(
         place_in_snapshot(&joined.blob, &snapshot, file.name).await?;
     }
     write_atomically(&cache.refs(), origin.revision(), fetched.commit.as_bytes()).await?;
-    ModelFiles::in_directory(&snapshot)
+    ModelFiles::in_snapshot(&snapshot, &fetched.commit)
 }
 
 /// One model identifier refusal, naming the value and the form expected.
@@ -1248,7 +1251,12 @@ mod tests {
             root.path(),
         )
         .await?;
-        assert_eq!(files, ModelFiles::in_directory(&snapshot)?);
+        assert_eq!(files, ModelFiles::in_snapshot(&snapshot, COMMIT)?);
+        assert_eq!(
+            files.revision(),
+            COMMIT,
+            "the files carry the resolved commit, not the `{DEFAULT_REVISION}` asked for"
+        );
         let rendered = format!("{files:?}");
         assert!(
             rendered.contains(&snapshot.display().to_string()),
@@ -1279,7 +1287,7 @@ mod tests {
             root.path(),
         )
         .await?;
-        assert_eq!(files, ModelFiles::in_directory(&snapshot)?);
+        assert_eq!(files, ModelFiles::in_snapshot(&snapshot, COMMIT)?);
         Ok(())
     }
 
@@ -1543,7 +1551,7 @@ mod tests {
         let named = environment(&[(HUB_CACHE_VARIABLE, &root.path().display().to_string())]);
         let source = ModelSource::repository(REPOSITORY)?;
         let files = acquire_from(&source, limits(1), &named).await?;
-        assert_eq!(files, ModelFiles::in_directory(&snapshot)?);
+        assert_eq!(files, ModelFiles::in_snapshot(&snapshot, COMMIT)?);
         let nowhere = acquire_from(&source, limits(1), &environment(&[]))
             .await
             .expect_err("no variable names a cache root");

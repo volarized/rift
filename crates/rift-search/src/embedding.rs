@@ -19,17 +19,18 @@
 //! contract makes array order meaningful: the response `index` decides, and a
 //! duplicate, missing, or out-of-range index is refused.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use data_encoding::HEXLOWER;
 use rig_core::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
-use rig_core::http_client::HttpClientExt as _;
+use rig_core::http_client::{Error as HttpClientError, HttpClientExt as _};
 use rig_core::providers::openai;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
+use crate::document::composition_revision;
 use crate::encoder::Encoder;
 use crate::error::{SearchError, SearchFault, SearchViolation};
 
@@ -43,22 +44,51 @@ pub const LOCAL_INPUTS_MAX: usize = 256;
 pub const REMOTE_INPUTS_MAX: usize = 2_048;
 /// The request path an OpenAI-compatible service answers embeddings at.
 const EMBEDDINGS_PATH: &str = "/embeddings";
-/// The document transformation the local and remote arms alike apply: the
-/// document text reaches the model unchanged.
-const DOCUMENT_TRANSFORMATION: &str = "document";
-/// The query transformation a symmetric model applies: the query text reaches
-/// the model unchanged.
-const SYMMETRIC_QUERY_TRANSFORMATION: &str = "query";
-/// The query transformation an asymmetric local model applies: the encoder
-/// prefixes the query with its retrieval instruction.
-const INSTRUCTED_QUERY_TRANSFORMATION: &str = "query-instruction";
 /// Characters one embedding-space identity renders as.
 const SPACE_IDENTITY_CHARS: usize = 16;
+/// The status a service answers when it timed the request out itself.
+const REQUEST_TIMEOUT_STATUS: u16 = 408;
+/// The status a service answers when the request arrived before it was ready.
+const TOO_EARLY_STATUS: u16 = 425;
+/// The status a service answers when the caller is over its rate limit.
+const TOO_MANY_REQUESTS_STATUS: u16 = 429;
+/// The first status a service answers its own failures with.
+const SERVER_FAILURE_STATUS_MIN: u16 = 500;
+/// The last status a service answers its own failures with.
+const SERVER_FAILURE_STATUS_MAX: u16 = 599;
+
+/// What a model does to a query before embedding it.
+///
+/// A symmetric model embeds a query the way it embeds a document. An
+/// asymmetric one prefixes the query with the retrieval instruction its
+/// checkpoint was trained on, so the two sides land in one space only when
+/// the query carries that prefix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueryTransformation {
+    /// The query text reaches the model unchanged.
+    Symmetric,
+    /// The encoder prefixes the query with its retrieval instruction.
+    Instructed,
+}
+
+impl QueryTransformation {
+    /// The transformation as the space identity records it.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Symmetric => "query",
+            Self::Instructed => "query-instruction",
+        }
+    }
+}
 
 /// Where one set of vectors came from, and how.
 ///
 /// Any change here invalidates the held corpus: two spaces are two coordinate
-/// systems, and a query embedded in one ranks nothing in the other.
+/// systems, and a query embedded in one ranks nothing in the other. The
+/// revision is the resolved one - a repository's commit, a directory's file
+/// digest - so a branch that moves under one name still mints another space,
+/// and the document transformation is derived from what the builder composes
+/// rather than declared, so changing the document changes the space.
 /// Credentials never enter it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EmbeddingSpace {
@@ -67,7 +97,7 @@ pub struct EmbeddingSpace {
     model: String,
     revision: String,
     dimensions: usize,
-    document_transformation: &'static str,
+    document_transformation: String,
     query_transformation: &'static str,
 }
 
@@ -79,7 +109,7 @@ impl EmbeddingSpace {
         model: impl Into<String>,
         revision: impl Into<String>,
         dimensions: usize,
-        instructed_query: bool,
+        query: QueryTransformation,
     ) -> Self {
         Self {
             kind,
@@ -87,12 +117,8 @@ impl EmbeddingSpace {
             model: model.into(),
             revision: revision.into(),
             dimensions,
-            document_transformation: DOCUMENT_TRANSFORMATION,
-            query_transformation: if instructed_query {
-                INSTRUCTED_QUERY_TRANSFORMATION
-            } else {
-                SYMMETRIC_QUERY_TRANSFORMATION
-            },
+            document_transformation: composition_revision(),
+            query_transformation: query.as_str(),
         }
     }
 
@@ -110,8 +136,8 @@ impl EmbeddingSpace {
             model: model.into(),
             revision: revision.into(),
             dimensions,
-            document_transformation: DOCUMENT_TRANSFORMATION,
-            query_transformation: SYMMETRIC_QUERY_TRANSFORMATION,
+            document_transformation: composition_revision(),
+            query_transformation: QueryTransformation::Symmetric.as_str(),
         }
     }
 
@@ -134,7 +160,7 @@ impl EmbeddingSpace {
             self.origin.as_deref().unwrap_or_default(),
             self.model.as_str(),
             self.revision.as_str(),
-            self.document_transformation,
+            self.document_transformation.as_str(),
             self.query_transformation,
         ] {
             hasher.update(part.as_bytes());
@@ -298,6 +324,11 @@ impl EmbeddingModels {
 /// model's own `MAX_DOCUMENTS`, and at most `max_in_flight` of them are open
 /// at once. A completed batch returns to the slots its inputs came from, so
 /// concurrency never reorders the answer.
+///
+/// The count is checked after the batches are joined as well as inside each
+/// one: the remote arm refuses a wrong count per response, and this is where
+/// a local model that answered a short batch is caught before a caller pairs
+/// the vectors with its declarations by position.
 async fn embed_all<Model>(
     model: &Model,
     texts: Vec<String>,
@@ -333,6 +364,15 @@ where
         answered.extend(
             held.ok_or_else(|| SearchError::new(SearchFault::new(SearchViolation::EncodeFailed)))?,
         );
+    }
+    if answered.len() != texts.len() {
+        return Err(SearchError::new(
+            SearchFault::new(SearchViolation::EncodeFailed).about(format!(
+                "{} vectors for {} inputs",
+                answered.len(),
+                texts.len()
+            )),
+        ));
     }
     Ok(answered)
 }
@@ -644,48 +684,140 @@ impl RiftOpenAiEmbeddingModel {
             client,
             model: settings.model.clone(),
             dimensions: settings.dimensions,
-            attempts: settings.attempts.max(1),
+            attempts: settings.attempts,
         })
     }
 
-    /// Issues one embedding request, retrying a refusal up to the configured
-    /// attempt count.
+    /// Issues one embedding request, trying again only where another attempt
+    /// could answer differently.
+    ///
+    /// One attempt always runs. A refused attempt ends the request at once,
+    /// because the service answers a malformed body, a rejected credential,
+    /// and an unknown model the same way however often they are sent; a
+    /// transient one is retried up to the configured attempt count.
     async fn request(&self, inputs: &[String]) -> Result<Vec<Vec<f64>>, EmbeddingError> {
-        let mut refusal = None;
-        for _attempt in 0..self.attempts {
-            match self.attempt(inputs).await {
-                Ok(embedded) => return Ok(embedded),
-                Err(error) => refusal = Some(error),
-            }
+        let mut attempted = self.attempt(inputs).await;
+        let mut remaining = self.attempts.saturating_sub(1);
+        while remaining > 0 && attempted.as_ref().is_err_and(AttemptFailure::is_transient) {
+            attempted = self.attempt(inputs).await;
+            remaining -= 1;
         }
-        Err(refusal.unwrap_or_else(|| {
-            EmbeddingError::ResponseError("no embedding attempt ran".to_owned())
-        }))
+        attempted.map_err(AttemptFailure::into_error)
     }
 
     /// One request and one decode.
-    async fn attempt(&self, inputs: &[String]) -> Result<Vec<Vec<f64>>, EmbeddingError> {
+    ///
+    /// A non-success status never reaches a response here: the transport
+    /// refuses it first (`rig_core::http_client`'s `into_lazy_response`), so
+    /// the status the retry reads rides on the transport failure.
+    async fn attempt(&self, inputs: &[String]) -> Result<Vec<Vec<f64>>, AttemptFailure> {
         let body = serde_json::to_vec(&EmbeddingRequestBody {
             model: &self.model,
             input: inputs,
             dimensions: self.dimensions,
-        })?;
+        })
+        .map_err(|error| AttemptFailure::refused(error.into()))?;
         let request = self
             .client
-            .post(EMBEDDINGS_PATH)?
+            .post(EMBEDDINGS_PATH)
+            .map_err(|error| AttemptFailure::refused(error.into()))?
             .body(body)
-            .map_err(|error| EmbeddingError::HttpError(error.into()))?;
-        let response = self.client.send(request).await?;
-        let status = response.status();
-        let received: Vec<u8> = response.into_body().await?;
-        if !status.is_success() {
-            return Err(EmbeddingError::from_http_response(
-                status,
-                String::from_utf8_lossy(&received).into_owned(),
-            ));
+            .map_err(|error| AttemptFailure::refused(EmbeddingError::HttpError(error.into())))?;
+        let response = self
+            .client
+            .send(request)
+            .await
+            .map_err(|error| AttemptFailure::new(outcome_of(&error), error.into()))?;
+        let received: Vec<u8> = response
+            .into_body()
+            .await
+            .map_err(|error| AttemptFailure::transient(error.into()))?;
+        let decoded: EmbeddingResponseBody = serde_json::from_slice(&received)
+            .map_err(|error| AttemptFailure::refused(error.into()))?;
+        placed_by_index(decoded.data, inputs.len()).map_err(AttemptFailure::refused)
+    }
+}
+
+/// What one failed attempt says about trying again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttemptOutcome {
+    /// Another attempt could answer differently.
+    Transient,
+    /// The service refuses the request itself, and will answer every repeat
+    /// of it the same way.
+    Refused,
+}
+
+/// One failed attempt: what went wrong, and whether another is worth making.
+#[derive(Debug)]
+struct AttemptFailure {
+    outcome: AttemptOutcome,
+    error: EmbeddingError,
+}
+
+impl AttemptFailure {
+    /// Names the outcome and the failure it carries.
+    const fn new(outcome: AttemptOutcome, error: EmbeddingError) -> Self {
+        Self { outcome, error }
+    }
+
+    /// A failure another attempt could answer differently.
+    const fn transient(error: EmbeddingError) -> Self {
+        Self::new(AttemptOutcome::Transient, error)
+    }
+
+    /// A failure every repeat of this request would meet again.
+    const fn refused(error: EmbeddingError) -> Self {
+        Self::new(AttemptOutcome::Refused, error)
+    }
+
+    /// Whether another attempt is worth making.
+    const fn is_transient(&self) -> bool {
+        matches!(self.outcome, AttemptOutcome::Transient)
+    }
+
+    /// The failure this attempt carries.
+    fn into_error(self) -> EmbeddingError {
+        self.error
+    }
+}
+
+/// What one transport failure says about trying again.
+///
+/// A failure carrying no status is the request never reaching the service,
+/// which another attempt can answer. A failure carrying one is classified by
+/// [`outcome_of_status`].
+fn outcome_of(error: &HttpClientError) -> AttemptOutcome {
+    match status_of(error) {
+        Some(status) => outcome_of_status(status),
+        None => AttemptOutcome::Transient,
+    }
+}
+
+/// The status one transport failure declares, absent when it carries none.
+const fn status_of(error: &HttpClientError) -> Option<u16> {
+    match error {
+        HttpClientError::InvalidStatusCode(status)
+        | HttpClientError::InvalidStatusCodeWithMessage(status, _)
+        | HttpClientError::InvalidStatusCodeWithDetails { status, .. } => Some(status.as_u16()),
+        _ => None,
+    }
+}
+
+/// What one response status says about trying again.
+///
+/// The service declares a timeout, a rate limit, and its own failures as
+/// statuses another attempt can answer. Every other status refuses the
+/// request as sent: a malformed body, a rejected credential, a model the
+/// service does not serve, and a width it does not accept all answer the
+/// same way however often they are repeated.
+const fn outcome_of_status(status: u16) -> AttemptOutcome {
+    match status {
+        REQUEST_TIMEOUT_STATUS | TOO_EARLY_STATUS | TOO_MANY_REQUESTS_STATUS => {
+            AttemptOutcome::Transient
         }
-        let decoded: EmbeddingResponseBody = serde_json::from_slice(&received)?;
-        placed_by_index(decoded.data, inputs.len())
+        SERVER_FAILURE_STATUS_MIN..=SERVER_FAILURE_STATUS_MAX => AttemptOutcome::Transient,
+        _ => AttemptOutcome::Refused,
     }
 }
 
@@ -713,9 +845,10 @@ struct EmbeddingDatum {
 /// Restores input order from the declared indexes.
 ///
 /// The service may answer in any array order. Every input position is covered
-/// exactly once or the response is refused: a duplicate index, a missing one,
-/// and one past the request's own length all mean at least one declaration
-/// would take another's vector.
+/// exactly once or the response is refused: a duplicate index and one past
+/// the request's own length both mean at least one declaration would take
+/// another's vector, and a missing index is one of those two, because the
+/// count is checked first.
 fn placed_by_index(
     data: Vec<EmbeddingDatum>,
     inputs: usize,
@@ -726,28 +859,19 @@ fn placed_by_index(
             data.len()
         )));
     }
-    let mut seen: BTreeSet<usize> = BTreeSet::new();
-    let mut placed: Vec<Option<Vec<f64>>> = vec![None; inputs];
+    let mut placed: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
     for datum in data {
-        if datum.index >= inputs || !seen.insert(datum.index) {
+        let index = datum.index;
+        if index >= inputs || placed.insert(index, datum.embedding).is_some() {
             return Err(EmbeddingError::ResponseError(format!(
-                "the embedding response declares index {} for {inputs} inputs",
-                datum.index
+                "the embedding response declares index {index} for {inputs} inputs"
             )));
         }
-        placed[datum.index] = Some(datum.embedding);
     }
-    placed
-        .into_iter()
-        .enumerate()
-        .map(|(position, held)| {
-            held.ok_or_else(|| {
-                EmbeddingError::ResponseError(format!(
-                    "the embedding response declares no vector for input {position}"
-                ))
-            })
-        })
-        .collect()
+    // The response carries `inputs` vectors, every declared index is distinct
+    // and below `inputs`, so the map holds one entry per input and its keys
+    // ascend from zero: draining it in key order is the answer in input order.
+    Ok(placed.into_values().collect())
 }
 
 impl EmbeddingModel for RiftOpenAiEmbeddingModel {
@@ -788,10 +912,12 @@ impl EmbeddingModel for RiftOpenAiEmbeddingModel {
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchSchedule, EmbeddingDatum, EmbeddingSpace, LOCAL_INPUTS_MAX, RemoteEmbeddingSettings,
-        narrowed, placed_by_index, stored_coordinate,
+        AttemptOutcome, BatchSchedule, EmbeddingDatum, EmbeddingSpace, HttpClientError,
+        LOCAL_INPUTS_MAX, QueryTransformation, RemoteEmbeddingSettings, RiftOpenAiEmbeddingModel,
+        SearchViolation, embed_all, narrowed, outcome_of, outcome_of_status, placed_by_index,
+        stored_coordinate,
     };
-    use rig_core::embeddings::Embedding;
+    use rig_core::embeddings::{Embedding, EmbeddingModel};
     use std::time::Duration;
 
     fn datum(index: usize, value: f64) -> EmbeddingDatum {
@@ -866,8 +992,20 @@ mod tests {
 
     #[test]
     fn test_a_local_space_records_its_query_transformation() {
-        let symmetric = EmbeddingSpace::local("hf", "model", "main", 256, false);
-        let instructed = EmbeddingSpace::local("hf", "model", "main", 256, true);
+        let symmetric = EmbeddingSpace::local(
+            "hf",
+            "model",
+            "main",
+            256,
+            super::QueryTransformation::Symmetric,
+        );
+        let instructed = EmbeddingSpace::local(
+            "hf",
+            "model",
+            "main",
+            256,
+            super::QueryTransformation::Instructed,
+        );
         assert_ne!(
             symmetric.identity(),
             instructed.identity(),
@@ -897,5 +1035,124 @@ mod tests {
         let rendered = format!("{settings:?}");
         assert!(!rendered.contains("secret-value"));
         assert!(rendered.contains("[redacted]"));
+    }
+
+    fn remote_settings() -> RemoteEmbeddingSettings {
+        RemoteEmbeddingSettings {
+            endpoint: "https://api.openai.com/v1".to_owned(),
+            model: "text-embedding-3-small".to_owned(),
+            revision: "2024-01-25".to_owned(),
+            dimensions: 1_536,
+            api_key: "secret-value".to_owned(),
+            request_timeout: Duration::from_secs(30),
+            attempts: 3,
+        }
+    }
+
+    /// A model that answers one vector fewer than it was given, which is the
+    /// only way a local handle can break the pairing a caller does by
+    /// position.
+    #[derive(Clone)]
+    struct ShortModel;
+
+    impl EmbeddingModel for ShortModel {
+        const MAX_DOCUMENTS: usize = 8;
+
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
+            Self
+        }
+
+        fn ndims(&self) -> usize {
+            1
+        }
+
+        fn embed_texts(
+            &self,
+            texts: impl IntoIterator<Item = String> + Send,
+        ) -> impl Future<Output = Result<Vec<Embedding>, rig_core::embeddings::EmbeddingError>> + Send
+        {
+            let mut texts: Vec<String> = texts.into_iter().collect();
+            texts.pop();
+            std::future::ready(Ok(texts
+                .into_iter()
+                .map(|document| Embedding {
+                    document,
+                    vec: vec![1.0],
+                })
+                .collect()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_pass_that_answered_fewer_vectors_than_inputs_is_refused() {
+        // The remote arm refuses a wrong count per response; this is the check
+        // that catches a local handle doing the same, before a caller pairs
+        // the vectors with its declarations by position.
+        let space =
+            EmbeddingSpace::local("directory", "short", "r", 1, QueryTransformation::Symmetric);
+        let refused = embed_all(
+            &ShortModel,
+            vec!["one".to_owned(), "two".to_owned()],
+            BatchSchedule::new(8, 1),
+            &space,
+        )
+        .await
+        .expect_err("a short answer must be refused");
+        assert_eq!(refused.fault().violation(), SearchViolation::EncodeFailed);
+        assert!(
+            format!("{refused}").contains("1 vectors for 2 inputs"),
+            "the refusal names both counts: {refused}"
+        );
+    }
+
+    #[test]
+    fn test_a_transport_failure_carrying_no_status_is_tried_again() {
+        assert_eq!(
+            outcome_of(&HttpClientError::NoHeaders),
+            AttemptOutcome::Transient,
+            "a request that never reached the service is worth another attempt"
+        );
+    }
+
+    #[test]
+    fn test_the_status_decides_whether_another_attempt_runs() {
+        for status in [408, 425, 429, 500, 502, 503, 504, 599] {
+            assert_eq!(
+                outcome_of_status(status),
+                AttemptOutcome::Transient,
+                "status {status} is one another attempt can answer"
+            );
+        }
+        for status in [400, 401, 403, 404, 409, 413, 422, 499] {
+            assert_eq!(
+                outcome_of_status(status),
+                AttemptOutcome::Refused,
+                "status {status} refuses the request as sent"
+            );
+        }
+    }
+
+    #[test]
+    fn test_the_model_rig_builds_carries_the_name_and_width_it_was_given() {
+        // Rift never calls `make`; the trait requires it, and an implementation
+        // that dropped the arguments would be invisible until a Rig client of
+        // this model's own type existed.
+        let built = RiftOpenAiEmbeddingModel::make(&remote_settings(), "other-model", Some(256));
+        let rendered = format!("{built:?}");
+        assert!(rendered.contains("other-model"), "{rendered}");
+        assert!(rendered.contains("256"), "{rendered}");
+        let kept = RiftOpenAiEmbeddingModel::make(&remote_settings(), "other-model", None);
+        assert!(format!("{kept:?}").contains("1536"));
+    }
+
+    #[test]
+    fn test_the_remote_model_renders_without_the_credential() {
+        let rendered = format!(
+            "{:?}",
+            RiftOpenAiEmbeddingModel::make(&remote_settings(), "text-embedding-3-small", None,)
+        );
+        assert!(!rendered.contains("secret-value"), "{rendered}");
     }
 }

@@ -393,7 +393,7 @@ mod through_the_embedding_contract {
     use super::{HIDDEN, TestResult, loaded, write_model};
     use rift_search::{
         BatchSchedule, EmbeddingModels, EmbeddingSpace, LOCAL_INPUTS_MAX, LocalEncoder,
-        RetrievalModels,
+        QueryTransformation, RetrievalModels,
     };
     use rig_core::embeddings::EmbeddingModel as _;
     use std::sync::Arc;
@@ -402,7 +402,13 @@ mod through_the_embedding_contract {
     fn pair(directory: &std::path::Path) -> TestResult<EmbeddingModels> {
         write_model(directory)?;
         let held = LocalEncoder::new(Arc::new(loaded(directory)?));
-        let space = EmbeddingSpace::local("directory", "fixture", "fixture", HIDDEN, true);
+        let space = EmbeddingSpace::local(
+            "directory",
+            "fixture",
+            "fixture",
+            HIDDEN,
+            QueryTransformation::Instructed,
+        );
         Ok(EmbeddingModels::Local(RetrievalModels::new(
             held.documents(),
             held.query(),
