@@ -18,6 +18,7 @@ rift-lsp = { path = "crates/rift-lsp" }
 rift-mcp = { path = "crates/rift-mcp" }
 rift-search = { path = "crates/rift-search" }
 rift-protocol = { path = "crates/rift-protocol" }
+rift-ranking = { path = "crates/rift-ranking" }
 rift-provider = { path = "crates/rift-provider" }
 rift-server = { path = "crates/rift-server" }
 rift-syntax = { path = "crates/rift-syntax" }

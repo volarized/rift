@@ -42,6 +42,7 @@ EXPECTED_EDGES = {
     "rift-mcp -> rift-search",
     "rift-mcp -> rift-server",
     "rift-provider -> rift-core",
+    "rift-ranking -> rift-core",
     "rift-search -> rift-core",
     "rift-search -> rift-index",
     "rift-server -> rift-core",
@@ -146,6 +147,57 @@ def fail_test_targets(packages: list[dict[str, Any]]) -> None:
         raise RuntimeError("Rift test targets differ:\n" + "\n".join(complaints))
 
 
+# rift-ranking states the retrieval decisions every index shares, and an
+# external adapter must be able to build it with no storage and no model
+# runtime. These are the crates that would make that false: the SQLite stack,
+# the embedding runtime, and the HTTP client. A dependency reaching any of
+# them means an algorithm moved back behind a storage boundary.
+STORAGE_INDEPENDENT = "rift-ranking"
+STORAGE_CRATES = frozenset(
+    {
+        "candle-core",
+        "candle-nn",
+        "candle-transformers",
+        "libsqlite3-sys",
+        "reqwest",
+        "rig-core",
+        "rusqlite",
+        "toasty",
+        "toasty-core",
+        "toasty-driver-sqlite",
+        "tokenizers",
+    }
+)
+
+
+def resolved_closure(name: str) -> set[str]:
+    """Return every crate the resolved dependency graph reaches from `name`."""
+    process = subprocess.run(
+        ["cargo", "tree", "--package", name, "--edges", "normal", "--prefix", "none",
+         "--no-dedupe", "--format", "{p}"],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if process.returncode != 0:
+        raise RuntimeError(process.stderr.strip() or "cargo tree failed")
+    return {
+        line.split()[0]
+        for line in process.stdout.splitlines()
+        if line.strip() and not line.startswith("[")
+    }
+
+
+def fail_storage_independence() -> None:
+    """Refuse a storage or model-runtime crate in the shared ranking closure."""
+    reached = sorted(resolved_closure(STORAGE_INDEPENDENT) & STORAGE_CRATES)
+    if reached:
+        raise RuntimeError(
+            f"{STORAGE_INDEPENDENT} must build without storage or a model runtime, "
+            f"and now reaches: {', '.join(reached)}"
+        )
+
+
 def main() -> int:
     """Check exact internal edges and binary targets."""
     packages = rift_packages(cargo_metadata())
@@ -173,4 +225,5 @@ def main() -> int:
         )
 
     fail_test_targets(packages)
+    fail_storage_independence()
     return 0

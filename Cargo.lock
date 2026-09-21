@@ -4072,6 +4072,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rift-ranking"
+version = "0.0.39"
+dependencies = [
+ "data-encoding",
+ "rift-core",
+ "serde",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "rift-search"
 version = "0.0.39"
 dependencies = [

@@ -1,0 +1,20 @@
+[package]
+name = "rift-ranking"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Storage-independent retrieval documents, query construction, and rank fusion for Rift"
+
+[lints]
+workspace = true
+
+[dependencies]
+data-encoding.workspace = true
+rift-core.workspace = true
+serde.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
