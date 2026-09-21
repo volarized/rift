@@ -1533,6 +1533,13 @@ fn endpoint_refused(value: &str) -> bool {
         return true;
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // A credential written into the authority would travel wherever the endpoint
+    // travels, and the server records the endpoint in its own log. `api_key_env`
+    // exists so the credential stays in an environment variable; a URL carrying
+    // one is refused rather than read.
+    if authority.contains('@') {
+        return true;
+    }
     let host = authority_host(authority);
     if host.is_empty() {
         return true;
@@ -1545,15 +1552,15 @@ fn endpoint_refused(value: &str) -> bool {
     !accepted
 }
 
-/// The host `authority` names: the text after any `user@` prefix, with a
-/// bracketed IPv6 literal unwrapped and any `:port` suffix removed.
+/// The host `authority` names, with a bracketed IPv6 literal unwrapped and any
+/// `:port` suffix removed.
+///
+/// An authority carrying a credential is refused before this runs, so there is
+/// no `user@` prefix left to step over.
 fn authority_host(authority: &str) -> &str {
-    let after_userinfo = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    match after_userinfo.split_once(']') {
+    match authority.split_once(']') {
         Some((bracketed, _)) => bracketed.strip_prefix('[').unwrap_or(bracketed),
-        None => after_userinfo.split(':').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
     }
 }
 
@@ -3300,6 +3307,11 @@ mod tests {
             "http://api.openai.com/v1",
             "http://localhost.example.com/v1",
             "https:///v1",
+            // A credential in the authority would travel wherever the endpoint does,
+            // and the server records the endpoint in its own log.
+            "https://token@api.openai.com/v1",
+            "https://user:secret@api.openai.com/v1",
+            "http://user:secret@localhost:8080/v1",
         ] {
             assert_eq!(
                 embedding_model_verdict(with_endpoint(refused)),
@@ -3350,15 +3362,12 @@ mod tests {
     }
 
     #[test]
-    fn test_authority_host_drops_userinfo_and_port_and_unwraps_a_bracketed_literal() {
+    fn test_authority_host_drops_the_port_and_unwraps_a_bracketed_literal() {
         let cases = [
             ("example.com", "example.com"),
             ("example.com:8443", "example.com"),
-            ("user@example.com", "example.com"),
-            ("user:secret@example.com:8443", "example.com"),
             ("[::1]", "::1"),
             ("[::1]:8080", "::1"),
-            ("user@[::1]:8080", "::1"),
             ("", ""),
         ];
         for (authority, expected) in cases {
