@@ -1026,8 +1026,59 @@ fn ranking_of(
     }
 }
 
+/// The instant every wait inside one request must end by.
+///
+/// `[server] readiness_timeout` bounds one request, not each wait that request makes. A
+/// search waits for a publication, then for the lexical lane's transaction, then repeats
+/// both when the tree moves under it, and handing each of those waits its own copy of the
+/// timeout let one read spend the operator's budget several times over: the corpus
+/// recorded a first `search` at 25.08 seconds against 6.21 for a `get_symbol` that made
+/// one wait. The deadline is taken once, where the request enters, and every wait inside
+/// it spends what remains.
+///
+/// A wait started past the deadline still resolves whatever is already available:
+/// `tokio::time::timeout_at` polls its future before its timer, so a publication the
+/// server already holds answers rather than refusing on a spent budget.
+#[derive(Clone, Copy, Debug)]
+struct RequestDeadline {
+    at: tokio::time::Instant,
+    budget: Duration,
+}
+
+impl RequestDeadline {
+    /// The deadline a request entering now gets from `budget`.
+    fn starting(budget: Duration) -> Self {
+        Self {
+            at: tokio::time::Instant::now() + budget,
+            budget,
+        }
+    }
+
+    /// The instant the request's waits end at.
+    fn at(self) -> tokio::time::Instant {
+        self.at
+    }
+
+    /// The whole budget the request was given, which a refusal reports it spent.
+    fn budget(self) -> Duration {
+        self.budget
+    }
+
+    /// What is left of the budget, zero once it is spent.
+    fn remaining(self) -> Duration {
+        self.at
+            .saturating_duration_since(tokio::time::Instant::now())
+    }
+
+    /// Whether nothing is left to wait with, so another wait would only read what is
+    /// already at hand.
+    fn is_spent(self) -> bool {
+        self.remaining().is_zero()
+    }
+}
+
 /// Where `tree_revision` stands with `lane` once the commit for it has landed, or once
-/// `budget` ran out with the lane still holding it: `Committing` in the second case
+/// `deadline` passed with the lane still holding it: `Committing` in the second case
 /// alone.
 ///
 /// The wake-up is subscribed before each state read, so a landing between the read and
@@ -1035,7 +1086,7 @@ fn ranking_of(
 /// `notify_waiters()` as soon as it has been created, even if it has not yet been
 /// polled". A landing for another revision - the one running ahead of a held write -
 /// wakes the wait, which reads the state again under the same deadline; the loop runs
-/// once per landing inside the budget.
+/// once per landing inside the request's remaining budget.
 ///
 /// # Cancel safety
 ///
@@ -1043,9 +1094,9 @@ fn ranking_of(
 async fn commit_landed(
     lane: &LexicalLane,
     tree_revision: &str,
-    budget: Duration,
+    deadline: RequestDeadline,
 ) -> LexicalCommitState {
-    let deadline = tokio::time::Instant::now() + budget;
+    let deadline = deadline.at();
     loop {
         let landed = lane.landed();
         let commit_state = lane.commit_state(tree_revision);
@@ -1570,7 +1621,10 @@ impl RiftMcp {
         params: SearchParams,
         change: rift_protocol::read::SearchChange,
     ) -> Result<Json<SearchResult>, ErrorData> {
-        let resolved = self.published_workspace(wire::ErrorPhase::Read).await?;
+        let deadline = self.request_deadline().await;
+        let resolved = self
+            .published_workspace(wire::ErrorPhase::Read, deadline)
+            .await?;
         let revision_read = self.revision_read(&resolved.published)?;
         let RevisionRead {
             root,
@@ -1602,16 +1656,17 @@ impl RiftMcp {
     /// past the captured publication ends this attempt rather than ranking rows the answer
     /// cannot place. The next attempt captures the publication the store already holds, and
     /// the bound is the same one `reconcile_workspace` applies to a tree that keeps moving.
-    /// Each attempt's wait for a lexical commit in flight gets the full
-    /// `[server] readiness_timeout`: the workspace wait's own deadline stays inside
-    /// `published_workspace`, so what remains of it is not at hand here.
+    /// The publication wait, each attempt's wait for a lexical commit in flight, and the
+    /// reference reads all spend one [`RequestDeadline`], taken once from
+    /// `[server] readiness_timeout`: that key bounds the request, so a read that waits
+    /// three times over cannot cost three times the budget the operator set.
     ///
-    /// A request whose attempts are spent answers from the publication it holds, with the
-    /// ranked tier reported unavailable. Capturing the publication the store holds is what
-    /// the attempts already try and cannot reach while rebuilds keep landing: the lexical
-    /// lane stamps the store as each candidate publishes, `published_workspace` resolves
-    /// the publication separately, and under back-to-back rebuilds the second trails the
-    /// first every time the pair is read. `ReadService::search` answers identifier
+    /// A request whose attempts or whose deadline are spent answers from the publication
+    /// it holds, with the ranked tier reported unavailable. Capturing the publication the
+    /// store holds is what the attempts already try and cannot reach while rebuilds keep
+    /// landing: the lexical lane stamps the store as each candidate publishes,
+    /// `published_workspace` resolves the publication separately, and under back-to-back
+    /// rebuilds the second trails the first every time the pair is read. `ReadService::search` answers identifier
     /// matching from the publication itself, so an answer without a ranking is still one
     /// snapshot's own rows; the ranked lane contributes the ordering alone, and its
     /// absence is what the warning states.
@@ -1619,19 +1674,25 @@ impl RiftMcp {
         &self,
         params: SearchParams,
     ) -> Result<Json<SearchResult>, ErrorData> {
-        let budget = self.readiness_timeout().await;
-        let mut resolved = self.published_workspace(wire::ErrorPhase::Read).await?;
-        let mut ranking = self.ranking(&params, &resolved.published, budget).await?;
+        let deadline = self.request_deadline().await;
+        let mut resolved = self
+            .published_workspace(wire::ErrorPhase::Read, deadline)
+            .await?;
+        let mut ranking = self.ranking(&params, &resolved.published, deadline).await?;
         for _retry in 1..INDEX_CAPTURE_ATTEMPTS_MAX {
-            if ranking.is_some() {
+            // A spent deadline ends the retries before a landed ranking does: another
+            // capture has nothing left to wait with, so it would only refuse.
+            if deadline.is_spent() || ranking.is_some() {
                 break;
             }
-            resolved = self.published_workspace(wire::ErrorPhase::Read).await?;
-            ranking = self.ranking(&params, &resolved.published, budget).await?;
+            resolved = self
+                .published_workspace(wire::ErrorPhase::Read, deadline)
+                .await?;
+            ranking = self.ranking(&params, &resolved.published, deadline).await?;
         }
-        let (resolved, ranking, references) = tokio::time::timeout(
-            budget,
-            Box::pin(self.current_tree_references(resolved, ranking, &params, budget)),
+        let (resolved, ranking, references) = tokio::time::timeout_at(
+            deadline.at(),
+            Box::pin(self.current_tree_references(resolved, ranking, &params, deadline)),
         )
         .await
         .map_err(|_| {
@@ -1659,22 +1720,25 @@ impl RiftMcp {
 
     /// Repeats engine reads against a fresh publication when their captured tree moves.
     ///
-    /// The caller bounds this entire exchange, including publication and ranking waits,
-    /// by the same readiness deadline as the original engine request.
+    /// The publication and ranking waits this recapture makes spend the same
+    /// [`RequestDeadline`] the whole request runs under, which the caller also ends the
+    /// exchange at.
     async fn current_tree_references(
         &self,
         mut resolved: ResolvedWorkspace,
         mut ranking: Option<SearchRanking>,
         params: &SearchParams,
-        budget: Duration,
+        deadline: RequestDeadline,
     ) -> Result<(ResolvedWorkspace, Option<SearchRanking>, EngineReferences), ErrorData> {
         for attempt in 0..INDEX_CAPTURE_ATTEMPTS_MAX {
             if let Some(references) = self.engine_references(&resolved, params).await? {
                 return Ok((resolved, ranking, references));
             }
             if attempt + 1 < INDEX_CAPTURE_ATTEMPTS_MAX {
-                resolved = self.published_workspace(wire::ErrorPhase::Read).await?;
-                ranking = self.ranking(params, &resolved.published, budget).await?;
+                resolved = self
+                    .published_workspace(wire::ErrorPhase::Read, deadline)
+                    .await?;
+                ranking = self.ranking(params, &resolved.published, deadline).await?;
             }
         }
         Err(ReadFault::unavailable(
@@ -1735,7 +1799,7 @@ impl RiftMcp {
     /// Returns nothing when the store has moved past `published`'s tree to a newer
     /// publication, which asks the caller to capture the publication the store already
     /// answers for. Every other outcome ranks: an index that could not be opened, one the
-    /// lexical lane is still committing this tree into once `budget` ran out, and one
+    /// lexical lane is still committing this tree into once `deadline` passed, and one
     /// that missed a commit warn `lexical_ranking_unavailable` and leave identifier
     /// search to answer alone. A query-term limit the index refuses surfaces as this
     /// request's own `limit_exceeded` error, never a silent degrade. A `dependencies`
@@ -1745,7 +1809,7 @@ impl RiftMcp {
         &self,
         params: &SearchParams,
         published: &PublishedWorkspace,
-        budget: Duration,
+        deadline: RequestDeadline,
     ) -> Result<Option<SearchRanking>, ErrorData> {
         // A global scope never consults the project store, and a selected package index
         // answers the full-text input from its own documents, so the shares stay what the
@@ -1773,7 +1837,7 @@ impl RiftMcp {
         };
         let tree_revision = published.reads.tree_revision();
         let (searched, commit_state) = self
-            .store_answer(index, tree_revision, &parsed, budget)
+            .store_answer(index, tree_revision, &parsed, deadline)
             .await?;
         Ok(ranking_of(
             searched,
@@ -1863,11 +1927,11 @@ impl RiftMcp {
     /// lexical lane, after waiting out a commit in flight.
     ///
     /// A store that does not hold the captured tree while the lane is still committing
-    /// it is a transient condition: the read waits for that commit to land under
-    /// `budget`, then reads the store and the state again once. `Owed` and `Settled`
-    /// never wait, since no held transaction can change either. A wait that runs out
-    /// leaves `Committing` standing, which is what [`ranking_of`] warns about. Without a
-    /// lane the revision counts as settled: nothing could commit it.
+    /// it is a transient condition: the read waits for that commit to land by
+    /// `deadline`, then reads the store and the state again once. `Owed` and `Settled`
+    /// never wait, since no held transaction can change either. A wait that reaches the
+    /// deadline leaves `Committing` standing, which is what [`ranking_of`] warns about.
+    /// Without a lane the revision counts as settled: nothing could commit it.
     ///
     /// # Cancel safety
     ///
@@ -1877,7 +1941,7 @@ impl RiftMcp {
         index: &SearchIndex,
         tree_revision: &str,
         query: &ParsedQuery,
-        budget: Duration,
+        deadline: RequestDeadline,
     ) -> Result<(RevisionScoped<PhasedRanking>, LexicalCommitState), ErrorData> {
         let searched = self.read_store(index, tree_revision, query).await?;
         let Some(lane) = self.lexical.as_ref() else {
@@ -1888,7 +1952,7 @@ impl RiftMcp {
         if matched || commit_state != LexicalCommitState::Committing {
             return Ok((searched, commit_state));
         }
-        let commit_state = commit_landed(lane, tree_revision, budget).await;
+        let commit_state = commit_landed(lane, tree_revision, deadline).await;
         let searched = self.read_store(index, tree_revision, query).await?;
         Ok((searched, commit_state))
     }
@@ -1931,7 +1995,10 @@ impl RiftMcp {
     where
         Answer: ReadAnswer + Send + 'static,
     {
-        let resolved = self.published_workspace(wire::ErrorPhase::Read).await?;
+        let deadline = self.request_deadline().await;
+        let resolved = self
+            .published_workspace(wire::ErrorPhase::Read, deadline)
+            .await?;
         let Some(rev) = rev else {
             return self.current_tree_read(&resolved, operation).await;
         };
@@ -2021,21 +2088,21 @@ impl RiftMcp {
 
     /// Returns one atomically published index and configuration policy.
     ///
-    /// The wait is bounded by `[server] readiness_timeout` from the last
-    /// accepted `rift.toml` - the default table's value while the file is
-    /// invalid, since the acceptance failure itself is what a request
-    /// meets once the wait ends. The deadline starts here, covering index
-    /// validation; a caller that goes on to wait for a specific engine's
-    /// readiness spends what remains of the same budget, not a fresh one.
+    /// The wait ends at `deadline`, which the request took once from
+    /// `[server] readiness_timeout` on the last accepted `rift.toml` - the
+    /// default table's value while the file is invalid, since the acceptance
+    /// failure itself is what a request meets once the wait ends. Index
+    /// validation, the lexical lane's transaction, and a specific engine's
+    /// readiness all spend that one budget, never a fresh one each.
     async fn published_workspace(
         &self,
         phase: wire::ErrorPhase,
+        deadline: RequestDeadline,
     ) -> Result<ResolvedWorkspace, ErrorData> {
-        let timeout = self.readiness_timeout().await;
-        let deadline = tokio::time::Instant::now() + timeout;
-        let Ok(result) = tokio::time::timeout_at(deadline, self.reconcile_workspace(phase)).await
+        let Ok(result) =
+            tokio::time::timeout_at(deadline.at(), self.reconcile_workspace(phase)).await
         else {
-            let detail = self.readiness_stall(timeout).await;
+            let detail = self.readiness_stall(deadline.budget()).await;
             tracing::warn!(
                 component = "index",
                 operation = "index.readiness",
@@ -2076,7 +2143,12 @@ impl RiftMcp {
         )
     }
 
-    /// The `[server] readiness_timeout` this request's wait is bounded by,
+    /// The deadline every wait in one request shares, starting now.
+    async fn request_deadline(&self) -> RequestDeadline {
+        RequestDeadline::starting(self.readiness_timeout().await)
+    }
+
+    /// The `[server] readiness_timeout` this request's waits are bounded by,
     /// read from whatever configuration is currently published - stale or
     /// not, since a deadline this call needs before validation can even
     /// begin cannot itself wait on that validation.
@@ -2918,7 +2990,7 @@ mod tests {
     use crate::validation::RebuildRequest;
     use crate::validation::tests::empty_package_branch;
 
-    use super::{BlockingExecutor, Parameters, RiftMcp};
+    use super::{BlockingExecutor, Parameters, RequestDeadline, RiftMcp};
     use crate::validation::lexical_double::StoreDouble;
     use crate::validation::{
         LEXICAL_COMMIT_TIMEOUT, LexicalCommitState, LexicalLane, PublishedWorkspace,
@@ -4016,8 +4088,9 @@ mod tests {
             "[languages.python.lsp]\nembedded = 'ty'\nretry = { attempts = 2, delay = '1ms', delay_limit = '1ms' }\n",
         )?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        let deadline = server.request_deadline().await;
         let resolved = server
-            .published_workspace(rift_protocol::error::ErrorPhase::Read)
+            .published_workspace(rift_protocol::error::ErrorPhase::Read, deadline)
             .await?;
         let before = resolved.published.fingerprint.clone();
         let params = serde_json::from_value(json!({"target": "symbol", "traversal": {
@@ -4035,10 +4108,9 @@ mod tests {
                 .is_none(),
             "the captured publication predates the new caller"
         );
-        let budget = server.readiness_timeout().await;
-        let (current, _, references) = tokio::time::timeout(
-            budget,
-            server.current_tree_references(resolved, None, &params, budget),
+        let (current, _, references) = tokio::time::timeout_at(
+            deadline.at(),
+            server.current_tree_references(resolved, None, &params, deadline),
         )
         .await
         .map_err(|_| "reference recapture exceeded the request deadline")??;
@@ -4956,7 +5028,11 @@ mod tests {
         let params: SearchParams = serde_json::from_value(json!({"query": "beacon"}))?;
         let started = tokio::time::Instant::now();
         let ranking = server
-            .ranking(&params, &published, COMMIT_WAIT_BUDGET)
+            .ranking(
+                &params,
+                &published,
+                RequestDeadline::starting(COMMIT_WAIT_BUDGET),
+            )
             .await?
             .ok_or("a tree still committing ranks by identifier matching alone")?;
         let waited = started.elapsed();
@@ -4988,7 +5064,7 @@ mod tests {
         let budget = server.readiness_timeout().await;
         let started = tokio::time::Instant::now();
         let ranking = server
-            .ranking(&params, &published, budget)
+            .ranking(&params, &published, RequestDeadline::starting(budget))
             .await?
             .ok_or("a settled store ranks")?;
         let waited = started.elapsed();
@@ -5000,6 +5076,106 @@ mod tests {
         assert!(
             waited < budget / 100,
             "a settled store answers without waiting: {waited:?} under {budget:?}"
+        );
+        Ok(())
+    }
+
+    /// One request's budget, spent across the waits it makes rather than once per wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_deadline_spends_one_budget_across_its_waits() -> TestResult {
+        let deadline = RequestDeadline::starting(COMMIT_WAIT_BUDGET);
+
+        assert_eq!(deadline.budget(), COMMIT_WAIT_BUDGET);
+        assert_eq!(deadline.remaining(), COMMIT_WAIT_BUDGET);
+        assert!(
+            !deadline.is_spent(),
+            "a request that just entered has its budget"
+        );
+
+        tokio::time::sleep(COMMIT_WAIT_BUDGET / 4).await;
+        assert_eq!(
+            deadline.remaining(),
+            COMMIT_WAIT_BUDGET * 3 / 4,
+            "a wait leaves the rest of the budget, not a fresh one"
+        );
+
+        tokio::time::sleep(COMMIT_WAIT_BUDGET).await;
+        assert_eq!(deadline.remaining(), Duration::ZERO);
+        assert!(deadline.is_spent(), "the budget does not go negative");
+        Ok(())
+    }
+
+    /// A commit wait handed a deadline an earlier wait already spent part of waits out
+    /// what remains of that budget, never a fresh one.
+    #[tokio::test(start_paused = true)]
+    async fn a_commit_wait_spends_what_the_request_deadline_has_left() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (server, _double) = server_over_gated_store(directory.path()).await?;
+        let published = current_publication(&server).await;
+        let params: SearchParams = serde_json::from_value(json!({"query": "beacon"}))?;
+        let deadline = RequestDeadline::starting(COMMIT_WAIT_BUDGET);
+        // An earlier wait in the same request took half of it.
+        tokio::time::sleep(COMMIT_WAIT_BUDGET / 2).await;
+
+        let started = tokio::time::Instant::now();
+        let ranking = server
+            .ranking(&params, &published, deadline)
+            .await?
+            .ok_or("a tree still committing ranks by identifier matching alone")?;
+        let waited = started.elapsed();
+
+        assert!(
+            unavailable_detail(&ranking).is_some(),
+            "the held transaction leaves the ranked tier unavailable: {:?}",
+            ranking.warnings
+        );
+        assert_eq!(
+            waited,
+            COMMIT_WAIT_BUDGET / 2,
+            "the wait ends at the request deadline: {waited:?}"
+        );
+        Ok(())
+    }
+
+    /// The whole budget a stalled publication wait reports, and the bound the wait itself
+    /// ends at: the remainder of the deadline the request carries.
+    const STALLED_PUBLICATION_BUDGET: Duration = Duration::from_secs(1);
+
+    /// A publication wait ends at the request's own deadline, and its refusal names the
+    /// whole budget the request was given.
+    #[tokio::test]
+    async fn a_publication_wait_ends_at_the_deadline_the_request_carries() -> TestResult {
+        let (directory, assembled) = unsupervised_fixture().await?;
+        let server = &assembled.server;
+        // The tree moves past the publication, so the read waits for a rebuild that the
+        // stopped supervisor never runs.
+        fs::write(directory.path().join("lantern.rs"), "pub fn lantern() {}\n")?;
+        server
+            .validation
+            .observed_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let deadline = RequestDeadline::starting(STALLED_PUBLICATION_BUDGET);
+        // An earlier wait in the same request took half of it.
+        tokio::time::sleep(STALLED_PUBLICATION_BUDGET / 2).await;
+
+        let started = std::time::Instant::now();
+        let Err(error) = server
+            .published_workspace(rift_protocol::error::ErrorPhase::Read, deadline)
+            .await
+        else {
+            return Err("a rebuild nothing runs spends the request's remaining budget".into());
+        };
+        let waited = started.elapsed();
+
+        assert!(
+            waited < STALLED_PUBLICATION_BUDGET,
+            "the wait ends at the request's deadline, not a fresh budget: {waited:?}"
+        );
+        assert!(
+            error
+                .message
+                .contains(&format!("{}ms", STALLED_PUBLICATION_BUDGET.as_millis())),
+            "the refusal names the whole budget the request was given: {error:?}"
         );
         Ok(())
     }
@@ -5983,9 +6159,9 @@ mod tests {
         fs::write(other.path().join("lib.rs"), "pub fn lantern() {}\n")?;
         let moved = stable_candidate(other.path(), 0)?;
         let params: SearchParams = serde_json::from_value(json!({"query": "lantern"}))?;
-        let budget = server.readiness_timeout().await;
+        let deadline = server.request_deadline().await;
         assert!(
-            server.ranking(&params, &moved, budget).await?.is_none(),
+            server.ranking(&params, &moved, deadline).await?.is_none(),
             "a store that never held this tree ends the attempt rather than ranking"
         );
         Ok(())

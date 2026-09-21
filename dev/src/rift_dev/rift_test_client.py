@@ -49,6 +49,11 @@ MESSAGE_BYTES_MAX = 16 * 1024 * 1024
 PAGE_COUNT_MAX = 32
 POLL_SECONDS = 0.05
 STOP_SECONDS = 5.0
+# The SDK session's own read timeout stands strictly inside the deadline the client puts
+# around the same call. Equal bounds fire together, so a call that runs long comes back as
+# a cancelled transport instead of the session's own refusal, and which of the two a test
+# reports is a race. The client carries the session's bound plus room for that refusal.
+SESSION_DEADLINE_MARGIN_SECONDS = 5.0
 _GATE_DEADLINE: ContextVar[float | None] = ContextVar(
     "rift_gate_deadline", default=None
 )
@@ -247,9 +252,10 @@ def stderr_log(path: Path | None = None) -> Iterator[TextIO]:
 class Client:
     """Validate calls against the schemas advertised by one SDK session."""
 
-    def __init__(self, session: ClientSession, call_seconds: float = 120.0) -> None:
+    def __init__(self, session: ClientSession, session_seconds: float = 120.0) -> None:
+        """Bound each call by `session_seconds` plus the session refusal's own room."""
         self.session = session
-        self.call_seconds = call_seconds
+        self.call_seconds = session_seconds + SESSION_DEADLINE_MARGIN_SECONDS
         self.tools: dict[str, types.Tool] = {}
         self.exercised: set[str] = set()
 
@@ -480,7 +486,9 @@ class Server:
     ) -> AsyncIterator[Client]:
         """Connect through the SDK's real `rift mcp` stdio subprocess.
 
-        An explicit log_path keeps concurrent connections' stderr files separate.
+        `call_seconds` is the session's own read timeout; the client's deadline stands
+        above it by SESSION_DEADLINE_MARGIN_SECONDS. An explicit log_path keeps
+        concurrent connections' stderr files separate.
         """
         proxy_log = log_path or self.log_path.with_suffix(".mcp.log")
         outside_workspace(proxy_log, self.root)

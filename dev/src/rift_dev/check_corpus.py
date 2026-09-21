@@ -49,13 +49,29 @@ from rift_dev.rift_test_client import (
     string_value,
 )
 
-# The server answers one read within `[server] readiness_timeout`, degrading to identifier
-# matching when the lexical lane has not landed its transaction. A client deadline equal to
-# that budget tears the transport down at the instant the server answers, so a read whose
-# lane genuinely needs the whole budget can never deliver the answer the contract promises.
-# The read carries the budget plus room for that answer to arrive.
+# The budgets bounding one corpus case each stand strictly inside the one outside them,
+# so a breach fails naming the action that ran long instead of tearing down whatever the
+# next budget out was waiting on:
+#
+#     STEADY_READ_SECONDS < READINESS_SECONDS < READ_SECONDS < CONVERGENCE_SECONDS
+#                                                            < Corpus.work_seconds()
+#
+# READINESS_SECONDS is what the corpus writes to `[server] readiness_timeout`. The server
+# answers one read within it, degrading to identifier matching when the lexical lane has
+# not landed its transaction. A client deadline equal to that budget tears the transport
+# down at the instant the server answers, so a read whose lane genuinely needs the whole
+# budget can never deliver the answer the contract promises. The read carries the budget
+# plus room for that answer to arrive.
 READINESS_SECONDS = 30.0
 READ_SECONDS = READINESS_SECONDS + 10.0
+# A tool's first read over a large workspace under sustained edits waits for the first
+# index to land, so it gets the whole read budget. Every read after it answers from a
+# published index: run 35661449692 over `nextjs` measured 53 such reads at a median of
+# 1.56 seconds, one outlier at 7.24 waiting out a rebuild, and everything else under 3.34,
+# against a first `search` that spent the server's whole budget. The steady budget stands
+# well above that outlier and strictly inside the readiness budget, so a steady read that
+# starts waiting for the index fails the case instead of hiding in the first read's room.
+STEADY_READ_SECONDS = READINESS_SECONDS * 2 / 3
 # Seconds a case keeps inside its own deadline for the served tree's removal,
 # the report write, and the process exit. Nextest allows the same grace after
 # it ends a corpus case, so the two bounds agree on what cleanup costs.
@@ -91,6 +107,9 @@ CHURN_REQUESTS: dict[str, JsonObject] = {
     "get_symbol": {"name": "corpus_probe"},
     "nodes": {"path": PROBE_PATH, "position": 0},
 }
+# The convergence loop resends every churn tool until the newest source lands, so it
+# stands outside the reads it repeats: one whole read budget for each of them.
+CONVERGENCE_SECONDS = READ_SECONDS * len(CHURN_REQUESTS)
 
 
 class Corpus:
@@ -474,13 +493,21 @@ class Corpus:
         )
 
     async def await_probe(self, present: bool) -> None:
-        async with asyncio.timeout(OBSERVATION_SECONDS):
-            for _ in range(int(OBSERVATION_SECONDS / POLL_SECONDS)):
-                if (probe_units(self.root) > 0) == present:
-                    return
-                await asyncio.sleep(POLL_SECONDS)
+        """Wait for the lexical publication to reach `present` under one budget.
+
+        The deadline drives the loop on its own. A separate iteration count of
+        OBSERVATION_SECONDS / POLL_SECONDS is the same budget spelled twice, and the
+        loop could never reach its last iteration inside it, so the count decided
+        nothing and the failure it raised was unreachable.
+        """
+        deadline = time.monotonic() + OBSERVATION_SECONDS
+        while time.monotonic() < deadline:
+            if (probe_units(self.root) > 0) == present:
+                return
+            await asyncio.sleep(POLL_SECONDS)
         raise AssertionError(
-            f"lexical probe publication never reached present={present}"
+            f"lexical probe publication never reached present={present} "
+            f"within {OBSERVATION_SECONDS}s"
         )
 
     async def symlinks(self, client: Client) -> None:
@@ -571,11 +598,15 @@ class Corpus:
         async def read(name: str, identity: str | None) -> tuple[str, int]:
             nonlocal overlaps
             before = len(sources)
+            # A tool's first read waits for the index this workspace is still building;
+            # every read after it answers from a published one.
+            first = not timings[name]
+            budget = READ_SECONDS if first else STEADY_READ_SECONDS
             started = time.monotonic()
             codes: list[str] = []
             revision: int | None = None
             try:
-                async with gate_deadline(f"churn {name}", READ_SECONDS):
+                async with gate_deadline(f"churn {name}", budget):
                     answer = await client.call(name, CHURN_REQUESTS[name])
                 codes = [
                     string_value(warning.get("code"), "warning code")
@@ -597,6 +628,8 @@ class Corpus:
                     "churn_read",
                     tool=name,
                     seconds=elapsed,
+                    deadline_seconds=budget,
+                    first=first,
                     writes=changed,
                     source_revision=revision,
                     source_revision_at_start=before - 1,
@@ -611,7 +644,9 @@ class Corpus:
             reads = 0
             tools = tuple(CHURN_REQUESTS)
             pressure_calls = {name: 0 for name in tools}
-            async with gate_deadline("corpus churn", self.work_seconds()):
+            async with gate_deadline(
+                "corpus churn", self.work_seconds() - CONVERGENCE_SECONDS
+            ):
                 while reads < READ_COUNT or overlaps < 2:
                     name = tools[reads % len(tools)]
                     await read(name, identity)
@@ -624,7 +659,7 @@ class Corpus:
             await asyncio.gather(task, return_exceptions=True)
             final = [sources[-1]]
             convergence = time.monotonic()
-            async with gate_deadline("churn final source", READ_SECONDS):
+            async with gate_deadline("churn final source", CONVERGENCE_SECONDS):
                 for name in CHURN_REQUESTS:
                     while True:
                         _identity, revision = await read(name, identity)
@@ -648,8 +683,13 @@ class Corpus:
                 edits=len(sources),
                 overlapping_writes=overlaps,
                 read_seconds_max=READ_SECONDS,
+                steady_read_seconds_max=STEADY_READ_SECONDS,
                 latency={
-                    name: {"calls": len(values), "maximum_seconds": max(values)}
+                    name: {
+                        "calls": len(values),
+                        "first_seconds": values[0],
+                        "maximum_seconds": max(values),
+                    }
                     for name, values in timings.items()
                 },
                 final_source=final[0],

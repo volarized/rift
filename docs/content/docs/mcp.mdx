@@ -61,8 +61,9 @@ The search ranking tiers carry their own warnings:
   tree revision. Ranking falls back to identifier matching, so a query phrased as prose finds
   nothing; the tier is read under the answer's own tree revision, so one that has moved past it
   is recaptured rather than warned about, a case a caller cannot otherwise tell apart from a
-  tier that searched and found nothing. A read waits for a commit in flight up to
-  `[server] readiness_timeout` and warns only when that budget runs out.
+  tier that searched and found nothing. A read waits for a commit in flight until its
+  `[server] readiness_timeout` budget is spent, and warns only then; the wait shares that
+  budget with everything else the read waits for.
 - `lexical_ranking_truncated` - the lexical ranking stopped at `matches_max` units, and hits
   past that bound never reach a page, whatever `paths` selects. `total_pages` counts the units
   that did; a narrower `query` brings the rest inside the bound.
@@ -447,8 +448,9 @@ engine is configured, or the engine lacks reference support, the walk refuses
 
 The server captures source and configuration before and after the engine request. If either
 changes, the server captures the current publication, refreshes the search ranking, and repeats
-the reference request, with at most three attempts. Reference resolution and these retries share
-one `[server] readiness_timeout` deadline. Exhausted attempts or an expired deadline return
+the reference request, with at most three attempts. The publication wait, the search ranking,
+reference resolution, and these retries share one `[server] readiness_timeout` deadline, taken
+once where the request enters. Exhausted attempts or an expired deadline return
 `temporarily_unavailable` with `retry: "same_request"`.
 
 A stale publication uses indexed relationships and carries `stale_index`. Each engine request
