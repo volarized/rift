@@ -907,13 +907,15 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
-    /// The vector ranking is still being built, so the answer was ranked lexically alone.
-    /// `prepared` and `total` state how many declarations already carry a vector, and
-    /// `ready_in` is derived from workspace size and embedding progress.
+    /// The vector ranking holds no vectors for the tree this read captured, so the answer
+    /// was ranked lexically alone. The pass over that tree is still running, or the tree
+    /// was published after the corpus the ranking holds was described. `prepared` and
+    /// `total` state how far the ranking has got for the captured tree, and `ready_in` is
+    /// derived from workspace size and embedding progress.
     VectorIndexPreparing {
-        /// Declarations that already carry a vector.
+        /// Declarations of the captured tree that already carry a vector.
         prepared: u64,
-        /// Declarations the published set holds.
+        /// Declarations the set being embedded holds.
         total: u64,
         /// Estimated wait before the vector ranking joins an answer, not a measurement
         /// of this machine. A caller may report it and must not schedule against it.

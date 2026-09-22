@@ -508,7 +508,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The vector ranking is still being built, so the answer was ranked lexically alone.\n`prepared` and `total` state how many declarations already carry a vector, and\n`ready_in` is derived from workspace size and embedding progress.",
+                "description": "The vector ranking holds no vectors for the tree this read captured, so the answer\nwas ranked lexically alone. The pass over that tree is still running, or the tree\nwas published after the corpus the ranking holds was described. `prepared` and\n`total` state how far the ranking has got for the captured tree, and `ready_in` is\nderived from workspace size and embedding progress.",
                 "properties": {
                   "code": {
                     "const": "vector_index_preparing",
@@ -520,7 +520,7 @@
                     "type": "string"
                   },
                   "prepared": {
-                    "description": "Declarations that already carry a vector.",
+                    "description": "Declarations of the captured tree that already carry a vector.",
                     "format": "uint64",
                     "minimum": 0,
                     "type": "integer"
@@ -530,7 +530,7 @@
                     "description": "Estimated wait before the vector ranking joins an answer, not a measurement\nof this machine. A caller may report it and must not schedule against it."
                   },
                   "total": {
-                    "description": "Declarations the published set holds.",
+                    "description": "Declarations the set being embedded holds.",
                     "format": "uint64",
                     "minimum": 0,
                     "type": "integer"
@@ -2334,7 +2334,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The vector ranking is still being built, so the answer was ranked lexically alone.\n`prepared` and `total` state how many declarations already carry a vector, and\n`ready_in` is derived from workspace size and embedding progress.",
+                "description": "The vector ranking holds no vectors for the tree this read captured, so the answer\nwas ranked lexically alone. The pass over that tree is still running, or the tree\nwas published after the corpus the ranking holds was described. `prepared` and\n`total` state how far the ranking has got for the captured tree, and `ready_in` is\nderived from workspace size and embedding progress.",
                 "properties": {
                   "code": {
                     "const": "vector_index_preparing",
@@ -2346,7 +2346,7 @@
                     "type": "string"
                   },
                   "prepared": {
-                    "description": "Declarations that already carry a vector.",
+                    "description": "Declarations of the captured tree that already carry a vector.",
                     "format": "uint64",
                     "minimum": 0,
                     "type": "integer"
@@ -2356,7 +2356,7 @@
                     "description": "Estimated wait before the vector ranking joins an answer, not a measurement\nof this machine. A caller may report it and must not schedule against it."
                   },
                   "total": {
-                    "description": "Declarations the published set holds.",
+                    "description": "Declarations the set being embedded holds.",
                     "format": "uint64",
                     "minimum": 0,
                     "type": "integer"
@@ -4014,7 +4014,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The vector ranking is still being built, so the answer was ranked lexically alone.\n`prepared` and `total` state how many declarations already carry a vector, and\n`ready_in` is derived from workspace size and embedding progress.",
+                "description": "The vector ranking holds no vectors for the tree this read captured, so the answer\nwas ranked lexically alone. The pass over that tree is still running, or the tree\nwas published after the corpus the ranking holds was described. `prepared` and\n`total` state how far the ranking has got for the captured tree, and `ready_in` is\nderived from workspace size and embedding progress.",
                 "properties": {
                   "code": {
                     "const": "vector_index_preparing",
@@ -4026,7 +4026,7 @@
                     "type": "string"
                   },
                   "prepared": {
-                    "description": "Declarations that already carry a vector.",
+                    "description": "Declarations of the captured tree that already carry a vector.",
                     "format": "uint64",
                     "minimum": 0,
                     "type": "integer"
@@ -4036,7 +4036,7 @@
                     "description": "Estimated wait before the vector ranking joins an answer, not a measurement\nof this machine. A caller may report it and must not schedule against it."
                   },
                   "total": {
-                    "description": "Declarations the published set holds.",
+                    "description": "Declarations the set being embedded holds.",
                     "format": "uint64",
                     "minimum": 0,
                     "type": "integer"

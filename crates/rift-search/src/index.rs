@@ -62,11 +62,12 @@ const PER_FILE_MAX_DEFAULT: u64 = 3;
 pub enum VectorReadiness {
     /// No vector ranking: the workspace turned it off.
     Disabled,
-    /// Embedding is under way.
+    /// Embedding is under way, or the corpus describes another tree than the one
+    /// this readiness was read for.
     Preparing {
-        /// Declarations that already carry a vector.
+        /// Declarations of that tree that already carry a vector.
         prepared: u64,
-        /// Declarations the published set holds.
+        /// Declarations the set being embedded holds.
         total: u64,
     },
     /// Every declaration in the published set has a vector.
@@ -87,25 +88,45 @@ impl VectorReadiness {
 
 /// What one store read answered for one query phase.
 ///
-///
 /// The store contributes ordered identities, never a fused score: the caller
 /// fuses them with the identifier ranking it built itself, so all three
 /// inputs meet in one place under one set of weights.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+///
+/// The vector ranking's readiness travels with those inputs rather than beside
+/// them. A caller that reads the readiness off the index after this answer is
+/// built reads it at a later instant, and a pass landing between the two turns
+/// a vector ranking that declined into one reporting nothing left to wait for.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoreRanking {
     inputs: Vec<RankingInput>,
     lexical_truncated_at: Option<u32>,
+    readiness: VectorReadiness,
 }
 
 impl StoreRanking {
-    /// Names the inputs one phase produced and the bound the full-text
-    /// ranking stopped at.
+    /// Names the inputs one phase produced, the bound the full-text ranking
+    /// stopped at, and the readiness the vector ranking decided under.
     #[must_use]
-    pub const fn new(inputs: Vec<RankingInput>, lexical_truncated_at: Option<u32>) -> Self {
+    pub const fn new(
+        inputs: Vec<RankingInput>,
+        lexical_truncated_at: Option<u32>,
+        readiness: VectorReadiness,
+    ) -> Self {
         Self {
             inputs,
             lexical_truncated_at,
+            readiness,
         }
+    }
+
+    /// What the vector ranking could do for the tree this phase was read for.
+    ///
+    /// This is the readiness a caller reports on the answer these inputs
+    /// produce. It is decided in the same call that decided whether the vector
+    /// tier contributes, so it cannot say the tier answered a read it declined.
+    #[must_use]
+    pub const fn readiness(&self) -> VectorReadiness {
+        self.readiness
     }
 
     /// The inputs, in the order the store ran them.
@@ -448,9 +469,37 @@ pub struct SearchIndex {
     lexical: LexicalSearchIndex,
     vectors: VectorStore,
     model: Mutex<Option<Arc<LoadedModel>>>,
-    readiness: Mutex<VectorReadiness>,
+    pass: Mutex<PassOutcome>,
     held: Mutex<Option<Arc<HeldCorpus>>>,
     limits: SearchIndexLimits,
+}
+
+/// What the last embedding pass left behind.
+///
+/// The readiness a read is told is derived from this together with the corpus
+/// that pass published, in one call, so a read can never be told the vector
+/// ranking answered a tree its scan declined.
+#[derive(Clone, Copy, Debug)]
+struct PassOutcome {
+    /// How far the pass got over the set it described.
+    readiness: VectorReadiness,
+    /// Declarations that set held.
+    described: u64,
+}
+
+/// What the vector ranking does for one tree, decided once.
+///
+/// The scan and the readiness are one decision read two ways: a read ranks
+/// through what this carries and reports the readiness beside it.
+struct VectorScan {
+    scanned: Option<ScannedCorpus>,
+    readiness: VectorReadiness,
+}
+
+/// The model and the corpus one scan runs over.
+struct ScannedCorpus {
+    model: Arc<LoadedModel>,
+    corpus: Arc<HeldCorpus>,
 }
 
 impl SearchIndex {
@@ -498,7 +547,10 @@ impl SearchIndex {
             lexical,
             vectors,
             model: Mutex::new(None),
-            readiness: Mutex::new(limits.initial_readiness()),
+            pass: Mutex::new(PassOutcome {
+                readiness: limits.initial_readiness(),
+                described: 0,
+            }),
             held: Mutex::new(None),
             limits,
         })
@@ -529,7 +581,7 @@ impl SearchIndex {
         source: &ModelSource,
         limits: AcquisitionLimits,
     ) -> Result<(), SearchError> {
-        if self.readiness() == VectorReadiness::Disabled {
+        if self.pass_readiness() == VectorReadiness::Disabled {
             return Ok(());
         }
         match self.load(source, limits).await {
@@ -559,7 +611,7 @@ impl SearchIndex {
         models: EmbeddingModels,
         space: EmbeddingSpace,
     ) -> Result<(), SearchError> {
-        if self.readiness() == VectorReadiness::Disabled {
+        if self.pass_readiness() == VectorReadiness::Disabled {
             return Ok(());
         }
         self.hold(LoadedModel { space, models }).await
@@ -670,6 +722,12 @@ impl SearchIndex {
     /// the two returned here with the identifier ranking it built itself, so
     /// all three meet under one set of weights.
     ///
+    /// The answer carries the vector ranking's readiness for this tree, decided in the
+    /// same call that decided whether that tier contributes. A caller reports what the
+    /// answer carries and never reads the readiness off the index afterwards: a pass
+    /// landing between the two reads would report nothing left to wait for on an answer
+    /// the vector tier declined to rank.
+    ///
     /// A query carrying no member returns no input: the full-text ranking has
     /// no term to match, and the vector ranking would rank the retrieval
     /// prefix alone.
@@ -689,6 +747,7 @@ impl SearchIndex {
         phase: QueryPhase,
         limit: u32,
     ) -> Result<RevisionScoped<StoreRanking>, SearchError> {
+        let scan = self.vector_scan(tree_revision);
         let lexical = match self
             .lexical
             .search(tree_revision, query, phase, limit)
@@ -702,26 +761,42 @@ impl SearchIndex {
             RevisionScoped::NoRevision => return Ok(RevisionScoped::NoRevision),
         };
         if query.is_empty() {
-            return Ok(RevisionScoped::Matched(StoreRanking::default()));
+            return Ok(RevisionScoped::Matched(StoreRanking::new(
+                Vec::new(),
+                None,
+                scan.readiness,
+            )));
         }
         let lexical_truncated_at = lexical.truncated_at();
         let mut inputs = vec![lexical.into_input()];
         if phase == QueryPhase::Precise {
-            inputs.push(self.vector_input(query.source(), tree_revision).await?);
+            inputs.push(match scan.scanned.as_ref() {
+                Some(scanned) => self.vector_input(query.source(), scanned).await?,
+                None => RankingInput::unanswered(RankingInputKind::Vector),
+            });
         }
         Ok(RevisionScoped::Matched(StoreRanking {
             inputs,
             lexical_truncated_at,
+            readiness: scan.readiness,
         }))
     }
 
-    /// What the vector ranking can answer right now.
+    /// How far the last embedding pass got.
+    ///
+    /// This is the pass's own state, not what a read may report: a pass reaches
+    /// [`VectorReadiness::Ready`] over the set it described, and the corpus it
+    /// published answers that tree alone. A read reports the readiness its own
+    /// [`StoreRanking`] carries, which is decided against the tree that read
+    /// captured.
     #[must_use]
-    pub fn readiness(&self) -> VectorReadiness {
-        *self
-            .readiness
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+    pub fn pass_readiness(&self) -> VectorReadiness {
+        self.pass_outcome().readiness
+    }
+
+    /// What the last pass left behind, both halves together.
+    fn pass_outcome(&self) -> PassOutcome {
+        *self.pass.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The tree revision the lexical tier is stamped with.
@@ -820,7 +895,7 @@ impl SearchIndex {
             .map_err(store_failed)?;
         let corpus = self.read_corpus(model).await?;
         self.publish(&documents, corpus, tree_revision);
-        self.set_readiness(reached(as_count(documents.len()), total));
+        self.set_pass(reached(as_count(documents.len()), total), total);
         Ok(())
     }
 
@@ -883,18 +958,13 @@ impl SearchIndex {
         Ok(())
     }
 
-    /// The vector ranking for `tree_revision`, or nothing when the tier cannot answer
-    /// for that tree.
+    /// The vector ranking over the corpus [`SearchIndex::vector_scan`] chose.
     ///
     /// The scan runs over the corpus the last pass published, and the query
     /// path reads no vector row of its own: doing that cost one `SELECT` over
     /// every stored vector and one decode of every blob it returned, per
-    /// query. A held corpus with nothing in it ranks nothing, which is the
-    /// answer this gave when the store held nothing.
-    ///
-    /// A corpus described for another tree ranks nothing either. Embedding runs after
-    /// publication, so a workspace published moments ago is answered by the lexical tier
-    /// alone until the pass for that tree lands, and never by the previous tree's vectors.
+    /// query. Whether there is a corpus to scan at all is decided by the
+    /// caller, which reports that same decision as the answer's readiness.
     ///
     /// One `tokio::task::spawn_blocking` call carries both the query's forward
     /// pass and the cosine scan over the held corpus. Neither may hold a
@@ -905,31 +975,19 @@ impl SearchIndex {
     async fn vector_input(
         &self,
         query: &str,
-        tree_revision: &str,
+        scan: &ScannedCorpus,
     ) -> Result<RankingInput, SearchError> {
-        let unanswered = RankingInput::unanswered(RankingInputKind::Vector);
-        let Some(model) = self.serving_model() else {
-            return Ok(unanswered);
-        };
-        let Some(held) = self
-            .held()
-            .filter(|held| held.tree_revision == tree_revision)
-        else {
-            return Ok(unanswered);
-        };
-        if held.vectors.is_empty() {
-            return Ok(unanswered);
-        }
+        let ScannedCorpus { model, corpus } = scan;
         let depth = self.limits.depth();
         let embedded = model.models.embed_query(query).await?;
-        let scanned = Arc::clone(&held);
+        let scanned = Arc::clone(corpus);
         let matched =
             tokio::task::spawn_blocking(move || nearest(&embedded, &scanned.vectors, depth))
                 .await
                 .map_err(task_failed)??;
-        let placed = placed(&matched, &held.addresses);
+        let placed = placed(&matched, &corpus.addresses);
         let spread = spread_per_file(&placed, as_usize(self.limits.per_file_max));
-        let resolved = resolved(&spread, &held.addresses, as_usize(self.limits.candidates));
+        let resolved = resolved(&spread, &corpus.addresses, as_usize(self.limits.candidates));
         Ok(RankingInput::new(
             RankingInputKind::Vector,
             resolved
@@ -946,11 +1004,65 @@ impl SearchIndex {
 
     /// The model this index ranks through, when its readiness lets it answer.
     fn serving_model(&self) -> Option<Arc<LoadedModel>> {
-        if !self.readiness().answers() {
+        if !self.pass_readiness().answers() {
             return None;
         }
+        self.held_model()
+    }
+
+    /// The model this index holds, whatever the pass reached.
+    fn held_model(&self) -> Option<Arc<LoadedModel>> {
         let held = self.model.lock().unwrap_or_else(PoisonError::into_inner);
         held.as_ref().map(Arc::clone)
+    }
+
+    /// What the vector ranking can do for `tree_revision`, and how far it has got.
+    ///
+    /// A pass publishes its corpus before it records that it finished, and stamps that
+    /// corpus with the tree it described. Both facts are read here together with the
+    /// model a scan needs, so a tier that ranks nothing for this tree reports
+    /// `Preparing` rather than the `Ready` its last pass reached for another one. Every
+    /// decline this makes is a read that must wait, and the caller attaches that wait to
+    /// the answer as a warning.
+    fn vector_scan(&self, tree_revision: &str) -> VectorScan {
+        let outcome = self.pass_outcome();
+        let declined = |readiness| VectorScan {
+            scanned: None,
+            readiness,
+        };
+        if !outcome.readiness.answers() {
+            return declined(outcome.readiness);
+        }
+        // For this tree the corpus holds nothing, whatever it holds for the one the
+        // pass described.
+        let waiting = VectorReadiness::Preparing {
+            prepared: 0,
+            total: outcome.described,
+        };
+        let Some(model) = self.held_model() else {
+            return declined(waiting);
+        };
+        let Some(corpus) = self
+            .held()
+            .filter(|held| held.tree_revision == tree_revision)
+        else {
+            return declined(waiting);
+        };
+        if corpus.vectors.is_empty() {
+            // A pass that described nothing owes no vector, so its empty corpus is
+            // every vector that tree has. An empty corpus for a set that held
+            // declarations is a pass whose rows did not reach the store.
+            let reached = if outcome.described == 0 {
+                outcome.readiness
+            } else {
+                waiting
+            };
+            return declined(reached);
+        }
+        VectorScan {
+            scanned: Some(ScannedCorpus { model, corpus }),
+            readiness: outcome.readiness,
+        }
     }
 
     /// What the last pass published, or nothing when no pass has published yet.
@@ -985,21 +1097,31 @@ impl SearchIndex {
     /// Records that a pass embedded nothing, without clearing a tier that is
     /// off or one that already failed for good.
     fn note_nothing_embedded(&self, total: usize) {
-        if matches!(self.readiness(), VectorReadiness::Preparing { .. }) {
-            self.set_readiness(VectorReadiness::Preparing {
-                prepared: 0,
-                total: as_count(total),
-            });
+        if matches!(self.pass_readiness(), VectorReadiness::Preparing { .. }) {
+            let described = as_count(total);
+            self.set_pass(
+                VectorReadiness::Preparing {
+                    prepared: 0,
+                    total: described,
+                },
+                described,
+            );
         }
     }
 
-    /// Records how far the vector ranking has got.
+    /// Records how far a pass over `described` declarations got.
+    fn set_pass(&self, readiness: VectorReadiness, described: u64) {
+        let mut held = self.pass.lock().unwrap_or_else(PoisonError::into_inner);
+        *held = PassOutcome {
+            readiness,
+            described,
+        };
+    }
+
+    /// Records a readiness the described set behind it did not change.
     fn set_readiness(&self, readiness: VectorReadiness) {
-        let mut held = self
-            .readiness
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        *held = readiness;
+        let mut held = self.pass.lock().unwrap_or_else(PoisonError::into_inner);
+        held.readiness = readiness;
     }
 }
 

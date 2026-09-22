@@ -922,12 +922,14 @@ fn bounded_detail(mut detail: String, bytes_max: usize) -> String {
     detail
 }
 
-/// What the search store answered for both query phases of one request.
-#[derive(Debug, Default)]
+/// What the search store answered for both query phases of one request, and how far
+/// the vector ranking had got for the tree it was read for.
+#[derive(Debug)]
 struct PhasedRanking {
     precise: Vec<RankingInput>,
     broad: Vec<RankingInput>,
     lexical_truncated_at: Option<u32>,
+    readiness: VectorReadiness,
 }
 
 /// The ranking one search request merges, and what the search index's own state adds to
@@ -977,7 +979,6 @@ impl SearchRanking {
 /// bound never reach a page.
 fn ranking_of(
     searched: RevisionScoped<PhasedRanking>,
-    readiness: VectorReadiness,
     files: u64,
     tree_revision: &str,
     commit_state: LexicalCommitState,
@@ -985,7 +986,7 @@ fn ranking_of(
 ) -> Option<SearchRanking> {
     match (searched, commit_state) {
         (RevisionScoped::Matched(phased), _) => {
-            let mut warnings = readiness_warnings(readiness, files);
+            let mut warnings = readiness_warnings(phased.readiness, files);
             warnings.extend(phased.lexical_truncated_at.map(lexical_truncated));
             Some(SearchRanking {
                 answer: StoreAnswer::new(phased.precise, phased.broad, weights),
@@ -1841,7 +1842,6 @@ impl RiftMcp {
             .await?;
         Ok(ranking_of(
             searched,
-            index.readiness(),
             published.reads.file_count(),
             tree_revision,
             commit_state,
@@ -1890,6 +1890,7 @@ impl RiftMcp {
         };
         Ok(RevisionScoped::Matched(PhasedRanking {
             lexical_truncated_at: precise.lexical_truncated_at(),
+            readiness: precise.readiness(),
             precise: precise.into_inputs(),
             broad,
         }))
@@ -5908,7 +5909,7 @@ mod tests {
             .clone()
             .ok_or("a refused model must not stop the search index from opening")?;
         assert_eq!(
-            index.readiness(),
+            index.pass_readiness(),
             VectorReadiness::Disabled,
             "a refused model disables the tier rather than leaving it preparing"
         );
@@ -5946,7 +5947,7 @@ mod tests {
             .clone()
             .ok_or("an invalid configuration must not stop the search index from opening")?;
         assert_eq!(
-            index.readiness(),
+            index.pass_readiness(),
             VectorReadiness::Disabled,
             "a server that answers nothing must not spend a download first"
         );
@@ -6002,6 +6003,16 @@ mod tests {
         ranking.answer.precise().is_empty() && ranking.answer.broad().is_empty()
     }
 
+    /// One phased ranking that answered nothing, under `readiness`.
+    fn phased(readiness: VectorReadiness) -> super::PhasedRanking {
+        super::PhasedRanking {
+            precise: Vec::new(),
+            broad: Vec::new(),
+            lexical_truncated_at: None,
+            readiness,
+        }
+    }
+
     /// The one `lexical_ranking_unavailable` detail a ranking carries, or nothing when it
     /// carries none.
     fn unavailable_detail(ranking: &super::SearchRanking) -> Option<&str> {
@@ -6016,7 +6027,6 @@ mod tests {
         assert!(
             super::ranking_of(
                 RevisionScoped::OtherRevision("aaaaaaaa".to_owned()),
-                VectorReadiness::Ready,
                 10,
                 "bbbbbbbb",
                 LexicalCommitState::Settled,
@@ -6032,7 +6042,6 @@ mod tests {
     fn a_settled_store_holding_no_tree_warns_that_it_will_not_answer() -> TestResult {
         let ranking = super::ranking_of(
             RevisionScoped::NoRevision,
-            VectorReadiness::Ready,
             10,
             "bbbbbbbb",
             LexicalCommitState::Settled,
@@ -6055,7 +6064,6 @@ mod tests {
         ] {
             let ranking = super::ranking_of(
                 searched,
-                VectorReadiness::Ready,
                 10,
                 "bbbbbbbb",
                 LexicalCommitState::Committing,
@@ -6077,7 +6085,6 @@ mod tests {
     fn a_store_owed_a_whole_replace_warns_that_it_missed_a_commit() -> TestResult {
         let ranking = super::ranking_of(
             RevisionScoped::OtherRevision("aaaaaaaa".to_owned()),
-            VectorReadiness::Ready,
             10,
             "bbbbbbbb",
             LexicalCommitState::Owed {
@@ -6099,11 +6106,10 @@ mod tests {
     #[test]
     fn a_matched_store_ranks_its_units_and_carries_the_readiness_warning() -> TestResult {
         let ranking = super::ranking_of(
-            RevisionScoped::Matched(super::PhasedRanking::default()),
-            VectorReadiness::Preparing {
+            RevisionScoped::Matched(phased(VectorReadiness::Preparing {
                 prepared: 1,
                 total: 4,
-            },
+            })),
             10,
             "bbbbbbbb",
             LexicalCommitState::Committing,
@@ -6131,9 +6137,8 @@ mod tests {
         let ranking = super::ranking_of(
             RevisionScoped::Matched(super::PhasedRanking {
                 lexical_truncated_at: Some(1_000),
-                ..super::PhasedRanking::default()
+                ..phased(VectorReadiness::Ready)
             }),
-            VectorReadiness::Ready,
             10,
             "bbbbbbbb",
             LexicalCommitState::Settled,

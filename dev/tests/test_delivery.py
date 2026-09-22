@@ -9,7 +9,12 @@ in-process mutex, which nextest's separate test processes never share.
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
@@ -71,6 +76,125 @@ INCLUDED_HELPER = re.compile(r"^\s*mod\s+([a-z_][a-z0-9_]*)\s*;", re.MULTILINE)
 
 # A nextest filterset names one test binary as `binary(=<name>)`.
 FILTERED_BINARY = re.compile(r"binary\(=([a-z0-9_]+)\)")
+
+# The suites that read the model hub, and where each one lives. Every wait they
+# declare is spelled as a `Duration` constant, so the deadline nextest ends them
+# at has to sit above the sum of those waits: a test cut short by the deadline
+# reports a timeout instead of the readiness it reached.
+HUB_SUITES = {
+    "live_vector_search": "crates/rift-mcp/tests/live_vector_search.rs",
+    "live_model_sources": "crates/rift-search/tests/live_model_sources.rs",
+}
+
+# One declared wait, in the unit it was written in.
+DECLARED_WAIT = re.compile(r"Duration::from_(millis|secs|mins)\((\d[\d_]*)\)")
+
+# What one unit is worth in seconds.
+WAIT_SECONDS = {"millis": 0.001, "secs": 1.0, "mins": 60.0}
+
+# A nextest timeout is written as a count and a unit suffix.
+TIMEOUT_PERIOD = re.compile(r"^(\d+)(ms|s|m)$")
+TIMEOUT_SECONDS = {"ms": 0.001, "s": 1.0, "m": 60.0}
+
+# The workflow that merges a dependency pull request without a human, the step
+# that decides whether a bump may take that path, and the output it decides it
+# in.
+AUTOMERGE_WORKFLOW = "dependabot-automerge.yml"
+RANGE_STEP = "range"
+RANGE_OUTPUT = "breaking"
+
+
+def declared_waits(path: str) -> float:
+    """The seconds one suite's declared waits add up to.
+
+    The sum is what one test of that suite can spend before it gives up, since
+    no test waits on a budget it did not name.
+    """
+    source = (REPOSITORY / path).read_text(encoding="utf-8")
+    return sum(
+        WAIT_SECONDS[unit] * int(count.replace("_", ""))
+        for unit, count in DECLARED_WAIT.findall(source)
+    )
+
+
+def timeout_seconds(period: str) -> float:
+    """One nextest timeout period in seconds."""
+    matched = TIMEOUT_PERIOD.match(period)
+    assert matched, f"a nextest period is a count and a unit: {period!r}"
+    return TIMEOUT_SECONDS[matched.group(2)] * int(matched.group(1))
+
+
+def suite_deadline(binary: str) -> float:
+    """The seconds nextest lets one test of `binary` run for.
+
+    The deadline is `slow-timeout.period` times `terminate-after`, taken from
+    the override that names the binary, or from the default profile when none
+    does.
+    """
+    configuration = tomllib.loads(NEXTEST_CONFIGURATION.read_text(encoding="utf-8"))
+    profile = configuration["profile"]["default"]
+    timeout = profile["slow-timeout"]
+    for override in profile.get("overrides", []):
+        if f"binary(={binary})" in override["filter"] and "slow-timeout" in override:
+            timeout = override["slow-timeout"]
+    return timeout_seconds(timeout["period"]) * timeout.get("terminate-after", 1)
+
+
+def automerge_step(step_id: str) -> dict[str, Any]:
+    """One step of the auto-merge job, by its id."""
+    document = workflow_documents()[AUTOMERGE_WORKFLOW]
+    for step in document["jobs"]["automerge"]["steps"]:
+        if step.get("id") == step_id:
+            return step
+    raise AssertionError(f"{AUTOMERGE_WORKFLOW} has no step with id {step_id!r}")
+
+
+def updated_dependencies(*bumps: tuple[str, str]) -> str:
+    """`fetch-metadata`'s own JSON for the dependencies one pull request bumps.
+
+    Each bump is the version it moves from and the semver field that moved, the
+    two members the classification reads. The field names are the action's:
+    `dependabot/fetch-metadata@v3` serializes `updatedDependency`, whose version
+    members are `prevVersion` and `newVersion`.
+    """
+    return json.dumps(
+        [
+            {
+                "dependencyName": f"dependency-{index}",
+                "prevVersion": previous,
+                "newVersion": "",
+                "updateType": update_type,
+            }
+            for index, (previous, update_type) in enumerate(bumps)
+        ]
+    )
+
+
+def classified(updated: str) -> str:
+    """Runs the workflow's own classification over `updated` and reads its output.
+
+    The script is taken from the workflow file rather than restated here, so a
+    rule that changes in one place cannot pass a test asserting the other.
+    """
+    script = automerge_step(RANGE_STEP)["run"]
+    with tempfile.TemporaryDirectory() as directory:
+        output = Path(directory) / "output"
+        output.touch()
+        subprocess.run(
+            ["bash", "-e", "-c", script],
+            check=True,
+            env={
+                "PATH": os.environ["PATH"],
+                "UPDATED": updated,
+                "GITHUB_OUTPUT": str(output),
+            },
+        )
+        written = dict(
+            line.split("=", 1)
+            for line in output.read_text(encoding="utf-8").splitlines()
+            if "=" in line
+        )
+    return written[RANGE_OUTPUT]
 
 
 def workflow_documents() -> dict[str, Any]:
@@ -358,3 +482,147 @@ class MachineGlobalSuites(unittest.TestCase):
             "a mutex inside one test process serializes nothing across the "
             f"processes nextest runs; group these suites instead: {offenders}",
         )
+
+
+class AutoMergeHoldsBreakingBumps(unittest.TestCase):
+    """Auto-merge admits a bump only while it keeps its compatibility range.
+
+    A major bump is not the same thing. Cargo, npm and uv read a pre-1.0
+    version's leftmost non-zero field as the breaking one, so `0.10.9` to
+    `0.11.0` and `0.0.3` to `0.0.4` leave their ranges while Dependabot reports
+    them as a minor and a patch. Nothing reached `main` through this path while
+    every dependency run failed the required `rust` check; once those runs go
+    green the classification is the only thing left holding a breaking bump
+    back.
+    """
+
+    def setUp(self) -> None:
+        if shutil.which("jq") is None:
+            self.skipTest("the classification reads its metadata with jq")
+
+    def test_a_major_bump_above_one_is_held(self) -> None:
+        self.assertEqual(
+            classified(updated_dependencies(("1.4.0", "version-update:semver-major"))),
+            "true",
+        )
+
+    def test_a_minor_bump_above_one_merges(self) -> None:
+        self.assertEqual(
+            classified(updated_dependencies(("1.4.0", "version-update:semver-minor"))),
+            "false",
+        )
+
+    def test_a_patch_bump_above_one_merges(self) -> None:
+        self.assertEqual(
+            classified(
+                updated_dependencies(("2.87.15", "version-update:semver-patch"))
+            ),
+            "false",
+        )
+
+    def test_a_pre_one_minor_bump_is_held(self) -> None:
+        for previous in ("0.10.9", "0.26.13"):
+            with self.subTest(previous=previous):
+                self.assertEqual(
+                    classified(
+                        updated_dependencies((previous, "version-update:semver-minor"))
+                    ),
+                    "true",
+                    f"{previous} leaves its compatibility range on a minor bump",
+                )
+
+    def test_a_pre_one_patch_bump_merges(self) -> None:
+        self.assertEqual(
+            classified(
+                updated_dependencies(("0.26.12", "version-update:semver-patch"))
+            ),
+            "false",
+        )
+
+    def test_a_zero_zero_patch_bump_is_held(self) -> None:
+        self.assertEqual(
+            classified(updated_dependencies(("0.0.3", "version-update:semver-patch"))),
+            "true",
+            "every field of a 0.0.z version is breaking",
+        )
+
+    def test_a_tag_spelling_carrying_v_is_read_as_its_version(self) -> None:
+        self.assertEqual(
+            classified(
+                updated_dependencies(("v4.37.6", "version-update:semver-patch"))
+            ),
+            "false",
+        )
+
+    def test_a_group_keeping_every_range_merges(self) -> None:
+        self.assertEqual(
+            classified(
+                updated_dependencies(
+                    ("1.4.0", "version-update:semver-minor"),
+                    ("0.26.12", "version-update:semver-patch"),
+                    ("2.87.15", "version-update:semver-patch"),
+                )
+            ),
+            "false",
+        )
+
+    def test_one_breaking_entry_holds_a_whole_group(self) -> None:
+        self.assertEqual(
+            classified(
+                updated_dependencies(
+                    ("1.4.0", "version-update:semver-minor"),
+                    ("0.10.9", "version-update:semver-minor"),
+                )
+            ),
+            "true",
+            "a group's highest field is a minor while one member leaves its range",
+        )
+
+    def test_a_version_the_metadata_could_not_name_is_held(self) -> None:
+        self.assertEqual(
+            classified(updated_dependencies(("", "version-update:semver-patch"))),
+            "true",
+            "a bump this cannot classify waits for a human",
+        )
+
+    def test_both_branches_hang_off_the_classification(self) -> None:
+        conditions = [
+            step["if"]
+            for step in workflow_documents()[AUTOMERGE_WORKFLOW]["jobs"]["automerge"][
+                "steps"
+            ]
+            if "if" in step
+        ]
+        self.assertEqual(
+            sorted(conditions),
+            sorted(
+                [
+                    f"success() && steps.{RANGE_STEP}.outputs.{RANGE_OUTPUT} != 'true'",
+                    f"success() && steps.{RANGE_STEP}.outputs.{RANGE_OUTPUT} == 'true'",
+                ]
+            ),
+            "auto-merge and its comment both decide on the classification, and "
+            "both carry the success check an explicit `if` would otherwise drop",
+        )
+
+
+class HubSuitesOutliveTheWaitsTheyDeclare(unittest.TestCase):
+    """A suite reading the model hub is not cut short by its own deadline.
+
+    Each of these suites names the budget it will wait for a download, and
+    fails naming the state it reached once that budget is spent. A deadline
+    below the sum of those budgets ends the test first, and the report is a
+    nextest timeout carrying none of what the suite was about to say.
+    """
+
+    def test_every_hub_suite_outlives_the_waits_it_declares(self) -> None:
+        for binary, path in HUB_SUITES.items():
+            with self.subTest(binary=binary):
+                declared = declared_waits(path)
+                self.assertGreater(declared, 0.0, f"{path} declares no wait")
+                self.assertGreater(
+                    suite_deadline(binary),
+                    declared,
+                    f"{binary} can wait {declared}s and is ended at "
+                    f"{suite_deadline(binary)}s, so its own failure never prints",
+                )

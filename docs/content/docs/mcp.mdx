@@ -51,9 +51,11 @@ the tree moved in recorded files outside the syntax-indexed ones or in the confi
 
 The search ranking tiers carry their own warnings:
 
-- `vector_index_preparing` - the vector ranking is still being built. A query sharing no
-  token with the code it describes reaches nothing until every declaration carries a vector;
-  `prepared` and `total` state how far that has got.
+- `vector_index_preparing` - the vector ranking holds no vectors for the tree this answer
+  was read from: the pass over that tree is still running, or the tree was published after
+  the corpus the ranking holds was described. A query sharing no token with the code it
+  describes reaches nothing until that pass lands; `prepared` and `total` state how far it
+  has got, and an answer carrying no such warning is one the vector ranking took part in.
 - `vector_ranking_unavailable` - the vector ranking will not answer for the life of this
   server: the model weights could not be acquired, or the model failed to load.
 - `lexical_ranking_unavailable` - the full-text tier has not yet committed the captured tree,
