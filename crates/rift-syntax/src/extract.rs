@@ -5,6 +5,8 @@
 //! starts - come from the grammar's [`GrammarRules`], so a new language
 //! plugs in without touching the walk or its node and depth budgets.
 
+use core::ops::Range;
+
 use rift_core::Error;
 use rift_protocol::read::{Documentation, Extensions, Language, Signature, SymbolFacet};
 use tree_sitter::Node;
@@ -12,6 +14,39 @@ use tree_sitter::Node;
 use crate::document::{ByteRange, SyntaxNode, SyntaxSymbol};
 use crate::failure::{SyntaxError, SyntaxFault, position_overflow};
 use crate::provider::{SyntaxLimits, SyntaxSource};
+
+/// The child index ranges tree-sitter's child accessors accept.
+///
+/// [`Node::child_count`] and [`Node::named_child_count`] widen the grammar's
+/// `uint32_t` counts to `usize`, while [`Node::child`] and
+/// [`Node::named_child`] take that same width back as `u32`. Every walk that
+/// indexes children builds its range here, so the conversion is spelled once.
+pub(crate) trait ChildIndices {
+    /// Every child index, in order.
+    fn child_indices(&self) -> Range<u32>;
+
+    /// Every named child index, in order.
+    fn named_child_indices(&self) -> Range<u32>;
+}
+
+impl ChildIndices for Node<'_> {
+    fn child_indices(&self) -> Range<u32> {
+        0..child_index_bound(self.child_count())
+    }
+
+    fn named_child_indices(&self) -> Range<u32> {
+        0..child_index_bound(self.named_child_count())
+    }
+}
+
+/// A child count in the width tree-sitter's child accessors take.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "tree-sitter widens its own uint32_t child count, so narrowing it back cannot truncate"
+)]
+fn child_index_bound(count: usize) -> u32 {
+    count as u32
+}
 
 /// Per-grammar decisions the shared walk delegates.
 pub(crate) trait GrammarRules {
@@ -127,7 +162,7 @@ pub(crate) fn extract(
             |name| qualify(rules.qualification_separator(), &qualification, &name),
         );
 
-        for child_index in (0..node.child_count()).rev() {
+        for child_index in node.child_indices().rev() {
             let Some(child) = node.child(child_index) else {
                 continue;
             };

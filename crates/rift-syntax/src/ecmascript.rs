@@ -34,7 +34,7 @@ use rift_protocol::read::{Language, NodeFacet, SymbolFacet};
 use tree_sitter::{Node, Parser};
 
 use crate::document::{ByteRange, SyntaxDocument};
-use crate::extract::{self, Declaration, GrammarRules};
+use crate::extract::{self, ChildIndices, Declaration, GrammarRules};
 use crate::failure::{SyntaxError, SyntaxFault, incompatible_grammar};
 use crate::provider::{SyntaxLimits, SyntaxSource};
 
@@ -334,7 +334,7 @@ impl EcmaScriptRules {
     /// grammar spells none or the declaration carries none.
     fn accessibility(&self, node: Node<'_>, text: &str) -> Option<String> {
         let modifier = self.kinds.accessibility_modifier?;
-        (0..node.named_child_count())
+        node.named_child_indices()
             .filter_map(|index| node.named_child(index))
             .find(|child| child.kind_id() == modifier)
             .and_then(|child| text.get(child.byte_range()))

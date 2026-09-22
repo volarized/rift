@@ -26,7 +26,7 @@ use rift_protocol::read::{Documentation, DocumentationFormat, Language, NodeFace
 use tree_sitter::{Node, Parser};
 
 use crate::document::SyntaxDocument;
-use crate::extract::{self, Declaration, GrammarRules};
+use crate::extract::{self, ChildIndices, Declaration, GrammarRules};
 use crate::failure::{SyntaxError, SyntaxFault, incompatible_grammar};
 use crate::provider::{
     SYNTAX_DEPTH_MAX_DEFAULT, SYNTAX_NODES_MAX_DEFAULT, SyntaxLimits, SyntaxProvider, SyntaxSource,
@@ -170,7 +170,7 @@ impl PythonRules {
             return Vec::new();
         };
         let mut content = String::new();
-        for child_index in 0..string.named_child_count() {
+        for child_index in string.named_child_indices() {
             let Some(child) = string.named_child(child_index) else {
                 continue;
             };
