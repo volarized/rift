@@ -28,13 +28,15 @@ const PACKAGE_BRANCH_LOCK: &str = "package index";
 const PACKAGE_REVISION: u64 = 1;
 
 /// What one fill of the branch produced.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PackageFallback {
     /// Packages this machine analyzed and the branch holds.
     pub(crate) indexed: u64,
     /// Packages the context named that the resolvers found no source for, so nothing was
     /// analyzed for them.
     pub(crate) unresolved: u64,
+    /// Exact packages whose source this machine could not resolve.
+    pub(crate) unavailable: Vec<PackageIdentity>,
 }
 
 /// What one fill needs: where the workspace is, what it makes visible, and which packages
@@ -108,6 +110,7 @@ impl PackageBranch {
                 outcome: PackageFallback {
                     indexed,
                     unresolved: 0,
+                    unavailable: Vec::new(),
                 },
             })),
         }
@@ -166,7 +169,7 @@ impl PackageBranch {
             && completed.limits == request.limits
             && completed.resolution == request.resolution
         {
-            return Ok(completed.outcome);
+            return Ok(completed.outcome.clone());
         }
         *self.write()? = DependencyIndex::empty(request.limits);
         let outcome = self.analyze_selected(request, &selection)?;
@@ -174,7 +177,7 @@ impl PackageBranch {
             selection,
             limits: request.limits,
             resolution: request.resolution,
-            outcome,
+            outcome: outcome.clone(),
         });
         Ok(outcome)
     }
@@ -183,7 +186,7 @@ impl PackageBranch {
     ///
     /// One record states the fallback the fill ran under, at the end of the pass: no
     /// global package index answered, and these are the counts this machine produced. It
-    /// carries counts alone, and rides one fill rather than one package or one hit.
+    /// rides one fill rather than one package or one hit.
     fn analyze_selected(
         &self,
         request: &PackageFill<'_>,
@@ -208,15 +211,12 @@ impl PackageBranch {
             .filter(|entry| selected.contains(&selector(entry.identity())))
             .collect();
         let mut indexed = 0_u64;
-        let mut unresolved = 0_u64;
         let mut built: Vec<(PackageIdentity, Result<PackageIndex, String>)> =
             Vec::with_capacity(entries.len());
-        for entry in entries {
-            if entry.source_root().is_none() {
-                unresolved = unresolved.saturating_add(1);
-                continue;
+        for entry in &entries {
+            if entry.source_root().is_some() {
+                built.push((entry.identity().clone(), analyzed(entry, &request.limits)));
             }
-            built.push((entry.identity().clone(), analyzed(entry, &request.limits)));
         }
         let mut index = self.write()?;
         let mut skipped = 0_usize;
@@ -235,6 +235,7 @@ impl PackageBranch {
                 }
             }
         }
+        let (unresolved, unavailable) = unavailable_packages(request.context, &entries);
         span.record("indexed", indexed);
         span.record("skipped", skipped);
         tracing::warn!(
@@ -249,8 +250,61 @@ impl PackageBranch {
         Ok(PackageFallback {
             indexed,
             unresolved,
+            unavailable,
         })
     }
+}
+
+fn unavailable_packages(
+    context: &DependencyContext,
+    entries: &[&CatalogEntry],
+) -> (u64, Vec<PackageIdentity>) {
+    let resolved: BTreeSet<_> = entries
+        .iter()
+        .filter(|entry| entry.source_root().is_some())
+        .map(|entry| selector(entry.identity()))
+        .collect();
+    let unresolved: BTreeSet<_> = context
+        .entries()
+        .iter()
+        .map(|entry| (entry.manager.clone(), entry.name.clone()))
+        .filter(|key| !resolved.contains(key))
+        .collect();
+    let mut unavailable = Vec::new();
+    for entry in context.entries() {
+        let key = (entry.manager.clone(), entry.name.clone());
+        if !unresolved.contains(&key) {
+            continue;
+        }
+        if let Some(identity) = entries
+            .iter()
+            .find(|candidate| selector(candidate.identity()) == key)
+            .map(|candidate| candidate.identity().clone())
+            .or_else(|| exact_identity(entry))
+            && !unavailable.contains(&identity)
+        {
+            unavailable.push(identity);
+        }
+    }
+    unavailable.sort_by(|left, right| {
+        (&left.manager, &left.name, &left.version).cmp(&(
+            &right.manager,
+            &right.name,
+            &right.version,
+        ))
+    });
+    (
+        u64::try_from(unresolved.len()).unwrap_or(u64::MAX),
+        unavailable,
+    )
+}
+
+fn exact_identity(entry: &PackageContextEntry) -> Option<PackageIdentity> {
+    Some(PackageIdentity {
+        manager: entry.manager.clone(),
+        name: entry.name.clone(),
+        version: entry.version.clone()?,
+    })
 }
 
 /// One package's analyzed source, or the reason it was refused.
@@ -463,7 +517,10 @@ pub(crate) mod tests {
             DependencyIndexLimits::default(),
         );
 
-        assert_eq!(outcome, PackageFallback::default());
+        assert_eq!(outcome.indexed, 0);
+        assert_eq!(outcome.unresolved, 1);
+        assert_eq!(outcome.unavailable.len(), 1);
+        assert_eq!(outcome.unavailable[0].name, "absent-probe");
         assert_eq!(recorded.named(RESOLVE_SPAN), 1, "{recorded:?}");
         assert_eq!(branch.read().expect("the branch reads").indexed_count(), 0);
         assert_eq!(

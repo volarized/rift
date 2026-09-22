@@ -4,8 +4,9 @@ format:
     cargo fmt --all --check
 
 generate:
-    cargo run -q -p rift-mcp --bin rift-schema-export -- docs plugins/claude
-    cargo run -q -p rift-mcp --bin rift-schema-export -- --analyzer-manifest .
+    cargo run -q -p rift-schema-export -- docs plugins/claude
+    cargo run -q -p rift-schema-export -- --analyzer-manifest .
+    oas3-gen generate client-mod -q --enum-mode relaxed --no-ordered-collections -i docs/public/global-api.openapi.json -o crates/rift-cloud-client/src/generated
     printf '$ rift --help\n' > docs/public/cli-help.txt
     cargo run -q -p rift -- --help >> docs/public/cli-help.txt
     printf '\n$ rift server --help\n' >> docs/public/cli-help.txt
@@ -16,9 +17,13 @@ generate:
 generate-check:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo run -q -p rift-mcp --bin rift-schema-export -- --check docs plugins/claude
-    cargo run -q -p rift-mcp --bin rift-schema-export -- --check --analyzer-manifest .
-    cargo run -q -p rift-mcp --bin rift-schema-export -- --global-api docs
+    cargo run -q -p rift-schema-export -- --check docs plugins/claude
+    cargo run -q -p rift-schema-export -- --check --analyzer-manifest .
+    cargo run -q -p rift-schema-export -- --global-contract docs
+    generated="$(mktemp -d)"
+    trap 'rm -r "$generated"' EXIT
+    oas3-gen generate client-mod -q --enum-mode relaxed --no-ordered-collections -i docs/public/global-api.openapi.json -o "$generated"
+    diff -ru crates/rift-cloud-client/src/generated "$generated"
     fresh="$(mktemp)"
     trap 'rm -f "$fresh"' EXIT
     printf '$ rift --help\n' > "$fresh"
@@ -110,8 +115,9 @@ coverage-target:
     fi
 
 # Unit tests use local fixtures and require no language servers or model downloads.
+# `generate-check` validates generated client bytes; coverage measures maintained Rust source.
 test archive="": coverage-target
-    cargo llvm-cov nextest {{ if archive == "" { "--workspace --all-targets --all-features --locked" } else { "--archive-file " + quote(archive) + " --extract-overwrite --workspace-remap ." } }} --profile ci --no-tests fail --lcov --output-path lcov.info --fail-under-lines 86
+    cargo llvm-cov nextest {{ if archive == "" { "--workspace --all-targets --all-features --locked" } else { "--archive-file " + quote(archive) + " --extract-overwrite --workspace-remap ." } }} --profile ci --no-tests fail --ignore-filename-regex '(^|/)crates/rift-cloud-client/src/generated(/|$)' --lcov --output-path lcov.info --fail-under-lines 86
 
 # The live suites drive real language engines. They read the same build the unit
 # suites do, so they reuse the fast archive instead of an optimized build of

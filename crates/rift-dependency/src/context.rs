@@ -54,6 +54,27 @@ impl DependencyContext {
         &self.entries
     }
 
+    /// Clones this context while retaining entries accepted by `keep`.
+    ///
+    /// Inputs and degradations stay attached to the filtered context, so a fallback read keeps
+    /// the evidence that produced the original package set.
+    #[must_use]
+    pub fn filter_entries<F>(&self, mut keep: F) -> Self
+    where
+        F: FnMut(&PackageContextEntry) -> bool,
+    {
+        Self {
+            entries: self
+                .entries
+                .iter()
+                .filter(|entry| keep(entry))
+                .cloned()
+                .collect(),
+            inputs: self.inputs.clone(),
+            degradations: self.degradations.clone(),
+        }
+    }
+
     /// The visible workspace paths the context was read from, in path order.
     pub fn inputs(&self) -> impl Iterator<Item = &ProjectPath> {
         self.inputs.iter()
@@ -454,6 +475,25 @@ mod tests {
                 reason: "probe.toml: no probe.lock beside it".to_owned(),
             }]
         );
+    }
+
+    #[test]
+    fn test_filter_entries_preserves_inputs_and_degradations() {
+        let resolver = ProbeResolver {
+            entries: vec![pinned("serde", "1.0.228"), declared("itoa", "^1")],
+            degradations: vec!["probe.toml: incomplete".to_owned()],
+        };
+        let context = resolve(&resolver, &[]);
+
+        let filtered = context.filter_entries(|entry| entry.name == "serde");
+
+        assert_eq!(filtered.entries().len(), 1);
+        assert_eq!(filtered.entries()[0].name, "serde");
+        assert_eq!(
+            filtered.inputs().collect::<Vec<_>>(),
+            [&project("probe.toml")]
+        );
+        assert_eq!(filtered.degradations(), context.degradations());
     }
 
     /// The configured list and the merged context share one ceiling. An operator who

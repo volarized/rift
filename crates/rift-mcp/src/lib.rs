@@ -2,7 +2,7 @@
 
 mod election;
 mod failure;
-pub mod global_api;
+mod global;
 mod http;
 mod identity;
 pub mod logs;

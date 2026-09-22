@@ -11,6 +11,7 @@ use rift_core::constants::{
 };
 use rift_core::line;
 use rift_core::{ProjectPath, SourceUnitId};
+use rift_dependency::DependencyContext;
 use rift_index::{
     DependencyIndex, DependencySymbolMatch, IndexedFile, LexicalChange, PathChanges, PathMatcher,
     SymbolMatch, TextSourceFile, WorkspaceIndex,
@@ -163,7 +164,7 @@ impl ReadService {
         params: &SearchParams,
         store: &StoreAnswer,
     ) -> Result<SearchResult, ReadError> {
-        self.search_with_references(params, store, &EngineReferences::default())
+        self.search_with_dependency_context(params, store, self.dependency_context())
     }
 
     /// Searches one publication with references resolved by its configured engines.
@@ -176,6 +177,49 @@ impl ReadService {
         params: &SearchParams,
         store: &StoreAnswer,
         references: &EngineReferences,
+    ) -> Result<SearchResult, ReadError> {
+        self.search_with_references_and_dependency_context(
+            params,
+            store,
+            references,
+            self.dependency_context(),
+        )
+    }
+
+    /// Searches one publication using `dependency_context` for package fallback selection.
+    ///
+    /// The service keeps project search unchanged. The supplied context only decides which
+    /// dependency packages the current-tree package branch may analyze and which context
+    /// warnings the answer carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::search`].
+    pub fn search_with_dependency_context(
+        &self,
+        params: &SearchParams,
+        store: &StoreAnswer,
+        dependency_context: &DependencyContext,
+    ) -> Result<SearchResult, ReadError> {
+        self.search_with_references_and_dependency_context(
+            params,
+            store,
+            &EngineReferences::default(),
+            dependency_context,
+        )
+    }
+
+    /// Searches one publication with references and a selected dependency context.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::search_with_references`].
+    pub fn search_with_references_and_dependency_context(
+        &self,
+        params: &SearchParams,
+        store: &StoreAnswer,
+        references: &EngineReferences,
+        dependency_context: &DependencyContext,
     ) -> Result<SearchResult, ReadError> {
         references.validate_revision(self)?;
         validate_search(params)?;
@@ -199,7 +243,7 @@ impl ReadService {
         // bound, so `pagination.total_pages` counts the full result set and every page is
         // one window of the same ordering.
         let fetch_limit = self.index().results_max();
-        let fallback = self.fill_packages(params.scope)?;
+        let fallback = self.fill_packages(params.scope, dependency_context)?;
         let dependencies = self.dependency_index(params.scope)?;
 
         let mut results = Vec::new();
@@ -261,10 +305,10 @@ impl ReadService {
         Ok(SearchResult {
             results,
             pagination,
-            warnings: self.search_warnings(
+            warnings: Self::search_warnings(
                 warnings,
                 params.scope,
-                (dependencies.as_deref(), fallback),
+                (dependencies.as_deref(), dependency_context, fallback),
                 traversal_report,
                 results_max_reached,
             ),
@@ -293,10 +337,13 @@ impl ReadService {
     /// lane reported, the result bound when the pool reached it, and the package warnings
     /// when `scope` reaches packages.
     fn search_warnings(
-        &self,
         mut warnings: Vec<ReadWarning>,
         scope: SearchScope,
-        (dependencies, fallback): (Option<&DependencyIndex>, PackageFallback),
+        (dependencies, dependency_context, fallback): (
+            Option<&DependencyIndex>,
+            &DependencyContext,
+            PackageFallback,
+        ),
         traversal: TraversalReport,
         results_max_reached: Option<usize>,
     ) -> Vec<ReadWarning> {
@@ -308,11 +355,7 @@ impl ReadService {
             warnings.push(results_truncation_warning(results_max));
         }
         if scope != SearchScope::Local {
-            warnings.extend(package_warnings(
-                dependencies,
-                self.dependency_context(),
-                fallback,
-            ));
+            warnings.extend(package_warnings(dependencies, dependency_context, fallback));
         }
         warnings
     }

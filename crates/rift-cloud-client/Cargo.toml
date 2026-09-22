@@ -1,0 +1,35 @@
+[package]
+name = "rift-cloud-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Bounded REST client for Rift global package data"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+http.workspace = true
+oas3-gen-support.workspace = true
+oas3.workspace = true
+percent-encoding.workspace = true
+reqwest = { workspace = true, features = ["json", "query"] }
+regex.workspace = true
+rift-core.workspace = true
+rift-protocol.workspace = true
+rift-ranking.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_with.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+validator.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+jsonschema.workspace = true
+tempfile.workspace = true

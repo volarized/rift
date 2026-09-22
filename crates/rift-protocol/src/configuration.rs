@@ -3139,8 +3139,10 @@ mod tests {
 
     #[test]
     fn test_global_bounds_accept_edges_and_refuse_each_outside_value() {
+        type BoundCase = (&'static str, u64, u64, fn(&mut GlobalConfiguration, u64));
+
         let mut configuration = WorkspaceConfiguration::default();
-        let cases: [(&str, u64, u64, fn(&mut GlobalConfiguration, u64)); 7] = [
+        let cases: [BoundCase; 7] = [
             (
                 "global.connect_timeout",
                 GLOBAL_CONNECT_TIMEOUT_MS_MIN,

@@ -88,7 +88,6 @@ pub struct Digest(
 
 /// One block of documentation attached to a declaration, in the markup it was written in.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct Documentation {
     /// Markup the comment text uses.
     pub format: DocumentationFormat,
@@ -831,7 +830,6 @@ pub struct Pagination {
 /// may pass it. A receiver is one of these too, held in its own field because it has no
 /// position in the parameter list.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 #[schemars(transform = schema::declare_parameter_empty_defaults)]
 pub struct Parameter {
     /// What the parameter is called. Absent where the language allows an unnamed one, as
@@ -878,10 +876,13 @@ pub struct ProjectPath(
     pub String,
 );
 
-/// Most `package_skipped` and `package_context_degraded` warnings one answer carries
-/// together: skipped packages first in identity order, then degraded resolvers in
-/// resolver order, cut here.
+/// Most package and dependency-context warnings one answer carries together. Local reads
+/// order skipped packages before degraded resolvers. Routed global reads order unavailable
+/// packages and degraded resolvers before packages absent from the global publication.
 pub const DEPENDENCY_WARNINGS_MAX: usize = 8;
+
+/// Maximum package count carried by one global fallback summary.
+pub const GLOBAL_FALLBACK_PACKAGES_MAX: u64 = crate::dependencies::DEPENDENCIES_PACKAGES_MAX as u64;
 
 /// Most `source_unavailable` warnings one answer carries for the files the index left out,
 /// in project-path order; when more files are left out, one more warning follows them and
@@ -1052,6 +1053,82 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
+    /// Global access was disabled, so every selected package used the local index.
+    GlobalAccessDisabled {
+        /// Packages the local fallback indexed for this answer.
+        #[schemars(range(min = 0_u64, max = GLOBAL_FALLBACK_PACKAGES_MAX))]
+        fallback_indexed: u64,
+        /// Packages the local fallback could not resolve for this answer.
+        #[schemars(range(min = 0_u64, max = GLOBAL_FALLBACK_PACKAGES_MAX))]
+        fallback_unresolved: u64,
+    },
+    /// The global API could not answer, so the affected packages used the local index.
+    GlobalApiUnavailable {
+        /// Bounded class of the global API failure.
+        failure_class: GlobalFailureClass,
+        /// Packages the local fallback indexed for this answer.
+        #[schemars(range(min = 0_u64, max = GLOBAL_FALLBACK_PACKAGES_MAX))]
+        fallback_indexed: u64,
+        /// Packages the local fallback could not resolve for this answer.
+        #[schemars(range(min = 0_u64, max = GLOBAL_FALLBACK_PACKAGES_MAX))]
+        fallback_unresolved: u64,
+    },
+    /// The global API advertised a publication the client cannot read, so the affected
+    /// packages used the local index.
+    GlobalPublicationIncompatible {
+        /// Bounded class of the incompatible publication.
+        failure_class: GlobalFailureClass,
+        /// Packages the local fallback indexed for this answer.
+        #[schemars(range(min = 0_u64, max = GLOBAL_FALLBACK_PACKAGES_MAX))]
+        fallback_indexed: u64,
+        /// Packages the local fallback could not resolve for this answer.
+        #[schemars(range(min = 0_u64, max = GLOBAL_FALLBACK_PACKAGES_MAX))]
+        fallback_unresolved: u64,
+    },
+    /// The global API returned an invalid or truncated response, so the affected packages
+    /// used the local index.
+    GlobalResponseInvalid {
+        /// Bounded class of the invalid response.
+        failure_class: GlobalFailureClass,
+        /// Packages the local fallback indexed for this answer.
+        #[schemars(range(min = 0_u64, max = GLOBAL_FALLBACK_PACKAGES_MAX))]
+        fallback_indexed: u64,
+        /// Packages the local fallback could not resolve for this answer.
+        #[schemars(range(min = 0_u64, max = GLOBAL_FALLBACK_PACKAGES_MAX))]
+        fallback_unresolved: u64,
+    },
+    /// The global package page carried a bounded condition while its items remained valid.
+    /// `warning_code` identifies the condition and `detail` carries its bounded explanation.
+    GlobalPageWarning {
+        /// Stable condition code returned by the global package service.
+        warning_code: GlobalPageWarningCode,
+        /// Optional bounded explanation returned by the global package service.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(max = 1024))]
+        detail: Option<String>,
+    },
+    /// A valid global resolution named no remote package, so the package used local indexing.
+    /// At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings ride one answer.
+    PackageAbsent {
+        /// The exact package absent from the global publication.
+        package: PackageIdentity,
+    },
+    /// A valid global resolution could not resolve a declared requirement, so the entry used
+    /// local indexing. At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings
+    /// ride one answer.
+    PackageRequirementAbsent {
+        /// The declared requirement absent from the global publication.
+        entry: crate::dependencies::PackageContextEntry,
+    },
+    /// A package remained unavailable after local fallback. At most `DEPENDENCY_WARNINGS_MAX`
+    /// package and dependency-context warnings ride one answer.
+    PackageUnavailable {
+        /// The package the local fallback could not serve.
+        package: PackageIdentity,
+        /// Why local fallback could not serve the package.
+        #[schemars(length(max = 4096))]
+        reason: String,
+    },
     /// The local package index refused one package, so none of its declarations answers.
     /// Rides only an answer whose `scope` reaches packages; at most
     /// `DEPENDENCY_WARNINGS_MAX` of this warning and `package_context_degraded` together
@@ -1076,6 +1153,56 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         reason: String,
     },
+}
+
+/// Bounded classes a global API failure can carry in a read warning.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GlobalFailureClass {
+    /// The endpoint could not accept a connection.
+    Connection,
+    /// The operation exceeded its time bound.
+    Timeout,
+    /// Bounded retry attempts ended without a valid response.
+    RetryExhausted,
+    /// The endpoint rejected credentials or access.
+    Authentication,
+    /// Credential configuration prevented a request.
+    CredentialConfiguration,
+    /// The endpoint returned a non-success status.
+    NonSuccessResponse,
+    /// The response did not satisfy its wire fields.
+    InvalidResponse,
+    /// The response exceeded its byte or item bound.
+    ResponseTruncated,
+    /// The publication format was not supported.
+    PublicationFormat,
+    /// The response named an unsupported corpus revision.
+    CorpusRevision,
+    /// The response omitted a required field set.
+    RequiredFieldSet,
+}
+
+/// Stable conditions a global package page can report while returning valid items.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GlobalPageWarningCode {
+    /// The service narrowed a query before ranking.
+    QueryNarrowed,
+    /// The service omitted source content at its source bound.
+    SourceTruncated,
+    /// The publication changed while pages were assembled.
+    PublicationChanged,
+    /// A requested capability was unavailable.
+    CapabilityUnavailable,
+    /// The service stopped before its result bound.
+    ResultTruncated,
+    /// The service returned a code this client does not know.
+    Unknown,
 }
 
 /// One named part of a node. A language marks these out inside a declaration, so an
@@ -1329,7 +1456,6 @@ pub enum Severity {
 /// One callable form of a symbol: the text it renders as, the symbols that text points at,
 /// and its structure. Overloads are separate entries.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 #[schemars(transform = schema::declare_signature_empty_defaults)]
 pub struct Signature {
     /// The signature as a reader sees it, in the language's own syntax.
@@ -1373,7 +1499,6 @@ pub struct Signature {
 /// One symbol named inside a rendered signature, with the byte range of that rendering which
 /// names it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct SignatureLink {
     /// Offsets into the rendered string in `Signature.display`.
     pub range: TextRange,
@@ -1493,7 +1618,6 @@ pub struct SourceUnitSpan {
 /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
 /// and is connected through Relationship.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 #[schemars(transform = schema::declare_symbol_empty_defaults)]
 pub struct Symbol {
     /// Unique identifier of this Symbol across the whole workspace. Absent for an
@@ -1672,7 +1796,6 @@ pub struct SymbolId(
 /// Absent from `Symbol` entirely when it says a project declaration, authored, with no
 /// package.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct SymbolOrigin {
     /// Which of the four places the declaration belongs. Absent exactly when
     /// `source_kind` is `synthetic`.
@@ -1751,7 +1874,6 @@ pub enum SymbolVersionKind {
 /// another, so that `end` is never below `start` is asserted by the surface
 /// validation tests instead.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct TextRange {
     /// First byte of the range, counted from the start of the file.
     #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
@@ -1764,7 +1886,6 @@ pub struct TextRange {
 
 /// One type a symbol carries, together with the role it plays for that symbol.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct TypeBinding {
     /// The role this type plays for the symbol.
     pub role: TypeBindingRole,
@@ -1825,7 +1946,6 @@ pub enum TypeBindingRole {
 /// type with a declaration resolves to that symbol; a structural type - `string | null`,
 /// `{ a: string }` - has the spelling and nothing to resolve to.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 #[schemars(transform = schema::declare_type_expression_empty_defaults)]
 pub struct TypeExpression {
     /// The language the spelling is in, and so which provider produced it.
@@ -1844,8 +1964,11 @@ pub struct TypeExpression {
 
 #[cfg(test)]
 mod tests {
+    use crate::dependencies::{PackageAvailability, PackageContextEntry, PackageSelector};
+
     use super::{
-        Digest, Duration, FileId, GetSymbolParams, IDENTITY_PATH_CHARACTER,
+        Digest, Duration, FileId, GLOBAL_FALLBACK_PACKAGES_MAX, GetSymbolParams,
+        GlobalFailureClass, GlobalPageWarningCode, IDENTITY_PATH_CHARACTER,
         LANGUAGE_IDENTITY_PATTERN, Language, NodeId, PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX,
         PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning, RelationshipFacet, RevisionId,
         RevisionIdViolation, SearchScope, SourceUnitId, Symbol, SymbolId,
@@ -2254,6 +2377,10 @@ mod tests {
 
     /// The package warnings a `global` or `all` answer rides with, pinned the same way.
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one table pins every package warning wire shape"
+    )]
     fn every_package_warning_round_trips_under_its_code_tag() {
         let cases = [
             (
@@ -2268,6 +2395,122 @@ mod tests {
                     "indexed": 3,
                     "detail": "no global package index is configured; 3 packages were indexed \
                                on this machine",
+                }),
+            ),
+            (
+                ReadWarning::GlobalAccessDisabled {
+                    fallback_indexed: 3,
+                    fallback_unresolved: 1,
+                },
+                json!({
+                    "code": "global_access_disabled",
+                    "fallback_indexed": 3,
+                    "fallback_unresolved": 1,
+                }),
+            ),
+            (
+                ReadWarning::GlobalApiUnavailable {
+                    failure_class: GlobalFailureClass::RetryExhausted,
+                    fallback_indexed: 3,
+                    fallback_unresolved: 1,
+                },
+                json!({
+                    "code": "global_api_unavailable",
+                    "failure_class": "retry_exhausted",
+                    "fallback_indexed": 3,
+                    "fallback_unresolved": 1,
+                }),
+            ),
+            (
+                ReadWarning::GlobalPublicationIncompatible {
+                    failure_class: GlobalFailureClass::PublicationFormat,
+                    fallback_indexed: 3,
+                    fallback_unresolved: 1,
+                },
+                json!({
+                    "code": "global_publication_incompatible",
+                    "failure_class": "publication_format",
+                    "fallback_indexed": 3,
+                    "fallback_unresolved": 1,
+                }),
+            ),
+            (
+                ReadWarning::GlobalResponseInvalid {
+                    failure_class: GlobalFailureClass::ResponseTruncated,
+                    fallback_indexed: 3,
+                    fallback_unresolved: 1,
+                },
+                json!({
+                    "code": "global_response_invalid",
+                    "failure_class": "response_truncated",
+                    "fallback_indexed": 3,
+                    "fallback_unresolved": 1,
+                }),
+            ),
+            (
+                ReadWarning::GlobalPageWarning {
+                    warning_code: GlobalPageWarningCode::SourceTruncated,
+                    detail: Some("source exceeded the active bound".to_owned()),
+                },
+                json!({
+                    "code": "global_page_warning",
+                    "warning_code": "source_truncated",
+                    "detail": "source exceeded the active bound",
+                }),
+            ),
+            (
+                ReadWarning::PackageAbsent {
+                    package: PackageIdentity {
+                        manager: "cargo".to_owned(),
+                        name: "missing-helper".to_owned(),
+                        version: "0.1.0".to_owned(),
+                    },
+                },
+                json!({
+                    "code": "package_absent",
+                    "package": {
+                        "manager": "cargo",
+                        "name": "missing-helper",
+                        "version": "0.1.0",
+                    },
+                }),
+            ),
+            (
+                ReadWarning::PackageRequirementAbsent {
+                    entry: PackageContextEntry::new(
+                        "cargo",
+                        "missing-helper",
+                        PackageSelector::Requirement("^0.1".to_owned()),
+                        PackageAvailability::Canonical,
+                    ),
+                },
+                json!({
+                    "code": "package_requirement_absent",
+                    "entry": {
+                        "manager": "cargo",
+                        "name": "missing-helper",
+                        "requirement": "^0.1",
+                        "availability": "canonical",
+                    },
+                }),
+            ),
+            (
+                ReadWarning::PackageUnavailable {
+                    package: PackageIdentity {
+                        manager: "cargo".to_owned(),
+                        name: "unavailable-helper".to_owned(),
+                        version: "0.1.0".to_owned(),
+                    },
+                    reason: "source was not available to local fallback".to_owned(),
+                },
+                json!({
+                    "code": "package_unavailable",
+                    "package": {
+                        "manager": "cargo",
+                        "name": "unavailable-helper",
+                        "version": "0.1.0",
+                    },
+                    "reason": "source was not available to local fallback",
                 }),
             ),
             (
@@ -2388,6 +2631,14 @@ mod tests {
             "source_unavailable",
             "symbol_disagreement",
             "global_index_unavailable",
+            "global_access_disabled",
+            "global_api_unavailable",
+            "global_publication_incompatible",
+            "global_response_invalid",
+            "global_page_warning",
+            "package_absent",
+            "package_requirement_absent",
+            "package_unavailable",
             "package_skipped",
             "package_context_degraded",
             "relationship_coverage_missing",
@@ -2397,6 +2648,56 @@ mod tests {
                 "the schema must advertise {code}: {codes:?}"
             );
         }
+    }
+
+    #[test]
+    fn global_warning_schema_bounds_failure_class_and_fallback_counts() {
+        let warning_schema = serde_json::to_value(schema_for!(ReadWarning)).expect("schema");
+        let arms = warning_schema["oneOf"]
+            .as_array()
+            .expect("tagged warning schema");
+        let arm = arms
+            .iter()
+            .find(|arm| {
+                arm["properties"]["code"]
+                    == json!({
+                        "const": "global_api_unavailable",
+                        "type": "string",
+                    })
+            })
+            .expect("global API warning schema");
+        assert_eq!(
+            arm["properties"]["fallback_indexed"]["maximum"],
+            json!(GLOBAL_FALLBACK_PACKAGES_MAX)
+        );
+        assert_eq!(
+            arm["properties"]["fallback_unresolved"]["maximum"],
+            json!(GLOBAL_FALLBACK_PACKAGES_MAX)
+        );
+
+        let failure_schema =
+            serde_json::to_value(schema_for!(GlobalFailureClass)).expect("failure class schema");
+        assert_eq!(
+            failure_schema["oneOf"]
+                .as_array()
+                .expect("failure class schema")
+                .iter()
+                .map(|arm| arm["const"].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                json!("connection"),
+                json!("timeout"),
+                json!("retry_exhausted"),
+                json!("authentication"),
+                json!("credential_configuration"),
+                json!("non_success_response"),
+                json!("invalid_response"),
+                json!("response_truncated"),
+                json!("publication_format"),
+                json!("corpus_revision"),
+                json!("required_field_set"),
+            ]
+        );
     }
 
     #[test]

@@ -216,8 +216,14 @@ pub async fn resolve_engine_references(
     let mut pending = vec![seed.clone()];
     let mut requested = BTreeSet::new();
     for depth in 0..traversal.depth {
-        if let Some(warning) =
-            extend_references(reads, engines, &mut references, pending, &mut requested).await?
+        if let Some(warning) = Box::pin(extend_references(
+            reads,
+            engines,
+            &mut references,
+            pending,
+            &mut requested,
+        ))
+        .await?
         {
             references.degrade(warning);
             return Ok(references);
@@ -980,13 +986,13 @@ mod tests {
         )?;
         let engines = pool(directory.path(), "python", configuration);
         let mut requested = std::collections::BTreeSet::from([prior]);
-        let result = super::extend_references(
+        let result = Box::pin(super::extend_references(
             &reads,
             &engines,
             &mut references,
             vec![target.clone()],
             &mut requested,
-        )
+        ))
         .await;
         engines.shutdown().await;
         let Some(rift_protocol::read::ReadWarning::EngineAnalysisUnavailable { detail, .. }) =

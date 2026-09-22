@@ -112,7 +112,8 @@ jobs:
         run: just corpus-test "${{ matrix.repository }}" "${{ matrix.test }}" target/integration.tar.zst
       - name: Report corpus coverage
         if: ${{ !cancelled() && steps.corpus.outcome != 'skipped' }}
-        run: cargo llvm-cov report --nextest-archive-file target/integration.tar.zst --lcov --output-path target/corpus.lcov
+        # `generate-check` validates generated client bytes; coverage measures maintained Rust source.
+        run: cargo llvm-cov report --nextest-archive-file target/integration.tar.zst --ignore-filename-regex '(^|/)crates/rift-cloud-client/src/generated(/|$)' --lcov --output-path target/corpus.lcov
       - uses: codecov/codecov-action@v5.5.5
         if: ${{ !cancelled() && steps.corpus.outcome != 'skipped' }}
         with:

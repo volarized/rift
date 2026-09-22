@@ -382,10 +382,6 @@ impl ConfigurationState {
 
     /// The `[global]` table from the last acceptance, or the default table while
     /// `rift.toml` is invalid or absent.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "global client consumes accepted table")
-    )]
     pub(crate) fn global_configuration(&self) -> GlobalConfiguration {
         self.accepted
             .as_ref()

@@ -47,6 +47,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use crate::failure::WireFailure;
+use crate::global::{
+    GlobalRoute, GlobalSearchCandidates, GlobalState, merge_search, merge_symbols, package_search,
+    package_symbols,
+};
 use crate::parameters::Parameters;
 use crate::resource;
 use crate::storage::WorkspaceStorage;
@@ -616,6 +620,45 @@ impl ReadAnswer for NodesResult {
     fn warnings_mut(&mut self) -> &mut Vec<ReadWarning> {
         &mut self.warnings
     }
+}
+
+/// Replaces the local package branch's legacy global warning with routed client state.
+fn apply_global_warnings(warnings: &mut Vec<ReadWarning>, route: &GlobalRoute) {
+    let fallback_indexed = warnings
+        .iter()
+        .find_map(|warning| match warning {
+            ReadWarning::GlobalIndexUnavailable { indexed, .. } => Some(*indexed),
+            _ => None,
+        })
+        .unwrap_or(0);
+    *warnings = warnings
+        .drain(..)
+        .filter_map(|warning| match warning {
+            ReadWarning::GlobalIndexUnavailable { .. } => None,
+            ReadWarning::PackageSkipped { package, reason } => {
+                Some(ReadWarning::PackageUnavailable { package, reason })
+            }
+            warning => Some(warning),
+        })
+        .collect();
+    route.record_fallback(fallback_indexed);
+    if let Some(warning) = route.fallback_warning(fallback_indexed) {
+        warnings.push(warning);
+    }
+    let package_warnings = warnings
+        .iter()
+        .filter(|warning| {
+            matches!(
+                warning,
+                ReadWarning::PackageUnavailable { .. } | ReadWarning::PackageContextDegraded { .. }
+            )
+        })
+        .count();
+    warnings.extend(
+        route
+            .missing_warnings()
+            .take(rift_protocol::read::DEPENDENCY_WARNINGS_MAX.saturating_sub(package_warnings)),
+    );
 }
 
 /// Most bytes one read warning's `detail` carries: the bound the served schema advertises
@@ -1247,6 +1290,8 @@ pub struct RiftMcp {
     /// The shares the identifier, full-text, and vector rankings fuse under, as
     /// `[search.ranking]` set them.
     ranking_weights: RankingWeights,
+    /// Lazy global package client, replaced when accepted settings or credentials change.
+    global: Arc<GlobalState>,
     /// The lexical lane, absent exactly when [`Self::search_index`] is. A rebuild commits
     /// through it before its snapshot becomes current.
     lexical: Option<LexicalLane>,
@@ -1443,6 +1488,7 @@ impl RiftMcp {
             blocking,
             search_index,
             ranking_weights,
+            global: Arc::new(GlobalState::default()),
             lexical,
             #[cfg(test)]
             dependencies: packages,
@@ -1567,9 +1613,88 @@ impl RiftMcp {
         &self,
         Parameters(params): Parameters<GetSymbolParams>,
     ) -> Result<Json<GetSymbolResult>, ErrorData> {
+        if params.rev.is_none() && params.scope != SearchScope::Local {
+            return self.current_tree_get_symbol(params).await;
+        }
         let rev = params.rev.clone();
         self.read_at(rev, move |reads| reads.get_symbol(&params))
             .await
+    }
+
+    /// Routes one current-tree package lookup through global data and selected local fallback.
+    async fn current_tree_get_symbol(
+        &self,
+        params: GetSymbolParams,
+    ) -> Result<Json<GetSymbolResult>, ErrorData> {
+        let deadline = self.request_deadline().await;
+        let resolved = self
+            .published_workspace(wire::ErrorPhase::Read, deadline)
+            .await?;
+        let context = Arc::clone(resolved.published.reads.dependency_context());
+        let configuration = resolved.published.configuration.global_configuration();
+        let mut route = match tokio::time::timeout_at(
+            deadline.at(),
+            Box::pin(self.global.route(&configuration, &context)),
+        )
+        .await
+        {
+            Ok(route) => route,
+            Err(_) => self.global.deadline_exceeded(&context),
+        };
+        let mut remote_warnings = Vec::new();
+        let remote = match (&route.client, route.remote_packages.is_empty()) {
+            (Some(client), false) => {
+                match tokio::time::timeout_at(
+                    deadline.at(),
+                    Box::pin(package_symbols(client, &params, &route.remote_packages)),
+                )
+                .await
+                {
+                    Ok(Ok(remote)) => {
+                        remote_warnings = remote.warnings;
+                        remote.items
+                    }
+                    Ok(Err(error)) => {
+                        route.discard_remote(&context, &error);
+                        Vec::new()
+                    }
+                    Err(_) => {
+                        route.discard_remote(&context, &rift_cloud_client::ClientError::Deadline);
+                        Vec::new()
+                    }
+                }
+            }
+            _ => Vec::new(),
+        };
+        let mut collected = params.clone();
+        collected.limit = rift_protocol::read::PAGE_LIMIT_MAX;
+        collected.page_index = 0;
+        let fallback_context = Arc::clone(&route.fallback_context);
+        let answer = self
+            .current_tree_read(&resolved, move |reads| {
+                reads.get_symbol_with_dependency_context(&collected, &fallback_context)
+            })
+            .await?;
+        let mut answer = match merge_symbols(&params, answer.0, remote) {
+            Ok(mut answer) => {
+                answer.warnings.append(&mut remote_warnings);
+                answer
+            }
+            Err(error) => {
+                route.discard_remote(&context, &error);
+                let mut collected = params.clone();
+                collected.limit = rift_protocol::read::PAGE_LIMIT_MAX;
+                collected.page_index = 0;
+                let fallback_context = Arc::clone(&route.fallback_context);
+                self.current_tree_read(&resolved, move |reads| {
+                    reads.get_symbol_with_dependency_context(&collected, &fallback_context)
+                })
+                .await?
+                .0
+            }
+        };
+        apply_global_warnings(&mut answer.warnings, &route);
+        Ok(Json(answer))
     }
 
     /// Searches indexed declarations and source lines by lexical `query`, merged with
@@ -1709,14 +1834,163 @@ impl RiftMcp {
                 self.ranking_weights,
             )
         });
-        let executed = params;
-        let mut answer = self
-            .current_tree_read(&resolved, move |reads| {
-                reads.search_with_references(&executed, &answer, &references)
-            })
+        self.route_current_tree_search(resolved, params, answer, warnings, references, deadline)
+            .await
+    }
+
+    /// Routes one current-tree search through global data and selected local fallback.
+    async fn route_current_tree_search(
+        &self,
+        resolved: ResolvedWorkspace,
+        params: SearchParams,
+        answer: StoreAnswer,
+        warnings: Vec<ReadWarning>,
+        references: EngineReferences,
+        deadline: RequestDeadline,
+    ) -> Result<Json<SearchResult>, ErrorData> {
+        if params.scope == SearchScope::Local {
+            let mut answer = self
+                .current_tree_search_selected(
+                    &resolved,
+                    params,
+                    answer,
+                    Arc::new(references),
+                    Arc::clone(resolved.published.reads.dependency_context()),
+                )
+                .await?;
+            answer.0.warnings.extend(warnings);
+            return Ok(answer);
+        }
+
+        let references = Arc::new(references);
+        let context = Arc::clone(resolved.published.reads.dependency_context());
+        let parsed = params
+            .query
+            .as_deref()
+            .and_then(|query| ParsedQuery::parse(query).ok());
+        let remote_query = (params.target != rift_protocol::read::SearchParamsTarget::File)
+            .then_some(parsed)
+            .flatten();
+        let Some(parsed) = remote_query else {
+            let selected = Arc::new(context.filter_entries(|_| false));
+            let mut answer = self
+                .current_tree_search_selected(&resolved, params, answer, references, selected)
+                .await?;
+            answer
+                .0
+                .warnings
+                .retain(|warning| !matches!(warning, ReadWarning::GlobalIndexUnavailable { .. }));
+            answer.0.warnings.extend(warnings);
+            return Ok(answer);
+        };
+
+        let configuration = resolved.published.configuration.global_configuration();
+        let (mut route, mut remote) = self
+            .global_search_candidates(deadline, &configuration, &context, &params, &parsed)
+            .await;
+        let remote_warnings = std::mem::take(&mut remote.warnings);
+        let mut collected = params.clone();
+        collected.limit = Some(rift_protocol::read::PAGE_LIMIT_MAX);
+        collected.page_index = 0;
+        let mut local = self
+            .current_tree_search_selected(
+                &resolved,
+                collected.clone(),
+                answer.clone(),
+                Arc::clone(&references),
+                Arc::clone(&route.fallback_context),
+            )
             .await?;
-        answer.0.warnings.extend(warnings);
-        Ok(answer)
+        local.0.warnings.extend(warnings.clone());
+        let mut answer = match merge_search(&params, local.0, remote) {
+            Ok(mut answer) => {
+                answer.warnings.extend(remote_warnings);
+                answer
+            }
+            Err(error) => {
+                route.discard_remote(&context, &error);
+                let mut fallback = self
+                    .current_tree_search_selected(
+                        &resolved,
+                        collected,
+                        answer,
+                        references,
+                        Arc::clone(&route.fallback_context),
+                    )
+                    .await?;
+                fallback.0.warnings.extend(warnings);
+                fallback.0
+            }
+        };
+        apply_global_warnings(&mut answer.warnings, &route);
+        Ok(Json(answer))
+    }
+
+    /// Resolves and reads the remote branch inside one MCP request deadline.
+    async fn global_search_candidates(
+        &self,
+        deadline: RequestDeadline,
+        configuration: &rift_protocol::configuration::GlobalConfiguration,
+        context: &Arc<rift_dependency::DependencyContext>,
+        params: &SearchParams,
+        parsed: &ParsedQuery,
+    ) -> (GlobalRoute, GlobalSearchCandidates) {
+        let mut route = match tokio::time::timeout_at(
+            deadline.at(),
+            Box::pin(self.global.route(configuration, context)),
+        )
+        .await
+        {
+            Ok(route) => route,
+            Err(_) => self.global.deadline_exceeded(context),
+        };
+        let remote = match (&route.client, route.remote_packages.is_empty()) {
+            (Some(client), false) => {
+                match tokio::time::timeout_at(
+                    deadline.at(),
+                    Box::pin(package_search(
+                        client,
+                        params,
+                        parsed,
+                        &route.remote_packages,
+                    )),
+                )
+                .await
+                {
+                    Ok(Ok(remote)) => remote,
+                    Ok(Err(error)) => {
+                        route.discard_remote(context, &error);
+                        GlobalSearchCandidates::default()
+                    }
+                    Err(_) => {
+                        route.discard_remote(context, &rift_cloud_client::ClientError::Deadline);
+                        GlobalSearchCandidates::default()
+                    }
+                }
+            }
+            _ => GlobalSearchCandidates::default(),
+        };
+        (route, remote)
+    }
+
+    /// Executes one search with package work limited to `dependency_context`.
+    async fn current_tree_search_selected(
+        &self,
+        resolved: &ResolvedWorkspace,
+        params: SearchParams,
+        answer: StoreAnswer,
+        references: Arc<EngineReferences>,
+        dependency_context: Arc<rift_dependency::DependencyContext>,
+    ) -> Result<Json<SearchResult>, ErrorData> {
+        self.current_tree_read(resolved, move |reads| {
+            reads.search_with_references_and_dependency_context(
+                &params,
+                &answer,
+                &references,
+                &dependency_context,
+            )
+        })
+        .await
     }
 
     /// Repeats engine reads against a fresh publication when their captured tree moves.
@@ -3862,7 +4136,7 @@ mod tests {
             data.message.as_ref(),
             "the request does not match the documented form: tool search, field paths, \
              accepted exclude, force_include, include, \
-             example {\"exclude\":[\"src/generated/**\"],\"include\":[\"src/**\"]}; \
+             example {\"include\":[\"src/**\"],\"exclude\":[\"src/generated/**\"]}; \
              correct the reported field and resend the request"
         );
         let wire = data.data.ok_or("wire error data must be present")?;
