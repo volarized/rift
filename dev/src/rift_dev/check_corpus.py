@@ -11,7 +11,7 @@ import traceback
 from collections.abc import Callable
 from pathlib import Path
 
-from mcp.shared.exceptions import McpError
+from mcp.shared.exceptions import MCPError
 
 from rift_dev.corpus_assertions import (
     CONTEXT_DEGRADED,
@@ -549,7 +549,7 @@ class Corpus:
         require((self.root / path).is_symlink(), f"{path}: pinned symlink is absent")
         try:
             await client.call("nodes", {"path": path, "position": 0})
-        except McpError as error:
+        except MCPError as error:
             require(
                 object_value(error.error.data, "nodes refusal").get("code")
                 == "resource_not_found",

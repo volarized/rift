@@ -170,8 +170,7 @@ def test_missing_engine_requires_launch_failure_and_preserves_syntax_reads(
     from typing import cast
     from unittest.mock import AsyncMock
 
-    from mcp.shared.exceptions import McpError
-    from mcp.types import ErrorData
+    from mcp.shared.exceptions import MCPError
     from rift_dev.rift_test_client import Client, JsonObject
 
     client = AsyncMock(spec=Client)
@@ -180,12 +179,10 @@ def test_missing_engine_requires_launch_failure_and_preserves_syntax_reads(
     async def call(name: str, arguments: JsonObject) -> JsonObject:
         if name == "search":
             if failed_launch:
-                raise McpError(
-                    ErrorData(
-                        code=-32000,
-                        message="launch_failed",
-                        data={"code": "capability_unavailable"},
-                    )
+                raise MCPError(
+                    code=-32000,
+                    message="launch_failed",
+                    data={"code": "capability_unavailable"},
                 )
             return {"results": []}
         assert name == "get_symbol"

@@ -47,7 +47,7 @@ use rift_protocol::read::{Language, NodeFacet};
 use tree_sitter::{Node, Parser};
 
 use crate::document::{ByteRange, SyntaxDocument};
-use crate::extract::{self, Declaration, GrammarRules};
+use crate::extract::{self, ChildIndices, Declaration, GrammarRules};
 use crate::failure::{SyntaxError, SyntaxFault, incompatible_grammar};
 use crate::provider::{
     SYNTAX_DEPTH_MAX_DEFAULT, SYNTAX_NODES_MAX_DEFAULT, SyntaxLimits, SyntaxProvider, SyntaxSource,
@@ -163,7 +163,8 @@ impl YamlRules {
     /// document ordinals once so each lookup during the walk is a binary
     /// search rather than a sibling scan.
     fn new(kinds: &'static YamlKinds, root: Node<'_>) -> Self {
-        let mut document_ordinals: Vec<(usize, usize)> = (0..root.named_child_count())
+        let mut document_ordinals: Vec<(usize, usize)> = root
+            .named_child_indices()
             .filter_map(|index| root.named_child(index))
             .filter(|child| child.kind_id() == kinds.document)
             .enumerate()
@@ -186,7 +187,7 @@ impl YamlRules {
         if let Some(spelling) = self.direct_scalar_spelling(node, text) {
             return Some(spelling);
         }
-        (0..node.named_child_count())
+        node.named_child_indices()
             .filter_map(|index| node.named_child(index))
             .find_map(|child| self.direct_scalar_spelling(child, text))
     }
@@ -269,7 +270,8 @@ impl YamlRules {
 
     /// The document's content span; `None` for a bare `---`.
     fn document_body_range(&self, document: Node<'_>) -> Result<Option<ByteRange>, SyntaxError> {
-        let content = (0..document.named_child_count())
+        let content = document
+            .named_child_indices()
             .filter_map(|index| document.named_child(index))
             .find(|child| {
                 child.kind_id() == self.kinds.block_node || child.kind_id() == self.kinds.flow_node

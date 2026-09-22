@@ -11,12 +11,11 @@ import json
 import os
 import time
 import uuid
-from datetime import timedelta
 from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from mcp.shared.exceptions import McpError
+from mcp.shared.exceptions import MCPError
 
 from rift_dev.check_artifact import incoming_references, symbol_hit, symbol_id
 from rift_dev.release_process import owned_environment, run
@@ -132,7 +131,7 @@ async def check_missing_executable(client: Client, name: str) -> None:
     hit = await symbol_hit(client, "beacon_cold")
     try:
         await incoming_references(client, symbol_id(hit))
-    except McpError as launch_error:
+    except MCPError as launch_error:
         detail = object_value(launch_error.error.data, "engine error")
         require(
             detail.get("code") == "capability_unavailable",
@@ -221,9 +220,7 @@ async def check_coldstart(binary: Path, image: str, version: str | None = None) 
                 )
                 async with (
                     stdio_client(parameters, errlog=log) as (read, write),
-                    ClientSession(
-                        read, write, timedelta(seconds=START_SECONDS)
-                    ) as session,
+                    ClientSession(read, write, START_SECONDS) as session,
                 ):
                     client = Client(session, START_SECONDS)
                     await client.initialize()

@@ -21,7 +21,6 @@ import xml.etree.ElementTree as ET
 from collections.abc import AsyncIterator, Coroutine, Iterator, Mapping, Sequence
 from contextlib import ExitStack, asynccontextmanager, contextmanager
 from contextvars import ContextVar
-from datetime import timedelta
 from pathlib import Path
 from types import TracebackType
 from typing import Self, TextIO, TypeAlias, cast
@@ -31,7 +30,6 @@ import tomllib
 from jsonschema import Draft202012Validator
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
-from pydantic import AnyUrl
 
 from rift_dev.check_mcp_conformance import REPOSITORY, build_server_binary
 from rift_dev.release_process import (
@@ -42,7 +40,13 @@ from rift_dev.release_process import (
     termination_handler,
 )
 
-Json: TypeAlias = None | bool | int | float | str | list["Json"] | dict[str, "Json"]
+# `list` and `dict` are invariant, so a `list[JsonObject]` an assertion builds is
+# not a `list[Json]` and cannot be passed where a JSON value is expected. The
+# covariant `Sequence` and `Mapping` accept both, and every consumer narrows
+# through `array_value` or `object_value` before it indexes or mutates.
+Json: TypeAlias = (
+    None | bool | int | float | str | Sequence["Json"] | Mapping[str, "Json"]
+)
 JsonObject: TypeAlias = dict[str, Json]
 LOG_BYTES_MAX = 8 * 1024 * 1024
 MESSAGE_BYTES_MAX = 16 * 1024 * 1024
@@ -270,16 +274,16 @@ class Client:
                 )
                 for tool in page.tools:
                     require(tool.name not in self.tools, f"duplicate tool: {tool.name}")
-                    if tool.outputSchema is None:
+                    if tool.output_schema is None:
                         raise AssertionError(f"{tool.name} has no output schema")
-                    for schema in (tool.inputSchema, tool.outputSchema):
+                    for schema in (tool.input_schema, tool.output_schema):
                         require(
                             schema is not None and schema.get("type") == "object",
                             f"{tool.name}: MCP requires object schemas",
                         )
                         Draft202012Validator.check_schema(schema)
                     self.tools[tool.name] = tool
-                cursor = page.nextCursor
+                cursor = page.next_cursor
                 if cursor is None:
                     require(bool(self.tools), "tools/list returned no tools")
                     return
@@ -288,32 +292,32 @@ class Client:
     async def call(self, name: str, arguments: JsonObject) -> JsonObject:
         """Validate requests and structured answers, preserving refusal values."""
         tool = self.tools[name]
-        Draft202012Validator(tool.inputSchema).validate(arguments)
+        Draft202012Validator(tool.input_schema).validate(arguments)
         async with asyncio.timeout(self.call_seconds):
             result = await self.session.call_tool(name, arguments)
-        answer = object_value(result.structuredContent, name)
+        answer = object_value(result.structured_content, name)
         require(
             len(json.dumps(answer).encode()) <= MESSAGE_BYTES_MAX,
             f"{name} result exceeds {MESSAGE_BYTES_MAX} bytes",
         )
-        if tool.outputSchema is None:
+        if tool.output_schema is None:
             raise AssertionError(f"{name} has no output schema")
-        Draft202012Validator(tool.outputSchema).validate(answer)
-        require(not result.isError, f"{name} reported a tool error: {answer}")
+        Draft202012Validator(tool.output_schema).validate(answer)
+        require(not result.is_error, f"{name} reported a tool error: {answer}")
         self.exercised.add(name)
         return answer
 
     async def resource(self, uri: str) -> JsonObject:
         """Require the SDK resource envelope to contain exactly one JSON document."""
         async with asyncio.timeout(self.call_seconds):
-            result = await self.session.read_resource(AnyUrl(uri))
+            result = await self.session.read_resource(uri)
         require(len(result.contents) == 1, f"{uri}: expected one resource document")
         content = result.contents[0]
         if not isinstance(content, types.TextResourceContents):
             raise TypeError(f"{uri}: expected text content")
         require(str(content.uri) == uri, f"{uri}: resource returned {content.uri}")
         require(
-            content.mimeType == "application/json", f"{uri}: expected application/json"
+            content.mime_type == "application/json", f"{uri}: expected application/json"
         )
         require(
             len(content.text.encode()) <= MESSAGE_BYTES_MAX,
@@ -504,7 +508,7 @@ class Server:
             )
             async with (
                 stdio_client(parameters, errlog=log) as (read, write),
-                ClientSession(read, write, timedelta(seconds=call_seconds)) as session,
+                ClientSession(read, write, call_seconds) as session,
             ):
                 client = Client(session, call_seconds)
                 await client.initialize()

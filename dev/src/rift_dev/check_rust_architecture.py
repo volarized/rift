@@ -177,8 +177,19 @@ STORAGE_CRATES = frozenset(
 def resolved_closure(name: str) -> set[str]:
     """Return every crate the resolved dependency graph reaches from `name`."""
     process = subprocess.run(
-        ["cargo", "tree", "--package", name, "--edges", "normal", "--prefix", "none",
-         "--no-dedupe", "--format", "{p}"],
+        [
+            "cargo",
+            "tree",
+            "--package",
+            name,
+            "--edges",
+            "normal",
+            "--prefix",
+            "none",
+            "--no-dedupe",
+            "--format",
+            "{p}",
+        ],
         capture_output=True,
         check=False,
         text=True,

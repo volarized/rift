@@ -9,7 +9,7 @@ use rift_protocol::read::{Language, NodeFacet, SymbolFacet};
 use tree_sitter::{Node, Parser, Query as TreeSitterQuery, QueryCursor, StreamingIterator};
 
 use crate::document::{ByteRange, SyntaxDocument};
-use crate::extract::{self, Declaration, GrammarRules};
+use crate::extract::{self, ChildIndices, Declaration, GrammarRules};
 use crate::failure::{SyntaxBound, SyntaxError, SyntaxFault, incompatible_grammar, invalid_query};
 use crate::provider::{
     SYNTAX_DEPTH_MAX_DEFAULT, SYNTAX_NODES_MAX_DEFAULT, SyntaxLimits, SyntaxProvider, SyntaxSource,
@@ -533,7 +533,7 @@ fn declared_visibility(node: Node<'_>, kind: RustSymbolKind, text: &str) -> Rust
 }
 
 fn declaration_visibility(node: Node<'_>, text: &str) -> RustVisibility {
-    (0..node.named_child_count())
+    node.named_child_indices()
         .filter_map(|index| node.named_child(index))
         .find(|child| child.kind() == RustGrammarNodeKind::VisibilityModifier.as_str())
         .and_then(|child| text.get(child.byte_range()))
