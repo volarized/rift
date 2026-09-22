@@ -566,7 +566,7 @@ async fn a_fresh_path_starts_preparing_and_reopening_reads_what_was_left() -> Te
     let root = workspace()?;
     let index = opened(root.path(), limits()).await?;
     assert_eq!(
-        index.readiness(),
+        index.pass_readiness(),
         VectorReadiness::Preparing {
             prepared: 0,
             total: 0
@@ -593,7 +593,7 @@ async fn a_build_with_no_declarations_leaves_the_vector_ranking_ready() -> TestR
     let index = prepared(root.path(), limits()).await?;
     whole_pass(&index, &[], &[], REVISION).await?;
     assert_eq!(
-        index.readiness(),
+        index.pass_readiness(),
         VectorReadiness::Ready,
         "an empty set has a vector for every declaration it holds"
     );
@@ -607,6 +607,99 @@ async fn a_build_with_no_declarations_leaves_the_vector_ranking_ready() -> TestR
     assert!(
         identities(input(&ranking, RankingInputKind::Vector)?).is_empty(),
         "a tier holding no vector ranks nothing either"
+    );
+    assert_eq!(
+        ranking.readiness(),
+        VectorReadiness::Ready,
+        "an empty corpus is every vector an empty set owes, so the read waits \
+         for nothing"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_ranking_carries_the_readiness_its_own_vector_scan_decided() -> TestResult {
+    let root = workspace()?;
+    let index = prepared(root.path(), limits()).await?;
+    let fixture = two()?;
+    index.replace_lexical(fixture.documents(), REVISION).await?;
+
+    // No pass has published a corpus, so the vector tier ranks nothing and the
+    // ranking says so.
+    let waiting = ranked(&index, "load config", 10).await?;
+    assert!(
+        identities(input(&waiting, RankingInputKind::Vector)?).is_empty(),
+        "a tier with no corpus to scan ranks nothing: {waiting:?}"
+    );
+    assert_eq!(
+        waiting.readiness(),
+        VectorReadiness::Preparing {
+            prepared: 0,
+            total: 0
+        },
+        "the ranking carries the wait the vector tier is owed"
+    );
+
+    // The pass lands. A caller reading the index now reads `Ready`, and the
+    // answer it would attach that to is the one above, which ranked nothing.
+    index
+        .embed_described(&fixture.described(), Embedding::Every, REVISION)
+        .await?;
+    assert_eq!(index.pass_readiness(), VectorReadiness::Ready);
+    assert_eq!(
+        waiting.readiness(),
+        VectorReadiness::Preparing {
+            prepared: 0,
+            total: 0
+        },
+        "a pass landing after a ranking cannot turn that ranking's decline into \
+         an answer with nothing left to wait for"
+    );
+
+    let answered = ranked(&index, "load config", 10).await?;
+    assert_eq!(answered.readiness(), VectorReadiness::Ready);
+    assert!(
+        !identities(input(&answered, RankingInputKind::Vector)?).is_empty(),
+        "the pass published a corpus for this tree, so the tier ranks: {answered:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_corpus_described_for_another_tree_reports_a_wait_rather_than_ready() -> TestResult {
+    let root = workspace()?;
+    let index = prepared(root.path(), limits()).await?;
+    let fixture = two()?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
+    assert_eq!(index.pass_readiness(), VectorReadiness::Ready);
+
+    // The lexical lane stamps the next tree as it commits, and the pass that
+    // describes that tree runs afterwards. Between the two the corpus answers
+    // the previous tree alone.
+    index
+        .replace_lexical(fixture.documents(), "rev-two")
+        .await?;
+
+    let ranking =
+        revision_ranking(&index, "rev-two", "load config", QueryPhase::Precise, 10).await?;
+    assert!(
+        identities(input(&ranking, RankingInputKind::Vector)?).is_empty(),
+        "a corpus described for another tree ranks nothing: {ranking:?}"
+    );
+    assert_eq!(
+        ranking.readiness(),
+        VectorReadiness::Preparing {
+            prepared: 0,
+            total: 2
+        },
+        "the tree this read captured carries no vector yet, whatever the pass \
+         reached for the one before it"
+    );
+    assert_eq!(
+        index.pass_readiness(),
+        VectorReadiness::Ready,
+        "the pass is finished with the tree it described, which is what a read \
+         must not be told about the tree it captured"
     );
     Ok(())
 }
@@ -625,7 +718,7 @@ async fn a_build_gives_every_declaration_a_vector_and_stamps_the_tree_revision()
     )
     .await?;
 
-    assert_eq!(index.readiness(), VectorReadiness::Ready);
+    assert_eq!(index.pass_readiness(), VectorReadiness::Ready);
     assert_eq!(index.tree_revision().await?, Some(REVISION.to_owned()));
     let vectors = stored(root.path(), "model").await?;
     let held: Vec<&str> = vectors.iter().map(StoredVector::digest).collect();
@@ -668,7 +761,7 @@ async fn a_refresh_leaves_a_moved_declaration_the_vector_it_already_had() -> Tes
         is_marked(&vectors, &carried),
         "a declaration whose own text is unchanged keeps the vector it had"
     );
-    assert_eq!(index.readiness(), VectorReadiness::Ready);
+    assert_eq!(index.pass_readiness(), VectorReadiness::Ready);
     assert_eq!(index.tree_revision().await?, Some("rev-two".to_owned()));
     Ok(())
 }
@@ -746,7 +839,7 @@ async fn a_build_stopping_at_the_vector_bound_reports_preparing() -> TestResult 
     let fixture = two()?;
     whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
     assert_eq!(
-        index.readiness(),
+        index.pass_readiness(),
         VectorReadiness::Preparing {
             prepared: 1,
             total: 2
@@ -761,18 +854,18 @@ async fn a_build_stopping_at_the_vector_bound_reports_preparing() -> TestResult 
 async fn a_disabled_tier_answers_in_the_full_text_order_alone() -> TestResult {
     let root = workspace()?;
     let index = opened(root.path(), lexical_only_limits()).await?;
-    assert_eq!(index.readiness(), VectorReadiness::Disabled);
+    assert_eq!(index.pass_readiness(), VectorReadiness::Disabled);
     index
         .prepare(&model_source(root.path(), "model")?, acquisition_limits())
         .await?;
     assert_eq!(
-        index.readiness(),
+        index.pass_readiness(),
         VectorReadiness::Disabled,
         "a disabled tier acquires nothing"
     );
     let fixture = two()?;
     whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
-    assert_eq!(index.readiness(), VectorReadiness::Disabled);
+    assert_eq!(index.pass_readiness(), VectorReadiness::Disabled);
     assert!(
         stored(root.path(), "model").await?.is_empty(),
         "a disabled tier embeds nothing"
@@ -874,7 +967,7 @@ async fn more_documents_than_described_entries_leave_the_undescribed_ones_withou
         ["sym-one"],
         "the only vector resolves to the only described document"
     );
-    assert_eq!(index.readiness(), VectorReadiness::Ready);
+    assert_eq!(index.pass_readiness(), VectorReadiness::Ready);
     Ok(())
 }
 
@@ -919,7 +1012,7 @@ async fn a_tier_that_will_not_load_leaves_the_full_text_ranking_serving() -> Tes
     let fixture = two()?;
     whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
     assert_eq!(
-        index.readiness(),
+        index.pass_readiness(),
         VectorReadiness::Preparing {
             prepared: 0,
             total: 2
@@ -932,7 +1025,7 @@ async fn a_tier_that_will_not_load_leaves_the_full_text_ranking_serving() -> Tes
         .await
         .expect_err("the directory holds no model");
     assert_eq!(error.fault().violation(), SearchViolation::ModelFileMissing);
-    assert_eq!(index.readiness(), VectorReadiness::Unavailable);
+    assert_eq!(index.pass_readiness(), VectorReadiness::Unavailable);
 
     assert_eq!(
         lexical_identities(&index, "load config", 10).await?,
@@ -945,7 +1038,7 @@ async fn a_tier_that_will_not_load_leaves_the_full_text_ranking_serving() -> Tes
     );
     whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
     assert_eq!(
-        index.readiness(),
+        index.pass_readiness(),
         VectorReadiness::Unavailable,
         "one failure is final for the life of this index"
     );
@@ -1022,7 +1115,7 @@ async fn readiness_walks_from_preparing_to_ready() -> TestResult {
     let root = workspace()?;
     let index = opened(root.path(), limits()).await?;
     assert_eq!(
-        index.readiness(),
+        index.pass_readiness(),
         VectorReadiness::Preparing {
             prepared: 0,
             total: 0
@@ -1031,7 +1124,7 @@ async fn readiness_walks_from_preparing_to_ready() -> TestResult {
     let fixture = two()?;
     whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
     assert_eq!(
-        index.readiness(),
+        index.pass_readiness(),
         VectorReadiness::Preparing {
             prepared: 0,
             total: 2
@@ -1041,7 +1134,7 @@ async fn readiness_walks_from_preparing_to_ready() -> TestResult {
         .prepare(&model_source(root.path(), "model")?, acquisition_limits())
         .await?;
     incremental_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
-    assert_eq!(index.readiness(), VectorReadiness::Ready);
+    assert_eq!(index.pass_readiness(), VectorReadiness::Ready);
     Ok(())
 }
 

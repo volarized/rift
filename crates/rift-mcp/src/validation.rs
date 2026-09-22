@@ -1477,7 +1477,7 @@ pub(crate) async fn populate_search(
              in [source], or increase search.text.max_chunk, to avoid this"
         );
     }
-    if index.readiness() == VectorReadiness::Disabled {
+    if index.pass_readiness() == VectorReadiness::Disabled {
         return;
     }
     let units = published.reads.index_documents();
@@ -5932,7 +5932,7 @@ pub(crate) mod tests {
         let limits = SearchIndexLimits::builder(LexicalIndexLimits::default()).build();
         let index = SearchIndex::open(database, limits).await?;
         assert_eq!(
-            index.readiness(),
+            index.pass_readiness(),
             VectorReadiness::Preparing {
                 prepared: 0,
                 total: 0
@@ -5967,14 +5967,14 @@ pub(crate) mod tests {
     /// Waits until the lane's readiness names `total` declarations.
     async fn described_within_bound(index: &SearchIndex, total: u64) -> TestResult {
         for _attempt in 0..LANE_ATTEMPTS_MAX {
-            if index.readiness() == (VectorReadiness::Preparing { prepared: 0, total }) {
+            if index.pass_readiness() == (VectorReadiness::Preparing { prepared: 0, total }) {
                 return Ok(());
             }
             tokio::time::sleep(LANE_POLL).await;
         }
         Err(format!(
             "the lane never recorded {total} declarations; readiness is {:?}",
-            index.readiness()
+            index.pass_readiness()
         )
         .into())
     }
@@ -6063,7 +6063,7 @@ pub(crate) mod tests {
         let newest = stable_candidate(directory.path(), 1)?;
         lane.request(Arc::clone(&newest));
         assert_eq!(
-            index.readiness(),
+            index.pass_readiness(),
             VectorReadiness::Preparing {
                 prepared: 0,
                 total: described
@@ -6107,7 +6107,7 @@ pub(crate) mod tests {
         let subscriber = tracing_subscriber::registry().with(sink);
         let _guard = tracing::subscriber::set_default(subscriber);
         super::populate_search(&index, &published, rift_search::Embedding::Every).await;
-        assert_eq!(index.readiness(), VectorReadiness::Disabled);
+        assert_eq!(index.pass_readiness(), VectorReadiness::Disabled);
         assert_eq!(index.tree_revision().await?.as_deref(), Some(revision));
         assert_eq!(ranked_at(&index, revision, "beacon", 8).await?, before);
         let records = queued_records(&mut drain);
@@ -6131,7 +6131,7 @@ pub(crate) mod tests {
             .disable_vector()
             .build();
         let index = SearchIndex::open(database, limits).await?;
-        assert_eq!(index.readiness(), VectorReadiness::Disabled);
+        assert_eq!(index.pass_readiness(), VectorReadiness::Disabled);
         Ok(index)
     }
 
