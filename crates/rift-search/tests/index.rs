@@ -14,9 +14,10 @@ use rift_ranking::{
     ParsedQuery, QueryPhase, RankingInput, RankingInputKind, SearchableField,
 };
 use rift_search::{
-    AcquisitionLimits, Declaration, DescribedUnit, DocumentDigest, Embedding, Encoder,
-    EncoderLimits, ModelFiles, ModelSource, RevisionScoped, SearchError, SearchIndex,
-    SearchIndexLimits, SearchViolation, StoreRanking, VectorReadiness, document,
+    AcquisitionLimits, Declaration, DescribedUnit, DocumentDigest, Embedding, EmbeddingModels,
+    EmbeddingSpace, Encoder, EncoderLimits, LocalEncoder, ModelFiles, ModelSource, RetrievalModels,
+    RevisionScoped, SearchError, SearchIndex, SearchIndexLimits, SearchViolation, StoreRanking,
+    VectorReadiness, document,
 };
 use tokenizers::models::wordpiece::WordPiece;
 use tokenizers::processors::bert::BertProcessing;
@@ -254,6 +255,29 @@ fn model_identity(root: &Path, name: &str) -> Fallible<String> {
         encoder.query_transformation(),
     )
     .identity())
+}
+
+/// The model pair and the space a caller hands an index that loaded its own
+/// encoder, which is the shape a remote service's client arrives in.
+fn local_models(root: &Path, name: &str) -> Fallible<(EmbeddingModels, EmbeddingSpace)> {
+    let directory = root.join(name);
+    let files = ModelFiles::in_directory(&directory)?;
+    let encoder = Encoder::load(&files, EncoderLimits::new(2, 16, 256))?;
+    let space = rift_search::local_embedding_space(
+        &ModelSource::Directory(directory),
+        &files,
+        encoder.dimension(),
+        encoder.query_transformation(),
+    );
+    let held = LocalEncoder::new(std::sync::Arc::new(encoder));
+    Ok((
+        EmbeddingModels::Local(RetrievalModels::new(
+            held.documents(),
+            held.query(),
+            space.clone(),
+        )),
+        space,
+    ))
 }
 
 /// An acquisition that spends no wall clock: a directory model reads no
@@ -700,6 +724,65 @@ async fn a_corpus_described_for_another_tree_reports_a_wait_rather_than_ready() 
         VectorReadiness::Ready,
         "the pass is finished with the tree it described, which is what a read \
          must not be told about the tree it captured"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pass_that_published_no_vector_reports_the_wait_rather_than_ranking_nothing() -> TestResult
+{
+    let root = workspace()?;
+    // A ceiling of nothing leaves the pass every declaration to describe and no
+    // room to store one, which is the shape of any pass whose rows did not reach
+    // the store.
+    let starved = SearchIndexLimits::builder(lexical_limits())
+        .batch_declarations(2)
+        .max_tokens(16)
+        .max_vectors(0)
+        .build();
+    let index = prepared(root.path(), starved).await?;
+    let fixture = two()?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
+    assert!(
+        stored(root.path(), "model").await?.is_empty(),
+        "the ceiling left room for no vector"
+    );
+
+    let ranking = ranked(&index, "load config", 10).await?;
+    assert!(
+        identities(input(&ranking, RankingInputKind::Vector)?).is_empty(),
+        "a corpus with nothing in it ranks nothing: {ranking:?}"
+    );
+    assert_eq!(
+        ranking.readiness(),
+        VectorReadiness::Preparing {
+            prepared: 0,
+            total: 2
+        },
+        "a set that described declarations and carries no vector is still owed one"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_disabled_tier_holds_no_model_it_is_handed() -> TestResult {
+    let root = workspace()?;
+    let index = opened(root.path(), lexical_only_limits()).await?;
+    let (models, space) = local_models(root.path(), "model")?;
+    index.hold_models(models, space).await?;
+    assert_eq!(
+        index.pass_readiness(),
+        VectorReadiness::Disabled,
+        "a workspace that turned the tier off holds no model for it"
+    );
+
+    let fixture = two()?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
+    let ranking = ranked(&index, "load config", 10).await?;
+    assert_eq!(
+        ranking.readiness(),
+        VectorReadiness::Disabled,
+        "a tier the workspace turned off reports that, not a wait that never ends"
     );
     Ok(())
 }
