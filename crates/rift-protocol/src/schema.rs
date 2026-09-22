@@ -6,6 +6,49 @@
 //! names are proven against the model structs by the `property!` macro, and
 //! wire values come from serializing the model enums themselves.
 
+/// Renders the JSON Schema for workspace configuration.
+#[must_use]
+pub fn configuration_schema_document() -> String {
+    render_schema::<crate::configuration::WorkspaceConfiguration>()
+}
+
+/// Renders the JSON Schema for one package publication.
+#[must_use]
+pub fn package_index_schema_document() -> String {
+    render_schema::<crate::index::PackagePublication>()
+}
+
+fn render_schema<Model: schemars::JsonSchema>() -> String {
+    let schema = schemars::schema_for!(Model);
+    let document = serde_json::to_value(&schema)
+        .unwrap_or_else(|error| unreachable!("schemas serialize to JSON values: {error}"));
+    render_json_document(document)
+}
+
+/// Renders one JSON document with object members sorted at every depth.
+#[must_use]
+pub fn render_json_document(mut document: Value) -> String {
+    sort_object_members(&mut document);
+    let mut rendered = format!("{document:#}");
+    rendered.push('\n');
+    rendered
+}
+
+fn sort_object_members(value: &mut Value) {
+    match value {
+        Value::Array(values) => values.iter_mut().for_each(sort_object_members),
+        Value::Object(object) => {
+            let mut entries = std::mem::take(object).into_iter().collect::<Vec<_>>();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (name, mut value) in entries {
+                sort_object_members(&mut value);
+                object.insert(name, value);
+            }
+        }
+        _ => {}
+    }
+}
+
 use crate::read::SearchHit;
 use schemars::Schema;
 use serde::Serialize;
@@ -1182,6 +1225,15 @@ mod tests {
 
     fn schema_from(value: Value) -> Schema {
         Schema::try_from(value).expect("test schema literal must be a valid schema object")
+    }
+
+    #[test]
+    fn rendered_document_sorts_object_members_at_every_depth() {
+        let rendered = render_json_document(json!({"z": {"b": 1, "a": 2}, "a": 0}));
+        assert_eq!(
+            rendered,
+            "{\n  \"a\": 0,\n  \"z\": {\n    \"a\": 2,\n    \"b\": 1\n  }\n}\n"
+        );
     }
 
     /// A schema shaped like a served tool's: an optional member spelled as a

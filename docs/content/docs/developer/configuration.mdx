@@ -193,6 +193,58 @@ requirement = "^5.9.0"
 A change to `package_size`, `index_size`, or `package_files` analyzes every package again on the
 next package read: each package the package index holds was read under the old bounds.
 
+## Global
+
+<VersionBadge version="v0.0.43" />
+
+`global` controls package reads through the configured REST API. The local server creates this
+client on the first `global` or `all` read that can return package declarations.
+
+```toml
+[global]
+enabled = true
+endpoint = "https://api.volar.sh/rift/rest"
+token_env = "RIFT_API_TOKEN"
+connect_timeout = "3s"
+request_timeout = "15s"
+attempts = 3
+max_in_flight = 4
+capabilities_ttl = "15m"
+resolution_ttl = "15m"
+failure_ttl = "30s"
+```
+
+- `enabled` defaults to `true`; `false` keeps package reads local and reports
+  `global_access_disabled` on package-scope reads
+- `endpoint` defaults to `https://api.volar.sh/rift/rest`; it must be an absolute base URL without
+  user information, query, fragment, or trailing slash
+- `token_env` defaults to `RIFT_API_TOKEN` and names the environment variable holding the optional
+  bearer token. An unset variable uses anonymous access
+- `connect_timeout` defaults to `"3s"` and accepts `100ms` to `30s`
+- `request_timeout` defaults to `"15s"` and accepts `1s` to `5m`; it covers connection, response,
+  retry delays, and every attempt
+- `attempts` defaults to `3` and accepts `1` to `5`
+- `max_in_flight` defaults to `4` and accepts `1` to `32`
+- `capabilities_ttl` and `resolution_ttl` default to `"15m"` and accept `1m` to `24h`
+- `failure_ttl` defaults to `"30s"` and accepts `1s` to `1h`
+
+When `token_env` names a non-empty valid value, the client sends it as the `Authorization: Bearer`
+header to the configured endpoint. Empty or malformed values leave global access unavailable before
+the client sends a request, and the token never enters logs, errors, metrics, or cache keys.
+
+The client does not contact the endpoint at server startup. A `local` read and a file-only search
+also make no global request. A connection failure, timeout, retry exhaustion, authentication
+failure, invalid response, or non-success response marks global access unavailable for
+`failure_ttl`; the affected package read then uses local indexing and reports a typed warning with
+the failure class and fallback counts.
+A valid remote page keeps its items and reports each bounded service condition as
+`global_page_warning`.
+
+A valid resolution sends available packages to the global API and sends missing or local-only
+packages to local indexing. A missing exact package reports `package_absent`; a missing declared
+requirement reports `package_requirement_absent`; a package that local indexing cannot serve
+reports `package_unavailable`.
+
 ## Languages and LSP
 
 <VersionBadge version="v0.0.25" />
@@ -573,4 +625,3 @@ whole body is one declaration, for example - is left out of the lexical index ra
 refusing the publication: its file stays in the syntax index and answers `get_symbol` and
 symbol search, only its text ranking is absent. The server records each such unit under
 `rift server logs --component index`, with the path and the observed size.
-

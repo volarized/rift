@@ -35,6 +35,21 @@ const VALID_TEXT_CONFIGURATION: &str = r#"
 max_chunk = "2mb"
 "#;
 
+/// A global table with values inside every published bound.
+const VALID_GLOBAL_CONFIGURATION: &str = r#"
+[global]
+enabled = false
+endpoint = "https://api.volar.sh/rift/rest"
+token_env = "RIFT_API_TOKEN"
+connect_timeout = "100ms"
+request_timeout = "5m"
+attempts = 5
+max_in_flight = 32
+capabilities_ttl = "24h"
+resolution_ttl = "1m"
+failure_ttl = "1h"
+"#;
+
 /// One workspace whose `rift.toml` turns the vector ranking off and then carries
 /// `configuration`, so the suite still proves what acceptance does with that block.
 ///
@@ -208,6 +223,80 @@ async fn valid_search_text_configuration_serves_normally() -> TestResult {
     );
 
     client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn valid_global_configuration_reaches_published_workspace() -> TestResult {
+    let directory = workspace_with(Some(VALID_GLOBAL_CONFIGURATION))?;
+    let client = client_for(directory.path()).await?;
+
+    let served = client
+        .call_tool(
+            CallToolRequestParams::new("get_symbol")
+                .with_arguments(arguments(&json!({"name": "beacon"}))?),
+        )
+        .await?;
+    assert_eq!(
+        served.structured_content.ok_or("structured content")?["hits"][0]["symbol"]["name"],
+        json!("beacon")
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn out_of_range_global_values_refuse_with_exact_evidence() -> TestResult {
+    let cases = [
+        (
+            "connect_timeout",
+            "\"0ms\"",
+            "global.connect_timeout",
+            "100..=30000",
+        ),
+        (
+            "request_timeout",
+            "\"0ms\"",
+            "global.request_timeout",
+            "1000..=300000",
+        ),
+        ("attempts", "0", "global.attempts", "1..=5"),
+        ("max_in_flight", "0", "global.max_in_flight", "1..=32"),
+        (
+            "capabilities_ttl",
+            "\"59s\"",
+            "global.capabilities_ttl",
+            "60000..=86400000",
+        ),
+        (
+            "resolution_ttl",
+            "\"25h\"",
+            "global.resolution_ttl",
+            "60000..=86400000",
+        ),
+        (
+            "failure_ttl",
+            "\"0ms\"",
+            "global.failure_ttl",
+            "1000..=3600000",
+        ),
+    ];
+    for (key, value, field, range) in cases {
+        let configuration = format!("[global]\n{key} = {value}\n");
+        let directory = workspace_with(Some(&configuration))?;
+        let client = client_for(directory.path()).await?;
+
+        let read = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
+        assert_eq!(read["code"], json!("configuration_invalid"));
+        let message = read["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(field) && message.contains(range),
+            "the refusal for {key} must name {field} and {range}: {message}"
+        );
+
+        client.cancel().await?;
+    }
     Ok(())
 }
 

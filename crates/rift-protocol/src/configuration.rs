@@ -76,6 +76,51 @@ pub const COMMAND_ARGUMENT_BYTES_MAX: usize = 4_096;
 /// Path patterns one language or text-search table may hold, at most.
 pub const CONFIGURATION_PATTERNS_MAX: usize = 64;
 
+/// The production global REST API base URL.
+pub const GLOBAL_ENDPOINT_DEFAULT: &str = "https://api.volar.sh/rift/rest";
+/// The environment variable read for the global REST API token.
+pub const GLOBAL_TOKEN_ENV_DEFAULT: &str = "RIFT_API_TOKEN";
+/// Global API connection timeout, at least: 100 milliseconds.
+pub const GLOBAL_CONNECT_TIMEOUT_MS_MIN: u64 = 100;
+/// Global API connection timeout, at most: 30 seconds.
+pub const GLOBAL_CONNECT_TIMEOUT_MS_MAX: u64 = 30_000;
+/// Global API request timeout, at least: one second.
+pub const GLOBAL_REQUEST_TIMEOUT_MS_MIN: u64 = 1_000;
+/// Global API request timeout, at most: five minutes.
+pub const GLOBAL_REQUEST_TIMEOUT_MS_MAX: u64 = 300_000;
+/// Global API attempts, at least.
+pub const GLOBAL_ATTEMPTS_MIN: u64 = 1;
+/// Global API attempts, at most.
+pub const GLOBAL_ATTEMPTS_MAX: u64 = 5;
+/// Global API requests in flight, at least.
+pub const GLOBAL_MAX_IN_FLIGHT_MIN: u64 = 1;
+/// Global API requests in flight, at most.
+pub const GLOBAL_MAX_IN_FLIGHT_MAX: u64 = 32;
+/// Global API capabilities and resolution cache lifetime, at least: one minute.
+pub const GLOBAL_CACHE_TTL_MS_MIN: u64 = 60_000;
+/// Global API capabilities and resolution cache lifetime, at most: one day.
+pub const GLOBAL_CACHE_TTL_MS_MAX: u64 = 86_400_000;
+/// Global API capabilities cache lifetime, at least: one minute.
+pub const GLOBAL_CAPABILITIES_TTL_MS_MIN: u64 = GLOBAL_CACHE_TTL_MS_MIN;
+/// Global API capabilities cache lifetime, at most: one day.
+pub const GLOBAL_CAPABILITIES_TTL_MS_MAX: u64 = GLOBAL_CACHE_TTL_MS_MAX;
+/// Global API package-resolution cache lifetime, at least: one minute.
+pub const GLOBAL_RESOLUTION_TTL_MS_MIN: u64 = GLOBAL_CACHE_TTL_MS_MIN;
+/// Global API package-resolution cache lifetime, at most: one day.
+pub const GLOBAL_RESOLUTION_TTL_MS_MAX: u64 = GLOBAL_CACHE_TTL_MS_MAX;
+/// Global API unavailable-state lifetime, at least: one second.
+pub const GLOBAL_FAILURE_TTL_MS_MIN: u64 = 1_000;
+/// Global API unavailable-state lifetime, at most: one hour.
+pub const GLOBAL_FAILURE_TTL_MS_MAX: u64 = 3_600_000;
+/// Milliseconds global API connection timeout holds when the key is absent.
+const GLOBAL_CONNECT_TIMEOUT_MS_DEFAULT: u64 = 3_000;
+/// Milliseconds global API request timeout holds when the key is absent.
+const GLOBAL_REQUEST_TIMEOUT_MS_DEFAULT: u64 = 15_000;
+/// Milliseconds global API capabilities and resolution cache lifetime hold when keys are absent.
+const GLOBAL_CACHE_TTL_MS_DEFAULT: u64 = 900_000;
+/// Milliseconds global API unavailable-state lifetime holds when the key is absent.
+const GLOBAL_FAILURE_TTL_MS_DEFAULT: u64 = 30_000;
+
 /// The pattern `[search.text].include` carries when the key is absent: every
 /// visible path no language entry claimed joins the text index.
 pub const TEXT_INCLUDE_PATTERN_DEFAULT: &str = "**";
@@ -362,6 +407,8 @@ fn split_magnitude<'text>(
 pub struct WorkspaceConfiguration {
     /// The server's own blocking-work bounds: worker count and queue wait.
     pub server: ServerConfiguration,
+    /// Whether package reads use the configured global REST API and its request bounds.
+    pub global: GlobalConfiguration,
     /// Bounds and switches for the built-in providers.
     pub providers: ProvidersConfiguration,
     /// Enablement and limits for caller-provided code.
@@ -421,6 +468,7 @@ impl WorkspaceConfiguration {
     fn violation(&self) -> Option<ConfigurationViolation> {
         self.server
             .violation()
+            .or_else(|| self.global.violation())
             .or_else(|| self.execution.violation())
             .or_else(|| self.providers.history.violation())
             .or_else(|| self.search.violation())
@@ -429,6 +477,154 @@ impl WorkspaceConfiguration {
             .or_else(|| self.logs.violation())
             .or_else(|| languages_violation(&self.languages, &self.lsp))
             .or_else(|| lsp_configurations_violation(&self.lsp))
+    }
+}
+
+/// The `[global]` table: global REST API access, request bounds, and cache lifetimes.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+#[schemars(transform = crate::configuration::declare_global_ranges)]
+pub struct GlobalConfiguration {
+    /// Whether package reads use the global REST API.
+    pub enabled: bool,
+    /// Base URL for global REST API requests. The client validates its URL form.
+    pub endpoint: String,
+    /// Environment variable containing the optional bearer token. The client validates its name.
+    pub token_env: String,
+    /// Connection timeout, 100ms to 30s.
+    pub connect_timeout: Duration,
+    /// Total request timeout across connection, response, delays, and attempts, 1s to 5m.
+    pub request_timeout: Duration,
+    /// Attempts one global API request makes, 1 to 5.
+    #[schemars(range(min = 1, max = 5))]
+    pub attempts: u64,
+    /// Global API requests running at once, 1 to 32.
+    #[schemars(range(min = 1, max = 32))]
+    pub max_in_flight: u64,
+    /// Capabilities cache lifetime, 1m to 24h.
+    pub capabilities_ttl: Duration,
+    /// Package-resolution cache lifetime, 1m to 24h.
+    pub resolution_ttl: Duration,
+    /// Unavailable-state cache lifetime, 1s to 1h.
+    pub failure_ttl: Duration,
+}
+
+impl Default for GlobalConfiguration {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            endpoint: GLOBAL_ENDPOINT_DEFAULT.to_owned(),
+            token_env: GLOBAL_TOKEN_ENV_DEFAULT.to_owned(),
+            connect_timeout: Duration::from_millis(GLOBAL_CONNECT_TIMEOUT_MS_DEFAULT),
+            request_timeout: Duration::from_millis(GLOBAL_REQUEST_TIMEOUT_MS_DEFAULT),
+            attempts: 3,
+            max_in_flight: 4,
+            capabilities_ttl: Duration::from_millis(GLOBAL_CACHE_TTL_MS_DEFAULT),
+            resolution_ttl: Duration::from_millis(GLOBAL_CACHE_TTL_MS_DEFAULT),
+            failure_ttl: Duration::from_millis(GLOBAL_FAILURE_TTL_MS_DEFAULT),
+        }
+    }
+}
+
+impl GlobalConfiguration {
+    /// The table's bounds in key order.
+    fn violation(&self) -> Option<ConfigurationViolation> {
+        first_out_of_range([
+            (
+                "global.connect_timeout",
+                self.connect_timeout.milliseconds(),
+                GLOBAL_CONNECT_TIMEOUT_MS_MIN,
+                GLOBAL_CONNECT_TIMEOUT_MS_MAX,
+            ),
+            (
+                "global.request_timeout",
+                self.request_timeout.milliseconds(),
+                GLOBAL_REQUEST_TIMEOUT_MS_MIN,
+                GLOBAL_REQUEST_TIMEOUT_MS_MAX,
+            ),
+            (
+                "global.attempts",
+                self.attempts,
+                GLOBAL_ATTEMPTS_MIN,
+                GLOBAL_ATTEMPTS_MAX,
+            ),
+            (
+                "global.max_in_flight",
+                self.max_in_flight,
+                GLOBAL_MAX_IN_FLIGHT_MIN,
+                GLOBAL_MAX_IN_FLIGHT_MAX,
+            ),
+            (
+                "global.capabilities_ttl",
+                self.capabilities_ttl.milliseconds(),
+                GLOBAL_CAPABILITIES_TTL_MS_MIN,
+                GLOBAL_CAPABILITIES_TTL_MS_MAX,
+            ),
+            (
+                "global.resolution_ttl",
+                self.resolution_ttl.milliseconds(),
+                GLOBAL_RESOLUTION_TTL_MS_MIN,
+                GLOBAL_RESOLUTION_TTL_MS_MAX,
+            ),
+            (
+                "global.failure_ttl",
+                self.failure_ttl.milliseconds(),
+                GLOBAL_FAILURE_TTL_MS_MIN,
+                GLOBAL_FAILURE_TTL_MS_MAX,
+            ),
+        ])
+    }
+}
+
+/// Adds `rift:range` annotations for `GlobalConfiguration` duration fields.
+pub fn declare_global_ranges(schema: &mut Schema) {
+    let ranges = [
+        (
+            "connect_timeout",
+            GLOBAL_CONNECT_TIMEOUT_MS_MIN,
+            GLOBAL_CONNECT_TIMEOUT_MS_MAX,
+        ),
+        (
+            "request_timeout",
+            GLOBAL_REQUEST_TIMEOUT_MS_MIN,
+            GLOBAL_REQUEST_TIMEOUT_MS_MAX,
+        ),
+        (
+            "capabilities_ttl",
+            GLOBAL_CAPABILITIES_TTL_MS_MIN,
+            GLOBAL_CAPABILITIES_TTL_MS_MAX,
+        ),
+        (
+            "resolution_ttl",
+            GLOBAL_RESOLUTION_TTL_MS_MIN,
+            GLOBAL_RESOLUTION_TTL_MS_MAX,
+        ),
+        (
+            "failure_ttl",
+            GLOBAL_FAILURE_TTL_MS_MIN,
+            GLOBAL_FAILURE_TTL_MS_MAX,
+        ),
+    ];
+    let Some(properties) = schema
+        .ensure_object()
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    for (field, min, max) in ranges {
+        if let Some(property) = properties
+            .get_mut(field)
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            property.insert(
+                "rift:range".to_owned(),
+                serde_json::json!({
+                    "min": String::from(Duration::from_millis(min)),
+                    "max": String::from(Duration::from_millis(max)),
+                }),
+            );
+        }
     }
 }
 
@@ -2793,6 +2989,7 @@ mod tests {
             json!({ "providers": { "unknown": {} } }),
             json!({ "providers": { "history": { "unknown": 1 } } }),
             json!({ "providers": { "binding": { "enabled": true } } }),
+            json!({ "global": { "unknown": true } }),
             json!({ "search": { "unknown": "x" } }),
             json!({ "search": { "text": { "unknown": "x" } } }),
             json!({ "source": { "unknown": "x" } }),
@@ -2878,6 +3075,223 @@ mod tests {
         assert_eq!(table.idle_timeout, Duration::from_millis(1_800_000));
         assert_eq!(table.readiness_timeout, Duration::from_millis(30_000));
         assert_eq!(WorkspaceConfiguration::default().validate(), Ok(()));
+    }
+
+    #[test]
+    fn test_global_defaults_match_cloud_client_configuration() {
+        let global = GlobalConfiguration::default();
+        assert!(global.enabled);
+        assert_eq!(global.endpoint, "https://api.volar.sh/rift/rest");
+        assert_eq!(global.token_env, "RIFT_API_TOKEN");
+        assert_eq!(global.connect_timeout, Duration::from_millis(3_000));
+        assert_eq!(global.request_timeout, Duration::from_millis(15_000));
+        assert_eq!(global.attempts, 3);
+        assert_eq!(global.max_in_flight, 4);
+        assert_eq!(global.capabilities_ttl, Duration::from_millis(900_000));
+        assert_eq!(global.resolution_ttl, Duration::from_millis(900_000));
+        assert_eq!(global.failure_ttl, Duration::from_millis(30_000));
+
+        let configuration: WorkspaceConfiguration =
+            serde_json::from_value(json!({})).expect("empty configuration must deserialize");
+        assert_eq!(configuration.global, global);
+    }
+
+    #[test]
+    fn test_global_table_deserializes_all_configuration_keys() {
+        let configuration: WorkspaceConfiguration = serde_json::from_value(json!({
+            "global": {
+                "enabled": false,
+                "endpoint": "http://127.0.0.1:8080/test",
+                "token_env": "CUSTOM_TOKEN",
+                "connect_timeout": "100ms",
+                "request_timeout": "5m",
+                "attempts": 1,
+                "max_in_flight": 32,
+                "capabilities_ttl": "1m",
+                "resolution_ttl": "24h",
+                "failure_ttl": "1s"
+            }
+        }))
+        .expect("global table must deserialize");
+        assert!(!configuration.global.enabled);
+        assert_eq!(configuration.global.endpoint, "http://127.0.0.1:8080/test");
+        assert_eq!(configuration.global.token_env, "CUSTOM_TOKEN");
+        assert_eq!(configuration.global.connect_timeout.milliseconds(), 100);
+        assert_eq!(configuration.global.request_timeout.milliseconds(), 300_000);
+        assert_eq!(configuration.global.attempts, 1);
+        assert_eq!(configuration.global.max_in_flight, 32);
+        assert_eq!(configuration.global.capabilities_ttl.milliseconds(), 60_000);
+        assert_eq!(
+            configuration.global.resolution_ttl.milliseconds(),
+            86_400_000
+        );
+        assert_eq!(configuration.global.failure_ttl.milliseconds(), 1_000);
+        assert_eq!(configuration.validate(), Ok(()));
+    }
+
+    #[test]
+    fn test_global_configuration_does_not_validate_client_owned_strings() {
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.global.endpoint = String::new();
+        configuration.global.token_env = String::new();
+        assert_eq!(configuration.validate(), Ok(()));
+    }
+
+    #[test]
+    fn test_global_bounds_accept_edges_and_refuse_each_outside_value() {
+        type BoundCase = (&'static str, u64, u64, fn(&mut GlobalConfiguration, u64));
+
+        let mut configuration = WorkspaceConfiguration::default();
+        let cases: [BoundCase; 7] = [
+            (
+                "global.connect_timeout",
+                GLOBAL_CONNECT_TIMEOUT_MS_MIN,
+                GLOBAL_CONNECT_TIMEOUT_MS_MAX,
+                |global, value| global.connect_timeout = Duration::from_millis(value),
+            ),
+            (
+                "global.request_timeout",
+                GLOBAL_REQUEST_TIMEOUT_MS_MIN,
+                GLOBAL_REQUEST_TIMEOUT_MS_MAX,
+                |global, value| global.request_timeout = Duration::from_millis(value),
+            ),
+            (
+                "global.attempts",
+                GLOBAL_ATTEMPTS_MIN,
+                GLOBAL_ATTEMPTS_MAX,
+                |global, value| global.attempts = value,
+            ),
+            (
+                "global.max_in_flight",
+                GLOBAL_MAX_IN_FLIGHT_MIN,
+                GLOBAL_MAX_IN_FLIGHT_MAX,
+                |global, value| global.max_in_flight = value,
+            ),
+            (
+                "global.capabilities_ttl",
+                GLOBAL_CACHE_TTL_MS_MIN,
+                GLOBAL_CACHE_TTL_MS_MAX,
+                |global, value| global.capabilities_ttl = Duration::from_millis(value),
+            ),
+            (
+                "global.resolution_ttl",
+                GLOBAL_CACHE_TTL_MS_MIN,
+                GLOBAL_CACHE_TTL_MS_MAX,
+                |global, value| global.resolution_ttl = Duration::from_millis(value),
+            ),
+            (
+                "global.failure_ttl",
+                GLOBAL_FAILURE_TTL_MS_MIN,
+                GLOBAL_FAILURE_TTL_MS_MAX,
+                |global, value| global.failure_ttl = Duration::from_millis(value),
+            ),
+        ];
+        for (field, min, max, set) in cases {
+            set(&mut configuration.global, min);
+            assert_eq!(
+                configuration.validate(),
+                Ok(()),
+                "{field} minimum must be accepted"
+            );
+            set(&mut configuration.global, max);
+            assert_eq!(
+                configuration.validate(),
+                Ok(()),
+                "{field} maximum must be accepted"
+            );
+            for value in [min.saturating_sub(1), max + 1] {
+                set(&mut configuration.global, value);
+                assert_eq!(
+                    configuration.validate(),
+                    Err(ConfigurationViolation::LimitOutOfRange {
+                        field,
+                        value,
+                        min,
+                        max,
+                    }),
+                    "{field} value {value} must be refused"
+                );
+            }
+            set(&mut configuration.global, min);
+        }
+    }
+
+    #[test]
+    fn test_global_schema_declares_keys_and_bounds() {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let global = &schema["$defs"]["GlobalConfiguration"];
+        let properties = &global["properties"];
+        for field in [
+            "enabled",
+            "endpoint",
+            "token_env",
+            "connect_timeout",
+            "request_timeout",
+            "attempts",
+            "max_in_flight",
+            "capabilities_ttl",
+            "resolution_ttl",
+            "failure_ttl",
+        ] {
+            assert!(
+                properties.get(field).is_some(),
+                "global.{field} must be in schema"
+            );
+        }
+        assert_eq!(
+            properties["connect_timeout"]["rift:range"],
+            json!({ "min": "100ms", "max": "30s" })
+        );
+        assert_eq!(
+            properties["request_timeout"]["rift:range"],
+            json!({ "min": "1s", "max": "5m" })
+        );
+        assert_eq!(
+            properties["capabilities_ttl"]["rift:range"],
+            json!({ "min": "1m", "max": "1d" })
+        );
+        assert_eq!(
+            properties["resolution_ttl"]["rift:range"],
+            json!({ "min": "1m", "max": "1d" })
+        );
+        assert_eq!(
+            properties["failure_ttl"]["rift:range"],
+            json!({ "min": "1s", "max": "1h" })
+        );
+        assert_eq!(
+            properties["attempts"]["minimum"],
+            json!(GLOBAL_ATTEMPTS_MIN)
+        );
+        assert_eq!(
+            properties["attempts"]["maximum"],
+            json!(GLOBAL_ATTEMPTS_MAX)
+        );
+        assert_eq!(
+            properties["max_in_flight"]["minimum"],
+            json!(GLOBAL_MAX_IN_FLIGHT_MIN)
+        );
+        assert_eq!(
+            properties["max_in_flight"]["maximum"],
+            json!(GLOBAL_MAX_IN_FLIGHT_MAX)
+        );
+    }
+
+    #[test]
+    fn test_global_bound_errors_name_field_and_range() {
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.global.connect_timeout = Duration::from_millis(0);
+        let violation = configuration
+            .validate()
+            .expect_err("an invalid global timeout must be refused");
+        assert_eq!(
+            violation.evidence(),
+            vec![
+                ("field", "global.connect_timeout".to_owned()),
+                ("value", "0".to_owned()),
+                ("range", "100..=30000".to_owned()),
+            ]
+        );
     }
 
     #[test]

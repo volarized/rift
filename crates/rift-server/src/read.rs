@@ -947,6 +947,23 @@ impl ReadService {
     /// `enabled = false` or beside `rev`, for a poisoned dependency index, and for
     /// symbol history the workspace's version control cannot serve.
     pub fn get_symbol(&self, params: &GetSymbolParams) -> Result<GetSymbolResult, ReadError> {
+        self.get_symbol_with_dependency_context(params, &self.context)
+    }
+
+    /// Finds declarations using `dependency_context` for package fallback selection.
+    ///
+    /// The service keeps project reads unchanged. The supplied context only decides which
+    /// dependency packages the current-tree package branch may analyze and which context
+    /// warnings the answer carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::get_symbol`].
+    pub fn get_symbol_with_dependency_context(
+        &self,
+        params: &GetSymbolParams,
+        dependency_context: &DependencyContext,
+    ) -> Result<GetSymbolResult, ReadError> {
         validate_common(params.rev.is_some())?;
         let limit = accepted_limit(params.limit)?;
         self.validate_dependency_scope(params.scope, params.rev.as_ref())?;
@@ -955,7 +972,7 @@ impl ReadService {
         // own `results_max` bound, so `pagination.total_pages` counts the full result
         // set the pages divide.
         let results_max = self.index.results_max();
-        let fallback = self.fill_packages(params.scope)?;
+        let fallback = self.fill_packages(params.scope, dependency_context)?;
         let dependencies = self.dependency_index(params.scope)?;
         let (mut candidates, bound_reached) =
             self.ranked_candidates(params, dependencies.as_deref(), results_max)?;
@@ -997,7 +1014,7 @@ impl ReadService {
         if reaches_dependencies {
             warnings.extend(package_warnings(
                 dependencies.as_deref(),
-                &self.context,
+                dependency_context,
                 fallback,
             ));
         }
@@ -1067,7 +1084,11 @@ impl ReadService {
     ///
     /// Returns [`ReadError`] when a holder panicked with a branch lock held, or when the
     /// workspace's visible paths cannot be read.
-    pub(crate) fn fill_packages(&self, scope: SearchScope) -> Result<PackageFallback, ReadError> {
+    pub(crate) fn fill_packages(
+        &self,
+        scope: SearchScope,
+        dependency_context: &DependencyContext,
+    ) -> Result<PackageFallback, ReadError> {
         let (Some(branch), Some(source_policy)) = (&self.packages, self.source_policy.as_deref())
         else {
             return Ok(PackageFallback::default());
@@ -1086,7 +1107,7 @@ impl ReadService {
             visible: &visible,
             resolution: ResolutionPolicy::from(&self.dependency_configuration),
             limits: DependencyIndexLimits::from(&self.dependency_configuration),
-            context: &self.context,
+            context: dependency_context,
         })
     }
 
@@ -1283,6 +1304,12 @@ pub(crate) fn package_warnings(
             fallback.indexed, fallback.unresolved
         ),
     }];
+    warnings.extend(fallback.unavailable.into_iter().map(|package| {
+        ReadWarning::PackageUnavailable {
+            package,
+            reason: "package source is unavailable on this machine".to_owned(),
+        }
+    }));
     let skipped_packages: &[SkippedPackage] = index.map_or(&[], DependencyIndex::skipped);
     let mut skipped: Vec<&SkippedPackage> = skipped_packages.iter().collect();
     skipped.sort_by(|left, right| identity_key(&left.identity).cmp(&identity_key(&right.identity)));
@@ -3196,7 +3223,7 @@ pub fn compute() -> i32 {
             let _guard = tracing::subscriber::set_default(
                 tracing_subscriber::registry().with(local.clone()),
             );
-            service.fill_packages(SearchScope::Local)?;
+            service.fill_packages(SearchScope::Local, service.dependency_context())?;
         }
         assert_eq!(local.named(RESOLVE_SPAN), 0, "{local:?}");
 
@@ -3205,9 +3232,38 @@ pub fn compute() -> i32 {
             let _guard = tracing::subscriber::set_default(
                 tracing_subscriber::registry().with(global.clone()),
             );
-            service.fill_packages(SearchScope::Global)?;
+            service.fill_packages(SearchScope::Global, service.dependency_context())?;
         }
         assert_eq!(global.named(RESOLVE_SPAN), 1, "{global:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn get_symbol_with_an_empty_dependency_context_skips_package_work() -> TestResult {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        use crate::packages::tests::{RESOLVE_SPAN, RecordedSpans, context_naming_one_package};
+
+        let (_directory, service) = beacon_fixture()?;
+        let branch = Arc::new(PackageBranch::new(DependencyIndexLimits::default()));
+        let service = service
+            .with_packages(Arc::clone(&branch))
+            .with_context(context_naming_one_package());
+        let selected = Arc::new(service.dependency_context().filter_entries(|_| false));
+        let recorded = RecordedSpans::default();
+        let result = {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(recorded.clone()),
+            );
+            service.get_symbol_with_dependency_context(
+                &scoped("helper_beacon", "global")?,
+                &selected,
+            )?
+        };
+
+        assert!(result.hits.is_empty());
+        assert_eq!(recorded.named(RESOLVE_SPAN), 0, "{recorded:?}");
+        assert_eq!(branch.read()?.indexed_count(), 0);
         Ok(())
     }
 

@@ -218,13 +218,25 @@ publication while every other file change leaves it untouched.
 
 ### Package index
 
-<VersionBadge version="v0.0.39" languages={["Rust", "Python", "TypeScript"]} />
+<VersionBadge version="v0.0.43" languages={["Rust", "Python", "TypeScript"]} />
 
-No package is analyzed until a read asks for one. The first `global` or `all` read runs
-the resolvers once, keeps the cataloged packages the dependency context names, and
-analyzes each one's source into the package index; every later read answers from what
-that fill built. For each analyzed package the walk selects the files that spell the
-package's API and keeps the declarations a caller outside the package can use:
+No package is analyzed until a read asks for one. A `global` or `all` read first resolves
+the dependency context, then the local server asks the configured global REST API for
+capabilities and package resolution. A valid response sends available packages to remote
+pages and keeps missing or `local_only` packages on the local package index.
+
+When global access is disabled or the REST API cannot answer, the server selects affected
+packages for local indexing. The answer distinguishes `global_access_disabled`,
+`global_api_unavailable`, `global_publication_incompatible`, and `global_response_invalid`.
+A valid remote page can also report `global_page_warning` without discarding its items.
+A valid resolution reports `package_absent` for an exact package or
+`package_requirement_absent` for a declared requirement; local fallback reports
+`package_unavailable` when it still cannot serve a package. Package reads reach the global service
+through this local server route; `rift mcp` and `rift server` do not expose a direct global MCP
+route.
+
+For each package the local index analyzes, the walk selects files that spell the package's API
+and keeps declarations a caller outside the package can use:
 
 - Rust - every `.rs` file below the root; `pub` declarations, and the items of a `pub` trait
 - Python - every `.pyi` stub when the package ships any, else every `.py` module; names
@@ -247,9 +259,6 @@ the packages again on the next read, since every package the package index holds
 under the old bounds. `resolution = "static"` keeps the resolvers off the toolchains, so the
 catalog comes from the lockfiles and package caches alone, and `command_timeout` bounds each
 run `auto` makes.
-
-No global package index exists yet, so every package read carries a
-`global_index_unavailable` warning stating what the local fallback produced.
 
 ## Providers
 

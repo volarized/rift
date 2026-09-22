@@ -20,12 +20,14 @@ axum.workspace = true
 data-encoding.workspace = true
 getrandom.workspace = true
 notify.workspace = true
+percent-encoding.workspace = true
 rmcp = { workspace = true, features = [
     "client",
     "transport-streamable-http-client-reqwest",
     "transport-streamable-http-server",
 ] }
 rift-core.workspace = true
+rift-cloud-client.workspace = true
 rift-dependency.workspace = true
 rift-index.workspace = true
 rift-protocol.workspace = true
@@ -63,8 +65,8 @@ name = "error_contract"
 path = "tests/error_contract.rs"
 
 [[test]]
-name = "global_api_contract"
-path = "tests/global_api_contract.rs"
+name = "global_routing"
+path = "tests/global_routing.rs"
 
 [[test]]
 name = "http_serve"
@@ -81,10 +83,6 @@ path = "tests/live_vector_search.rs"
 [[test]]
 name = "map_resource"
 path = "tests/map_resource.rs"
-
-[[test]]
-name = "schema_export"
-path = "tests/schema_export.rs"
 
 [[test]]
 name = "search_change"

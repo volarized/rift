@@ -246,11 +246,9 @@ async fn a_global_lookup_leaves_the_served_project_out_of_the_packages() -> Test
     Ok(())
 }
 
-/// A lockfile naming a registry package no cache on this machine holds: the fill counts
-/// it as unresolved, analyzes nothing for it, and the fallback warning states the count
-/// beside the packages it did analyze.
+/// A mixed package set that local fallback cannot resolve reports both selected packages.
 #[tokio::test]
-async fn a_package_with_no_source_on_this_machine_is_counted_unresolved() -> TestResult {
+async fn a_package_set_local_fallback_cannot_resolve_reports_counts() -> TestResult {
     let helper = tempfile::tempdir()?;
     fs::create_dir_all(helper.path().join("src"))?;
     fs::write(
@@ -283,17 +281,14 @@ async fn a_package_with_no_source_on_this_machine_is_counted_unresolved() -> Tes
     )
     .await?;
 
-    let detail = answer["warnings"]
+    let warning = answer["warnings"]
         .as_array()
         .into_iter()
         .flatten()
-        .find(|warning| warning["code"] == json!("global_index_unavailable"))
-        .and_then(|warning| warning["detail"].as_str())
+        .find(|warning| warning["code"] == json!("global_access_disabled"))
         .ok_or_else(|| format!("a package read states its fallback: {answer:#}"))?;
-    assert!(
-        detail.contains("1 named no source this machine holds"),
-        "{detail}"
-    );
+    assert_eq!(warning["fallback_indexed"], json!(0));
+    assert_eq!(warning["fallback_unresolved"], json!(2));
 
     client.cancel().await?;
     server_task.abort();
@@ -575,7 +570,7 @@ async fn a_revision_search_with_a_global_scope_refuses_invalid_request() -> Test
     Ok(())
 }
 
-/// The `package_skipped` warning naming the helper, which the first package read
+/// The `package_unavailable` warning naming the helper, which the first package read
 /// records when its bounds refuse the package.
 async fn helper_skipped(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
@@ -594,7 +589,7 @@ async fn helper_skipped(
         .into_iter()
         .flatten()
         .find(|warning| {
-            warning["code"] == json!("package_skipped")
+            warning["code"] == json!("package_unavailable")
                 && warning["package"]["name"] == json!("helper")
         })
         .cloned()

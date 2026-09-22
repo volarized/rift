@@ -21,8 +21,8 @@ use rift_index::{
     WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::{
-    HistoryConfiguration, LanguageLspConfiguration, LogsConfiguration, LspConfiguration,
-    SearchConfiguration, ServerConfiguration, WorkspaceConfiguration,
+    GlobalConfiguration, HistoryConfiguration, LanguageLspConfiguration, LogsConfiguration,
+    LspConfiguration, SearchConfiguration, ServerConfiguration, WorkspaceConfiguration,
 };
 use rift_protocol::dependencies::DependenciesConfiguration;
 use rift_protocol::error as wire;
@@ -377,6 +377,15 @@ impl ConfigurationState {
         self.accepted
             .as_ref()
             .map(|configuration| configuration.server.clone())
+            .unwrap_or_default()
+    }
+
+    /// The `[global]` table from the last acceptance, or the default table while
+    /// `rift.toml` is invalid or absent.
+    pub(crate) fn global_configuration(&self) -> GlobalConfiguration {
+        self.accepted
+            .as_ref()
+            .map(|configuration| configuration.global.clone())
             .unwrap_or_default()
     }
 
@@ -3091,7 +3100,7 @@ pub(crate) mod tests {
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
     use notify::{Event, EventKind};
     use rift_index::{LexicalChange, LexicalIndexLimits, WorkspaceIndexLimits};
-    use rift_protocol::configuration::ServerConfiguration;
+    use rift_protocol::configuration::{GlobalConfiguration, ServerConfiguration};
     use rift_ranking::{
         DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, IndexDocument,
         ParsedQuery, QueryPhase, RankingInput, SearchableField,
@@ -3113,6 +3122,34 @@ pub(crate) mod tests {
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+    #[test]
+    fn global_configuration_accessor_keeps_defaults_when_acceptance_fails() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let defaults = GlobalConfiguration::default();
+
+        let missing = ConfigurationState::accept(directory.path());
+        assert_eq!(missing.global_configuration(), defaults);
+
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[global]\nenabled = false\nattempts = 5\n",
+        )?;
+        let accepted = ConfigurationState::accept(directory.path());
+        let mut expected = defaults.clone();
+        expected.enabled = false;
+        expected.attempts = 5;
+        assert_eq!(accepted.global_configuration(), expected);
+
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[global]\nattempts = 6\n",
+        )?;
+        let invalid = ConfigurationState::accept(directory.path());
+        assert!(invalid.accepted.is_err());
+        assert_eq!(invalid.global_configuration(), defaults);
+        Ok(())
+    }
 
     fn stable_candidate(root: &std::path::Path, epoch: u64) -> TestResult<Arc<PublishedWorkspace>> {
         candidate_with_limits(root, epoch, WorkspaceIndexLimits::default())

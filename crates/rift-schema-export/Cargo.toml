@@ -1,0 +1,23 @@
+[package]
+name = "rift-schema-export"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Rift artifact exporter"
+
+[lints]
+workspace = true
+
+[dependencies]
+rift-cloud-client.workspace = true
+rift-core.workspace = true
+rift-index.workspace = true
+rift-mcp.workspace = true
+rift-protocol.workspace = true
+
+[dev-dependencies]
+jsonschema.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

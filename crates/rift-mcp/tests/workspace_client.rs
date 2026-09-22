@@ -54,8 +54,8 @@ pub(crate) async fn served_relative_workspace(
     Ok((directory, client, server_task))
 }
 
-/// One temporary workspace holding `files` and a `rift.toml`: the table that turns
-/// the vector ranking off, then the LSP configuration when the suite drives one.
+/// One temporary workspace holding `files` and a `rift.toml`: tables that keep vector
+/// acquisition and global HTTP off, then the LSP configuration when the suite drives one.
 ///
 /// A table header ends where the next one begins, so the LSP configuration follows
 /// unchanged and each suite still proves whatever its own table carries.
@@ -72,6 +72,12 @@ fn laid_out_workspace(
         fs::write(path, source)?;
     }
     let mut configuration = crate::hermetic_search::VECTOR_DISABLED.to_owned();
+    if !lsp_configuration
+        .as_deref()
+        .is_some_and(|value| value.contains("[global]"))
+    {
+        configuration.push_str("\n[global]\nenabled = false\n");
+    }
     if let Some(lsp_configuration) = lsp_configuration {
         configuration.push('\n');
         configuration.push_str(&lsp_configuration);

@@ -87,15 +87,30 @@ lookup while every other file stays available. An answer carries at most eight o
 project-path order; when more files were left out, one more `source_unavailable` carries no `unit`
 and counts the rest, and `rift://logs` names each.
 
-Three warnings ride a `get_symbol` or `search` answer whose `scope` reaches packages, and no
-other answer:
+Package-scope answers can carry these global routing warnings:
 
-- `global_index_unavailable` - no global package index answered, so the package facts came
-  from the packages this machine indexed. `indexed` counts them.
+- `global_access_disabled` - `[global].enabled` is `false`, so every selected package uses local
+  indexing. `fallback_indexed` and `fallback_unresolved` count the local result.
+- `global_api_unavailable` - the global API could not answer. `failure_class` identifies the
+  bounded failure, and `fallback_indexed` and `fallback_unresolved` count local fallback results.
+- `global_publication_incompatible` - the global API publication format or corpus revision is not
+  supported by this client. The warning carries `failure_class` and local fallback counts.
+- `global_response_invalid` - the global API response is invalid or truncated. The warning carries
+  `failure_class` and local fallback counts.
+- `global_page_warning` - a valid global page carried a bounded condition. `warning_code` identifies
+  it and optional `detail` explains it.
+- `package_absent` - a valid global resolution did not name an exact `package`, so local indexing
+  serves it.
+- `package_requirement_absent` - a valid global resolution did not resolve the declared `entry`,
+  so local indexing serves it.
+- `package_unavailable` - local fallback could not serve `package`; `reason` states why.
 - `package_skipped` - the local package index refused `package` for `reason`, so none of its
   declarations answers.
 - `package_context_degraded` - `resolver` read less than its manifests and lockfiles state,
   for `reason`, so the dependency context can miss packages.
+
+The local package-index path can also report `global_index_unavailable` when no global package
+index answered. Routed `rift mcp` reads use the typed warnings above.
 
 An answer carries at most eight `package_skipped` and `package_context_degraded` warnings
 together: the skipped packages first, in package identity order, then the degraded resolvers
@@ -176,11 +191,19 @@ A package hit carries `unit` in place of `path`: the
 `rift://source/<manager>/<name>@<version>/<file>`. Its `symbol.origin` names the owning
 package. The hit carries neither `node` nor `history`.
 
+<VersionBadge version="v0.0.43" />
+
 A `local` read reaches no package declaration and resolves no package. The first `global` or
-`all` read indexes the workspace's dependency packages on this machine within the
-[`[dependencies]`](/docs/developer/configuration#dependencies) bounds, then reuses what it
-built. No global package index exists yet, so every package read carries a
-`global_index_unavailable` warning stating what the local fallback produced.
+`all` read resolves the workspace's dependency context, then asks the configured global REST API
+for capabilities and package resolution. A valid response serves available package declarations
+from the global service and sends missing packages to local indexing under the
+[`[dependencies]`](/docs/developer/configuration#dependencies) bounds.
+
+When the REST API is unavailable, the server selects affected packages for local indexing and adds
+`global_api_unavailable`, including its bounded `failure_class` and fallback counts. Disabled
+access adds `global_access_disabled`; a valid resolution that names no remote package adds
+`package_absent` or `package_requirement_absent`. Callers still reach this route through the local
+`rift mcp` and `rift server` processes; they do not connect to a global MCP or server directly.
 
 The server refuses `rev` together with a scope beyond `local` as `invalid_request`: package
 facts are served for the current tree alone.
@@ -222,9 +245,10 @@ This lookup reaches the `helper` crate a workspace's `Cargo.toml` names by path:
   "pagination": { "page_index": 0, "total_pages": 1 },
   "warnings": [
     {
-      "code": "global_index_unavailable",
-      "indexed": 1,
-      "detail": "no global package index answered; 1 of the workspace's packages were analyzed on this machine, and 0 named no source this machine holds"
+      "code": "global_api_unavailable",
+      "failure_class": "connection",
+      "fallback_indexed": 1,
+      "fallback_unresolved": 0
     }
   ]
 }
@@ -589,14 +613,17 @@ of `path` - the [`SourceUnitId`](/docs/developer/protocol/reference#SourceUnitId
 with `range` and `line` inside that unit, and `source` when `include` names it. A package
 contributes declarations alone, so `target: "file"` answers nothing from it.
 
+<VersionBadge version="v0.0.43" />
+
 The server refuses `rev` together with a scope beyond `local` as `invalid_request`, since
 package facts are served for the current tree alone, and refuses `traversal` together with
 `global` the same way, since a walk runs over the project alone; `all` still walks the
-project graph. The three package warnings under [Reads](#reads) ride a `search` answer whose
+project graph. The package warnings under [Reads](#reads) ride a `search` answer whose
 `scope` reaches packages, as they ride a `get_symbol` answer.
 
 The resolvers read at most 256 manifests per workspace, taken in path order, so a `global` or
-`all` search over a workspace holding more answers from the packages those manifests declare.
+`all` search over a workspace reaches packages those manifests declare. The package branch uses
+the same lazy REST request and local fallback as [`get_symbol`](#get_symbol-scope).
 
 This search reaches the `helper` crate the `get_symbol` lookup above reaches:
 
@@ -638,9 +665,10 @@ This search reaches the `helper` crate the `get_symbol` lookup above reaches:
   "pagination": { "page_index": 0, "total_pages": 1 },
   "warnings": [
     {
-      "code": "global_index_unavailable",
-      "indexed": 1,
-      "detail": "no global package index answered; 1 of the workspace's packages were analyzed on this machine, and 0 named no source this machine holds"
+      "code": "global_api_unavailable",
+      "failure_class": "connection",
+      "fallback_indexed": 1,
+      "fallback_unresolved": 0
     }
   ]
 }

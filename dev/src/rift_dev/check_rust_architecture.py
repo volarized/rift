@@ -22,6 +22,9 @@ EXPECTED_EDGES = {
     "rift -> rift-search",
     "rift -> rift-server",
     "rift -> rift-syntax",
+    "rift-cloud-client -> rift-core",
+    "rift-cloud-client -> rift-protocol",
+    "rift-cloud-client -> rift-ranking",
     "rift-core -> rift-protocol",
     "rift-dependency -> rift-core",
     "rift-dependency -> rift-protocol",
@@ -36,6 +39,7 @@ EXPECTED_EDGES = {
     "rift-lsp -> rift-core",
     "rift-lsp -> rift-provider",
     "rift-mcp -> rift-core",
+    "rift-mcp -> rift-cloud-client",
     "rift-mcp -> rift-dependency",
     "rift-mcp -> rift-history",
     "rift-mcp -> rift-index",
@@ -48,6 +52,11 @@ EXPECTED_EDGES = {
     "rift-search -> rift-core",
     "rift-search -> rift-index",
     "rift-search -> rift-ranking",
+    "rift-schema-export -> rift-cloud-client",
+    "rift-schema-export -> rift-core",
+    "rift-schema-export -> rift-index",
+    "rift-schema-export -> rift-mcp",
+    "rift-schema-export -> rift-protocol",
     "rift-server -> rift-core",
     "rift-server -> rift-dependency",
     "rift-server -> rift-history",
@@ -231,7 +240,7 @@ def main() -> int:
     # docs/public. Engine behavior is proven against real language servers, so
     # the workspace ships no test engine of its own.
     expected_binaries = [
-        "rift-mcp:rift-schema-export",
+        "rift-schema-export:rift-schema-export",
         "rift:rift",
     ]
     if binaries != expected_binaries:
