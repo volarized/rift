@@ -2195,18 +2195,38 @@ impl PopulationLane {
 
     /// Hands `published` to the lane and returns, never awaiting the pass it asks for.
     ///
+    /// A publication older than the one the lane already holds is dropped. Two callers
+    /// ask for a pass - the supervisor as each publication lands, and the vector
+    /// preparation once its model is held - and the second reads the current publication
+    /// before it asks, so a publication landing between that read and the ask would
+    /// otherwise displace the newer tree with the older one. The lane would then embed a
+    /// tree nobody is served, and no later ask would correct it, because the newer
+    /// publication has already been sent. Epochs are minted in publication order, so
+    /// keeping the higher one keeps the newest tree. One publication asked for twice is
+    /// two passes over the same tree, which is what the vector preparation asks for when
+    /// nothing has published since the model started loading.
+    ///
     /// A closed channel is a server already shutting down: the lane's task ended with the
     /// cancellation token, and no later search will read the store this pass would have
     /// written. That is a debug line rather than a caller's failure, because the work this
     /// publication came from already landed.
     pub(crate) fn request(&self, published: Arc<PublishedWorkspace>) {
-        if self.publications.send(Some(published)).is_err() {
+        if self.publications.is_closed() {
             tracing::debug!(
                 component = "search",
                 operation = "search.populate",
                 "the population lane has ended, so this publication is not populated for"
             );
+            return;
         }
+        let epoch = published.epoch;
+        self.publications.send_if_modified(|waiting| {
+            if waiting.as_ref().is_some_and(|held| held.epoch > epoch) {
+                return false;
+            }
+            *waiting = Some(published);
+            true
+        });
     }
 
     /// Whether the lane's task has ended, which a cancelled token causes.
@@ -6023,6 +6043,88 @@ pub(crate) mod tests {
         lane.request(Arc::clone(&earlier));
         lane.request(Arc::clone(&newest));
         described_within_bound(&index, described).await?;
+
+        cancellation.cancel();
+        Ok(())
+    }
+
+    /// Reads a lane that has settled takes before it accepts that nothing else lands.
+    ///
+    /// The lane owns one task, so a request it never took cannot arrive later. A few
+    /// reads past the settled count are enough to catch one that did.
+    const SETTLED_READS: usize = 5;
+
+    /// Polls until the lane's readiness names `total` declarations, then holds it there.
+    ///
+    /// Reaching the count proves the pass ran; staying at it proves no later pass
+    /// replaced that tree with another one.
+    async fn settled_on_described(index: &SearchIndex, total: u64) -> TestResult {
+        described_within_bound(index, total).await?;
+        for _attempt in 0..SETTLED_READS {
+            assert_eq!(
+                index.pass_readiness(),
+                VectorReadiness::Preparing { prepared: 0, total },
+                "a pass for another tree replaced the one the lane settled on"
+            );
+            tokio::time::sleep(LANE_POLL).await;
+        }
+        Ok(())
+    }
+
+    /// Two publications, the older asked for second, which is the order the vector
+    /// preparation can ask in: it reads the current publication before it asks, so a
+    /// publication landing in between leaves it holding the older one.
+    ///
+    /// The lane must stay on the newer tree. Running the older one would embed a tree no
+    /// request is answered from, and no later ask would correct it: the newer publication
+    /// has already been sent, so nothing else will ask for it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_older_publication_does_not_displace_the_newest_one() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn beacon() {}\npub fn lantern() {}\n",
+        )?;
+        let earlier = stable_candidate(directory.path(), 0)?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let newest = stable_candidate(directory.path(), 1)?;
+        let index = Arc::new(counting_index(&directory.path().join("search.db")).await?);
+        let cancellation = CancellationToken::new();
+        let lane = PopulationLane::spawn(Arc::clone(&index), cancellation.clone());
+
+        lane.request(Arc::clone(&newest));
+        lane.request(Arc::clone(&earlier));
+        settled_on_described(&index, 1).await?;
+
+        cancellation.cancel();
+        Ok(())
+    }
+
+    /// The same publication asked for twice runs twice. Startup asks once as it publishes
+    /// and the vector preparation asks again once its model is held, and that second ask
+    /// is what gives a workspace nobody writes to its vectors.
+    ///
+    /// The two candidates carry one epoch and different trees, which no publication
+    /// sequence mints: it is how a test tells which of two asks at one epoch the lane ran.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_publication_asked_for_again_at_one_epoch_runs_again() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn beacon() {}\npub fn lantern() {}\n",
+        )?;
+        let asked = stable_candidate(directory.path(), 1)?;
+        let index = Arc::new(counting_index(&directory.path().join("search.db")).await?);
+        let cancellation = CancellationToken::new();
+        let lane = PopulationLane::spawn(Arc::clone(&index), cancellation.clone());
+
+        lane.request(Arc::clone(&asked));
+        described_within_bound(&index, 2).await?;
+
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let asked_again = stable_candidate(directory.path(), 1)?;
+        lane.request(Arc::clone(&asked_again));
+        described_within_bound(&index, 1).await?;
 
         cancellation.cancel();
         Ok(())
