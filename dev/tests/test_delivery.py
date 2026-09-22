@@ -77,12 +77,67 @@ INCLUDED_HELPER = re.compile(r"^\s*mod\s+([a-z_][a-z0-9_]*)\s*;", re.MULTILINE)
 # A nextest filterset names one test binary as `binary(=<name>)`.
 FILTERED_BINARY = re.compile(r"binary\(=([a-z0-9_]+)\)")
 
+# The suites that read the model hub, and where each one lives. Every wait they
+# declare is spelled as a `Duration` constant, so the deadline nextest ends them
+# at has to sit above the sum of those waits: a test cut short by the deadline
+# reports a timeout instead of the readiness it reached.
+HUB_SUITES = {
+    "live_vector_search": "crates/rift-mcp/tests/live_vector_search.rs",
+    "live_model_sources": "crates/rift-search/tests/live_model_sources.rs",
+}
+
+# One declared wait, in the unit it was written in.
+DECLARED_WAIT = re.compile(r"Duration::from_(millis|secs|mins)\((\d[\d_]*)\)")
+
+# What one unit is worth in seconds.
+WAIT_SECONDS = {"millis": 0.001, "secs": 1.0, "mins": 60.0}
+
+# A nextest timeout is written as a count and a unit suffix.
+TIMEOUT_PERIOD = re.compile(r"^(\d+)(ms|s|m)$")
+TIMEOUT_SECONDS = {"ms": 0.001, "s": 1.0, "m": 60.0}
+
 # The workflow that merges a dependency pull request without a human, the step
 # that decides whether a bump may take that path, and the output it decides it
 # in.
 AUTOMERGE_WORKFLOW = "dependabot-automerge.yml"
 RANGE_STEP = "range"
 RANGE_OUTPUT = "breaking"
+
+
+def declared_waits(path: str) -> float:
+    """The seconds one suite's declared waits add up to.
+
+    The sum is what one test of that suite can spend before it gives up, since
+    no test waits on a budget it did not name.
+    """
+    source = (REPOSITORY / path).read_text(encoding="utf-8")
+    return sum(
+        WAIT_SECONDS[unit] * int(count.replace("_", ""))
+        for unit, count in DECLARED_WAIT.findall(source)
+    )
+
+
+def timeout_seconds(period: str) -> float:
+    """One nextest timeout period in seconds."""
+    matched = TIMEOUT_PERIOD.match(period)
+    assert matched, f"a nextest period is a count and a unit: {period!r}"
+    return TIMEOUT_SECONDS[matched.group(2)] * int(matched.group(1))
+
+
+def suite_deadline(binary: str) -> float:
+    """The seconds nextest lets one test of `binary` run for.
+
+    The deadline is `slow-timeout.period` times `terminate-after`, taken from
+    the override that names the binary, or from the default profile when none
+    does.
+    """
+    configuration = tomllib.loads(NEXTEST_CONFIGURATION.read_text(encoding="utf-8"))
+    profile = configuration["profile"]["default"]
+    timeout = profile["slow-timeout"]
+    for override in profile.get("overrides", []):
+        if f"binary(={binary})" in override["filter"] and "slow-timeout" in override:
+            timeout = override["slow-timeout"]
+    return timeout_seconds(timeout["period"]) * timeout.get("terminate-after", 1)
 
 
 def automerge_step(step_id: str) -> dict[str, Any]:
@@ -549,3 +604,25 @@ class AutoMergeHoldsBreakingBumps(unittest.TestCase):
             "auto-merge and its comment both decide on the classification, and "
             "both carry the success check an explicit `if` would otherwise drop",
         )
+
+
+class HubSuitesOutliveTheWaitsTheyDeclare(unittest.TestCase):
+    """A suite reading the model hub is not cut short by its own deadline.
+
+    Each of these suites names the budget it will wait for a download, and
+    fails naming the state it reached once that budget is spent. A deadline
+    below the sum of those budgets ends the test first, and the report is a
+    nextest timeout carrying none of what the suite was about to say.
+    """
+
+    def test_every_hub_suite_outlives_the_waits_it_declares(self) -> None:
+        for binary, path in HUB_SUITES.items():
+            with self.subTest(binary=binary):
+                declared = declared_waits(path)
+                self.assertGreater(declared, 0.0, f"{path} declares no wait")
+                self.assertGreater(
+                    suite_deadline(binary),
+                    declared,
+                    f"{binary} can wait {declared}s and is ended at "
+                    f"{suite_deadline(binary)}s, so its own failure never prints",
+                )
