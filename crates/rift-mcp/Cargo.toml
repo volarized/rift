@@ -63,6 +63,10 @@ name = "error_contract"
 path = "tests/error_contract.rs"
 
 [[test]]
+name = "global_api_contract"
+path = "tests/global_api_contract.rs"
+
+[[test]]
 name = "http_serve"
 path = "tests/http_serve.rs"
 

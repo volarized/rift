@@ -141,6 +141,34 @@ fn package_index_schema_document_is_deterministic() -> TestResult {
 }
 
 #[test]
+fn global_api_target_validates_the_published_contract() -> TestResult {
+    let request = schema::parse_arguments([
+        "--global-api".to_owned(),
+        repository_root()?.join("docs").display().to_string(),
+    ])?;
+    schema::run(&request)?;
+    Ok(())
+}
+
+#[test]
+fn global_api_target_reports_contract_drift() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let public = directory.path().join("public");
+    fs::create_dir_all(&public)?;
+    fs::write(public.join("global-api.openapi.json"), "{}")?;
+    let request = schema::parse_arguments([
+        "--global-api".to_owned(),
+        directory.path().display().to_string(),
+    ])?;
+
+    let error = schema::run(&request).expect_err("an invalid contract must fail");
+    assert!(matches!(error, ExportError::GlobalApi { .. }));
+    assert_eq!(error.descriptor().code(), "artifact_stale");
+    assert!(error.source().is_some());
+    Ok(())
+}
+
+#[test]
 fn check_fails_when_the_package_index_schema_is_stale() -> TestResult {
     let directory = tempfile::tempdir()?;
     schema::run(&write_request(&directory)?)?;

@@ -20,6 +20,7 @@ use rift_core::{ErrorCode, ErrorDescriptor, ErrorName};
 use serde_json::json;
 
 use crate::RiftMcp;
+use crate::global_api;
 use crate::skill::{self, SkillForm};
 
 /// One-line summary rendered at the top of the exported document.
@@ -60,8 +61,7 @@ const PLUGIN_SKILL_PATH: &str = "skills/rift/SKILL.md";
 const PLUGIN_TOOLS_PATH: &str = "skills/rift/references/tools.md";
 
 /// Usage line appended to argument errors.
-const USAGE: &str =
-    "usage: rift-schema-export [--check] [--analyzer-manifest] [OUTPUT_DIR] [PLUGIN_DIR]";
+const USAGE: &str = "usage: rift-schema-export [--check] [--analyzer-manifest | --global-api] [OUTPUT_DIR] [PLUGIN_DIR]";
 
 /// Recipe to run when a generated document is out of date. It runs every
 /// exporter invocation, so one command covers the docs artifacts, the plugin
@@ -169,6 +169,11 @@ pub enum ExportError {
         /// What the renderer said.
         source: rift_index::ManifestError,
     },
+    /// The published global API contract is invalid.
+    GlobalApi {
+        /// What validation returned.
+        source: global_api::ContractError,
+    },
     /// The document to check against could not be read.
     CheckUnreadable {
         /// The document that should have been readable.
@@ -209,6 +214,7 @@ impl fmt::Display for ExportError {
                  carry it; align the table in the skill module with the tool router"
             ),
             Self::AnalyzerManifest { source } => write!(formatter, "{source}"),
+            Self::GlobalApi { source } => write!(formatter, "{source}"),
             Self::CheckUnreadable { path, source } => write!(
                 formatter,
                 "cannot read `{path}` to check it: {source}; generate the document first \
@@ -236,6 +242,7 @@ impl Error for ExportError {
         match self {
             Self::CheckUnreadable { source, .. } | Self::WriteFailed { source, .. } => Some(source),
             Self::AnalyzerManifest { source } => Some(source),
+            Self::GlobalApi { source } => Some(source),
             Self::UnknownFlag { .. }
             | Self::ExtraArgument { .. }
             | Self::TemplateToolMissing { .. }
@@ -260,7 +267,7 @@ impl ExportError {
             | Self::AnalyzerManifest { .. } => {
                 ErrorName::Wire(ErrorCode::StorageFailure).descriptor()
             }
-            Self::CheckMismatch { .. } => {
+            Self::CheckMismatch { .. } | Self::GlobalApi { .. } => {
                 ErrorName::Cli(rift_core::CliCode::ArtifactStale).descriptor()
             }
         }
@@ -276,6 +283,8 @@ enum ExportTarget {
     /// The analyzer manifest, read from and written below the repository root the first
     /// positional argument names.
     AnalyzerManifest,
+    /// The authored global API contract below the docs directory.
+    GlobalApi,
 }
 
 /// One parsed export invocation.
@@ -310,6 +319,8 @@ where
             check = true;
         } else if argument == "--analyzer-manifest" {
             target = ExportTarget::AnalyzerManifest;
+        } else if argument == "--global-api" {
+            target = ExportTarget::GlobalApi;
         } else if argument.starts_with('-') {
             return Err(ExportError::UnknownFlag { argument });
         } else if output_dir.is_none() {
@@ -339,6 +350,12 @@ where
 pub fn run(request: &ExportRequest) -> Result<(), ExportError> {
     if request.target == ExportTarget::AnalyzerManifest {
         return run_analyzer_manifest(request);
+    }
+    if request.target == ExportTarget::GlobalApi {
+        let path = request.output_dir.join(global_api::DOCUMENT_PATH);
+        global_api::validate(&path).map_err(|source| ExportError::GlobalApi { source })?;
+        println!("{} is valid", path.display());
+        return Ok(());
     }
     let tools = tool_listing();
     let generated = skill::generate(&tools, SkillForm::Plugin)
