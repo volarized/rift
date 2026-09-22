@@ -82,7 +82,7 @@ async def check_resources(client: Client) -> None:
     async with asyncio.timeout(client.call_seconds):
         listed = await client.session.list_resources()
     require(
-        listed.nextCursor is None, "resource listing requires a new pagination case"
+        listed.next_cursor is None, "resource listing requires a new pagination case"
     )
     observed = {str(resource.uri) for resource in listed.resources}
     require(observed == RESOURCE_URIS, f"resource coverage differs: {observed}")

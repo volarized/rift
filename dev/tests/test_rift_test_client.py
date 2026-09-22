@@ -29,7 +29,7 @@ def client_with_result(result: types.CallToolResult) -> Client:
     session.call_tool.return_value = result
     client = Client(cast(ClientSession, session))
     client.tools["search"] = types.Tool(
-        name="search", inputSchema={"type": "object"}, outputSchema=SCHEMA
+        name="search", input_schema={"type": "object"}, output_schema=SCHEMA
     )
     return client
 
@@ -38,7 +38,7 @@ def client_with_result(result: types.CallToolResult) -> Client:
 def test_invalid_structured_answer_fails_including_tool_errors(error: bool) -> None:
     client = client_with_result(
         types.CallToolResult(
-            content=[], structuredContent={"status": "unknown"}, isError=error
+            content=[], structured_content={"status": "unknown"}, is_error=error
         )
     )
     with pytest.raises(ValidationError):
@@ -57,8 +57,8 @@ def test_non_object_tool_schema_fails_before_calls() -> None:
         tools=[
             types.Tool(
                 name="search",
-                inputSchema={"type": "object"},
-                outputSchema={"oneOf": [SCHEMA]},
+                input_schema={"type": "object"},
+                output_schema={"oneOf": [SCHEMA]},
             ),
         ]
     )
@@ -68,9 +68,9 @@ def test_non_object_tool_schema_fails_before_calls() -> None:
 
 def test_invalid_input_never_reaches_server() -> None:
     client = client_with_result(
-        types.CallToolResult(content=[], structuredContent={"results": []})
+        types.CallToolResult(content=[], structured_content={"results": []})
     )
-    client.tools["search"].inputSchema = {"type": "object", "required": ["search"]}
+    client.tools["search"].input_schema = {"type": "object", "required": ["search"]}
     with pytest.raises(ValidationError):
         asyncio.run(client.call("search", {}))
     cast(AsyncMock, client.session.call_tool).assert_not_called()
@@ -81,7 +81,7 @@ def test_resource_rejects_wrong_uri() -> None:
     session.read_resource.return_value = types.ReadResourceResult(
         contents=[
             types.TextResourceContents(
-                uri="rift://map", mimeType="application/json", text="{}"
+                uri="rift://map", mime_type="application/json", text="{}"
             ),
         ]
     )
@@ -141,14 +141,14 @@ def test_active_sdk_request_interruption_reaps_every_owned_process(
     binary = fake_binary(
         tmp_path,
         """import asyncio,json,os,pathlib,signal,subprocess,sys,time
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 if sys.argv[1:]==['server','start','--foreground','--auth','skip']:
     pathlib.Path('.rift').mkdir()
     pathlib.Path('.rift/server.json').write_text(json.dumps({'pid':os.getpid(),'port':12000}))
     time.sleep(30)
 else:
-    app = FastMCP('interrupted request')
+    app = MCPServer('interrupted request')
 
     @app.tool()
     async def wait() -> dict[str, str]:
@@ -323,7 +323,7 @@ def test_server_drain_stops_at_its_byte_bound(tmp_path: Path) -> None:
 def test_tool_error_cannot_satisfy_a_read() -> None:
     client = client_with_result(
         types.CallToolResult(
-            content=[], structuredContent={"results": []}, isError=True
+            content=[], structured_content={"results": []}, is_error=True
         )
     )
     with pytest.raises(AssertionError, match="reported a tool error"):
@@ -588,7 +588,7 @@ def test_stop_deadline_includes_observation_and_validation(
 
 def test_missing_read_tool_is_rejected() -> None:
     client = client_with_result(
-        types.CallToolResult(content=[], structuredContent={"results": []})
+        types.CallToolResult(content=[], structured_content={"results": []})
     )
     with pytest.raises(AssertionError, match="missing tools.*nodes"):
         client.require_complete({"search", "nodes"})
@@ -596,7 +596,7 @@ def test_missing_read_tool_is_rejected() -> None:
 
 def test_unexercised_read_tool_is_rejected() -> None:
     client = client_with_result(
-        types.CallToolResult(content=[], structuredContent={"results": []})
+        types.CallToolResult(content=[], structured_content={"results": []})
     )
     with pytest.raises(AssertionError, match="unexercised tools.*search"):
         client.require_complete({"search"})
