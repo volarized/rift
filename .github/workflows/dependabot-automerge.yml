@@ -24,19 +24,71 @@ jobs:
       - uses: dependabot/fetch-metadata@v3
         id: meta
 
-      # Majors deliberately excluded - they carry breaking changes and want a
-      # human. Everything else merges once the required checks pass; auto-merge
-      # waits for them rather than bypassing them.
-      - name: Enable auto-merge for non-major updates
-        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+      # What auto-merge holds back is a bump that leaves its dependency's
+      # compatibility range, which is not the same as a major bump. Cargo, npm
+      # and uv all read a pre-1.0 version's leftmost non-zero field as the
+      # breaking one: `1.4.0` to `2.0.0` leaves the range, and so do `0.10.9` to
+      # `0.11.0` and `0.0.3` to `0.0.4`. `fetch-metadata` reports which field
+      # moved and nothing about what that field means, so the range is worked
+      # out here from that field together with the version it moved from.
+      #
+      # A grouped pull request carries one entry per dependency, and
+      # `update-type` reports the highest field any of them moved. That is not
+      # enough: a group whose highest move is a minor can still carry a 0.x
+      # dependency leaving its range. Every entry is classified, and one
+      # breaking entry holds the whole group.
+      #
+      # The metadata is read through the environment, never interpolated into
+      # this script. It is derived from the pull request's own branch and commit
+      # message, so `${{ }}` here would run that text as shell on a job holding
+      # write permissions.
+      - name: Classify each bump against its compatibility range
+        id: range
+        env:
+          UPDATED: ${{ steps.meta.outputs.updated-dependencies-json }}
+        run: |
+          set -euo pipefail
+          breaking=false
+          while IFS='|' read -r previous update; do
+            previous="${previous#v}"
+            case "$previous" in
+              "" | null)
+                # A version the metadata could not name is one this cannot
+                # classify, and an unclassified bump waits for a human.
+                breaking=true
+                ;;
+              0.0.*)
+                breaking=true
+                ;;
+              0.*)
+                if [ "$update" != version-update:semver-patch ]; then
+                  breaking=true
+                fi
+                ;;
+              *)
+                if [ "$update" = version-update:semver-major ]; then
+                  breaking=true
+                fi
+                ;;
+            esac
+          done <<EOF
+          $(jq -r '.[] | "\(.prevVersion)|\(.updateType)"' <<<"$UPDATED")
+          EOF
+          echo "breaking=$breaking" >>"$GITHUB_OUTPUT"
+
+      # Both conditions carry `success()`. An `if` replaces the implicit
+      # success check a step otherwise runs under, so without it a failed
+      # classification would leave auto-merge enabled on an unclassified bump.
+      - name: Enable auto-merge for updates that keep their range
+        if: success() && steps.range.outputs.breaking != 'true'
         run: gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Comment on major updates
-        if: steps.meta.outputs.update-type == 'version-update:semver-major'
-        run: gh pr comment "$PR_URL" --body "Major version bump - auto-merge skipped, needs a human."
+      - name: Comment on updates that leave their range
+        if: success() && steps.range.outputs.breaking == 'true'
+        run: gh pr comment "$PR_URL" --body "This bump leaves a dependency's compatibility range - auto-merge skipped, needs a human."
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
