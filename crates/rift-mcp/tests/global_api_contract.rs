@@ -85,6 +85,10 @@ fn fixed_surface_changes_fail_validation() -> TestResult {
     let mut document = contract()?;
     document["paths"]["/v1/search"]["post"]["security"] = json!([]);
     assert_invalid(&document, "optional bearer authentication")?;
+
+    let mut document = contract()?;
+    document["servers"] = json!([{"url": "https://example.com/rift/rest"}]);
+    assert_invalid(&document, "`servers` must stay absent")?;
     Ok(())
 }
 

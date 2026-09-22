@@ -21,7 +21,6 @@ pub const CONTRACT_PATH: &str = "docs/public/global-api.openapi.json";
 /// Published path below the docs directory.
 pub const DOCUMENT_PATH: &str = "public/global-api.openapi.json";
 
-const SERVER_URL: &str = "https://api.volar.sh/rift/rest";
 const ERROR_STATUSES: [&str; 10] = [
     "400", "401", "403", "406", "413", "415", "429", "500", "502", "503",
 ];
@@ -118,7 +117,11 @@ pub fn validate(path: &Path) -> Result<(), ContractError> {
         &json!("https://json-schema.org/draft/2020-12/schema"),
     )
     .map_err(&invalid)?;
-    expect_value(&document, "/servers/0/url", &json!(SERVER_URL)).map_err(&invalid)?;
+    if document.get("servers").is_some() {
+        return Err(invalid(
+            "root `servers` must stay absent; client configuration selects the endpoint".to_owned(),
+        ));
+    }
     expect_value(&document, "/security", &optional_bearer()).map_err(&invalid)?;
     expect_value(
         &document,

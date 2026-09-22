@@ -6,11 +6,6 @@
     "description": "REST contract for package capabilities, resolution, declaration search, and symbol reads.",
     "version": "0.0.43"
   },
-  "servers": [
-    {
-      "url": "https://api.volar.sh/rift/rest"
-    }
-  ],
   "security": [
     {},
     {
