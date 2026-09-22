@@ -314,7 +314,8 @@ fn validate_shared_schemas(document: &Value) -> Result<(), String> {
     let _ = generator.subschema_for::<SymbolId>();
 
     let components = object_at(document, "/components/schemas")?;
-    for (name, expected) in generator.take_definitions(true) {
+    for (name, mut expected) in generator.take_definitions(true) {
+        normalize_shared_string_enum(&mut expected);
         let actual = components
             .get(&name)
             .ok_or_else(|| format!("shared schema `{name}` is missing"))?;
@@ -325,6 +326,35 @@ fn validate_shared_schemas(document: &Value) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn normalize_shared_string_enum(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    let Some(variants) = object.get("oneOf").and_then(Value::as_array) else {
+        return;
+    };
+    let values = variants
+        .iter()
+        .map(|variant| variant.get("const").and_then(Value::as_str))
+        .collect::<Option<Vec<_>>>();
+    let descriptions = variants
+        .iter()
+        .map(|variant| variant.get("description").and_then(Value::as_str))
+        .collect::<Option<Vec<_>>>();
+    let (Some(values), Some(descriptions)) = (values, descriptions) else {
+        return;
+    };
+    let values = values.into_iter().map(str::to_owned).collect::<Vec<_>>();
+    let descriptions = descriptions
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    object.remove("oneOf");
+    object.insert("type".to_owned(), json!("string"));
+    object.insert("enum".to_owned(), json!(values));
+    object.insert("x-enum-descriptions".to_owned(), json!(descriptions));
 }
 
 fn expect_value(document: &Value, pointer: &str, expected: &Value) -> Result<(), String> {

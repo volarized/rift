@@ -1212,47 +1212,32 @@
       },
       "SourceKind": {
         "description": "How source or a declaration came to exist.",
-        "oneOf": [
-          {
-            "const": "authored",
-            "description": "A person wrote it.",
-            "type": "string"
-          },
-          {
-            "const": "generated",
-            "description": "A tool produced it from other source.",
-            "type": "string"
-          },
-          {
-            "const": "synthetic",
-            "description": "The provider minted it without any source text.",
-            "type": "string"
-          }
+        "type": "string",
+        "enum": [
+          "authored",
+          "generated",
+          "synthetic"
+        ],
+        "x-enum-descriptions": [
+          "A person wrote it.",
+          "A tool produced it from other source.",
+          "The provider minted it without any source text."
         ]
       },
       "SourceLocationKind": {
         "description": "Which of the four places a declaration's source belongs, on `SymbolOrigin`. Package\nownership is the separate `package` field: a `project` declaration can carry one too,\nand `dependency` always does.",
-        "oneOf": [
-          {
-            "const": "project",
-            "description": "Owned by the current workspace.",
-            "type": "string"
-          },
-          {
-            "const": "dependency",
-            "description": "Owned by one resolved dependency.",
-            "type": "string"
-          },
-          {
-            "const": "stdlib",
-            "description": "Installed with the language toolchain.",
-            "type": "string"
-          },
-          {
-            "const": "external",
-            "description": "Outside the project, dependency graph, and standard library.",
-            "type": "string"
-          }
+        "type": "string",
+        "enum": [
+          "project",
+          "dependency",
+          "stdlib",
+          "external"
+        ],
+        "x-enum-descriptions": [
+          "Owned by the current workspace.",
+          "Owned by one resolved dependency.",
+          "Installed with the language toolchain.",
+          "Outside the project, dependency graph, and standard library."
         ]
       },
       "Language": {
@@ -1285,17 +1270,14 @@
       },
       "DocumentationFormat": {
         "description": "Which markup the text is written in, since whoever displays a doc comment is the one that\nrenders it.",
-        "oneOf": [
-          {
-            "const": "plain",
-            "description": "Plain text with no markup to render.",
-            "type": "string"
-          },
-          {
-            "const": "markdown",
-            "description": "Markdown as authored in the source.",
-            "type": "string"
-          }
+        "type": "string",
+        "enum": [
+          "plain",
+          "markdown"
+        ],
+        "x-enum-descriptions": [
+          "Plain text with no markup to render.",
+          "Markdown as authored in the source."
         ]
       },
       "Extensions": {
@@ -1330,157 +1312,70 @@
       },
       "SymbolFacet": {
         "description": "One portable category a symbol falls into. Kinds are language-specific; facets are\nshared, so a filter written once applies to every served language.",
-        "oneOf": [
-          {
-            "const": "namespace",
-            "description": "A named scope that groups declarations.",
-            "type": "string"
-          },
-          {
-            "const": "module",
-            "description": "A compilation or import unit.",
-            "type": "string"
-          },
-          {
-            "const": "type",
-            "description": "Names a type.",
-            "type": "string"
-          },
-          {
-            "const": "value",
-            "description": "Holds a runtime value.",
-            "type": "string"
-          },
-          {
-            "const": "callable",
-            "description": "Can be invoked.",
-            "type": "string"
-          },
-          {
-            "const": "member",
-            "description": "Belongs to a containing type.",
-            "type": "string"
-          },
-          {
-            "const": "member_container",
-            "description": "Owns members of its own.",
-            "type": "string"
-          },
-          {
-            "const": "parameter",
-            "description": "A declared input of a callable.",
-            "type": "string"
-          },
-          {
-            "const": "type_parameter",
-            "description": "A generic parameter a declaration abstracts over.",
-            "type": "string"
-          },
-          {
-            "const": "constructible",
-            "description": "Instances of it can be created.",
-            "type": "string"
-          },
-          {
-            "const": "extensible",
-            "description": "Other types can inherit from it.",
-            "type": "string"
-          },
-          {
-            "const": "implementable",
-            "description": "Other types can fulfil it.",
-            "type": "string"
-          },
-          {
-            "const": "macro",
-            "description": "Expands at compile time.",
-            "type": "string"
-          },
-          {
-            "const": "test",
-            "description": "Exercises other code as a test.",
-            "type": "string"
-          },
-          {
-            "const": "annotation",
-            "description": "Decorates other declarations.",
-            "type": "string"
-          },
-          {
-            "const": "extension",
-            "description": "Adds members to a type declared elsewhere.",
-            "type": "string"
-          },
-          {
-            "const": "variant",
-            "description": "One case of an enumeration.",
-            "type": "string"
-          },
-          {
-            "const": "enumeration",
-            "description": "A closed set of variants.",
-            "type": "string"
-          },
-          {
-            "const": "alias",
-            "description": "Another name for an existing symbol.",
-            "type": "string"
-          },
-          {
-            "const": "property",
-            "description": "A member accessed like a field but backed by code.",
-            "type": "string"
-          },
-          {
-            "const": "abstract",
-            "description": "Declared without a complete implementation.",
-            "type": "string"
-          },
-          {
-            "const": "constructor",
-            "description": "Creates instances of its container.",
-            "type": "string"
-          },
-          {
-            "const": "static",
-            "description": "Belongs to the type rather than an instance.",
-            "type": "string"
-          },
-          {
-            "const": "mutable",
-            "description": "Its value can change after initialization.",
-            "type": "string"
-          },
-          {
-            "const": "public",
-            "description": "Visible outside its declaring scope.",
-            "type": "string"
-          },
-          {
-            "const": "deprecated",
-            "description": "Marked as discouraged for new use.",
-            "type": "string"
-          },
-          {
-            "const": "entrypoint",
-            "description": "Where execution starts.",
-            "type": "string"
-          },
-          {
-            "const": "operator",
-            "description": "Invoked through operator syntax.",
-            "type": "string"
-          },
-          {
-            "const": "async",
-            "description": "Runs asynchronously.",
-            "type": "string"
-          },
-          {
-            "const": "generator",
-            "description": "Yields a sequence of values over time.",
-            "type": "string"
-          }
+        "type": "string",
+        "enum": [
+          "namespace",
+          "module",
+          "type",
+          "value",
+          "callable",
+          "member",
+          "member_container",
+          "parameter",
+          "type_parameter",
+          "constructible",
+          "extensible",
+          "implementable",
+          "macro",
+          "test",
+          "annotation",
+          "extension",
+          "variant",
+          "enumeration",
+          "alias",
+          "property",
+          "abstract",
+          "constructor",
+          "static",
+          "mutable",
+          "public",
+          "deprecated",
+          "entrypoint",
+          "operator",
+          "async",
+          "generator"
+        ],
+        "x-enum-descriptions": [
+          "A named scope that groups declarations.",
+          "A compilation or import unit.",
+          "Names a type.",
+          "Holds a runtime value.",
+          "Can be invoked.",
+          "Belongs to a containing type.",
+          "Owns members of its own.",
+          "A declared input of a callable.",
+          "A generic parameter a declaration abstracts over.",
+          "Instances of it can be created.",
+          "Other types can inherit from it.",
+          "Other types can fulfil it.",
+          "Expands at compile time.",
+          "Exercises other code as a test.",
+          "Decorates other declarations.",
+          "Adds members to a type declared elsewhere.",
+          "One case of an enumeration.",
+          "A closed set of variants.",
+          "Another name for an existing symbol.",
+          "A member accessed like a field but backed by code.",
+          "Declared without a complete implementation.",
+          "Creates instances of its container.",
+          "Belongs to the type rather than an instance.",
+          "Its value can change after initialization.",
+          "Visible outside its declaring scope.",
+          "Marked as discouraged for new use.",
+          "Where execution starts.",
+          "Invoked through operator syntax.",
+          "Runs asynchronously.",
+          "Yields a sequence of values over time."
         ]
       },
       "ExactKind": {
@@ -1664,87 +1559,48 @@
       },
       "TypeBindingRole": {
         "description": "What this type is to the symbol that carries it.",
-        "oneOf": [
-          {
-            "const": "receiver",
-            "description": "The type of the implicit first parameter.",
-            "type": "string"
-          },
-          {
-            "const": "parameter",
-            "description": "The type a parameter accepts.",
-            "type": "string"
-          },
-          {
-            "const": "return",
-            "description": "The type a call yields.",
-            "type": "string"
-          },
-          {
-            "const": "field",
-            "description": "The type a field holds.",
-            "type": "string"
-          },
-          {
-            "const": "bound",
-            "description": "A constraint on a type parameter.",
-            "type": "string"
-          },
-          {
-            "const": "element",
-            "description": "The type of a collection's entries.",
-            "type": "string"
-          },
-          {
-            "const": "key",
-            "description": "The type a map is indexed by.",
-            "type": "string"
-          },
-          {
-            "const": "error",
-            "description": "The type of the failure a fallible result carries.",
-            "type": "string"
-          },
-          {
-            "const": "underlying",
-            "description": "The type an alias or wrapper stands for.",
-            "type": "string"
-          },
-          {
-            "const": "yielded",
-            "description": "The type a generator produces per step.",
-            "type": "string"
-          },
-          {
-            "const": "awaited",
-            "description": "The type awaiting the value resolves to.",
-            "type": "string"
-          },
-          {
-            "const": "discriminant",
-            "description": "The type that tags which variant a value holds.",
-            "type": "string"
-          }
+        "type": "string",
+        "enum": [
+          "receiver",
+          "parameter",
+          "return",
+          "field",
+          "bound",
+          "element",
+          "key",
+          "error",
+          "underlying",
+          "yielded",
+          "awaited",
+          "discriminant"
+        ],
+        "x-enum-descriptions": [
+          "The type of the implicit first parameter.",
+          "The type a parameter accepts.",
+          "The type a call yields.",
+          "The type a field holds.",
+          "A constraint on a type parameter.",
+          "The type of a collection's entries.",
+          "The type a map is indexed by.",
+          "The type of the failure a fallible result carries.",
+          "The type an alias or wrapper stands for.",
+          "The type a generator produces per step.",
+          "The type awaiting the value resolves to.",
+          "The type that tags which variant a value holds."
         ]
       },
       "TypeBindingOrigin": {
         "description": "Where the type fact came from. A declared type and an inferred one can both be present\nand disagree, which is the interesting case.",
-        "oneOf": [
-          {
-            "const": "declared",
-            "description": "Written in the source by the author.",
-            "type": "string"
-          },
-          {
-            "const": "inferred",
-            "description": "Worked out by the provider from usage.",
-            "type": "string"
-          },
-          {
-            "const": "expected",
-            "description": "Required by the surrounding context.",
-            "type": "string"
-          }
+        "type": "string",
+        "enum": [
+          "declared",
+          "inferred",
+          "expected"
+        ],
+        "x-enum-descriptions": [
+          "Written in the source by the author.",
+          "Worked out by the provider from usage.",
+          "Required by the surrounding context."
         ]
       },
       "TypeExpression": {
@@ -1886,17 +1742,14 @@
       },
       "PackageAvailability": {
         "description": "Whether a global package index can answer for one package.",
-        "oneOf": [
-          {
-            "const": "canonical",
-            "description": "The entry names a package a public registry serves: crates.io, npm, or the\nPython Package Index.",
-            "type": "string"
-          },
-          {
-            "const": "local_only",
-            "description": "The entry names a path, git, or custom-registry package only this machine can\nanswer for.",
-            "type": "string"
-          }
+        "type": "string",
+        "enum": [
+          "canonical",
+          "local_only"
+        ],
+        "x-enum-descriptions": [
+          "The entry names a package a public registry serves: crates.io, npm, or the\nPython Package Index.",
+          "The entry names a path, git, or custom-registry package only this machine can\nanswer for."
         ]
       },
       "PublicationFormat": {
