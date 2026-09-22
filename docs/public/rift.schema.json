@@ -390,6 +390,89 @@
       },
       "type": "object"
     },
+    "GlobalConfiguration": {
+      "additionalProperties": false,
+      "description": "The `[global]` table: global REST API access, request bounds, and cache lifetimes.",
+      "properties": {
+        "attempts": {
+          "default": 3,
+          "description": "Attempts one global API request makes, 1 to 5.",
+          "format": "uint64",
+          "maximum": 5,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "capabilities_ttl": {
+          "$ref": "#/$defs/Duration",
+          "default": "15m",
+          "description": "Capabilities cache lifetime, 1m to 24h.",
+          "rift:range": {
+            "max": "1d",
+            "min": "1m"
+          }
+        },
+        "connect_timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "3s",
+          "description": "Connection timeout, 100ms to 30s.",
+          "rift:range": {
+            "max": "30s",
+            "min": "100ms"
+          }
+        },
+        "enabled": {
+          "default": true,
+          "description": "Whether package reads use the global REST API.",
+          "type": "boolean"
+        },
+        "endpoint": {
+          "default": "https://api.volar.sh/rift/rest",
+          "description": "Base URL for global REST API requests. The client validates its URL form.",
+          "type": "string"
+        },
+        "failure_ttl": {
+          "$ref": "#/$defs/Duration",
+          "default": "30s",
+          "description": "Unavailable-state cache lifetime, 1s to 1h.",
+          "rift:range": {
+            "max": "1h",
+            "min": "1s"
+          }
+        },
+        "max_in_flight": {
+          "default": 4,
+          "description": "Global API requests running at once, 1 to 32.",
+          "format": "uint64",
+          "maximum": 32,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "request_timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "15s",
+          "description": "Total request timeout across connection, response, delays, and attempts, 1s to 5m.",
+          "rift:range": {
+            "max": "5m",
+            "min": "1s"
+          }
+        },
+        "resolution_ttl": {
+          "$ref": "#/$defs/Duration",
+          "default": "15m",
+          "description": "Package-resolution cache lifetime, 1m to 24h.",
+          "rift:range": {
+            "max": "1d",
+            "min": "1m"
+          }
+        },
+        "token_env": {
+          "default": "RIFT_API_TOKEN",
+          "description": "Environment variable containing the optional bearer token. The client validates its name.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "HistoryConfiguration": {
       "additionalProperties": false,
       "description": "The `[providers.history]` table. The history provider's cost scales with\nhow far back it walks, so its depth is the budget worth setting.",
@@ -1081,6 +1164,22 @@
         "max_timeout": "30s"
       },
       "description": "Enablement and limits for caller-provided code."
+    },
+    "global": {
+      "$ref": "#/$defs/GlobalConfiguration",
+      "default": {
+        "attempts": 3,
+        "capabilities_ttl": "15m",
+        "connect_timeout": "3s",
+        "enabled": true,
+        "endpoint": "https://api.volar.sh/rift/rest",
+        "failure_ttl": "30s",
+        "max_in_flight": 4,
+        "request_timeout": "15s",
+        "resolution_ttl": "15m",
+        "token_env": "RIFT_API_TOKEN"
+      },
+      "description": "Whether package reads use the configured global REST API and its request bounds."
     },
     "languages": {
       "additionalProperties": {
