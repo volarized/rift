@@ -38,7 +38,7 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{
     Implementation, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
     ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ServerCapabilities,
-    ServerInfo,
+    ServerConfig,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData, Json, ServerHandler, tool, tool_handler, tool_router};
@@ -2556,8 +2556,8 @@ impl ServerHandler for RiftMcp {
         }
     }
 
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()

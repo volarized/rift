@@ -17,7 +17,7 @@ use rift_protocol::lock::{ProductIdentity, ServerLock};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, Implementation, ListResourceTemplatesResult,
     ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
-    ReadResourceResponse, ServerCapabilities, ServerInfo, ServerPeerInfo,
+    ReadResourceResponse, ServerCapabilities, ServerConfig, ServerPeerInfo,
 };
 use rmcp::service::{
     ClientInitializeError, Peer, QuitReason, RequestContext, RoleClient, RoleServer,
@@ -185,7 +185,7 @@ struct RiftProxy {
     root: Arc<Path>,
     identity: Arc<ProductIdentity>,
     upstream: Arc<tokio::sync::Mutex<UpstreamSlot>>,
-    advertised: Arc<std::sync::Mutex<Option<ServerInfo>>>,
+    advertised: Arc<std::sync::Mutex<Option<ServerConfig>>>,
 }
 
 /// The proxy's one upstream connection and the generation counter that
@@ -384,7 +384,7 @@ impl RiftProxy {
     /// The info advertised downstream: the upstream's mirrored
     /// advertisement once a connect succeeded, and a tools-enabled fallback
     /// naming this binary before then.
-    fn advertised_info(&self) -> ServerInfo {
+    fn advertised_info(&self) -> ServerConfig {
         self.lock_advertised()
             .clone()
             .unwrap_or_else(|| fallback_info(&self.identity))
@@ -400,7 +400,7 @@ impl RiftProxy {
 
     /// The advertised slot, recovered from a poisoned lock: the stored
     /// value is plain data, valid regardless of a panicked writer.
-    fn lock_advertised(&self) -> std::sync::MutexGuard<'_, Option<ServerInfo>> {
+    fn lock_advertised(&self) -> std::sync::MutexGuard<'_, Option<ServerConfig>> {
         match self.advertised.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -748,8 +748,8 @@ fn forwarded_error(error: ServiceError) -> ErrorData {
 }
 
 /// The advertisement served before the first successful upstream connect.
-fn fallback_info(identity: &ProductIdentity) -> ServerInfo {
-    let mut info = ServerInfo::new(
+fn fallback_info(identity: &ProductIdentity) -> ServerConfig {
+    let mut info = ServerConfig::new(
         ServerCapabilities::builder()
             .enable_tools()
             .enable_resources()
@@ -765,8 +765,8 @@ fn fallback_info(identity: &ProductIdentity) -> ServerInfo {
 /// The protocol version is a starting point only: initialize re-negotiates
 /// it against the downstream client. An upstream that named no
 /// implementation identity falls back to this binary's own.
-fn mirrored_info(peer_info: &ServerPeerInfo) -> ServerInfo {
-    let mut info = ServerInfo::new(peer_info.capabilities.clone())
+fn mirrored_info(peer_info: &ServerPeerInfo) -> ServerConfig {
+    let mut info = ServerConfig::new(peer_info.capabilities.clone())
         .with_protocol_version(peer_info.protocol_version.clone())
         .with_server_info(
             peer_info
@@ -780,7 +780,7 @@ fn mirrored_info(peer_info: &ServerPeerInfo) -> ServerInfo {
 }
 
 impl ServerHandler for RiftProxy {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         self.advertised_info()
     }
 
