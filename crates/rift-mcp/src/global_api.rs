@@ -18,6 +18,8 @@ use rift_ranking::{
 
 /// Published path below the repository root.
 pub const CONTRACT_PATH: &str = "docs/public/global-api.openapi.json";
+/// Published path below the docs directory.
+pub const DOCUMENT_PATH: &str = "public/global-api.openapi.json";
 
 const SERVER_URL: &str = "https://api.volar.sh/rift/rest";
 const ERROR_STATUSES: [&str; 10] = [

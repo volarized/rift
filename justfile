@@ -18,7 +18,7 @@ generate-check:
     set -euo pipefail
     cargo run -q -p rift-mcp --bin rift-schema-export -- --check docs plugins/claude
     cargo run -q -p rift-mcp --bin rift-schema-export -- --check --analyzer-manifest .
-    cargo run -q -p rift-mcp --bin rift-global-api-check
+    cargo run -q -p rift-mcp --bin rift-schema-export -- --global-api docs
     fresh="$(mktemp)"
     trap 'rm -f "$fresh"' EXIT
     printf '$ rift --help\n' > "$fresh"
