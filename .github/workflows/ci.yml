@@ -102,7 +102,7 @@ jobs:
           cache-dependency-glob: |
             dev/uv.lock
             tools/rift-release/uv.lock
-      - uses: taiki-e/install-action@v2.87.15
+      - uses: taiki-e/install-action@v2.87.16
         with:
           tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
       - run: >-
@@ -155,7 +155,7 @@ jobs:
           cache-dependency-glob: |
             dev/uv.lock
             tools/rift-release/uv.lock
-      - uses: taiki-e/install-action@v2.87.15
+      - uses: taiki-e/install-action@v2.87.16
         with:
           tool: just,cargo-audit,cargo-deny,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
 
@@ -287,7 +287,7 @@ jobs:
         with:
           name: fast-build
           path: target
-      - uses: taiki-e/install-action@v2.87.15
+      - uses: taiki-e/install-action@v2.87.16
         with:
           tool: just,cargo-nextest@0.9.140
       - run: >-
