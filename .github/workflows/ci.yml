@@ -102,7 +102,7 @@ jobs:
           cache-dependency-glob: |
             dev/uv.lock
             tools/rift-release/uv.lock
-      - uses: taiki-e/install-action@v2.86.3
+      - uses: taiki-e/install-action@v2.87.15
         with:
           tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
       - run: >-
@@ -155,7 +155,7 @@ jobs:
           cache-dependency-glob: |
             dev/uv.lock
             tools/rift-release/uv.lock
-      - uses: taiki-e/install-action@v2.86.3
+      - uses: taiki-e/install-action@v2.87.15
         with:
           tool: just,cargo-audit,cargo-deny,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
 
@@ -187,8 +187,14 @@ jobs:
           PYTEST_ADDOPTS: >-
             --junitxml=release.junit.xml -o junit_family=legacy
 
+      # Codecov uploads are skipped on Dependabot runs. A Dependabot-triggered
+      # workflow reads the Dependabot secret scope, not the Actions scope that
+      # holds `CODECOV_TOKEN`, so the upload fails with "Token required because
+      # branch is protected" and `fail_ci_if_error` turns that into a red
+      # `rust` check on every dependency pull request. A dependency bump adds
+      # no source lines to cover, so skipping the upload loses no report.
       - name: Upload release test results
-        if: ${{ !cancelled() && steps.release_tests.outcome != 'skipped' }}
+        if: ${{ !cancelled() && steps.release_tests.outcome != 'skipped' && github.actor != 'dependabot[bot]' }}
         uses: codecov/codecov-action@v5.5.5
         with:
           disable_search: true
@@ -219,7 +225,7 @@ jobs:
             --junitxml=installers.junit.xml -o junit_family=legacy
 
       - name: Upload installer test results
-        if: ${{ !cancelled() && steps.installer_tests.outcome != 'skipped' }}
+        if: ${{ !cancelled() && steps.installer_tests.outcome != 'skipped' && github.actor != 'dependabot[bot]' }}
         uses: codecov/codecov-action@v5.5.5
         with:
           disable_search: true
@@ -231,6 +237,7 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Upload CLI coverage
+        if: ${{ github.actor != 'dependabot[bot]' }}
         uses: codecov/codecov-action@v5.5.5
         with:
           disable_search: true
@@ -241,7 +248,7 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Upload Rust test results
-        if: ${{ !cancelled() && steps.rust_tests.outcome != 'skipped' }}
+        if: ${{ !cancelled() && steps.rust_tests.outcome != 'skipped' && github.actor != 'dependabot[bot]' }}
         uses: codecov/codecov-action@v5.5.5
         with:
           disable_search: true
@@ -280,7 +287,7 @@ jobs:
         with:
           name: fast-build
           path: target
-      - uses: taiki-e/install-action@v2.86.3
+      - uses: taiki-e/install-action@v2.87.15
         with:
           tool: just,cargo-nextest@0.9.140
       - run: >-

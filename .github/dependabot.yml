@@ -30,6 +30,15 @@ updates:
       # One PR per week for the routine churn instead of a dozen.
       docs-minor-patch:
         update-types: [minor, patch]
+      # The docs toolchain upgrades as one unit: fumadocs-mdx imports paths
+      # that only the matching fumadocs-core exports, and fumadocs-ui carries
+      # its own copy of fumadocs-core. Split across separate pull requests,
+      # each major fails against the versions the others still pin, so the
+      # group is what can land. Cargo, uv, and github-actions majors stay
+      # ungrouped: those are independent packages, and grouping them would let
+      # one breaking bump hold back the rest.
+      docs-major:
+        update-types: [major]
 
   # tools/mcp-conformance JavaScript: the MCP specification's own conformance
   # runner. Following its releases is how the gate picks up new scenarios and
@@ -46,6 +55,8 @@ updates:
     groups:
       conformance-minor-patch:
         update-types: [minor, patch]
+      conformance-major:
+        update-types: [major]
 
   - package-ecosystem: cargo
     directory: /
