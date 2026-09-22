@@ -17,21 +17,20 @@ Source reviewed before use:
 Generation command:
 
 ```sh
-oas3-gen generate client-mod -q --enum-mode relaxed --no-ordered-collections \
+oas3-gen generate types -q --enum-mode relaxed --no-ordered-collections \
   -i docs/public/global-api.openapi.json \
-  -o crates/rift-cloud-client/src/generated
+  -o crates/rift-cloud-client/src/generated.rs
 ```
 
 Observed output: 53 types, comprising 32 structs, 16 enums, and 5 type aliases, with 4
 operations converted. Two clean runs produced equal output.
 
 `just generate` runs this command directly. `just generate-check` writes fresh output to a
-temporary directory and compares its bytes with the checked module. Keep generated source
-rustfmt-skipped so checked bytes remain exact `oas3-gen` output. `oas3-gen` emits a direct client
-with its placeholder `BASE_URL`; that client stays private. `GlobalClient` owns configured endpoint
-selection, bounds, retries, caches, and response streaming. It uses generated request and query
-types for serialization, then generated response parsers and status enums after bounded response
-streaming. Public exports contain the generated wire types needed by callers.
+temporary file and compares its bytes with the checked module. Keep generated source
+rustfmt-skipped so checked bytes remain exact `oas3-gen` output. Types mode emits operation request
+and query types, response parsers, and status enums without a transport client or default endpoint.
+`GlobalClient` owns configured endpoint selection, bounds, retries, caches, and response streaming.
+Public exports contain the generated wire types needed by callers.
 
 ## Rejected generator
 

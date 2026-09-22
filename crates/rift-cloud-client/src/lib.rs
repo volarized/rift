@@ -36,7 +36,7 @@ use tracing::Instrument as _;
     clippy::wildcard_imports,
     unreachable_pub,
     unused_imports,
-    reason = "generated direct client stays private behind the bounded runtime"
+    reason = "generated wire types stay private behind the bounded runtime"
 )]
 #[rustfmt::skip]
 mod generated;
