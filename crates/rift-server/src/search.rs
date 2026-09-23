@@ -4868,8 +4868,8 @@ impl Tower {
         Ok(())
     }
 
-    /// The package warnings ride a `search` answer whose scope reaches packages, the
-    /// same way they ride `get_symbol`'s, and no other.
+    /// Package warnings follow every search that includes dependency sources, including
+    /// local documentation search.
     #[test]
     fn search_global_scope_warns_a_skipped_package() -> TestResult {
         let mut index =
@@ -4906,7 +4906,23 @@ impl Tower {
         }
         let params: SearchParams = serde_json::from_value(json!({"query": "beacon"}))?;
         let result = service.search(&params, &StoreAnswer::identifier_only())?;
-        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(
+            result.warnings,
+            [ReadWarning::PackageSkipped {
+                package: zeta,
+                reason: "zeta refused".to_owned(),
+            }]
+        );
+        for target in ["symbol", "file"] {
+            let params: SearchParams =
+                serde_json::from_value(json!({"query": "beacon", "target": target}))?;
+            let result = service.search(&params, &StoreAnswer::identifier_only())?;
+            assert!(
+                result.warnings.is_empty(),
+                "target {target}: {:?}",
+                result.warnings
+            );
+        }
         Ok(())
     }
 }
