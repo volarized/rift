@@ -5301,7 +5301,7 @@ mod tests {
             "every visible path no language claims joins the text catalog"
         );
         let source_paths: Vec<&str> = index.files().map(|file| file.path().as_str()).collect();
-        assert_eq!(source_paths, ["docs/guide.md"]);
+        assert_eq!(source_paths, ["docs/guide.md", "docs/notes.mdx"]);
     }
 
     /// A workspace that gives a shipped language a nonstandard pattern gets syntax
