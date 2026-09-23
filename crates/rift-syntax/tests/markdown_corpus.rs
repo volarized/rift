@@ -81,6 +81,10 @@ fn gfm_examples(corpus: &str) -> Vec<(usize, String)> {
 }
 
 fn assert_ranges_within_source(source: &str, document: &rift_syntax::SyntaxDocument) -> usize {
+    assert_eq!(
+        document.source_digest(),
+        Some(&rift_core::FileDigest::of(source.as_bytes()))
+    );
     let facts = document.markdown_facts().expect("Markdown facts");
     let source_len = source.len() as u64;
     let ranges = facts
@@ -278,6 +282,25 @@ fn gfm_table_and_task_list_examples_keep_block_kinds() {
             .count(),
         1
     );
+}
+
+#[test]
+fn mdx_keeps_code_markers_and_omits_only_authored_prose_markers() {
+    let source = "# Guide\n\nUse `{Name}` and `<Thing>` safely.\n\n```rust\nfn item() {}\n```\n\nText {expression}\n\nimport Widget from 'widget'\n";
+    let document = analyze("docs/guide.mdx", source);
+    let facts = document.markdown_facts().expect("Markdown facts");
+    let filtered = facts.for_mdx(source);
+    assert_eq!(filtered.omitted_ranges().len(), 2);
+    assert_eq!(filtered.blocks().len(), 3);
+    assert!(
+        filtered
+            .blocks()
+            .iter()
+            .any(|block| block.kind == MarkdownBlockKind::Code)
+    );
+    assert_eq!(filtered.reference_candidates().len(), 2);
+    assert!(filtered.heading_path(Some(usize::MAX)).is_empty());
+    assert_eq!(filtered.heading_path(Some(0)).len(), 1);
 }
 
 #[test]
