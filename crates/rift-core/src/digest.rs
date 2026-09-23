@@ -38,3 +38,28 @@ impl FileDigest {
         &self.0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::FileDigest;
+
+    #[test]
+    fn content_and_file_state_keep_bytes_and_executable_state_distinct() {
+        for bytes in [b"".as_slice(), b"abc", "café\n".as_bytes()] {
+            let content = FileDigest::of(bytes);
+            let mut states = Vec::new();
+            for executable in [false, true] {
+                let (combined_content, combined_state) =
+                    FileDigest::of_content_and_file_state(bytes, executable);
+                assert_eq!(combined_content, content);
+                assert_eq!(combined_state, FileDigest::of_file_state(bytes, executable));
+                let mut state_bytes = bytes.to_vec();
+                state_bytes.push(u8::from(executable));
+                assert_eq!(combined_state, FileDigest::of(&state_bytes));
+                assert_ne!(combined_state.as_bytes(), content.as_bytes());
+                states.push(combined_state);
+            }
+            assert_ne!(states[0], states[1]);
+        }
+    }
+}

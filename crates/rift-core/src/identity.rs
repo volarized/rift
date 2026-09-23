@@ -644,6 +644,9 @@ mod tests {
         assert_eq!(parsed.path().as_str(), "src/café mod.rs");
         assert_eq!(parsed.qualified_name(), "Rift::separated name");
         assert_eq!(parsed.wire_identity(), identity);
+        let oversized = format!("rift://symbol/rust/src/lib.rs/{}", "x".repeat(8192));
+        let error = parse_symbol_identity(&oversized).expect_err("identity exceeds byte bound");
+        assert_eq!(error.to_string(), "symbol identity is not canonical");
 
         for invalid in [
             "invalid",

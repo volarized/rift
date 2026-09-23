@@ -1195,6 +1195,91 @@ fn sorted_unique_ranges(mut ranges: Vec<ByteRange>) -> Vec<ByteRange> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rift_core::{ErrorContext, Fault};
+
+    #[test]
+    fn inline_parser_handles_empty_invalid_and_exhausted_ranges() {
+        let text = "word ".repeat(20_000);
+        let path = ProjectPath::new("docs/facts.md").expect("valid path");
+        let source = SyntaxSource {
+            path: &path,
+            text: &text,
+        };
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_md::INLINE_LANGUAGE.into())
+            .expect("pinned grammar");
+        assert!(
+            parse_inline_tree(source, &mut parser, &[], &mut ProgressBudget::new(0))
+                .expect("empty ranges need no parse")
+                .is_none()
+        );
+        let range = Range {
+            start_byte: 0,
+            end_byte: text.len(),
+            start_point: Point::new(0, 0),
+            end_point: Point::new(0, text.len()),
+        };
+        let invalid = parse_inline_tree(
+            source,
+            &mut parser,
+            &[range, range],
+            &mut ProgressBudget::new(10),
+        )
+        .expect_err("overlapping ranges refused");
+        assert_eq!(
+            invalid.fault().violation(),
+            crate::SyntaxViolation::InvalidMarkdownRanges
+        );
+        assert_eq!(
+            invalid.context(),
+            vec![ErrorContext::new("path", "docs/facts.md")]
+        );
+        let exhausted =
+            parse_inline_tree(source, &mut parser, &[range], &mut ProgressBudget::new(0))
+                .expect_err("inline parse exceeds shared callback bound");
+        assert_eq!(
+            exhausted.fault().violation(),
+            crate::SyntaxViolation::MarkdownProgressExceeded
+        );
+        assert_eq!(
+            exhausted.context(),
+            vec![
+                ErrorContext::new("path", "docs/facts.md"),
+                ErrorContext::new("progress_callbacks_max", "0"),
+            ]
+        );
+        assert_eq!(
+            exhausted.fault().name(),
+            rift_core::ErrorName::Wire(rift_core::ErrorCode::LimitExceeded)
+        );
+    }
+
+    #[test]
+    fn empty_tree_still_counts_toward_node_bound() {
+        let path = ProjectPath::new("docs/facts.md").expect("valid path");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_md::LANGUAGE.into())
+            .expect("pinned grammar");
+        let tree = parser.parse("", None).expect("empty document parses");
+        let Err(error) = bounded_tree_nodes(tree.root_node(), 0, &path, 0, 16) else {
+            panic!("root exceeds zero node bound");
+        };
+        assert_eq!(
+            error.fault().violation(),
+            crate::SyntaxViolation::TooManyNodes
+        );
+    }
+
+    #[test]
+    fn parser_error_ranges_include_zero_width_missing_nodes() {
+        let containing = ByteRange { start: 1, end: 5 };
+        assert!(ranges_overlap(containing, ByteRange { start: 3, end: 3 }));
+        assert!(ranges_overlap(ByteRange { start: 1, end: 1 }, containing));
+        assert!(!ranges_overlap(containing, ByteRange { start: 6, end: 6 }));
+        assert!(!ranges_overlap(containing, ByteRange { start: 5, end: 8 }));
+    }
 
     #[test]
     fn inline_range_limit_is_checked_before_inline_parse() {
@@ -1210,6 +1295,18 @@ mod tests {
             },
         )
         .expect_err("inline ranges exceed zero limit");
+        assert_eq!(
+            error.fault().violation(),
+            crate::SyntaxViolation::TooManyMarkdownInlineRanges
+        );
+        assert_eq!(
+            error.context(),
+            vec![
+                ErrorContext::new("path", "docs/facts.md"),
+                ErrorContext::new("inline_ranges_max", "0"),
+                ErrorContext::new("observed", "1"),
+            ]
+        );
         assert!(matches!(
             error.fault(),
             SyntaxFault::TooManyMarkdownInlineRanges {

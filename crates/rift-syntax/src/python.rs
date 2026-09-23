@@ -551,8 +551,15 @@ mod tests {
 
     #[test]
     fn test_a_body_without_a_docstring_carries_no_documentation() {
-        let document = analyze("def serve():\n    return 1\n");
-        assert_eq!(symbol(&document, "serve").documentation, []);
+        for text in [
+            "def serve():\n    return 1\n",
+            "def serve():\n    ''\n",
+            "def serve():\n",
+        ] {
+            let document = analyze(text);
+            assert_eq!(symbol(&document, "serve").documentation, []);
+            assert_eq!(symbol(&document, "serve").documentation_ranges, []);
+        }
     }
 
     #[test]
