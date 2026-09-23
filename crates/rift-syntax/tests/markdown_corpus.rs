@@ -304,6 +304,16 @@ fn mdx_keeps_code_markers_and_omits_only_authored_prose_markers() {
 }
 
 #[test]
+fn mdx_filter_omits_facts_outside_supplied_source() {
+    let document = analyze("docs/guide.mdx", "# Guide\n\nBody text.\n");
+    let facts = document.markdown_facts().expect("Markdown facts");
+    let filtered = facts.for_mdx("");
+    assert!(filtered.blocks().is_empty());
+    assert!(filtered.headings().is_empty());
+    assert_eq!(filtered.omitted_ranges().len(), facts.blocks().len());
+}
+
+#[test]
 fn gfm_reference_link_example_keeps_authored_ranges() {
     let source = include_str!("fixtures/markdown/corpus/gfm_reference_link.md");
     let document = analyze("docs/references.md", source);
