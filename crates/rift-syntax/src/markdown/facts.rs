@@ -1185,6 +1185,7 @@ fn sorted_unique_ranges(mut ranges: Vec<ByteRange>) -> Vec<ByteRange> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::SyntaxProvider;
     use rift_core::{ErrorContext, Fault};
 
     #[test]
@@ -1242,6 +1243,26 @@ mod tests {
         assert_eq!(
             exhausted.fault().name(),
             rift_core::ErrorName::Wire(rift_core::ErrorCode::LimitExceeded)
+        );
+    }
+
+    #[test]
+    fn block_error_without_named_range_omits_the_full_source() {
+        let text = "# [";
+        let path = ProjectPath::new("docs/malformed.md").expect("valid fixture path");
+        let document = crate::markdown::MarkdownSyntaxProvider::default()
+            .analyze(SyntaxSource { path: &path, text })
+            .expect("malformed Markdown still yields facts");
+        let facts = document.markdown_facts().expect("Markdown facts");
+
+        assert!(document.has_errors());
+        assert!(facts.blocks().is_empty());
+        assert_eq!(
+            facts.error_ranges(),
+            &[ByteRange {
+                start: 0,
+                end: u64::try_from(text.len()).expect("fixture length fits u64"),
+            }]
         );
     }
 
