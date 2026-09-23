@@ -104,3 +104,34 @@ pub(super) fn refused(
 ) -> DocumentationError {
     DocumentationFault::new(violation, field).into()
 }
+
+#[cfg(test)]
+mod tests {
+    use rift_core::{ErrorCode, ErrorName, Fault};
+
+    use super::{DocumentationFault, DocumentationViolation};
+
+    #[test]
+    fn documentation_fault_maps_wire_codes_and_preserves_cause() {
+        for (violation, expected) in [
+            (
+                DocumentationViolation::LimitExceeded,
+                ErrorCode::LimitExceeded,
+            ),
+            (
+                DocumentationViolation::MissingTarget,
+                ErrorCode::ResourceNotFound,
+            ),
+            (DocumentationViolation::Digest, ErrorCode::InvalidRequest),
+        ] {
+            let fault = DocumentationFault::new(violation, "source")
+                .caused_by(std::io::Error::other("fixture cause"));
+            assert_eq!(fault.name(), ErrorName::Wire(expected));
+            assert_eq!(fault.context()[1].value(), "source");
+            assert_eq!(
+                Fault::source(&fault).expect("cause retained").to_string(),
+                "fixture cause"
+            );
+        }
+    }
+}

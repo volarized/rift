@@ -985,4 +985,31 @@ mod tests {
         );
         assert_eq!(error.fault().field(), "rst_progress");
     }
+
+    #[test]
+    fn node_and_depth_bounds_refuse_supported_source() {
+        let path = path();
+        let text = "Title\n=====\n\nParagraph.\n";
+        let node_error = extract_rst_facts_with_bounds(
+            text,
+            &path,
+            RstParseBounds {
+                node_count: 1,
+                ..RstParseBounds::default()
+            },
+        )
+        .expect_err("node bound");
+        assert_eq!(node_error.fault().field(), "rst_nodes");
+
+        let depth_error = extract_rst_facts_with_bounds(
+            text,
+            &path,
+            RstParseBounds {
+                depth: 0,
+                ..RstParseBounds::default()
+            },
+        )
+        .expect_err("depth bound");
+        assert_eq!(depth_error.fault().field(), "rst_depth");
+    }
 }

@@ -520,4 +520,37 @@ mod tests {
         let error = resolve_references(&[], &[candidate("", 0)]).expect_err("empty spelling");
         assert_eq!(error.fault().violation(), DocumentationViolation::Identity);
     }
+
+    #[test]
+    fn test_declaration_name_range_and_candidate_count_bounds() {
+        let source = source("src/lib.rs");
+        let language = language();
+        let identity = SymbolId(rift_core::symbol_identity("rust", "src/lib.rs", "open"));
+        let control_name = DocumentationDeclaration::new(
+            &identity,
+            &language,
+            "open\n",
+            "open",
+            &source,
+            TextRange { start: 0, end: 1 },
+        )
+        .expect_err("control character in declaration name");
+        assert_eq!(control_name.fault().field(), "declaration.name");
+
+        let reversed_range = DocumentationDeclaration::new(
+            &identity,
+            &language,
+            "open",
+            "open",
+            &source,
+            TextRange { start: 2, end: 1 },
+        )
+        .expect_err("reversed declaration range");
+        assert_eq!(reversed_range.fault().field(), "declaration.range");
+
+        let candidates =
+            vec![candidate("open", 0); super::DOCUMENTATION_REFERENCES_MAX as usize + 1];
+        let error = resolve_references(&[], &candidates).expect_err("candidate bound");
+        assert_eq!(error.fault().field(), "references");
+    }
 }

@@ -523,7 +523,8 @@ mod tests {
     };
     use rift_protocol::read::ProjectPath;
 
-    use super::{NotebookCellContent, decode_notebook};
+    use super::{NotebookCellContent, SOURCE_DEPTH_MAX, SOURCE_NODES_MAX, decode_notebook};
+    use rift_protocol::documentation::DOCUMENTATION_SOURCE_BYTES_MAX;
 
     fn notebook_identity() -> DocumentationContentIdentity {
         DocumentationContentIdentity {
@@ -609,5 +610,35 @@ mod tests {
 
         let invalid_source = r#"{"cells":[{"cell_type":"markdown","source":42}],"metadata":{}}"#;
         assert!(decode_notebook(invalid_source, &notebook_identity()).is_err());
+    }
+
+    #[test]
+    fn duplicate_top_level_field_and_excessive_depth_are_refused() {
+        let duplicate = r#"{"cells":[],"cells":[],"metadata":{}}"#;
+        let duplicate_error =
+            decode_notebook(duplicate, &notebook_identity()).expect_err("duplicate cells field");
+        assert_eq!(duplicate_error.fault().field(), "notebook.duplicate_field");
+
+        let nested = format!(
+            "{{\"cells\":[],\"metadata\":{{}},\"extra\":{}0{}}}",
+            "[".repeat(SOURCE_DEPTH_MAX + 1),
+            "]".repeat(SOURCE_DEPTH_MAX + 1),
+        );
+        let depth_error = decode_notebook(&nested, &notebook_identity()).expect_err("depth bound");
+        assert_eq!(depth_error.fault().field(), "notebook.depth");
+    }
+
+    #[test]
+    fn excessive_json_node_count_is_refused_before_cell_selection() {
+        let cell_count = SOURCE_NODES_MAX / 4 + 1;
+        let raw_cell = r#"{"cell_type":"raw"}"#;
+        let cells = std::iter::repeat_n(raw_cell, cell_count)
+            .collect::<Vec<_>>()
+            .join(",");
+        let source = format!("{{\"cells\":[{cells}],\"metadata\":{{}}}}");
+        assert!(source.len() < DOCUMENTATION_SOURCE_BYTES_MAX as usize);
+
+        let error = decode_notebook(&source, &notebook_identity()).expect_err("node bound");
+        assert_eq!(error.fault().field(), "notebook.nodes");
     }
 }

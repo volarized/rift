@@ -929,4 +929,59 @@ mod tests {
             .expect("all projection");
         assert_eq!(result[0].order()[0].identity(), &package_owner);
     }
+
+    #[test]
+    fn projection_refuses_unowned_blocks_and_candidate_overflow() {
+        let source = source(
+            "docs/guide.md",
+            "guide",
+            DocumentationSourceFormat::Markdown,
+        );
+        let block = block(
+            &source,
+            "guide",
+            TextRange { start: 0, end: 5 },
+            vec![("docs/guide#chunk/0", TextRange { start: 0, end: 5 })],
+            &[],
+            None,
+        );
+        let block_identity = block.identity.clone();
+        let collection = collection(vec![source], vec![block]);
+        let mut projection = DocumentationProjection::new(&collection).expect("projection");
+
+        let unknown = projection
+            .associate_document(
+                DocumentIdentity::new("package-owner").expect("identity"),
+                &content_digest(b"unknown"),
+            )
+            .expect_err("unknown block");
+        assert_eq!(unknown.fault().field(), "block.identity");
+
+        let owner = projection
+            .associate_document(
+                DocumentIdentity::new("package-owner").expect("identity"),
+                &block_identity,
+            )
+            .expect_err("block has no symbol owner");
+        assert_eq!(owner.fault().field(), "block.symbol");
+
+        let candidates = (0..=rift_protocol::documentation::DOCUMENTATION_BLOCKS_MAX)
+            .map(|index| {
+                RankedIdentity::new(
+                    DocumentIdentity::new(format!("candidate-{index}"))
+                        .expect("candidate identity"),
+                    FieldSet::EMPTY,
+                )
+            })
+            .collect();
+        let inputs = [RankingInput::new(RankingInputKind::Lexical, candidates)];
+        let overflow = projection
+            .project(
+                &inputs,
+                DocumentationProjectionTarget::Documentation,
+                |_, _| None,
+            )
+            .expect_err("candidate bound");
+        assert_eq!(overflow.fault().field(), "projection.candidates");
+    }
 }

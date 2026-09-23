@@ -810,9 +810,9 @@ mod tests {
     use rift_protocol::documentation::{
         DocumentationBlock, DocumentationBlockKind, DocumentationContentIdentity,
         DocumentationCoverage, DocumentationIndex, DocumentationLink, DocumentationLinkResolution,
-        DocumentationReference, DocumentationReferenceEvidence, DocumentationSelectionReason,
-        DocumentationSource, DocumentationSourceFormat, DocumentationSourceIdentity,
-        DocumentationTarget, DocumentationUnresolvedReason,
+        DocumentationReference, DocumentationReferenceCandidate, DocumentationReferenceEvidence,
+        DocumentationSelectionReason, DocumentationSource, DocumentationSourceFormat,
+        DocumentationSourceIdentity, DocumentationTarget, DocumentationUnresolvedReason,
     };
     use rift_protocol::read::{
         Digest, ProjectPath, SourceKind, SourceLocationKind, SymbolId, SymbolOrigin, TextRange,
@@ -893,6 +893,11 @@ mod tests {
                 reason: DocumentationUnresolvedReason::Missing,
             },
         }
+    }
+
+    fn refused_field(candidate: DocumentationIndex, expected: &str) {
+        let error = DocumentationCollection::new(candidate).expect_err("invalid candidate");
+        assert_eq!(error.fault().field(), expected);
     }
 
     #[test]
@@ -1097,5 +1102,85 @@ mod tests {
                 .violation(),
             DocumentationViolation::LimitExceeded
         );
+    }
+
+    #[test]
+    fn candidate_count_coverage_and_source_order_refusals_are_explicit() {
+        let source_record = source("README.md", "hello world");
+        let base = index(vec![source_record.clone()]);
+
+        let mut over_count = base.clone();
+        over_count.warnings = vec![
+            rift_protocol::documentation::DocumentationWarning {
+                source: source_record.identity.clone(),
+                stage: rift_protocol::documentation::DocumentationStage::Extract,
+                kind: rift_protocol::documentation::DocumentationWarningKind::OmittedRange,
+                count: 1,
+            };
+            rift_protocol::documentation::DOCUMENTATION_WARNINGS_MAX as usize
+                + 1
+        ];
+        refused_field(over_count, "warnings");
+
+        let mut bad_coverage = base;
+        bad_coverage.coverage.selected += 1;
+        refused_field(bad_coverage, "coverage");
+
+        let mut out_of_order = index(vec![
+            source("a.md", "hello world"),
+            source("b.md", "hello world"),
+        ]);
+        out_of_order.sources.reverse();
+        refused_field(out_of_order, "sources");
+    }
+
+    #[test]
+    fn block_link_and_reference_relationships_refuse_invalid_ranges() {
+        let source_record = source("README.md", "hello world");
+        let base = index(vec![source_record.clone()]);
+
+        let mut bad_block = base.clone();
+        bad_block.blocks[0].range.end = 0;
+        refused_field(bad_block, "block.range");
+
+        let mut bad_heading = base.clone();
+        bad_heading.blocks[0].heading_path.push(
+            rift_protocol::documentation::DocumentationHeading {
+                level: 0,
+                name: "Guide".to_owned(),
+            },
+        );
+        refused_field(bad_heading, "heading_path");
+
+        let mut bad_link = base.clone();
+        bad_link.links.push(link(&bad_link.blocks[0], "next.md"));
+        bad_link.links.push(bad_link.links[0].clone());
+        refused_field(bad_link, "link");
+
+        let mut bad_reference = base;
+        bad_reference.references.push(DocumentationReference {
+            identity: content_digest(b"reference"),
+            block: bad_reference.blocks[0].identity.clone(),
+            target: SymbolId(rift_core::symbol_identity("rust", "src/lib.rs", "Thing")),
+            range: TextRange { start: 0, end: 12 },
+            authored: "Thing".to_owned(),
+            evidence: DocumentationReferenceEvidence::UniqueName,
+        });
+        refused_field(bad_reference, "reference.range");
+
+        let mut bad_candidate = index(vec![source_record]);
+        bad_candidate
+            .unresolved_references
+            .push(DocumentationReferenceCandidate {
+                block: bad_candidate.blocks[0].identity.clone(),
+                range: TextRange { start: 0, end: 5 },
+                authored: "Thing".to_owned(),
+                language: Some(rift_protocol::read::Language {
+                    name: "invalid language".to_owned(),
+                    dialect: None,
+                }),
+                reason: rift_protocol::documentation::DocumentationUnresolvedReason::Missing,
+            });
+        refused_field(bad_candidate, "reference.range");
     }
 }

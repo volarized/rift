@@ -748,4 +748,106 @@ mod tests {
         record.license.as_mut().expect("license").files.push(file);
         assert_eq!(violation(record, "a"), DocumentationViolation::Identity);
     }
+
+    #[test]
+    fn test_source_metadata_bounds_and_selection_are_enforced() {
+        let mut record = source("README.md", "a");
+        record.language = Some(rift_protocol::read::Language {
+            name: "not a language".to_owned(),
+            dialect: None,
+        });
+        assert_eq!(violation(record, "a"), DocumentationViolation::Format);
+
+        let mut record = source("README.md", "a");
+        record.selection = DocumentationSelectionReason::PackageArchive;
+        assert_eq!(violation(record, "a"), DocumentationViolation::Origin);
+
+        let mut record = source("README.md", "a");
+        record.physical_ranges.push(TextRange { start: 1, end: 2 });
+        assert_eq!(violation(record, "a"), DocumentationViolation::Notebook);
+
+        let mut record = source("README.md", "a");
+        record.license = Some(DocumentationLicense {
+            expression: Some(
+                "x".repeat(rift_protocol::documentation::DOCUMENTATION_TEXT_BYTES_MAX as usize + 1),
+            ),
+            files: Vec::new(),
+        });
+        assert_eq!(
+            violation(record, "a"),
+            DocumentationViolation::LimitExceeded
+        );
+
+        let mut record = source("README.md", "a");
+        record.license = Some(DocumentationLicense {
+            expression: None,
+            files: vec![
+                DocumentationLicenseFile {
+                    path: ProjectPath("LICENSE".to_owned()),
+                    digest: content_digest(b"license"),
+                };
+                rift_protocol::documentation::DOCUMENTATION_LICENSE_FILES_MAX as usize + 1
+            ],
+        });
+        assert_eq!(
+            violation(record, "a"),
+            DocumentationViolation::LimitExceeded
+        );
+    }
+
+    #[test]
+    fn test_baseline_chunk_count_bound_is_enforced_before_partition_check() {
+        let text = "a";
+        let chunks = vec![
+            rift_protocol::documentation::DocumentationChunk {
+                identity: "README.md#0".to_owned(),
+                range: TextRange { start: 0, end: 1 },
+            };
+            rift_protocol::documentation::DOCUMENTATION_BLOCKS_MAX as usize + 1
+        ];
+        let error = DocumentationInput::new(source("README.md", text), text)
+            .expect("source")
+            .with_chunks(chunks)
+            .expect_err("chunk count bound");
+        assert_eq!(error.fault().field(), "chunks");
+    }
+
+    #[test]
+    fn test_source_set_total_bytes_and_notebook_range_bounds_are_enforced() {
+        let text =
+            "a".repeat(rift_protocol::documentation::DOCUMENTATION_SOURCE_BYTES_MAX as usize);
+        let source_count = usize::try_from(
+            rift_protocol::documentation::DOCUMENTATION_TOTAL_BYTES_MAX
+                / u64::from(rift_protocol::documentation::DOCUMENTATION_SOURCE_BYTES_MAX),
+        )
+        .expect("source count")
+            + 1;
+        let sources = (0..source_count)
+            .map(|index| {
+                let mut source = source(&format!("docs/{index:03}.md"), &text);
+                source.byte_length = text.len() as u64;
+                DocumentationInput::new(source, &text)
+                    .expect("source bytes within per-source bound")
+            })
+            .collect();
+        let error = DocumentationSourceSet::new(sources).expect_err("total byte bound");
+        assert_eq!(error.fault().field(), "source_bytes");
+
+        let mut notebook = source("guide.ipynb", "a");
+        notebook.format = DocumentationSourceFormat::Notebook;
+        notebook.media_type = "application/x-ipynb+json".to_owned();
+        notebook.identity.cell = Some(NotebookCell {
+            identity: NotebookCellIdentity::Indexed { index: 0 },
+            kind: NotebookCellKind::Markdown,
+        });
+        notebook.physical_ranges =
+            vec![
+                TextRange { start: 0, end: 1 };
+                rift_protocol::documentation::NOTEBOOK_SOURCE_RANGES_MAX as usize + 1
+            ];
+        assert_eq!(
+            violation(notebook, "a"),
+            DocumentationViolation::LimitExceeded
+        );
+    }
 }

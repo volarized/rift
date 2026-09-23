@@ -150,6 +150,36 @@ fn context_shares_excerpt_budget_and_reports_utf8_cut_and_missing_source() {
 }
 
 #[test]
+fn context_reports_captured_source_truncated_before_block_range() {
+    let text = "`Compass` is documented here.\n";
+    let (collection, symbol) = compass_collection(text);
+    let context = documentation_context(&collection, &symbol, |_| Some("short"));
+
+    assert_eq!(context.references.len(), 1);
+    assert!(context.references[0].excerpt.is_none());
+    assert_eq!(context.warnings.len(), 1);
+    assert_eq!(
+        context.warnings[0].kind,
+        DocumentationWarningKind::SourceTruncated
+    );
+}
+
+#[test]
+fn attached_comment_without_matching_syntax_is_omitted_with_warning() {
+    let text = "pub fn serve() {}\n";
+    let collection = collect("src/lib.rs", text);
+
+    assert_eq!(collection.index().coverage.selected, 1);
+    assert_eq!(collection.index().coverage.parsed, 0);
+    assert_eq!(collection.index().coverage.omitted, 1);
+    assert!(collection.index().blocks.is_empty());
+    assert!(collection.index().warnings.iter().any(|warning| {
+        warning.kind == DocumentationWarningKind::UnsupportedFormat
+            && warning.stage == DocumentationStage::Extract
+    }));
+}
+
+#[test]
 fn context_reference_bound_returns_deterministic_prefix_and_warning() {
     let text = "`Compass`\n\n".repeat(DOCUMENTATION_SYMBOL_REFERENCES_MAX as usize + 1);
     let (collection, symbol) = compass_collection(&text);
@@ -316,6 +346,33 @@ fn parser_bound_omits_one_source_and_collects_next_source() {
                 path: ProjectPath("guide.rst".to_owned()),
             }
             && warning.kind == DocumentationWarningKind::LimitExceeded
+            && warning.stage == DocumentationStage::Extract
+    }));
+}
+
+#[test]
+fn markdown_syntax_bound_omits_source_and_keeps_following_source() {
+    let mut nested = String::new();
+    for _ in 0..100_001 {
+        nested.push_str("item\n\n");
+    }
+    let markdown = DocumentationInput::new(source("guide.md", &nested), &nested)
+        .expect("bounded source bytes");
+    let next = input("z-guide.md", "# Guide\n\nKept.\n");
+    let sources = DocumentationSourceSet::new(vec![markdown, next]).expect("sources");
+
+    let collection = collect_documentation(&sources, &[]).expect("partial collection");
+
+    assert_eq!(collection.index().coverage.selected, 2);
+    assert_eq!(collection.index().coverage.parsed, 1);
+    assert_eq!(collection.index().coverage.omitted, 1);
+    assert_eq!(collection.index().blocks.len(), 2);
+    assert!(collection.index().warnings.iter().any(|warning| {
+        warning.source.source
+            == DocumentationSourceIdentity::Project {
+                path: ProjectPath("guide.md".to_owned()),
+            }
+            && warning.kind == DocumentationWarningKind::MalformedSource
             && warning.stage == DocumentationStage::Extract
     }));
 }
@@ -490,6 +547,44 @@ fn local_links_resolve_and_generated_fragments_remain_unresolved() {
             .count()
             >= 2
     );
+}
+
+#[test]
+fn authored_destinations_refuse_invalid_paths_and_never_fetch_external_urls() {
+    let text = concat!(
+        "[outside](../../outside.md) ",
+        "[query](next.md?view=full) ",
+        "[backslash](folder\\file.md) ",
+        "[control](bad%00path.md) ",
+        "[remote](//example.invalid/guide)\n",
+    );
+    let collection = collect("docs/README.md", text);
+    let links = &collection.index().links;
+
+    for authored in [
+        "../../outside.md",
+        "next.md?view=full",
+        "folder\\file.md",
+        "bad%00path.md",
+    ] {
+        assert!(
+            links.iter().any(|link| {
+                link.authored == authored
+                    && link.resolution
+                        == DocumentationLinkResolution::Unresolved {
+                            reason: DocumentationUnresolvedReason::Invalid,
+                        }
+            }),
+            "expected invalid destination: {authored}; links={links:#?}"
+        );
+    }
+    assert!(links.iter().any(|link| {
+        link.authored == "//example.invalid/guide"
+            && link.resolution
+                == DocumentationLinkResolution::Unresolved {
+                    reason: DocumentationUnresolvedReason::External,
+                }
+    }));
 }
 
 #[test]
