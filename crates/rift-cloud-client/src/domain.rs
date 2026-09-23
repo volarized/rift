@@ -966,6 +966,38 @@ mod tests {
         .expect("generated documentation fixture")
     }
 
+    fn documentation_context_and_target() -> (
+        rift_protocol::documentation::DocumentationContext,
+        rift_protocol::read::SymbolId,
+    ) {
+        use rift_protocol::documentation as docs;
+        use rift_protocol::read::{Digest, SymbolId, TextRange as Range};
+
+        let target = SymbolId(rift_core::symbol_identity(
+            "rust",
+            "cargo/helper@1.0.0/src/lib.rs",
+            "helper_beacon",
+        ));
+        let context = docs::DocumentationContext {
+            documentation_revision: Digest("0123abcd".to_owned()),
+            references: vec![docs::DocumentationReferenceHit {
+                reference: docs::DocumentationReference {
+                    identity: rift_protocol::documentation::DocumentationDigest("5".repeat(64)),
+                    block: rift_protocol::documentation::DocumentationDigest("1".repeat(64)),
+                    target: target.clone(),
+                    evidence: docs::DocumentationReferenceEvidence::UniqueName,
+                    authored: "helper_beacon".to_owned(),
+                    range: Range { start: 1, end: 14 },
+                },
+                documentation: documentation(),
+                excerpt: Some("guide".to_owned()),
+            }],
+            truncated: false,
+            warnings: Vec::new(),
+        };
+        (context, target)
+    }
+
     #[test]
     fn documentation_candidate_validates_package_ranges_and_excerpt() {
         use rift_protocol::documentation::DocumentationSourceIdentity;
@@ -1017,32 +1049,24 @@ mod tests {
     }
 
     #[test]
+    fn documentation_candidate_refuses_wrong_target() {
+        let mut item = documentation_item(&documentation());
+        let PackageSearchItem::Documentation(hit) = &mut item else {
+            panic!("documentation item")
+        };
+        hit.target = "symbol".to_owned();
+
+        assert!(matches!(
+            PackageSearchCandidate::try_from(item),
+            Err(ClientError::InvalidResponseField { field: "target" })
+        ));
+    }
+
+    #[test]
     fn documentation_context_refuses_forged_reference_and_other_package_warning() {
         use rift_protocol::documentation as docs;
-        use rift_protocol::read::{Digest, SymbolId, TextRange as Range};
-        let target = SymbolId(rift_core::symbol_identity(
-            "rust",
-            "cargo/helper@1.0.0/src/lib.rs",
-            "helper_beacon",
-        ));
+        let (mut context, target) = documentation_context_and_target();
         let package = package_identity(&package());
-        let mut context = docs::DocumentationContext {
-            documentation_revision: Digest("0123abcd".to_owned()),
-            references: vec![docs::DocumentationReferenceHit {
-                reference: docs::DocumentationReference {
-                    identity: rift_protocol::documentation::DocumentationDigest("5".repeat(64)),
-                    block: rift_protocol::documentation::DocumentationDigest("1".repeat(64)),
-                    target: target.clone(),
-                    evidence: docs::DocumentationReferenceEvidence::UniqueName,
-                    authored: "helper_beacon".to_owned(),
-                    range: Range { start: 1, end: 14 },
-                },
-                documentation: documentation(),
-                excerpt: Some("guide".to_owned()),
-            }],
-            truncated: false,
-            warnings: Vec::new(),
-        };
         validate_documentation_context(&context, &target, &package).expect("valid context");
         context.references[0].reference.range.end = 41;
         assert!(validate_documentation_context(&context, &target, &package).is_err());
@@ -1065,6 +1089,50 @@ mod tests {
             count: 1,
         });
         assert!(validate_documentation_context(&context, &target, &package).is_err());
+    }
+
+    #[test]
+    fn documentation_context_refuses_reference_from_another_hit_package() {
+        let (context, target) = documentation_context_and_target();
+        let other_package = rift_protocol::read::PackageIdentity {
+            manager: "cargo".to_owned(),
+            name: "other".to_owned(),
+            version: "1.0.0".to_owned(),
+        };
+
+        assert!(matches!(
+            validate_documentation_context(&context, &target, &other_package),
+            Err(ClientError::InvalidResponseField {
+                field: "documentation"
+            })
+        ));
+    }
+
+    #[test]
+    fn documentation_context_refuses_project_warning_source_for_package_hit() {
+        use rift_protocol::documentation as docs;
+        use rift_protocol::read::ProjectPath;
+
+        let (mut context, target) = documentation_context_and_target();
+        let package = package_identity(&package());
+        context.warnings.push(docs::DocumentationWarning {
+            source: docs::DocumentationContentIdentity {
+                source: docs::DocumentationSourceIdentity::Project {
+                    path: ProjectPath("docs/guide.md".to_owned()),
+                },
+                cell: None,
+            },
+            stage: docs::DocumentationStage::Index,
+            kind: docs::DocumentationWarningKind::SourceUnavailable,
+            count: 1,
+        });
+
+        assert!(matches!(
+            validate_documentation_context(&context, &target, &package),
+            Err(ClientError::InvalidResponseField {
+                field: "source_identity"
+            })
+        ));
     }
 
     #[test]

@@ -6221,8 +6221,9 @@ mod tests {
     #[test]
     fn test_documentation_selection_rebuild_resolves_new_plain_text_target() {
         use rift_protocol::documentation::{
-            DocumentationLinkResolution, DocumentationSourceIdentity,
+            DocumentationContentIdentity, DocumentationLinkResolution, DocumentationSourceIdentity,
         };
+        use rift_protocol::read::SourceUnitId;
 
         let directory = tempfile::tempdir().expect("temporary workspace");
         let root = directory.path();
@@ -6263,6 +6264,13 @@ mod tests {
                     DocumentationLinkResolution::Resolved { .. }
                 )
         }));
+        let package_owner = DocumentationContentIdentity {
+            source: DocumentationSourceIdentity::Package {
+                unit: SourceUnitId("rift://source/cargo/example@1.0.0/src/lib.rs".into()),
+            },
+            cell: None,
+        };
+        assert_eq!(after.documentation_content(&package_owner), None);
     }
 
     #[test]

@@ -1248,6 +1248,105 @@ mod tests {
     }
 
     #[test]
+    fn documentation_requests_preserve_targets_and_symbol_includes() {
+        use rift_cloud_client::{PackageSearchRequestTarget, PackageSymbolRequestInclude};
+
+        let query = ParsedQuery::parse("compass").expect("query");
+        for (target, expected) in [
+            ("symbol", None),
+            ("file", None),
+            (
+                "documentation",
+                Some(PackageSearchRequestTarget::Documentation),
+            ),
+            ("all", Some(PackageSearchRequestTarget::All)),
+        ] {
+            let params = serde_json::from_value(serde_json::json!({
+                "query": "compass", "target": target
+            }))
+            .expect("search request");
+            assert_eq!(
+                search_request(&params, &query, &[], QueryPhase::Precise).target,
+                expected
+            );
+        }
+        let params = serde_json::from_value(serde_json::json!({
+            "name": "Compass", "include": ["documentation", "source"]
+        }))
+        .expect("symbol request");
+        assert_eq!(
+            super::symbol_include(&params),
+            Some(vec![
+                PackageSymbolRequestInclude::Source,
+                PackageSymbolRequestInclude::Documentation
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn file_search_returns_no_remote_candidates_with_a_disabled_client() {
+        let client = rift_cloud_client::GlobalClient::new(rift_cloud_client::Config {
+            enabled: false,
+            token_env: String::new(),
+            ..rift_cloud_client::Config::default()
+        })
+        .expect("disabled client");
+        let params = serde_json::from_value(serde_json::json!({
+            "query": "compass", "target": "file"
+        }))
+        .expect("file search request");
+        let query = ParsedQuery::parse("compass").expect("query");
+        let candidates = super::package_search(&client, &params, &query, &[])
+            .await
+            .expect("file search does not call remote client");
+        assert_eq!(candidates, super::GlobalSearchCandidates::default());
+    }
+
+    #[test]
+    fn documentation_order_uses_block_identity() {
+        let directory = tempfile::tempdir().expect("workspace");
+        std::fs::write(directory.path().join("guide.txt"), "First.\n\nSecond.\n")
+            .expect("documentation source");
+        let index = rift_index::WorkspaceIndex::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::new(vec!["guide.txt".to_owned()], 1024),
+        )
+        .expect("workspace index");
+        let metadata = index.documentation().index();
+        let mut hits = metadata
+            .blocks
+            .iter()
+            .map(|block| {
+                serde_json::from_value(serde_json::json!({
+                    "hit": {"target": "documentation", "documentation": {
+                        "documentation_revision": metadata.documentation_revision,
+                        "block": block, "source": metadata.sources[0]
+                    }},
+                    "path": "guide.txt", "range": block.range, "line": block.line
+                }))
+                .expect("documentation hit")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(hits.len(), 2);
+        let mut expected = metadata
+            .blocks
+            .iter()
+            .map(|block| block.identity.0.as_str())
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        for order in [super::ResultOrder::Identity, super::ResultOrder::Path] {
+            hits.reverse();
+            super::order_search_hits(&mut hits, order);
+            assert_eq!(
+                hits.iter().map(super::search_hit_key).collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn page_window_reports_empty_page_after_last_page() {
         let (page, pagination) = page_window(vec![1, 2, 3], 4, 2);
         assert!(page.is_empty());

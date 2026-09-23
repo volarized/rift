@@ -251,7 +251,8 @@ fn invalid_metadata(error: impl std::error::Error + Send + Sync + 'static) -> Le
 #[cfg(test)]
 mod tests {
     use super::{
-        DocumentationCollection, DocumentationReferenceRecord, EncodedDocumentation, MetadataWriter,
+        DocumentationCollection, DocumentationReferenceRecord, EncodedDocumentation,
+        METADATA_BYTES_MAX, MetadataWriter, replace,
     };
     use std::io::Write;
 
@@ -267,6 +268,96 @@ mod tests {
         assert!(writer.write_all(b"!").is_err());
         assert!(writer.exceeded);
         assert_eq!(writer.bytes, b"text");
+    }
+
+    #[test]
+    fn metadata_encoding_refuses_collection_over_serialized_bound() {
+        let collection = large_metadata_collection();
+        let Err(error) = EncodedDocumentation::new(&collection) else {
+            panic!("serialized metadata over bound must be refused");
+        };
+        assert_eq!(
+            error.fault().violation(),
+            crate::LexicalIndexViolation::RecordLimit
+        );
+    }
+
+    fn large_metadata_collection() -> rift_analysis::documentation::DocumentationCollection {
+        use rift_protocol::documentation::{
+            DocumentationContentIdentity, DocumentationSelectionReason, DocumentationSource,
+            DocumentationSourceFormat, DocumentationSourceIdentity,
+        };
+        use rift_protocol::read::{ProjectPath, SourceKind, SourceLocationKind, SymbolOrigin};
+
+        let digest = rift_analysis::documentation::content_digest(b"");
+        let origin = SymbolOrigin {
+            location: Some(SourceLocationKind::Project),
+            package: None,
+            source_kind: SourceKind::Authored,
+        };
+        let mut sources = Vec::with_capacity(70_000);
+        for index in 0..70_000 {
+            let prefix = format!("source-{index:05}/");
+            let path = format!("{prefix}{}.txt", "x".repeat(996 - prefix.len()));
+            sources.push(DocumentationSource {
+                identity: DocumentationContentIdentity {
+                    source: DocumentationSourceIdentity::Project {
+                        path: ProjectPath(path),
+                    },
+                    cell: None,
+                },
+                revision: digest.clone(),
+                content_digest: digest.clone(),
+                origin: origin.clone(),
+                format: DocumentationSourceFormat::Text,
+                media_type: "text/plain".into(),
+                selection: DocumentationSelectionReason::Workspace,
+                byte_length: 0,
+                language: None,
+                physical_ranges: Vec::new(),
+                license: None,
+            });
+        }
+        rift_analysis::documentation::DocumentationCollection::from_candidate_blocks(
+            rift_analysis::documentation::documentation_revision(),
+            sources,
+            Vec::new(),
+        )
+        .expect("bounded empty source records form valid metadata")
+    }
+
+    #[tokio::test]
+    async fn metadata_replace_refuses_excess_stored_reference_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = crate::WorkspaceDatabase::open(
+            &directory.path().join("index.db"),
+            crate::DatabasePool::new(2, 1000),
+        )
+        .await?;
+        let encoded = EncodedDocumentation::new(&collection("Guide.\n"))?;
+        let mut access = database.writing().await?;
+        let mut transaction = access.transaction().await?;
+        let row_limit = i64::from(rift_protocol::documentation::DOCUMENTATION_REFERENCES_MAX);
+        toasty::sql::statement(
+            "WITH RECURSIVE rows(number) AS (\
+               SELECT 1 UNION ALL SELECT number + 1 FROM rows WHERE number < ?1\
+             ) \
+             INSERT INTO documentation_references(identity, target, block, position) \
+             SELECT 'reference-' || number, 'target', 'block', number FROM rows",
+        )
+        .bind(row_limit + 1)
+        .exec(&mut transaction)
+        .await?;
+
+        let error = replace(&mut transaction, Some(&encoded))
+            .await
+            .expect_err("replacement must refuse excess prior rows");
+        assert_eq!(
+            error.fault().violation(),
+            crate::LexicalIndexViolation::RecordLimit
+        );
+        Ok(())
     }
 
     fn collection(text: &str) -> rift_analysis::documentation::DocumentationCollection {
@@ -318,6 +409,69 @@ mod tests {
             &[],
         )
         .expect("metadata")
+    }
+
+    #[tokio::test]
+    async fn metadata_read_requires_a_current_corpus_revision()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            LexicalIndexLimits, LexicalIndexViolation, LexicalSearchIndex, RevisionScoped,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let database = crate::WorkspaceDatabase::open(
+            &directory.path().join("index.db"),
+            crate::DatabasePool::new(2, 1000),
+        )
+        .await?;
+        let store = LexicalSearchIndex::attached(
+            std::sync::Arc::clone(&database),
+            LexicalIndexLimits::default(),
+        );
+        assert!(matches!(
+            store.documentation("tree").await?,
+            RevisionScoped::NoRevision
+        ));
+        let metadata = collection("Guide.\n");
+        store
+            .replace_all_with_documentation(&[], "tree", &metadata)
+            .await?;
+        assert!(matches!(
+            store.documentation("tree").await?,
+            RevisionScoped::Matched(Some(_))
+        ));
+        let oversized_payload = "x".repeat(METADATA_BYTES_MAX + 1);
+        let mut access = database.writing().await?;
+        let mut transaction = access.transaction().await?;
+        toasty::sql::statement("UPDATE documentation_manifest SET payload = ?1 WHERE id = 1")
+            .bind(oversized_payload)
+            .exec(&mut transaction)
+            .await?;
+        transaction.commit().await?;
+        drop(access);
+        let error = store
+            .documentation("tree")
+            .await
+            .expect_err("oversized stored metadata must be refused");
+        assert_eq!(
+            error.fault().violation(),
+            LexicalIndexViolation::RecordLimit
+        );
+        store
+            .replace_all_with_documentation(&[], "tree", &metadata)
+            .await?;
+        let mut access = database.writing().await?;
+        let mut transaction = access.transaction().await?;
+        toasty::sql::statement("UPDATE lexical_index_state SET corpus_revision = 'older-corpus'")
+            .exec(&mut transaction)
+            .await?;
+        transaction.commit().await?;
+        drop(access);
+        assert!(matches!(
+            store.documentation("tree").await?,
+            RevisionScoped::NoRevision
+        ));
+        Ok(())
     }
 
     #[tokio::test]

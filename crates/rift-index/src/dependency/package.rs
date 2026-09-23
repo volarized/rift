@@ -448,7 +448,11 @@ mod tests {
 
     #[test]
     fn test_cached_package_indexes_file_content_and_attached_comment_metadata() {
-        use rift_protocol::documentation::{DocumentationBlockKind, DocumentationSourceFormat};
+        use rift_protocol::documentation::{
+            DocumentationBlockKind, DocumentationContentIdentity, DocumentationSourceFormat,
+            DocumentationSourceIdentity,
+        };
+        use rift_protocol::read::ProjectPath;
 
         let source = "/// Runs one task.\npub fn spawn() {}\n";
         let entry = CatalogEntry::dependency(
@@ -482,6 +486,13 @@ mod tests {
                 && record.format == DocumentationSourceFormat::AttachedComment
         }));
         assert_eq!(package.documentation_content(&block.source), Some(source));
+        let project_owner = DocumentationContentIdentity {
+            source: DocumentationSourceIdentity::Project {
+                path: ProjectPath("src/lib.rs".into()),
+            },
+            cell: None,
+        };
+        assert_eq!(package.documentation_content(&project_owner), None);
         assert_eq!(
             &source[usize::try_from(block.range.start).expect("range start")
                 ..usize::try_from(block.range.end).expect("range end")],
