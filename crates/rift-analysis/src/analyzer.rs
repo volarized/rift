@@ -522,8 +522,15 @@ fn append_notebook_cell<'source>(
             return Ok(());
         }
     };
-    let document_id = content_chunk_identity(&identity, 0)
-        .map_err(|error| documentation_error(error, package))?;
+    let document_id = match content_chunk_identity(&identity, 0) {
+        Ok(document_id) => document_id,
+        Err(error) => {
+            inputs
+                .omit(identity, documentation_warning_kind(&error))
+                .map_err(|error| documentation_error(error, package))?;
+            return Ok(());
+        }
+    };
     if cell.text().len() <= bound(PACKAGE_SOURCE_BYTES_MAX) && !cell.text().is_empty() {
         input = match input.with_chunks(vec![DocumentationChunk {
             identity: document_id.clone(),
@@ -1517,7 +1524,8 @@ mod tests {
     use rift_core::{ContributionOrigin, ProjectPath, SourceKind, SourceLocation};
     use rift_protocol::canonical::canonical_json;
     use rift_protocol::documentation::{
-        DocumentationSourceIdentity, DocumentationStage, DocumentationWarningKind,
+        DocumentationContentIdentity, DocumentationSourceIdentity, DocumentationStage,
+        DocumentationWarningKind,
     };
     use rift_protocol::index::{
         PACKAGE_IDENTIFIER_TERMS_MAX, PACKAGE_PUBLICATION_FORMAT_REVISION,
@@ -2068,6 +2076,89 @@ mod tests {
     }
 
     #[test]
+    fn long_package_identity_omits_notebook_cell_and_keeps_readme() {
+        let mut package = identity();
+        package.name = "~".repeat(3_000);
+        let language = language(ShippedLanguage::Rust);
+        let origin = ContributionOrigin::new(
+            Some(SourceLocation::Dependency {
+                package: package.clone(),
+            }),
+            SourceKind::Authored,
+        )
+        .expect("package origin");
+        let readme_path = ProjectPath::new("README.md").expect("README path");
+        let notebook_path = ProjectPath::new("notebooks/guide.ipynb").expect("notebook path");
+        let readme = "# Package guide\n\nValid package documentation.\n";
+        let notebook = r#"{"cells":[{"cell_type":"markdown","id":"guide","source":"Notebook text."}],"metadata":{}}"#;
+        let files = [
+            PackageSource::new(&readme_path, readme),
+            PackageSource::new(&notebook_path, notebook),
+        ];
+        let unit = rift_core::SourceUnitId::for_package(&package, &notebook_path)
+            .expect("package source unit accepts exact package name and path");
+        assert_eq!(
+            unit.to_string(),
+            format!(
+                "rift://source/cargo/{}@1.0.0/notebooks/guide.ipynb",
+                package.name
+            )
+        );
+        let byte_limit = u64::try_from(readme.len() + notebook.len()).expect("byte count");
+        let input = ExactPackageInput::new(
+            &package,
+            &language,
+            &origin,
+            &files,
+            ExactPackageLimits::new(2, byte_limit),
+        )
+        .expect("exact package input accepts bounded package identity");
+        let analysis = PackageAnalyzer::analyze(input, 1).expect("package analysis");
+        let publication = analysis.publication();
+        let notebook_source = DocumentationContentIdentity {
+            source: DocumentationSourceIdentity::Package {
+                unit: rift_protocol::read::SourceUnitId(unit.to_string()),
+            },
+            cell: Some(rift_protocol::documentation::NotebookCell {
+                identity: rift_protocol::documentation::NotebookCellIdentity::Authored {
+                    id: "guide".to_owned(),
+                },
+                kind: rift_protocol::documentation::NotebookCellKind::Markdown,
+            }),
+        };
+
+        assert_eq!(publication.documentation.coverage.selected, 2);
+        assert_eq!(publication.documentation.coverage.parsed, 1);
+        assert_eq!(publication.documentation.coverage.omitted, 1);
+        assert!(publication.documentation.blocks.iter().any(|block| {
+            matches!(
+                &block.source.source,
+                DocumentationSourceIdentity::Package { unit }
+                    if unit.0.ends_with("/README.md")
+            )
+        }));
+        assert!(
+            !publication
+                .documentation
+                .sources
+                .iter()
+                .any(|source| source.identity == notebook_source)
+        );
+        assert!(
+            publication
+                .documents
+                .iter()
+                .all(|document| document.unit.0 != unit.to_string())
+        );
+        assert!(publication.documentation.warnings.iter().any(|warning| {
+            warning.source == notebook_source
+                && warning.stage == DocumentationStage::Source
+                && warning.kind == DocumentationWarningKind::SourceUnavailable
+                && warning.count == 1
+        }));
+    }
+
+    #[test]
     fn oversized_selected_text_source_is_omitted_with_other_docs_retained() {
         let oversized =
             "x".repeat(rift_protocol::documentation::DOCUMENTATION_SOURCE_BYTES_MAX as usize + 1);
@@ -2098,6 +2189,78 @@ mod tests {
                     &warning.source.source,
                     DocumentationSourceIdentity::Package { unit }
                         if unit.0.ends_with("/docs/large.txt")
+                )
+        }));
+    }
+
+    #[test]
+    fn package_markdown_and_rst_near_path_bound_keep_documentation() {
+        let markdown_path = format!("{}README.md", "a".repeat(982));
+        let rst_path = format!("{}guide.rst", "b".repeat(982));
+        let attached_path = format!("{}lib.rs", "c".repeat(982));
+        ProjectPath::new(&markdown_path).expect("bounded Markdown path");
+        ProjectPath::new(&rst_path).expect("bounded RST path");
+        ProjectPath::new(&attached_path).expect("bounded Rust path");
+        let publication = analyzed(
+            ShippedLanguage::Rust,
+            vec![
+                (&markdown_path, "# Package guide\n\nMarkdown retained.\n"),
+                (&rst_path, "Package guide\n=============\n\nRST retained.\n"),
+                (
+                    &attached_path,
+                    "/// Attached retained.\npub fn serve() {}\n",
+                ),
+            ],
+        );
+        let documentation = &publication.documentation;
+        let markdown_unit = format!("rift://source/cargo/beacon@1.0.0/{markdown_path}");
+        let rst_unit = format!("rift://source/cargo/beacon@1.0.0/{rst_path}");
+        let attached_unit = format!("rift://source/cargo/beacon@1.0.0/{attached_path}");
+
+        assert_eq!(documentation.coverage.selected, 3);
+        assert_eq!(documentation.coverage.parsed, 3);
+        assert_eq!(documentation.coverage.omitted, 0);
+        assert!(documentation.sources.iter().any(|source| {
+            matches!(
+                &source.identity.source,
+                DocumentationSourceIdentity::Package { unit }
+                    if unit.0 == markdown_unit
+            )
+        }));
+        assert!(documentation.sources.iter().any(|source| {
+            matches!(
+                &source.identity.source,
+                DocumentationSourceIdentity::Package { unit }
+                    if unit.0 == rst_unit
+            )
+        }));
+        assert!(documentation.sources.iter().any(|source| {
+            matches!(
+                &source.identity.source,
+                DocumentationSourceIdentity::Package { unit }
+                    if unit.0 == attached_unit
+            )
+        }));
+        assert!(documentation.blocks.iter().any(|block| {
+            matches!(
+                &block.source.source,
+                DocumentationSourceIdentity::Package { unit }
+                    if unit.0.ends_with("README.md")
+            )
+        }));
+        assert!(documentation.blocks.iter().any(|block| {
+            matches!(
+                &block.source.source,
+                DocumentationSourceIdentity::Package { unit }
+                    if unit.0.ends_with("guide.rst")
+            )
+        }));
+        assert!(documentation.blocks.iter().any(|block| {
+            block.symbol.is_some()
+                && matches!(
+                    &block.source.source,
+                    DocumentationSourceIdentity::Package { unit }
+                        if unit.0 == attached_unit
                 )
         }));
     }

@@ -79,6 +79,11 @@ impl<'declaration> DocumentationDeclaration<'declaration> {
         self.symbol
     }
 
+    #[cfg(feature = "collector")]
+    pub(super) const fn qualified_name(&self) -> &str {
+        self.qualified_name
+    }
+
     /// Returns the source containing the declaration.
     #[must_use]
     pub const fn source(&self) -> &DocumentationContentIdentity {

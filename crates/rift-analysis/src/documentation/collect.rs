@@ -22,7 +22,7 @@ use rift_syntax::{
 
 use super::failure::{DocumentationError, DocumentationViolation, refused};
 use super::identity::{canonical_digest, content_digest};
-use super::input::{slice, source_path};
+use super::input::{slice, source_file_path};
 use super::{
     DocumentationCollection, DocumentationDeclaration, DocumentationInput, DocumentationSourceSet,
 };
@@ -252,10 +252,7 @@ fn attached_syntax_facts(
     };
     let accepted: std::collections::BTreeSet<_> =
         attached.iter().map(|(symbol, _)| symbol.clone()).collect();
-    let path = rift_core::ProjectPath::new(super::references::declaration_path(
-        &input.source().identity,
-    )?)
-    .map_err(|_| refused(DocumentationViolation::Identity, "source"))?;
+    let path = super::references::declaration_path(&input.source().identity)?;
     let facts = syntax
         .symbols()
         .iter()
@@ -413,10 +410,7 @@ fn extract_attached_comments(
         .filter(|declaration| declaration.source() == &input.source().identity)
         .map(|declaration| declaration.symbol().clone())
         .collect::<std::collections::BTreeSet<_>>();
-    let path = rift_core::ProjectPath::new(super::references::declaration_path(
-        &input.source().identity,
-    )?)
-    .map_err(|_| refused(DocumentationViolation::Identity, "source"))?;
+    let path = super::references::declaration_path(&input.source().identity)?;
     let starts = line_starts(input.text());
     let mut ordinals = BTreeMap::new();
     for symbol in syntax.symbols() {
@@ -452,8 +446,7 @@ fn extract_rst(
     input: &DocumentationInput<'_>,
     output: &mut Collected,
 ) -> Result<(), DocumentationError> {
-    let path = rift_core::ProjectPath::new(source_path(&input.source().identity)?)
-        .map_err(|_| refused(DocumentationViolation::Identity, "source"))?;
+    let path = source_file_path(input.source())?;
     let facts = super::rst::extract_rst_facts(input.text(), &path)?;
     let mut ordinals = BTreeMap::new();
     let mut blocks = BTreeMap::new();
@@ -633,8 +626,7 @@ fn markdown_document<'a>(
         }
         return Ok(Cow::Borrowed(document));
     }
-    let path = rift_core::ProjectPath::new(source_path(&input.source().identity)?)
-        .map_err(|_| refused(DocumentationViolation::Identity, "source"))?;
+    let path = source_file_path(input.source())?;
     MarkdownSyntaxProvider::default()
         .analyze(SyntaxSource {
             path: &path,

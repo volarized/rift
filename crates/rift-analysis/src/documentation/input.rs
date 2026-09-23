@@ -144,26 +144,13 @@ fn syntax_matches_source(
     text: &str,
     syntax: &rift_syntax::SyntaxDocument,
 ) -> bool {
-    let source_path = match &source.identity.source {
-        DocumentationSourceIdentity::Project { path } => path.0.clone(),
-        DocumentationSourceIdentity::Package { unit } => {
-            let Ok(parsed) = SourceUnitId::parse(&unit.0) else {
-                return false;
-            };
-            let Some(package) = &source.origin.package else {
-                return false;
-            };
-            let prefix = format!("{}@{}/", package.name, package.version);
-            let Some(path) = parsed.key().as_str().strip_prefix(&prefix) else {
-                return false;
-            };
-            path.to_owned()
-        }
+    let Ok(path) = source_file_path(source) else {
+        return false;
     };
     let source_digest_matches = syntax
         .source_digest()
         .is_some_and(|digest| *digest == rift_core::FileDigest::of(text.as_bytes()));
-    source_path == syntax.path().as_str()
+    path.as_str() == syntax.path().as_str()
         && source
             .language
             .as_ref()
@@ -444,6 +431,26 @@ pub(super) fn source_path(
             .map(|unit| unit.key().as_str().to_owned())
             .map_err(|_| refused(DocumentationViolation::Identity, "source.unit")),
     }
+}
+
+pub(super) fn source_file_path(
+    source: &DocumentationSource,
+) -> Result<ProjectPath, DocumentationError> {
+    let full_path = source_path(&source.identity)?;
+    let path = match &source.identity.source {
+        DocumentationSourceIdentity::Project { .. } => full_path.as_str(),
+        DocumentationSourceIdentity::Package { .. } => {
+            let package = source
+                .origin
+                .package
+                .as_ref()
+                .ok_or_else(|| refused(DocumentationViolation::Origin, "origin.package"))?;
+            full_path
+                .strip_prefix(&format!("{}@{}/", package.name, package.version))
+                .ok_or_else(|| refused(DocumentationViolation::Origin, "origin.package"))?
+        }
+    };
+    ProjectPath::new(path).map_err(|_| refused(DocumentationViolation::Identity, "source"))
 }
 
 fn validate_physical_ranges(source: &DocumentationSource) -> Result<(), DocumentationError> {

@@ -12,7 +12,7 @@ use rift_protocol::read::{ProjectPath, SourceUnitId, TextRange};
 use url::Url;
 
 use super::failure::{DocumentationError, DocumentationViolation, refused};
-use super::input::source_path;
+use super::input::source_file_path;
 
 /// One explicit fragment supplied by a format parser, never a generated heading slug.
 #[derive(Clone, Debug)]
@@ -93,23 +93,22 @@ pub(super) struct DeclarationLinkNames<'declaration> {
 
 #[cfg(feature = "collector")]
 impl<'declaration> DeclarationLinkNames<'declaration> {
-    pub(super) fn new(
-        declarations: &'declaration [super::DocumentationDeclaration<'_>],
-    ) -> Result<Self, DocumentationError> {
+    pub(super) fn new(declarations: &'declaration [super::DocumentationDeclaration<'_>]) -> Self {
         let symbols = declarations
             .iter()
             .map(|declaration| (declaration.symbol().0.as_str(), declaration.symbol()))
             .collect();
         let mut qualified = BTreeMap::new();
         for declaration in declarations {
-            let parsed = rift_core::parse_symbol_identity(&declaration.symbol().0)
-                .map_err(|_| refused(DocumentationViolation::Identity, "declaration.symbol"))?;
             qualified
-                .entry((declaration.source(), parsed.qualified_name().to_owned()))
+                .entry((
+                    declaration.source(),
+                    declaration.qualified_name().to_owned(),
+                ))
                 .and_modify(|entry| *entry = None)
                 .or_insert(Some(declaration.symbol()));
         }
-        Ok(Self { symbols, qualified })
+        Self { symbols, qualified }
     }
 
     pub(super) fn direct(
@@ -177,7 +176,7 @@ pub(super) fn resolve_declaration_links(
         .iter()
         .map(|block| (&block.identity, block))
         .collect();
-    let names = DeclarationLinkNames::new(declarations)?;
+    let names = DeclarationLinkNames::new(declarations);
     let mut references = Vec::new();
     let mut occurrences = BTreeMap::new();
     for link in links {
@@ -358,24 +357,11 @@ fn resolve_fragment(
 fn source_base(source: &DocumentationSource) -> Result<Url, DocumentationError> {
     let mut base = Url::parse("https://rift.invalid/root/")
         .map_err(|_| refused(DocumentationViolation::Identity, "source.base"))?;
-    let full_path = source_path(&source.identity)?;
-    let path = match &source.identity.source {
-        DocumentationSourceIdentity::Project { .. } => full_path.as_str(),
-        DocumentationSourceIdentity::Package { .. } => {
-            let package = source
-                .origin
-                .package
-                .as_ref()
-                .ok_or_else(|| refused(DocumentationViolation::Origin, "origin.package"))?;
-            full_path
-                .strip_prefix(&format!("{}@{}/", package.name, package.version))
-                .ok_or_else(|| refused(DocumentationViolation::Origin, "origin.package"))?
-        }
-    };
+    let path = source_file_path(source)?;
     base.path_segments_mut()
         .map_err(|()| refused(DocumentationViolation::Identity, "source.base"))?
         .pop_if_empty()
-        .extend(path.split('/'));
+        .extend(path.as_str().split('/'));
     Ok(base)
 }
 

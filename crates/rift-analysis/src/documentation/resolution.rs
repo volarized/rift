@@ -197,7 +197,7 @@ impl<'a> ResolverIndexes<'a> {
                 .collect(),
             fragments: super::links::fragment_index(input.fragments)?,
             reference_names: DeclarationNames::new(input.declarations),
-            declaration_names: DeclarationLinkNames::new(input.declarations)?,
+            declaration_names: DeclarationLinkNames::new(input.declarations),
         })
     }
 }
