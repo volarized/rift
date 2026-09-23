@@ -1,4 +1,4 @@
-//! Checked CommonMark and GFM examples against Markdown documentation facts.
+//! Checked `CommonMark` and GFM examples against Markdown documentation facts.
 
 use rift_core::ProjectPath;
 use rift_syntax::{
@@ -108,9 +108,10 @@ fn assert_ranges_within_source(source: &str, document: &rift_syntax::SyntaxDocum
             "range start exceeds end: {range:?}"
         );
         assert!(range.end <= source_len, "range exceeds source: {range:?}");
+        let start = usize::try_from(range.start).expect("range starts within source bound");
+        let end = usize::try_from(range.end).expect("range ends within source bound");
         assert!(
-            source.is_char_boundary(range.start as usize)
-                && source.is_char_boundary(range.end as usize),
+            source.is_char_boundary(start) && source.is_char_boundary(end),
             "range splits UTF-8 source: {range:?}"
         );
         checked += 1;
@@ -299,8 +300,10 @@ fn gfm_reference_link_example_keeps_authored_ranges() {
     let range = definition
         .destination_range
         .expect("authored destination range");
+    let start = usize::try_from(range.start).expect("destination range starts within fixture");
+    let end = usize::try_from(range.end).expect("destination range ends within fixture");
     assert_eq!(
-        &source[range.start as usize..range.end as usize],
+        source.get(start..end).expect("destination range is valid"),
         "/f&ouml;&ouml;"
     );
 }
