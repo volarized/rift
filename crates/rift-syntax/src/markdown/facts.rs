@@ -528,19 +528,9 @@ fn extract_block_facts(
     let mut heading_for_node = HashMap::new();
     let mut blocks = Vec::new();
     let mut node_blocks = HashMap::with_capacity(block_nodes.len());
-    let mut stack = vec![(
-        trees.block.root_node(),
-        0_usize,
-        None::<usize>,
-        None::<ByteRange>,
-    )];
-    while let Some((node, depth, inherited_heading, inherited_block)) = stack.pop() {
-        if depth > limits.syntax_depth_max() {
-            return Err(Error::new(SyntaxFault::TooDeep {
-                path: source.path.clone(),
-                syntax_depth_max: limits.syntax_depth_max(),
-            }));
-        }
+    // `bounded_tree_nodes` already checked this tree's node and depth limits.
+    let mut stack = vec![(trees.block.root_node(), None::<usize>, None::<ByteRange>)];
+    while let Some((node, inherited_heading, inherited_block)) = stack.pop() {
         let mut child_heading = inherited_heading;
         if node.kind_id() == kinds.section {
             if let Some(declared) = declaring_heading(node, kinds.atx_heading, kinds.setext_heading)
@@ -602,7 +592,7 @@ fn extract_block_facts(
             if !child.is_named() {
                 continue;
             }
-            stack.push((child, depth + 1, child_heading, current_block));
+            stack.push((child, child_heading, current_block));
         }
     }
 
