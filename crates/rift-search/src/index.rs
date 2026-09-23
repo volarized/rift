@@ -651,6 +651,23 @@ impl SearchIndex {
             .map_err(store_failed)
     }
 
+    /// Replaces lexical documents and their documentation metadata atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns `store_failed` when the lexical store refuses either collection.
+    pub async fn replace_lexical_with_documentation(
+        &self,
+        documents: &[IndexDocument],
+        tree_revision: &str,
+        documentation: &rift_index::DocumentationCollection,
+    ) -> Result<(), SearchError> {
+        self.lexical
+            .replace_all_with_documentation(documents, tree_revision, documentation)
+            .await
+            .map_err(store_failed)
+    }
+
     /// Applies one change set's lexical units and stamps `tree_revision`, in one
     /// transaction.
     ///
@@ -671,6 +688,23 @@ impl SearchIndex {
     ) -> Result<(), SearchError> {
         self.lexical
             .apply(change, tree_revision)
+            .await
+            .map_err(store_failed)
+    }
+
+    /// Applies lexical changes and documentation metadata in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns `store_failed` when the lexical store refuses either collection.
+    pub async fn apply_lexical_with_documentation(
+        &self,
+        change: &LexicalChange,
+        tree_revision: &str,
+        documentation: &rift_index::DocumentationCollection,
+    ) -> Result<(), SearchError> {
+        self.lexical
+            .apply_with_documentation(change, tree_revision, documentation)
             .await
             .map_err(store_failed)
     }

@@ -3,6 +3,11 @@
 //! from `read` so that module stays below its size bound. The bounded relationship `traversal`
 //! lane lives in the sibling `traversal` module.
 
+mod documentation;
+#[cfg(test)]
+mod documentation_tests;
+use documentation::SearchDocumentation;
+
 use std::cmp::Ordering;
 use std::path::Path;
 
@@ -249,6 +254,7 @@ impl ReadService {
         let mut results = Vec::new();
         let mut warnings = self.warnings();
         warnings.extend(selected.warnings());
+        warnings.extend(self.documentation_warnings(params.target));
         warnings.extend(references.analysis_unavailable().cloned());
         let mut ranked_truncated_at = None;
         if let Some(query) = query {
@@ -297,6 +303,16 @@ impl ReadService {
             order_and_bound_hits(&mut results, params.order, fetch_limit).or(ranked_truncated_at);
         let (mut results, pagination) = page(results, params.page_index, limit);
         populate_symbol_lines(&mut results, self.index(), selected.force_include.as_ref())?;
+        if payloads.source {
+            warnings.extend(documentation::populate_sources(
+                &mut results,
+                self.index(),
+                Resolution {
+                    force_include: selected.force_include.as_ref(),
+                    packages: dependencies.as_deref(),
+                },
+            ));
+        }
         if !payloads.score {
             for hit in &mut results {
                 hit.score = None;
@@ -313,6 +329,24 @@ impl ReadService {
                 results_max_reached,
             ),
         })
+    }
+
+    fn documentation_warnings(&self, target: SearchParamsTarget) -> Vec<ReadWarning> {
+        if matches!(
+            target,
+            SearchParamsTarget::Documentation | SearchParamsTarget::All
+        ) {
+            self.index()
+                .documentation()
+                .index()
+                .warnings
+                .iter()
+                .cloned()
+                .map(|warning| ReadWarning::Documentation { warning })
+                .collect()
+        } else {
+            Vec::new()
+        }
     }
 
     pub(crate) fn validate_engine_search(&self, params: &SearchParams) -> Result<(), ReadError> {
@@ -423,12 +457,19 @@ impl ReadService {
             force_include: sources.force_include,
             packages: dependencies,
         };
+        let documentation = matches!(
+            criteria.target,
+            SearchParamsTarget::Documentation | SearchParamsTarget::All
+        )
+        .then(|| SearchDocumentation::new(index, scope, resolution))
+        .transpose()?;
         let screen = CandidateScreen {
             index,
             matcher,
             root,
             target: criteria.target,
             resolution,
+            documentation: documentation.as_ref(),
         };
         let mut inputs = vec![identifier_input(
             index,
@@ -444,13 +485,10 @@ impl ReadService {
             query,
             QueryPhase::Precise,
             fetch_limit,
+            criteria.target,
         ));
-        let mut ranked = fuse(
-            &screen.screened(&inputs),
-            store.weights(),
-            QueryPhase::Precise,
-            fetch_limit,
-        );
+        let screened = screen.projected(&inputs, query)?;
+        let mut ranked = fuse(&screened, store.weights(), QueryPhase::Precise, fetch_limit);
         // The widened inputs are built only when the precise phase came up short,
         // because ranking every package's documents again is work the full pool
         // would throw away.
@@ -461,16 +499,20 @@ impl ReadService {
                 query,
                 QueryPhase::Broad,
                 fetch_limit,
+                criteria.target,
             ));
-            let broad = fuse(
-                &screen.screened(&widened),
-                store.weights(),
-                QueryPhase::Broad,
-                fetch_limit,
-            );
+            let screened = screen.projected(&widened, query)?;
+            let broad = fuse(&screened, store.weights(), QueryPhase::Broad, fetch_limit);
             ranked.append_phase(broad, fetch_limit);
         }
-        resolve_ranked_hits(index, criteria, resolution, &ranked, results)?;
+        resolve_ranked_hits(
+            index,
+            criteria,
+            resolution,
+            documentation.as_ref(),
+            &ranked,
+            results,
+        )?;
         Ok(ranked.truncated_at())
     }
 
@@ -836,6 +878,7 @@ fn package_inputs(
     query: &ParsedQuery,
     phase: QueryPhase,
     bound: usize,
+    target: SearchParamsTarget,
 ) -> Vec<RankingInput> {
     let Some(dependencies) = dependencies else {
         return Vec::new();
@@ -846,12 +889,14 @@ fn package_inputs(
     dependencies
         .packages()
         .map(|package| {
-            package.reader().ranked(RankRequest::new(
-                query,
-                RankingInputKind::Lexical,
-                phase,
-                bound,
-            ))
+            package.reader().ranked_where(
+                RankRequest::new(query, RankingInputKind::Lexical, phase, bound),
+                |document| match target {
+                    SearchParamsTarget::Symbol => document.kind() == DocumentKind::Symbol,
+                    SearchParamsTarget::File => false,
+                    SearchParamsTarget::Documentation | SearchParamsTarget::All => true,
+                },
+            )
         })
         .collect()
 }
@@ -890,9 +935,21 @@ struct CandidateScreen<'a> {
     root: &'a Path,
     target: SearchParamsTarget,
     resolution: Resolution<'a>,
+    documentation: Option<&'a SearchDocumentation<'a>>,
 }
 
 impl CandidateScreen<'_> {
+    fn projected(
+        &self,
+        inputs: &[RankingInput],
+        query: &ParsedQuery,
+    ) -> Result<Vec<RankingInput>, ReadError> {
+        let screened = self.screened(inputs);
+        match self.documentation {
+            Some(documentation) => documentation.project(&screened, self.target, query),
+            None => Ok(screened),
+        }
+    }
     /// `inputs` with every identity this request's filters exclude removed, each input
     /// keeping the order it answered in. An input screened down to nothing no longer
     /// answers, so fusion redistributes its share across the inputs that did.
@@ -915,6 +972,12 @@ impl CandidateScreen<'_> {
     /// it, when the `paths` selector excludes the path it names, or when `target`
     /// excludes the kind it names.
     fn admits(&self, identity: &DocumentIdentity) -> bool {
+        if let Some(admitted) = self
+            .documentation
+            .and_then(|documentation| documentation.admits(identity, self.matcher, self.root))
+        {
+            return admitted;
+        }
         resolve_candidate(self.index, self.resolution, identity).is_some_and(|resolved| {
             resolved.reaches(self.index, self.matcher, self.root) && resolved.answers(self.target)
         })
@@ -932,11 +995,16 @@ fn resolve_ranked_hits(
     index: &WorkspaceIndex,
     criteria: SearchCriteria<'_>,
     resolution: Resolution<'_>,
+    documentation: Option<&SearchDocumentation<'_>>,
     ranked: &RankedCandidates,
     results: &mut Vec<SearchHit>,
 ) -> Result<(), ReadError> {
     let mut answered: Vec<ProjectPath> = Vec::new();
     for candidate in ranked.candidates() {
+        if let Some(hit) = documentation.and_then(|documentation| documentation.hit(candidate)) {
+            results.push(hit);
+            continue;
+        }
         let Some(resolved) = resolve_candidate(index, resolution, candidate.identity()) else {
             continue;
         };
@@ -1381,6 +1449,17 @@ pub(crate) fn resolve_symbol<'a>(
 /// Splitting the caller's raw text here instead would leave `"impact` and `radius"` with
 /// their quotes attached, match nothing, and hand back the whole file as the excerpt.
 fn locate_query_line(content: &str, query: &ParsedQuery) -> (u64, ByteRange, String) {
+    if let Some((line, range, text)) = query_line(content, query) {
+        return (line, range, text.to_owned());
+    }
+    let end = u64::try_from(content.len()).unwrap_or(u64::MAX);
+    (1, ByteRange { start: 0, end }, content.to_owned())
+}
+
+fn query_line<'source>(
+    content: &'source str,
+    query: &ParsedQuery,
+) -> Option<(u64, ByteRange, &'source str)> {
     let terms: Vec<String> = query
         .members()
         .iter()
@@ -1396,12 +1475,11 @@ fn locate_query_line(content: &str, query: &ParsedQuery) -> (u64, ByteRange, Str
             let start = offset;
             let end = start.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
             let line_number = u64::try_from(index + 1).unwrap_or(u64::MAX);
-            return (line_number, ByteRange { start, end }, text.to_owned());
+            return Some((line_number, ByteRange { start, end }, text));
         }
         offset = offset.saturating_add(u64::try_from(raw_line.len()).unwrap_or(u64::MAX));
     }
-    let end = u64::try_from(content.len()).unwrap_or(u64::MAX);
-    (1, ByteRange { start: 0, end }, content.to_owned())
+    None
 }
 
 /// Finds `results`' existing hit for `file`/`symbol`'s wire identity, if a lexical or
@@ -1428,7 +1506,9 @@ pub(crate) fn find_symbol_hit_mut<'a>(
 pub(crate) fn hit_symbol_id(hit: &SearchHit) -> Option<&SymbolId> {
     match &hit.hit {
         SearchHitTarget::Symbol { symbol } => symbol.id.as_ref(),
-        SearchHitTarget::Node { .. } | SearchHitTarget::File { .. } => None,
+        SearchHitTarget::Node { .. }
+        | SearchHitTarget::File { .. }
+        | SearchHitTarget::Documentation { .. } => None,
     }
 }
 
@@ -1493,6 +1573,7 @@ fn hit_identity(hit: &SearchHit) -> &str {
         // only orders a hit no constructor in this crate produces.
         SearchHitTarget::File { .. } => hit.path.as_ref().map_or("", |path| path.0.as_str()),
         SearchHitTarget::Node { node } => node.0.as_str(),
+        SearchHitTarget::Documentation { documentation } => &documentation.block.identity.0,
     }
 }
 
@@ -1611,6 +1692,7 @@ mod tests {
             root: index.root(),
             target: criteria.target,
             resolution,
+            documentation: None,
         };
         let ranked = fuse(
             &screen.screened(inputs),
@@ -1619,7 +1701,7 @@ mod tests {
             32,
         );
         let mut results = Vec::new();
-        super::resolve_ranked_hits(index, criteria, resolution, &ranked, &mut results)?;
+        super::resolve_ranked_hits(index, criteria, resolution, None, &ranked, &mut results)?;
         Ok(results)
     }
 
@@ -2055,12 +2137,10 @@ impl Tower {
         Ok(())
     }
 
-    /// One answer carries the declarations and the whole files one query reached: the
-    /// two declarations of `src/lib.rs`, that file itself, and the `README.txt` the
-    /// store's full-text input placed. Scores fall strictly with position, so the answer
-    /// states its own order.
+    /// One answer carries declarations, source files, and projected documentation blocks.
+    /// The README block retains its baseline document mapping and the fused score.
     #[tokio::test]
-    async fn search_combines_symbol_and_file_hits_on_one_page() -> TestResult {
+    async fn search_combines_symbol_file_and_documentation_hits_on_one_page() -> TestResult {
         let (directory, service) = fixture()?;
         let store = answered(&directory.path().join("search.db"), &service, "Beacon").await?;
         let params: SearchParams = serde_json::from_value(json!({
@@ -2069,12 +2149,39 @@ impl Tower {
             "include": ["score"]
         }))?;
         let result = service.search(&params, &store)?;
-        let mut identities = hit_identities(&result);
-        identities.sort();
+        let documentation: Vec<_> = result
+            .results
+            .iter()
+            .filter_map(|hit| {
+                if let SearchHitTarget::Documentation { documentation } = &hit.hit {
+                    Some((hit, documentation))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(documentation.len(), 1);
+        let (hit, documentation) = documentation[0];
+        assert_eq!(
+            hit.path.as_ref().map(|path| path.0.as_str()),
+            Some("README.txt")
+        );
+        assert_eq!(
+            documentation.block.range,
+            rift_protocol::read::TextRange { start: 0, end: 11 }
+        );
+        assert_eq!(documentation.block.chunks.len(), 1);
+        assert_eq!(documentation.block.chunks[0].identity, "README.txt");
+        let mut identities: Vec<_> = result
+            .results
+            .iter()
+            .filter(|hit| !matches!(hit.hit, SearchHitTarget::Documentation { .. }))
+            .map(super::hit_identity)
+            .collect();
+        identities.sort_unstable();
         assert_eq!(
             identities,
             [
-                "README.txt",
                 "rift://symbol/rust/src/lib.rs/Beacon",
                 "rift://symbol/rust/src/lib.rs/Beacon::signal",
                 "src/lib.rs",
@@ -4085,8 +4192,8 @@ impl Tower {
         Ok(())
     }
 
-    /// Every identity the store ranked reaches the answer, each carrying the score its
-    /// place in the fused order derived.
+    /// Every ranked identity reaches the answer directly or through its documentation block,
+    /// carrying the score derived from its place in the fused order.
     #[tokio::test]
     async fn search_answers_every_identity_the_store_ranked() -> TestResult {
         let (directory, service) = fixture()?;
@@ -4100,7 +4207,15 @@ impl Tower {
                 assert!(
                     identities
                         .iter()
-                        .any(|held| held == entry.identity().as_str()),
+                        .any(|held| held == entry.identity().as_str())
+                        || answer.results.iter().any(|hit| match &hit.hit {
+                            SearchHitTarget::Documentation { documentation } => documentation
+                                .block
+                                .chunks
+                                .iter()
+                                .any(|chunk| chunk.identity == entry.identity().as_str()),
+                            _ => false,
+                        }),
                     "every ranked identity must reach the answer: identity={}, answer={answer:#?}",
                     entry.identity()
                 );

@@ -14,17 +14,14 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
-use rift_core::constants::DIGEST_WIRE_CHARS;
+pub use rift_analysis::analyzer_revision;
 use rift_protocol::canonical::canonical_json;
-use rift_protocol::read::Digest;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
-/// The committed manifest, read at compile time so a publication's revision needs no file
-/// at run time.
-const ANALYZER_MANIFEST: &str = include_str!("analyzer-manifest.json");
+#[cfg(test)]
+const ANALYZER_MANIFEST: &str = include_str!("../../../rift-analysis/src/analyzer-manifest.json");
 
 /// The lockfile the grammar versions and checksums are read from, relative to the
 /// repository root.
@@ -41,13 +38,15 @@ const GRAMMAR_PREFIX: &str = "tree-sitter";
 /// Naming single files here was not enough. A grammar rule set in `rift-syntax` and the
 /// export rule in `walk.rs` each change what a publication holds while `extract.rs` and
 /// `analyzer.rs` stay byte-identical.
-const ANALYZED_SOURCES: [&str; 7] = [
-    "crates/rift-core/src/identity.rs",
+const ANALYZED_SOURCES: [&str; 9] = [
+    "crates/rift-core/src",
+    "crates/rift-analysis/src",
     "crates/rift-index/src/dependency/analyzer.rs",
     "crates/rift-index/src/dependency/walk.rs",
     "crates/rift-index/src/lexical.rs",
-    "crates/rift-index/src/semantic.rs",
     "crates/rift-provider/src",
+    "crates/rift-protocol/src",
+    "crates/rift-ranking/src",
     "crates/rift-syntax/src",
 ];
 
@@ -59,21 +58,6 @@ const SOURCE_DEPTH_MAX: usize = 8;
 
 /// Most entries the source walk examines below all named roots together.
 const SOURCE_ENTRIES_MAX: usize = 4_096;
-
-/// The analyzer this build publishes under.
-///
-/// Computed once per process from the committed manifest, since the manifest is fixed at
-/// compile time.
-#[must_use]
-pub fn analyzer_revision() -> Digest {
-    static REVISION: OnceLock<Digest> = OnceLock::new();
-    REVISION
-        .get_or_init(|| {
-            let rendered = format!("{:x}", Sha256::digest(ANALYZER_MANIFEST.as_bytes()));
-            Digest(rendered[..DIGEST_WIRE_CHARS].to_owned())
-        })
-        .clone()
-}
 
 /// One shipped grammar, as the workspace lockfile pins it.
 #[derive(Debug, Serialize)]
@@ -205,7 +189,7 @@ fn analyzed_files(
 /// The path the generated manifest is committed at, relative to the repository root.
 #[must_use]
 pub fn analyzer_manifest_path() -> PathBuf {
-    PathBuf::from("crates/rift-index/src/dependency/analyzer-manifest.json")
+    PathBuf::from("crates/rift-analysis/src/analyzer-manifest.json")
 }
 
 /// Every shipped grammar the lockfile pins, in name order.
@@ -468,8 +452,14 @@ checksum = \"def\"\n";
         let root = manifest_root("0.25.10");
         let rendered = super::render_analyzer_manifest(root.path()).expect("the manifest renders");
 
-        let source = root.path().join(super::ANALYZED_SOURCES[0]);
-        assert!(source.is_file(), "the first named root is one file");
+        let source = root
+            .path()
+            .join(super::ANALYZED_SOURCES[0])
+            .join("probe.rs");
+        assert!(
+            source.is_file(),
+            "the first named root contains source files"
+        );
         std::fs::write(&source, "// another analysis\n").expect("the source is rewritten");
         let after_source =
             super::render_analyzer_manifest(root.path()).expect("the manifest renders");
@@ -521,7 +511,7 @@ checksum = \"def\"\n";
 
         assert_eq!(
             path,
-            std::path::PathBuf::from("crates/rift-index/src/dependency/analyzer-manifest.json")
+            std::path::PathBuf::from("crates/rift-analysis/src/analyzer-manifest.json")
         );
     }
 

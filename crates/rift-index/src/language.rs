@@ -232,6 +232,9 @@ impl WorkspaceLanguagePolicy {
         {
             return Ok(Some(ClassifiedPath::Source(provider)));
         }
+        if is_workspace_document(path.extension().and_then(|extension| extension.to_str())) {
+            return Ok(Some(ClassifiedPath::Text));
+        }
         Ok(self
             .text
             .as_ref()
@@ -246,6 +249,11 @@ impl WorkspaceLanguagePolicy {
             self.root.join(path)
         }
     }
+}
+
+/// Whether the extension selects workspace documentation independently of `[search.text]`.
+fn is_workspace_document(extension: Option<&str>) -> bool {
+    matches!(extension, Some("md" | "markdown" | "mdx" | "rst" | "ipynb"))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -559,6 +567,39 @@ mod tests {
                 Ok(Some(ClassifiedPath::Text))
             ),
             "a disabled entry drops syntax facts, not the file"
+        );
+    }
+
+    #[test]
+    fn test_documentation_extensions_enter_text_lane_without_text_selection() {
+        let policy = WorkspaceLanguagePolicy::build(
+            Path::new("/workspace"),
+            &LanguageFileSelections::default(),
+            &TextFileInclusion::new(Vec::new(), TextFileInclusion::default().chunk_bytes_max()),
+        )
+        .expect("language policy");
+        for path in [
+            "docs/guide.md",
+            "docs/guide.markdown",
+            "docs/guide.mdx",
+            "docs/guide.rst",
+            "notebooks/guide.ipynb",
+        ] {
+            assert!(
+                policy
+                    .classifies(Path::new(path))
+                    .is_ok_and(|class| matches!(
+                        class,
+                        Some(ClassifiedPath::Source(_) | ClassifiedPath::Text)
+                    )),
+                "documentation path must be selected: {path}"
+            );
+        }
+        assert!(
+            policy
+                .classifies(Path::new("docs/notes.txt"))
+                .is_ok_and(|class| class.is_none()),
+            "plain text remains controlled by text.include"
         );
     }
 

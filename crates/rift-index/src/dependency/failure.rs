@@ -169,9 +169,14 @@ impl Fault for PackageIndexFault {
     }
 
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source
-            .as_deref()
-            .map(|source| source as &(dyn std::error::Error + 'static))
+        let source = self.source.as_deref()?;
+        if self.violation == PackageIndexViolation::Identity
+            && let Some(input) = source.downcast_ref::<rift_analysis::PackageInputError>()
+            && let Some(cause) = std::error::Error::source(input)
+        {
+            return Some(cause);
+        }
+        Some(source as &(dyn std::error::Error + 'static))
     }
 
     fn limit_evidence(&self) -> Option<LimitEvidence> {

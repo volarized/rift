@@ -30,7 +30,7 @@ pub struct PublicationFormat(u32);
 
 impl PublicationFormat {
     /// The format this build publishes and reads.
-    pub const CURRENT: Self = Self(1);
+    pub const CURRENT: Self = Self(2);
 
     /// Reads a format a store already holds.
     #[must_use]

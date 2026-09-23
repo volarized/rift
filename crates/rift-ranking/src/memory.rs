@@ -201,10 +201,18 @@ impl MemoryIndex {
     }
 
     /// Ranks the caller's identifiers against the held declarations.
-    fn rank_identifiers(&self, query: &ParsedQuery, bound: usize) -> Vec<RankedIdentity> {
+    fn rank_identifiers(
+        &self,
+        query: &ParsedQuery,
+        bound: usize,
+        accepts: impl Fn(&IndexDocument) -> bool,
+    ) -> Vec<RankedIdentity> {
         let candidates = query.candidates();
         let mut ranking = IdentifierRanking::new();
         for entry in &self.held {
+            if !accepts(&entry.document) {
+                continue;
+            }
             let fields = entry.document.fields();
             let name = fields
                 .get(SearchableField::Name)
@@ -236,12 +244,14 @@ impl MemoryIndex {
         if members.is_empty() || self.held.is_empty() {
             return Vec::new();
         }
-        let inverse = self.inverse_frequencies(&members);
+        let selected: Vec<_> = self.held.iter().collect();
+        let inverse = Self::inverse_frequencies(&selected, &members);
         let mut scored: Vec<(DocumentIdentity, f64)> = self
             .held
             .iter()
             .filter_map(|entry| {
-                let (score, _) = self.score(entry, &members, &inverse, phase)?;
+                let (score, _) =
+                    Self::score(entry, &members, &inverse, phase, self.average_length)?;
                 Some((entry.document.identity().clone(), score))
             })
             .collect();
@@ -255,15 +265,25 @@ impl MemoryIndex {
         query: &ParsedQuery,
         phase: QueryPhase,
         bound: usize,
+        accepts: impl Fn(&IndexDocument) -> bool,
     ) -> Vec<RankedIdentity> {
         let members: Vec<Member> = query.members().iter().filter_map(Member::of).collect();
-        if members.is_empty() || self.held.is_empty() {
+        let selected: Vec<_> = self
+            .held
+            .iter()
+            .filter(|entry| accepts(&entry.document))
+            .collect();
+        if members.is_empty() || selected.is_empty() {
             return Vec::new();
         }
-        let inverse = self.inverse_frequencies(&members);
+        let average_length = as_float(selected.iter().map(|entry| entry.tokens.length).sum())
+            / as_float(selected.len());
+        let inverse = Self::inverse_frequencies(&selected, &members);
         let mut scored: Vec<(f64, &DocumentIdentity, FieldSet)> = Vec::new();
-        for entry in &self.held {
-            let Some((score, fields)) = self.score(entry, &members, &inverse, phase) else {
+        for entry in selected {
+            let Some((score, fields)) =
+                Self::score(entry, &members, &inverse, phase, average_length)
+            else {
                 continue;
             };
             scored.push((score, entry.document.identity(), fields));
@@ -278,13 +298,13 @@ impl MemoryIndex {
 
     /// The inverse document frequency of every member, floored the way FTS5
     /// floors it.
-    fn inverse_frequencies(&self, members: &[Member]) -> Vec<f64> {
-        let total = as_float(self.held.len());
+    fn inverse_frequencies(selected: &[&HeldDocument], members: &[Member]) -> Vec<f64> {
+        let total = as_float(selected.len());
         members
             .iter()
             .map(|member| {
                 let holding = as_float(
-                    self.held
+                    selected
                         .iter()
                         .filter(|entry| Self::holds(entry, member))
                         .count(),
@@ -311,11 +331,11 @@ impl MemoryIndex {
     /// every column weight is one, so a corpus that exercises a single
     /// weight cannot tell them apart.
     fn score(
-        &self,
         entry: &HeldDocument,
         members: &[Member],
         inverse: &[f64],
         phase: QueryPhase,
+        average_length: f64,
     ) -> Option<(f64, FieldSet)> {
         let mut matched = FieldSet::EMPTY;
         let mut score = 0.0;
@@ -337,7 +357,7 @@ impl MemoryIndex {
             }
             let member_matched = weighted > 0.0;
             if member_matched {
-                score += idf * saturation(weighted, entry, self.average_length);
+                score += idf * saturation(weighted, entry, average_length);
             }
             if member.is_phrase() {
                 if !member_matched {
@@ -479,10 +499,26 @@ impl MemoryIndex {
     /// that is not calls this and gets the same value.
     #[must_use]
     pub fn ranked(&self, request: RankRequest<'_>) -> RankingInput {
+        self.ranked_where(request, |_| true)
+    }
+
+    /// Ranks only accepted documents, applying selection before corpus statistics and bounds.
+    ///
+    /// The predicate reads held metadata. Selected documents borrow their existing tokens;
+    /// neither source text nor token fields are copied. Work is bounded by this index's
+    /// published document count and the shared query member bound.
+    #[must_use]
+    pub fn ranked_where(
+        &self,
+        request: RankRequest<'_>,
+        accepts: impl Fn(&IndexDocument) -> bool,
+    ) -> RankingInput {
         let order = match request.input() {
-            RankingInputKind::Identifier => self.rank_identifiers(request.query(), request.bound()),
+            RankingInputKind::Identifier => {
+                self.rank_identifiers(request.query(), request.bound(), &accepts)
+            }
             RankingInputKind::Lexical => {
-                self.rank_lexical(request.query(), request.phase(), request.bound())
+                self.rank_lexical(request.query(), request.phase(), request.bound(), &accepts)
             }
             RankingInputKind::Vector => Vec::new(),
         };
@@ -520,6 +556,43 @@ mod tests {
 
     fn identity(value: &str) -> DocumentIdentity {
         DocumentIdentity::new(value).expect("identity must be accepted")
+    }
+
+    #[test]
+    fn selected_symbols_keep_their_corpus_and_candidate_bound() {
+        let documents = vec![
+            symbol("Compass", "Compass", "navigation"),
+            symbol("CompassGuide", "CompassGuide", "navigation navigation"),
+        ];
+        let baseline = MemoryIndex::new(documents.clone(), "revision");
+        let mut mixed = documents;
+        mixed.extend((0..8).map(|index| {
+            text_file(
+                &format!("Compass{index}.txt"),
+                "Compass navigation navigation navigation",
+            )
+        }));
+        let mixed = MemoryIndex::new(mixed, "revision");
+        let query = ParsedQuery::parse("Compass").expect("query");
+        for input in [RankingInputKind::Identifier, RankingInputKind::Lexical] {
+            for phase in [QueryPhase::Precise, QueryPhase::Broad] {
+                let request = RankRequest::new(&query, input, phase, 1);
+                let expected = baseline.ranked(request);
+                let observed =
+                    mixed.ranked_where(request, |document| document.kind() == DocumentKind::Symbol);
+                assert_eq!(observed.order(), expected.order());
+                assert_eq!(observed.order().len(), 1);
+            }
+        }
+        assert!(
+            mixed
+                .ranked_where(
+                    RankRequest::new(&query, RankingInputKind::Lexical, QueryPhase::Precise, 1),
+                    |_| false
+                )
+                .order()
+                .is_empty()
+        );
     }
 
     #[test]

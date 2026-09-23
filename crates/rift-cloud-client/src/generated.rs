@@ -783,13 +783,13 @@ impl<'de> serde::Deserialize<'de> for PackageAvailability {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
 pub enum PublicationFormat {
     #[default]
-    RiftPackageIndexV1,
+    RiftPackageIndexV2,
     Unknown,
 }
 impl core::fmt::Display for PublicationFormat {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::RiftPackageIndexV1 => write!(f, "rift-package-index-v1"),
+            Self::RiftPackageIndexV2 => write!(f, "rift-package-index-v2"),
             Self::Unknown => write!(f, "unknown"),
         }
     }
@@ -801,7 +801,7 @@ impl<'de> serde::Deserialize<'de> for PublicationFormat {
     {
         let s = String::deserialize(deserializer)?;
         match s.to_ascii_lowercase().as_str() {
-            "rift-package-index-v1" => Ok(PublicationFormat::RiftPackageIndexV1),
+            "rift-package-index-v2" => Ok(PublicationFormat::RiftPackageIndexV2),
             "unknown" => Ok(PublicationFormat::Unknown),
             _ => Ok(PublicationFormat::Unknown),
         }
@@ -877,6 +877,8 @@ pub struct Capabilities {
     pub required_search_fields: Vec<String>,
     /// Active server ceilings for requests and responses.
     pub bounds: CapabilityBounds,
+    /// Documentation revision used for documentation reads.
+    pub documentation_revision: Option<String>,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
@@ -954,6 +956,8 @@ pub struct PackageSearchRequest {
     pub packages: Vec<PackageIdentity>,
     /// Ranking phase to execute.
     pub phase: PackageSearchRequestPhase,
+    /// Which package results may be returned. Omitted, symbol.
+    pub target: Option<PackageSearchRequestTarget>,
 }
 /// Match class established for one declaration identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
@@ -1028,7 +1032,7 @@ pub struct PackageSearchHit {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct PackageSearchPage {
     /// Ranked package declarations.
-    pub items: Vec<PackageSearchHit>,
+    pub items: Vec<PackageSearchItem>,
     /// Opaque cursor for the next page.
     pub next_cursor: Option<String>,
     /// Warnings attached to this page.
@@ -1039,6 +1043,8 @@ pub struct PackageSearchPage {
     pub analyzer_revision: String,
     /// Corpus revision used for this page.
     pub corpus_revision: String,
+    /// Documentation revision used for this page.
+    pub documentation_revision: Option<String>,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
@@ -1061,8 +1067,8 @@ pub struct PackageSymbolRequest {
     /// Optional language filter.
     pub language: Option<Language>,
     /// Optional fields to include.
-    #[validate(length(max = 1u64))]
-    pub include: Option<Vec<String>>,
+    #[validate(length(max = 2u64))]
+    pub include: Option<Vec<PackageSymbolRequestInclude>>,
     /// Selected exact package versions.
     #[validate(length(max = 20_000u64), nested)]
     pub packages: Vec<PackageIdentity>,
@@ -1093,6 +1099,8 @@ pub struct PackageSymbol {
     pub match_class: IdentifierMatchClass,
     /// Optional declaration source excerpt.
     pub source: Option<String>,
+    /// Exact documentation references, when requested.
+    pub documentation: Option<DocumentationContext>,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
@@ -1112,6 +1120,8 @@ pub struct PackageSymbolPage {
     pub analyzer_revision: String,
     /// Corpus revision used for this page.
     pub corpus_revision: String,
+    /// Documentation revision used for this page.
+    pub documentation_revision: Option<String>,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
@@ -1129,6 +1139,618 @@ pub struct ProblemDetails {
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
 }
+/// The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`
+/// uses. The full digest is computed and compared internally; only this short form ever
+/// reaches the wire.
+pub type Digest = String;
+/// Documentation metadata addressing bytes held by an existing content owner.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentationBlock {
+    /// Existing ranked documents intersecting this block, in source order.
+    pub chunks: Option<Vec<DocumentationChunk>>,
+    /// Full lowercase SHA-256 digest for documentation content and identity.
+    pub content_digest: String,
+    /// Headings owning the block, in increasing depth order.
+    pub heading_path: Option<Vec<DocumentationHeading>>,
+    /// Full lowercase SHA-256 digest for documentation content and identity.
+    pub identity: String,
+    /// The content a documentation block addresses.
+    pub kind: DocumentationBlockKind,
+    /// Authored code language, when supplied by the format.
+    pub language: Option<String>,
+    /// One-based line where the block starts.
+    pub line: u64,
+    /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
+    /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
+    /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
+    /// another, so that `end` is never below `start` is asserted by the surface
+    /// validation tests instead.
+    pub range: TextRange,
+    /// One content owner: a regular source or decoded notebook cell.
+    pub source: DocumentationContentIdentity,
+    /// Owning declaration for an attached comment.
+    pub symbol: Option<SymbolId>,
+}
+/// The content a documentation block addresses.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+pub enum DocumentationBlockKind {
+    /// Authored prose and its markup.
+    #[default]
+    Prose,
+    /// Authored code without execution or inferred name resolution.
+    Code,
+}
+impl core::fmt::Display for DocumentationBlockKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Prose => write!(f, "prose"),
+            Self::Code => write!(f, "code"),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for DocumentationBlockKind {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "prose" => Ok(DocumentationBlockKind::Prose),
+            "code" => Ok(DocumentationBlockKind::Code),
+            _ => Err(serde::de::Error::unknown_variant(&s, &["prose", "code"])),
+        }
+    }
+}
+/// A baseline search document intersecting one block.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentationChunk {
+    /// Existing symbol or text document identity.
+    pub identity: String,
+    /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
+    /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
+    /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
+    /// another, so that `end` is never below `start` is asserted by the surface
+    /// validation tests instead.
+    pub range: TextRange,
+}
+/// One content owner: a regular source or decoded notebook cell.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentationContentIdentity {
+    /// Decoded cell when the parent source is a notebook.
+    pub cell: Option<NotebookCell>,
+    /// The selected source's canonical address.
+    pub source: DocumentationSourceIdentity,
+}
+/// Bounded documentation context requested for one exact declaration.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentationContext {
+    /// The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`
+    /// uses. The full digest is computed and compared internally; only this short form ever
+    /// reaches the wire.
+    pub documentation_revision: String,
+    /// References ordered by evidence, source, block range, and identity.
+    pub references: Vec<DocumentationReferenceHit>,
+    /// Whether the reference count or total excerpt bytes reached its bound.
+    pub truncated: bool,
+    /// Incomplete source conditions for requested excerpts.
+    pub warnings: Option<Vec<DocumentationWarning>>,
+}
+/// One heading in a block's ordered section path.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentationHeading {
+    /// Heading depth established by the format parser.
+    pub level: u32,
+    /// Heading identity, including the parser's duplicate-heading disambiguator.
+    pub name: String,
+}
+/// One documentation block projected from its existing content owner.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentationHit {
+    /// Documentation metadata addressing bytes held by an existing content owner.
+    pub block: DocumentationBlock,
+    /// The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`
+    /// uses. The full digest is computed and compared internally; only this short form ever
+    /// reaches the wire.
+    pub documentation_revision: String,
+    /// Source facts shared by every block belonging to one content owner.
+    pub source: DocumentationSource,
+}
+/// License metadata supplied by the source adapter.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentationLicense {
+    /// Declared expression; collection does not infer a license from source text.
+    pub expression: Option<String>,
+    /// License files whose bytes the adapter verified.
+    pub files: Option<Vec<DocumentationLicenseFile>>,
+}
+/// One license file's address and byte digest.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentationLicenseFile {
+    /// Full lowercase SHA-256 digest for documentation content and identity.
+    pub digest: String,
+    /// One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift
+    /// normalizes what it emits and what it accepts, and compares byte-for-byte. The empty path
+    /// names the root itself. Absolute paths, backslashes, control characters, empty segments,
+    /// and `.` or `..` segments are refused before the filesystem is touched. The limit is 1000
+    /// UTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal
+    /// fails the read that touches them with `content_unavailable`.
+    pub path: String,
+}
+/// An exact declaration reference authored inside standalone documentation.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentationReference {
+    /// Exact authored spelling.
+    pub authored: String,
+    /// Full lowercase SHA-256 digest for documentation content and identity.
+    pub block: String,
+    /// Evidence establishing a documentation reference, ordered strongest first.
+    pub evidence: DocumentationReferenceEvidence,
+    /// Full lowercase SHA-256 digest for documentation content and identity.
+    pub identity: String,
+    /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
+    /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
+    /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
+    /// another, so that `end` is never below `start` is asserted by the surface
+    /// validation tests instead.
+    pub range: TextRange,
+    /// Identity of one symbol. The name after the language is the provider's stable qualified
+    /// name for the declaration; where the language derives module identity from the file path,
+    /// as TypeScript does, that path is part of the name. A `~N` suffix separates declarations
+    /// the qualified name alone cannot, such as overloads that dispatch separately. A move can
+    /// change the identity when the language includes module path in that qualified name.
+    pub target: String,
+}
+/// Evidence establishing a documentation reference, ordered strongest first.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+pub enum DocumentationReferenceEvidence {
+    /// A typed contribution naming an exact declaration.
+    #[default]
+    Provider,
+    /// An authored link resolving to one declaration location.
+    AuthoredLink,
+    /// Inline code equal to one declaration's qualified name.
+    QualifiedName,
+    /// Inline code equal to one unique declaration name.
+    UniqueName,
+}
+impl core::fmt::Display for DocumentationReferenceEvidence {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Provider => write!(f, "provider"),
+            Self::AuthoredLink => write!(f, "authored_link"),
+            Self::QualifiedName => write!(f, "qualified_name"),
+            Self::UniqueName => write!(f, "unique_name"),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for DocumentationReferenceEvidence {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "provider" => Ok(DocumentationReferenceEvidence::Provider),
+            "authored_link" => Ok(DocumentationReferenceEvidence::AuthoredLink),
+            "qualified_name" => Ok(DocumentationReferenceEvidence::QualifiedName),
+            "unique_name" => Ok(DocumentationReferenceEvidence::UniqueName),
+            _ => {
+                Err(
+                    serde::de::Error::unknown_variant(
+                        &s,
+                        &["provider", "authored_link", "qualified_name", "unique_name"],
+                    ),
+                )
+            }
+        }
+    }
+}
+/// One exact declaration reference and the documentation containing it.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentationReferenceHit {
+    /// One documentation block projected from its existing content owner.
+    pub documentation: DocumentationHit,
+    /// Bytes read from the existing content owner within the response bound.
+    pub excerpt: Option<String>,
+    /// An exact declaration reference authored inside standalone documentation.
+    pub reference: DocumentationReference,
+}
+/// Why the caller selected this source.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+pub enum DocumentationSelectionReason {
+    /// Visible documentation in the captured workspace.
+    #[default]
+    Workspace,
+    /// Source selected from one exact package's acquired bytes.
+    PackageArchive,
+    /// Comment supplied by its declaration's syntax provider.
+    AttachedComment,
+    /// Source supplied by a cloud resolver.
+    CloudResolver,
+}
+impl core::fmt::Display for DocumentationSelectionReason {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Workspace => write!(f, "workspace"),
+            Self::PackageArchive => write!(f, "package_archive"),
+            Self::AttachedComment => write!(f, "attached_comment"),
+            Self::CloudResolver => write!(f, "cloud_resolver"),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for DocumentationSelectionReason {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "workspace" => Ok(DocumentationSelectionReason::Workspace),
+            "package_archive" => Ok(DocumentationSelectionReason::PackageArchive),
+            "attached_comment" => Ok(DocumentationSelectionReason::AttachedComment),
+            "cloud_resolver" => Ok(DocumentationSelectionReason::CloudResolver),
+            _ => {
+                Err(
+                    serde::de::Error::unknown_variant(
+                        &s,
+                        &[
+                            "workspace",
+                            "package_archive",
+                            "attached_comment",
+                            "cloud_resolver",
+                        ],
+                    ),
+                )
+            }
+        }
+    }
+}
+/// Source facts shared by every block belonging to one content owner.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentationSource {
+    /// Exact content length in UTF-8 bytes.
+    pub byte_length: u64,
+    /// Full lowercase SHA-256 digest for documentation content and identity.
+    pub content_digest: String,
+    /// The selected source's format.
+    pub format: DocumentationSourceFormat,
+    /// One content owner: a regular source or decoded notebook cell.
+    pub identity: DocumentationContentIdentity,
+    /// Declared source language, when known.
+    pub language: Option<Language>,
+    /// License facts recorded by the source adapter.
+    pub license: Option<DocumentationLicense>,
+    /// Media type supplied by the source adapter.
+    pub media_type: String,
+    /// Where a symbol belongs and how its declaration came to exist. Source location and
+    /// generation are separate: generated code can belong to the project or to a dependency.
+    /// Absent from `Symbol` entirely when it says a project declaration, authored, with no
+    /// package.
+    pub origin: SymbolOrigin,
+    /// Original JSON string-token ranges for a decoded notebook cell, in source order.
+    pub physical_ranges: Option<Vec<TextRange>>,
+    /// Full lowercase SHA-256 digest for documentation content and identity.
+    pub revision: String,
+    /// Why the caller selected this source.
+    pub selection: DocumentationSelectionReason,
+}
+/// The selected source's format.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+pub enum DocumentationSourceFormat {
+    /// Markdown block and inline syntax.
+    #[default]
+    Markdown,
+    /// Recognized Markdown ranges inside MDX.
+    Mdx,
+    /// Supported reStructuredText block and reference syntax.
+    RestructuredText,
+    /// Plain text paragraphs.
+    Text,
+    /// Selected markdown and code cells from a notebook.
+    Notebook,
+    /// Documentation attached by a syntax provider.
+    AttachedComment,
+}
+impl core::fmt::Display for DocumentationSourceFormat {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Markdown => write!(f, "markdown"),
+            Self::Mdx => write!(f, "mdx"),
+            Self::RestructuredText => write!(f, "restructured_text"),
+            Self::Text => write!(f, "text"),
+            Self::Notebook => write!(f, "notebook"),
+            Self::AttachedComment => write!(f, "attached_comment"),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for DocumentationSourceFormat {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "markdown" => Ok(DocumentationSourceFormat::Markdown),
+            "mdx" => Ok(DocumentationSourceFormat::Mdx),
+            "restructured_text" => Ok(DocumentationSourceFormat::RestructuredText),
+            "text" => Ok(DocumentationSourceFormat::Text),
+            "notebook" => Ok(DocumentationSourceFormat::Notebook),
+            "attached_comment" => Ok(DocumentationSourceFormat::AttachedComment),
+            _ => {
+                Err(
+                    serde::de::Error::unknown_variant(
+                        &s,
+                        &[
+                            "markdown",
+                            "mdx",
+                            "restructured_text",
+                            "text",
+                            "notebook",
+                            "attached_comment",
+                        ],
+                    ),
+                )
+            }
+        }
+    }
+}
+/// The selected source's canonical address.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(untagged)]
+pub enum DocumentationSourceIdentity {
+    /// A visible workspace file.
+    #[default]
+    ProjectPath(DocumentationSourceIdentityProjectPath),
+    /// A source unit supplied by an exact package adapter.
+    SourceUnitId(DocumentationSourceIdentitySourceUnitId),
+}
+impl DocumentationSourceIdentity {
+    /// A visible workspace file.
+    pub fn project_path(path: String) -> Self {
+        Self::ProjectPath(DocumentationSourceIdentityProjectPath {
+            path,
+            ..Default::default()
+        })
+    }
+    /// A source unit supplied by an exact package adapter.
+    pub fn unit_id(unit: String) -> Self {
+        Self::SourceUnitId(DocumentationSourceIdentitySourceUnitId {
+            unit,
+            ..Default::default()
+        })
+    }
+}
+/// The collection step reporting incomplete documentation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+pub enum DocumentationStage {
+    /// Source selection and byte validation.
+    #[default]
+    Source,
+    /// Format parsing and block extraction.
+    Extract,
+    /// Authored link and declaration reference resolution.
+    Resolve,
+    /// Mapping metadata to existing ranked documents.
+    Index,
+}
+impl core::fmt::Display for DocumentationStage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Source => write!(f, "source"),
+            Self::Extract => write!(f, "extract"),
+            Self::Resolve => write!(f, "resolve"),
+            Self::Index => write!(f, "index"),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for DocumentationStage {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "source" => Ok(DocumentationStage::Source),
+            "extract" => Ok(DocumentationStage::Extract),
+            "resolve" => Ok(DocumentationStage::Resolve),
+            "index" => Ok(DocumentationStage::Index),
+            _ => {
+                Err(
+                    serde::de::Error::unknown_variant(
+                        &s,
+                        &["source", "extract", "resolve", "index"],
+                    ),
+                )
+            }
+        }
+    }
+}
+/// One bounded warning with repeated conditions counted per source.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentationWarning {
+    /// Number of items omitted or truncated for this condition.
+    pub count: u64,
+    /// Why one documentation source is incomplete.
+    pub kind: DocumentationWarningKind,
+    /// One content owner: a regular source or decoded notebook cell.
+    pub source: DocumentationContentIdentity,
+    /// The collection step reporting incomplete documentation.
+    pub stage: DocumentationStage,
+}
+/// Why one documentation source is incomplete.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+pub enum DocumentationWarningKind {
+    /// Source bytes or their format are unavailable.
+    #[default]
+    SourceUnavailable,
+    /// Retained source ends before an addressed range.
+    SourceTruncated,
+    /// Format and extension do not select a supported parser.
+    UnsupportedFormat,
+    /// Parser refused malformed source.
+    MalformedSource,
+    /// Recognized syntax was excluded from documentation metadata.
+    OmittedRange,
+    /// A configured or format bound stopped output.
+    LimitExceeded,
+}
+impl core::fmt::Display for DocumentationWarningKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::SourceUnavailable => write!(f, "source_unavailable"),
+            Self::SourceTruncated => write!(f, "source_truncated"),
+            Self::UnsupportedFormat => write!(f, "unsupported_format"),
+            Self::MalformedSource => write!(f, "malformed_source"),
+            Self::OmittedRange => write!(f, "omitted_range"),
+            Self::LimitExceeded => write!(f, "limit_exceeded"),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for DocumentationWarningKind {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "source_unavailable" => Ok(DocumentationWarningKind::SourceUnavailable),
+            "source_truncated" => Ok(DocumentationWarningKind::SourceTruncated),
+            "unsupported_format" => Ok(DocumentationWarningKind::UnsupportedFormat),
+            "malformed_source" => Ok(DocumentationWarningKind::MalformedSource),
+            "omitted_range" => Ok(DocumentationWarningKind::OmittedRange),
+            "limit_exceeded" => Ok(DocumentationWarningKind::LimitExceeded),
+            _ => {
+                Err(
+                    serde::de::Error::unknown_variant(
+                        &s,
+                        &[
+                            "source_unavailable",
+                            "source_truncated",
+                            "unsupported_format",
+                            "malformed_source",
+                            "omitted_range",
+                            "limit_exceeded",
+                        ],
+                    ),
+                )
+            }
+        }
+    }
+}
+/// A selected cell addressed within its parent notebook.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct NotebookCell {
+    /// The authored cell identifier or its position when no identifier exists.
+    pub identity: NotebookCellIdentity,
+    /// The selected notebook cell's content kind.
+    pub kind: NotebookCellKind,
+}
+/// The authored cell identifier or its position when no identifier exists.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(untagged)]
+pub enum NotebookCellIdentity {
+    /// A valid identifier stored in the notebook.
+    #[default]
+    Object(NotebookCellIdentityObject),
+    /// The cell's zero-based position in its notebook.
+    Object2(NotebookCellIdentityObject2),
+}
+impl NotebookCellIdentity {
+    /// A valid identifier stored in the notebook.
+    pub fn object(id: String) -> Self {
+        Self::Object(NotebookCellIdentityObject {
+            id,
+            ..Default::default()
+        })
+    }
+    /// The cell's zero-based position in its notebook.
+    pub fn object2(index: u32) -> Self {
+        Self::Object2(NotebookCellIdentityObject2 {
+            index,
+            ..Default::default()
+        })
+    }
+}
+/// The selected notebook cell's content kind.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+pub enum NotebookCellKind {
+    /// Markdown source decoded from a markdown cell.
+    #[default]
+    Markdown,
+    /// Source decoded from a code cell, without execution.
+    Code,
+}
+impl core::fmt::Display for NotebookCellKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Markdown => write!(f, "markdown"),
+            Self::Code => write!(f, "code"),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for NotebookCellKind {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "markdown" => Ok(NotebookCellKind::Markdown),
+            "code" => Ok(NotebookCellKind::Code),
+            _ => Err(serde::de::Error::unknown_variant(&s, &["markdown", "code"])),
+        }
+    }
+}
+/// One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift
+/// normalizes what it emits and what it accepts, and compares byte-for-byte. The empty path
+/// names the root itself. Absolute paths, backslashes, control characters, empty segments,
+/// and `.` or `..` segments are refused before the filesystem is touched. The limit is 1000
+/// UTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal
+/// fails the read that touches them with `content_unavailable`.
+pub type ProjectPath = String;
+/// One documentation block returned by search.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(default)]
+pub struct PackageDocumentationHit {
+    #[default("documentation".to_string())]
+    pub target: String,
+    /// One package as its package manager identifies it.
+    pub package: PackageIdentity,
+    /// One documentation block projected from its existing content owner.
+    pub documentation: DocumentationHit,
+    /// Fields that contributed to ranking.
+    pub contributing_fields: Vec<PackageDocumentationHitContributingField>,
+    /// The block source excerpt when requested, bounded across the response page.
+    pub source: Option<String>,
+    /// Additional properties not defined in the schema.
+    #[serde(flatten)]
+    pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
+}
+/// One symbol or documentation result.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(untagged)]
+pub enum PackageSearchItem {
+    /// One public package declaration returned by search.
+    #[default]
+    Search(PackageSearchHit),
+    /// One documentation block returned by search.
+    Documentation(PackageDocumentationHit),
+}
+/// Full lowercase SHA-256 digest for documentation content and identity.
+pub type DocumentationDigest = String;
 /// Returns supported package managers, features, publication revisions, and active bounds.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
 pub struct GetCapabilitiesRequest {}
@@ -1747,6 +2369,47 @@ impl<'de> serde::Deserialize<'de> for PackageSearchRequestPhase {
         }
     }
 }
+/// Which package results may be returned. Omitted, symbol.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
+pub enum PackageSearchRequestTarget {
+    #[serde(rename = "symbol")]
+    #[default]
+    Symbol,
+    #[serde(rename = "documentation")]
+    Documentation,
+    #[serde(rename = "all")]
+    All,
+}
+impl core::fmt::Display for PackageSearchRequestTarget {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Symbol => write!(f, "symbol"),
+            Self::Documentation => write!(f, "documentation"),
+            Self::All => write!(f, "all"),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for PackageSearchRequestTarget {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "symbol" => Ok(PackageSearchRequestTarget::Symbol),
+            "documentation" => Ok(PackageSearchRequestTarget::Documentation),
+            "all" => Ok(PackageSearchRequestTarget::All),
+            _ => {
+                Err(
+                    serde::de::Error::unknown_variant(
+                        &s,
+                        &["symbol", "documentation", "all"],
+                    ),
+                )
+            }
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
 pub enum PackageSearchHitContributingField {
     #[default]
@@ -1785,6 +2448,112 @@ impl<'de> serde::Deserialize<'de> for PackageSearchHitContributingField {
             }
             "unknown" => Ok(PackageSearchHitContributingField::Unknown),
             _ => Ok(PackageSearchHitContributingField::Unknown),
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
+pub enum PackageSymbolRequestInclude {
+    #[serde(rename = "source")]
+    #[default]
+    Source,
+    #[serde(rename = "documentation")]
+    Documentation,
+}
+impl core::fmt::Display for PackageSymbolRequestInclude {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Source => write!(f, "source"),
+            Self::Documentation => write!(f, "documentation"),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for PackageSymbolRequestInclude {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "source" => Ok(PackageSymbolRequestInclude::Source),
+            "documentation" => Ok(PackageSymbolRequestInclude::Documentation),
+            _ => Err(serde::de::Error::unknown_variant(&s, &["source", "documentation"])),
+        }
+    }
+}
+/// A visible workspace file.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct DocumentationSourceIdentityProjectPath {
+    #[default("project".to_string())]
+    pub kind: String,
+    /// One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift
+    /// normalizes what it emits and what it accepts, and compares byte-for-byte. The empty path
+    /// names the root itself. Absolute paths, backslashes, control characters, empty segments,
+    /// and `.` or `..` segments are refused before the filesystem is touched. The limit is 1000
+    /// UTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal
+    /// fails the read that touches them with `content_unavailable`.
+    pub path: String,
+}
+/// A source unit supplied by an exact package adapter.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct DocumentationSourceIdentitySourceUnitId {
+    #[default("package".to_string())]
+    pub kind: String,
+    /// Stable identity of one source unit in the source catalog: a resolver identity, then that
+    /// resolver's canonical unit key in canonical percent-encoding - for the project resolver, the
+    /// project-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its
+    /// resolver's canonical human-readable key; digests appear on the wire only as short witnesses
+    /// where byte-identity is required.
+    pub unit: String,
+}
+/// A valid identifier stored in the notebook.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct NotebookCellIdentityObject {
+    /// Identifier accepted by the notebook format.
+    pub id: String,
+    #[default("authored".to_string())]
+    pub kind: String,
+}
+/// The cell's zero-based position in its notebook.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct NotebookCellIdentityObject2 {
+    /// Position among every cell, including unselected cells.
+    pub index: u32,
+    #[default("indexed".to_string())]
+    pub kind: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+pub enum PackageDocumentationHitContributingField {
+    #[default]
+    Documentation,
+    Content,
+    Unknown,
+}
+impl core::fmt::Display for PackageDocumentationHitContributingField {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Documentation => write!(f, "documentation"),
+            Self::Content => write!(f, "content"),
+            Self::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for PackageDocumentationHitContributingField {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "documentation" => {
+                Ok(PackageDocumentationHitContributingField::Documentation)
+            }
+            "content" => Ok(PackageDocumentationHitContributingField::Content),
+            "unknown" => Ok(PackageDocumentationHitContributingField::Unknown),
+            _ => Ok(PackageDocumentationHitContributingField::Unknown),
         }
     }
 }

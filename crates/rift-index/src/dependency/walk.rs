@@ -4,17 +4,21 @@
 //! public-declaration rule; the package index consults the rule through
 //! `public_qualified_names`.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use ignore::{DirEntry, Walk, WalkBuilder};
+use rift_analysis::ExactPackageLimits;
+use rift_analysis::archive::{
+    ArchiveDigest, ArchiveFiles, ArchiveFormat, ArchiveLimits, read_archive,
+};
+use rift_analysis::{PackageLanguage, documentation_format};
 use rift_core::{LoopBudget, ProjectPath, bounded_for};
-use rift_dependency::CatalogEntry;
-use rift_protocol::read::{Language, PackageIdentity};
-use rift_syntax::{ShippedLanguage, SyntaxDocument, SyntaxSymbol};
+use rift_dependency::{CatalogEntry, CatalogSource};
+use rift_protocol::documentation::DocumentationSourceFormat;
+use rift_protocol::read::PackageIdentity;
 
 use super::failure::{PackageIndexError, PackageIndexFault, PackageIndexViolation};
 use super::{
@@ -36,143 +40,12 @@ const SKIPPED_DIRECTORY_NAMES: &[&str] = &[
 /// Suffix a skipped directory name ends in once its surrounding underscores are trimmed.
 /// `integration_tests` and `__tests__` both match.
 const TESTS_DIRECTORY_SUFFIX: &str = "tests";
-/// Rust source file suffix.
-const RUST_SOURCE_SUFFIX: &str = ".rs";
-/// Python module suffix, selected when the package ships no stub.
-const PYTHON_MODULE_SUFFIX: &str = ".py";
 /// Python stub suffix, preferred over modules when the package ships any.
 const PYTHON_STUB_SUFFIX: &str = ".pyi";
-/// TypeScript declaration-file suffix, the only TypeScript files selected.
-const TYPESCRIPT_DECLARATION_SUFFIX: &str = ".d.ts";
-
-/// The Rust provider's spelling of bare `pub`.
-const RUST_PUBLIC_VISIBILITY: &str = "pub";
-/// The Rust provider's spelling of a declaration without a visibility modifier.
-const RUST_PRIVATE_VISIBILITY: &str = "private";
-/// The Rust provider's kind word for a trait declaration.
-const RUST_TRAIT_KIND: &str = "trait";
-/// The prefix a Python name carries when the module keeps it private.
-const PYTHON_PRIVATE_PREFIX: char = '_';
-/// The TypeScript accessibility modifiers that hide a member from callers.
-const TYPESCRIPT_HIDDEN_VISIBILITIES: &[&str] = &["private", "protected"];
 
 /// A `usize` count as the `u64` a limit refusal reports.
 fn count_u64(count: usize) -> u64 {
     u64::try_from(count).unwrap_or(u64::MAX)
-}
-
-/// The languages the dependency index reads an API from, and each one's rules.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PackageLanguage {
-    /// Every `.rs` file; `pub` declarations and the items of a `pub` trait are public.
-    Rust,
-    /// Every `.pyi` stub when the package ships any, else every `.py` module;
-    /// names without a leading underscore are public.
-    Python,
-    /// Every `.d.ts` declaration file; every member but `private` and `protected`
-    /// ones is public.
-    TypeScript,
-}
-
-impl PackageLanguage {
-    /// The rules for `language`; `None` when no shipped definition serves it.
-    fn for_language(language: &Language) -> Option<Self> {
-        let shipped = rift_syntax::definitions()
-            .iter()
-            .map(|definition| definition.shipped())
-            .find(|shipped| &shipped.language() == language)?;
-        match shipped {
-            ShippedLanguage::Rust => Some(Self::Rust),
-            ShippedLanguage::Python => Some(Self::Python),
-            ShippedLanguage::TypeScript | ShippedLanguage::TypeScriptTsx => Some(Self::TypeScript),
-            ShippedLanguage::JavaScript
-            | ShippedLanguage::Markdown
-            | ShippedLanguage::Json
-            | ShippedLanguage::Yaml
-            | ShippedLanguage::Toml => None,
-        }
-    }
-
-    /// Whether `file_name` is selected before the Python stub preference applies.
-    fn is_candidate(self, file_name: &str) -> bool {
-        match self {
-            Self::Rust => file_name.ends_with(RUST_SOURCE_SUFFIX),
-            Self::Python => {
-                file_name.ends_with(PYTHON_MODULE_SUFFIX) || file_name.ends_with(PYTHON_STUB_SUFFIX)
-            }
-            Self::TypeScript => file_name.ends_with(TYPESCRIPT_DECLARATION_SUFFIX),
-        }
-    }
-
-    /// The candidates that spell the API: Python keeps stubs alone when it ships any.
-    fn api_files(self, candidates: Vec<Candidate>) -> Vec<Candidate> {
-        if self != Self::Python {
-            return candidates;
-        }
-        let ships_stubs = candidates.iter().any(Candidate::is_python_stub);
-        candidates
-            .into_iter()
-            .filter(|candidate| candidate.is_python_stub() == ships_stubs)
-            .collect()
-    }
-
-    /// Whether a caller outside the package can use `symbol`.
-    ///
-    /// `by_name` indexes the document's declarations by qualified name, so a
-    /// Rust trait item can consult its container. Module reachability is not
-    /// modeled: a `pub` item inside a private module counts as public.
-    fn is_public(self, symbol: &SyntaxSymbol, by_name: &BTreeMap<&str, &SyntaxSymbol>) -> bool {
-        match self {
-            Self::Rust => is_public_rust(symbol, by_name),
-            Self::Python => !symbol.name.starts_with(PYTHON_PRIVATE_PREFIX),
-            Self::TypeScript => !symbol
-                .visibility
-                .as_deref()
-                .is_some_and(|visibility| TYPESCRIPT_HIDDEN_VISIBILITIES.contains(&visibility)),
-        }
-    }
-}
-
-/// `pub` declarations, and the modifier-free items of a `pub` trait.
-fn is_public_rust(symbol: &SyntaxSymbol, by_name: &BTreeMap<&str, &SyntaxSymbol>) -> bool {
-    match symbol.visibility.as_deref() {
-        Some(RUST_PUBLIC_VISIBILITY) => true,
-        Some(RUST_PRIVATE_VISIBILITY) => symbol
-            .container
-            .as_deref()
-            .and_then(|container| by_name.get(container))
-            .is_some_and(|container| {
-                container.kind == RUST_TRAIT_KIND
-                    && container.visibility.as_deref() == Some(RUST_PUBLIC_VISIBILITY)
-            }),
-        _ => false,
-    }
-}
-
-/// The qualified names of every declaration in `document` a caller can use.
-///
-/// A language outside [`PackageLanguage`] states no visibility this index reads,
-/// so every declaration counts as public.
-pub(super) fn public_qualified_names(
-    language: &Language,
-    document: &SyntaxDocument,
-) -> BTreeSet<String> {
-    let symbols = document.symbols();
-    let Some(rules) = PackageLanguage::for_language(language) else {
-        return symbols
-            .iter()
-            .map(|symbol| symbol.qualified_name.clone())
-            .collect();
-    };
-    let by_name: BTreeMap<&str, &SyntaxSymbol> = symbols
-        .iter()
-        .map(|symbol| (symbol.qualified_name.as_str(), symbol))
-        .collect();
-    symbols
-        .iter()
-        .filter(|symbol| rules.is_public(symbol, &by_name))
-        .map(|symbol| symbol.qualified_name.clone())
-        .collect()
 }
 
 /// The files one cataloged package's API is read from: package-relative, UTF-8.
@@ -180,15 +53,39 @@ pub(super) fn public_qualified_names(
 pub struct PackageFiles {
     files: Vec<TextSourceFile>,
     skipped_binary: usize,
+    limits: ExactPackageLimits,
 }
 
 impl PackageFiles {
     /// The selected files, with the count of files skipped as binary.
+    #[cfg(test)]
     pub(crate) fn new(files: Vec<TextSourceFile>, skipped_binary: usize) -> Self {
+        let files_max = u32::try_from(files.len()).unwrap_or(u32::MAX);
+        let bytes_max = files
+            .iter()
+            .map(|file| count_u64(file.content().len()))
+            .fold(0, u64::saturating_add);
+        Self::with_limits(
+            files,
+            skipped_binary,
+            ExactPackageLimits::new(files_max, bytes_max),
+        )
+    }
+
+    fn with_limits(
+        files: Vec<TextSourceFile>,
+        skipped_binary: usize,
+        limits: ExactPackageLimits,
+    ) -> Self {
         Self {
             files,
             skipped_binary,
+            limits,
         }
+    }
+
+    pub(crate) const fn analysis_limits(&self) -> ExactPackageLimits {
+        self.limits
     }
 
     /// Every selected file, in walk order.
@@ -232,6 +129,30 @@ impl Candidate {
     fn is_python_stub(&self) -> bool {
         self.relative.as_str().ends_with(PYTHON_STUB_SUFFIX)
     }
+
+    fn is_documentation(&self) -> bool {
+        is_selected_documentation(self.relative.as_str())
+    }
+}
+
+fn is_selected_documentation(path: &str) -> bool {
+    documentation_format(path).is_some_and(|format| format != DocumentationSourceFormat::Text)
+}
+
+fn selected_files(language: PackageLanguage, candidates: Vec<Candidate>) -> Vec<Candidate> {
+    let has_stub = candidates
+        .iter()
+        .any(|candidate| !candidate.is_documentation() && candidate.is_python_stub());
+    let mut selected: Vec<Candidate> = candidates
+        .into_iter()
+        .filter(|candidate| {
+            candidate.is_documentation()
+                || language != PackageLanguage::Python
+                || candidate.is_python_stub() == has_stub
+        })
+        .collect();
+    selected.sort_by(|left, right| left.relative.cmp(&right.relative));
+    selected
 }
 
 /// Reads the files that spell one cataloged package's API.
@@ -257,10 +178,26 @@ pub fn package_files(
     let language = PackageLanguage::for_language(entry.language()).ok_or_else(|| {
         PackageIndexFault::new(PackageIndexViolation::LanguageUnsupported, package)
     })?;
-    let root = entry
-        .source_root()
-        .ok_or_else(|| PackageIndexFault::new(PackageIndexViolation::SourceRootMissing, package))?;
-    let candidates = language.api_files(candidates_below(root, language, package, limits)?);
+    match entry.source() {
+        Some(CatalogSource::Directory(root)) => {
+            package_directory_files(root, language, package, limits)
+        }
+        Some(CatalogSource::Archive { path, sha256 }) => {
+            package_archive_files(path, sha256, language, package, limits)
+        }
+        None => {
+            Err(PackageIndexFault::new(PackageIndexViolation::SourceRootMissing, package).into())
+        }
+    }
+}
+
+fn package_directory_files(
+    root: &Path,
+    language: PackageLanguage,
+    package: &PackageIdentity,
+    limits: &DependencyIndexLimits,
+) -> Result<PackageFiles, PackageIndexError> {
+    let candidates = selected_files(language, candidates_below(root, language, package, limits)?);
     if candidates.len() > limits.package_files_max {
         return Err(
             PackageIndexFault::new(PackageIndexViolation::PackageFilesExceeded, package)
@@ -274,6 +211,190 @@ pub fn package_files(
         );
     }
     read_candidates(candidates, package, limits)
+}
+
+fn package_archive_files(
+    archive_path: &Path,
+    sha256: &[u8; 32],
+    language: PackageLanguage,
+    package: &PackageIdentity,
+    limits: &DependencyIndexLimits,
+) -> Result<PackageFiles, PackageIndexError> {
+    let archive = checked_package_archive(archive_path, sha256, package, limits)?;
+    let archive_files = archive.into_files();
+    let mut candidates = archive_files
+        .into_iter()
+        .filter(|(path, _)| archive_path_selected(path, language))
+        .collect::<Vec<_>>();
+    if language == PackageLanguage::Python {
+        let has_stub = candidates.iter().any(|(path, _)| {
+            !is_selected_documentation(path.as_str()) && is_python_stub(path.as_str())
+        });
+        if has_stub {
+            candidates.retain(|(path, _)| {
+                is_selected_documentation(path.as_str()) || is_python_stub(path.as_str())
+            });
+        }
+    }
+    if candidates.len() > limits.package_files_max {
+        return Err(
+            PackageIndexFault::new(PackageIndexViolation::PackageFilesExceeded, package)
+                .at(archive_path)
+                .breached(
+                    PACKAGE_FILES_MAX_FIELD,
+                    count_u64(limits.package_files_max),
+                    count_u64(candidates.len()),
+                )
+                .into(),
+        );
+    }
+    let selected_bytes = candidates.iter().fold(0_u64, |total, (_, bytes)| {
+        total.saturating_add(count_u64(bytes.len()))
+    });
+    if selected_bytes > limits.package_bytes_max {
+        return Err(
+            PackageIndexFault::new(PackageIndexViolation::PackageBytesExceeded, package)
+                .at(archive_path)
+                .breached(
+                    PACKAGE_BYTES_MAX_FIELD,
+                    limits.package_bytes_max,
+                    selected_bytes,
+                )
+                .into(),
+        );
+    }
+    let mut files = Vec::with_capacity(candidates.len());
+    let mut skipped_binary = 0_usize;
+    for (path, bytes) in candidates {
+        match text_content(bytes) {
+            Some(content) => files.push(TextSourceFile::from_content(path, content)),
+            None => skipped_binary = skipped_binary.saturating_add(1),
+        }
+    }
+    Ok(PackageFiles::with_limits(
+        files,
+        skipped_binary,
+        ExactPackageLimits::new(
+            u32::try_from(limits.package_files_max).unwrap_or(u32::MAX),
+            limits.package_bytes_max,
+        ),
+    ))
+}
+
+fn checked_package_archive(
+    archive_path: &Path,
+    sha256: &[u8; 32],
+    package: &PackageIdentity,
+    limits: &DependencyIndexLimits,
+) -> Result<ArchiveFiles, PackageIndexError> {
+    let bytes = read_archive_bytes(archive_path, package)?;
+    let root = format!("{}-{}", package.name, package.version);
+    let archive = read_archive(
+        &bytes,
+        ArchiveFormat::TarGzip,
+        &ArchiveDigest::Sha256(*sha256),
+        Some(&root),
+        ArchiveLimits::default(),
+    )
+    .map_err(|error| {
+        PackageIndexFault::new(PackageIndexViolation::Unreadable, package)
+            .at(archive_path)
+            .caused_by(error)
+    })?;
+    if archive.files().len() > limits.walk_entries_max {
+        return Err(
+            PackageIndexFault::new(PackageIndexViolation::WalkEntriesExceeded, package)
+                .at(archive_path)
+                .breached(
+                    WALK_ENTRIES_MAX_FIELD,
+                    count_u64(limits.walk_entries_max),
+                    count_u64(archive.files().len()),
+                )
+                .into(),
+        );
+    }
+    for path in archive
+        .files()
+        .keys()
+        .filter(|path| !path_has_skipped_directory(path))
+    {
+        let depth = path.as_str().split('/').count();
+        if depth > limits.directory_depth_max.saturating_add(1) {
+            return Err(PackageIndexFault::new(
+                PackageIndexViolation::DirectoryDepthExceeded,
+                package,
+            )
+            .at(archive_path)
+            .breached(
+                DIRECTORY_DEPTH_MAX_FIELD,
+                count_u64(limits.directory_depth_max),
+                count_u64(depth.saturating_sub(1)),
+            )
+            .into());
+        }
+    }
+    Ok(archive)
+}
+
+fn read_archive_bytes(
+    path: &Path,
+    package: &PackageIdentity,
+) -> Result<Vec<u8>, PackageIndexError> {
+    let unreadable = |error: std::io::Error| {
+        PackageIndexFault::new(PackageIndexViolation::Unreadable, package)
+            .at(path)
+            .caused_by(error)
+    };
+    let metadata = fs::symlink_metadata(path).map_err(unreadable)?;
+    let maximum = ArchiveLimits::default().compressed_bytes_max();
+    let length = metadata.len();
+    if !metadata.is_file() || length > count_u64(maximum) {
+        return Err(
+            PackageIndexFault::new(PackageIndexViolation::PackageBytesExceeded, package)
+                .at(path)
+                .breached("archive.compressed_bytes", count_u64(maximum), length)
+                .into(),
+        );
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(length).unwrap_or(maximum));
+    fs::File::open(path)
+        .map_err(unreadable)?
+        .take(count_u64(maximum).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    if bytes.len() > maximum {
+        return Err(
+            PackageIndexFault::new(PackageIndexViolation::PackageBytesExceeded, package)
+                .at(path)
+                .breached(
+                    "archive.compressed_bytes",
+                    count_u64(maximum),
+                    count_u64(bytes.len()),
+                )
+                .into(),
+        );
+    }
+    Ok(bytes)
+}
+
+fn archive_path_selected(path: &ProjectPath, language: PackageLanguage) -> bool {
+    !path_has_skipped_directory(path)
+        && path
+            .as_str()
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| language.is_candidate(name) || is_selected_documentation(name))
+}
+
+fn path_has_skipped_directory(path: &ProjectPath) -> bool {
+    path.as_str()
+        .split('/')
+        .take(path.as_str().matches('/').count())
+        .any(is_skipped_directory_name)
+}
+
+fn is_python_stub(path: &str) -> bool {
+    path.ends_with(PYTHON_STUB_SUFFIX)
 }
 
 /// Every candidate file below `root`, or the root itself when it is one file.
@@ -336,7 +457,7 @@ fn single_file_candidate(
                 .into(),
         );
     };
-    if !language.is_candidate(name) {
+    if !language.is_candidate(name) && !is_selected_documentation(name) {
         return Ok(None);
     }
     let relative = ProjectPath::new(name).map_err(|error| {
@@ -375,7 +496,7 @@ fn candidate_of(
                 .into(),
         );
     };
-    if !language.is_candidate(name) {
+    if !language.is_candidate(name) && !is_selected_documentation(name) {
         return Ok(None);
     }
     let relative = package_relative(root, entry.path(), package)?;
@@ -484,7 +605,14 @@ fn read_candidates(
             None => skipped_binary += 1,
         }
     }
-    Ok(PackageFiles::new(files, skipped_binary))
+    Ok(PackageFiles::with_limits(
+        files,
+        skipped_binary,
+        ExactPackageLimits::new(
+            u32::try_from(limits.package_files_max).unwrap_or(u32::MAX),
+            limits.package_bytes_max,
+        ),
+    ))
 }
 
 /// Reads at most `remaining + 1` bytes: an oversized file is counted, never held whole.
@@ -547,9 +675,12 @@ fn is_skipped_directory_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
     use rift_core::{ErrorCode, ErrorName, Fault as _, ProjectPath};
-    use rift_dependency::{CatalogEntry, PackageLocation};
+    use rift_dependency::{CatalogEntry, CatalogSource, PackageLocation};
     use rift_syntax::ShippedLanguage;
+    use sha2::{Digest as _, Sha256};
 
     use super::super::fixture::{
         identity, language, rooted, sorted_paths, tokio, violation_of, write,
@@ -558,8 +689,72 @@ mod tests {
         Candidate, DependencyIndexLimits, PackageIndexViolation, package_files, read_candidates,
     };
 
+    fn cargo_archive(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        for (path, content) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(u64::try_from(content.len()).expect("fixture length"));
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, format!("beacon-1.0.0/{path}"), *content)
+                .expect("archive member");
+        }
+        archive
+            .into_inner()
+            .expect("tar archive")
+            .finish()
+            .expect("gzip archive")
+    }
+
     #[test]
-    fn test_package_files_rust_selects_rs_files_and_skips_test_directories() {
+    fn test_cached_archive_and_installed_directory_select_same_files() {
+        let members = [
+            ("src/lib.rs", b"pub fn spawn() {}\n".as_slice()),
+            ("README.md", b"# Beacon\n".as_slice()),
+            ("tests/ignored.rs", b"fn ignored() {}\n".as_slice()),
+        ];
+        let archive_bytes = cargo_archive(&members);
+        let archive_digest: [u8; 32] = Sha256::digest(&archive_bytes).into();
+        let archive_directory = tempfile::tempdir().expect("archive directory");
+        let archive_path = archive_directory.path().join("beacon-1.0.0.crate");
+        std::fs::write(&archive_path, &archive_bytes).expect("archive bytes");
+        let package = identity("cargo", "beacon", "1.0.0");
+        let archived_entry =
+            CatalogEntry::dependency(package.clone(), language(ShippedLanguage::Rust), None, true)
+                .with_source_archive(archive_path, archive_digest);
+        assert!(matches!(
+            archived_entry.source(),
+            Some(CatalogSource::Archive { .. })
+        ));
+
+        let installed_directory = tempfile::tempdir().expect("installed directory");
+        for (path, contents) in members {
+            write(installed_directory.path(), path, contents);
+        }
+        let installed_entry = rooted(package, ShippedLanguage::Rust, installed_directory.path());
+        let limits = DependencyIndexLimits::default();
+        let archived = package_files(&archived_entry, &limits).expect("cached archive");
+        let installed = package_files(&installed_entry, &limits).expect("installed tree");
+
+        assert_eq!(sorted_paths(&archived), sorted_paths(&installed));
+        assert_eq!(
+            archived
+                .files()
+                .iter()
+                .map(|file| (file.path().as_str(), file.content()))
+                .collect::<Vec<_>>(),
+            installed
+                .files()
+                .iter()
+                .map(|file| (file.path().as_str(), file.content()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_package_files_rust_selects_api_and_documentation_files_and_skips_test_directories() {
         let root = tempfile::tempdir().expect("package root");
         write(root.path(), "src/lib.rs", b"pub fn spawn() {}\n");
         write(root.path(), "src/net/mod.rs", b"pub struct Socket;\n");
@@ -574,10 +769,13 @@ mod tests {
 
         let files = package_files(&entry, &DependencyIndexLimits::default()).expect("selected");
 
-        assert_eq!(sorted_paths(&files), ["src/lib.rs", "src/net/mod.rs"]);
-        assert_eq!(files.file_count(), 2);
+        assert_eq!(
+            sorted_paths(&files),
+            ["src/lib.rs", "src/net/mod.rs", "src/notes.md"]
+        );
+        assert_eq!(files.file_count(), 3);
         assert_eq!(files.skipped_binary(), 0);
-        assert_eq!(files.byte_count(), 18 + 19);
+        assert_eq!(files.byte_count(), 18 + 19 + 13);
     }
 
     #[test]
@@ -586,6 +784,7 @@ mod tests {
         write(root.path(), "six.py", b"def public(): ...\n");
         write(root.path(), "six.pyi", b"def public() -> None: ...\n");
         write(root.path(), "pkg/__init__.py", b"");
+        write(root.path(), "README.md", b"# six\n");
         let entry = rooted(
             identity("uv", "six", "1.17.0"),
             ShippedLanguage::Python,
@@ -594,7 +793,7 @@ mod tests {
 
         let files = package_files(&entry, &DependencyIndexLimits::default()).expect("selected");
 
-        assert_eq!(sorted_paths(&files), ["six.pyi"]);
+        assert_eq!(sorted_paths(&files), ["README.md", "six.pyi"]);
     }
 
     #[test]

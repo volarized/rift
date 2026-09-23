@@ -544,7 +544,7 @@ fn search_page_json(
 ) -> serde_json::Value {
     serde_json::json!({
         "items":[search_hit_json(package, suffix)], "next_cursor":next,
-        "warnings":[], "publication_format":"rift-package-index-v1",
+        "warnings":[], "publication_format":"rift-package-index-v2",
         "analyzer_revision":analyzer, "corpus_revision":"corpus-v1"
     })
 }
@@ -572,7 +572,7 @@ fn symbol_page_json(
 ) -> serde_json::Value {
     serde_json::json!({
         "items":[{"package":package_json(package),"symbol":symbol_json(package, suffix),"unit":format!("rift://source/cargo/{package}@1.0.0/src/{suffix}.rs"),"range":{"start":0,"end":4},"line":1,"match_class":"qualified_exact"}],
-        "next_cursor":next, "warnings":[], "publication_format":"rift-package-index-v1",
+        "next_cursor":next, "warnings":[], "publication_format":"rift-package-index-v2",
         "analyzer_revision":analyzer, "corpus_revision":"corpus-v1"
     })
 }
@@ -594,7 +594,7 @@ fn capabilities_json() -> String {
     serde_json::json!({
         "supported_package_managers": ["cargo"],
         "supported_features": ["resolutions", "search", "symbols"],
-        "publication_format": "rift-package-index-v1",
+        "publication_format": "rift-package-index-v2",
         "analyzer_revision": "analyzer-v1",
         "corpus_revision": "corpus-v1",
         "required_search_fields": [
@@ -880,7 +880,38 @@ fn test_disabled_client_makes_no_request() {
 fn test_generated_requests_serialize_only_declared_fields() {
     let value = serde_json::to_value(search_request()).expect("search request serialization");
     assert!(value.get("query").is_some());
+    assert!(value.get("target").is_none());
     assert!(value.get("unknown").is_none());
+}
+
+#[test]
+fn test_documentation_request_requires_advertised_capability() {
+    let mut capabilities: Capabilities =
+        serde_json::from_str(&capabilities_json()).expect("capabilities fixture");
+    let mut request = search_request();
+    request.target = Some(PackageSearchRequestTarget::Documentation);
+    assert_eq!(
+        validate_search_request_for_capabilities(&request, 20, None, &capabilities),
+        Err(ClientError::InvalidRequest { field: "target" })
+    );
+
+    capabilities
+        .supported_features
+        .push("documentation_search".to_owned());
+    capabilities.documentation_revision = Some("0123abcd".to_owned());
+    validate_capabilities(&capabilities).expect("valid documentation capability");
+    assert!(validate_search_request_for_capabilities(&request, 20, None, &capabilities).is_ok());
+
+    let mut symbol = symbol_request();
+    symbol.include = Some(vec![PackageSymbolRequestInclude::Documentation]);
+    assert_eq!(
+        validate_symbol_request_for_capabilities(&symbol, 20, None, &capabilities),
+        Err(ClientError::InvalidRequest { field: "include" })
+    );
+    capabilities
+        .supported_features
+        .push("symbol_documentation".to_owned());
+    assert!(validate_symbol_request_for_capabilities(&symbol, 20, None, &capabilities).is_ok());
 }
 
 #[test]
@@ -959,7 +990,10 @@ async fn test_fixture_accepts_additive_nested_symbol_field() {
         .await
         .expect("additive symbol field");
     assert_eq!(page.items.len(), 1);
-    assert_eq!(page.items[0].symbol.name, "demo");
+    let PackageSearchItem::Search(hit) = &page.items[0] else {
+        panic!("legacy search item must remain symbol hit");
+    };
+    assert_eq!(hit.symbol.name, "demo");
 }
 
 #[test]
@@ -1475,6 +1509,7 @@ fn search_request() -> PackageSearchRequest {
         include: None,
         packages: vec![package_request()],
         phase: PackageSearchRequestPhase::Precise,
+        target: None,
     }
 }
 

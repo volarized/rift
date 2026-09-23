@@ -17,6 +17,11 @@
                 "const": "history",
                 "description": "The hit's version-control timeline.",
                 "type": "string"
+              },
+              {
+                "const": "documentation",
+                "description": "Bounded documentation referring to the exact declaration.",
+                "type": "string"
               }
             ]
           },
@@ -177,6 +182,184 @@
             ],
             "type": "object"
           },
+          "DocumentationBlock": {
+            "additionalProperties": false,
+            "description": "Documentation metadata addressing bytes held by an existing content owner.",
+            "properties": {
+              "chunks": {
+                "description": "Existing ranked documents intersecting this block, in source order.",
+                "items": {
+                  "$ref": "#/$defs/DocumentationChunk"
+                },
+                "type": "array"
+              },
+              "content_digest": {
+                "$ref": "#/$defs/DocumentationDigest",
+                "description": "Digest of the block's exact bytes."
+              },
+              "heading_path": {
+                "description": "Headings owning the block, in increasing depth order.",
+                "items": {
+                  "$ref": "#/$defs/DocumentationHeading"
+                },
+                "type": "array"
+              },
+              "identity": {
+                "$ref": "#/$defs/DocumentationDigest",
+                "description": "Digest of canonical source identity and structural position."
+              },
+              "kind": {
+                "$ref": "#/$defs/DocumentationBlockKind",
+                "description": "Whether the range carries prose or code."
+              },
+              "language": {
+                "description": "Authored code language, when supplied by the format.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "line": {
+                "description": "One-based line where the block starts.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "range": {
+                "$ref": "#/$defs/TextRange",
+                "description": "Exact range in the regular source or decoded notebook cell."
+              },
+              "source": {
+                "$ref": "#/$defs/DocumentationContentIdentity",
+                "description": "Source record containing revision, format, origin, and license facts."
+              },
+              "symbol": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/SymbolId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Owning declaration for an attached comment."
+              }
+            },
+            "required": [
+              "identity",
+              "source",
+              "content_digest",
+              "range",
+              "line",
+              "kind"
+            ],
+            "type": "object"
+          },
+          "DocumentationBlockKind": {
+            "description": "The content a documentation block addresses.",
+            "oneOf": [
+              {
+                "const": "prose",
+                "description": "Authored prose and its markup.",
+                "type": "string"
+              },
+              {
+                "const": "code",
+                "description": "Authored code without execution or inferred name resolution.",
+                "type": "string"
+              }
+            ]
+          },
+          "DocumentationChunk": {
+            "additionalProperties": false,
+            "description": "A baseline search document intersecting one block.",
+            "properties": {
+              "identity": {
+                "description": "Existing symbol or text document identity.",
+                "type": "string"
+              },
+              "range": {
+                "$ref": "#/$defs/TextRange",
+                "description": "Exact content range held by this document."
+              }
+            },
+            "required": [
+              "identity",
+              "range"
+            ],
+            "type": "object"
+          },
+          "DocumentationContentIdentity": {
+            "additionalProperties": false,
+            "description": "One content owner: a regular source or decoded notebook cell.",
+            "properties": {
+              "cell": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/NotebookCell"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Decoded cell when the parent source is a notebook."
+              },
+              "source": {
+                "$ref": "#/$defs/DocumentationSourceIdentity",
+                "description": "Original workspace file or package source unit."
+              }
+            },
+            "required": [
+              "source"
+            ],
+            "type": "object"
+          },
+          "DocumentationContext": {
+            "additionalProperties": false,
+            "description": "Bounded documentation context requested for one exact declaration.",
+            "properties": {
+              "documentation_revision": {
+                "$ref": "#/$defs/Digest",
+                "description": "Documentation revision used for the reverse reference lookup."
+              },
+              "references": {
+                "description": "References ordered by evidence, source, block range, and identity.",
+                "items": {
+                  "$ref": "#/$defs/DocumentationReferenceHit"
+                },
+                "maxItems": 32,
+                "type": "array"
+              },
+              "truncated": {
+                "description": "Whether the reference count or total excerpt bytes reached its bound.",
+                "type": "boolean"
+              },
+              "warnings": {
+                "description": "Incomplete source conditions for requested excerpts.",
+                "items": {
+                  "$ref": "#/$defs/DocumentationWarning"
+                },
+                "maxItems": 256,
+                "type": "array"
+              }
+            },
+            "required": [
+              "documentation_revision",
+              "references",
+              "truncated"
+            ],
+            "type": "object"
+          },
+          "DocumentationDigest": {
+            "description": "Full lowercase SHA-256 digest for documentation content and identity.",
+            "examples": [
+              "3f9a1c2e7b4d6a09876543210fedcba9876543210fedcba9876543210fedcba"
+            ],
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
           "DocumentationFormat": {
             "description": "Which markup the text is written in, since whoever displays a doc comment is the one that\nrenders it.",
             "oneOf": [
@@ -188,6 +371,456 @@
               {
                 "const": "markdown",
                 "description": "Markdown as authored in the source.",
+                "type": "string"
+              }
+            ]
+          },
+          "DocumentationHeading": {
+            "additionalProperties": false,
+            "description": "One heading in a block's ordered section path.",
+            "properties": {
+              "level": {
+                "description": "Heading depth established by the format parser.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "name": {
+                "description": "Heading identity, including the parser's duplicate-heading disambiguator.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "level",
+              "name"
+            ],
+            "type": "object"
+          },
+          "DocumentationHit": {
+            "additionalProperties": false,
+            "description": "One documentation block projected from its existing content owner.",
+            "properties": {
+              "block": {
+                "$ref": "#/$defs/DocumentationBlock",
+                "description": "Exact block metadata, including source identity and range."
+              },
+              "documentation_revision": {
+                "$ref": "#/$defs/Digest",
+                "description": "Documentation revision under which this block was published."
+              },
+              "source": {
+                "$ref": "#/$defs/DocumentationSource",
+                "description": "Origin, revision, format, and license of the content owner."
+              }
+            },
+            "required": [
+              "block",
+              "source",
+              "documentation_revision"
+            ],
+            "type": "object"
+          },
+          "DocumentationLicense": {
+            "additionalProperties": false,
+            "description": "License metadata supplied by the source adapter.",
+            "properties": {
+              "expression": {
+                "description": "Declared expression; collection does not infer a license from source text.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "files": {
+                "description": "License files whose bytes the adapter verified.",
+                "items": {
+                  "$ref": "#/$defs/DocumentationLicenseFile"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          },
+          "DocumentationLicenseFile": {
+            "additionalProperties": false,
+            "description": "One license file's address and byte digest.",
+            "properties": {
+              "digest": {
+                "$ref": "#/$defs/DocumentationDigest",
+                "description": "Digest of the license file's original bytes."
+              },
+              "path": {
+                "$ref": "#/$defs/ProjectPath",
+                "description": "Path relative to the source's project or package root."
+              }
+            },
+            "required": [
+              "path",
+              "digest"
+            ],
+            "type": "object"
+          },
+          "DocumentationReference": {
+            "additionalProperties": false,
+            "description": "An exact declaration reference authored inside standalone documentation.",
+            "properties": {
+              "authored": {
+                "description": "Exact authored spelling.",
+                "type": "string"
+              },
+              "block": {
+                "$ref": "#/$defs/DocumentationDigest",
+                "description": "Block containing this reference."
+              },
+              "evidence": {
+                "$ref": "#/$defs/DocumentationReferenceEvidence",
+                "description": "Rule that established the target."
+              },
+              "identity": {
+                "$ref": "#/$defs/DocumentationDigest",
+                "description": "Digest of block, target, evidence, spelling, and occurrence ordinal."
+              },
+              "range": {
+                "$ref": "#/$defs/TextRange",
+                "description": "Reference range in its content owner."
+              },
+              "target": {
+                "$ref": "#/$defs/SymbolId",
+                "description": "Exact declaration this reference describes."
+              }
+            },
+            "required": [
+              "identity",
+              "block",
+              "target",
+              "range",
+              "authored",
+              "evidence"
+            ],
+            "type": "object"
+          },
+          "DocumentationReferenceEvidence": {
+            "description": "Evidence establishing a documentation reference, ordered strongest first.",
+            "oneOf": [
+              {
+                "const": "provider",
+                "description": "A typed contribution naming an exact declaration.",
+                "type": "string"
+              },
+              {
+                "const": "authored_link",
+                "description": "An authored link resolving to one declaration location.",
+                "type": "string"
+              },
+              {
+                "const": "qualified_name",
+                "description": "Inline code equal to one declaration's qualified name.",
+                "type": "string"
+              },
+              {
+                "const": "unique_name",
+                "description": "Inline code equal to one unique declaration name.",
+                "type": "string"
+              }
+            ]
+          },
+          "DocumentationReferenceHit": {
+            "additionalProperties": false,
+            "description": "One exact declaration reference and the documentation containing it.",
+            "properties": {
+              "documentation": {
+                "$ref": "#/$defs/DocumentationHit",
+                "description": "Source block and its origin facts."
+              },
+              "excerpt": {
+                "description": "Bytes read from the existing content owner within the response bound.",
+                "maxLength": 16384,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reference": {
+                "$ref": "#/$defs/DocumentationReference",
+                "description": "Exact reference evidence, never a repeated name lookup."
+              }
+            },
+            "required": [
+              "reference",
+              "documentation"
+            ],
+            "type": "object"
+          },
+          "DocumentationSelectionReason": {
+            "description": "Why the caller selected this source.",
+            "oneOf": [
+              {
+                "const": "workspace",
+                "description": "Visible documentation in the captured workspace.",
+                "type": "string"
+              },
+              {
+                "const": "package_archive",
+                "description": "Source selected from one exact package's acquired bytes.",
+                "type": "string"
+              },
+              {
+                "const": "attached_comment",
+                "description": "Comment supplied by its declaration's syntax provider.",
+                "type": "string"
+              },
+              {
+                "const": "cloud_resolver",
+                "description": "Source supplied by a cloud resolver.",
+                "type": "string"
+              }
+            ]
+          },
+          "DocumentationSource": {
+            "additionalProperties": false,
+            "description": "Source facts shared by every block belonging to one content owner.",
+            "properties": {
+              "byte_length": {
+                "description": "Exact content length in UTF-8 bytes.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "content_digest": {
+                "$ref": "#/$defs/DocumentationDigest",
+                "description": "Digest of the content owner's exact bytes."
+              },
+              "format": {
+                "$ref": "#/$defs/DocumentationSourceFormat",
+                "description": "Parser selected for these bytes."
+              },
+              "identity": {
+                "$ref": "#/$defs/DocumentationContentIdentity",
+                "description": "Canonical address of the bytes block ranges use."
+              },
+              "language": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/Language"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Declared source language, when known."
+              },
+              "license": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/DocumentationLicense"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "License facts recorded by the source adapter."
+              },
+              "media_type": {
+                "description": "Media type supplied by the source adapter.",
+                "type": "string"
+              },
+              "origin": {
+                "$ref": "#/$defs/SymbolOrigin",
+                "description": "Ownership and generation facts supplied by the caller."
+              },
+              "physical_ranges": {
+                "description": "Original JSON string-token ranges for a decoded notebook cell, in source order.",
+                "items": {
+                  "$ref": "#/$defs/TextRange"
+                },
+                "type": "array"
+              },
+              "revision": {
+                "$ref": "#/$defs/DocumentationDigest",
+                "description": "Source revision supplied by the caller."
+              },
+              "selection": {
+                "$ref": "#/$defs/DocumentationSelectionReason",
+                "description": "Why the source adapter selected these bytes."
+              }
+            },
+            "required": [
+              "identity",
+              "revision",
+              "content_digest",
+              "origin",
+              "format",
+              "media_type",
+              "selection",
+              "byte_length"
+            ],
+            "type": "object"
+          },
+          "DocumentationSourceFormat": {
+            "description": "The selected source's format.",
+            "oneOf": [
+              {
+                "const": "markdown",
+                "description": "Markdown block and inline syntax.",
+                "type": "string"
+              },
+              {
+                "const": "mdx",
+                "description": "Recognized Markdown ranges inside MDX.",
+                "type": "string"
+              },
+              {
+                "const": "restructured_text",
+                "description": "Supported reStructuredText block and reference syntax.",
+                "type": "string"
+              },
+              {
+                "const": "text",
+                "description": "Plain text paragraphs.",
+                "type": "string"
+              },
+              {
+                "const": "notebook",
+                "description": "Selected markdown and code cells from a notebook.",
+                "type": "string"
+              },
+              {
+                "const": "attached_comment",
+                "description": "Documentation attached by a syntax provider.",
+                "type": "string"
+              }
+            ]
+          },
+          "DocumentationSourceIdentity": {
+            "description": "The selected source's canonical address.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "A visible workspace file.",
+                "properties": {
+                  "kind": {
+                    "const": "project",
+                    "type": "string"
+                  },
+                  "path": {
+                    "$ref": "#/$defs/ProjectPath",
+                    "description": "Path relative to the workspace root."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "path"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A source unit supplied by an exact package adapter.",
+                "properties": {
+                  "kind": {
+                    "const": "package",
+                    "type": "string"
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/SourceUnitId",
+                    "description": "Canonical package source identity."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "unit"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "DocumentationStage": {
+            "description": "The collection step reporting incomplete documentation.",
+            "oneOf": [
+              {
+                "const": "source",
+                "description": "Source selection and byte validation.",
+                "type": "string"
+              },
+              {
+                "const": "extract",
+                "description": "Format parsing and block extraction.",
+                "type": "string"
+              },
+              {
+                "const": "resolve",
+                "description": "Authored link and declaration reference resolution.",
+                "type": "string"
+              },
+              {
+                "const": "index",
+                "description": "Mapping metadata to existing ranked documents.",
+                "type": "string"
+              }
+            ]
+          },
+          "DocumentationWarning": {
+            "additionalProperties": false,
+            "description": "One bounded warning with repeated conditions counted per source.",
+            "properties": {
+              "count": {
+                "description": "Number of items omitted or truncated for this condition.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "$ref": "#/$defs/DocumentationWarningKind",
+                "description": "Typed condition the caller can inspect."
+              },
+              "source": {
+                "$ref": "#/$defs/DocumentationContentIdentity",
+                "description": "Source whose documentation is incomplete."
+              },
+              "stage": {
+                "$ref": "#/$defs/DocumentationStage",
+                "description": "Collection step reporting the condition."
+              }
+            },
+            "required": [
+              "source",
+              "stage",
+              "kind",
+              "count"
+            ],
+            "type": "object"
+          },
+          "DocumentationWarningKind": {
+            "description": "Why one documentation source is incomplete.",
+            "oneOf": [
+              {
+                "const": "source_unavailable",
+                "description": "Source bytes or their format are unavailable.",
+                "type": "string"
+              },
+              {
+                "const": "source_truncated",
+                "description": "Retained source ends before an addressed range.",
+                "type": "string"
+              },
+              {
+                "const": "unsupported_format",
+                "description": "Format and extension do not select a supported parser.",
+                "type": "string"
+              },
+              {
+                "const": "malformed_source",
+                "description": "Parser refused malformed source.",
+                "type": "string"
+              },
+              {
+                "const": "omitted_range",
+                "description": "Recognized syntax was excluded from documentation metadata.",
+                "type": "string"
+              },
+              {
+                "const": "limit_exceeded",
+                "description": "A configured or format bound stopped output.",
                 "type": "string"
               }
             ]
@@ -262,6 +895,17 @@
             ],
             "description": "One declaration a `get_symbol` lookup found.",
             "properties": {
+              "documentation": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/DocumentationContext"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Exact documentation references, present only when `include` names `documentation`."
+              },
               "history": {
                 "anyOf": [
                   {
@@ -448,6 +1092,85 @@
             "minLength": 27,
             "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
             "type": "string"
+          },
+          "NotebookCell": {
+            "additionalProperties": false,
+            "description": "A selected cell addressed within its parent notebook.",
+            "properties": {
+              "identity": {
+                "$ref": "#/$defs/NotebookCellIdentity",
+                "description": "Authored identifier or original cell position."
+              },
+              "kind": {
+                "$ref": "#/$defs/NotebookCellKind",
+                "description": "Which content the cell carries."
+              }
+            },
+            "required": [
+              "identity",
+              "kind"
+            ],
+            "type": "object"
+          },
+          "NotebookCellIdentity": {
+            "description": "The authored cell identifier or its position when no identifier exists.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "A valid identifier stored in the notebook.",
+                "properties": {
+                  "id": {
+                    "description": "Identifier accepted by the notebook format.",
+                    "type": "string"
+                  },
+                  "kind": {
+                    "const": "authored",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "id"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The cell's zero-based position in its notebook.",
+                "properties": {
+                  "index": {
+                    "description": "Position among every cell, including unselected cells.",
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "kind": {
+                    "const": "indexed",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "index"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "NotebookCellKind": {
+            "description": "The selected notebook cell's content kind.",
+            "oneOf": [
+              {
+                "const": "markdown",
+                "description": "Markdown source decoded from a markdown cell.",
+                "type": "string"
+              },
+              {
+                "const": "code",
+                "description": "Source decoded from a code cell, without execution.",
+                "type": "string"
+              }
+            ]
           },
           "PackageAvailability": {
             "description": "Whether a global package index can answer for one package.",
@@ -642,6 +1365,25 @@
           "ReadWarning": {
             "description": "One warning attached to a read result. The answer stands; the warning carries evidence\nof a condition the caller weighs before relying on it.",
             "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "Documentation collection or excerpt output omitted part of a selected source.",
+                "properties": {
+                  "code": {
+                    "const": "documentation",
+                    "type": "string"
+                  },
+                  "warning": {
+                    "$ref": "#/$defs/DocumentationWarning",
+                    "description": "Bounded source identity, stage, failure label, and omitted count."
+                  }
+                },
+                "required": [
+                  "code",
+                  "warning"
+                ],
+                "type": "object"
+              },
               {
                 "additionalProperties": false,
                 "description": "The answer was computed from an index that lags the tree the read captured. Facts\nderived from the index may miss the newest writes; the digests state which two\ntrees disagree. When the two digests are equal, the tree moved in recorded files\noutside the syntax-indexed ones or in the configuration file, and `detail` says\nwhich.",
@@ -2396,6 +3138,165 @@
             "pattern": "^[0-9a-f]{8}$",
             "type": "string"
           },
+          "DocumentationContentIdentity": {
+            "additionalProperties": false,
+            "description": "One content owner: a regular source or decoded notebook cell.",
+            "properties": {
+              "cell": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/NotebookCell"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Decoded cell when the parent source is a notebook."
+              },
+              "source": {
+                "$ref": "#/$defs/DocumentationSourceIdentity",
+                "description": "Original workspace file or package source unit."
+              }
+            },
+            "required": [
+              "source"
+            ],
+            "type": "object"
+          },
+          "DocumentationSourceIdentity": {
+            "description": "The selected source's canonical address.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "A visible workspace file.",
+                "properties": {
+                  "kind": {
+                    "const": "project",
+                    "type": "string"
+                  },
+                  "path": {
+                    "$ref": "#/$defs/ProjectPath",
+                    "description": "Path relative to the workspace root."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "path"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A source unit supplied by an exact package adapter.",
+                "properties": {
+                  "kind": {
+                    "const": "package",
+                    "type": "string"
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/SourceUnitId",
+                    "description": "Canonical package source identity."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "unit"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "DocumentationStage": {
+            "description": "The collection step reporting incomplete documentation.",
+            "oneOf": [
+              {
+                "const": "source",
+                "description": "Source selection and byte validation.",
+                "type": "string"
+              },
+              {
+                "const": "extract",
+                "description": "Format parsing and block extraction.",
+                "type": "string"
+              },
+              {
+                "const": "resolve",
+                "description": "Authored link and declaration reference resolution.",
+                "type": "string"
+              },
+              {
+                "const": "index",
+                "description": "Mapping metadata to existing ranked documents.",
+                "type": "string"
+              }
+            ]
+          },
+          "DocumentationWarning": {
+            "additionalProperties": false,
+            "description": "One bounded warning with repeated conditions counted per source.",
+            "properties": {
+              "count": {
+                "description": "Number of items omitted or truncated for this condition.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "$ref": "#/$defs/DocumentationWarningKind",
+                "description": "Typed condition the caller can inspect."
+              },
+              "source": {
+                "$ref": "#/$defs/DocumentationContentIdentity",
+                "description": "Source whose documentation is incomplete."
+              },
+              "stage": {
+                "$ref": "#/$defs/DocumentationStage",
+                "description": "Collection step reporting the condition."
+              }
+            },
+            "required": [
+              "source",
+              "stage",
+              "kind",
+              "count"
+            ],
+            "type": "object"
+          },
+          "DocumentationWarningKind": {
+            "description": "Why one documentation source is incomplete.",
+            "oneOf": [
+              {
+                "const": "source_unavailable",
+                "description": "Source bytes or their format are unavailable.",
+                "type": "string"
+              },
+              {
+                "const": "source_truncated",
+                "description": "Retained source ends before an addressed range.",
+                "type": "string"
+              },
+              {
+                "const": "unsupported_format",
+                "description": "Format and extension do not select a supported parser.",
+                "type": "string"
+              },
+              {
+                "const": "malformed_source",
+                "description": "Parser refused malformed source.",
+                "type": "string"
+              },
+              {
+                "const": "omitted_range",
+                "description": "Recognized syntax was excluded from documentation metadata.",
+                "type": "string"
+              },
+              {
+                "const": "limit_exceeded",
+                "description": "A configured or format bound stopped output.",
+                "type": "string"
+              }
+            ]
+          },
           "Duration": {
             "description": "A duration: an integer magnitude with a required unit suffix `ms`, `s`, `m`, `h`, or `d`.",
             "pattern": "^(?:0|[1-9][0-9]*)(?:ms|s|m|h|d)$",
@@ -2751,6 +3652,85 @@
             ],
             "type": "object"
           },
+          "NotebookCell": {
+            "additionalProperties": false,
+            "description": "A selected cell addressed within its parent notebook.",
+            "properties": {
+              "identity": {
+                "$ref": "#/$defs/NotebookCellIdentity",
+                "description": "Authored identifier or original cell position."
+              },
+              "kind": {
+                "$ref": "#/$defs/NotebookCellKind",
+                "description": "Which content the cell carries."
+              }
+            },
+            "required": [
+              "identity",
+              "kind"
+            ],
+            "type": "object"
+          },
+          "NotebookCellIdentity": {
+            "description": "The authored cell identifier or its position when no identifier exists.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "A valid identifier stored in the notebook.",
+                "properties": {
+                  "id": {
+                    "description": "Identifier accepted by the notebook format.",
+                    "type": "string"
+                  },
+                  "kind": {
+                    "const": "authored",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "id"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The cell's zero-based position in its notebook.",
+                "properties": {
+                  "index": {
+                    "description": "Position among every cell, including unselected cells.",
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "kind": {
+                    "const": "indexed",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "index"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "NotebookCellKind": {
+            "description": "The selected notebook cell's content kind.",
+            "oneOf": [
+              {
+                "const": "markdown",
+                "description": "Markdown source decoded from a markdown cell.",
+                "type": "string"
+              },
+              {
+                "const": "code",
+                "description": "Source decoded from a code cell, without execution.",
+                "type": "string"
+              }
+            ]
+          },
           "PackageAvailability": {
             "description": "Whether a global package index can answer for one package.",
             "oneOf": [
@@ -2851,9 +3831,37 @@
             ],
             "type": "object"
           },
+          "ProjectPath": {
+            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
+            "examples": [
+              "src/lib.rs"
+            ],
+            "maxLength": 1000,
+            "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
+            "type": "string"
+          },
           "ReadWarning": {
             "description": "One warning attached to a read result. The answer stands; the warning carries evidence\nof a condition the caller weighs before relying on it.",
             "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "Documentation collection or excerpt output omitted part of a selected source.",
+                "properties": {
+                  "code": {
+                    "const": "documentation",
+                    "type": "string"
+                  },
+                  "warning": {
+                    "$ref": "#/$defs/DocumentationWarning",
+                    "description": "Bounded source identity, stage, failure label, and omitted count."
+                  }
+                },
+                "required": [
+                  "code",
+                  "warning"
+                ],
+                "type": "object"
+              },
               {
                 "additionalProperties": false,
                 "description": "The answer was computed from an index that lags the tree the read captured. Facts\nderived from the index may miss the newest writes; the digests state which two\ntrees disagree. When the two digests are equal, the tree moved in recorded files\noutside the syntax-indexed ones or in the configuration file, and `detail` says\nwhich.",
@@ -3698,6 +4706,13 @@
               }
             ]
           },
+          "SourceUnitId": {
+            "description": "Stable identity of one source unit in the source catalog: a resolver identity, then that\nresolver's canonical unit key in canonical percent-encoding - for the project resolver, the\nproject-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its\nresolver's canonical human-readable key; digests appear on the wire only as short witnesses\nwhere byte-identity is required.",
+            "maxLength": 8192,
+            "minLength": 17,
+            "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,8192}$",
+            "type": "string"
+          },
           "SymbolId": {
             "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name.",
             "examples": [
@@ -4142,6 +5157,11 @@
                 "type": "string"
               },
               {
+                "const": "documentation",
+                "description": "Only collected documentation blocks may match.",
+                "type": "string"
+              },
+              {
                 "const": "all",
                 "description": "Any entity kind may match.",
                 "type": "string"
@@ -4473,6 +5493,148 @@
             ],
             "type": "object"
           },
+          "DocumentationBlock": {
+            "additionalProperties": false,
+            "description": "Documentation metadata addressing bytes held by an existing content owner.",
+            "properties": {
+              "chunks": {
+                "description": "Existing ranked documents intersecting this block, in source order.",
+                "items": {
+                  "$ref": "#/$defs/DocumentationChunk"
+                },
+                "type": "array"
+              },
+              "content_digest": {
+                "$ref": "#/$defs/DocumentationDigest",
+                "description": "Digest of the block's exact bytes."
+              },
+              "heading_path": {
+                "description": "Headings owning the block, in increasing depth order.",
+                "items": {
+                  "$ref": "#/$defs/DocumentationHeading"
+                },
+                "type": "array"
+              },
+              "identity": {
+                "$ref": "#/$defs/DocumentationDigest",
+                "description": "Digest of canonical source identity and structural position."
+              },
+              "kind": {
+                "$ref": "#/$defs/DocumentationBlockKind",
+                "description": "Whether the range carries prose or code."
+              },
+              "language": {
+                "description": "Authored code language, when supplied by the format.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "line": {
+                "description": "One-based line where the block starts.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "range": {
+                "$ref": "#/$defs/TextRange",
+                "description": "Exact range in the regular source or decoded notebook cell."
+              },
+              "source": {
+                "$ref": "#/$defs/DocumentationContentIdentity",
+                "description": "Source record containing revision, format, origin, and license facts."
+              },
+              "symbol": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/SymbolId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Owning declaration for an attached comment."
+              }
+            },
+            "required": [
+              "identity",
+              "source",
+              "content_digest",
+              "range",
+              "line",
+              "kind"
+            ],
+            "type": "object"
+          },
+          "DocumentationBlockKind": {
+            "description": "The content a documentation block addresses.",
+            "oneOf": [
+              {
+                "const": "prose",
+                "description": "Authored prose and its markup.",
+                "type": "string"
+              },
+              {
+                "const": "code",
+                "description": "Authored code without execution or inferred name resolution.",
+                "type": "string"
+              }
+            ]
+          },
+          "DocumentationChunk": {
+            "additionalProperties": false,
+            "description": "A baseline search document intersecting one block.",
+            "properties": {
+              "identity": {
+                "description": "Existing symbol or text document identity.",
+                "type": "string"
+              },
+              "range": {
+                "$ref": "#/$defs/TextRange",
+                "description": "Exact content range held by this document."
+              }
+            },
+            "required": [
+              "identity",
+              "range"
+            ],
+            "type": "object"
+          },
+          "DocumentationContentIdentity": {
+            "additionalProperties": false,
+            "description": "One content owner: a regular source or decoded notebook cell.",
+            "properties": {
+              "cell": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/NotebookCell"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Decoded cell when the parent source is a notebook."
+              },
+              "source": {
+                "$ref": "#/$defs/DocumentationSourceIdentity",
+                "description": "Original workspace file or package source unit."
+              }
+            },
+            "required": [
+              "source"
+            ],
+            "type": "object"
+          },
+          "DocumentationDigest": {
+            "description": "Full lowercase SHA-256 digest for documentation content and identity.",
+            "examples": [
+              "3f9a1c2e7b4d6a09876543210fedcba9876543210fedcba9876543210fedcba"
+            ],
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
           "DocumentationFormat": {
             "description": "Which markup the text is written in, since whoever displays a doc comment is the one that\nrenders it.",
             "oneOf": [
@@ -4484,6 +5646,365 @@
               {
                 "const": "markdown",
                 "description": "Markdown as authored in the source.",
+                "type": "string"
+              }
+            ]
+          },
+          "DocumentationHeading": {
+            "additionalProperties": false,
+            "description": "One heading in a block's ordered section path.",
+            "properties": {
+              "level": {
+                "description": "Heading depth established by the format parser.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "name": {
+                "description": "Heading identity, including the parser's duplicate-heading disambiguator.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "level",
+              "name"
+            ],
+            "type": "object"
+          },
+          "DocumentationHit": {
+            "additionalProperties": false,
+            "description": "One documentation block projected from its existing content owner.",
+            "properties": {
+              "block": {
+                "$ref": "#/$defs/DocumentationBlock",
+                "description": "Exact block metadata, including source identity and range."
+              },
+              "documentation_revision": {
+                "$ref": "#/$defs/Digest",
+                "description": "Documentation revision under which this block was published."
+              },
+              "source": {
+                "$ref": "#/$defs/DocumentationSource",
+                "description": "Origin, revision, format, and license of the content owner."
+              }
+            },
+            "required": [
+              "block",
+              "source",
+              "documentation_revision"
+            ],
+            "type": "object"
+          },
+          "DocumentationLicense": {
+            "additionalProperties": false,
+            "description": "License metadata supplied by the source adapter.",
+            "properties": {
+              "expression": {
+                "description": "Declared expression; collection does not infer a license from source text.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "files": {
+                "description": "License files whose bytes the adapter verified.",
+                "items": {
+                  "$ref": "#/$defs/DocumentationLicenseFile"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          },
+          "DocumentationLicenseFile": {
+            "additionalProperties": false,
+            "description": "One license file's address and byte digest.",
+            "properties": {
+              "digest": {
+                "$ref": "#/$defs/DocumentationDigest",
+                "description": "Digest of the license file's original bytes."
+              },
+              "path": {
+                "$ref": "#/$defs/ProjectPath",
+                "description": "Path relative to the source's project or package root."
+              }
+            },
+            "required": [
+              "path",
+              "digest"
+            ],
+            "type": "object"
+          },
+          "DocumentationSelectionReason": {
+            "description": "Why the caller selected this source.",
+            "oneOf": [
+              {
+                "const": "workspace",
+                "description": "Visible documentation in the captured workspace.",
+                "type": "string"
+              },
+              {
+                "const": "package_archive",
+                "description": "Source selected from one exact package's acquired bytes.",
+                "type": "string"
+              },
+              {
+                "const": "attached_comment",
+                "description": "Comment supplied by its declaration's syntax provider.",
+                "type": "string"
+              },
+              {
+                "const": "cloud_resolver",
+                "description": "Source supplied by a cloud resolver.",
+                "type": "string"
+              }
+            ]
+          },
+          "DocumentationSource": {
+            "additionalProperties": false,
+            "description": "Source facts shared by every block belonging to one content owner.",
+            "properties": {
+              "byte_length": {
+                "description": "Exact content length in UTF-8 bytes.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "content_digest": {
+                "$ref": "#/$defs/DocumentationDigest",
+                "description": "Digest of the content owner's exact bytes."
+              },
+              "format": {
+                "$ref": "#/$defs/DocumentationSourceFormat",
+                "description": "Parser selected for these bytes."
+              },
+              "identity": {
+                "$ref": "#/$defs/DocumentationContentIdentity",
+                "description": "Canonical address of the bytes block ranges use."
+              },
+              "language": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/Language"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Declared source language, when known."
+              },
+              "license": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/DocumentationLicense"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "License facts recorded by the source adapter."
+              },
+              "media_type": {
+                "description": "Media type supplied by the source adapter.",
+                "type": "string"
+              },
+              "origin": {
+                "$ref": "#/$defs/SymbolOrigin",
+                "description": "Ownership and generation facts supplied by the caller."
+              },
+              "physical_ranges": {
+                "description": "Original JSON string-token ranges for a decoded notebook cell, in source order.",
+                "items": {
+                  "$ref": "#/$defs/TextRange"
+                },
+                "type": "array"
+              },
+              "revision": {
+                "$ref": "#/$defs/DocumentationDigest",
+                "description": "Source revision supplied by the caller."
+              },
+              "selection": {
+                "$ref": "#/$defs/DocumentationSelectionReason",
+                "description": "Why the source adapter selected these bytes."
+              }
+            },
+            "required": [
+              "identity",
+              "revision",
+              "content_digest",
+              "origin",
+              "format",
+              "media_type",
+              "selection",
+              "byte_length"
+            ],
+            "type": "object"
+          },
+          "DocumentationSourceFormat": {
+            "description": "The selected source's format.",
+            "oneOf": [
+              {
+                "const": "markdown",
+                "description": "Markdown block and inline syntax.",
+                "type": "string"
+              },
+              {
+                "const": "mdx",
+                "description": "Recognized Markdown ranges inside MDX.",
+                "type": "string"
+              },
+              {
+                "const": "restructured_text",
+                "description": "Supported reStructuredText block and reference syntax.",
+                "type": "string"
+              },
+              {
+                "const": "text",
+                "description": "Plain text paragraphs.",
+                "type": "string"
+              },
+              {
+                "const": "notebook",
+                "description": "Selected markdown and code cells from a notebook.",
+                "type": "string"
+              },
+              {
+                "const": "attached_comment",
+                "description": "Documentation attached by a syntax provider.",
+                "type": "string"
+              }
+            ]
+          },
+          "DocumentationSourceIdentity": {
+            "description": "The selected source's canonical address.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "A visible workspace file.",
+                "properties": {
+                  "kind": {
+                    "const": "project",
+                    "type": "string"
+                  },
+                  "path": {
+                    "$ref": "#/$defs/ProjectPath",
+                    "description": "Path relative to the workspace root."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "path"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A source unit supplied by an exact package adapter.",
+                "properties": {
+                  "kind": {
+                    "const": "package",
+                    "type": "string"
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/SourceUnitId",
+                    "description": "Canonical package source identity."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "unit"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "DocumentationStage": {
+            "description": "The collection step reporting incomplete documentation.",
+            "oneOf": [
+              {
+                "const": "source",
+                "description": "Source selection and byte validation.",
+                "type": "string"
+              },
+              {
+                "const": "extract",
+                "description": "Format parsing and block extraction.",
+                "type": "string"
+              },
+              {
+                "const": "resolve",
+                "description": "Authored link and declaration reference resolution.",
+                "type": "string"
+              },
+              {
+                "const": "index",
+                "description": "Mapping metadata to existing ranked documents.",
+                "type": "string"
+              }
+            ]
+          },
+          "DocumentationWarning": {
+            "additionalProperties": false,
+            "description": "One bounded warning with repeated conditions counted per source.",
+            "properties": {
+              "count": {
+                "description": "Number of items omitted or truncated for this condition.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "$ref": "#/$defs/DocumentationWarningKind",
+                "description": "Typed condition the caller can inspect."
+              },
+              "source": {
+                "$ref": "#/$defs/DocumentationContentIdentity",
+                "description": "Source whose documentation is incomplete."
+              },
+              "stage": {
+                "$ref": "#/$defs/DocumentationStage",
+                "description": "Collection step reporting the condition."
+              }
+            },
+            "required": [
+              "source",
+              "stage",
+              "kind",
+              "count"
+            ],
+            "type": "object"
+          },
+          "DocumentationWarningKind": {
+            "description": "Why one documentation source is incomplete.",
+            "oneOf": [
+              {
+                "const": "source_unavailable",
+                "description": "Source bytes or their format are unavailable.",
+                "type": "string"
+              },
+              {
+                "const": "source_truncated",
+                "description": "Retained source ends before an addressed range.",
+                "type": "string"
+              },
+              {
+                "const": "unsupported_format",
+                "description": "Format and extension do not select a supported parser.",
+                "type": "string"
+              },
+              {
+                "const": "malformed_source",
+                "description": "Parser refused malformed source.",
+                "type": "string"
+              },
+              {
+                "const": "omitted_range",
+                "description": "Recognized syntax was excluded from documentation metadata.",
+                "type": "string"
+              },
+              {
+                "const": "limit_exceeded",
+                "description": "A configured or format bound stopped output.",
                 "type": "string"
               }
             ]
@@ -4731,6 +6252,85 @@
             "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
             "type": "string"
           },
+          "NotebookCell": {
+            "additionalProperties": false,
+            "description": "A selected cell addressed within its parent notebook.",
+            "properties": {
+              "identity": {
+                "$ref": "#/$defs/NotebookCellIdentity",
+                "description": "Authored identifier or original cell position."
+              },
+              "kind": {
+                "$ref": "#/$defs/NotebookCellKind",
+                "description": "Which content the cell carries."
+              }
+            },
+            "required": [
+              "identity",
+              "kind"
+            ],
+            "type": "object"
+          },
+          "NotebookCellIdentity": {
+            "description": "The authored cell identifier or its position when no identifier exists.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "A valid identifier stored in the notebook.",
+                "properties": {
+                  "id": {
+                    "description": "Identifier accepted by the notebook format.",
+                    "type": "string"
+                  },
+                  "kind": {
+                    "const": "authored",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "id"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The cell's zero-based position in its notebook.",
+                "properties": {
+                  "index": {
+                    "description": "Position among every cell, including unselected cells.",
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "kind": {
+                    "const": "indexed",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "index"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "NotebookCellKind": {
+            "description": "The selected notebook cell's content kind.",
+            "oneOf": [
+              {
+                "const": "markdown",
+                "description": "Markdown source decoded from a markdown cell.",
+                "type": "string"
+              },
+              {
+                "const": "code",
+                "description": "Source decoded from a code cell, without execution.",
+                "type": "string"
+              }
+            ]
+          },
           "PackageAvailability": {
             "description": "Whether a global package index can answer for one package.",
             "oneOf": [
@@ -4924,6 +6524,25 @@
           "ReadWarning": {
             "description": "One warning attached to a read result. The answer stands; the warning carries evidence\nof a condition the caller weighs before relying on it.",
             "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "Documentation collection or excerpt output omitted part of a selected source.",
+                "properties": {
+                  "code": {
+                    "const": "documentation",
+                    "type": "string"
+                  },
+                  "warning": {
+                    "$ref": "#/$defs/DocumentationWarning",
+                    "description": "Bounded source identity, stage, failure label, and omitted count."
+                  }
+                },
+                "required": [
+                  "code",
+                  "warning"
+                ],
+                "type": "object"
+              },
               {
                 "additionalProperties": false,
                 "description": "The answer was computed from an index that lags the tree the read captured. Facts\nderived from the index may miss the newest writes; the digests state which two\ntrees disagree. When the two digests are equal, the tree moved in recorded files\noutside the syntax-indexed ones or in the configuration file, and `detail` says\nwhich.",
@@ -5974,6 +7593,25 @@
           "SearchHitTarget": {
             "description": "What a search hit is. Tagged, so the payload correlation survives code generation.",
             "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "A documentation block projected from an existing text or symbol document.",
+                "properties": {
+                  "documentation": {
+                    "$ref": "#/$defs/DocumentationHit",
+                    "description": "Block, source, and collector revision answering this match."
+                  },
+                  "target": {
+                    "const": "documentation",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "target",
+                  "documentation"
+                ],
+                "type": "object"
+              },
               {
                 "additionalProperties": false,
                 "description": "A symbol hit: the declaration a provider resolved.",

@@ -4,6 +4,8 @@ mod change_set;
 mod chunk;
 mod database;
 mod dependency;
+mod documentation;
+mod documentation_store;
 mod glob;
 mod language;
 mod lexical;
@@ -38,6 +40,11 @@ pub use relationship::{
     RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore, produced_relationship_facets,
 };
 pub use revision::RevisionPaths;
+pub use rift_analysis::documentation::{
+    DocumentationCollection, DocumentationError, documentation_context,
+    documentation_context_with_budget,
+};
+pub use rift_analysis::documentation::{DocumentationProjection, DocumentationProjectionTarget};
 pub use vector::{StoredVector, VectorStore};
 pub use workspace::{
     IndexedFile, ReadableSymbol, SymbolMatch, TextSourceFile, WorkspaceFingerprint, WorkspaceIndex,

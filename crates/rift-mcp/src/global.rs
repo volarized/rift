@@ -10,8 +10,8 @@ use rift_cloud_client::{
     ClientError, Config, ConfigError, GlobalClient, PackageAvailability as WireAvailability,
     PackageContextEntry as WireContextEntry, PackageIdentity as WirePackageIdentity,
     PackageResolutionRequest, PackageSearchCandidate, PackageSearchRequest,
-    PackageSearchRequestPhase, PackageSymbolCandidate, PackageSymbolRequest, QueryTerm, Warning,
-    WarningCode,
+    PackageSearchRequestPhase, PackageSearchRequestTarget, PackageSymbolCandidate,
+    PackageSymbolRequest, PackageSymbolRequestInclude, QueryTerm, Warning, WarningCode,
 };
 use rift_dependency::DependencyContext;
 use rift_protocol::configuration::GlobalConfiguration;
@@ -232,6 +232,9 @@ pub(crate) async fn package_search(
     query: &ParsedQuery,
     packages: &[WirePackageIdentity],
 ) -> Result<GlobalSearchCandidates, ClientError> {
+    if params.target == rift_protocol::read::SearchParamsTarget::File {
+        return Ok(GlobalSearchCandidates::default());
+    }
     let page_limit = rift_cloud_client::PAGE_LIMIT_MAX;
     let precise_page = client
         .search_packages_pages(
@@ -305,11 +308,15 @@ fn extend_page_warnings(target: &mut Vec<ReadWarning>, warnings: Vec<Warning>) {
     }
 }
 
-fn symbol_include(params: &GetSymbolParams) -> Option<Vec<String>> {
-    params
-        .include
-        .contains(&GetSymbolInclude::Source)
-        .then(|| vec!["source".to_owned()])
+fn symbol_include(params: &GetSymbolParams) -> Option<Vec<PackageSymbolRequestInclude>> {
+    let mut fields = Vec::new();
+    if params.include.contains(&GetSymbolInclude::Source) {
+        fields.push(PackageSymbolRequestInclude::Source);
+    }
+    if params.include.contains(&GetSymbolInclude::Documentation) {
+        fields.push(PackageSymbolRequestInclude::Documentation);
+    }
+    (!fields.is_empty()).then_some(fields)
 }
 
 fn search_request(
@@ -344,6 +351,14 @@ fn search_request(
         phase: match phase {
             QueryPhase::Precise => PackageSearchRequestPhase::Precise,
             QueryPhase::Broad => PackageSearchRequestPhase::Broad,
+        },
+        target: match params.target {
+            rift_protocol::read::SearchParamsTarget::Symbol
+            | rift_protocol::read::SearchParamsTarget::File => None,
+            rift_protocol::read::SearchParamsTarget::Documentation => {
+                Some(PackageSearchRequestTarget::Documentation)
+            }
+            rift_protocol::read::SearchParamsTarget::All => Some(PackageSearchRequestTarget::All),
         },
     }
 }
@@ -624,6 +639,9 @@ fn search_identity(hit: &SearchHit) -> Result<DocumentIdentity, ClientError> {
                     .clone(),
             ),
             SearchHitTarget::Node { node } => DocumentIdentity::new(node.0.clone()),
+            SearchHitTarget::Documentation { documentation } => {
+                DocumentIdentity::for_documentation_block(&documentation.block.identity.0)
+            }
         };
     identity.map_err(|_| ClientError::InvalidResponseField {
         field: "search_identity",
@@ -655,6 +673,7 @@ fn search_hit_key(hit: &SearchHit) -> &str {
             .map_or(symbol.name.as_str(), |identity| identity.0.as_str()),
         SearchHitTarget::File { .. } => hit.path.as_ref().map_or("", |path| path.0.as_str()),
         SearchHitTarget::Node { node } => node.0.as_str(),
+        SearchHitTarget::Documentation { documentation } => documentation.block.identity.0.as_str(),
     }
 }
 

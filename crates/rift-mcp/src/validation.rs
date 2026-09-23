@@ -1620,10 +1620,11 @@ impl LexicalWrite {
         &self,
         store: &Store,
         tree_revision: &str,
+        documentation: &rift_index::DocumentationCollection,
     ) -> Result<(), SearchError> {
         match self {
-            Self::Whole(units) => store.replace(units, tree_revision).await,
-            Self::Change(change) => store.apply(change, tree_revision).await,
+            Self::Whole(units) => store.replace(units, tree_revision, documentation).await,
+            Self::Change(change) => store.apply(change, tree_revision, documentation).await,
         }
     }
 }
@@ -1652,6 +1653,7 @@ pub(crate) trait LexicalStore: Send + Sync + 'static {
         &self,
         units: &[IndexDocument],
         tree_revision: &str,
+        documentation: &rift_index::DocumentationCollection,
     ) -> impl Future<Output = Result<(), SearchError>> + Send;
 
     /// Applies `change` and stamps `tree_revision`, in one transaction.
@@ -1659,6 +1661,7 @@ pub(crate) trait LexicalStore: Send + Sync + 'static {
         &self,
         change: &LexicalChange,
         tree_revision: &str,
+        documentation: &rift_index::DocumentationCollection,
     ) -> impl Future<Output = Result<(), SearchError>> + Send;
 }
 
@@ -1667,16 +1670,18 @@ impl LexicalStore for SearchIndex {
         &self,
         units: &[IndexDocument],
         tree_revision: &str,
+        documentation: &rift_index::DocumentationCollection,
     ) -> impl Future<Output = Result<(), SearchError>> + Send {
-        self.replace_lexical(units, tree_revision)
+        self.replace_lexical_with_documentation(units, tree_revision, documentation)
     }
 
     fn apply(
         &self,
         change: &LexicalChange,
         tree_revision: &str,
+        documentation: &rift_index::DocumentationCollection,
     ) -> impl Future<Output = Result<(), SearchError>> + Send {
-        self.apply_lexical(change, tree_revision)
+        self.apply_lexical_with_documentation(change, tree_revision, documentation)
     }
 }
 
@@ -2032,6 +2037,7 @@ impl<Store: LexicalStore> LexicalTask<Store> {
     async fn transaction(&self, commit: LexicalCommit, whole_owed: bool) -> Result<(), ReadError> {
         let LexicalCommit { write, published } = commit;
         let tree_revision = published.reads.tree_revision().to_owned();
+        let documentation = published.reads.documentation_snapshot();
         let write = match (whole_owed, write) {
             (true, LexicalWrite::Change(_)) => self.whole_set(published).await?,
             (_, write) => {
@@ -2043,14 +2049,14 @@ impl<Store: LexicalStore> LexicalTask<Store> {
         };
         let (write, left_out) = write.within_unit_bound(self.unit_bytes_max);
         record_units_left_out(&left_out, self.unit_bytes_max);
-        if write.is_empty() {
-            return Ok(());
-        }
+        // A source selection or resolved reference can change metadata without changing
+        // lexical documents. Commit the revision and metadata even for an empty delta.
         let deadline = commit_deadline(write.unit_count());
         let form = write.form();
         let store = Arc::clone(&self.store);
         let stamped = tree_revision.clone();
-        let mut running = tokio::spawn(async move { write.commit_to(&*store, &stamped).await });
+        let mut running =
+            tokio::spawn(async move { write.commit_to(&*store, &stamped, &documentation).await });
         let ended = tokio::select! {
             ended = wait_for_transaction(&mut running, &tree_revision, form, deadline) => ended,
             () = self.cancellation.cancelled() => {
@@ -2947,10 +2953,15 @@ pub(crate) mod lexical_double {
             &self,
             units: &[IndexDocument],
             tree_revision: &str,
+            documentation: &rift_index::DocumentationCollection,
         ) -> Result<(), SearchError> {
             let through = async {
                 match self.attached() {
-                    Some(index) => index.replace_lexical(units, tree_revision).await,
+                    Some(index) => {
+                        index
+                            .replace_lexical_with_documentation(units, tree_revision, documentation)
+                            .await
+                    }
                     None => Ok(()),
                 }
             };
@@ -2961,6 +2972,7 @@ pub(crate) mod lexical_double {
             &self,
             change: &LexicalChange,
             tree_revision: &str,
+            documentation: &rift_index::DocumentationCollection,
         ) -> Result<(), SearchError> {
             let through = async {
                 if self.refuse_changes.load(Ordering::SeqCst) {
@@ -2970,7 +2982,11 @@ pub(crate) mod lexical_double {
                     ));
                 }
                 match self.attached() {
-                    Some(index) => index.apply_lexical(change, tree_revision).await,
+                    Some(index) => {
+                        index
+                            .apply_lexical_with_documentation(change, tree_revision, documentation)
+                            .await
+                    }
                     None => Ok(()),
                 }
             };

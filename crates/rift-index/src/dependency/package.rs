@@ -5,20 +5,25 @@
 //! and compares, and answers reads from the same pass's parsed material, so no package is
 //! parsed twice.
 
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use rift_core::{ErrorContext, ProjectPath, SourceUnitId, symbol_identity};
 use rift_dependency::CatalogEntry;
-use rift_protocol::index::PackagePublication;
+use rift_protocol::documentation::{DocumentationContentIdentity, DocumentationSourceIdentity};
+use rift_protocol::index::{PackageDocumentKind, PackagePublication};
 use rift_protocol::read::PackageIdentity;
 use rift_syntax::SyntaxSymbol;
 
-use super::analyzer::{AnalyzedFile, PackageAnalysis, PackageAnalyzer};
+use super::analyzer::{AnalyzedFile, PackageAnalysis};
 use super::failure::{PackageIndexError, PackageIndexFault, PackageIndexViolation};
 use super::walk::PackageFiles;
 use crate::semantic::WorkspaceSemantics;
-use rift_ranking::{DocumentIdentity, DocumentKind, DocumentLocation, IndexDocument, MemoryIndex};
+use rift_ranking::{
+    DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, IndexDocument, MemoryIndex,
+    SearchableField,
+};
 
 use super::manifest::analyzer_revision;
 
@@ -34,6 +39,8 @@ use crate::workspace::{
 pub struct PackageIndex {
     entry: CatalogEntry,
     publication: PackagePublication,
+    documentation: Arc<rift_analysis::documentation::DocumentationCollection>,
+    notebook_cells: BTreeMap<DocumentationContentIdentity, String>,
     files: Vec<AnalyzedFile>,
     declaration_count: usize,
     byte_count: u64,
@@ -55,7 +62,7 @@ impl PackageIndex {
         files: &PackageFiles,
         revision: u64,
     ) -> Result<Self, PackageIndexError> {
-        let analysis = PackageAnalyzer::analyze(entry, files, revision)?;
+        let analysis = super::analyzer::analyze(entry, files, revision)?;
         Ok(Self::from_analysis(
             entry,
             analysis,
@@ -65,6 +72,10 @@ impl PackageIndex {
     }
 
     /// Holds one analyzer run as a readable package index.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if package analysis returns invalid documentation facts.
     #[must_use]
     pub fn from_analysis(
         entry: &CatalogEntry,
@@ -72,11 +83,19 @@ impl PackageIndex {
         byte_count: u64,
         skipped_binary: usize,
     ) -> Self {
-        let (publication, files, semantics) = analysis.into_parts();
+        let (publication, files, semantics, notebook_cells) = analysis.into_parts();
         let declaration_count = publication.symbols.len();
+        let documentation = Arc::new(
+            rift_analysis::documentation::DocumentationCollection::new(
+                publication.documentation.clone(),
+            )
+            .expect("package analyzer returns validated documentation facts"),
+        );
         Self {
             entry: entry.clone(),
             publication,
+            documentation,
+            notebook_cells,
             files,
             declaration_count,
             byte_count,
@@ -127,6 +146,36 @@ impl PackageIndex {
     #[must_use]
     pub const fn publication(&self) -> &PackagePublication {
         &self.publication
+    }
+
+    /// The validated documentation metadata this package index reads from.
+    #[must_use]
+    pub fn documentation(&self) -> &rift_analysis::documentation::DocumentationCollection {
+        &self.documentation
+    }
+
+    /// Holds one documentation metadata snapshot for a publication operation.
+    #[must_use]
+    pub fn documentation_snapshot(
+        &self,
+    ) -> Arc<rift_analysis::documentation::DocumentationCollection> {
+        Arc::clone(&self.documentation)
+    }
+
+    /// Returns retained source bytes for one documentation content owner.
+    #[must_use]
+    pub fn documentation_content(&self, identity: &DocumentationContentIdentity) -> Option<&str> {
+        let DocumentationSourceIdentity::Package { unit } = &identity.source else {
+            return None;
+        };
+        let unit = unit.0.parse::<SourceUnitId>().ok()?;
+        if identity.cell.is_some() {
+            return self.notebook_cells.get(identity).map(String::as_str);
+        }
+        self.files
+            .iter()
+            .find(|held| held.placement().unit() == &unit)
+            .map(|held| held.file().source())
     }
 
     /// The package as its manager identifies it.
@@ -184,7 +233,8 @@ impl PackageIndex {
     #[must_use]
     pub fn index_documents(&self) -> Vec<IndexDocument> {
         let package = self.identity().clone();
-        let mut documents = Vec::with_capacity(self.declaration_count);
+        let mut documents =
+            Vec::with_capacity(self.declaration_count + self.publication.documents.len());
         let mut left_out = 0_usize;
         // The analyzed files carry their own placement, so the unit a document is
         // addressed by comes from the file rather than from a lookup that could
@@ -200,6 +250,40 @@ impl PackageIndex {
                     Some(document) => documents.push(document.in_package(package.clone())),
                     None => left_out += 1,
                 }
+            }
+        }
+        for source in self
+            .publication
+            .documents
+            .iter()
+            .filter(|document| document.kind == PackageDocumentKind::File)
+        {
+            let Ok(identity) = DocumentIdentity::new(&source.identity) else {
+                left_out += 1;
+                continue;
+            };
+            let fields = DocumentFields::empty()
+                .with(SearchableField::Name, source.name.clone())
+                .with(
+                    SearchableField::IdentifierTerms,
+                    source.identifier_terms.join(" "),
+                )
+                .with_optional(SearchableField::FileContent, source.file_content.clone());
+            match IndexDocument::new(
+                identity,
+                DocumentLocation::Unit(source.unit.0.parse().unwrap_or_else(|error| {
+                    unreachable!("validated package unit must parse: error={error}")
+                })),
+                DocumentKind::TextFile,
+                fields.digest(),
+                fields,
+            ) {
+                Ok(document) => documents.push(
+                    document
+                        .in_language(source.language.clone())
+                        .in_package(source.package.clone()),
+                ),
+                Err(_) => left_out += 1,
             }
         }
         if left_out > 0 {
@@ -308,16 +392,19 @@ mod tests {
     }
 
     #[test]
-    fn test_a_package_publishes_one_document_per_exported_declaration() {
+    fn test_a_package_indexes_exported_declarations_and_file_content() {
         let package = published_package();
         let documents = package.index_documents();
 
         assert_eq!(
             documents.len(),
-            1,
-            "a declaration the package does not export is no document a caller reaches"
+            2,
+            "one file document accompanies the exported declaration"
         );
-        let document = &documents[0];
+        let document = documents
+            .iter()
+            .find(|document| document.kind() == rift_ranking::DocumentKind::Symbol)
+            .expect("exported declaration document");
         assert_eq!(
             document.identity().as_str(),
             "rift://source/cargo/tokio@1.53.1/src/lib.rs#spawn"
@@ -350,6 +437,56 @@ mod tests {
                 .is_some_and(|source| source.contains("pub fn spawn")),
             "a package document carries the declaration's own source"
         );
+        assert!(documents.iter().any(|document| {
+            document.kind() == rift_ranking::DocumentKind::TextFile
+                && document
+                    .fields()
+                    .get(rift_ranking::SearchableField::FileContent)
+                    .is_some_and(|content| content.contains("fn hidden"))
+        }));
+    }
+
+    #[test]
+    fn test_cached_package_indexes_file_content_and_attached_comment_metadata() {
+        use rift_protocol::documentation::{DocumentationBlockKind, DocumentationSourceFormat};
+
+        let source = "/// Runs one task.\npub fn spawn() {}\n";
+        let entry = CatalogEntry::dependency(
+            tokio(),
+            language(ShippedLanguage::Rust),
+            Some(PathBuf::from("/cache/tokio-1.53.1")),
+            true,
+        );
+        let files = PackageFiles::new(vec![text("src/lib.rs", source)], 0);
+        let package = PackageIndex::build(&entry, &files, 7).expect("cached package builds");
+
+        let file_document = package
+            .index_documents()
+            .into_iter()
+            .find(|document| document.kind() == rift_ranking::DocumentKind::TextFile)
+            .expect("cached package file remains ranked");
+        assert_eq!(
+            file_document
+                .fields()
+                .get(rift_ranking::SearchableField::FileContent),
+            Some(source)
+        );
+        let index = package.documentation().index();
+        let block = index
+            .blocks
+            .iter()
+            .find(|block| block.kind == DocumentationBlockKind::Prose)
+            .expect("attached comment metadata");
+        assert!(index.sources.iter().any(|record| {
+            record.identity == block.source
+                && record.format == DocumentationSourceFormat::AttachedComment
+        }));
+        assert_eq!(package.documentation_content(&block.source), Some(source));
+        assert_eq!(
+            &source[usize::try_from(block.range.start).expect("range start")
+                ..usize::try_from(block.range.end).expect("range end")],
+            "/// Runs one task.\n"
+        );
     }
 
     #[tokio::test]
@@ -371,7 +508,10 @@ mod tests {
                 .iter()
                 .map(|ranked| ranked.identity().as_str())
                 .collect::<Vec<&str>>(),
-            ["rift://source/cargo/tokio@1.53.1/src/lib.rs#spawn"]
+            [
+                "rift://source/cargo/tokio@1.53.1/src/lib.rs#spawn",
+                "rift://source/cargo/tokio@1.53.1/src/lib.rs"
+            ]
         );
         package
             .reader()
@@ -432,7 +572,10 @@ mod tests {
                 .iter()
                 .map(|entry| entry.identity().as_str())
                 .collect::<Vec<_>>(),
-            ["rift://source/cargo/tokio@1.53.1/src/lib.rs#spawn"],
+            [
+                "rift://source/cargo/tokio@1.53.1/src/lib.rs#spawn",
+                "rift://source/cargo/tokio@1.53.1/src/lib.rs"
+            ],
             "a package publication ranks through the same contract the project store does"
         );
         let read = published
@@ -485,6 +628,13 @@ mod tests {
         );
         assert_eq!(readable.assembled().index_revision().get(), 7);
         assert_eq!(readable.facts().visibility_spelling(), Some("pub"));
+        let published = package
+            .publication()
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "spawn")
+            .expect("published declaration");
+        assert_eq!(published.presentation, readable.to_protocol_symbol());
     }
 
     #[test]

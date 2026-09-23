@@ -25,7 +25,7 @@ use rift_protocol::read::{
     GetSymbolParams, GetSymbolResult, Language, Node, NodeFacet, NodeId, NodesParams, NodesResult,
     PAGE_LIMIT_MAX, PackageIdentity, Pagination, ProjectPath, ReadWarning, RevisionId,
     SOURCE_WARNINGS_MAX, SearchScope, SourceLocationKind, SourceUnitId, Symbol, SymbolId,
-    SymbolOrigin, TextRange,
+    TextRange,
 };
 use rift_ranking::IdentifierMatchClass;
 use rift_syntax::{ByteRange, SyntaxNode, SyntaxProvider, SyntaxSymbol, registry};
@@ -62,6 +62,8 @@ pub enum ReadFault {
 
     /// A cataloged package's index could not assemble the declaration a lookup matched.
     Dependency(Box<PackageIndexError>),
+    /// Documentation metadata could not answer the requested projection.
+    Documentation(Box<rift_index::DocumentationError>),
     /// A thread panicked while holding one of the service's locks, so what the lock
     /// guards may be half-written and no holder takes it again.
     LockPoisoned {
@@ -138,6 +140,7 @@ impl Fault for ReadFault {
             Self::Engine(source) => source.name(),
 
             Self::Dependency(source) => source.name(),
+            Self::Documentation(source) => source.name(),
             Self::Unsupported { .. } | Self::UnclaimedExtension { .. } => {
                 ErrorName::Wire(ErrorCode::CapabilityUnavailable)
             }
@@ -163,6 +166,7 @@ impl Fault for ReadFault {
             Self::Engine(source) => source.context(),
 
             Self::Dependency(source) => source.context(),
+            Self::Documentation(source) => source.context(),
             Self::LockPoisoned { lock } => vec![
                 ErrorContext::new("lock", *lock),
                 ErrorContext::new("detail", format!("{lock} lock poisoned")),
@@ -212,6 +216,7 @@ impl Fault for ReadFault {
             Self::Engine(source) => source.fault().limit_evidence(),
 
             Self::Dependency(source) => source.fault().limit_evidence(),
+            Self::Documentation(source) => source.fault().limit_evidence(),
             Self::Unsupported { .. }
             | Self::UnclaimedExtension { .. }
             | Self::Invalid { .. }
@@ -233,6 +238,7 @@ impl Fault for ReadFault {
             Self::Engine(source) => Some(source),
 
             Self::Dependency(source) => Some(source.as_ref()),
+            Self::Documentation(source) => Some(source.as_ref()),
             Self::Unsupported { .. }
             | Self::UnclaimedExtension { .. }
             | Self::Invalid { .. }
@@ -327,6 +333,10 @@ impl ReadFault {
     /// The failure is boxed so the read fault stays small on every `Result` it rides.
     pub(crate) fn dependency(source: PackageIndexError) -> ReadError {
         Error::new(Self::Dependency(Box::new(source)))
+    }
+
+    pub(crate) fn documentation(source: rift_index::DocumentationError) -> ReadError {
+        Error::new(Self::Documentation(Box::new(source)))
     }
 
     /// Classifies a lock a holder panicked under.
@@ -805,6 +815,12 @@ impl ReadService {
         self.index.index_documents()
     }
 
+    /// Shares this captured tree's validated documentation metadata for atomic publication.
+    #[must_use]
+    pub fn documentation_snapshot(&self) -> Arc<rift_index::DocumentationCollection> {
+        self.index.documentation_snapshot()
+    }
+
     /// Returns each baseline text file split into more than one lexical
     /// chunk, paired with its chunk count, so a caller can warn about the
     /// split instead of it passing silently.
@@ -987,6 +1003,9 @@ impl ReadService {
         let (window, pagination) = page(candidates, params.page_index, limit);
         let include_source = params.include.contains(&GetSymbolInclude::Source);
         let include_history = params.include.contains(&GetSymbolInclude::History);
+        let include_documentation = params.include.contains(&GetSymbolInclude::Documentation);
+        let mut documentation_bytes_left =
+            rift_protocol::documentation::DOCUMENTATION_EXCERPT_BYTES_MAX as usize;
         let mut timelines = if include_history {
             Some(self.symbol_timelines()?)
         } else {
@@ -997,12 +1016,31 @@ impl ReadService {
         for ranked in window {
             let hit = match ranked {
                 RankedMatch::Project(matched) => {
-                    let (hit, disagreement) =
+                    let (mut hit, disagreement) =
                         self.project_hit(matched, include_source, timelines.as_mut())?;
                     disagreements.extend(disagreement);
+                    if include_documentation && let Some(symbol) = &hit.symbol.id {
+                        hit.documentation = Some(rift_index::documentation_context_with_budget(
+                            self.index.documentation(),
+                            symbol,
+                            |source| self.index.documentation_content(source),
+                            &mut documentation_bytes_left,
+                        ));
+                    }
                     hit
                 }
-                RankedMatch::Dependency(found) => dependency_hit(found, include_source)?,
+                RankedMatch::Dependency(found) => {
+                    let mut hit = dependency_hit(found, include_source)?;
+                    if include_documentation && let Some(symbol) = &hit.symbol.id {
+                        hit.documentation = Some(rift_index::documentation_context_with_budget(
+                            found.package.documentation(),
+                            symbol,
+                            |source| found.package.documentation_content(source),
+                            &mut documentation_bytes_left,
+                        ));
+                    }
+                    hit
+                }
             };
             hits.push(hit);
         }
@@ -1153,6 +1191,7 @@ impl ReadService {
             node: include_source.then(|| symbol_node(matched).id),
             source: include_source.then(|| excerpt(matched.file, matched.symbol.range)),
             history,
+            documentation: None,
         };
         Ok((hit, disagreement))
     }
@@ -1276,6 +1315,7 @@ fn dependency_hit(
         node: None,
         source: include_source.then(|| excerpt(matched.file, matched.symbol.range)),
         history: None,
+        documentation: None,
     })
 }
 
@@ -1425,48 +1465,7 @@ pub(crate) fn wire_symbol(
 }
 
 fn assembled_wire_symbol(readable: &ReadableSymbol) -> Symbol {
-    let assembled = readable.assembled();
-    let facts = readable.facts();
-    let mut extension_values = BTreeMap::new();
-    for (_, extensions) in assembled.namespaced() {
-        for (key, value) in &extensions.0 {
-            extension_values
-                .entry(key.clone())
-                .or_insert_with(|| value.clone());
-        }
-    }
-    Symbol {
-        id: readable
-            .identity()
-            .map(|identity| SymbolId(identity.as_str().to_owned())),
-        language: facts.language().clone(),
-        name: facts.name().to_owned(),
-        kind: facts.kind().clone(),
-        facets: facts.symbol_facets().to_vec(),
-        origin: wire_symbol_origin(assembled.origin()),
-        container: assembled
-            .container()
-            .map(|container| SymbolId(container.as_str().to_owned())),
-        modifiers: facts.modifier_words().to_vec(),
-        visibility: facts.visibility_spelling().map(str::to_owned),
-        types: facts.type_bindings().to_vec(),
-        signatures: facts.signatures_slice().to_vec(),
-        documentation: facts.documentation_blocks().to_vec(),
-        extensions: Extensions(extension_values),
-        document_local: facts.is_document_local(),
-    }
-}
-
-/// Builds the wire origin from `origin`'s internal location and source kind. The
-/// declaration's source-catalog unit, where its location differs from the project, rides
-/// on the hit itself (see [`hit_location`]) rather than being repeated here.
-fn wire_symbol_origin(origin: &rift_core::ContributionOrigin) -> SymbolOrigin {
-    let location = origin.location();
-    SymbolOrigin {
-        location: location.map(wire_source_location_kind),
-        package: location.and_then(source_location_package),
-        source_kind: origin.source_kind(),
-    }
+    readable.to_protocol_symbol()
 }
 
 /// A `get_symbol` hit's own location: `path` for a project declaration or a declaration
@@ -1488,22 +1487,13 @@ fn hit_location(
     }
 }
 
+#[cfg(test)]
 fn wire_source_location_kind(location: &rift_core::SourceLocation) -> SourceLocationKind {
     match location {
         rift_core::SourceLocation::Project { .. } => SourceLocationKind::Project,
         rift_core::SourceLocation::Dependency { .. } => SourceLocationKind::Dependency,
         rift_core::SourceLocation::Stdlib {} => SourceLocationKind::Stdlib,
         rift_core::SourceLocation::External {} => SourceLocationKind::External,
-    }
-}
-
-/// The package a location carries: present for `Project` when a manifest assigned one,
-/// always present for `Dependency`, and absent for `Stdlib` and `External`.
-fn source_location_package(location: &rift_core::SourceLocation) -> Option<PackageIdentity> {
-    match location {
-        rift_core::SourceLocation::Project { package } => package.clone(),
-        rift_core::SourceLocation::Dependency { package } => Some(package.clone()),
-        rift_core::SourceLocation::Stdlib {} | rift_core::SourceLocation::External {} => None,
     }
 }
 
@@ -3703,41 +3693,6 @@ pub fn compute() -> i32 {
         for (internal, wire) in cases {
             assert_eq!(super::wire_source_location_kind(&internal), wire);
         }
-    }
-
-    /// `package` rides beside `Project` when a manifest assigned one and always beside
-    /// `Dependency`; `Stdlib` and `External` never carry one.
-    #[test]
-    fn source_location_package_is_present_for_project_and_dependency_alone() {
-        let package = rift_protocol::read::PackageIdentity {
-            manager: "cargo".to_owned(),
-            name: "beacon-core".to_owned(),
-            version: "0.1.0".to_owned(),
-        };
-        assert_eq!(
-            super::source_location_package(&rift_core::SourceLocation::Project { package: None }),
-            None
-        );
-        assert_eq!(
-            super::source_location_package(&rift_core::SourceLocation::Project {
-                package: Some(package.clone())
-            }),
-            Some(package.clone())
-        );
-        assert_eq!(
-            super::source_location_package(&rift_core::SourceLocation::Dependency {
-                package: package.clone()
-            }),
-            Some(package)
-        );
-        assert_eq!(
-            super::source_location_package(&rift_core::SourceLocation::Stdlib {}),
-            None
-        );
-        assert_eq!(
-            super::source_location_package(&rift_core::SourceLocation::External {}),
-            None
-        );
     }
 
     #[test]
