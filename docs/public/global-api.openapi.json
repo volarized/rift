@@ -615,14 +615,14 @@
                           },
                           "documentation": {
                             "block": {
-                              "identity": "aaaaaaaa",
+                              "identity": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                               "source": {
                                 "source": {
                                   "kind": "package",
                                   "unit": "rift://source/cargo/serde-1.0.219/README.md"
                                 }
                               },
-                              "content_digest": "bbbbbbbb",
+                              "content_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                               "range": {
                                 "start": 0,
                                 "end": 13
@@ -637,8 +637,8 @@
                                   "unit": "rift://source/cargo/serde-1.0.219/README.md"
                                 }
                               },
-                              "revision": "cccccccc",
-                              "content_digest": "dddddddd",
+                              "revision": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                              "content_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
                               "origin": {
                                 "location": "dependency",
                                 "package": {

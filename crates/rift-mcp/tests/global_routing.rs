@@ -181,10 +181,11 @@ fn json_response(value: &Value) -> Response {
 fn capabilities() -> Value {
     json!({
         "supported_package_managers": ["cargo"],
-        "supported_features": ["resolutions", "search", "symbols"],
-        "publication_format": "rift-package-index-v1",
+        "supported_features": ["resolutions", "search", "symbols", "documentation_search", "symbol_documentation"],
+        "publication_format": "rift-package-index-v2",
         "analyzer_revision": "analyzer-v1",
         "corpus_revision": "corpus-v1",
+        "documentation_revision": "0123abcd",
         "required_search_fields": [
             "name", "qualified_name", "documentation", "signature", "declaration_source"
         ],
@@ -252,15 +253,17 @@ fn symbols(fixture: SymbolFixture) -> Value {
             "code": "source_truncated",
             "detail": "source exceeded the active bound"
         }],
-        "publication_format": "rift-package-index-v1",
+        "publication_format": "rift-package-index-v2",
         "analyzer_revision": "analyzer-v1",
-        "corpus_revision": "corpus-v1"
+        "corpus_revision": "corpus-v1",
+        "documentation_revision": "0123abcd"
     })
 }
 
 fn search_page(with_item: bool) -> Value {
     let items = if with_item {
         vec![json!({
+            "target": "symbol",
             "package": {"manager":"cargo","name":"demo","version":"1.0.0"},
             "symbol": {
                 "id": "rift://symbol/rust/src/lib.rs/helper_beacon",
@@ -293,9 +296,10 @@ fn search_page(with_item: bool) -> Value {
         } else {
             json!([])
         },
-        "publication_format": "rift-package-index-v1",
+        "publication_format": "rift-package-index-v2",
         "analyzer_revision": "analyzer-v1",
-        "corpus_revision": "corpus-v1"
+        "corpus_revision": "corpus-v1",
+        "documentation_revision": "0123abcd"
     })
 }
 

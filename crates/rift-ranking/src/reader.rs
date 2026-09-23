@@ -278,8 +278,8 @@ mod tests {
 
     #[test]
     fn test_one_publication_format_round_trips_through_its_stored_value() {
-        assert_eq!(PublicationFormat::stored(1), PublicationFormat::CURRENT);
-        assert_eq!(PublicationFormat::CURRENT.value(), 1);
+        assert_eq!(PublicationFormat::stored(2), PublicationFormat::CURRENT);
+        assert_eq!(PublicationFormat::CURRENT.value(), 2);
     }
 
     #[test]
@@ -309,12 +309,12 @@ mod tests {
     #[test]
     fn test_another_publication_format_is_refused() {
         let held = capabilities(PublicationFormat::CURRENT, CorpusRevision::current());
-        let other = capabilities(PublicationFormat::stored(2), CorpusRevision::current());
+        let other = capabilities(PublicationFormat::stored(3), CorpusRevision::current());
         assert_eq!(
             held.mismatch(&other),
             Some(CapabilityMismatch::PublicationFormat {
                 held: PublicationFormat::CURRENT,
-                offered: PublicationFormat::stored(2),
+                offered: PublicationFormat::stored(3),
             })
         );
         assert_eq!(
@@ -344,9 +344,9 @@ mod tests {
     fn test_a_mismatch_names_the_two_values_it_compared() {
         let format = CapabilityMismatch::PublicationFormat {
             held: PublicationFormat::CURRENT,
-            offered: PublicationFormat::stored(2),
+            offered: PublicationFormat::stored(3),
         };
-        assert_eq!(format.subject(), "publication_format held=1 offered=2");
+        assert_eq!(format.subject(), "publication_format held=2 offered=3");
         let revision = CapabilityMismatch::CorpusRevision {
             held: CorpusRevision::stored("aaaaaaaa"),
             offered: CorpusRevision::stored("bbbbbbbb"),
