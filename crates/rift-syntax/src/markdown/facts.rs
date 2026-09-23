@@ -880,9 +880,31 @@ fn add_heading(
         symbol_index,
         range,
         level,
-        parent,
+        parent: shallower_ancestor(headings, parent, level),
     });
     Ok(Some(index))
+}
+
+/// The nearest heading on `parent`'s path whose level is above `level`.
+///
+/// A setext heading never closes its section, so a later setext heading inside that section
+/// can sit at the section heading's level or above it. Its path starts at the nearest shallower
+/// heading instead, which keeps levels strictly increasing along every heading path. Each step
+/// moves to an earlier heading, so the walk visits at most `headings.len()` entries.
+fn shallower_ancestor(
+    headings: &[MarkdownHeadingFact],
+    parent: Option<usize>,
+    level: u8,
+) -> Option<usize> {
+    let mut current = parent;
+    while let Some(index) = current {
+        let heading = headings.get(index)?;
+        if heading.level < level {
+            return Some(index);
+        }
+        current = heading.parent;
+    }
+    None
 }
 
 fn heading_level(node: Node<'_>, source: &str) -> u8 {
@@ -1244,6 +1266,27 @@ mod tests {
             exhausted.fault().name(),
             rift_core::ErrorName::Wire(rift_core::ErrorCode::LimitExceeded)
         );
+    }
+
+    #[test]
+    fn later_setext_heading_paths_keep_levels_strictly_increasing() {
+        let text = "About\n=====\n\nOne.\n\nPolicy\n======\n\nTwo.\n\nDetails\n-------\n\nThree.\n";
+        let path = ProjectPath::new("AUTHORS.md").expect("valid fixture path");
+        let document = crate::markdown::MarkdownSyntaxProvider::default()
+            .analyze(SyntaxSource { path: &path, text })
+            .expect("setext Markdown parses");
+        let facts = document.markdown_facts().expect("Markdown facts");
+        let levels = (0..facts.headings().len())
+            .map(|index| {
+                facts
+                    .heading_path(Some(index))
+                    .iter()
+                    .map(|heading| heading.level)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(levels, [vec![1], vec![1], vec![1, 2]]);
     }
 
     #[test]
