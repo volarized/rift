@@ -148,6 +148,51 @@ fn rift(root: &Path, arguments: &[&str]) -> TestResult<Output> {
         .output()?)
 }
 
+/// Runs the CLI with `variables` added to the inherited environment; a started
+/// server inherits them too.
+fn rift_with_variables(
+    root: &Path,
+    arguments: &[&str],
+    variables: &[(&str, &str)],
+) -> TestResult<Output> {
+    Ok(Command::new(rift_binary()?)
+        .args(arguments)
+        .envs(variables.iter().copied())
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .output()?)
+}
+
+/// Parenthesis nesting past the default `[providers.syntax] max_depth` of 512.
+const DEEP_NESTING: usize = 600;
+
+/// One Rust file whose expression nests past the default syntax depth bound.
+fn deep_source() -> String {
+    format!(
+        "pub fn deep() -> i32 {{ {open}1{close} }}\n",
+        open = "(".repeat(DEEP_NESTING),
+        close = ")".repeat(DEEP_NESTING),
+    )
+}
+
+/// Starts the workspace's server with `variables`, then polls `search` for
+/// `query` until the answer holds `expected`.
+fn started_answer_holding(
+    root: &Path,
+    variables: &[(&str, &str)],
+    query: &str,
+    expected: &str,
+) -> TestResult<String> {
+    let started = rift_with_variables(root, &["server", "start"], variables)?;
+    require_success(&started, "start with variables")?;
+    let serving = serving_document(root).ok_or("probe must report the started server")?;
+    wait_for(START_POLL_ATTEMPT_COUNT, expected, || {
+        search_request(serving.port, &serving.token, query)
+            .ok()
+            .filter(|answer| answer.contains(expected))
+    })
+}
+
 fn stdout_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -232,12 +277,12 @@ fn serving_document(root: &Path) -> Option<ServerLock> {
 /// `POST` carries the whole call and the reply arrives on the same connection,
 /// which `Connection: close` ends. A query matching every unit of the large
 /// fixture keeps the request in flight while the stop lands.
-fn search_request(port: u16, token: &str) -> TestResult<String> {
+fn search_request(port: u16, token: &str, query: &str) -> TestResult<String> {
     let body = serde_json::to_vec(&serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
-        "params": {"name": "search", "arguments": {"query": "beacon"}},
+        "params": {"name": "search", "arguments": {"query": query}},
     }))?;
     let head = format!(
         "POST /api/mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n\
@@ -619,7 +664,7 @@ fn a_stop_reports_success_only_once_the_election_it_waited_on_released() -> Test
     // asserted: a drain the stop's budget cuts short leaves the caller without one,
     // and that is a valid stop.
     let searching = std::thread::spawn(move || {
-        let _answer = search_request(serving.port, &serving.token);
+        let _answer = search_request(serving.port, &serving.token, "beacon");
     });
     let stopping = std::thread::spawn({
         let root = root.to_owned();
@@ -906,5 +951,49 @@ fn status_reports_absent_stale_and_serving_states() -> TestResult {
 
     let stopped = rift(root, &["server", "stop"])?;
     require_success(&stopped, "stop after the serving status")?;
+    Ok(())
+}
+
+#[test]
+fn a_variable_overrides_rift_toml_in_the_started_server() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    fs::write(root.join("deep.rs"), deep_source())?;
+    let _cleanup = StopOnDrop::new(root);
+
+    let answer = started_answer_holding(
+        root,
+        &[("RIFT_PROVIDERS_SYNTAX_MAX_DEPTH", "2048")],
+        "deep",
+        "deep.rs",
+    )?;
+    assert!(answer.contains("deep.rs"), "{answer}");
+
+    require_success(&rift(root, &["server", "stop"])?, "stop")?;
+    Ok(())
+}
+
+#[test]
+fn a_misspelled_variable_refuses_every_request_naming_it() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+
+    let answer = started_answer_holding(
+        root,
+        &[("RIFT_PROVIDERS_SYNTAX_MAX_NODE", "5000000")],
+        "beacon",
+        "configuration_invalid",
+    )?;
+    assert!(
+        answer.contains("RIFT_PROVIDERS_SYNTAX_MAX_NODE"),
+        "{answer}"
+    );
+    assert!(
+        answer.contains("RIFT_PROVIDERS_SYNTAX_MAX_NODES"),
+        "{answer}"
+    );
+
+    require_success(&rift(root, &["server", "stop"])?, "stop")?;
     Ok(())
 }

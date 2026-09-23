@@ -1,5 +1,6 @@
 //! Pure domain vocabulary and correctness primitives for Rift.
 
+pub mod acceptance;
 mod capture;
 mod configuration;
 mod digest;
