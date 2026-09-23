@@ -650,4 +650,33 @@ mod tests {
         let error = decode_notebook(&source, &notebook_identity()).expect_err("node bound");
         assert_eq!(error.fault().field(), "notebook.nodes");
     }
+
+    #[test]
+    fn input_bounds_and_invalid_cell_ids_use_safe_fallbacks() {
+        let too_large = " ".repeat(DOCUMENTATION_SOURCE_BYTES_MAX as usize + 1);
+        let error = decode_notebook(&too_large, &notebook_identity())
+            .expect_err("source byte bound is enforced before parsing");
+        assert_eq!(error.fault().field(), "notebook.source_bytes");
+
+        let mut with_cell_identity = notebook_identity();
+        with_cell_identity.cell = Some(rift_protocol::documentation::NotebookCell {
+            identity: NotebookCellIdentity::Indexed { index: 0 },
+            kind: NotebookCellKind::Markdown,
+        });
+        let error = decode_notebook("{}", &with_cell_identity)
+            .expect_err("input identity must name source, not one decoded cell");
+        assert_eq!(error.fault().field(), "notebook.identity");
+
+        let long_id =
+            "a".repeat(rift_protocol::documentation::NOTEBOOK_CELL_ID_BYTES_MAX as usize + 1);
+        let source = format!(
+            r#"{{"cells":[{{"cell_type":"code","id":"{long_id}","source":"run()"}}],"metadata":{{"language_info":{{"name":7}}}}}}"#
+        );
+        let content = decode_notebook(&source, &notebook_identity()).expect("notebook");
+        assert_eq!(
+            cell_identity(&content.cells()[0]),
+            &NotebookCellIdentity::Indexed { index: 0 }
+        );
+        assert_eq!(content.cells()[0].declared_language(), None);
+    }
 }

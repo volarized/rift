@@ -215,6 +215,62 @@ fn sparse_pax_metadata_and_invalid_release_roots_are_refused() -> TestResult {
 }
 
 #[test]
+fn schily_sparse_metadata_and_nested_root_are_refused() -> TestResult {
+    let mut builder = tar::Builder::new(Vec::new());
+    builder.append_pax_extensions([("SCHILY.filetype", b"sparse".as_slice())])?;
+    let mut header = tar::Header::new_gnu();
+    header.set_size(4);
+    header.set_mode(0o644);
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_cksum();
+    builder.append_data(&mut header, "release/a", b"text".as_slice())?;
+    let tar = builder.into_inner()?;
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(&tar)?;
+    let sparse = gzip.finish()?;
+    assert_eq!(
+        read(&sparse, ArchiveLimits::default()).expect_err("SCHILY sparse metadata is refused"),
+        ArchiveError::UnsupportedEntry
+    );
+
+    let regular = tar_bytes(&[("release/a", b"text", tar::EntryType::Regular)])?;
+    let digest = ArchiveDigest::Sha256(Sha256::digest(&regular).into());
+    assert_eq!(
+        read_archive(
+            &regular,
+            ArchiveFormat::TarGzip,
+            &digest,
+            Some("release/docs"),
+            ArchiveLimits::default(),
+        )
+        .expect_err("nested root is refused"),
+        ArchiveError::UnsafePath
+    );
+    Ok(())
+}
+
+#[test]
+fn archive_without_root_keeps_archive_paths() -> TestResult {
+    let bytes = tar_bytes(&[("release/a", b"text", tar::EntryType::Regular)])?;
+    let files = read_archive(
+        &bytes,
+        ArchiveFormat::TarGzip,
+        &ArchiveDigest::Sha256(Sha256::digest(&bytes).into()),
+        None,
+        ArchiveLimits::default(),
+    )?;
+
+    assert_eq!(
+        files
+            .files()
+            .get(&ProjectPath::new("release/a")?)
+            .map(Vec::as_slice),
+        Some(b"text".as_slice())
+    );
+    Ok(())
+}
+
+#[test]
 fn member_and_compressed_bounds_accept_exact_and_refuse_one_over() -> TestResult {
     let bytes = tar_bytes(&[("release/a", b"1234", tar::EntryType::Regular)])?;
     let exact = ArchiveLimits::new(bytes.len(), 16_384, 4, 1, 200)?;

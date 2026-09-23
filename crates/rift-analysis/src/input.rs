@@ -447,4 +447,51 @@ mod tests {
             PackageInputViolation::InvalidOrigin
         );
     }
+
+    #[test]
+    fn package_input_refuses_location_mismatch_and_source_unit_overflow() {
+        let package = identity();
+        let language = language();
+        let path = ProjectPath::new("src/lib.rs").expect("path");
+        let files = [PackageSource::new(&path, "source")];
+
+        let invalid_origin = ContributionOrigin::new(
+            Some(SourceLocation::Project { package: None }),
+            SourceKind::Authored,
+        )
+        .expect("project origin");
+        let error = ExactPackageInput::new(
+            &package,
+            &language,
+            &invalid_origin,
+            &files,
+            ExactPackageLimits::new(1, 64),
+        )
+        .expect_err("package input refuses project origin");
+        assert_eq!(
+            error.fault().violation(),
+            PackageInputViolation::InvalidOrigin
+        );
+
+        let long_package = PackageIdentity {
+            manager: "cargo".to_owned(),
+            name: "p".repeat(3_500),
+            version: "1.0.0".to_owned(),
+        };
+        let long_path = ProjectPath::new("x".repeat(1_000)).expect("bounded project path");
+        let long_files = [PackageSource::new(&long_path, "source")];
+        let long_origin = origin(&long_package);
+        let error = ExactPackageInput::new(
+            &long_package,
+            &language,
+            &long_origin,
+            &long_files,
+            ExactPackageLimits::new(1, 64),
+        )
+        .expect_err("combined package and path exceed source path bound");
+        assert_eq!(
+            error.fault().violation(),
+            PackageInputViolation::InvalidIdentity
+        );
+    }
 }

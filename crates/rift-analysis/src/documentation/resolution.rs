@@ -962,6 +962,35 @@ mod tests {
         super::super::DocumentationSourceSet::new(inputs).expect("source set")
     }
 
+    fn ambiguous_declarations<'a>(
+        owner: &DocumentationContentIdentity,
+        rust_symbol: &'a SymbolId,
+        python_symbol: &'a SymbolId,
+        rust: &'a Language,
+        python: &'a Language,
+    ) -> [DocumentationDeclaration<'a>; 2] {
+        [
+            DocumentationDeclaration::new(
+                rust_symbol,
+                rust,
+                "Compass",
+                "Compass",
+                owner,
+                TextRange { start: 0, end: 20 },
+            )
+            .expect("Rust declaration"),
+            DocumentationDeclaration::new(
+                python_symbol,
+                python,
+                "Compass",
+                "Compass",
+                owner,
+                TextRange { start: 0, end: 20 },
+            )
+            .expect("Python declaration"),
+        ]
+    }
+
     fn target_sources(
         include_target: bool,
         include_target_link: bool,
@@ -1054,6 +1083,71 @@ mod tests {
             key,
             DependencyKey::Target { source, .. } if source == &target
         )));
+    }
+
+    #[test]
+    fn empty_fragment_tracks_whole_source_addition() {
+        let guide = input("guide.md", "[target](target.md#)\n");
+        let absent_sources = source_set(vec![guide.clone()]);
+        let absent =
+            super::super::collect_documentation(&absent_sources, &[]).expect("missing target");
+        assert!(matches!(
+            absent.index().links[0].resolution,
+            DocumentationLinkResolution::Unresolved {
+                reason: DocumentationUnresolvedReason::Missing,
+            }
+        ));
+
+        let present_sources = source_set(vec![guide, input("target.md", "Target content.\n")]);
+        let incremental =
+            super::super::collect_documentation_incremental(Some(&absent), &present_sources, &[])
+                .expect("whole-source target addition");
+        let full = super::super::collect_documentation(&present_sources, &[])
+            .expect("full whole-source target");
+        assert_parity(&incremental, &full);
+        assert_recomputed(&incremental, 1);
+        assert!(matches!(
+            &incremental.index().links[0].resolution,
+            DocumentationLinkResolution::Resolved {
+                target: rift_protocol::documentation::DocumentationTarget::Source {
+                    range,
+                    ..
+                }
+            } if range.start == 0 && range.end == "Target content.\n".len() as u64
+        ));
+    }
+
+    #[test]
+    fn ambiguous_same_source_declarations_invalidate_qualified_link() {
+        let sources = source_set(vec![
+            input("guide.md", "[target](lib.md#Compass)\n"),
+            input("lib.md", "pub struct Compass;\n"),
+        ]);
+        let owner = content_identity("lib.md");
+        let rust = Language::from_identity_segment("rust").expect("Rust language");
+        let python = Language::from_identity_segment("python").expect("Python language");
+        let rust_symbol = SymbolId(rift_core::symbol_identity("rust", "lib.md", "Compass"));
+        let python_symbol = SymbolId(rift_core::symbol_identity("python", "lib.md", "Compass"));
+        let declarations =
+            ambiguous_declarations(&owner, &rust_symbol, &python_symbol, &rust, &python);
+        let initial = super::super::collect_documentation(&sources, &declarations[..1])
+            .expect("one declaration");
+        let updated = super::super::collect_documentation_incremental(
+            Some(&initial),
+            &sources,
+            &declarations,
+        )
+        .expect("ambiguous declarations");
+        let full = super::super::collect_documentation(&sources, &declarations)
+            .expect("full ambiguous declarations");
+        assert_parity(&updated, &full);
+        assert_recomputed(&updated, 1);
+        assert!(matches!(
+            updated.index().links[0].resolution,
+            DocumentationLinkResolution::Unresolved {
+                reason: DocumentationUnresolvedReason::Ambiguous,
+            }
+        ));
     }
 
     #[test]

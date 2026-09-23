@@ -135,6 +135,21 @@ mod tests {
     }
 
     #[test]
+    fn regular_project_content_owner_keeps_project_path() {
+        let identity = DocumentationContentIdentity {
+            source: DocumentationSourceIdentity::Project {
+                path: ProjectPath("docs/guide.md".to_owned()),
+            },
+            cell: None,
+        };
+
+        assert_eq!(
+            content_owner_identity(&identity).expect("owner identity"),
+            "docs/guide.md"
+        );
+    }
+
+    #[test]
     fn notebook_cells_use_canonical_distinct_identity_namespace() {
         let owner = |index| DocumentationContentIdentity {
             source: DocumentationSourceIdentity::Project {

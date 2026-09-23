@@ -576,6 +576,29 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_reference_target_yields_no_relationship_edge() {
+        let caller = symbol("rift://symbol/rust/src/lib.rs/caller");
+        let store = RelationshipStore::build(&graph(vec![
+            definition(
+                "caller",
+                "rift://symbol/rust/src/lib.rs/caller",
+                "src/lib.rs",
+                (0, 40),
+            ),
+            reference(
+                "caller_ref_missing",
+                binding("src/lib.rs", 5, 11),
+                ReferenceRole::Call,
+                "missing",
+            ),
+        ]));
+
+        assert!(store.outgoing(&caller).is_empty());
+        assert!(store.is_empty());
+        assert!(store.is_complete());
+    }
+
+    #[test]
     fn building_the_same_graph_twice_produces_equal_stores() {
         let occurrence = binding("src/lib.rs", 30, 35);
         let contributions = vec![

@@ -407,6 +407,21 @@ fn context_shares_excerpt_budget_and_reports_utf8_cut_and_missing_source() {
 }
 
 #[test]
+fn context_coalesces_source_unavailable_warnings_per_source() {
+    let text = "See `Compass` first.\n\nSee `Compass` second.\n";
+    let (collection, symbol) = compass_collection(text);
+    let context = documentation_context(&collection, &symbol, |_| None);
+
+    assert_eq!(context.references.len(), 2);
+    assert_eq!(context.warnings.len(), 1);
+    assert_eq!(
+        context.warnings[0].kind,
+        DocumentationWarningKind::SourceUnavailable
+    );
+    assert_eq!(context.warnings[0].count, 2);
+}
+
+#[test]
 fn context_reports_captured_source_truncated_before_block_range() {
     let text = "`Compass` is documented here.\n";
     let (collection, symbol) = compass_collection(text);
@@ -573,6 +588,49 @@ fn rst_references_resolve_local_targets_and_keep_missing_or_ambiguous_names() {
                     reason: DocumentationUnresolvedReason::Ambiguous,
                 }
     }));
+}
+
+#[test]
+fn rst_collection_keeps_code_block_language() {
+    let text = ".. code-block:: rust\n\n    fn main() {}\n";
+    let collection = collect("guide.rst", text);
+    let block = collection
+        .index()
+        .blocks
+        .iter()
+        .find(|block| block.kind == DocumentationBlockKind::Code)
+        .expect("code block");
+
+    assert_eq!(block.language.as_deref(), Some("rust"));
+    assert!(exact_text(text, &block.range).contains("fn main()"));
+}
+
+#[test]
+fn missing_markdown_reference_label_stays_unresolved() {
+    let collection = collect("README.md", "See [Compass][unknown].\n");
+    let link = collection.index().links.first().expect("reference link");
+
+    assert!(link.authored.contains("unknown"));
+    assert_eq!(
+        link.resolution,
+        DocumentationLinkResolution::Unresolved {
+            reason: DocumentationUnresolvedReason::Missing,
+        }
+    );
+}
+
+#[test]
+fn rst_double_underscore_reference_range_omits_markers() {
+    let text = "See target__.\n";
+    let collection = collect("README.rst", text);
+    let link = collection
+        .index()
+        .links
+        .iter()
+        .find(|link| link.authored == "target")
+        .expect("double-underscore reference");
+
+    assert_eq!(exact_text(text, &link.range), "target");
 }
 
 #[test]

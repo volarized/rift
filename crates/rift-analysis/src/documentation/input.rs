@@ -178,6 +178,19 @@ pub struct DocumentationSourceSet<'source> {
     selection_digest: DocumentationDigest,
 }
 
+/// Validates one aggregate count of selected documentation sources.
+///
+/// # Errors
+///
+/// Returns [`DocumentationError`] when the count exceeds [`DOCUMENTATION_SOURCES_MAX`].
+pub fn check_documentation_source_count(count: usize) -> Result<(), DocumentationError> {
+    if count > DOCUMENTATION_SOURCES_MAX as usize {
+        Err(refused(DocumentationViolation::LimitExceeded, "sources"))
+    } else {
+        Ok(())
+    }
+}
+
 impl<'source> DocumentationSourceSet<'source> {
     /// Validates aggregate bounds and rejects duplicate source identities.
     ///
@@ -188,9 +201,7 @@ impl<'source> DocumentationSourceSet<'source> {
     ///
     /// Returns a typed refusal for duplicate identities or aggregate bounds.
     pub fn new(mut sources: Vec<DocumentationInput<'source>>) -> Result<Self, DocumentationError> {
-        if sources.len() > DOCUMENTATION_SOURCES_MAX as usize {
-            return Err(refused(DocumentationViolation::LimitExceeded, "sources"));
-        }
+        check_documentation_source_count(sources.len())?;
         sources.sort_by(|left, right| left.source.identity.cmp(&right.source.identity));
         let mut bytes = 0_u64;
         let mut previous = None;
@@ -612,6 +623,31 @@ mod tests {
             violation(source("README.md", &over), &over),
             DocumentationViolation::LimitExceeded
         );
+    }
+
+    #[test]
+    fn test_actual_text_bound_and_source_origin_must_match_identity() {
+        let bound = rift_protocol::documentation::DOCUMENTATION_SOURCE_BYTES_MAX as usize;
+        let over = "a".repeat(bound + 1);
+        let mut record = source("README.md", &over);
+        record.byte_length = u64::try_from(bound).expect("source bound fits u64");
+        assert_eq!(
+            violation(record, &over),
+            DocumentationViolation::LimitExceeded
+        );
+
+        let mut project = source("README.md", "text");
+        project.origin.location = Some(SourceLocationKind::Dependency);
+        project.origin.package = Some(PackageIdentity {
+            manager: "cargo".to_owned(),
+            name: "beacon".to_owned(),
+            version: "1.0.0".to_owned(),
+        });
+        assert_eq!(violation(project, "text"), DocumentationViolation::Origin);
+
+        let mut package = package_source("text");
+        package.origin.location = Some(SourceLocationKind::Project);
+        assert_eq!(violation(package, "text"), DocumentationViolation::Origin);
     }
 
     #[test]

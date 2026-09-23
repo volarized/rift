@@ -620,6 +620,39 @@ mod tests {
     }
 
     #[test]
+    fn protocol_symbol_preserves_extensions_and_external_origin() {
+        let graph = graph();
+        let record = graph
+            .records()
+            .iter()
+            .find(|record| record.identity().is_some())
+            .expect("established record");
+        let mut assembled =
+            SymbolAssembler::assemble(&graph, record, &[]).expect("assembled symbol");
+        let key = rift_core::ExtensionKey("org.rift.history".to_owned());
+        let value = rift_core::ExtensionValue {
+            version: 1,
+            data: serde_json::json!({"commit": "abc123"}),
+        };
+        assembled.namespaced.push((
+            provider("git"),
+            Extensions(BTreeMap::from([(key.clone(), value.clone())])),
+        ));
+        assembled.origin =
+            ContributionOrigin::new(Some(SourceLocation::External {}), SourceKind::Authored)
+                .expect("external origin");
+
+        let symbol = assembled.to_protocol_symbol(assembled.facts().expect("portable facts"));
+
+        assert_eq!(symbol.extensions.0.get(&key), Some(&value));
+        assert_eq!(
+            symbol.origin.location,
+            Some(rift_protocol::read::SourceLocationKind::External)
+        );
+        assert!(symbol.origin.package.is_none());
+    }
+
+    #[test]
     fn assembly_retains_namespaced_fact_without_portable_fields() {
         let namespaced = Extensions(BTreeMap::from([(
             rift_core::ExtensionKey("org.rift.history".to_owned()),

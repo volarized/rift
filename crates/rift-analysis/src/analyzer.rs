@@ -32,8 +32,10 @@ use rift_core::{
 };
 use rift_protocol::canonical::canonical_json;
 use rift_protocol::documentation::{
-    DocumentationChunk, DocumentationContentIdentity, DocumentationSelectionReason,
-    DocumentationSource, DocumentationSourceFormat, DocumentationSourceIdentity, NotebookCellKind,
+    DOCUMENTATION_SOURCE_BYTES_MAX, DOCUMENTATION_TOTAL_BYTES_MAX, DocumentationChunk,
+    DocumentationContentIdentity, DocumentationSelectionReason, DocumentationSource,
+    DocumentationSourceFormat, DocumentationSourceIdentity, DocumentationWarningKind,
+    NotebookCellKind,
 };
 use rift_protocol::index::{
     PACKAGE_DOCUMENTS_MAX, PACKAGE_IDENTIFIER_TERMS_MAX, PACKAGE_PUBLICATION_FORMAT_REVISION,
@@ -391,98 +393,253 @@ fn package_documentation(
     ),
     PackageAnalysisError,
 > {
-    let notebooks = decode_package_notebooks(package, analyzed)?;
-    let mut inputs = Vec::new();
-    for (held, notebook_content) in analyzed.iter().zip(&notebooks) {
+    let DecodedPackageNotebooks {
+        notebooks,
+        omissions,
+    } = decode_package_notebooks(analyzed).map_err(|error| documentation_error(error, package))?;
+    let mut inputs = PackageDocumentationInputs {
+        inputs: Vec::new(),
+        omissions,
+        input_bytes: 0,
+    };
+    append_notebook_inputs(
+        package,
+        package_language,
+        origin,
+        analyzed,
+        &notebooks,
+        records,
+        &mut inputs,
+    )?;
+    append_regular_inputs(package, origin, analyzed, &mut inputs)?;
+    append_attached_comment_inputs(analyzed, origin, package, &mut inputs)?;
+    let sources = DocumentationSourceSet::new(inputs.inputs)
+        .map_err(|error| documentation_error(error, package))?;
+    let declarations = package_declarations(package, analyzed, records)?;
+    let notebook_cells = package_notebook_cells(analyzed, &notebooks);
+    let collection = collect_documentation(&sources, &declarations)
+        .map_err(|error| documentation_error(error, package))?
+        .with_source_omissions(inputs.omissions)
+        .map_err(|error| documentation_error(error, package))?;
+    Ok((collection.into_index(), notebook_cells))
+}
+
+struct PackageDocumentationInputs<'source> {
+    inputs: Vec<DocumentationInput<'source>>,
+    omissions: Vec<(DocumentationContentIdentity, DocumentationWarningKind)>,
+    input_bytes: u64,
+}
+
+impl PackageDocumentationInputs<'_> {
+    fn ensure_next(&self) -> Result<(), DocumentationError> {
+        crate::documentation::check_documentation_source_count(
+            self.inputs
+                .len()
+                .saturating_add(self.omissions.len())
+                .saturating_add(1),
+        )
+    }
+
+    fn omit(
+        &mut self,
+        identity: DocumentationContentIdentity,
+        kind: DocumentationWarningKind,
+    ) -> Result<(), DocumentationError> {
+        self.ensure_next()?;
+        self.omissions.push((identity, kind));
+        Ok(())
+    }
+}
+
+fn append_notebook_inputs<'source>(
+    package: &PackageIdentity,
+    package_language: &Language,
+    origin: &SymbolOrigin,
+    analyzed: &[AnalyzedFile],
+    notebooks: &'source [Option<crate::documentation::notebook::NotebookContent>],
+    records: &mut Records,
+    inputs: &mut PackageDocumentationInputs<'source>,
+) -> Result<(), PackageAnalysisError> {
+    for (held, notebook) in analyzed.iter().zip(notebooks) {
+        let Some(notebook) = notebook else {
+            continue;
+        };
+        for cell in notebook.cells() {
+            append_notebook_cell(
+                package,
+                package_language,
+                origin,
+                held,
+                cell,
+                records,
+                inputs,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn append_notebook_cell<'source>(
+    package: &PackageIdentity,
+    package_language: &Language,
+    origin: &SymbolOrigin,
+    held: &AnalyzedFile,
+    cell: &'source crate::documentation::notebook::NotebookCellContent,
+    records: &mut Records,
+    inputs: &mut PackageDocumentationInputs<'source>,
+) -> Result<(), PackageAnalysisError> {
+    inputs
+        .ensure_next()
+        .map_err(|error| documentation_error(error, package))?;
+    let unit = wire_unit(held.placement.unit());
+    let identity = DocumentationContentIdentity {
+        source: DocumentationSourceIdentity::Package { unit: unit.clone() },
+        cell: Some(cell.cell().clone()),
+    };
+    let source_bytes = u64::try_from(cell.text().len()).unwrap_or(u64::MAX);
+    if source_bytes > u64::from(DOCUMENTATION_SOURCE_BYTES_MAX)
+        || inputs.input_bytes.saturating_add(source_bytes) > DOCUMENTATION_TOTAL_BYTES_MAX
+    {
+        inputs
+            .omit(identity, DocumentationWarningKind::SourceUnavailable)
+            .map_err(|error| documentation_error(error, package))?;
+        return Ok(());
+    }
+    let source = documentation_source(
+        identity.clone(),
+        cell.text(),
+        origin,
+        DocumentationSourceFormat::Notebook,
+        cell.declared_language().cloned(),
+        cell.physical_ranges().to_vec(),
+    );
+    let mut input = match DocumentationInput::new(source, cell.text()) {
+        Ok(input) => input,
+        Err(error) => {
+            inputs
+                .omit(identity, documentation_warning_kind(&error))
+                .map_err(|error| documentation_error(error, package))?;
+            return Ok(());
+        }
+    };
+    let document_id = content_chunk_identity(&identity, 0)
+        .map_err(|error| documentation_error(error, package))?;
+    if cell.text().len() <= bound(PACKAGE_SOURCE_BYTES_MAX) && !cell.text().is_empty() {
+        input = match input.with_chunks(vec![DocumentationChunk {
+            identity: document_id.clone(),
+            range: TextRange {
+                start: 0,
+                end: u64::try_from(cell.text().len()).unwrap_or(u64::MAX),
+            },
+        }]) {
+            Ok(input) => input,
+            Err(error) => {
+                inputs
+                    .omit(identity, documentation_warning_kind(&error))
+                    .map_err(|error| documentation_error(error, package))?;
+                return Ok(());
+            }
+        };
+    }
+    inputs.inputs.push(input);
+    inputs.input_bytes = inputs.input_bytes.saturating_add(source_bytes);
+    add_notebook_document(
+        package,
+        package_language,
+        held,
+        cell,
+        &unit,
+        document_id,
+        records,
+    )
+}
+
+fn add_notebook_document(
+    package: &PackageIdentity,
+    package_language: &Language,
+    held: &AnalyzedFile,
+    cell: &crate::documentation::notebook::NotebookCellContent,
+    unit: &SourceUnitId,
+    document_id: String,
+    records: &mut Records,
+) -> Result<(), PackageAnalysisError> {
+    let language = match cell.cell().kind {
+        NotebookCellKind::Markdown => ShippedLanguage::Markdown.language(),
+        NotebookCellKind::Code => cell
+            .declared_language()
+            .cloned()
+            .unwrap_or_else(|| package_language.clone()),
+    };
+    let path = wire_path(held.file.path());
+    let retained = records.retained(cell.text(), &path);
+    let name = file_name(&path);
+    records.document(PackageDocument {
+        identity: document_id,
+        kind: PackageDocumentKind::File,
+        unit: unit.clone(),
+        language,
+        package: package.clone(),
+        content_digest: text_digest(&retained.text),
+        identifier_terms: identifier_terms(&[&name]),
+        name,
+        qualified_name: None,
+        signature: None,
+        documentation: None,
+        declaration_source: None,
+        file_content: Some(retained.text),
+        digest: Digest(String::new()),
+    })
+}
+
+fn append_regular_inputs<'source>(
+    package: &PackageIdentity,
+    origin: &SymbolOrigin,
+    analyzed: &'source [AnalyzedFile],
+    inputs: &mut PackageDocumentationInputs<'source>,
+) -> Result<(), PackageAnalysisError> {
+    for held in analyzed {
         let Some(format) = documentation_format(held.file.path().as_str()) else {
             continue;
         };
         if format == DocumentationSourceFormat::Notebook {
-            let unit = wire_unit(held.placement.unit());
-            let owner = DocumentationContentIdentity {
-                source: DocumentationSourceIdentity::Package { unit: unit.clone() },
-                cell: None,
-            };
-            let notebook = notebook_content
-                .as_ref()
-                .ok_or_else(|| documentation_error_for_package(package))?;
-            for cell in notebook.cells() {
-                let cell_identity = DocumentationContentIdentity {
-                    source: owner.source.clone(),
-                    cell: Some(cell.cell().clone()),
-                };
-                let source = documentation_source(
-                    cell_identity.clone(),
-                    cell.text(),
-                    origin,
-                    format,
-                    cell.declared_language().cloned(),
-                    cell.physical_ranges().to_vec(),
-                );
-                let mut input = DocumentationInput::new(source, cell.text())
-                    .map_err(|error| documentation_error(error, package))?;
-                let document_id = content_chunk_identity(&cell_identity, 0)
-                    .map_err(|error| documentation_error(error, package))?;
-                if cell.text().len() <= bound(PACKAGE_SOURCE_BYTES_MAX) && !cell.text().is_empty() {
-                    input = input
-                        .with_chunks(vec![DocumentationChunk {
-                            identity: document_id.clone(),
-                            range: TextRange {
-                                start: 0,
-                                end: u64::try_from(cell.text().len()).unwrap_or(u64::MAX),
-                            },
-                        }])
-                        .map_err(|error| documentation_error(error, package))?;
-                }
-                inputs.push(input);
-
-                let language = match cell.cell().kind {
-                    NotebookCellKind::Markdown => ShippedLanguage::Markdown.language(),
-                    NotebookCellKind::Code => cell
-                        .declared_language()
-                        .cloned()
-                        .unwrap_or_else(|| package_language.clone()),
-                };
-                let path = wire_path(held.file.path());
-                let retained = records.retained(cell.text(), &path);
-                let name = file_name(&path);
-                records.document(PackageDocument {
-                    identity: document_id,
-                    kind: PackageDocumentKind::File,
-                    unit: unit.clone(),
-                    language,
-                    package: package.clone(),
-                    content_digest: text_digest(&retained.text),
-                    identifier_terms: identifier_terms(&[&name]),
-                    name,
-                    qualified_name: None,
-                    signature: None,
-                    documentation: None,
-                    declaration_source: None,
-                    file_content: Some(retained.text),
-                    digest: Digest(String::new()),
-                })?;
-            }
             continue;
         }
-        inputs.push(package_file_input(package, origin, held, format)?);
+        inputs
+            .ensure_next()
+            .map_err(|error| documentation_error(error, package))?;
+        let identity = DocumentationContentIdentity {
+            source: DocumentationSourceIdentity::Package {
+                unit: wire_unit(held.placement.unit()),
+            },
+            cell: None,
+        };
+        let source_bytes = u64::try_from(held.file.source().len()).unwrap_or(u64::MAX);
+        if source_bytes > u64::from(DOCUMENTATION_SOURCE_BYTES_MAX)
+            || inputs.input_bytes.saturating_add(source_bytes) > DOCUMENTATION_TOTAL_BYTES_MAX
+        {
+            inputs
+                .omit(identity, DocumentationWarningKind::SourceUnavailable)
+                .map_err(|error| documentation_error(error, package))?;
+            continue;
+        }
+        match package_file_input(origin, held, format) {
+            Ok(input) => {
+                inputs.inputs.push(input);
+                inputs.input_bytes = inputs.input_bytes.saturating_add(source_bytes);
+            }
+            Err(error) => inputs
+                .omit(identity, documentation_warning_kind(&error))
+                .map_err(|error| documentation_error(error, package))?,
+        }
     }
-    append_attached_comment_inputs(package, origin, analyzed, &mut inputs)?;
-    let sources =
-        DocumentationSourceSet::new(inputs).map_err(|error| documentation_error(error, package))?;
-    let declarations = package_declarations(package, analyzed, records)?;
-    let notebook_cells = package_notebook_cells(analyzed, &notebooks);
-    collect_documentation(&sources, &declarations)
-        .map(|collection| (collection.into_index(), notebook_cells))
-        .map_err(|error| documentation_error(error, package))
+    Ok(())
 }
 
 fn package_file_input<'source>(
-    package: &PackageIdentity,
     origin: &SymbolOrigin,
     held: &'source AnalyzedFile,
     format: DocumentationSourceFormat,
-) -> Result<DocumentationInput<'source>, PackageAnalysisError> {
+) -> Result<DocumentationInput<'source>, DocumentationError> {
     let unit = wire_unit(held.placement.unit());
     let identity = DocumentationContentIdentity {
         source: DocumentationSourceIdentity::Package { unit: unit.clone() },
@@ -490,35 +647,36 @@ fn package_file_input<'source>(
     };
     let text = held.file.source();
     let source = documentation_source(identity, text, origin, format, None, Vec::new());
-    let mut input = DocumentationInput::new(source, text)
-        .map_err(|error| documentation_error(error, package))?;
+    let mut input = DocumentationInput::new(source, text)?;
     if matches!(
         format,
         DocumentationSourceFormat::Markdown | DocumentationSourceFormat::Mdx
     ) {
-        input = input
-            .with_syntax(held.file.syntax())
-            .map_err(|error| documentation_error(error, package))?;
+        input = input.with_syntax(held.file.syntax())?;
     }
     if text.len() <= bound(PACKAGE_SOURCE_BYTES_MAX) && !text.is_empty() {
-        input = input
-            .with_chunks(vec![DocumentationChunk {
-                identity: unit.0,
-                range: TextRange {
-                    start: 0,
-                    end: u64::try_from(text.len()).unwrap_or(u64::MAX),
-                },
-            }])
-            .map_err(|error| documentation_error(error, package))?;
+        input = input.with_chunks(vec![DocumentationChunk {
+            identity: unit.0,
+            range: TextRange {
+                start: 0,
+                end: u64::try_from(text.len()).unwrap_or(u64::MAX),
+            },
+        }])?;
     }
     Ok(input)
 }
 
+struct DecodedPackageNotebooks {
+    notebooks: Vec<Option<crate::documentation::notebook::NotebookContent>>,
+    omissions: Vec<(DocumentationContentIdentity, DocumentationWarningKind)>,
+}
+
 fn decode_package_notebooks(
-    package: &PackageIdentity,
     analyzed: &[AnalyzedFile],
-) -> Result<Vec<Option<crate::documentation::notebook::NotebookContent>>, PackageAnalysisError> {
+) -> Result<DecodedPackageNotebooks, DocumentationError> {
     let mut notebooks = Vec::with_capacity(analyzed.len());
+    let mut omissions = Vec::new();
+    let mut selected = 0_usize;
     for held in analyzed {
         if documentation_format(held.file.path().as_str())
             != Some(DocumentationSourceFormat::Notebook)
@@ -532,19 +690,31 @@ fn decode_package_notebooks(
             },
             cell: None,
         };
-        let notebook =
-            crate::documentation::notebook::decode_notebook(held.file.source(), &identity)
-                .map_err(|error| documentation_error(error, package))?;
-        notebooks.push(Some(notebook));
+        match crate::documentation::notebook::decode_notebook(held.file.source(), &identity) {
+            Ok(notebook) => {
+                selected = selected.saturating_add(notebook.cells().len());
+                crate::documentation::check_documentation_source_count(selected)?;
+                notebooks.push(Some(notebook));
+            }
+            Err(error) => {
+                selected = selected.saturating_add(1);
+                crate::documentation::check_documentation_source_count(selected)?;
+                omissions.push((identity, documentation_warning_kind(&error)));
+                notebooks.push(None);
+            }
+        }
     }
-    Ok(notebooks)
+    Ok(DecodedPackageNotebooks {
+        notebooks,
+        omissions,
+    })
 }
 
 fn append_attached_comment_inputs<'source>(
-    package: &PackageIdentity,
-    origin: &SymbolOrigin,
     analyzed: &'source [AnalyzedFile],
-    inputs: &mut Vec<DocumentationInput<'source>>,
+    origin: &SymbolOrigin,
+    package: &PackageIdentity,
+    inputs: &mut PackageDocumentationInputs<'source>,
 ) -> Result<(), PackageAnalysisError> {
     for held in analyzed {
         if !held
@@ -556,36 +726,73 @@ fn append_attached_comment_inputs<'source>(
         {
             continue;
         }
-        let source_text = held.file.source();
-        let unit = wire_unit(held.placement.unit());
-        let source = documentation_source(
-            DocumentationContentIdentity {
-                source: DocumentationSourceIdentity::Package { unit: unit.clone() },
-                cell: None,
-            },
-            source_text,
-            origin,
-            DocumentationSourceFormat::AttachedComment,
-            Some(held.file.syntax().language().clone()),
-            Vec::new(),
-        );
-        let mut input = DocumentationInput::new(source, source_text)
-            .map_err(|error| documentation_error(error, package))?
-            .with_syntax(held.file.syntax())
+        inputs
+            .ensure_next()
             .map_err(|error| documentation_error(error, package))?;
-        if source_text.len() <= bound(PACKAGE_SOURCE_BYTES_MAX) && !source_text.is_empty() {
-            input = input
-                .with_chunks(vec![DocumentationChunk {
-                    identity: unit.0,
-                    range: TextRange {
-                        start: 0,
-                        end: u64::try_from(source_text.len()).unwrap_or(u64::MAX),
-                    },
-                }])
-                .map_err(|error| documentation_error(error, package))?;
-        }
-        inputs.push(input);
+        append_attached_comment(held, origin, package, inputs)?;
     }
+    Ok(())
+}
+
+fn append_attached_comment<'source>(
+    held: &'source AnalyzedFile,
+    origin: &SymbolOrigin,
+    package: &PackageIdentity,
+    inputs: &mut PackageDocumentationInputs<'source>,
+) -> Result<(), PackageAnalysisError> {
+    let source_text = held.file.source();
+    let unit = wire_unit(held.placement.unit());
+    let identity = DocumentationContentIdentity {
+        source: DocumentationSourceIdentity::Package { unit: unit.clone() },
+        cell: None,
+    };
+    let source_bytes = u64::try_from(source_text.len()).unwrap_or(u64::MAX);
+    if source_bytes > u64::from(DOCUMENTATION_SOURCE_BYTES_MAX)
+        || inputs.input_bytes.saturating_add(source_bytes) > DOCUMENTATION_TOTAL_BYTES_MAX
+    {
+        inputs
+            .omit(identity, DocumentationWarningKind::SourceUnavailable)
+            .map_err(|error| documentation_error(error, package))?;
+        return Ok(());
+    }
+    let source = documentation_source(
+        identity.clone(),
+        source_text,
+        origin,
+        DocumentationSourceFormat::AttachedComment,
+        Some(held.file.syntax().language().clone()),
+        Vec::new(),
+    );
+    let mut input = match DocumentationInput::new(source, source_text)
+        .and_then(|input| input.with_syntax(held.file.syntax()))
+    {
+        Ok(input) => input,
+        Err(error) => {
+            inputs
+                .omit(identity, documentation_warning_kind(&error))
+                .map_err(|error| documentation_error(error, package))?;
+            return Ok(());
+        }
+    };
+    if source_text.len() <= bound(PACKAGE_SOURCE_BYTES_MAX) && !source_text.is_empty() {
+        input = match input.with_chunks(vec![DocumentationChunk {
+            identity: unit.0,
+            range: TextRange {
+                start: 0,
+                end: u64::try_from(source_text.len()).unwrap_or(u64::MAX),
+            },
+        }]) {
+            Ok(input) => input,
+            Err(error) => {
+                inputs
+                    .omit(identity, documentation_warning_kind(&error))
+                    .map_err(|error| documentation_error(error, package))?;
+                return Ok(());
+            }
+        };
+    }
+    inputs.inputs.push(input);
+    inputs.input_bytes = inputs.input_bytes.saturating_add(source_bytes);
     Ok(())
 }
 
@@ -699,6 +906,15 @@ fn documentation_error(
     PackageAnalysisFault::new(PackageAnalysisViolation::Provider, package)
         .caused_by(error)
         .into_error()
+}
+
+fn documentation_warning_kind(error: &DocumentationError) -> DocumentationWarningKind {
+    match error.fault().violation() {
+        crate::documentation::DocumentationViolation::LimitExceeded => {
+            DocumentationWarningKind::SourceUnavailable
+        }
+        _ => DocumentationWarningKind::MalformedSource,
+    }
 }
 
 fn documentation_error_for_package(package: &PackageIdentity) -> PackageAnalysisError {
@@ -1300,6 +1516,9 @@ fn package_segment(identity: &PackageIdentity) -> String {
 mod tests {
     use rift_core::{ContributionOrigin, ProjectPath, SourceKind, SourceLocation};
     use rift_protocol::canonical::canonical_json;
+    use rift_protocol::documentation::{
+        DocumentationSourceIdentity, DocumentationStage, DocumentationWarningKind,
+    };
     use rift_protocol::index::{
         PACKAGE_IDENTIFIER_TERMS_MAX, PACKAGE_PUBLICATION_FORMAT_REVISION,
         PACKAGE_SOURCE_BYTES_MAX, PackageAnalysisWarning, PackageDocumentKind,
@@ -1790,6 +2009,97 @@ mod tests {
             document.file_content.as_deref(),
             Some("def spawn(): pass\n")
         );
+    }
+
+    #[test]
+    fn malformed_notebook_omission_keeps_package_documentation_and_code() {
+        let publication = analyzed(
+            ShippedLanguage::Rust,
+            vec![
+                (
+                    "README.md",
+                    "# Package guide\n\nValid package documentation.\n",
+                ),
+                ("src/lib.rs", "/// Code documentation.\npub fn serve() {}\n"),
+                ("notebooks/broken.ipynb", "{"),
+            ],
+        );
+        let documentation = &publication.documentation;
+
+        assert!(
+            publication
+                .documents
+                .iter()
+                .all(|document| !document.unit.0.ends_with("/notebooks/broken.ipynb"))
+        );
+        assert!(documentation.coverage.selected >= 3);
+        assert_eq!(documentation.coverage.omitted, 1);
+        assert!(documentation.sources.iter().any(|source| {
+            matches!(
+                &source.identity.source,
+                DocumentationSourceIdentity::Package { unit }
+                    if unit.0.ends_with("/README.md")
+            )
+        }));
+        assert!(documentation.blocks.iter().any(|block| {
+            block.source.source
+                == DocumentationSourceIdentity::Package {
+                    unit: rift_protocol::read::SourceUnitId(
+                        "rift://source/cargo/beacon@1.0.0/README.md".to_owned(),
+                    ),
+                }
+        }));
+        assert!(
+            publication
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "serve")
+        );
+        assert!(documentation.warnings.iter().any(|warning| {
+            warning.stage == DocumentationStage::Source
+                && warning.kind == DocumentationWarningKind::MalformedSource
+                && warning.count == 1
+                && matches!(
+                    &warning.source.source,
+                    DocumentationSourceIdentity::Package { unit }
+                        if unit.0.ends_with("/notebooks/broken.ipynb")
+                )
+        }));
+    }
+
+    #[test]
+    fn oversized_selected_text_source_is_omitted_with_other_docs_retained() {
+        let oversized =
+            "x".repeat(rift_protocol::documentation::DOCUMENTATION_SOURCE_BYTES_MAX as usize + 1);
+        let publication = analyzed(
+            ShippedLanguage::Rust,
+            vec![
+                (
+                    "README.md",
+                    "# Package guide\n\nValid package documentation.\n",
+                ),
+                ("docs/large.txt", &oversized),
+            ],
+        );
+        let documentation = &publication.documentation;
+
+        assert_eq!(documentation.coverage.omitted, 1);
+        assert!(documentation.sources.iter().any(|source| {
+            matches!(
+                &source.identity.source,
+                DocumentationSourceIdentity::Package { unit }
+                    if unit.0.ends_with("/README.md")
+            )
+        }));
+        assert!(documentation.warnings.iter().any(|warning| {
+            warning.stage == DocumentationStage::Source
+                && warning.kind == DocumentationWarningKind::SourceUnavailable
+                && matches!(
+                    &warning.source.source,
+                    DocumentationSourceIdentity::Package { unit }
+                        if unit.0.ends_with("/docs/large.txt")
+                )
+        }));
     }
 
     /// A declaration past the retained-source bound keeps the bytes that fit, reports the

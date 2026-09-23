@@ -708,6 +708,166 @@ mod tests {
             .expect("gzip archive")
     }
 
+    fn archived_entry(files: &[(&str, &[u8])]) -> (tempfile::TempDir, CatalogEntry) {
+        let directory = tempfile::tempdir().expect("archive directory");
+        let path = directory.path().join("beacon-1.0.0.crate");
+        let bytes = cargo_archive(files);
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        std::fs::write(&path, bytes).expect("archive bytes");
+        let entry = CatalogEntry::dependency(
+            identity("cargo", "beacon", "1.0.0"),
+            language(ShippedLanguage::Rust),
+            None,
+            true,
+        )
+        .with_source_archive(path, digest);
+        (directory, entry)
+    }
+
+    #[test]
+    fn test_cached_archive_refuses_past_package_files_max() {
+        let (directory, entry) =
+            archived_entry(&[("src/a.rs", b"fn a() {}"), ("src/b.rs", b"fn b() {}")]);
+        let limits = DependencyIndexLimits {
+            package_files_max: 1,
+            ..DependencyIndexLimits::default()
+        };
+
+        let error = package_files(&entry, &limits).expect_err("selected files exceed bound");
+
+        assert_eq!(
+            violation_of(&error),
+            PackageIndexViolation::PackageFilesExceeded
+        );
+        let evidence = error.fault().limit_evidence().expect("limit evidence");
+        assert_eq!(
+            (evidence.field.as_str(), evidence.limit, evidence.required),
+            ("package_files_max", 1, 2)
+        );
+        assert_eq!(
+            error.fault().path(),
+            Some(directory.path().join("beacon-1.0.0.crate").as_path())
+        );
+    }
+
+    #[test]
+    fn test_cached_archive_refuses_past_package_bytes_max() {
+        let (directory, entry) = archived_entry(&[("src/lib.rs", b"0123456789")]);
+        let limits = DependencyIndexLimits {
+            package_bytes_max: 9,
+            ..DependencyIndexLimits::default()
+        };
+
+        let error = package_files(&entry, &limits).expect_err("selected bytes exceed bound");
+
+        assert_eq!(
+            violation_of(&error),
+            PackageIndexViolation::PackageBytesExceeded
+        );
+        let evidence = error.fault().limit_evidence().expect("limit evidence");
+        assert_eq!(
+            (evidence.field.as_str(), evidence.limit, evidence.required),
+            ("package_bytes_max", 9, 10)
+        );
+        assert_eq!(
+            error.fault().path(),
+            Some(directory.path().join("beacon-1.0.0.crate").as_path())
+        );
+    }
+
+    #[test]
+    fn test_cached_archive_refuses_past_walk_entries_max() {
+        let (directory, entry) =
+            archived_entry(&[("src/a.rs", b"fn a() {}"), ("README.md", b"# Beacon")]);
+        let limits = DependencyIndexLimits {
+            walk_entries_max: 1,
+            ..DependencyIndexLimits::default()
+        };
+
+        let error = package_files(&entry, &limits).expect_err("archive entries exceed bound");
+
+        assert_eq!(
+            violation_of(&error),
+            PackageIndexViolation::WalkEntriesExceeded
+        );
+        let evidence = error.fault().limit_evidence().expect("limit evidence");
+        assert_eq!(
+            (evidence.field.as_str(), evidence.limit, evidence.required),
+            ("walk_entries_max", 1, 2)
+        );
+        assert_eq!(
+            error.fault().path(),
+            Some(directory.path().join("beacon-1.0.0.crate").as_path())
+        );
+    }
+
+    #[test]
+    fn test_cached_archive_refuses_past_directory_depth_max() {
+        let (directory, entry) = archived_entry(&[("src/deep/lib.rs", b"fn spawn() {}")]);
+        let limits = DependencyIndexLimits {
+            directory_depth_max: 1,
+            ..DependencyIndexLimits::default()
+        };
+
+        let error = package_files(&entry, &limits).expect_err("archive path exceeds depth");
+
+        assert_eq!(
+            violation_of(&error),
+            PackageIndexViolation::DirectoryDepthExceeded
+        );
+        let evidence = error.fault().limit_evidence().expect("limit evidence");
+        assert_eq!(
+            (evidence.field.as_str(), evidence.limit, evidence.required),
+            ("directory_depth_max", 1, 2)
+        );
+        assert_eq!(
+            error.fault().path(),
+            Some(directory.path().join("beacon-1.0.0.crate").as_path())
+        );
+    }
+
+    #[test]
+    fn test_cached_archive_refuses_a_missing_archive_with_package_path() {
+        let directory = tempfile::tempdir().expect("archive directory");
+        let path = directory.path().join("missing.crate");
+        let entry = CatalogEntry::dependency(
+            identity("cargo", "beacon", "1.0.0"),
+            language(ShippedLanguage::Rust),
+            None,
+            true,
+        )
+        .with_source_archive(path.clone(), [0; 32]);
+
+        let error = package_files(&entry, &DependencyIndexLimits::default())
+            .expect_err("missing archive refuses");
+
+        assert_eq!(violation_of(&error), PackageIndexViolation::Unreadable);
+        assert_eq!(error.fault().path(), Some(path.as_path()));
+        assert!(error.fault().source().is_some());
+    }
+
+    #[test]
+    fn test_cached_archive_refuses_a_digest_mismatch_as_unreadable() {
+        let directory = tempfile::tempdir().expect("archive directory");
+        let path = directory.path().join("beacon-1.0.0.crate");
+        std::fs::write(&path, cargo_archive(&[("src/lib.rs", b"fn spawn() {}")]))
+            .expect("archive bytes");
+        let entry = CatalogEntry::dependency(
+            identity("cargo", "beacon", "1.0.0"),
+            language(ShippedLanguage::Rust),
+            None,
+            true,
+        )
+        .with_source_archive(path.clone(), [0; 32]);
+
+        let error = package_files(&entry, &DependencyIndexLimits::default())
+            .expect_err("digest mismatch refuses");
+
+        assert_eq!(violation_of(&error), PackageIndexViolation::Unreadable);
+        assert_eq!(error.fault().path(), Some(path.as_path()));
+        assert!(error.fault().source().is_some());
+    }
+
     #[test]
     fn test_cached_archive_and_installed_directory_select_same_files() {
         let members = [
