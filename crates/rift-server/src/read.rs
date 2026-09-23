@@ -3248,6 +3248,41 @@ pub fn compute() -> i32 {
         Ok((directory, service))
     }
 
+    #[test]
+    fn held_packages_match_only_the_same_exact_dependency_context() -> TestResult {
+        let mut index = rift_index::DependencyIndex::empty(DependencyIndexLimits::default());
+        index.insert(helper_package()?)?;
+        for (version, requirement, expected) in [
+            (Some("0.1.0"), None, true),
+            (Some("0.2.0"), None, false),
+            (None, Some("^0.1"), false),
+        ] {
+            let package = rift_protocol::dependencies::ConfiguredPackage {
+                manager: "cargo".to_owned(),
+                name: "helper".to_owned(),
+                version: version.map(str::to_owned),
+                requirement: requirement.map(str::to_owned),
+            };
+            let context = rift_dependency::resolve_context(
+                std::path::Path::new("/workspace"),
+                &[],
+                &[],
+                &mut RefusedInputs,
+                &[package],
+            );
+            assert_eq!(context.entries().len(), 1);
+            assert_eq!(
+                super::branch_matches_exact_context(&index, &context),
+                expected
+            );
+        }
+        assert!(!super::branch_matches_exact_context(
+            &index,
+            &rift_dependency::DependencyContext::default(),
+        ));
+        Ok(())
+    }
+
     fn scoped(name: &str, scope: &str) -> TestResult<GetSymbolParams> {
         let request = json!({"name": name, "scope": scope, "limit": 10});
         Ok(serde_json::from_value(request)?)
@@ -3683,6 +3718,33 @@ pub fn compute() -> i32 {
         assert_eq!(error.context(), expected_context);
         let source =
             std::error::Error::source(&error).ok_or("a dependency fault carries a source")?;
+        assert_eq!(source.to_string(), expected_text);
+        Ok(())
+    }
+
+    #[test]
+    fn a_documentation_fault_keeps_its_identity_evidence_and_source() -> TestResult {
+        use rift_core::Fault;
+
+        let failure = rift_index::DocumentationCollection::from_candidate_blocks(
+            rift_protocol::read::Digest("00000000".to_owned()),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect_err("incompatible documentation revision");
+        let expected_name = failure.name();
+        let expected_context = failure.context();
+        let expected_text = failure.to_string();
+        let expected_limit = failure.fault().limit_evidence();
+
+        let error = ReadFault::documentation(failure);
+
+        assert!(matches!(error.fault(), ReadFault::Documentation(_)));
+        assert_eq!(error.name(), expected_name);
+        assert_eq!(error.context(), expected_context);
+        assert_eq!(error.fault().limit_evidence(), expected_limit);
+        let source =
+            std::error::Error::source(&error).ok_or("a documentation fault carries a source")?;
         assert_eq!(source.to_string(), expected_text);
         Ok(())
     }

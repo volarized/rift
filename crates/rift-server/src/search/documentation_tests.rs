@@ -8,7 +8,7 @@ use rift_index::{
 };
 use rift_protocol::configuration::{HistoryConfiguration, RankingConfiguration};
 use rift_protocol::read::{
-    GetSymbolParams, PackageIdentity, SearchHit, SearchParams, SearchResult,
+    GetSymbolParams, PackageIdentity, ReadWarning, SearchHit, SearchParams, SearchResult,
 };
 use rift_ranking::{ParsedQuery, QueryPhase, RankingInput, RankingWeights};
 use rift_search::{RevisionScoped, SearchIndex, SearchIndexLimits};
@@ -229,6 +229,79 @@ async fn heading_and_baseline_match_project_once_before_pagination() -> TestResu
         result.results[0].hit,
         SearchHitTarget::Symbol { .. }
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn page_excerpt_budget_respects_utf8_and_coalesces_same_source_warnings() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let first = format!("xx compass {}\n", "é".repeat(10_000));
+    let second = format!("\nxx compass {}\n", "界".repeat(10_000));
+    fs::write(
+        directory.path().join("large.md"),
+        format!("{first}{second}\n{first}"),
+    )?;
+    let service = ReadService::build(
+        directory.path(),
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::new(vec!["selected.txt".to_owned()], 20_013),
+        HistoryConfiguration::default(),
+    )?;
+    let store = stored(directory.path(), &service).await?;
+    let params: SearchParams = serde_json::from_value(json!({
+        "query":"compass",
+        "target":"documentation",
+        "include":["source"],
+        "limit":100
+    }))?;
+
+    let result = service.search(&params, &answer(&store, &service, "compass").await?)?;
+
+    assert_eq!(result.results.len(), 3, "{result:#?}");
+    let excerpts = result
+        .results
+        .iter()
+        .filter_map(|hit| hit.source.as_deref())
+        .collect::<Vec<_>>();
+    assert_eq!(excerpts.len(), 2, "{result:#?}");
+    let excerpt_limit = rift_protocol::documentation::DOCUMENTATION_EXCERPT_BYTES_MAX as usize;
+    assert_eq!(
+        excerpts.iter().map(|source| source.len()).sum::<usize>(),
+        excerpt_limit
+    );
+    let excerpt = excerpts
+        .iter()
+        .max_by_key(|source| source.len())
+        .ok_or("bounded excerpt required")?;
+    assert!(excerpt.len() <= excerpt_limit);
+    assert!(excerpt.len() >= excerpt_limit - 2);
+    assert!(excerpt.ends_with('é') || excerpt.ends_with('界'));
+
+    let warnings = result
+        .warnings
+        .iter()
+        .filter_map(|warning| match warning {
+            ReadWarning::Documentation { warning }
+                if warning.kind
+                    == rift_protocol::documentation::DocumentationWarningKind::LimitExceeded =>
+            {
+                Some(warning)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(warnings.len(), 1, "{result:#?}");
+    assert_eq!(warnings[0].count, 3);
+    assert!(matches!(
+        &warnings[0].source.source,
+        rift_protocol::documentation::DocumentationSourceIdentity::Project { path }
+            if path.0 == "large.md"
+    ));
+    assert_eq!(
+        warnings[0].stage,
+        rift_protocol::documentation::DocumentationStage::Index
+    );
     Ok(())
 }
 

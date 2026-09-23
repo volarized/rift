@@ -174,6 +174,39 @@ fn symbol_context_matches_requested_symbol_and_revision() {
         let page = serde_json::from_value(invalid).expect("generated symbol page");
         assert!(validate_symbol_page(&request, &capabilities(), &page, None).is_err());
     }
+
+    let mut mismatched_revision = value;
+    *mismatched_revision
+        .pointer_mut("/items/0/documentation/documentation_revision")
+        .expect("symbol context revision") = json!("abcdef01");
+    *mismatched_revision
+        .pointer_mut("/items/0/documentation/references/0/documentation/documentation_revision")
+        .expect("referenced documentation revision") = json!("abcdef01");
+    let mismatched_revision = serde_json::from_value(mismatched_revision)
+        .expect("generated symbol page with internally matching documentation revision");
+    assert!(matches!(
+        validate_symbol_page(&request, &capabilities(), &mismatched_revision, None),
+        Err(ClientError::InvalidResponseField {
+            field: "documentation_revision"
+        })
+    ));
+}
+
+#[test]
+fn symbol_source_requires_source_include() {
+    let mut value = symbol_page_json("demo", None, "analyzer-v1", "first");
+    value["items"][0]["source"] = json!("demo");
+    let page: PackageSymbolPage = serde_json::from_value(value).expect("symbol page with source");
+
+    let mut request = symbol_request();
+    request.include = Some(vec![PackageSymbolRequestInclude::Source]);
+    validate_symbol_page(&request, &capabilities(), &page, None).expect("requested symbol source");
+
+    request.include = None;
+    assert!(matches!(
+        validate_symbol_page(&request, &capabilities(), &page, None),
+        Err(ClientError::InvalidResponseField { field: "source" })
+    ));
 }
 
 #[test]

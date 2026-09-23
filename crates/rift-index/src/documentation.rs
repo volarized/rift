@@ -601,6 +601,8 @@ fn warning_kind(error: &DocumentationError) -> DocumentationWarningKind {
 mod tests {
     use super::{NotebookFiles, decode_notebooks};
     use crate::workspace::TextSourceFile;
+    use crate::{WorkspaceIndex, WorkspaceIndexLimits};
+    use rift_core::{SourceVisibility, TextFileInclusion};
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -645,5 +647,76 @@ mod tests {
             super::NotebookOutcome::Decoded(_)
         ));
         let _: NotebookFiles = next;
+    }
+
+    #[test]
+    fn workspace_build_reports_malformed_and_oversized_documentation_sources() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let source_max = rift_protocol::documentation::DOCUMENTATION_SOURCE_BYTES_MAX as usize;
+        let oversized = "x".repeat(source_max + 1);
+        std::fs::write(directory.path().join("broken.ipynb"), "{").expect("malformed notebook");
+        std::fs::write(directory.path().join("oversized.rst"), &oversized)
+            .expect("oversized reStructuredText source");
+        std::fs::write(directory.path().join("oversized.ipynb"), &oversized)
+            .expect("oversized notebook source");
+
+        let capture_file_max = source_max + 2;
+        let limits = WorkspaceIndexLimits::new(8, capture_file_max, capture_file_max * 3, 8, 32)
+            .expect("capture limits above documentation source bound");
+        let inclusion = TextFileInclusion::new(vec!["**".to_owned()], 1_024);
+        let workspace = WorkspaceIndex::build(
+            directory.path(),
+            limits,
+            &SourceVisibility::default(),
+            &inclusion,
+        )
+        .expect("workspace capture accepts files above documentation bound");
+
+        assert_eq!(workspace.text_file_count(), 3);
+        let index = workspace.documentation().index();
+        assert_eq!(index.coverage.selected, 3);
+        assert_eq!(index.coverage.parsed, 0);
+        assert_eq!(index.coverage.omitted, 3);
+        assert_eq!(
+            warning_kind(index, "broken.ipynb"),
+            Some((
+                rift_protocol::documentation::DocumentationStage::Source,
+                rift_protocol::documentation::DocumentationWarningKind::MalformedSource,
+            ))
+        );
+        assert_eq!(
+            warning_kind(index, "oversized.rst"),
+            Some((
+                rift_protocol::documentation::DocumentationStage::Source,
+                rift_protocol::documentation::DocumentationWarningKind::SourceUnavailable,
+            ))
+        );
+        assert_eq!(
+            warning_kind(index, "oversized.ipynb"),
+            Some((
+                rift_protocol::documentation::DocumentationStage::Source,
+                rift_protocol::documentation::DocumentationWarningKind::SourceUnavailable,
+            ))
+        );
+    }
+
+    fn warning_kind(
+        index: &rift_protocol::documentation::DocumentationIndex,
+        path: &str,
+    ) -> Option<(
+        rift_protocol::documentation::DocumentationStage,
+        rift_protocol::documentation::DocumentationWarningKind,
+    )> {
+        let identity = rift_protocol::documentation::DocumentationContentIdentity {
+            source: rift_protocol::documentation::DocumentationSourceIdentity::Project {
+                path: rift_protocol::read::ProjectPath(path.to_owned()),
+            },
+            cell: None,
+        };
+        index
+            .warnings
+            .iter()
+            .find(|warning| warning.source == identity)
+            .map(|warning| (warning.stage, warning.kind))
     }
 }
