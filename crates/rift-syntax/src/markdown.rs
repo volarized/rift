@@ -1,8 +1,9 @@
-//! Markdown syntax facts from the pinned tree-sitter-md block grammar.
+//! Markdown syntax facts from the pinned tree-sitter-md block and inline grammars.
 //!
-//! Only the block grammar is read; inline content stays raw bytes -
-//! `**bold**` in a heading is part of the name - so the inline grammar
-//! never loads. Each named heading declares one `heading` symbol.
+//! The block grammar supplies headings and block structure. The inline
+//! grammar supplies authored link ranges and inline code candidates. Heading
+//! names keep source spelling, so `**bold**` stays part of the name. Each
+//! named heading declares one `heading` symbol.
 //!
 //! Decisions this module fixes:
 //! - Nesting follows the grammar's section tree. The pinned block grammar
