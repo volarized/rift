@@ -373,7 +373,7 @@ adding a language is one definition plus one list entry.
 
 <VersionBadge version="v0.0.39" />
 
-One package's source reaches the index through the package analyzer in `rift-index`, which
+One package's source reaches the index through the package analyzer in `rift-analysis`, which
 holds no I/O: it takes bytes a caller already read, parses them with the shipped syntax
 providers, places each file under `rift://source/<manager>/<name>@<version>/<path>`, assembles
 the declarations, and renders one `PackagePublication`. That publication is the logical package
@@ -393,7 +393,7 @@ added, replaced, and removed records by identity and digest alone. A publication
 by package-relative path and source unit, so no machine's directory layout reaches a consumer.
 
 The analyzer manifest is generated beside the served schemas and committed at
-`crates/rift-index/src/dependency/analyzer-manifest.json`, so a change to any of those files
+`crates/rift-analysis/src/analyzer-manifest.json`, so a change to any of those files
 that ships without a regenerated manifest fails `just generate-check`. The publication's own schema is
 exported to [`package-index.schema.json`](https://volar.sh/rift/package-index.schema.json).
 
