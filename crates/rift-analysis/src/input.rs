@@ -8,6 +8,7 @@ use rift_core::{
 };
 use rift_protocol::index::PACKAGE_UNITS_MAX;
 use rift_protocol::read::{Language, PackageIdentity};
+#[cfg(feature = "collector")]
 use rift_syntax::SyntaxLimits;
 use serde::Serialize;
 
@@ -16,6 +17,7 @@ use serde::Serialize;
 pub struct ExactPackageLimits {
     files_max: u32,
     bytes_max: u64,
+    #[cfg(feature = "collector")]
     syntax: Option<SyntaxLimits>,
 }
 
@@ -27,6 +29,7 @@ impl ExactPackageLimits {
         Self {
             files_max,
             bytes_max,
+            #[cfg(feature = "collector")]
             syntax: None,
         }
     }
@@ -35,6 +38,7 @@ impl ExactPackageLimits {
     ///
     /// A caller that must analyze packages carrying one outsized generated file raises the
     /// bounds here; the package source and byte bounds still apply.
+    #[cfg(feature = "collector")]
     #[must_use]
     pub const fn with_syntax(self, syntax: SyntaxLimits) -> Self {
         Self {
@@ -44,6 +48,7 @@ impl ExactPackageLimits {
     }
 
     /// Syntax bounds replacing each provider's declared bounds, when the caller set them.
+    #[cfg(feature = "collector")]
     #[must_use]
     pub const fn syntax(self) -> Option<SyntaxLimits> {
         self.syntax
